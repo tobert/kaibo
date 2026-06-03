@@ -1,0 +1,14 @@
+# Rust build output
+/target
+
+# Local, per-user Claude Code settings (shared settings.json would be committed)
+.claude/settings.local.json
+
+# Defensive: provider key-files live in $HOME, never in the repo — but never
+# let one slip in if it's ever dropped here.
+*-key.txt
+*-key
+*.key
+.anthropic-key.txt
+.deepseek-key
+.gemini-api-key

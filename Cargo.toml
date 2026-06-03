@@ -1,0 +1,42 @@
+[package]
+name = "kaibo"
+description = "解剖 — a two-phase MCP consult agent that explores a read-only filesystem through kaish builtins"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[lib]
+name = "kaibo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kaibo"
+path = "src/main.rs"
+
+[dependencies]
+# kaish-kernel embedded as a library: read-only VFS + builtin toolbox for the explorer.
+# We opt into ONLY the `localfs` axis (real-file I/O through the backend). That
+# leaves `subprocess` (exec/spawn/kill), `git`, `host` (ps/uname), and
+# `os-integration` (trash) OFF — so those builtins are never compiled in. kaibo's
+# read-only safety is thus structural (the dangerous surface doesn't exist),
+# backed by the runtime read-only mount; see src/sandbox.rs.
+kaish-kernel = { path = "../kaish/crates/kaish-kernel", default-features = false, features = ["localfs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+async-trait = "0.1"
+anyhow = "1"
+
+# LLM providers + agent/tool loop. Native tools (no `rmcp` feature needed — kaibo
+# wraps kaish as an in-process rig Tool, not over MCP).
+rig-core = "0.34"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# MCP server (stdio only — never bind a socket; the FS is the boundary).
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
