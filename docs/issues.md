@@ -14,18 +14,13 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-03 (initial list, the day the two-phase consult + rmcp server
-first worked end-to-end).
+Last pass: 2026-06-03 (caught up to kaish's four-crate split — `kaish-tool-api` /
+`kaish-vfs` / `kaish-tools-git` / `kaish-tools-host` — and the `Tool::execute`
+`&mut dyn ToolCtx` boundary).
 
 ---
 
 ## P1 — High-leverage features & robustness
-
-### No version control yet
-The project isn't a git repo (`git rev-parse` fails as of 2026-06-03). We have a
-working MCP server with 17 offline + 2 live tests — snapshot it before it grows.
-First commit should include `.gitignore` (target/, key-files must NEVER be
-committed), then branch for subsequent work.
 
 ### Multi-turn sessions (the last v1 feature)
 `consult` is stateless: every call re-explores from scratch. dpal keeps cap-based
@@ -93,6 +88,18 @@ answer text (`server.rs`). The curated report is useful for debugging the
 hand-off and for "show your work" — surface it as `structured_content` or a
 `kaibo://consult/last` resource, ideally behind a flag so it doesn't bloat every
 client context.
+
+### Explorer sandbox isn't fully hermetic from the host env
+Surfaced 2026-06-03 catching up to kaish's four-crate split. Several kaish builtins
+read the host environment directly instead of the kernel scope: tilde expansion in
+`interpreter/eval.rs` (`~`/`~/path`), `cd` with no args (`cd.rs`), and the
+`~user`→`/etc/passwd` lookup (now gated behind the `host` capability, which kaibo
+doesn't enable). For kaibo these are *read* disclosures, not write bypasses — `~`
+expands to the host home path string, which then resolves through `/`=`MemoryFs` to
+ephemeral scratch, so no real off-project file is read — but the host home *path* is
+disclosed to the explorer model. The fix is kaish-side (consult the scope `HOME`,
+not `std::env`) and is tracked in kaish's own `docs/issues.md` P2 hermetic pass;
+recorded here so we don't lose that our sandbox's hermeticity depends on it landing.
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they

@@ -1261,7 +1261,9 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "kaish-glob",
+ "kaish-tool-api",
  "kaish-types",
+ "kaish-vfs",
  "logos",
  "md-5",
  "opentelemetry",
@@ -1280,6 +1282,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaish-tool-api"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "kaish-types",
+]
+
+[[package]]
 name = "kaish-types"
 version = "0.8.0"
 dependencies = [
@@ -1287,6 +1298,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio-util",
+]
+
+[[package]]
+name = "kaish-vfs"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "kaish-types",
+ "tokio",
 ]
 
 [[package]]

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use kaish_kernel::interpreter::ExecResult;
-use kaish_kernel::tools::{ExecContext, Tool, ToolArgs, ToolRegistry, ToolSchema};
+use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend};
 
@@ -59,7 +59,7 @@ impl Tool for Blocked {
         self.inner.schema()
     }
 
-    async fn execute(&self, _args: ToolArgs, _ctx: &mut ExecContext) -> ExecResult {
+    async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
         ExecResult::failure(
             126,
             format!(
