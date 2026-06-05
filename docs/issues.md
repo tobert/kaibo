@@ -113,11 +113,25 @@ Only the Anthropic path has been dogfooded. DeepSeek and Gemini are wired
 (`consult.rs`, generic over rig's `CompletionClient`) and compile, but no live test
 has exercised them — provider quirks (gemini tool-calling, deepseek reasoning
 fields) may bite. Add opt-in live tests gated on each key, like the Anthropic one.
+Lemonade has an `#[ignore]`d live test (`consult.rs::two_phase_consult_runs_against_local_gemma`)
+but is otherwise in the same boat — gemma's tool-calling fidelity over many explorer
+turns is unproven.
+
+### A small local context window makes uncapped output acute
+A local server's context window can be far smaller than the model advertises
+(Gemma-4-26B reports `max_context_window` 262144; the lemonade box was briefly
+serving it at `--ctx-size 4096` before we bumped it). The explorer dumps file
+contents over up to 50 turns, so on a tight window a single wide `cat`/`rg` blows
+it. kaibo can't size the server's ctx (a lemonade launch flag), but it *can* stop
+flooding: wiring kaish's `OutputLimitConfig` (the P2 "run_kaish output is uncapped"
+issue) matters more for local models than for the hosted providers.
 
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
 error. Validating available providers at startup (and noting them in the server
-instructions) would fail faster and tell a client what it can actually use.
+instructions) would fail faster and tell a client what it can actually use. For
+lemonade this would mean a startup ping of `LEMONADE_BASE_URL/models` rather than a
+key check.
 
 ---
 

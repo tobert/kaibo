@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig::providers::{anthropic, deepseek, gemini};
+use rig::providers::{anthropic, deepseek, gemini, openai};
 
 use crate::credentials::{self, Provider};
 use crate::explorer::RunKaish;
@@ -58,6 +58,9 @@ pub fn default_models(provider: Provider) -> (&'static str, &'static str) {
         Provider::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
         // Gemini: LITE explorer; flash (not pro) synth — pro is API-flaky.
         Provider::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
+        // Local lemonade/Gemma: the small E4B drives the tool-heavy exploration,
+        // the 26B MoE writes the answer. Both carry the `tool-calling` label.
+        Provider::Lemonade => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
 
@@ -210,23 +213,39 @@ pub async fn consult(
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
     let root = root.into();
-    let key = credentials::load(provider)?;
     let (explorer_model, synth_model) = cfg.resolved_models(provider);
 
+    // Keyed providers load a key; the local one is reached by base URL instead,
+    // so credential loading is per-arm rather than shared up front.
     match provider {
         Provider::Anthropic => {
+            let key = credentials::load(provider)?;
             let client =
                 anthropic::Client::new(&key).map_err(|e| anyhow!("anthropic client init: {e}"))?;
             consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
         }
         Provider::DeepSeek => {
+            let key = credentials::load(provider)?;
             let client =
                 deepseek::Client::new(&key).map_err(|e| anyhow!("deepseek client init: {e}"))?;
             consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
         }
         Provider::Gemini => {
+            let key = credentials::load(provider)?;
             let client =
                 gemini::Client::new(&key).map_err(|e| anyhow!("gemini client init: {e}"))?;
+            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
+        }
+        Provider::Lemonade => {
+            // Local OpenAI-compatible server: point rig's completions client at
+            // the lemonade base URL. The bearer token is required-but-ignored —
+            // lemonade does no auth — so any non-empty string serves.
+            let base_url = credentials::lemonade_base_url();
+            let client = openai::CompletionsClient::builder()
+                .api_key("lemonade")
+                .base_url(&base_url)
+                .build()
+                .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
             consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
         }
     }

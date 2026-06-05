@@ -9,7 +9,9 @@ A stdio MCP server with one tool, `consult`: ask a question about a codebase, ge
 a grounded, cited answer. Two-phase (the dpal pattern): a cheap **explorer** model
 drives a **read-only** kaish shell via `run_kaish(script)` and writes a curated
 report; a stronger **synthesizer** model answers from that report (with `run_kaish`
-as a fallback). Multi-provider (Anthropic / DeepSeek / Gemini) over `rig-core`.
+as a fallback). Multi-provider over `rig-core`: keyed Anthropic / DeepSeek / Gemini,
+plus **Lemonade** — a local, keyless OpenAI-compatible server (Gemma-4) reached by
+base URL (`LEMONADE_BASE_URL`, default `http://localhost:13305/api/v1`).
 kaibo never modifies the project and cannot run external commands.
 
 ## Invariants — do not weaken without a failing-first test

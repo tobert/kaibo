@@ -1,8 +1,11 @@
 //! Credential resolution — pure, no real env or `$HOME` touched.
 
 use std::fs;
+use std::str::FromStr;
 
-use kaibo::credentials::{resolve, Provider};
+use kaibo::credentials::{
+    load, resolve, resolve_base_url, Provider, DEFAULT_LEMONADE_BASE_URL,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -52,6 +55,54 @@ fn empty_file_is_an_error_not_an_empty_key() {
 
     let err = resolve(None, &file).unwrap_err();
     assert!(err.to_string().contains("empty"), "got: {err}");
+}
+
+// --- Lemonade: a local, keyless provider addressed by base URL, not an API key.
+
+#[test]
+fn lemonade_parses_from_friendly_aliases() {
+    // The default provider clients call it gemma in conversation; accept the
+    // model-name aliases as well as the canonical "lemonade".
+    for s in ["lemonade", "Lemonade", "  GEMMA ", "gemma4", "local"] {
+        assert_eq!(
+            Provider::from_str(s).unwrap(),
+            Provider::Lemonade,
+            "{s:?} should parse as Lemonade"
+        );
+    }
+}
+
+#[test]
+fn lemonade_is_local_the_keyed_providers_are_not() {
+    assert!(Provider::Lemonade.is_local());
+    assert!(!Provider::Anthropic.is_local());
+    assert!(!Provider::DeepSeek.is_local());
+    assert!(!Provider::Gemini.is_local());
+}
+
+#[test]
+fn load_refuses_a_local_provider_loudly() {
+    // A local provider has no API key; asking to load one is a programming
+    // error we want surfaced, not a silent empty key sent to a server.
+    let err = load(Provider::Lemonade).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("local"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn lemonade_base_url_defaults_when_env_absent_or_blank() {
+    assert_eq!(resolve_base_url(None), DEFAULT_LEMONADE_BASE_URL);
+    assert_eq!(resolve_base_url(Some("   ")), DEFAULT_LEMONADE_BASE_URL);
+}
+
+#[test]
+fn lemonade_base_url_env_wins_and_is_trimmed() {
+    assert_eq!(
+        resolve_base_url(Some("  http://box:9000/api/v1\n")),
+        "http://box:9000/api/v1"
+    );
 }
 
 #[test]
