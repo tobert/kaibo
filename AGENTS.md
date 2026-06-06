@@ -19,12 +19,16 @@ loop. Every tool is that loop wearing different clothes:
 - **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
 
 Each tool is independently gated by a `--no-<tool>` flag (all on by default;
-all-four-off is refused at startup). Multi-provider over `rig-core`: keyed
-Anthropic / DeepSeek / Gemini, plus **`openai`** — any OpenAI-compatible endpoint
-reached by base URL (`OPENAI_BASE_URL`, default the local keyless
-`http://localhost:13305/api/v1` serving Gemma-4) with an *optional* key
-(`OPENAI_API_KEY` / `~/.openai-key`; a placeholder is sent when unset). kaibo
-never modifies the project and cannot run external commands.
+all-four-off is refused at startup). Multi-provider over `rig-core`: a
+**`ProviderKind`** is the wire protocol (keyed Anthropic / DeepSeek / Gemini, plus
+**`openai`** for any OpenAI-compatible endpoint). A **`Profile`** (`config.rs`) is a
+*named instance* of a kind with its own base URL, key source, and models — so two
+`openai` profiles (hosted GPT and a local Gemma/llama.cpp server, say) can be live
+at once, each selected by the `provider` arg. Profiles come from a built-in registry
+merged under an XDG `config.toml`, `KAIBO_*` env, then CLI flags (precedence:
+per-call > CLI > env > file > built-in); a missing config file is a non-error.
+See `docs/config.md`. kaibo never modifies the project and cannot run external
+commands.
 
 ## Invariants — do not weaken without a failing-first test
 
@@ -46,8 +50,9 @@ never modifies the project and cannot run external commands.
 - **`kaish-kernel` is a path dep** (`../kaish/crates/kaish-kernel`), under active
   development. It will break kaibo's build transiently — adapt to its new API,
   don't pin around it. `kaish-mcp` is a useful reference sibling, not a dependency.
-- **Provider model ids drift.** Defaults live in `consult.rs::default_models`;
-  rig's bundled model consts are often retired. Cross-check the pal configs.
+- **Provider model ids drift.** Built-in defaults seed the profile registry in
+  `config.rs::default_models`; rig's bundled model consts are often retired.
+  Cross-check the pal configs. Per-profile overrides live in the XDG `config.toml`.
 
 ## Commit style
 

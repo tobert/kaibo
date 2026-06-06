@@ -23,8 +23,8 @@ use rmcp::ErrorData as McpError;
 use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
 
+use crate::config::{Config, Profile};
 use crate::consult::{consult, explore, synthesize, ConsultConfig};
-use crate::credentials::Provider;
 use crate::explorer::format_output;
 use crate::kaish_syntax::{kaibo_sandbox_doc, kaibo_instructions, render_builtin_help, render_topic, topics};
 use crate::sandbox::{builtin_schemas, KaishWorker};
@@ -44,7 +44,7 @@ const BUILTIN_URI_TEMPLATE: &str = "kaibo://kaish/builtin/{name}";
 /// consult-only surface; only `run_kaish` on ≈ "no code leaves the box, kaibo as a
 /// pure read-only shell". A server with *all* off is a misconfiguration — refused
 /// at startup (see `main`), not represented as a valid state here.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolGating {
     pub consult: bool,
     pub explore: bool,
@@ -76,7 +76,8 @@ pub struct ConsultInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Provider: "anthropic" (default), "deepseek", or "gemini".
+    /// Provider/profile: a built-in kind ("anthropic" (default), "deepseek",
+    /// "gemini", "openai") or a profile name from config.toml.
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -163,8 +164,10 @@ pub struct RunKaishInput {
 /// kaibo's MCP handler. Cheap to clone (rmcp clones it per request).
 #[derive(Clone)]
 pub struct KaiboHandler {
-    default_root: Option<PathBuf>,
-    default_provider: Provider,
+    /// The resolved configuration: profile registry, defaults, default root and
+    /// provider. `Arc` because rmcp clones the handler per request and it's
+    /// immutable after startup.
+    config: Arc<Config>,
     tool_router: ToolRouter<Self>,
     /// The kernel's builtin schemas, snapshotted once at startup. Drives the
     /// `kaibo://kaish/*` help resources and the composed onboarding instructions.
@@ -174,14 +177,11 @@ pub struct KaiboHandler {
 
 #[tool_router]
 impl KaiboHandler {
-    /// Build the handler. Snapshots the kernel's builtin schemas up front (a cheap
-    /// in-memory kernel); a failure here is a broken build, surfaced at startup
-    /// rather than papered over with an empty help surface.
-    pub fn new(
-        default_root: Option<PathBuf>,
-        default_provider: Provider,
-        gating: ToolGating,
-    ) -> Result<Self> {
+    /// Build the handler from a resolved [`Config`]. Snapshots the kernel's builtin
+    /// schemas up front (a cheap in-memory kernel); a failure here is a broken build,
+    /// surfaced at startup rather than papered over with an empty help surface.
+    pub fn new(config: Config) -> Result<Self> {
+        let gating = config.tools;
         // `#[tool_router]` gathers every #[tool] method at compile time; gating is a
         // runtime choice, so build the full router and drop the disabled routes by
         // name. (The methods stay compiled — no dead code — they're just not
@@ -205,8 +205,7 @@ impl KaiboHandler {
             }
         }
         Ok(Self {
-            default_root,
-            default_provider,
+            config: Arc::new(config),
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
         })
@@ -229,7 +228,7 @@ impl KaiboHandler {
     fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
         match path {
             Some(p) => Ok(PathBuf::from(p)),
-            None => self.default_root.clone().ok_or_else(|| {
+            None => self.config.root.clone().ok_or_else(|| {
                 McpError::invalid_params(
                     "no `path` provided and the server has no default --root",
                     None,
@@ -238,15 +237,16 @@ impl KaiboHandler {
         }
     }
 
-    /// Resolve a call's provider: the explicit string (parsed), else the server's
-    /// default. An unrecognized provider string is a parameter error.
-    fn parse_provider(&self, provider: Option<String>) -> Result<Provider, McpError> {
-        match provider {
-            Some(s) => s
-                .parse::<Provider>()
-                .map_err(|e| McpError::invalid_params(e.to_string(), None)),
-            None => Ok(self.default_provider),
-        }
+    /// Resolve a call's provider profile: the explicit name (looked up in the
+    /// registry, by name or alias), else the server's default profile. An unknown
+    /// name is a parameter error naming the available profiles. Returns an owned
+    /// clone so the caller can layer per-call model overrides onto it.
+    fn resolve_profile(&self, provider: Option<String>) -> Result<Profile, McpError> {
+        let name = provider.unwrap_or_else(|| self.config.default_provider.clone());
+        self.config
+            .resolve_profile(&name)
+            .cloned()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))
     }
 
     #[tool(
@@ -265,18 +265,22 @@ impl KaiboHandler {
         Parameters(input): Parameters<ConsultInput>,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-        let provider = self.parse_provider(input.provider)?;
-
-        let defaults = ConsultConfig::default();
+        // Resolve the profile, then layer per-call model overrides onto the clone.
+        let mut profile = self.resolve_profile(input.provider)?;
+        if let Some(m) = input.explorer_model {
+            profile.explorer_model = m;
+        }
+        if let Some(m) = input.synth_model {
+            profile.synth_model = m;
+        }
+        let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
-            explorer_model: input.explorer_model,
-            synth_model: input.synth_model,
             explorer_max_turns: input.explorer_max_turns.unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
-            ..defaults
+            max_tokens: profile.max_tokens,
         };
 
-        let out = consult(&input.question, root, provider, &cfg)
+        let out = consult(&input.question, root, &profile, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
@@ -300,16 +304,18 @@ impl KaiboHandler {
         Parameters(input): Parameters<ExploreInput>,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-        let provider = self.parse_provider(input.provider)?;
-
-        let defaults = ConsultConfig::default();
+        let mut profile = self.resolve_profile(input.provider)?;
+        if let Some(m) = input.model {
+            profile.explorer_model = m;
+        }
+        let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
-            explorer_model: input.model,
             explorer_max_turns: input.max_turns.unwrap_or(defaults.explorer_max_turns),
-            ..defaults
+            synth_max_turns: defaults.synth_max_turns,
+            max_tokens: profile.max_tokens,
         };
 
-        let report = explore(&input.question, root, provider, &cfg)
+        let report = explore(&input.question, root, &profile, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
@@ -332,15 +338,18 @@ impl KaiboHandler {
         Parameters(input): Parameters<SynthesizeInput>,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-        let provider = self.parse_provider(input.provider)?;
-
-        let defaults = ConsultConfig::default();
+        let mut profile = self.resolve_profile(input.provider)?;
+        if let Some(m) = input.model {
+            profile.synth_model = m;
+        }
+        let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
-            synth_model: input.model,
-            ..defaults
+            explorer_max_turns: defaults.explorer_max_turns,
+            synth_max_turns: defaults.synth_max_turns,
+            max_tokens: profile.max_tokens,
         };
 
-        let answer = synthesize(&input.question, input.context.as_deref(), root, provider, &cfg)
+        let answer = synthesize(&input.question, input.context.as_deref(), root, &profile, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 

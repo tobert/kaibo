@@ -9,6 +9,7 @@
 //! The load-bearing safety property lives in [`sandbox`]: the explorer can read
 //! the project but cannot mutate it, and cannot shell out to external commands.
 
+pub mod config;
 pub mod consult;
 pub mod credentials;
 pub mod explorer;

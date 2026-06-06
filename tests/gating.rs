@@ -5,13 +5,15 @@
 
 use std::process::Command;
 
-use kaibo::credentials::Provider;
+use kaibo::config::Config;
 use kaibo::server::{KaiboHandler, ToolGating};
 
 const ALL_TOOLS: [&str; 4] = ["consult", "explore", "run_kaish", "synthesize"];
 
 fn advertised(gating: ToolGating) -> Vec<String> {
-    KaiboHandler::new(None, Provider::Anthropic, gating)
+    let mut config = Config::builtin();
+    config.tools = gating;
+    KaiboHandler::new(config)
         .expect("handler builds")
         .advertised_tools()
 }

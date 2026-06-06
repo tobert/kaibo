@@ -27,47 +27,48 @@ use rig::tool::{Tool, ToolDyn};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::credentials::{self, Provider};
+use crate::config::Profile;
+use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::sandbox::KaishWorker;
 
-/// Construct the rig client for `$provider` (loading its key, or the base URL and
-/// optional key for the OpenAI one) and bind it to `$client` for `$body`. The four
-/// provider client
-/// types differ, so this is the single place those arms live — `consult`,
-/// `explore`, and `synthesize` all dispatch through it. `$body` runs inside the
-/// arm, so it may `.await` and use `?`.
+/// Construct the rig client for `$profile` (resolving its key, plus base URL for an
+/// OpenAI-compatible one) and bind it to `$client` for `$body`. The kind selects the
+/// client type; the *profile* carries the endpoint, key source, and models — so two
+/// `openai` profiles build two distinct clients. This is the single place those four
+/// client types live — `consult`, `explore`, and `synthesize` all dispatch through
+/// it. `$body` runs inside the arm, so it may `.await` and use `?`.
 macro_rules! with_provider_client {
-    ($provider:expr, |$client:ident| $body:expr) => {{
-        // Bind once so `$provider` is evaluated a single time even though each arm
-        // also reads it (e.g. `credentials::load`).
-        let provider = $provider;
-        match provider {
-            Provider::Anthropic => {
-                let key = credentials::load(provider)?;
+    ($profile:expr, |$client:ident| $body:expr) => {{
+        // Bind once so `$profile` is evaluated a single time even though each arm
+        // also reads it (key resolution, base URL).
+        let profile = $profile;
+        match profile.kind {
+            ProviderKind::Anthropic => {
+                let key = profile.resolve_key()?;
                 let $client = anthropic::Client::new(&key)
                     .map_err(|e| anyhow!("anthropic client init: {e}"))?;
                 $body
             }
-            Provider::DeepSeek => {
-                let key = credentials::load(provider)?;
+            ProviderKind::DeepSeek => {
+                let key = profile.resolve_key()?;
                 let $client = deepseek::Client::new(&key)
                     .map_err(|e| anyhow!("deepseek client init: {e}"))?;
                 $body
             }
-            Provider::Gemini => {
-                let key = credentials::load(provider)?;
+            ProviderKind::Gemini => {
+                let key = profile.resolve_key()?;
                 let $client = gemini::Client::new(&key)
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
                 $body
             }
-            Provider::Openai => {
-                // Any OpenAI-compatible endpoint, addressed by base URL. The key
-                // is optional: `openai_key` returns the configured key or, for the
-                // keyless local default, a placeholder the server ignores.
-                let base_url = credentials::openai_base_url();
-                let key = credentials::openai_key();
+            ProviderKind::Openai => {
+                // Any OpenAI-compatible endpoint, addressed by the profile's base
+                // URL. The key is optional for a keyless profile: `resolve_key`
+                // returns the configured key or a placeholder the server ignores.
+                let base_url = profile.resolved_base_url();
+                let key = profile.resolve_key()?;
                 let $client = openai::CompletionsClient::builder()
                     .api_key(&key)
                     .base_url(&base_url)
@@ -127,77 +128,48 @@ pub const THINKING_BUDGET: u64 = 8192;
 /// - **OpenAI** — the generic OpenAI-compatible path; the local Gemma default
 ///   already reasons (`--reasoning-format auto`) and there's no portable toggle
 ///   across arbitrary endpoints, so nothing to send. `None`.
-pub fn thinking_params(provider: Provider) -> Option<Value> {
-    match provider {
-        Provider::Anthropic => Some(json!({
-            "thinking": { "type": "enabled", "budget_tokens": THINKING_BUDGET }
+pub fn thinking_params(kind: ProviderKind, budget: u64) -> Option<Value> {
+    match kind {
+        ProviderKind::Anthropic => Some(json!({
+            "thinking": { "type": "enabled", "budget_tokens": budget }
         })),
-        Provider::Gemini => Some(json!({
+        ProviderKind::Gemini => Some(json!({
             "generationConfig": {
                 "thinkingConfig": {
-                    "thinkingBudget": THINKING_BUDGET,
+                    "thinkingBudget": budget,
                     "includeThoughts": true
                 }
             }
         })),
-        Provider::DeepSeek | Provider::Openai => None,
+        ProviderKind::DeepSeek | ProviderKind::Openai => None,
     }
 }
 
-/// Default (explorer, synth) model ids per provider. Values drift — see the
-/// `provider-model-ids` note for the source-of-truth configs they track.
-pub fn default_models(provider: Provider) -> (&'static str, &'static str) {
-    match provider {
-        // (cheap explorer, capable synth)
-        Provider::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
-        Provider::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
-        // Gemini: LITE explorer; flash (not pro) synth — pro is API-flaky.
-        Provider::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
-        // OpenAI default endpoint is local Gemma: the small E4B drives the
-        // tool-heavy exploration, the 26B MoE writes the answer (both carry the
-        // `tool-calling` label). Override per call when pointing at a hosted host.
-        Provider::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
-    }
-}
-
-/// Tunables for a two-phase consult. Model ids are optional overrides; when unset
-/// the provider's [`default_models`] are used.
+/// Per-call loop tunables for a phase. Models, `max_tokens`, and the thinking budget
+/// now live on the [`Profile`] (they track the provider/model); what remains here
+/// are the loop bounds the caller may dial per request, plus the resolved
+/// `max_tokens` the phase passes straight through to the API.
 #[derive(Debug, Clone)]
 pub struct ConsultConfig {
-    pub explorer_model: Option<String>,
-    pub synth_model: Option<String>,
+    /// Bounds each cheap `explore′` sweep — it's cheap, let it rip.
     pub explorer_max_turns: usize,
+    /// Bounds the recomposed consult's *whole* driver loop (it delegates sweeps AND
+    /// reads spans), so it must be generous — a multi-part question blew the old 8.
     pub synth_max_turns: usize,
+    /// Output headroom, resolved from the profile. **Thinking is on**, so reasoning
+    /// eats this budget — it must sit well above the profile's thinking budget or the
+    /// answer gets truncated to empty.
     pub max_tokens: u64,
 }
 
 impl Default for ConsultConfig {
     fn default() -> Self {
+        let d = crate::config::Defaults::default();
         Self {
-            explorer_model: None,
-            synth_model: None,
-            // explorer_max_turns bounds each cheap explore′ sweep — let it rip.
-            // synth_max_turns now bounds the recomposed consult's *whole* driver
-            // loop (it delegates sweeps AND reads spans), so the old 8 was far too
-            // low — a multi-part question blew it. ≥100 gives the driver room.
-            explorer_max_turns: 50,
-            synth_max_turns: 100,
-            // Generous output headroom by design: few high-value turns, not long
-            // chats, and **thinking is on** — reasoning eats this budget, so it must
-            // sit well above THINKING_BUDGET or the answer gets truncated to empty.
-            max_tokens: 16384,
+            explorer_max_turns: d.explorer_max_turns,
+            synth_max_turns: d.synth_max_turns,
+            max_tokens: d.max_tokens,
         }
-    }
-}
-
-impl ConsultConfig {
-    /// Resolve (explorer, synth) model ids for `provider`, applying overrides.
-    pub fn resolved_models(&self, provider: Provider) -> (String, String) {
-        let (de, ds) = default_models(provider);
-        (
-            self.explorer_model.clone().unwrap_or_else(|| de.to_string()),
-            self.synth_model.clone().unwrap_or_else(|| ds.to_string()),
-        )
     }
 }
 
@@ -429,16 +401,15 @@ where
 pub async fn explore(
     question: &str,
     root: impl Into<PathBuf>,
-    provider: Provider,
+    profile: &Profile,
     cfg: &ConsultConfig,
 ) -> Result<String> {
     let root = root.into();
-    let (explorer_model, _) = cfg.resolved_models(provider);
-    let thinking = thinking_params(provider);
+    let thinking = thinking_params(profile.kind, profile.thinking_budget);
     let thinking = thinking.as_ref();
 
-    with_provider_client!(provider, |client| {
-        explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
+    with_provider_client!(profile, |client| {
+        explore_with(&client, &profile.explorer_model, &root, cfg, thinking, question).await
     })
 }
 
@@ -520,17 +491,16 @@ pub async fn synthesize(
     question: &str,
     context: Option<&str>,
     root: impl Into<PathBuf>,
-    provider: Provider,
+    profile: &Profile,
     cfg: &ConsultConfig,
 ) -> Result<String> {
     let root = root.into();
-    let (_, synth_model) = cfg.resolved_models(provider);
-    let thinking = thinking_params(provider);
+    let thinking = thinking_params(profile.kind, profile.thinking_budget);
     let thinking = thinking.as_ref();
     let user_prompt = synthesize_user_prompt(question, context);
 
-    with_provider_client!(provider, |client| {
-        synthesize_with(&client, &synth_model, &root, cfg, thinking, user_prompt).await
+    with_provider_client!(profile, |client| {
+        synthesize_with(&client, &profile.synth_model, &root, cfg, thinking, user_prompt).await
     })
 }
 
@@ -628,24 +598,32 @@ where
     Ok(ConsultOutput { answer, report })
 }
 
-/// Run a two-phase consult against `root` using `provider`.
+/// Run a two-phase consult against `root` using `profile`.
 ///
-/// Loads the provider's key (env var or key-file) and resolves model ids from
-/// `cfg` (falling back to [`default_models`]).
+/// Resolves the profile's key (env var or key-file) and takes its models, token
+/// budget, and thinking budget; `cfg` carries the per-call loop bounds.
 pub async fn consult(
     question: &str,
     root: impl Into<PathBuf>,
-    provider: Provider,
+    profile: &Profile,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
     let root = root.into();
-    let (explorer_model, synth_model) = cfg.resolved_models(provider);
     // Thinking on, both phases, where the provider takes a request-time toggle.
-    let thinking = thinking_params(provider);
+    let thinking = thinking_params(profile.kind, profile.thinking_budget);
     let thinking = thinking.as_ref();
 
-    with_provider_client!(provider, |client| {
-        consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking).await
+    with_provider_client!(profile, |client| {
+        consult_with(
+            &client,
+            question,
+            &root,
+            &profile.explorer_model,
+            &profile.synth_model,
+            cfg,
+            thinking,
+        )
+        .await
     })
 }
 

@@ -4,7 +4,7 @@ use std::fs;
 use std::str::FromStr;
 
 use kaibo::credentials::{
-    load, resolve, resolve_base_url, resolve_openai_key, Provider, DEFAULT_OPENAI_BASE_URL,
+    load, resolve, resolve_base_url, resolve_openai_key, ProviderKind, DEFAULT_OPENAI_BASE_URL,
     PLACEHOLDER_OPENAI_KEY,
 };
 use tempfile::tempdir;
@@ -66,8 +66,8 @@ fn openai_parses_from_friendly_aliases() {
     // local keyless default (Gemma served by Lemonade).
     for s in ["openai", "OpenAI", "local", "lemonade", "  GEMMA ", "gemma4"] {
         assert_eq!(
-            Provider::from_str(s).unwrap(),
-            Provider::Openai,
+            ProviderKind::from_str(s).unwrap(),
+            ProviderKind::Openai,
             "{s:?} should parse as Openai"
         );
     }
@@ -75,10 +75,10 @@ fn openai_parses_from_friendly_aliases() {
 
 #[test]
 fn only_openai_tolerates_a_missing_key() {
-    assert!(Provider::Openai.key_optional());
-    assert!(!Provider::Anthropic.key_optional());
-    assert!(!Provider::DeepSeek.key_optional());
-    assert!(!Provider::Gemini.key_optional());
+    assert!(ProviderKind::Openai.key_optional());
+    assert!(!ProviderKind::Anthropic.key_optional());
+    assert!(!ProviderKind::DeepSeek.key_optional());
+    assert!(!ProviderKind::Gemini.key_optional());
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn load_refuses_the_key_optional_provider_loudly() {
     // OpenAI's key may legitimately be absent; asking load() for it is a
     // programming error we surface rather than letting it masquerade as a
     // missing-credential failure. Callers must use openai_key() instead.
-    let err = load(Provider::Openai).unwrap_err();
+    let err = load(ProviderKind::Openai).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("openai_key"),
         "got: {err}"
@@ -131,10 +131,10 @@ fn openai_base_url_env_wins_and_is_trimmed() {
 fn provider_paths_match_amys_dotfiles() {
     let home = std::path::Path::new("/home/amy");
     assert_eq!(
-        Provider::Anthropic.key_file(home),
+        ProviderKind::Anthropic.key_file(home),
         home.join(".anthropic-key.txt")
     );
-    assert_eq!(Provider::DeepSeek.key_file(home), home.join(".deepseek-key"));
-    assert_eq!(Provider::Gemini.key_file(home), home.join(".gemini-api-key"));
-    assert_eq!(Provider::Openai.key_file(home), home.join(".openai-key"));
+    assert_eq!(ProviderKind::DeepSeek.key_file(home), home.join(".deepseek-key"));
+    assert_eq!(ProviderKind::Gemini.key_file(home), home.join(".gemini-api-key"));
+    assert_eq!(ProviderKind::Openai.key_file(home), home.join(".openai-key"));
 }

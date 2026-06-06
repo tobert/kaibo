@@ -1,4 +1,4 @@
-//! Provider credentials, from key-files with an env-var override.
+//! ProviderKind credentials, from key-files with an env-var override.
 //!
 //! Long-term kaibo will take credentials from both files and env. For now the
 //! source of truth is a per-provider dotfile in `$HOME`; if the matching env var
@@ -8,7 +8,7 @@
 //! - DeepSeek:  `DEEPSEEK_API_KEY`  / `~/.deepseek-key`
 //! - Gemini:    `GEMINI_API_KEY`    / `~/.gemini-api-key`
 //!
-//! [`Provider::Openai`] is the general case: any endpoint speaking the OpenAI
+//! [`ProviderKind::Openai`] is the general case: any endpoint speaking the OpenAI
 //! wire protocol, addressed by [`openai_base_url`] (`OPENAI_BASE_URL`, default a
 //! local keyless server) rather than tied to a hosted service. Its key is
 //! *optional* — `OPENAI_API_KEY` / `~/.openai-key` when talking to a keyed
@@ -25,11 +25,11 @@ use anyhow::{anyhow, Context, Result};
 pub const DEFAULT_OPENAI_BASE_URL: &str = "http://localhost:13305/api/v1";
 
 /// A model provider. The keyed providers (Anthropic/DeepSeek/Gemini) each speak
-/// their own wire protocol and require an API key. [`Provider::Openai`] is the
+/// their own wire protocol and require an API key. [`ProviderKind::Openai`] is the
 /// generic OpenAI-compatible endpoint: any base URL speaking that protocol, with
 /// an *optional* key — keyless by default, since the default endpoint is local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provider {
+pub enum ProviderKind {
     Anthropic,
     DeepSeek,
     Gemini,
@@ -38,34 +38,45 @@ pub enum Provider {
     Openai,
 }
 
-impl Provider {
+impl ProviderKind {
     /// Whether a missing credential is tolerated rather than a hard error. Only
     /// the OpenAI-compatible provider is: its default endpoint is a local keyless
     /// server, so an absent key falls back to a placeholder bearer token (see
     /// [`openai_key`]). The keyed providers must fail loudly on a missing key.
     pub fn key_optional(self) -> bool {
-        matches!(self, Provider::Openai)
+        matches!(self, ProviderKind::Openai)
+    }
+
+    /// The canonical lower-case name of this kind — also the name of its built-in
+    /// profile (so a bare `--provider anthropic` resolves to the built-in).
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::DeepSeek => "deepseek",
+            ProviderKind::Gemini => "gemini",
+            ProviderKind::Openai => "openai",
+        }
     }
 
     /// The environment variable that overrides the key-file.
     pub fn env_var(self) -> &'static str {
         match self {
-            Provider::Anthropic => "ANTHROPIC_API_KEY",
-            Provider::DeepSeek => "DEEPSEEK_API_KEY",
-            Provider::Gemini => "GEMINI_API_KEY",
-            Provider::Openai => "OPENAI_API_KEY",
+            ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
+            ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
+            ProviderKind::Gemini => "GEMINI_API_KEY",
+            ProviderKind::Openai => "OPENAI_API_KEY",
         }
     }
 
     /// The key-file's name within `$HOME`. For the OpenAI provider the key is
-    /// optional (see [`Provider::key_optional`]); the file is consulted only if
+    /// optional (see [`ProviderKind::key_optional`]); the file is consulted only if
     /// present.
     pub fn key_file_name(self) -> &'static str {
         match self {
-            Provider::Anthropic => ".anthropic-key.txt",
-            Provider::DeepSeek => ".deepseek-key",
-            Provider::Gemini => ".gemini-api-key",
-            Provider::Openai => ".openai-key",
+            ProviderKind::Anthropic => ".anthropic-key.txt",
+            ProviderKind::DeepSeek => ".deepseek-key",
+            ProviderKind::Gemini => ".gemini-api-key",
+            ProviderKind::Openai => ".openai-key",
         }
     }
 
@@ -75,17 +86,17 @@ impl Provider {
     }
 }
 
-impl std::str::FromStr for Provider {
+impl std::str::FromStr for ProviderKind {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "anthropic" | "claude" => Ok(Provider::Anthropic),
-            "deepseek" => Ok(Provider::DeepSeek),
-            "gemini" | "google" => Ok(Provider::Gemini),
+            "anthropic" | "claude" => Ok(ProviderKind::Anthropic),
+            "deepseek" => Ok(ProviderKind::DeepSeek),
+            "gemini" | "google" => Ok(ProviderKind::Gemini),
             // The OpenAI-compatible endpoint. Also accept the names people reach
             // for when it points at the local keyless default (Gemma via Lemonade).
-            "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(Provider::Openai),
+            "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
             other => Err(anyhow!(
                 "unknown provider {other:?} (expected anthropic, deepseek, gemini, or openai)"
             )),
@@ -124,9 +135,9 @@ pub fn resolve_openai_key(env_value: Option<&str>, key_file: &Path) -> String {
 pub fn openai_key() -> String {
     let key_file = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| Provider::Openai.key_file(&home))
+        .map(|home| ProviderKind::Openai.key_file(&home))
         .unwrap_or_else(|| PathBuf::from("/nonexistent/.openai-key"));
-    let env_value = std::env::var(Provider::Openai.env_var()).ok();
+    let env_value = std::env::var(ProviderKind::Openai.env_var()).ok();
     resolve_openai_key(env_value.as_deref(), &key_file)
 }
 
@@ -164,7 +175,7 @@ pub fn resolve(env_value: Option<&str>, key_file: &Path) -> Result<String> {
 /// The OpenAI provider's key is optional; calling this for it is a programming
 /// error — its key may legitimately be absent, so route through [`openai_key`],
 /// which falls back to a placeholder rather than refusing.
-pub fn load(provider: Provider) -> Result<String> {
+pub fn load(provider: ProviderKind) -> Result<String> {
     if provider.key_optional() {
         return Err(anyhow!(
             "{provider:?} tolerates a missing key — use openai_key(), not load()"

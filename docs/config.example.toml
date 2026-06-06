@@ -1,0 +1,119 @@
+# kaibo (解剖) — example configuration.
+#
+# Copy to $XDG_CONFIG_HOME/kaibo/config.toml (default ~/.config/kaibo/config.toml),
+# or point at it with --config <path> / KAIBO_CONFIG.
+#
+# EVERYTHING here is optional. With no config file at all, kaibo runs exactly as it
+# does today: the four built-in profiles below (anthropic/deepseek/gemini/openai)
+# are already present in code; this file only OVERRIDES fields or ADDS profiles.
+#
+# Precedence, highest wins:
+#   MCP per-call input  >  CLI flag  >  env var (KAIBO_*)  >  this file  >  built-in
+#
+# Naming rule:  config key `foo_bar`  ⇄  env `KAIBO_FOO_BAR`  ⇄  CLI `--foo-bar`
+# Exceptions (kept native, on purpose): the provider key env vars
+# (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY) and
+# OPENAI_BASE_URL. RUST_LOG is also kept as-is.
+
+# ---------------------------------------------------------------------------
+# [server] — process-level defaults (the things --root / --provider / --no-* set)
+# ---------------------------------------------------------------------------
+[server]
+# Default project root when a call omits `path`. Omit to require `path` per call.
+# root = "/home/atobey/src/kaibo"
+
+# Default profile (by name) when a call omits `provider`.
+provider = "anthropic"
+
+# tracing/EnvFilter directive used when RUST_LOG is unset.
+log = "kaibo=info"
+
+# Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
+# A config with all four false is refused at startup, same as today.
+[server.tools]
+consult    = true
+explore    = true
+synthesize = true
+run_kaish  = true
+
+# ---------------------------------------------------------------------------
+# [defaults] — tunables shared by all profiles (each profile may override below)
+# ---------------------------------------------------------------------------
+[defaults]
+explorer_max_turns = 50      # bounds each cheap explore′ sweep — cheap, let it rip
+synth_max_turns    = 100     # bounds the consult driver loop (sweeps AND span reads)
+max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
+thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle
+
+# NOTE: sandbox limits (per-exec timeout, output cap) are NOT yet configurable —
+# they remain code constants in src/sandbox.rs. A `[sandbox]` table here is rejected
+# at load (unknown key) rather than silently ignored. Tracked in docs/issues.md.
+
+# ---------------------------------------------------------------------------
+# [profiles.<name>] — named instances. `kind` picks the wire protocol/rig client
+# (anthropic | deepseek | gemini | openai); everything else is per-instance.
+#
+# Keys are referenced, never inlined: api_key_env names an env var, api_key_file a
+# path (~ ok). env wins over file. key_optional=true falls back to a placeholder
+# bearer token (keyless local servers).
+# ---------------------------------------------------------------------------
+
+# --- The four built-ins, shown with their current defaults. You only need to list
+#     a profile here to CHANGE something; these blocks are illustrative. ---
+
+[profiles.anthropic]
+kind = "anthropic"
+aliases = ["claude"]
+api_key_env  = "ANTHROPIC_API_KEY"
+api_key_file = "~/.anthropic-key.txt"
+explorer_model = "claude-haiku-4-5"
+synth_model    = "claude-sonnet-4-6"
+
+[profiles.deepseek]
+kind = "deepseek"
+api_key_env  = "DEEPSEEK_API_KEY"
+api_key_file = "~/.deepseek-key"
+explorer_model = "deepseek-v4-flash"
+synth_model    = "deepseek-v4-pro"
+
+[profiles.gemini]
+kind = "gemini"
+aliases = ["google"]
+api_key_env  = "GEMINI_API_KEY"
+api_key_file = "~/.gemini-api-key"
+explorer_model = "gemini-flash-lite-latest"
+synth_model    = "gemini-3.5-flash"   # flash, not pro — pro is API-flaky
+
+[profiles.openai]
+kind = "openai"
+aliases = ["local", "lemonade", "gemma", "gemma4"]
+base_url = "http://localhost:13305/api/v1"   # also overridable via OPENAI_BASE_URL
+api_key_env  = "OPENAI_API_KEY"
+api_key_file = "~/.openai-key"
+key_optional = true                          # keyless local default → placeholder
+explorer_model = "Gemma-4-E4B-it-GGUF"       # small E4B drives tool-heavy explore
+synth_model    = "Gemma-4-26B-A4B-it-GGUF"   # 26B MoE writes the answer
+
+# --- The reason this file exists: more than one openai-kind backend, all live,
+#     each selected by name (`--provider gpt`, `--provider llama`). ---
+
+# Hosted OpenAI, keyed.
+[profiles.gpt]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+key_optional = false
+explorer_model = "gpt-5-mini"
+synth_model    = "gpt-5"
+# max_tokens / thinking_budget are per-profile: they track the model, not the
+# server. A hosted model has headroom local Gemma doesn't — override the defaults.
+max_tokens      = 32768
+thinking_budget = 16384
+
+# A second local llama.cpp server on another port, keyless.
+[profiles.llama]
+kind = "openai"
+base_url = "http://localhost:8080/v1"
+key_optional = true
+explorer_model = "qwen2.5-coder-7b"
+synth_model    = "qwen2.5-coder-32b"

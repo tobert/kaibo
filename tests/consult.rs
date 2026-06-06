@@ -1,10 +1,19 @@
 //! Two-phase consult: offline prompt-builder test + an `#[ignore]`d live e2e.
 
+use kaibo::config::{default_models, Config, Profile};
 use kaibo::consult::{
-    consult, default_models, explore, synth_user_prompt, synthesize, synthesize_user_prompt,
-    thinking_params, ConsultConfig, THINKING_BUDGET,
+    consult, explore, synth_user_prompt, synthesize, synthesize_user_prompt, thinking_params,
+    ConsultConfig, THINKING_BUDGET,
 };
-use kaibo::credentials::{load, Provider};
+use kaibo::credentials::{load, ProviderKind};
+
+/// A built-in profile by name, for the live tests below.
+fn profile(name: &str) -> Profile {
+    Config::builtin()
+        .resolve_profile(name)
+        .unwrap_or_else(|e| panic!("built-in profile {name:?}: {e}"))
+        .clone()
+}
 
 #[test]
 fn synthesize_prompt_grounds_in_supplied_context() {
@@ -58,16 +67,18 @@ fn synth_prompt_carries_question_and_report() {
 }
 
 #[test]
-fn thinking_is_enabled_for_providers_with_a_request_toggle() {
+fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
     // Anthropic: extended thinking via a top-level `thinking` block (rig flattens
-    // additional_params into the Messages request).
-    let a = thinking_params(Provider::Anthropic).expect("anthropic has a thinking toggle");
+    // additional_params into the Messages request). The budget is now a parameter.
+    let a = thinking_params(ProviderKind::Anthropic, THINKING_BUDGET)
+        .expect("anthropic has a thinking toggle");
     assert_eq!(a["thinking"]["type"], "enabled");
     assert_eq!(a["thinking"]["budget_tokens"], THINKING_BUDGET);
 
     // Gemini: nested under generationConfig.thinkingConfig with camelCase keys —
     // rig parses these into a typed GenerationConfig, so the shape must be exact.
-    let g = thinking_params(Provider::Gemini).expect("gemini has a thinking toggle");
+    let g = thinking_params(ProviderKind::Gemini, THINKING_BUDGET)
+        .expect("gemini has a thinking toggle");
     assert_eq!(
         g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
         THINKING_BUDGET
@@ -79,11 +90,20 @@ fn thinking_is_enabled_for_providers_with_a_request_toggle() {
 }
 
 #[test]
-fn providers_that_reason_without_a_toggle_get_no_params() {
+fn thinking_budget_is_threaded_through_not_hardcoded() {
+    // A per-profile budget must reach the request, not the old global constant.
+    let a = thinking_params(ProviderKind::Anthropic, 4096).expect("anthropic toggle");
+    assert_eq!(a["thinking"]["budget_tokens"], 4096);
+    let g = thinking_params(ProviderKind::Gemini, 4096).expect("gemini toggle");
+    assert_eq!(g["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
+}
+
+#[test]
+fn kinds_that_reason_without_a_toggle_get_no_params() {
     // DeepSeek reasoner models and the local Gemma default (its --reasoning-format
     // auto) already reason; there is no request-time switch to flip, so: None.
-    assert!(thinking_params(Provider::DeepSeek).is_none());
-    assert!(thinking_params(Provider::Openai).is_none());
+    assert!(thinking_params(ProviderKind::DeepSeek, THINKING_BUDGET).is_none());
+    assert!(thinking_params(ProviderKind::Openai, THINKING_BUDGET).is_none());
 }
 
 #[test]
@@ -100,20 +120,58 @@ fn default_config_gives_large_headroom_above_the_thinking_budget() {
 }
 
 #[test]
-fn openai_defaults_to_cheap_gemma_explorer_strong_gemma_synth() {
+fn builtin_openai_profile_is_cheap_gemma_explorer_strong_gemma_synth() {
     // The chosen mapping for the local default endpoint: small E4B drives the
     // tool-heavy exploration, the larger 26B writes the answer — the cheap-
     // explorer/strong-synth pattern, local edition.
-    let (explorer, synth) = default_models(Provider::Openai);
+    let (explorer, synth) = default_models(ProviderKind::Openai);
     assert_eq!(explorer, "Gemma-4-E4B-it-GGUF");
     assert_eq!(synth, "Gemma-4-26B-A4B-it-GGUF");
 
-    // And an unset config resolves to exactly those.
-    let cfg = ConsultConfig::default();
-    assert_eq!(
-        cfg.resolved_models(Provider::Openai),
-        (explorer.to_string(), synth.to_string())
-    );
+    // And the built-in `openai` profile resolves to exactly those.
+    let p = profile("openai");
+    assert_eq!(p.explorer_model, explorer);
+    assert_eq!(p.synth_model, synth);
+    assert_eq!(p.kind, ProviderKind::Openai);
+}
+
+// Validation of the secondary-profile path: load the real user config
+// (~/.config/kaibo/config.toml), resolve a *non-built-in* openai profile, and run
+// its synth model against Lemonade. Proves config → profile → client wiring for a
+// second model on the same provider — the headline feature, exercised live.
+#[tokio::test]
+#[ignore = "loads ~/.config/kaibo/config.toml and hits local Lemonade (GLM); run with --ignored while it's up"]
+async fn secondary_local_profile_from_user_config_runs() {
+    // Part 1 — the user config file parses and its extra profiles resolve to the
+    // right model + endpoint (no network).
+    let cfg = Config::load(None).expect("load user config from the XDG default path");
+    let glm = cfg
+        .resolve_profile("glm")
+        .expect("the user config should define a `glm` profile")
+        .clone();
+    assert_eq!(glm.synth_model, "GLM-4.5-Air-UD-Q4K-XL-GGUF");
+    assert_eq!(glm.resolved_base_url(), "http://localhost:13305/api/v1");
+    assert_eq!(glm.kind, ProviderKind::Openai);
+    let qwen = cfg.resolve_profile("qwen").expect("a `qwen` profile");
+    assert_eq!(qwen.synth_model, "Qwen3-Coder-Next-GGUF");
+
+    // Part 2 — run a *second* profile live to prove the resolve → client → call path
+    // end-to-end. The GLM/Qwen builds don't always load on Lemonade; Gemma does, so
+    // validate against a profile that selects a Gemma synth distinct from any
+    // built-in default. (If GLM/Qwen are loadable, point synth_model back at them.)
+    let mut secondary = glm.clone();
+    secondary.synth_model = "Gemma-4-E4B-it-GGUF".to_string();
+    let answer = synthesize(
+        "In one sentence, what does kaibo's read-only sandbox prevent?",
+        Some("src/sandbox.rs builds a read-only kernel; writes and external commands are refused."),
+        env!("CARGO_MANIFEST_DIR"),
+        &secondary,
+        &ConsultConfig::default(),
+    )
+    .await
+    .expect("secondary-profile synthesize against Lemonade should succeed");
+    eprintln!("=== SECONDARY PROFILE ANSWER ===\n{answer}\n");
+    assert!(!answer.trim().is_empty(), "expected a non-empty answer");
 }
 
 // The recomposed consult (one loop, {run_kaish, explore′}) on the weakest target —
@@ -130,7 +188,7 @@ async fn recomposed_consult_runs_against_local_gemma() {
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         root,
-        Provider::Openai,
+        &profile("openai"),
         &cfg,
     )
     .await
@@ -159,7 +217,7 @@ async fn explore_unit_reports_from_the_real_tree() {
     let report = explore(
         "Which source file enforces the read-only sandbox, and name one builtin it blocks?",
         env!("CARGO_MANIFEST_DIR"),
-        Provider::Openai,
+        &profile("openai"),
         &ConsultConfig::default(),
     )
     .await
@@ -181,13 +239,14 @@ async fn explore_unit_reports_from_the_real_tree() {
 async fn synthesize_grounds_in_context_and_investigates_without_it() {
     let root = env!("CARGO_MANIFEST_DIR");
     let cfg = ConsultConfig::default();
+    let p = profile("openai");
 
     // With a thin context: it should answer grounded, optionally confirming via run_kaish.
     let with_ctx = synthesize(
         "Which file enforces the read-only sandbox?",
         Some("src/sandbox.rs builds a read-only kernel; the DENYLIST shadow-blocks touch/git."),
         root,
-        Provider::Openai,
+        &p,
         &cfg,
     )
     .await
@@ -203,7 +262,7 @@ async fn synthesize_grounds_in_context_and_investigates_without_it() {
         "Which file enforces the read-only sandbox?",
         None,
         root,
-        Provider::Openai,
+        &p,
         &cfg,
     )
     .await
@@ -221,13 +280,13 @@ async fn synthesize_grounds_in_context_and_investigates_without_it() {
 #[tokio::test]
 #[ignore = "hits the DeepSeek API (explore + synth); run with --ignored and a key"]
 async fn two_phase_consult_via_deepseek() {
-    if let Err(e) = load(Provider::DeepSeek) {
+    if let Err(e) = load(ProviderKind::DeepSeek) {
         panic!("no DeepSeek credential for live test: {e}");
     }
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         env!("CARGO_MANIFEST_DIR"),
-        Provider::DeepSeek,
+        &profile("deepseek"),
         &ConsultConfig::default(),
     )
     .await
@@ -244,13 +303,13 @@ async fn two_phase_consult_via_deepseek() {
 #[tokio::test]
 #[ignore = "hits the Gemini API (explore + synth); run with --ignored and a key"]
 async fn two_phase_consult_via_gemini() {
-    if let Err(e) = load(Provider::Gemini) {
+    if let Err(e) = load(ProviderKind::Gemini) {
         panic!("no Gemini credential for live test: {e}");
     }
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         env!("CARGO_MANIFEST_DIR"),
-        Provider::Gemini,
+        &profile("gemini"),
         &ConsultConfig::default(),
     )
     .await
@@ -268,7 +327,7 @@ async fn two_phase_consult_via_gemini() {
 #[ignore = "hits the Anthropic API (explore + synth); run with --ignored and a key"]
 async fn two_phase_consult_answers_from_the_real_tree() {
     // Surface a clear message if the credential is missing, before the API call.
-    if let Err(e) = load(Provider::Anthropic) {
+    if let Err(e) = load(ProviderKind::Anthropic) {
         panic!("no Anthropic credential for live test: {e}");
     }
 
@@ -278,7 +337,7 @@ async fn two_phase_consult_answers_from_the_real_tree() {
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         root,
-        Provider::Anthropic,
+        &profile("anthropic"),
         &cfg,
     )
     .await

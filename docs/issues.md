@@ -54,6 +54,18 @@ client experience.
 
 ## P2 — Focused fixes & hardening
 
+### Unified TOML config — wire the deferred `[sandbox]` tunables
+The config system shipped (`src/config.rs`, `tests/config.rs`, `docs/config.md`):
+`ProviderKind` (wire protocol) split from named `Profile`s, an XDG `config.toml`
+merged under `KAIBO_*` env and CLI flags (precedence: per-call > CLI > env > file >
+built-in), multi-`openai` proven by a two-endpoint regression test, model ids and
+credential paths now data. **Still deferred:** the `[sandbox]` table (per-exec
+timeout, output cap) from the design isn't wired — those stay code constants in
+`sandbox.rs`, and a `[sandbox]` key is currently *rejected* (deny_unknown_fields).
+Wiring it means threading a timeout through every `KaishWorker::spawn` site; do it
+alongside the "no overall wall-clock timeout" work below, which touches the same
+seam. When wired, add the `[sandbox]` block back to `docs/config.example.toml`.
+
 ### `touch` / `mktemp` still bypass the read-only mount
 Under the `localfs`-only build, the only compiled builtins that reach real state
 directly are `touch` (`std::fs` mtime on existing files) and `mktemp` (real temp
@@ -130,8 +142,10 @@ recorded here so we don't lose that our sandbox's hermeticity depends on it land
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they
 rot (rig 0.34's bundled `CLAUDE_*` / gemini consts are already retired — see the
 `claude-3-5-haiku-latest` 404 on 2026-06-03). Keep them in sync with the
-source-of-truth pal configs (`provider-model-ids` memory). Consider validating ids
-at startup, or a tiny config file.
+source-of-truth pal configs (`provider-model-ids` memory). → The "tiny config
+file" half of this is now designed: model ids move into profiles
+(`docs/config.md`). See the P2 config entry; the in-sync-with-pals discipline
+stays regardless.
 
 ### Thinking config tracks model generation (Gemini), and budgets are static
 Thinking is on by default, both phases (`consult.rs::thinking_params`): Anthropic
@@ -160,14 +174,12 @@ Thinking-on makes this tighter still: reasoning now also draws on the 16384
 `max_tokens`, so a local server needs a context window comfortably above input +
 reasoning + answer.
 
-### Only one `openai` endpoint can be live per process
+### Only one `openai` endpoint can be live per process → designed
 `Provider::Openai` resolves a single `OPENAI_BASE_URL` + `OPENAI_API_KEY`, so a
-server instance can talk to exactly one OpenAI-compatible endpoint at a time. You
-can override the *model* per call, but not the endpoint or key — you can't have,
-say, hosted GPT and local Gemma both selectable in one run. Supporting several
-would mean *named* instances (e.g. `openai:local`, `openai:gpt`) backed by a small
-registry (suffixed env vars or a config file), with the provider arg carrying the
-instance name. Deferred until a concrete two-endpoint need shows up.
+server instance can talk to exactly one OpenAI-compatible endpoint at a time. The
+headline driver for the config work: named profiles backed by a registry, the
+`provider` arg carrying the instance name. Designed in `docs/config.md`; tracked
+for implementation under the P2 config entry.
 
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
@@ -180,10 +192,12 @@ rather than a key check.
 
 ## P4 — Eventually
 
-### Credential paths are fixed
+### Credential paths are fixed → designed (paths), deferred (secrets manager)
 `credentials.rs` reads `~/.anthropic-key.txt` / `~/.deepseek-key` /
-`~/.gemini-api-key` (env var overrides). No config for custom paths or a secrets
-manager. Fine for Amy's box; revisit if kaibo runs elsewhere.
+`~/.gemini-api-key` (env var overrides). Custom paths are now designed: a profile's
+`api_key_file` / `api_key_env` (`docs/config.md`, P2 config entry). A secrets
+manager is still out of scope — by design the TOML references keys, never inlines
+them, so "point at $SECRET_TOOL output" would be a future key-source variant.
 
 ### Provider-specific features are flattened
 The pals (gpal/dpal/cpal) deliberately pass through provider-specific features

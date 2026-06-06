@@ -9,13 +9,13 @@
 //! It points the explorer at kaibo's own source tree and asks a question whose
 //! answer lives in `src/sandbox.rs`.
 
-use kaibo::credentials::{load, Provider};
+use kaibo::credentials::{load, ProviderKind};
 use kaibo::explorer::{explore, ExploreConfig};
 
 #[tokio::test]
 #[ignore = "hits the Anthropic API; run with --ignored and a configured key"]
 async fn explorer_answers_from_the_real_tree() {
-    let key = match load(Provider::Anthropic) {
+    let key = match load(ProviderKind::Anthropic) {
         Ok(k) => k,
         Err(e) => panic!("no Anthropic credential for live test: {e}"),
     };

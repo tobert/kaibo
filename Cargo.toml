@@ -31,6 +31,9 @@ anyhow = "1"
 rig-core = "0.34"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
+# raw structs turns a typo'd key into a startup error rather than a silent no-op.
+toml = "0.8"
 
 # MCP server (stdio only — never bind a socket; the FS is the boundary).
 rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
