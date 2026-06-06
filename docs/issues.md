@@ -54,13 +54,6 @@ client experience.
 
 ## P2 — Focused fixes & hardening
 
-### `run_kaish` output is uncapped — can flood the model context
-`sandbox.rs::run` returns the full kernel stdout/stderr; a `cat` of a big file or a
-wide `rg` dumps everything into the explorer's context, burning tokens and turns.
-kaish has `OutputLimitConfig` (`KernelConfig::with_output_limit`) — wire a sane cap
-into `build_readonly_kernel` and tell the model in `RunKaish`'s description that
-output is truncated, so it narrows with line ranges / `head` instead of re-reading.
-
 ### `touch` / `mktemp` still bypass the read-only mount
 Under the `localfs`-only build, the only compiled builtins that reach real state
 directly are `touch` (`std::fs` mtime on existing files) and `mktemp` (real temp
@@ -88,6 +81,38 @@ answer text (`server.rs`). The curated report is useful for debugging the
 hand-off and for "show your work" — surface it as `structured_content` or a
 `kaibo://consult/last` resource, ideally behind a flag so it doesn't bloat every
 client context.
+
+### `synthesize_batch` — a tool-less, batchable synth variant (deferred from the tool-surface work)
+The standalone `synthesize` we shipped is *interactive* (`{run_kaish}`) so it can
+self-correct a bad cite — the panel was unanimous a tool-less synth is too weak.
+The strictly tool-less, non-interactive variant is still worth having for batch
+fan-out: submit → poll → read, modelled on gpal/cpal's job system. Uses the parked
+`SYNTH_ONESHOT_PREAMBLE` wording in the (now-deleted) plan. It's a **per-provider
+capability** like `thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, Lemonade ✗ —
+`None` where unsupported. Open fork when built: many-questions/one-model vs
+one-question/many-models (the diverse-opinion panel made literal).
+
+### Retire the legacy single-phase `explorer::explore()`
+`explorer.rs::explore()` is Anthropic-only and now shadowed by the multi-provider
+`consult::explore` unit built on the generalized `run_phase`. Its only caller is
+`tests/explorer_live.rs`. Retire it (and that test, or repoint it at
+`consult::explore`) once the new path has a few real miles on it — kept for now so
+there's a fallback if the recomposed path surprises us.
+
+### No overall wall-clock timeout on a tool call (per-exec timeout shipped)
+The 30s per-exec kaish timeout (`sandbox.rs`) bounds individual scripts, but the
+tool loop's *LLM API calls* have no deadline — a hung provider request wedges the
+MCP call indefinitely (both DeepSeek and Gemini flagged this in review). `run_kaish`
+is fine (no model). Wrap `run_phase`'s `agent.prompt(...).await` in
+`tokio::time::timeout`, or configure a total-request timeout on the rig clients.
+(Distinct from the older "consult has no overall timeout" P1 — same root, restated
+now that three model-driven tools share the gap.)
+
+### A mock `CompletionClient` test that consult actually delegates to `explore′`
+Gemini's review noted: we pin the consult *toolset wiring* offline and exercise the
+*loop* live, but nothing offline proves the model's tool calls actually drive the
+nested `explore′` agent and aggregate into `ConsultOutput.report`. A mock client
+that forces an `explore` tool call would close that gap without live-model flakiness.
 
 ### Explorer sandbox isn't fully hermetic from the host env
 Surfaced 2026-06-03 catching up to kaish's four-crate split. Several kaish builtins
@@ -128,11 +153,12 @@ A local server's context window can be far smaller than the model advertises
 (Gemma-4-26B reports `max_context_window` 262144; the lemonade box was briefly
 serving it at `--ctx-size 4096` before we bumped it). The explorer dumps file
 contents over up to 50 turns, so on a tight window a single wide `cat`/`rg` blows
-it. kaibo can't size the server's ctx (a lemonade launch flag), but it *can* stop
-flooding: wiring kaish's `OutputLimitConfig` (the P2 "run_kaish output is uncapped"
-issue) matters more for local models than for the hosted providers. Thinking-on
-makes this tighter still: reasoning now also draws on the 16384 `max_tokens`, so a
-local server needs a context window comfortably above input + reasoning + answer.
+it. kaibo now installs an 8 KB `OutputLimitConfig` via `KernelConfig::mcp()`
+(`sandbox.rs`), so a single wide `cat`/`rg` can't flood — but 50 capped turns still
+accumulate, and that matters more for local models than for the hosted providers.
+Thinking-on makes this tighter still: reasoning now also draws on the 16384
+`max_tokens`, so a local server needs a context window comfortably above input +
+reasoning + answer.
 
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
