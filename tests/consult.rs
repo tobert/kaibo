@@ -1,7 +1,8 @@
 //! Two-phase consult: offline prompt-builder test + an `#[ignore]`d live e2e.
 
 use kaibo::consult::{
-    consult, default_models, synth_user_prompt, thinking_params, ConsultConfig, THINKING_BUDGET,
+    consult, default_models, explore, synth_user_prompt, thinking_params, ConsultConfig,
+    THINKING_BUDGET,
 };
 use kaibo::credentials::{load, Provider};
 
@@ -102,6 +103,28 @@ async fn two_phase_consult_runs_against_local_gemma() {
         lower.contains("sandbox") || lower.contains("read-only") || lower.contains("read only"),
         "answer should explain the read-only sandbox mechanism, got: {}",
         out.answer
+    );
+}
+
+// The `explore` unit on its own (the seam behind the MCP `explore` tool): a cheap
+// model drives {run_kaish} and returns a curated report citing real file:line.
+#[tokio::test]
+#[ignore = "hits the local lemonade server (explore only); run with --ignored while it's up"]
+async fn explore_unit_reports_from_the_real_tree() {
+    let report = explore(
+        "Which source file enforces the read-only sandbox, and name one builtin it blocks?",
+        env!("CARGO_MANIFEST_DIR"),
+        Provider::Lemonade,
+        &ConsultConfig::default(),
+    )
+    .await
+    .expect("explore against local gemma should succeed");
+
+    eprintln!("=== EXPLORE REPORT ===\n{report}\n");
+    let lower = report.to_lowercase();
+    assert!(
+        lower.contains("sandbox.rs") || lower.contains("sandbox"),
+        "the report should cite the sandbox source, got: {report}"
     );
 }
 

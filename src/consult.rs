@@ -16,8 +16,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig::completion::{Prompt, ToolDefinition};
 use rig::providers::{anthropic, deepseek, gemini, openai};
+use rig::tool::{Tool, ToolDyn};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::credentials::{self, Provider};
@@ -163,33 +165,37 @@ pub fn synth_user_prompt(question: &str, report: &str) -> String {
     )
 }
 
-/// One model phase: spawn a fresh read-only kernel, build an agent with the
-/// `run_kaish` tool, and run its bounded tool loop. Generic over the provider.
-async fn run_phase<C>(
+/// One model loop, parameterized by its toolset: build an agent with `preamble`,
+/// hand it `tools`, and run its bounded tool loop. Generic over the provider.
+///
+/// The toolset is injected (not hardcoded to `run_kaish`) so the same loop is the
+/// primitive behind every tool on the surface — `explore` ({run_kaish}),
+/// `synthesize` ({run_kaish}), and the recomposed `consult` ({run_kaish,
+/// explore′}). Heterogeneous tools erase to `Box<dyn ToolDyn>`, so this stays
+/// monomorphic in its toolset. The caller owns each tool's worker lifetime.
+pub(crate) async fn run_phase<C>(
     client: &C,
     model: &str,
     preamble: &str,
     max_tokens: u64,
-    root: &Path,
     user_prompt: String,
     max_turns: usize,
     thinking: Option<&Value>,
+    tools: Vec<Box<dyn ToolDyn>>,
 ) -> Result<String>
 where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
-    let worker = KaishWorker::spawn(root)?;
     let mut builder = client
         .agent(model)
         .preamble(preamble)
-        .max_tokens(max_tokens)
-        .tool(RunKaish::new(worker));
+        .max_tokens(max_tokens);
     // Thinking on (both phases) where the provider takes a request-time toggle.
     if let Some(params) = thinking {
         builder = builder.additional_params(params.clone());
     }
-    let agent = builder.build();
+    let agent = builder.tools(tools).build();
     agent
         .prompt(user_prompt)
         .max_turns(max_turns)
@@ -209,6 +215,188 @@ where
         })
 }
 
+/// `explore′` — the explorer unit wrapped as a rig [`Tool`] the consult loop can
+/// call. Its `call` runs a *nested* agent: a cheap model driving `{run_kaish}`
+/// over a fresh kernel, returning a curated report. This is what lets the capable
+/// `consult` model delegate a broad repo sweep instead of reading every span
+/// itself.
+///
+/// `!Send` care (an invariant): the nested kernel stays on its `KaishWorker`
+/// thread and never crosses the `.await` here — only the `Send` worker handle
+/// does — so `call`'s future is `Send`, as rig requires. `tests/explore_send.rs`
+/// pins this at compile time.
+pub struct RunExplore<C> {
+    client: C,
+    model: String,
+    max_tokens: u64,
+    max_turns: usize,
+    thinking: Option<Value>,
+    root: PathBuf,
+}
+
+impl<C> RunExplore<C> {
+    pub fn new(
+        client: C,
+        model: impl Into<String>,
+        max_tokens: u64,
+        max_turns: usize,
+        thinking: Option<Value>,
+        root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            client,
+            model: model.into(),
+            max_tokens,
+            max_turns,
+            thinking,
+            root: root.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunExploreArgs {
+    /// The question or sub-question to investigate across the repo.
+    pub question: String,
+}
+
+/// The nested explore loop failed (the sub-agent errored or its worker died).
+#[derive(Debug)]
+pub struct RunExploreError(String);
+
+impl std::fmt::Display for RunExploreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "explore failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for RunExploreError {}
+
+impl<C> Tool for RunExplore<C>
+where
+    C: CompletionClient + Send + Sync,
+    C::CompletionModel: 'static,
+{
+    const NAME: &'static str = "explore";
+    type Error = RunExploreError;
+    type Args = RunExploreArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Delegate a broad sweep to a fast investigator that rips \
+                through the repo on a read-only kaish shell and reports back with \
+                concrete `file:line` citations. Give it a focused question; use it \
+                to cover breadth, and read precise spans yourself with `run_kaish`."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "the question or sub-question to investigate"
+                    }
+                },
+                "required": ["question"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // A fresh kernel per call (the §2.1 cost note: a KaishWorker per explore′).
+        let worker = KaishWorker::spawn(&self.root).map_err(|e| RunExploreError(e.to_string()))?;
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(RunKaish::new(worker))];
+        // Reuse the one loop — explore′ is just run_phase with the explorer model.
+        run_phase(
+            &self.client,
+            &self.model,
+            &report_preamble(),
+            self.max_tokens,
+            args.question,
+            self.max_turns,
+            self.thinking.as_ref(),
+            tools,
+        )
+        .await
+        .map_err(|e| RunExploreError(format!("{e:#}")))
+    }
+}
+
+/// One explore loop against an already-constructed client: a cheap model drives
+/// `{run_kaish}` over a fresh kernel rooted at `root`, returning a curated report.
+async fn explore_with<C>(
+    client: &C,
+    model: &str,
+    root: &Path,
+    cfg: &ConsultConfig,
+    thinking: Option<&Value>,
+    question: &str,
+) -> Result<String>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+{
+    let tools: Vec<Box<dyn ToolDyn>> =
+        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
+    run_phase(
+        client,
+        model,
+        &report_preamble(),
+        cfg.max_tokens,
+        question.to_string(),
+        cfg.explorer_max_turns,
+        thinking,
+        tools,
+    )
+    .await
+}
+
+/// The `explore` unit: a cheap model drives `{run_kaish}` over `root` and returns
+/// a curated report. The standalone seam behind the MCP `explore` tool — multi-
+/// provider, unlike the legacy Anthropic-only [`crate::explorer::explore`].
+pub async fn explore(
+    question: &str,
+    root: impl Into<PathBuf>,
+    provider: Provider,
+    cfg: &ConsultConfig,
+) -> Result<String> {
+    let root = root.into();
+    let (explorer_model, _) = cfg.resolved_models(provider);
+    let thinking = thinking_params(provider);
+    let thinking = thinking.as_ref();
+
+    match provider {
+        Provider::Anthropic => {
+            let key = credentials::load(provider)?;
+            let client =
+                anthropic::Client::new(&key).map_err(|e| anyhow!("anthropic client init: {e}"))?;
+            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
+        }
+        Provider::DeepSeek => {
+            let key = credentials::load(provider)?;
+            let client =
+                deepseek::Client::new(&key).map_err(|e| anyhow!("deepseek client init: {e}"))?;
+            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
+        }
+        Provider::Gemini => {
+            let key = credentials::load(provider)?;
+            let client =
+                gemini::Client::new(&key).map_err(|e| anyhow!("gemini client init: {e}"))?;
+            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
+        }
+        Provider::Lemonade => {
+            let base_url = credentials::lemonade_base_url();
+            let client = openai::CompletionsClient::builder()
+                .api_key("lemonade")
+                .base_url(&base_url)
+                .build()
+                .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
+            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
+        }
+    }
+}
+
 /// Run both phases against an already-constructed provider client.
 async fn consult_with<C>(
     client: &C,
@@ -223,28 +411,34 @@ where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
+    // Each phase gets its own fresh worker (kernel rooted at the project) so the
+    // synth starts at the root rather than wherever the explorer wandered.
+    let explore_tools: Vec<Box<dyn ToolDyn>> =
+        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
     let report = run_phase(
         client,
         explorer_model,
         &report_preamble(),
         cfg.max_tokens,
-        root,
         question.to_string(),
         cfg.explorer_max_turns,
         thinking,
+        explore_tools,
     )
     .await
     .context("explore phase")?;
 
+    let synth_tools: Vec<Box<dyn ToolDyn>> =
+        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
     let answer = run_phase(
         client,
         synth_model,
         SYNTH_PREAMBLE,
         cfg.max_tokens,
-        root,
         synth_user_prompt(question, &report),
         cfg.synth_max_turns,
         thinking,
+        synth_tools,
     )
     .await
     .context("synth phase")?;

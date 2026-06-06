@@ -18,7 +18,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
 
-use crate::consult::{consult, ConsultConfig};
+use crate::consult::{consult, explore, ConsultConfig};
 use crate::credentials::Provider;
 use crate::explorer::format_output;
 use crate::kaish_syntax::kaish_syntax_resource;
@@ -57,6 +57,30 @@ pub struct ConsultInput {
     /// Max tool-loop turns for the synth fallback fetches (default 8).
     #[serde(default)]
     pub synth_max_turns: Option<usize>,
+}
+
+/// Arguments to the `explore` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExploreInput {
+    /// The question to investigate about the project.
+    pub question: String,
+
+    /// Absolute path to the project. Optional only if the server was launched
+    /// with a default `--root`.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Provider: "anthropic" (default), "deepseek", "gemini", or "lemonade".
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Override the explorer model id.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Max tool-loop turns for the explorer (default 50 — it's cheap, let it rip).
+    #[serde(default)]
+    pub max_turns: Option<usize>,
 }
 
 /// Arguments to the `run_kaish` tool.
@@ -104,6 +128,17 @@ impl KaiboHandler {
         }
     }
 
+    /// Resolve a call's provider: the explicit string (parsed), else the server's
+    /// default. An unrecognized provider string is a parameter error.
+    fn parse_provider(&self, provider: Option<String>) -> Result<Provider, McpError> {
+        match provider {
+            Some(s) => s
+                .parse::<Provider>()
+                .map_err(|e| McpError::invalid_params(e.to_string(), None)),
+            None => Ok(self.default_provider),
+        }
+    }
+
     #[tool(
         description = "Investigate a question about a codebase and return a grounded, \
             cited answer. A cheap explorer model reads the project through a read-only \
@@ -118,13 +153,7 @@ impl KaiboHandler {
         Parameters(input): Parameters<ConsultInput>,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-
-        let provider = match input.provider {
-            Some(s) => s
-                .parse::<Provider>()
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
-            None => self.default_provider,
-        };
+        let provider = self.parse_provider(input.provider)?;
 
         let defaults = ConsultConfig::default();
         let cfg = ConsultConfig {
@@ -140,6 +169,39 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(out.answer)]))
+    }
+
+    #[tool(
+        description = "Investigate a question about a codebase and return a curated \
+            report citing concrete `file:line` locations. A fast, cheap model reads \
+            the project through a read-only kaish shell (cat/grep/rg/find/pipelines) \
+            and reports what it found — relevant files, line numbers, key snippets. \
+            This is the explorer seam on its own: it gathers evidence, it does not \
+            write a polished final answer (use `consult` for that). Read-only: it \
+            never modifies the project. Args: question (required), path (project dir; \
+            optional if the server has a default root), provider \
+            (anthropic|deepseek|gemini|lemonade), and optional model / max_turns \
+            overrides."
+    )]
+    async fn explore(
+        &self,
+        Parameters(input): Parameters<ExploreInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.resolve_root(input.path)?;
+        let provider = self.parse_provider(input.provider)?;
+
+        let defaults = ConsultConfig::default();
+        let cfg = ConsultConfig {
+            explorer_model: input.model,
+            explorer_max_turns: input.max_turns.unwrap_or(defaults.explorer_max_turns),
+            ..defaults
+        };
+
+        let report = explore(&input.question, root, provider, &cfg)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(report)]))
     }
 
     #[tool(
