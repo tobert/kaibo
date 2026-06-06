@@ -24,8 +24,9 @@ more — e.g. `rg -l TODO src | head` or `cat -n Cargo.toml | sed -n '1,20p'`. E
 starts at the project root; there is no persistent cwd. The sandbox is read-only and \
 offline, so work within it and just read: writes, `git`, `touch`, and external commands \
 are refused — exit 126 means blocked by the sandbox, 124 means a script was killed for \
-running past its time budget, 127 means command-not-found, and any other non-zero means \
-the script itself failed.";
+running past its time budget, 3 means the output was too large and got truncated (the \
+text you got back is a head+tail sample, not a failure), 127 means command-not-found, \
+and any other non-zero means the script itself failed.";
 
 /// The `run_kaish` (rig) tool description shown to the internal models. It *is*
 /// the shared core — same idioms, same exit-code contract, no drift.
@@ -56,6 +57,8 @@ pub fn kaish_syntax_resource() -> String {
          land.\n\n\
          ## Exit codes\n\
          - `0` — success\n\
+         - `3` — output exceeded the cap and was truncated to a head+tail sample \
+         (not a failure; the full output is not returned)\n\
          - `124` — killed for exceeding the per-exec time budget\n\
          - `126` — blocked by the read-only sandbox (collides with POSIX \
          \"not executable\" — read the message to be sure)\n\

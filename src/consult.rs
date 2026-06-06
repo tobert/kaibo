@@ -39,21 +39,24 @@ use crate::sandbox::KaishWorker;
 /// arm, so it may `.await` and use `?`.
 macro_rules! with_provider_client {
     ($provider:expr, |$client:ident| $body:expr) => {{
-        match $provider {
+        // Bind once so `$provider` is evaluated a single time even though each arm
+        // also reads it (e.g. `credentials::load`).
+        let provider = $provider;
+        match provider {
             Provider::Anthropic => {
-                let key = credentials::load($provider)?;
+                let key = credentials::load(provider)?;
                 let $client = anthropic::Client::new(&key)
                     .map_err(|e| anyhow!("anthropic client init: {e}"))?;
                 $body
             }
             Provider::DeepSeek => {
-                let key = credentials::load($provider)?;
+                let key = credentials::load(provider)?;
                 let $client = deepseek::Client::new(&key)
                     .map_err(|e| anyhow!("deepseek client init: {e}"))?;
                 $body
             }
             Provider::Gemini => {
-                let key = credentials::load($provider)?;
+                let key = credentials::load(provider)?;
                 let $client = gemini::Client::new(&key)
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
                 $body

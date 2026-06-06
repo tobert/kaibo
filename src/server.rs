@@ -77,11 +77,12 @@ pub struct ConsultInput {
     #[serde(default)]
     pub synth_model: Option<String>,
 
-    /// Max tool-loop turns for the explorer (default 50 — it's cheap, let it rip).
+    /// Max tool-loop turns for each delegated `explore′` sweep (default 50).
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
 
-    /// Max tool-loop turns for the synth fallback fetches (default 8).
+    /// Max tool-loop turns for the consult driver loop itself (default 100 — it now
+    /// drives the whole investigation, delegating sweeps and reading spans).
     #[serde(default)]
     pub synth_max_turns: Option<usize>,
 }
@@ -168,17 +169,22 @@ impl KaiboHandler {
         // name. (The methods stay compiled — no dead code — they're just not
         // advertised or callable.)
         let mut tool_router = Self::tool_router();
-        if !gating.consult {
-            tool_router.remove_route("consult");
-        }
-        if !gating.explore {
-            tool_router.remove_route("explore");
-        }
-        if !gating.synthesize {
-            tool_router.remove_route("synthesize");
-        }
-        if !gating.run_kaish {
-            tool_router.remove_route("run_kaish");
+        // `remove_route` silently no-ops on an unknown name, so a renamed #[tool]
+        // method would leave its --no-<tool> flag quietly inert. Assert the route
+        // exists before dropping it — a stale name is a build-time bug we want loud.
+        for (enabled, name) in [
+            (gating.consult, "consult"),
+            (gating.explore, "explore"),
+            (gating.synthesize, "synthesize"),
+            (gating.run_kaish, "run_kaish"),
+        ] {
+            if !enabled {
+                assert!(
+                    tool_router.has_route(name),
+                    "gating: no tool route named {name:?} — did a #[tool] method get renamed?"
+                );
+                tool_router.remove_route(name);
+            }
         }
         Self {
             default_root,
@@ -226,12 +232,14 @@ impl KaiboHandler {
 
     #[tool(
         description = "Investigate a question about a codebase and return a grounded, \
-            cited answer. A cheap explorer model reads the project through a read-only \
-            kaish shell (cat/grep/rg/find/jq/pipelines), writes a curated report, then a \
-            stronger model synthesizes the final answer. Read-only: it never modifies the \
-            project. Args: question (required), path (project dir; optional if the server \
-            has a default root), provider (anthropic|deepseek|gemini), and optional \
-            explorer_model / synth_model overrides."
+            cited answer. A capable model drives a read-only kaish shell \
+            (cat/grep/rg/find/jq/pipelines): it reads precise spans directly and \
+            delegates broad repo sweeps to a fast explorer sub-agent, then answers \
+            from what they find with concrete `file:line` citations. Read-only: it \
+            never modifies the project. Args: question (required), path (project dir; \
+            optional if the server has a default root), provider \
+            (anthropic|deepseek|gemini|lemonade), and optional explorer_model / \
+            synth_model overrides."
     )]
     async fn consult(
         &self,
