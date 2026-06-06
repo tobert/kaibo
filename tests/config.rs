@@ -388,6 +388,72 @@ fn key_optional_profile_with_a_present_but_empty_key_file_errors() {
     );
 }
 
+// --- [sandbox] -------------------------------------------------------------
+
+#[test]
+fn sandbox_defaults_when_unconfigured() {
+    let c = Config::builtin();
+    assert_eq!(c.sandbox.exec_timeout, std::time::Duration::from_secs(30));
+    assert_eq!(c.sandbox.output_limit_bytes, 8 * 1024);
+    assert!(c.sandbox.disable_builtins.is_empty());
+}
+
+#[test]
+fn sandbox_section_parses() {
+    let c = Config::from_toml_str(
+        r#"
+        [sandbox]
+        exec_timeout_secs = 5
+        output_limit_bytes = 4096
+        disable_builtins = ["rg", "find"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(c.sandbox.exec_timeout, std::time::Duration::from_secs(5));
+    assert_eq!(c.sandbox.output_limit_bytes, 4096);
+    assert_eq!(c.sandbox.disable_builtins, vec!["rg".to_string(), "find".to_string()]);
+}
+
+#[test]
+fn sandbox_env_overrides_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[sandbox]\nexec_timeout_secs = 30\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_EXEC_TIMEOUT_SECS", "7")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.sandbox.exec_timeout, std::time::Duration::from_secs(7));
+}
+
+#[test]
+fn validate_against_builtins_rejects_an_unknown_name() {
+    let c = Config::from_toml_str(
+        r#"
+        [sandbox]
+        disable_builtins = ["rg", "definitely-not-a-builtin"]
+        "#,
+    )
+    .unwrap();
+    let known = vec!["rg".to_string(), "cat".to_string(), "find".to_string()];
+    let err = c.validate_against_builtins(&known).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("definitely-not-a-builtin"),
+        "an unknown disabled builtin must error loudly, got: {err:#}"
+    );
+}
+
+#[test]
+fn validate_against_builtins_accepts_a_known_subset() {
+    let c = Config::from_toml_str(
+        r#"
+        [sandbox]
+        disable_builtins = ["rg"]
+        "#,
+    )
+    .unwrap();
+    let known = vec!["rg".to_string(), "cat".to_string()];
+    assert!(c.validate_against_builtins(&known).is_ok());
+}
+
 #[test]
 fn thinking_budget_at_or_above_max_tokens_is_rejected() {
     // Anthropic requires max_tokens > thinking_budget; catch the inverted config at

@@ -31,7 +31,7 @@ use crate::config::Profile;
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::kaish_syntax::kaish_syntax_core;
-use crate::sandbox::KaishWorker;
+use crate::sandbox::{KaishWorker, SandboxConfig};
 
 /// Construct the rig client for `$profile` (resolving its key, plus base URL for an
 /// OpenAI-compatible one) and bind it to `$client` for `$body`. The kind selects the
@@ -160,6 +160,8 @@ pub struct ConsultConfig {
     /// eats this budget — it must sit well above the profile's thinking budget or the
     /// answer gets truncated to empty.
     pub max_tokens: u64,
+    /// Read-only sandbox limits applied to every kaish worker this phase spawns.
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for ConsultConfig {
@@ -169,6 +171,7 @@ impl Default for ConsultConfig {
             explorer_max_turns: d.explorer_max_turns,
             synth_max_turns: d.synth_max_turns,
             max_tokens: d.max_tokens,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -262,6 +265,8 @@ pub struct RunExplore<C> {
     max_turns: usize,
     thinking: Option<Value>,
     root: PathBuf,
+    /// Sandbox limits for the fresh kernel each delegated sweep spawns.
+    sandbox: SandboxConfig,
     /// Every delegated report is appended here, so the caller can surface what the
     /// sweeps found (the recomposed `consult`'s `report`) and a test can observe
     /// that a delegation actually happened.
@@ -277,6 +282,7 @@ impl<C> RunExplore<C> {
         max_turns: usize,
         thinking: Option<Value>,
         root: impl Into<PathBuf>,
+        sandbox: SandboxConfig,
         reports: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         Self {
@@ -286,6 +292,7 @@ impl<C> RunExplore<C> {
             max_turns,
             thinking,
             root: root.into(),
+            sandbox,
             reports,
         }
     }
@@ -342,7 +349,8 @@ where
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // A fresh kernel per call (the §2.1 cost note: a KaishWorker per explore′).
-        let worker = KaishWorker::spawn(&self.root).map_err(|e| RunExploreError(e.to_string()))?;
+        let worker = KaishWorker::spawn_with(&self.root, self.sandbox.clone())
+            .map_err(|e| RunExploreError(e.to_string()))?;
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(RunKaish::new(worker))];
         // Reuse the one loop — explore′ is just run_phase with the explorer model.
         let report = run_phase(
@@ -381,7 +389,7 @@ where
     C::CompletionModel: 'static,
 {
     let tools: Vec<Box<dyn ToolDyn>> =
-        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
+        vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))];
     run_phase(
         client,
         model,
@@ -469,7 +477,7 @@ where
     C::CompletionModel: 'static,
 {
     let tools: Vec<Box<dyn ToolDyn>> =
-        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
+        vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))];
     run_phase(
         client,
         model,
@@ -540,7 +548,7 @@ where
     C::CompletionModel: 'static,
 {
     // run_kaish for precise reads by the consult model itself.
-    let worker = KaishWorker::spawn(root)?;
+    let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
     // explore′ for delegated breadth: same explore unit, wrapped as a tool, pointed
     // at the cheap explorer model. Bounded by explorer_max_turns per sweep; no cap
     // on how many times consult may delegate (Amy's call — watch real behavior).
@@ -551,6 +559,7 @@ where
         cfg.explorer_max_turns,
         thinking.cloned(),
         root,
+        cfg.sandbox.clone(),
         reports,
     );
     Ok(vec![Box::new(RunKaish::new(worker)), Box::new(explore)])

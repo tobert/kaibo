@@ -54,18 +54,6 @@ client experience.
 
 ## P2 — Focused fixes & hardening
 
-### Unified TOML config — wire the deferred `[sandbox]` tunables
-The config system shipped (`src/config.rs`, `tests/config.rs`, `docs/config.md`):
-`ProviderKind` (wire protocol) split from named `Profile`s, an XDG `config.toml`
-merged under `KAIBO_*` env and CLI flags (precedence: per-call > CLI > env > file >
-built-in), multi-`openai` proven by a two-endpoint regression test, model ids and
-credential paths now data. **Still deferred:** the `[sandbox]` table (per-exec
-timeout, output cap) from the design isn't wired — those stay code constants in
-`sandbox.rs`, and a `[sandbox]` key is currently *rejected* (deny_unknown_fields).
-Wiring it means threading a timeout through every `KaishWorker::spawn` site; do it
-alongside the "no overall wall-clock timeout" work below, which touches the same
-seam. When wired, add the `[sandbox]` block back to `docs/config.example.toml`.
-
 ### `touch` / `mktemp` still bypass the read-only mount
 Under the `localfs`-only build, the only compiled builtins that reach real state
 directly are `touch` (`std::fs` mtime on existing files) and `mktemp` (real temp

@@ -278,6 +278,7 @@ impl KaiboHandler {
             explorer_max_turns: input.explorer_max_turns.unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             max_tokens: profile.max_tokens,
+            sandbox: self.config.sandbox.clone(),
         };
 
         let out = consult(&input.question, root, &profile, &cfg)
@@ -313,6 +314,7 @@ impl KaiboHandler {
             explorer_max_turns: input.max_turns.unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: defaults.synth_max_turns,
             max_tokens: profile.max_tokens,
+            sandbox: self.config.sandbox.clone(),
         };
 
         let report = explore(&input.question, root, &profile, &cfg)
@@ -347,6 +349,7 @@ impl KaiboHandler {
             explorer_max_turns: defaults.explorer_max_turns,
             synth_max_turns: defaults.synth_max_turns,
             max_tokens: profile.max_tokens,
+            sandbox: self.config.sandbox.clone(),
         };
 
         let answer = synthesize(&input.question, input.context.as_deref(), root, &profile, &cfg)
@@ -375,8 +378,9 @@ impl KaiboHandler {
         let root = self.resolve_root(input.path)?;
 
         // A fresh worker (and kernel) per call: stateless, starts at root, and the
-        // !Send kernel stays on its own thread so this future stays Send.
-        let worker = KaishWorker::spawn(&root)
+        // !Send kernel stays on its own thread so this future stays Send. Applies the
+        // configured sandbox limits (timeout, output cap, disabled builtins).
+        let worker = KaishWorker::spawn_with(&root, self.config.sandbox.clone())
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         let out = worker
             .run(input.script)

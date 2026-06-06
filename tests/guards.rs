@@ -9,7 +9,10 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
-use kaibo::sandbox::{build_readonly_kernel, build_readonly_kernel_with_timeout, run};
+use kaibo::sandbox::{
+    build_readonly_kernel, build_readonly_kernel_with, build_readonly_kernel_with_timeout, run,
+    SandboxConfig,
+};
 use tempfile::tempdir;
 
 /// A zero timeout makes the kernel return 124 immediately without spawning —
@@ -78,4 +81,49 @@ async fn oversized_output_is_capped_or_marked() {
     // runtime dir and remaps the exit code to 3. kaibo's invariant (never modify
     // the *project*) holds — the project mount is read-only — but the ideal is
     // in-memory head+tail truncation with no host write and the real code preserved.
+}
+
+/// Config-driven `[sandbox].disable_builtins` actually shadow-blocks a builtin that
+/// would otherwise work. Teeth: `cat` reads fine under the default sandbox (proven
+/// elsewhere); here, disabling it must turn the same read into a 126 refusal while
+/// the file is untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn disable_builtins_blocks_an_otherwise_working_builtin() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("f.txt"), "hi\n").unwrap();
+
+    let sandbox = SandboxConfig {
+        disable_builtins: vec!["cat".to_string()],
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
+    let r = run(&kernel, "cat f.txt").await.unwrap();
+
+    assert_eq!(r.code, 126, "a config-disabled builtin must be refused (126), got {r:?}");
+    assert!(
+        r.err.contains("read-only sandbox") || r.text_out().contains("read-only sandbox"),
+        "the refusal should carry the sandbox marker, got {r:?}"
+    );
+}
+
+/// A custom `output_limit_bytes` is honored: a read past a tiny cap is truncated.
+/// Teeth: the source is many times the configured cap, so an unconfigured (8 KB)
+/// path would let it through — only a threaded-in small cap catches it.
+#[tokio::test(flavor = "current_thread")]
+async fn custom_output_limit_is_honored() {
+    let dir = tempdir().unwrap();
+    let body = "y".repeat(4096); // 4 KB, well under the 8 KB default but past our 512 B cap
+    fs::write(dir.path().join("mid.txt"), &body).unwrap();
+
+    let sandbox = SandboxConfig { output_limit_bytes: 512, ..SandboxConfig::default() };
+    let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
+    let r = run(&kernel, "cat mid.txt").await.unwrap();
+
+    let out = r.text_out();
+    assert!(
+        out.len() + r.err.len() < body.len(),
+        "a 512 B cap must truncate a 4 KB read, got {} bytes (code={})",
+        out.len() + r.err.len(),
+        r.code
+    );
 }

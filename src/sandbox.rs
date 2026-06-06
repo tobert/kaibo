@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{LocalFs, MemoryFs, VfsRouter};
-use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend};
+use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig};
 
 /// Builtins that bypass the read-only backend to touch real state directly, so
 /// the [`LocalFs::read_only`] mount can't stop them (audited for
@@ -77,9 +77,16 @@ impl Tool for Blocked {
     }
 }
 
-/// Shadow-block every [`DENYLIST`] builtin present in the registry.
-fn apply_denylist(registry: &mut ToolRegistry) {
-    for &name in DENYLIST {
+/// Shadow-block the [`DENYLIST`] builtins plus any caller-supplied `extra` names.
+///
+/// `extra` is the config's `[sandbox].disable_builtins`: it can only *add* to the
+/// block set, never remove from it — config makes the box stricter, never looser.
+/// The hardcoded `DENYLIST` is the read-only invariant and is always applied. An
+/// `extra` name that isn't a registered builtin is a no-op *here* (already
+/// validated loudly at startup, see [`builtin_names`]).
+fn apply_denylist(registry: &mut ToolRegistry, extra: &[String]) {
+    let names = DENYLIST.iter().copied().chain(extra.iter().map(String::as_str));
+    for name in names {
         if let Some(inner) = registry.get(name) {
             registry.register_arc(Arc::new(Blocked { inner }));
         }
@@ -96,23 +103,64 @@ fn apply_denylist(registry: &mut ToolRegistry) {
 /// matches a patient MCP caller while still bounding a runaway.
 pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default per-script output cap (matches `OutputLimitConfig::mcp()`'s 8 KB): a
+/// single wide `cat`/`rg` can't flood the caller's context. Override via
+/// `[sandbox].output_limit_bytes`.
+pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
+
+/// Tunable read-only-sandbox limits, set via `[sandbox]` in config.toml.
+///
+/// These can only make the box *stricter* — `disable_builtins` adds to the
+/// hardcoded [`DENYLIST`], never removes from it, and the dangerous axes aren't
+/// even compiled in. The read-only invariant is not a config knob.
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    /// Per-kaish-script wall-clock budget; exceeding it exits 124.
+    pub exec_timeout: Duration,
+    /// Max bytes of script output before truncation (exit 3 + head/tail sample).
+    pub output_limit_bytes: usize,
+    /// Builtins to shadow-block *in addition* to the read-only [`DENYLIST`].
+    pub disable_builtins: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            exec_timeout: KAISH_EXEC_TIMEOUT,
+            output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            disable_builtins: Vec::new(),
+        }
+    }
+}
+
 /// Build a kernel that can *read* everything under `root` and *mutate* nothing,
-/// with the default [`KAISH_EXEC_TIMEOUT`].
+/// with default sandbox limits.
 ///
 /// The project is mounted at its real absolute path (mirroring kaish's own
 /// sandbox layout) so familiar paths like `/home/me/proj/src/main.rs` resolve
 /// transparently, while `cat`/`grep`/`find` see the live tree.
 pub fn build_readonly_kernel(root: impl Into<PathBuf>) -> Result<Kernel> {
-    build_readonly_kernel_with_timeout(root, KAISH_EXEC_TIMEOUT)
+    build_readonly_kernel_with(root, &SandboxConfig::default())
 }
 
 /// Like [`build_readonly_kernel`] but with an explicit per-exec `timeout`.
 ///
 /// Exposed so tests can drive the timeout path with a short budget without
-/// waiting the full [`KAISH_EXEC_TIMEOUT`]; production always uses the default.
+/// waiting the full [`KAISH_EXEC_TIMEOUT`].
 pub fn build_readonly_kernel_with_timeout(
     root: impl Into<PathBuf>,
     timeout: Duration,
+) -> Result<Kernel> {
+    build_readonly_kernel_with(
+        root,
+        &SandboxConfig { exec_timeout: timeout, ..SandboxConfig::default() },
+    )
+}
+
+/// Build the read-only kernel with explicit [`SandboxConfig`] limits.
+pub fn build_readonly_kernel_with(
+    root: impl Into<PathBuf>,
+    sandbox: &SandboxConfig,
 ) -> Result<Kernel> {
     let root = root.into();
     let mount_point = root.to_string_lossy().to_string();
@@ -125,18 +173,23 @@ pub fn build_readonly_kernel_with_timeout(
 
     let backend: Arc<dyn KernelBackend> = Arc::new(LocalBackend::new(Arc::new(vfs)));
 
-    // `KernelConfig::mcp()` already installs an 8 KB `OutputLimitConfig`, so a
-    // runaway `cat` can't flood the caller's context; the timeout bounds wall
-    // clock. Both guards matter for a caller-facing `run_kaish` with no turn cap.
+    // Start from the MCP output limit (head+tail truncation) and set the configured
+    // cap so a runaway `cat` can't flood the caller's context; the timeout bounds
+    // wall clock. Both guards matter for a caller-facing `run_kaish` with no turn cap.
+    let mut output_limit = OutputLimitConfig::mcp();
+    output_limit.set_limit(Some(sandbox.output_limit_bytes));
     let config = KernelConfig::mcp()
         .with_cwd(root)
         .with_allow_external_commands(false)
-        .with_request_timeout(timeout);
+        .with_request_timeout(sandbox.exec_timeout)
+        .with_output_limit(output_limit);
 
     // `with_backend` ignores config.vfs_mode and routes all non-`/v/*` paths
     // through our read-only backend. `configure_tools` runs after the default
-    // builtins are registered, so the denylist shadows win.
-    Kernel::with_backend(backend, config, |_| {}, apply_denylist)
+    // builtins are registered, so the denylist shadows win. The extra disabled
+    // builtins are union'd with the hardcoded DENYLIST.
+    let extra = sandbox.disable_builtins.clone();
+    Kernel::with_backend(backend, config, |_| {}, move |reg| apply_denylist(reg, &extra))
         .context("failed to build read-only kaish kernel")
 }
 
@@ -153,6 +206,13 @@ pub fn builtin_schemas() -> Result<Vec<ToolSchema>> {
     let kernel = Kernel::new(KernelConfig::isolated().with_skip_validation(true))
         .context("failed to build schema kernel")?;
     Ok(kernel.tool_schemas())
+}
+
+/// The names of every builtin compiled into kaibo's kernel. Used to validate
+/// `[sandbox].disable_builtins` at startup so a typo (`"rgg"`) is a loud error
+/// rather than a silent no-op that leaves the builtin enabled.
+pub fn builtin_names() -> Result<Vec<String>> {
+    Ok(builtin_schemas()?.into_iter().map(|s| s.name).collect())
 }
 
 /// Run one kaish script in the sandbox and hand back the raw kernel result.
@@ -200,11 +260,18 @@ struct Job {
 }
 
 impl KaishWorker {
-    /// Spawn the worker thread and build its read-only kernel rooted at `root`.
+    /// Spawn the worker thread and build its read-only kernel rooted at `root`,
+    /// with default sandbox limits.
+    pub fn spawn(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::spawn_with(root, SandboxConfig::default())
+    }
+
+    /// Spawn the worker thread and build its read-only kernel rooted at `root`,
+    /// with explicit [`SandboxConfig`] limits.
     ///
     /// Blocks until the kernel is built so construction failures surface here
     /// rather than on the first `run`.
-    pub fn spawn(root: impl Into<PathBuf>) -> Result<Self> {
+    pub fn spawn_with(root: impl Into<PathBuf>, sandbox: SandboxConfig) -> Result<Self> {
         let root = root.into();
         let (jobs_tx, mut jobs_rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -224,7 +291,7 @@ impl KaishWorker {
                 };
                 // `block_on` runs the `!Send` kernel future on this thread only.
                 rt.block_on(async move {
-                    let kernel = match build_readonly_kernel(&root) {
+                    let kernel = match build_readonly_kernel_with(&root, &sandbox) {
                         Ok(k) => {
                             let _ = init_tx.send(Ok(()));
                             k

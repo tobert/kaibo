@@ -25,11 +25,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
+use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
 
 // --- Tunable defaults (the [defaults] table) -------------------------------
@@ -156,6 +158,8 @@ pub struct Config {
     /// Which tools to advertise.
     pub tools: ToolGating,
     pub defaults: Defaults,
+    /// Read-only sandbox limits (exec timeout, output cap, extra disabled builtins).
+    pub sandbox: SandboxConfig,
     /// Profiles by name.
     pub profiles: BTreeMap<String, Profile>,
     /// alias → profile name.
@@ -228,6 +232,24 @@ impl Config {
             "unknown provider/profile {name:?}; known profiles: {}",
             names.join(", ")
         ))
+    }
+
+    /// Validate `[sandbox].disable_builtins` against the set of builtins actually
+    /// compiled in (`known`). An unknown name is a loud startup error — a typo must
+    /// not silently leave a builtin enabled. Call with [`crate::sandbox::builtin_names`].
+    pub fn validate_against_builtins(&self, known: &[String]) -> Result<()> {
+        for name in &self.sandbox.disable_builtins {
+            if !known.iter().any(|k| k == name) {
+                let mut sorted: Vec<&str> = known.iter().map(String::as_str).collect();
+                sorted.sort_unstable();
+                bail!(
+                    "[sandbox].disable_builtins names {name:?}, which is not a kaish \
+                     builtin in this build; known builtins: {}",
+                    sorted.join(", ")
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Merge a raw (file/env) config over the built-in registry and validate.
@@ -307,6 +329,7 @@ impl Config {
         let default_provider = server.provider.unwrap_or_else(|| "anthropic".to_string());
         let log = server.log.unwrap_or_else(|| "kaibo=info".to_string());
         let root = server.root.map(PathBuf::from);
+        let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
 
         let cfg = Self {
             root,
@@ -314,6 +337,7 @@ impl Config {
             log,
             tools,
             defaults,
+            sandbox,
             profiles,
             aliases,
         };
@@ -462,7 +486,17 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
 struct RawConfig {
     server: Option<RawServer>,
     defaults: Option<RawDefaults>,
+    sandbox: Option<RawSandbox>,
     profiles: Option<BTreeMap<String, RawProfile>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSandbox {
+    exec_timeout_secs: Option<u64>,
+    output_limit_bytes: Option<usize>,
+    /// Builtins to disable on top of the read-only denylist (file-only; no env).
+    disable_builtins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -563,6 +597,18 @@ fn merge_defaults(raw: RawDefaults) -> Defaults {
     }
 }
 
+fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
+    let d = SandboxConfig::default();
+    SandboxConfig {
+        exec_timeout: raw
+            .exec_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(d.exec_timeout),
+        output_limit_bytes: raw.output_limit_bytes.unwrap_or(d.output_limit_bytes),
+        disable_builtins: raw.disable_builtins.unwrap_or(d.disable_builtins),
+    }
+}
+
 fn merge_tools(raw: RawTools) -> ToolGating {
     let d = ToolGating::default();
     ToolGating {
@@ -615,6 +661,15 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_THINKING_BUDGET") {
         defaults.thinking_budget = Some(parse_env("KAIBO_THINKING_BUDGET", &v)?);
     }
+
+    let sandbox = raw.sandbox.get_or_insert_with(Default::default);
+    if let Some(v) = get("KAIBO_EXEC_TIMEOUT_SECS") {
+        sandbox.exec_timeout_secs = Some(parse_env("KAIBO_EXEC_TIMEOUT_SECS", &v)?);
+    }
+    if let Some(v) = get("KAIBO_OUTPUT_LIMIT_BYTES") {
+        sandbox.output_limit_bytes = Some(parse_env("KAIBO_OUTPUT_LIMIT_BYTES", &v)?);
+    }
+    // disable_builtins is a list — file-only, no env form.
     Ok(())
 }
 

@@ -45,9 +45,17 @@ synth_max_turns    = 100     # bounds the consult driver loop (sweeps AND span r
 max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
 thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle
 
-# NOTE: sandbox limits (per-exec timeout, output cap) are NOT yet configurable —
-# they remain code constants in src/sandbox.rs. A `[sandbox]` table here is rejected
-# at load (unknown key) rather than silently ignored. Tracked in docs/issues.md.
+# ---------------------------------------------------------------------------
+# [sandbox] — the read-only execution limits (see src/sandbox.rs)
+# ---------------------------------------------------------------------------
+[sandbox]
+exec_timeout_secs  = 30      # per-kaish-script wall clock; exit 124 on overrun
+output_limit_bytes = 8192    # per-script output cap; exit 3 + head/tail sample
+# Builtins to shadow-block ON TOP OF the read-only denylist (exit 126 if invoked).
+# This only makes the box STRICTER — it can't re-enable the read-only denylist
+# (git/touch/spawn/exec/kill/mktemp), and the dangerous axes aren't compiled in.
+# A name that isn't a real builtin is a loud startup error, not a silent no-op.
+# disable_builtins = ["rg", "find"]
 
 # ---------------------------------------------------------------------------
 # [profiles.<name>] — named instances. `kind` picks the wire protocol/rig client

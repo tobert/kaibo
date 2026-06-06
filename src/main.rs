@@ -115,6 +115,10 @@ async fn main() -> Result<()> {
         .resolve_profile(&config.default_provider)
         .map_err(|e| anyhow::anyhow!("default provider: {e}"))?;
 
+    // Any [sandbox].disable_builtins must name a builtin that actually exists in this
+    // build — a typo must crash here, not silently leave the builtin enabled.
+    config.validate_against_builtins(&kaibo::sandbox::builtin_names()?)?;
+
     tracing::info!(
         provider = %config.default_provider,
         root = ?config.root.as_ref().map(|p| p.display().to_string()),

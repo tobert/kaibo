@@ -1,10 +1,7 @@
 # kaibo configuration
 
 Status: **implemented** (`src/config.rs`, tested in `tests/config.rs`). This doc is
-the rationale and reference; the code is ground truth. One deferral: the `[sandbox]`
-tunables below are **not** wired yet — they remain code constants in
-`src/sandbox.rs`, and a `[sandbox]` table is rejected at load rather than silently
-ignored (tracked in `docs/issues.md`).
+the rationale and reference; the code is ground truth.
 
 ## Why
 
@@ -118,8 +115,9 @@ else is mechanical:
 | synth max turns | `defaults.synth_max_turns` | `KAIBO_SYNTH_MAX_TURNS` | *(per-call only)* |
 | max output tokens | `defaults.max_tokens` *(per-profile override)* | `KAIBO_MAX_TOKENS` | — |
 | thinking budget | `defaults.thinking_budget` *(per-profile override)* | `KAIBO_THINKING_BUDGET` | — |
-| exec timeout (s) | *(deferred — code constant)* | — | — |
-| output cap (bytes) | *(deferred — code constant)* | — | — |
+| exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
+| output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
+| disable extra builtins | `sandbox.disable_builtins` *(list; file-only)* | — | — |
 
 **Two deliberate exceptions to the rule:**
 
