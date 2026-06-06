@@ -108,14 +108,20 @@ rot (rig 0.34's bundled `CLAUDE_*` / gemini consts are already retired — see t
 source-of-truth pal configs (`provider-model-ids` memory). Consider validating ids
 at startup, or a tiny config file.
 
-### DeepSeek and Gemini paths are unverified end-to-end
-Only the Anthropic path has been dogfooded. DeepSeek and Gemini are wired
-(`consult.rs`, generic over rig's `CompletionClient`) and compile, but no live test
-has exercised them — provider quirks (gemini tool-calling, deepseek reasoning
-fields) may bite. Add opt-in live tests gated on each key, like the Anthropic one.
-Lemonade has an `#[ignore]`d live test (`consult.rs::two_phase_consult_runs_against_local_gemma`)
-but is otherwise in the same boat — gemma's tool-calling fidelity over many explorer
-turns is unproven.
+### Thinking config tracks model generation (Gemini), and budgets are static
+Thinking is on by default, both phases (`consult.rs::thinking_params`): Anthropic
+`thinking`, Gemini `generationConfig.thinkingConfig`. Two watch-items:
+- **Gemini 2.5 vs 3.** kaibo sends `thinkingBudget` (the 2.5 field). `gemini-3.5-flash`
+  accepted it in the 2026-06-06 live test, but Gemini *3* officially uses
+  `thinkingLevel` (mutually exclusive with budget). If a default id moves fully to a
+  3.x line that rejects `thinkingBudget`, switch that arm to `thinkingLevel`.
+- **Static budget.** `THINKING_BUDGET` (8192) and `max_tokens` (16384) are constants,
+  not per-model/per-phase. Fine today; if a provider caps output below 16384 it'll
+  400 (DeepSeek accepted 16384 in testing) — cap that arm rather than lowering the
+  global, per the `large-token-headroom` memory.
+
+All four provider paths now have opt-in live tests (`tests/consult.rs`,
+`#[ignore]`d, gated on a key/endpoint) and passed with thinking on.
 
 ### A small local context window makes uncapped output acute
 A local server's context window can be far smaller than the model advertises
@@ -124,7 +130,9 @@ serving it at `--ctx-size 4096` before we bumped it). The explorer dumps file
 contents over up to 50 turns, so on a tight window a single wide `cat`/`rg` blows
 it. kaibo can't size the server's ctx (a lemonade launch flag), but it *can* stop
 flooding: wiring kaish's `OutputLimitConfig` (the P2 "run_kaish output is uncapped"
-issue) matters more for local models than for the hosted providers.
+issue) matters more for local models than for the hosted providers. Thinking-on
+makes this tighter still: reasoning now also draws on the 16384 `max_tokens`, so a
+local server needs a context window comfortably above input + reasoning + answer.
 
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call

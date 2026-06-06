@@ -18,6 +18,7 @@ use anyhow::{anyhow, Context, Result};
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
 use rig::providers::{anthropic, deepseek, gemini, openai};
+use serde_json::{json, Value};
 
 use crate::credentials::{self, Provider};
 use crate::explorer::RunKaish;
@@ -48,6 +49,43 @@ You also have the `run_kaish` tool (read-only kaish shell) as a FALLBACK: use it
 sparingly to fetch or confirm a precise span the report pointed to but didn't fully \
 quote. Do not re-explore from scratch — the report is primary, the tool is a \
 backstop for a specific gap.";
+
+/// Token budget for model "thinking"/reasoning, for the providers that expose a
+/// request-time toggle. Sized well under [`ConsultConfig`]'s `max_tokens` so the
+/// reasoning never starves the actual answer (a thinking model that spends its
+/// whole budget reasoning returns empty content — we saw exactly that on Gemma).
+/// Anthropic additionally *requires* `max_tokens > budget_tokens`.
+pub const THINKING_BUDGET: u64 = 8192;
+
+/// Provider-specific request params that turn **thinking on**, or `None` when the
+/// provider reasons without a switch.
+///
+/// - **Anthropic** — a top-level `thinking` block; rig flattens `additional_params`
+///   straight into the Messages request.
+/// - **Gemini** — `generationConfig.thinkingConfig` (camelCase; rig parses this
+///   into a typed `GenerationConfig`, so the shape must be exact). Note: Gemini 3
+///   models take `thinkingLevel` instead of `thinkingBudget` — if a default model
+///   id moves to a 3.x line this may need to switch (tracked in `docs/issues.md`).
+/// - **DeepSeek** — reasoner models (`*-pro`) emit `reasoning_content` on their own;
+///   there is no request toggle. `None`.
+/// - **Lemonade/Gemma** — the local server already reasons (`--reasoning-format
+///   auto`); nothing to send. `None`.
+pub fn thinking_params(provider: Provider) -> Option<Value> {
+    match provider {
+        Provider::Anthropic => Some(json!({
+            "thinking": { "type": "enabled", "budget_tokens": THINKING_BUDGET }
+        })),
+        Provider::Gemini => Some(json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "thinkingBudget": THINKING_BUDGET,
+                    "includeThoughts": true
+                }
+            }
+        })),
+        Provider::DeepSeek | Provider::Lemonade => None,
+    }
+}
 
 /// Default (explorer, synth) model ids per provider. Values drift — see the
 /// `provider-model-ids` note for the source-of-truth configs they track.
@@ -84,7 +122,10 @@ impl Default for ConsultConfig {
             // expensive model and only needs a few fallback fetches, so keep it lean.
             explorer_max_turns: 50,
             synth_max_turns: 8,
-            max_tokens: 4096,
+            // Generous output headroom by design: few high-value turns, not long
+            // chats, and **thinking is on** — reasoning eats this budget, so it must
+            // sit well above THINKING_BUDGET or the answer gets truncated to empty.
+            max_tokens: 16384,
         }
     }
 }
@@ -131,18 +172,23 @@ async fn run_phase<C>(
     root: &Path,
     user_prompt: String,
     max_turns: usize,
+    thinking: Option<&Value>,
 ) -> Result<String>
 where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
     let worker = KaishWorker::spawn(root)?;
-    let agent = client
+    let mut builder = client
         .agent(model)
         .preamble(preamble)
         .max_tokens(max_tokens)
-        .tool(RunKaish::new(worker))
-        .build();
+        .tool(RunKaish::new(worker));
+    // Thinking on (both phases) where the provider takes a request-time toggle.
+    if let Some(params) = thinking {
+        builder = builder.additional_params(params.clone());
+    }
+    let agent = builder.build();
     agent
         .prompt(user_prompt)
         .max_turns(max_turns)
@@ -170,6 +216,7 @@ async fn consult_with<C>(
     explorer_model: &str,
     synth_model: &str,
     cfg: &ConsultConfig,
+    thinking: Option<&Value>,
 ) -> Result<ConsultOutput>
 where
     C: CompletionClient,
@@ -183,6 +230,7 @@ where
         root,
         question.to_string(),
         cfg.explorer_max_turns,
+        thinking,
     )
     .await
     .context("explore phase")?;
@@ -195,6 +243,7 @@ where
         root,
         synth_user_prompt(question, &report),
         cfg.synth_max_turns,
+        thinking,
     )
     .await
     .context("synth phase")?;
@@ -214,6 +263,9 @@ pub async fn consult(
 ) -> Result<ConsultOutput> {
     let root = root.into();
     let (explorer_model, synth_model) = cfg.resolved_models(provider);
+    // Thinking on, both phases, where the provider takes a request-time toggle.
+    let thinking = thinking_params(provider);
+    let thinking = thinking.as_ref();
 
     // Keyed providers load a key; the local one is reached by base URL instead,
     // so credential loading is per-arm rather than shared up front.
@@ -222,19 +274,22 @@ pub async fn consult(
             let key = credentials::load(provider)?;
             let client =
                 anthropic::Client::new(&key).map_err(|e| anyhow!("anthropic client init: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
+            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
+                .await
         }
         Provider::DeepSeek => {
             let key = credentials::load(provider)?;
             let client =
                 deepseek::Client::new(&key).map_err(|e| anyhow!("deepseek client init: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
+            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
+                .await
         }
         Provider::Gemini => {
             let key = credentials::load(provider)?;
             let client =
                 gemini::Client::new(&key).map_err(|e| anyhow!("gemini client init: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
+            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
+                .await
         }
         Provider::Lemonade => {
             // Local OpenAI-compatible server: point rig's completions client at
@@ -246,7 +301,8 @@ pub async fn consult(
                 .base_url(&base_url)
                 .build()
                 .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg).await
+            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
+                .await
         }
     }
 }
