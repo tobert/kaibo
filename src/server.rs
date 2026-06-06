@@ -17,6 +17,8 @@ use serde::Deserialize;
 
 use crate::consult::{consult, ConsultConfig};
 use crate::credentials::Provider;
+use crate::explorer::format_output;
+use crate::sandbox::KaishWorker;
 
 /// Arguments to the `consult` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -50,6 +52,19 @@ pub struct ConsultInput {
     pub synth_max_turns: Option<usize>,
 }
 
+/// Arguments to the `run_kaish` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunKaishInput {
+    /// The kaish (sh-like) script to run against the read-only project.
+    pub script: String,
+
+    /// Absolute path to the project. Optional only if the server was launched
+    /// with a default `--root`. Each call starts at this root — there is no
+    /// persistent cwd across calls.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 /// kaibo's MCP handler. Cheap to clone (rmcp clones it per request).
 #[derive(Clone)]
 pub struct KaiboHandler {
@@ -68,6 +83,20 @@ impl KaiboHandler {
         }
     }
 
+    /// Resolve a call's project root: the explicit `path`, else the server's
+    /// `--root`. A call with neither is a parameter error, not a silent default.
+    fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
+        match path {
+            Some(p) => Ok(PathBuf::from(p)),
+            None => self.default_root.clone().ok_or_else(|| {
+                McpError::invalid_params(
+                    "no `path` provided and the server has no default --root",
+                    None,
+                )
+            }),
+        }
+    }
+
     #[tool(
         description = "Investigate a question about a codebase and return a grounded, \
             cited answer. A cheap explorer model reads the project through a read-only \
@@ -81,15 +110,7 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<ConsultInput>,
     ) -> Result<CallToolResult, McpError> {
-        let root = match input.path {
-            Some(p) => PathBuf::from(p),
-            None => self.default_root.clone().ok_or_else(|| {
-                McpError::invalid_params(
-                    "no `path` provided and the server has no default --root",
-                    None,
-                )
-            })?,
-        };
+        let root = self.resolve_root(input.path)?;
 
         let provider = match input.provider {
             Some(s) => s
@@ -112,6 +133,34 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(out.answer)]))
+    }
+
+    #[tool(
+        description = "Run a kaish (sh-like) script against the read-only project; \
+            returns exit code + stdout + stderr. Browse code with line numbers: \
+            `cat -n FILE`, `rg -n PATTERN`, `cat -n FILE | sed -n '40,80p'`; compose \
+            builtins with pipes (grep/jq/awk/find/...). Read-only: writes and external \
+            commands are refused (exit 126 = blocked by the sandbox; a script killed \
+            for running too long exits 124). Each call starts at the project root — \
+            there is no persistent cwd. Args: script (required), path (project dir; \
+            optional if the server has a default root)."
+    )]
+    pub async fn run_kaish(
+        &self,
+        Parameters(input): Parameters<RunKaishInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.resolve_root(input.path)?;
+
+        // A fresh worker (and kernel) per call: stateless, starts at root, and the
+        // !Send kernel stays on its own thread so this future stays Send.
+        let worker = KaishWorker::spawn(&root)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let out = worker
+            .run(input.script)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format_output(&out))]))
     }
 }
 

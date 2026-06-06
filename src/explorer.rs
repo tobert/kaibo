@@ -129,8 +129,8 @@ impl Tool for RunKaish {
     }
 }
 
-/// Render an execution as the flat text the model reads back.
-fn format_output(o: &KaishOutput) -> String {
+/// Render an execution as the flat text the model (or an MCP caller) reads back.
+pub(crate) fn format_output(o: &KaishOutput) -> String {
     let mut s = format!("exit: {}\n", o.code);
     if !o.stdout.is_empty() {
         s.push_str("--- stdout ---\n");
