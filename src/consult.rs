@@ -1,18 +1,23 @@
-//! Two-phase `consult` (the dpal pattern), across providers.
+//! `consult` and the seams it's composed from, across providers.
 //!
-//! 1. **Explore** — a cheap model drives the read-only kaish sandbox via
-//!    `run_kaish` and writes a *curated report*: relevant files, `file:line`
-//!    locations, short quoted snippets. It does NOT write the final answer.
-//! 2. **Synthesize** — a stronger model writes the answer grounded in that
-//!    report, with `run_kaish` available as a *fallback* to fetch a precise span
-//!    the report pointed to but didn't fully quote.
+//! One primitive — [`run_phase`]: a model + preamble + an injected toolset, run as
+//! a bounded tool loop. Every tool on the surface is that loop wearing different
+//! clothes:
 //!
-//! Provider choice (Anthropic / DeepSeek / Gemini) only changes which client is
-//! constructed; the phase logic is shared generically via [`CompletionClient`].
-//! Each phase gets its own fresh [`KaishWorker`] (kernel rooted at the project),
-//! so the synth starts at the root rather than wherever the explorer wandered.
+//! - [`explore`] — a cheap model · `{run_kaish}` → a curated report.
+//! - [`synthesize`] — a capable model · `{run_kaish}` · optional context → an answer.
+//! - [`consult`] — a capable model · `{run_kaish, explore′}` → a cited answer. No
+//!   rigid explorer→synth hand-off: the capable model decides when to delegate a
+//!   broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span directly.
+//!
+//! Provider choice (Anthropic / DeepSeek / Gemini / Lemonade) only changes which
+//! client is constructed (see `with_provider_client!`); the loop is shared
+//! generically via [`CompletionClient`]. Each tool gets its own fresh
+//! [`KaishWorker`] (a kernel rooted at the project), and so does every `explore′`
+//! delegation.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use rig::client::CompletionClient;
@@ -163,10 +168,12 @@ impl Default for ConsultConfig {
         Self {
             explorer_model: None,
             synth_model: None,
-            // The explorer is cheap and tool-heavy — let it rip. The synth is the
-            // expensive model and only needs a few fallback fetches, so keep it lean.
+            // explorer_max_turns bounds each cheap explore′ sweep — let it rip.
+            // synth_max_turns now bounds the recomposed consult's *whole* driver
+            // loop (it delegates sweeps AND reads spans), so the old 8 was far too
+            // low — a multi-part question blew it. ≥100 gives the driver room.
             explorer_max_turns: 50,
-            synth_max_turns: 8,
+            synth_max_turns: 100,
             // Generous output headroom by design: few high-value turns, not long
             // chats, and **thinking is on** — reasoning eats this budget, so it must
             // sit well above THINKING_BUDGET or the answer gets truncated to empty.
@@ -274,9 +281,14 @@ pub struct RunExplore<C> {
     max_turns: usize,
     thinking: Option<Value>,
     root: PathBuf,
+    /// Every delegated report is appended here, so the caller can surface what the
+    /// sweeps found (the recomposed `consult`'s `report`) and a test can observe
+    /// that a delegation actually happened.
+    reports: Arc<Mutex<Vec<String>>>,
 }
 
 impl<C> RunExplore<C> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: C,
         model: impl Into<String>,
@@ -284,6 +296,7 @@ impl<C> RunExplore<C> {
         max_turns: usize,
         thinking: Option<Value>,
         root: impl Into<PathBuf>,
+        reports: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         Self {
             client,
@@ -292,6 +305,7 @@ impl<C> RunExplore<C> {
             max_turns,
             thinking,
             root: root.into(),
+            reports,
         }
     }
 }
@@ -350,7 +364,7 @@ where
         let worker = KaishWorker::spawn(&self.root).map_err(|e| RunExploreError(e.to_string()))?;
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(RunKaish::new(worker))];
         // Reuse the one loop — explore′ is just run_phase with the explorer model.
-        run_phase(
+        let report = run_phase(
             &self.client,
             &self.model,
             &report_preamble(),
@@ -361,7 +375,13 @@ where
             tools,
         )
         .await
-        .map_err(|e| RunExploreError(format!("{e:#}")))
+        .map_err(|e| RunExploreError(format!("{e:#}")))?;
+        // Lock poisoning means another delegation panicked — surface it, don't mask.
+        self.reports
+            .lock()
+            .expect("explore report sink poisoned")
+            .push(report.clone());
+        Ok(report)
     }
 }
 
@@ -504,7 +524,63 @@ pub async fn synthesize(
     })
 }
 
-/// Run both phases against an already-constructed provider client.
+/// The recomposed `consult` driver: one capable model, two tools. Composes the
+/// shared [`KAISH_SYNTAX_CORE`] (for `run_kaish`) and frames `explore` as the way
+/// to cover breadth. Positive framing on purpose — weaker/local models loop on
+/// blanket prohibitions, so reinforce the grounded behavior we want.
+pub fn consult_preamble() -> String {
+    format!(
+        "You answer a question about a codebase, grounded in evidence and citing \
+         concrete `file:line`. {KAISH_SYNTAX_CORE}\n\n\
+         You also have a second tool, `explore`: it delegates a broad sweep to a \
+         fast investigator that rips through the repo and reports back with \
+         `file:line` citations. Reach for `explore` to cover breadth — find where a \
+         thing lives, gather the relevant files — and use `run_kaish` to read a \
+         precise span yourself and confirm a detail. Build your answer from what \
+         they return: quote the key snippet, name its `file:line`, and let the \
+         evidence carry the claim. Where the evidence settles the question, answer \
+         it fully; where it reaches its edge, say so and name what would close the gap."
+    )
+}
+
+/// Build the recomposed `consult` toolset: `{run_kaish, explore′}`. Factored out so
+/// the wiring (both tools present, explore′ pointed at the cheap model) is
+/// unit-testable without a live model. `reports` collects each `explore′` sweep.
+fn consult_tools<C>(
+    client: &C,
+    explorer_model: &str,
+    root: &Path,
+    cfg: &ConsultConfig,
+    thinking: Option<&Value>,
+    reports: Arc<Mutex<Vec<String>>>,
+) -> Result<Vec<Box<dyn ToolDyn>>>
+where
+    C: CompletionClient + Clone + Send + Sync + 'static,
+    C::CompletionModel: 'static,
+{
+    // run_kaish for precise reads by the consult model itself.
+    let worker = KaishWorker::spawn(root)?;
+    // explore′ for delegated breadth: same explore unit, wrapped as a tool, pointed
+    // at the cheap explorer model. Bounded by explorer_max_turns per sweep; no cap
+    // on how many times consult may delegate (Amy's call — watch real behavior).
+    let explore = RunExplore::new(
+        client.clone(),
+        explorer_model,
+        cfg.max_tokens,
+        cfg.explorer_max_turns,
+        thinking.cloned(),
+        root,
+        reports,
+    );
+    Ok(vec![Box::new(RunKaish::new(worker)), Box::new(explore)])
+}
+
+/// Run a `consult` against an already-constructed provider client.
+///
+/// One loop, two tools — no rigid explorer→synth hand-off. The capable model
+/// decides when to delegate a sweep to the cheap `explore′` vs. read a span
+/// directly with `run_kaish`. `ConsultOutput.report` aggregates whatever the
+/// `explore′` sweeps returned (empty if the model read everything itself).
 async fn consult_with<C>(
     client: &C,
     question: &str,
@@ -515,41 +591,29 @@ async fn consult_with<C>(
     thinking: Option<&Value>,
 ) -> Result<ConsultOutput>
 where
-    C: CompletionClient,
+    C: CompletionClient + Clone + Send + Sync + 'static,
     C::CompletionModel: 'static,
 {
-    // Each phase gets its own fresh worker (kernel rooted at the project) so the
-    // synth starts at the root rather than wherever the explorer wandered.
-    let explore_tools: Vec<Box<dyn ToolDyn>> =
-        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
-    let report = run_phase(
-        client,
-        explorer_model,
-        &report_preamble(),
-        cfg.max_tokens,
-        question.to_string(),
-        cfg.explorer_max_turns,
-        thinking,
-        explore_tools,
-    )
-    .await
-    .context("explore phase")?;
+    let reports = Arc::new(Mutex::new(Vec::<String>::new()));
+    let tools = consult_tools(client, explorer_model, root, cfg, thinking, reports.clone())?;
 
-    let synth_tools: Vec<Box<dyn ToolDyn>> =
-        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
     let answer = run_phase(
         client,
         synth_model,
-        SYNTH_PREAMBLE,
+        &consult_preamble(),
         cfg.max_tokens,
-        synth_user_prompt(question, &report),
+        question.to_string(),
         cfg.synth_max_turns,
         thinking,
-        synth_tools,
+        tools,
     )
     .await
-    .context("synth phase")?;
+    .context("consult loop")?;
 
+    let report = reports
+        .lock()
+        .expect("explore report sink poisoned")
+        .join("\n\n---\n\n");
     Ok(ConsultOutput { answer, report })
 }
 
@@ -572,4 +636,28 @@ pub async fn consult(
     with_provider_client!(provider, |client| {
         consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking).await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// The recomposed consult must drive BOTH tools: a direct `run_kaish` and the
+    /// delegated `explore′`. Pin the wiring offline — no model, just the toolset.
+    #[test]
+    fn consult_toolset_has_both_run_kaish_and_explore() {
+        let dir = tempdir().unwrap();
+        // Construction is offline (no network): the key is never validated here.
+        let client = anthropic::Client::new("test-key").unwrap();
+        let cfg = ConsultConfig::default();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+
+        let tools = consult_tools(&client, "explorer-model", dir.path(), &cfg, None, reports)
+            .expect("building the consult toolset should succeed");
+
+        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.iter().any(|n| n == "run_kaish"), "missing run_kaish, got {names:?}");
+        assert!(names.iter().any(|n| n == "explore"), "missing explore′, got {names:?}");
+    }
 }

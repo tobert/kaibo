@@ -115,9 +115,14 @@ fn lemonade_defaults_to_cheap_gemma_explorer_strong_gemma_synth() {
     );
 }
 
+// The recomposed consult (one loop, {run_kaish, explore′}) on the weakest target —
+// the §2.1 weak-model validation. Asserts a grounded answer; the aggregated report
+// is non-empty iff the model chose to delegate to explore′, which we log but do NOT
+// assert (Gemma may read directly — a fixed pipeline is more robust for weak models,
+// per the panel; if delegation proves shaky here, that's a note, not a failure).
 #[tokio::test]
-#[ignore = "hits the local lemonade server (explore + synth); run with --ignored while it's up"]
-async fn two_phase_consult_runs_against_local_gemma() {
+#[ignore = "hits the local lemonade server (consult, one loop); run with --ignored while it's up"]
+async fn recomposed_consult_runs_against_local_gemma() {
     let root = env!("CARGO_MANIFEST_DIR");
     let cfg = ConsultConfig::default();
 
@@ -130,8 +135,12 @@ async fn two_phase_consult_runs_against_local_gemma() {
     .await
     .expect("consult against local gemma should succeed");
 
-    eprintln!("=== REPORT (gemma explorer) ===\n{}\n", out.report);
-    eprintln!("=== ANSWER (gemma synth) ===\n{}\n", out.answer);
+    eprintln!(
+        "=== explore′ delegated {} time(s); aggregated report ===\n{}\n",
+        out.report.matches("---").count() + if out.report.is_empty() { 0 } else { 1 },
+        out.report
+    );
+    eprintln!("=== ANSWER ===\n{}\n", out.answer);
 
     let lower = out.answer.to_lowercase();
     assert!(
