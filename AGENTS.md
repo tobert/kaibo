@@ -5,14 +5,25 @@ Critical orientation for agents working on kaibo. Short by design; the code and
 
 ## What kaibo is
 
-A stdio MCP server with one tool, `consult`: ask a question about a codebase, get
-a grounded, cited answer. Two-phase (the dpal pattern): a cheap **explorer** model
-drives a **read-only** kaish shell via `run_kaish(script)` and writes a curated
-report; a stronger **synthesizer** model answers from that report (with `run_kaish`
-as a fallback). Multi-provider over `rig-core`: keyed Anthropic / DeepSeek / Gemini,
-plus **Lemonade** — a local, keyless OpenAI-compatible server (Gemma-4) reached by
-base URL (`LEMONADE_BASE_URL`, default `http://localhost:13305/api/v1`).
-kaibo never modifies the project and cannot run external commands.
+A stdio MCP server that answers questions about a codebase with grounded, cited
+answers, read-only. **One primitive, four tools.** The primitive is `run_phase`
+(`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
+loop. Every tool is that loop wearing different clothes:
+
+- **`consult`** — a capable model with `{run_kaish, explore′}`: it reads precise
+  spans directly and delegates broad sweeps to a cheap explorer sub-agent, then
+  answers. No rigid explorer→synth hand-off; the model chooses.
+- **`explore`** — a cheap model with `{run_kaish}` → a curated report (the seam).
+- **`synthesize`** — a capable model with `{run_kaish}` + optional caller `context`
+  → an answer (investigates directly when context is thin).
+- **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
+
+Each tool is independently gated by a `--no-<tool>` flag (all on by default;
+all-four-off is refused at startup). Multi-provider over `rig-core`: keyed
+Anthropic / DeepSeek / Gemini, plus **Lemonade** — a local, keyless
+OpenAI-compatible server (Gemma-4) reached by base URL (`LEMONADE_BASE_URL`,
+default `http://localhost:13305/api/v1`). kaibo never modifies the project and
+cannot run external commands.
 
 ## Invariants — do not weaken without a failing-first test
 
