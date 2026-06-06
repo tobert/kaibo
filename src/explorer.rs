@@ -18,25 +18,19 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::kaish_syntax::{run_kaish_tool_description, KAISH_SYNTAX_CORE};
 use crate::sandbox::{KaishOutput, KaishWorker};
 
-/// System prompt for the explorer. It leans on kaish being a *shell*, not a
-/// fixed set of read tools — composition is the whole point.
-pub const EXPLORER_PREAMBLE: &str = "\
-You are a code explorer. You investigate a project on a READ-ONLY filesystem by \
-calling the `run_kaish` tool, which runs a kaish (sh-like) script and returns its \
-exit code, stdout, and stderr.
-
-You have kaish's builtins and pipelines: ls, cat, head, tail, grep, rg, find, jq, \
-awk, cut, sed, sort, uniq, wc, diff, tree, and more. Compose them with pipes and \
-`$(...)` — e.g. `rg -l TODO src | head`, `cat Cargo.toml | grep '^name'`. Each call \
-starts at the project root.
-
-The sandbox is read-only and offline: writes, `git`, `touch`, `spawn`, and any \
-external command are refused — don't try to work around that, just read.
-
-Work iteratively: look, then narrow. When you have enough, answer the question \
-directly and concretely, citing concrete paths and `file:line` where you can.";
+/// System prompt for the explorer. Composes the shared [`KAISH_SYNTAX_CORE`] (so
+/// the shell idioms and exit-code contract never drift) with the explorer's task.
+pub fn explorer_preamble() -> String {
+    format!(
+        "You are a code explorer. {KAISH_SYNTAX_CORE}\n\n\
+         Work iteratively: look, then narrow. When you have enough, answer the \
+         question directly and concretely, citing concrete paths and `file:line` \
+         where you can."
+    )
+}
 
 /// Tunables for one explore pass.
 #[derive(Debug, Clone)]
@@ -101,11 +95,7 @@ impl Tool for RunKaish {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Run a kaish (sh-like) script against the read-only project \
-                and return its exit code, stdout, and stderr. Use builtins and pipes \
-                (ls, cat, grep, rg, find, jq, awk, ...). Writes and external commands \
-                are refused."
-                .to_string(),
+            description: run_kaish_tool_description(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -164,7 +154,7 @@ pub async fn explore(
 
     let agent = client
         .agent(cfg.model.as_str())
-        .preamble(EXPLORER_PREAMBLE)
+        .preamble(&explorer_preamble())
         .max_tokens(cfg.max_tokens)
         .tool(RunKaish::new(worker))
         .build();

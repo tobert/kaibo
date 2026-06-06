@@ -22,22 +22,23 @@ use serde_json::{json, Value};
 
 use crate::credentials::{self, Provider};
 use crate::explorer::RunKaish;
+use crate::kaish_syntax::KAISH_SYNTAX_CORE;
 use crate::sandbox::KaishWorker;
 
-/// Explorer preamble: gather and organize evidence, don't conclude.
-pub const REPORT_PREAMBLE: &str = "\
-You are a code explorer. You investigate a project on a READ-ONLY filesystem by \
-calling the `run_kaish` tool, which runs a kaish (sh-like) script and returns its \
-exit code, stdout, and stderr. You have kaish's builtins and pipelines: ls, cat, \
-head, grep, rg, find, jq, awk, cut, sort, wc, diff, tree, and more — compose them \
-with pipes and `$(...)`. Each call starts at the project root. Writes, `git`, \
-`touch`, and external commands are refused.
-
-Your job is NOT to write a polished answer. Investigate the question, then produce \
-a CURATED REPORT for a synthesizer who will write the final answer: list the \
-relevant files with `file:line` locations, quote the short key snippets verbatim, \
-and note what each means for the question. Be precise and evidence-first; omit \
-filler. The synthesizer trusts your citations, so make them exact.";
+/// Explorer preamble: gather and organize evidence, don't conclude. Composes the
+/// shared [`KAISH_SYNTAX_CORE`] so the shell idioms and exit-code contract are
+/// stated in exactly one place.
+pub fn report_preamble() -> String {
+    format!(
+        "You are a code explorer. {KAISH_SYNTAX_CORE}\n\n\
+         Your job is NOT to write a polished answer. Investigate the question, then \
+         produce a CURATED REPORT for a synthesizer who will write the final answer: \
+         list the relevant files with `file:line` locations, quote the short key \
+         snippets verbatim, and note what each means for the question. Be precise and \
+         evidence-first; omit filler. The synthesizer trusts your citations, so make \
+         them exact."
+    )
+}
 
 /// Synth preamble: answer from the report, reach for tools only to fill a gap.
 pub const SYNTH_PREAMBLE: &str = "\
@@ -225,7 +226,7 @@ where
     let report = run_phase(
         client,
         explorer_model,
-        REPORT_PREAMBLE,
+        &report_preamble(),
         cfg.max_tokens,
         root,
         question.to_string(),

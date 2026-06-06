@@ -133,3 +133,31 @@ async fn spawn_is_blocked() {
     let r = run(&kernel, "spawn /bin/echo escaped").await.unwrap();
     assert!(!r.ok(), "spawn must be denied, got code={}", r.code);
 }
+
+/// The exit-code contract a caller-facing `run_kaish` advertises: a *sandbox
+/// block* is exit 126, and that's distinguishable from an ordinary *script
+/// failure*. An automated caller keys off this to tell "the boundary refused you"
+/// from "your command failed", so pin that 126 is not just "any non-zero".
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_is_126_and_distinct_from_a_plain_failure() {
+    let dir = tempdir().unwrap();
+    let kernel = build_readonly_kernel(dir.path()).unwrap();
+
+    // A denylisted builtin → 126 + the sandbox marker.
+    let blocked = run(&kernel, "touch anything.txt").await.unwrap();
+    assert_eq!(blocked.code, 126, "a sandbox block must be exit 126, got {blocked:?}");
+    assert!(
+        blocked.err.contains("read-only sandbox"),
+        "the 126 must carry the sandbox marker (126 also means POSIX not-executable), got {:?}",
+        blocked.err
+    );
+
+    // An ordinary read failure → non-zero but NOT 126, so it can't be mistaken
+    // for a block.
+    let failed = run(&kernel, "cat does-not-exist.txt").await.unwrap();
+    assert!(!failed.ok(), "reading a missing file must fail, got {failed:?}");
+    assert_ne!(
+        failed.code, 126,
+        "a plain failure must not collide with the 126 sandbox-block code, got {failed:?}"
+    );
+}

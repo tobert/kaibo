@@ -8,17 +8,24 @@ use std::path::PathBuf;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    AnnotateAble, CallToolResult, Content, Implementation, ListResourcesResult,
+    PaginatedRequestParams, ProtocolVersion, RawResource, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::service::RequestContext;
 use rmcp::ErrorData as McpError;
-use rmcp::{tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
 
 use crate::consult::{consult, ConsultConfig};
 use crate::credentials::Provider;
 use crate::explorer::format_output;
+use crate::kaish_syntax::kaish_syntax_resource;
 use crate::sandbox::KaishWorker;
+
+/// The one resource kaibo serves: the verbose kaish cheatsheet.
+const KAISH_SYNTAX_URI: &str = "kaibo://kaish-syntax";
 
 /// Arguments to the `consult` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -142,8 +149,9 @@ impl KaiboHandler {
             builtins with pipes (grep/jq/awk/find/...). Read-only: writes and external \
             commands are refused (exit 126 = blocked by the sandbox; a script killed \
             for running too long exits 124). Each call starts at the project root — \
-            there is no persistent cwd. Args: script (required), path (project dir; \
-            optional if the server has a default root)."
+            there is no persistent cwd. Full reference: the `kaibo://kaish-syntax` \
+            resource. Args: script (required), path (project dir; optional if the \
+            server has a default root)."
     )]
     pub async fn run_kaish(
         &self,
@@ -169,7 +177,10 @@ impl rmcp::ServerHandler for KaiboHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
             server_info: Implementation {
                 name: "kaibo".to_string(),
@@ -186,5 +197,90 @@ impl rmcp::ServerHandler for KaiboHandler {
                     .to_string(),
             ),
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult {
+            resources: kaibo_resources(),
+            ..Default::default()
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        read_kaibo_resource(&request.uri)
+    }
+}
+
+/// The resources kaibo advertises. Pure (no `self`, no transport) so the dispatch
+/// is unit-testable without fabricating a `RequestContext`.
+fn kaibo_resources() -> Vec<rmcp::model::Resource> {
+    let resource = RawResource {
+        mime_type: Some("text/markdown".to_string()),
+        description: Some(
+            "kaish read-only shell cheatsheet: line-number browsing idioms, \
+             builtins, and the exit-code contract."
+                .to_string(),
+        ),
+        ..RawResource::new(KAISH_SYNTAX_URI, "kaish syntax")
+    };
+    vec![resource.no_annotation()]
+}
+
+/// Read one kaibo resource by URI. An unknown URI is a not-found error, not a
+/// silent empty result — a caller asking for the wrong thing should hear so.
+fn read_kaibo_resource(uri: &str) -> Result<ReadResourceResult, McpError> {
+    if uri != KAISH_SYNTAX_URI {
+        return Err(McpError::resource_not_found(
+            format!("unknown resource: {uri}"),
+            None,
+        ));
+    }
+    Ok(ReadResourceResult {
+        contents: vec![ResourceContents::text(kaish_syntax_resource(), KAISH_SYNTAX_URI)],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_the_kaish_syntax_resource() {
+        let uris: Vec<String> = kaibo_resources()
+            .into_iter()
+            .map(|r| r.raw.uri)
+            .collect();
+        assert!(
+            uris.iter().any(|u| u == KAISH_SYNTAX_URI),
+            "list_resources must advertise {KAISH_SYNTAX_URI}, got {uris:?}"
+        );
+    }
+
+    #[test]
+    fn reads_the_kaish_syntax_resource_with_the_idioms_and_codes() {
+        let result = read_kaibo_resource(KAISH_SYNTAX_URI).expect("known uri must read");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            other => panic!("expected text contents, got {other:?}"),
+        };
+        for needle in ["cat -n", "rg", "read-only", "126", "124"] {
+            assert!(text.contains(needle), "resource must mention {needle:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_resource_uri_is_an_error() {
+        assert!(
+            read_kaibo_resource("kaibo://nope").is_err(),
+            "an unknown URI must be a not-found error, not an empty success"
+        );
     }
 }
