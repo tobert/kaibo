@@ -120,6 +120,16 @@ is fine (no model). Wrap `run_phase`'s `agent.prompt(...).await` in
 (Distinct from the older "consult has no overall timeout" P1 — same root, restated
 now that three model-driven tools share the gap.)
 
+Bumping this up: it bit hard in real use on 2026-06-06. A local `consult`
+(`provider = openai`, Gemma-4-26B synth) hung ~29 min with no result — the
+underlying llama-server had wedged (a 262144-token `--ctx-size --no-mmap` launch:
+GPU 2% busy, one CPU core spinning, never emitting tokens), and kaibo, having no
+LLM-call deadline, simply waited. A local capable-model `consult` is the worst case
+for this gap: weak model, no convergence, no brake. Note this is the *LLM-loop*
+timeout, separate from the per-script kaish timeout (which fired fine). A
+per-`run_phase` `tokio::time::timeout` wrapping `agent.prompt(...)` would have
+surfaced it in seconds instead of tens of minutes.
+
 ### A mock `CompletionClient` test that consult actually delegates to `explore′`
 Gemini's review noted: we pin the consult *toolset wiring* offline and exercise the
 *loop* live, but nothing offline proves the model's tool calls actually drive the
