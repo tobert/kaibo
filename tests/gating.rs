@@ -11,7 +11,9 @@ use kaibo::server::{KaiboHandler, ToolGating};
 const ALL_TOOLS: [&str; 4] = ["consult", "explore", "run_kaish", "synthesize"];
 
 fn advertised(gating: ToolGating) -> Vec<String> {
-    KaiboHandler::new(None, Provider::Anthropic, gating).advertised_tools()
+    KaiboHandler::new(None, Provider::Anthropic, gating)
+        .expect("handler builds")
+        .advertised_tools()
 }
 
 #[test]

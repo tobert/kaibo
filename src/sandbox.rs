@@ -140,6 +140,21 @@ pub fn build_readonly_kernel_with_timeout(
         .context("failed to build read-only kaish kernel")
 }
 
+/// The schemas of every builtin kaibo's kernel registers, sorted by name.
+///
+/// Used to drive `help builtins` / per-builtin help (the `kaibo://kaish/*`
+/// resources) and the composed onboarding instructions. The set is static for a
+/// given build — it depends only on the compiled feature axes, not on the project
+/// root or VFS mode — so we read it from a throwaway `isolated()` kernel (pure
+/// in-memory, no backend) rather than spinning a full read-only mount. The
+/// `DENYLIST` builtins still appear here: shadow-blocking preserves their schema
+/// (only execution is refused), so the help surface matches what's registered.
+pub fn builtin_schemas() -> Result<Vec<ToolSchema>> {
+    let kernel = Kernel::new(KernelConfig::isolated().with_skip_validation(true))
+        .context("failed to build schema kernel")?;
+    Ok(kernel.tool_schemas())
+}
+
 /// Run one kaish script in the sandbox and hand back the raw kernel result.
 ///
 /// A non-zero `code` (or non-empty `err`) is a normal in-band outcome the

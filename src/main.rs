@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         "starting kaibo MCP server on stdio"
     );
 
-    let handler = KaiboHandler::new(args.root, provider, gating);
+    let handler = KaiboHandler::new(args.root, provider, gating)?;
     let service = handler.serve(stdio()).await?;
     service.waiting().await?;
 

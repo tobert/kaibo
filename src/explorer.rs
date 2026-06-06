@@ -18,14 +18,15 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::kaish_syntax::{run_kaish_tool_description, KAISH_SYNTAX_CORE};
+use crate::kaish_syntax::{kaish_syntax_core, run_kaish_tool_description};
 use crate::sandbox::{KaishOutput, KaishWorker};
 
-/// System prompt for the explorer. Composes the shared [`KAISH_SYNTAX_CORE`] (so
+/// System prompt for the explorer. Composes the shared [`kaish_syntax_core`] (so
 /// the shell idioms and exit-code contract never drift) with the explorer's task.
 pub fn explorer_preamble() -> String {
+    let core = kaish_syntax_core();
     format!(
-        "You are a code explorer. {KAISH_SYNTAX_CORE}\n\n\
+        "You are a code explorer. {core}\n\n\
          Work iteratively: look, then narrow. When you have enough, answer the \
          question directly and concretely, citing concrete paths and `file:line` \
          where you can."

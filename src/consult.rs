@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use crate::credentials::{self, Provider};
 use crate::explorer::RunKaish;
-use crate::kaish_syntax::KAISH_SYNTAX_CORE;
+use crate::kaish_syntax::kaish_syntax_core;
 use crate::sandbox::KaishWorker;
 
 /// Construct the rig client for `$provider` (loading its key, or the base URL and
@@ -80,11 +80,12 @@ macro_rules! with_provider_client {
 }
 
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
-/// shared [`KAISH_SYNTAX_CORE`] so the shell idioms and exit-code contract are
+/// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
 pub fn report_preamble() -> String {
+    let core = kaish_syntax_core();
     format!(
-        "You are a code explorer. {KAISH_SYNTAX_CORE}\n\n\
+        "You are a code explorer. {core}\n\n\
          Your job is NOT to write a polished answer. Investigate the question, then \
          produce a CURATED REPORT for a synthesizer who will write the final answer: \
          list the relevant files with `file:line` locations, quote the short key \
@@ -468,10 +469,11 @@ pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
 
 /// Standalone synth preamble: interactive, with `run_kaish` as a first-class
 /// investigation tool (not just a fallback). Composes the shared
-/// [`KAISH_SYNTAX_CORE`] so the shell idioms and exit-code contract don't drift.
+/// [`kaish_syntax_core`] so the shell idioms and exit-code contract don't drift.
 pub fn synthesize_preamble() -> String {
+    let core = kaish_syntax_core();
     format!(
-        "You answer a question about a codebase. {KAISH_SYNTAX_CORE}\n\n\
+        "You answer a question about a codebase. {core}\n\n\
          You may be given CONTEXT — a curated explorer report or pasted material. \
          When context is present, treat it as primary evidence and ground your answer \
          in it, using `run_kaish` to verify a citation or fetch a precise span it \
@@ -533,13 +535,14 @@ pub async fn synthesize(
 }
 
 /// The recomposed `consult` driver: one capable model, two tools. Composes the
-/// shared [`KAISH_SYNTAX_CORE`] (for `run_kaish`) and frames `explore` as the way
+/// shared [`kaish_syntax_core`] (for `run_kaish`) and frames `explore` as the way
 /// to cover breadth. Positive framing on purpose — weaker/local models loop on
 /// blanket prohibitions, so reinforce the grounded behavior we want.
 pub fn consult_preamble() -> String {
+    let core = kaish_syntax_core();
     format!(
         "You answer a question about a codebase, grounded in evidence and citing \
-         concrete `file:line`. {KAISH_SYNTAX_CORE}\n\n\
+         concrete `file:line`. {core}\n\n\
          You also have a second tool, `explore`: it delegates a broad sweep to a \
          fast investigator that rips through the repo and reports back with \
          `file:line` citations. Reach for `explore` to cover breadth — find where a \

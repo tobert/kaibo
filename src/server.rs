@@ -5,12 +5,17 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
+use anyhow::Result;
+use kaish_kernel::tools::ToolSchema;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, CallToolResult, Content, Implementation, ListResourcesResult,
-    PaginatedRequestParams, ProtocolVersion, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    AnnotateAble, CallToolResult, Content, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, ProtocolVersion, RawResource,
+    RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::RequestContext;
@@ -21,11 +26,17 @@ use serde::Deserialize;
 use crate::consult::{consult, explore, synthesize, ConsultConfig};
 use crate::credentials::Provider;
 use crate::explorer::format_output;
-use crate::kaish_syntax::kaish_syntax_resource;
-use crate::sandbox::KaishWorker;
+use crate::kaish_syntax::{kaibo_sandbox_doc, kaibo_instructions, render_builtin_help, render_topic, topics};
+use crate::sandbox::{builtin_schemas, KaishWorker};
 
-/// The one resource kaibo serves: the verbose kaish cheatsheet.
-const KAISH_SYNTAX_URI: &str = "kaibo://kaish-syntax";
+/// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
+const KAISH_RES_PREFIX: &str = "kaibo://kaish/";
+/// kaibo's own read-only boundary doc (replaces the old `kaibo://kaish-syntax`).
+const SANDBOX_URI: &str = "kaibo://kaish/sandbox";
+/// Per-builtin help, addressed by name: `kaibo://kaish/builtin/grep`.
+const BUILTIN_PREFIX: &str = "kaibo://kaish/builtin/";
+/// The URI template advertised for the per-builtin resources.
+const BUILTIN_URI_TEMPLATE: &str = "kaibo://kaish/builtin/{name}";
 
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
@@ -155,15 +166,22 @@ pub struct KaiboHandler {
     default_root: Option<PathBuf>,
     default_provider: Provider,
     tool_router: ToolRouter<Self>,
+    /// The kernel's builtin schemas, snapshotted once at startup. Drives the
+    /// `kaibo://kaish/*` help resources and the composed onboarding instructions.
+    /// `Arc` because rmcp clones the handler per request and these never change.
+    tool_schemas: Arc<Vec<ToolSchema>>,
 }
 
 #[tool_router]
 impl KaiboHandler {
+    /// Build the handler. Snapshots the kernel's builtin schemas up front (a cheap
+    /// in-memory kernel); a failure here is a broken build, surfaced at startup
+    /// rather than papered over with an empty help surface.
     pub fn new(
         default_root: Option<PathBuf>,
         default_provider: Provider,
         gating: ToolGating,
-    ) -> Self {
+    ) -> Result<Self> {
         // `#[tool_router]` gathers every #[tool] method at compile time; gating is a
         // runtime choice, so build the full router and drop the disabled routes by
         // name. (The methods stay compiled — no dead code — they're just not
@@ -186,11 +204,12 @@ impl KaiboHandler {
                 tool_router.remove_route(name);
             }
         }
-        Self {
+        Ok(Self {
             default_root,
             default_provider,
             tool_router,
-        }
+            tool_schemas: Arc::new(builtin_schemas()?),
+        })
     }
 
     /// Tool names this handler advertises, after gating. For tests/diagnostics.
@@ -335,9 +354,10 @@ impl KaiboHandler {
             builtins with pipes (grep/jq/awk/find/...). Read-only: writes and external \
             commands are refused (exit 126 = blocked by the sandbox; a script killed \
             for running too long exits 124). Each call starts at the project root — \
-            there is no persistent cwd. Full reference: the `kaibo://kaish-syntax` \
-            resource. Args: script (required), path (project dir; optional if the \
-            server has a default root)."
+            there is no persistent cwd. Learn more kaish without spending a turn: the \
+            `kaibo://kaish/*` resources (syntax, builtins, vfs, scatter, …) or run \
+            `help`/`help syntax`/`help <builtin>` in the script itself. Args: script \
+            (required), path (project dir; optional if the server has a default root)."
     )]
     pub async fn run_kaish(
         &self,
@@ -376,12 +396,7 @@ impl rmcp::ServerHandler for KaiboHandler {
                 icons: None,
                 website_url: None,
             },
-            instructions: Some(
-                "kaibo (解剖) — ask `consult` a question about a codebase. kaibo explores \
-                 the project read-only through a kaish shell and returns a cited answer. \
-                 It never modifies files and cannot run external commands."
-                    .to_string(),
-            ),
+            instructions: Some(kaibo_instructions(&self.tool_schemas)),
         }
     }
 
@@ -396,41 +411,101 @@ impl rmcp::ServerHandler for KaiboHandler {
         })
     }
 
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult {
+            resource_templates: kaibo_resource_templates(),
+            ..Default::default()
+        })
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        read_kaibo_resource(&request.uri)
+        read_kaibo_resource(&request.uri, &self.tool_schemas)
     }
 }
 
-/// The resources kaibo advertises. Pure (no `self`, no transport) so the dispatch
-/// is unit-testable without fabricating a `RequestContext`.
-fn kaibo_resources() -> Vec<rmcp::model::Resource> {
-    let resource = RawResource {
+/// A `text/markdown` resource at `uri` with `name`/`description`. Small helper so
+/// the listing reads as a table of what kaibo serves.
+fn markdown_resource(uri: &str, name: &str, description: &str) -> rmcp::model::Resource {
+    RawResource {
         mime_type: Some("text/markdown".to_string()),
+        description: Some(description.to_string()),
+        ..RawResource::new(uri, name)
+    }
+    .no_annotation()
+}
+
+/// The resources kaibo advertises: its own read-only sandbox doc plus one per kaish
+/// help topic (sourced from `kaish-help`'s registry, so the list tracks upstream).
+/// Pure (no `self`, no transport) so the dispatch is unit-testable without
+/// fabricating a `RequestContext`.
+fn kaibo_resources() -> Vec<rmcp::model::Resource> {
+    let mut resources = vec![markdown_resource(
+        SANDBOX_URI,
+        "kaibo read-only sandbox",
+        "kaibo's read-only boundary: line-number browsing idioms and the exit-code contract.",
+    )];
+    for (topic, description) in topics() {
+        resources.push(markdown_resource(
+            &format!("{KAISH_RES_PREFIX}{topic}"),
+            &format!("kaish: {topic}"),
+            description,
+        ));
+    }
+    resources
+}
+
+/// The URI templates kaibo advertises: per-builtin help, addressed by name.
+fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
+    let template = RawResourceTemplate {
+        uri_template: BUILTIN_URI_TEMPLATE.to_string(),
+        name: "kaish builtin help".to_string(),
+        title: None,
         description: Some(
-            "kaish read-only shell cheatsheet: line-number browsing idioms, \
-             builtins, and the exit-code contract."
+            "Help for a single kaish builtin — parameters and examples. \
+             e.g. kaibo://kaish/builtin/rg"
                 .to_string(),
         ),
-        ..RawResource::new(KAISH_SYNTAX_URI, "kaish syntax")
+        mime_type: Some("text/markdown".to_string()),
+        icons: None,
     };
-    vec![resource.no_annotation()]
+    vec![template.no_annotation()]
+}
+
+/// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
+/// one kaibo serves. Pure and offline-testable; the handler wraps the result.
+fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
+    if uri == SANDBOX_URI {
+        return Some(kaibo_sandbox_doc());
+    }
+    if let Some(name) = uri.strip_prefix(BUILTIN_PREFIX) {
+        // An unregistered builtin is a miss (not-found), not an "unknown topic" stub.
+        return render_builtin_help(name, schemas);
+    }
+    if let Some(topic) = uri.strip_prefix(KAISH_RES_PREFIX) {
+        // Only the registry's own topics — anything else falls through to not-found
+        // rather than rendering kaish-help's "Unknown topic" body.
+        if topics().iter().any(|(t, _)| *t == topic) {
+            return Some(render_topic(topic, schemas));
+        }
+    }
+    None
 }
 
 /// Read one kaibo resource by URI. An unknown URI is a not-found error, not a
 /// silent empty result — a caller asking for the wrong thing should hear so.
-fn read_kaibo_resource(uri: &str) -> Result<ReadResourceResult, McpError> {
-    if uri != KAISH_SYNTAX_URI {
-        return Err(McpError::resource_not_found(
-            format!("unknown resource: {uri}"),
-            None,
-        ));
-    }
+fn read_kaibo_resource(uri: &str, schemas: &[ToolSchema]) -> Result<ReadResourceResult, McpError> {
+    let body = render_resource(uri, schemas)
+        .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
     Ok(ReadResourceResult {
-        contents: vec![ResourceContents::text(kaish_syntax_resource(), KAISH_SYNTAX_URI)],
+        contents: vec![ResourceContents::text(body, uri)],
     })
 }
 
@@ -438,35 +513,93 @@ fn read_kaibo_resource(uri: &str) -> Result<ReadResourceResult, McpError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lists_the_kaish_syntax_resource() {
-        let uris: Vec<String> = kaibo_resources()
-            .into_iter()
-            .map(|r| r.raw.uri)
-            .collect();
-        assert!(
-            uris.iter().any(|u| u == KAISH_SYNTAX_URI),
-            "list_resources must advertise {KAISH_SYNTAX_URI}, got {uris:?}"
-        );
+    /// A small stand-in builtin set so resource rendering is offline-testable.
+    fn sample_schemas() -> Vec<ToolSchema> {
+        vec![
+            ToolSchema::new("cat", "Read a file"),
+            ToolSchema::new("rg", "Recursive grep"),
+        ]
     }
 
     #[test]
-    fn reads_the_kaish_syntax_resource_with_the_idioms_and_codes() {
-        let result = read_kaibo_resource(KAISH_SYNTAX_URI).expect("known uri must read");
-        let text = match &result.contents[0] {
+    fn lists_the_sandbox_doc_and_every_kaish_topic() {
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        assert!(
+            uris.iter().any(|u| u == SANDBOX_URI),
+            "must advertise the sandbox doc, got {uris:?}"
+        );
+        for (topic, _) in topics() {
+            let want = format!("{KAISH_RES_PREFIX}{topic}");
+            assert!(
+                uris.contains(&want),
+                "must advertise the {topic:?} topic at {want}, got {uris:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertises_the_per_builtin_template() {
+        let templates = kaibo_resource_templates();
+        assert!(
+            templates.iter().any(|t| t.raw.uri_template == BUILTIN_URI_TEMPLATE),
+            "must advertise the per-builtin URI template"
+        );
+    }
+
+    fn read_text(uri: &str, schemas: &[ToolSchema]) -> String {
+        let result = read_kaibo_resource(uri, schemas).expect("known uri must read");
+        match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
-        };
-        for needle in ["cat -n", "rg", "read-only", "126", "124"] {
-            assert!(text.contains(needle), "resource must mention {needle:?}");
         }
+    }
+
+    #[test]
+    fn reads_the_sandbox_doc_with_the_idioms_and_codes() {
+        let text = read_text(SANDBOX_URI, &[]);
+        for needle in ["cat -n", "rg", "read-only", "126", "124"] {
+            assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
+        }
+    }
+
+    #[test]
+    fn reads_a_topic_resource() {
+        let text = read_text(&format!("{KAISH_RES_PREFIX}syntax"), &[]);
+        assert!(text.contains("Variables"), "syntax topic should cover Variables:\n{text}");
+    }
+
+    #[test]
+    fn reads_a_builtin_resource_and_rejects_an_unknown_builtin() {
+        let schemas = sample_schemas();
+        let text = read_text(&format!("{BUILTIN_PREFIX}rg"), &schemas);
+        assert!(text.contains("rg"), "builtin help should name the tool:\n{text}");
+        assert!(
+            read_kaibo_resource(&format!("{BUILTIN_PREFIX}nope"), &schemas).is_err(),
+            "an unregistered builtin must be a not-found error"
+        );
     }
 
     #[test]
     fn unknown_resource_uri_is_an_error() {
         assert!(
-            read_kaibo_resource("kaibo://nope").is_err(),
+            read_kaibo_resource("kaibo://nope", &[]).is_err(),
             "an unknown URI must be a not-found error, not an empty success"
+        );
+    }
+
+    #[test]
+    fn instructions_compose_the_canonical_onboarding_and_point_at_resources() {
+        let text = kaibo_instructions(&sample_schemas());
+        assert!(text.contains("kaibo"), "instructions should introduce kaibo");
+        // The canonical onboarding spine from kaish-help.
+        assert!(
+            text.contains("How kaish works"),
+            "instructions should embed the kaish-help foundations:\n{text}"
+        );
+        // The progressive-learning pointer.
+        assert!(
+            text.contains("kaibo://kaish/"),
+            "instructions should point at the kaish resources"
         );
     }
 }

@@ -161,3 +161,21 @@ async fn blocked_is_126_and_distinct_from_a_plain_failure() {
         "a plain failure must not collide with the 126 sandbox-block code, got {failed:?}"
     );
 }
+
+/// The builtin-schema snapshot that drives kaibo's help surface must enumerate the
+/// real read tools (so `help builtins` and `kaibo://kaish/builtins` aren't empty)
+/// and the `help` builtin itself (so an agent can `help syntax` inside run_kaish).
+#[test]
+fn builtin_schemas_enumerate_the_read_toolbox() {
+    let names: Vec<String> = kaibo::sandbox::builtin_schemas()
+        .expect("schema kernel must build")
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    for want in ["cat", "grep", "find", "help"] {
+        assert!(
+            names.iter().any(|n| n == want),
+            "builtin_schemas must list {want:?}, got {names:?}"
+        );
+    }
+}

@@ -33,7 +33,7 @@ async fn run_tool(handler: &KaiboHandler, path: &Path, script: &str) -> String {
 
 fn handler_for(_root: &Path) -> KaiboHandler {
     // No default root: the test passes `path` explicitly each call.
-    KaiboHandler::new(None, Provider::Anthropic, ToolGating::default())
+    KaiboHandler::new(None, Provider::Anthropic, ToolGating::default()).expect("handler builds")
 }
 
 #[tokio::test]
