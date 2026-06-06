@@ -27,6 +27,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -60,6 +61,12 @@ impl Tool for Blocked {
     }
 
     async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
+        // Exit **126** = "blocked by the read-only sandbox". Distinct from the
+        // kernel's other non-zero codes a caller may see: 124 = killed for
+        // exceeding [`KAISH_EXEC_TIMEOUT`], 130 = cancelled, 127 = command not
+        // found, and any other non-zero = the script itself failed. 126 also
+        // collides with POSIX "not executable", so an automated caller must read
+        // the message, not just the code, to classify a sandbox block.
         ExecResult::failure(
             126,
             format!(
@@ -79,12 +86,34 @@ fn apply_denylist(registry: &mut ToolRegistry) {
     }
 }
 
-/// Build a kernel that can *read* everything under `root` and *mutate* nothing.
+/// Per-exec wall-clock budget for a kaish script in the sandbox.
+///
+/// A read-only read/grep/find over a project almost never legitimately needs
+/// this long; the budget exists so a hung provider script or a pathological loop
+/// can't wedge the single serial worker thread (there's no `max_turns` braking a
+/// caller-facing `run_kaish`). On elapse the kernel cancels and the script exits
+/// **124** — distinct from 126 (a builtin refused by the read-only sandbox). 30s
+/// matches a patient MCP caller while still bounding a runaway.
+pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a kernel that can *read* everything under `root` and *mutate* nothing,
+/// with the default [`KAISH_EXEC_TIMEOUT`].
 ///
 /// The project is mounted at its real absolute path (mirroring kaish's own
 /// sandbox layout) so familiar paths like `/home/me/proj/src/main.rs` resolve
 /// transparently, while `cat`/`grep`/`find` see the live tree.
 pub fn build_readonly_kernel(root: impl Into<PathBuf>) -> Result<Kernel> {
+    build_readonly_kernel_with_timeout(root, KAISH_EXEC_TIMEOUT)
+}
+
+/// Like [`build_readonly_kernel`] but with an explicit per-exec `timeout`.
+///
+/// Exposed so tests can drive the timeout path with a short budget without
+/// waiting the full [`KAISH_EXEC_TIMEOUT`]; production always uses the default.
+pub fn build_readonly_kernel_with_timeout(
+    root: impl Into<PathBuf>,
+    timeout: Duration,
+) -> Result<Kernel> {
     let root = root.into();
     let mount_point = root.to_string_lossy().to_string();
 
@@ -96,9 +125,13 @@ pub fn build_readonly_kernel(root: impl Into<PathBuf>) -> Result<Kernel> {
 
     let backend: Arc<dyn KernelBackend> = Arc::new(LocalBackend::new(Arc::new(vfs)));
 
+    // `KernelConfig::mcp()` already installs an 8 KB `OutputLimitConfig`, so a
+    // runaway `cat` can't flood the caller's context; the timeout bounds wall
+    // clock. Both guards matter for a caller-facing `run_kaish` with no turn cap.
     let config = KernelConfig::mcp()
         .with_cwd(root)
-        .with_allow_external_commands(false);
+        .with_allow_external_commands(false)
+        .with_request_timeout(timeout);
 
     // `with_backend` ignores config.vfs_mode and routes all non-`/v/*` paths
     // through our read-only backend. `configure_tools` runs after the default
