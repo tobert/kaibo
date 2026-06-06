@@ -18,7 +18,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
 
-use crate::consult::{consult, explore, ConsultConfig};
+use crate::consult::{consult, explore, synthesize, ConsultConfig};
 use crate::credentials::Provider;
 use crate::explorer::format_output;
 use crate::kaish_syntax::kaish_syntax_resource;
@@ -81,6 +81,31 @@ pub struct ExploreInput {
     /// Max tool-loop turns for the explorer (default 50 — it's cheap, let it rip).
     #[serde(default)]
     pub max_turns: Option<usize>,
+}
+
+/// Arguments to the `synthesize` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SynthesizeInput {
+    /// The question to answer.
+    pub question: String,
+
+    /// Optional context to ground the answer in — typically an `explore` report or
+    /// pasted source. When absent, the model investigates via `run_kaish`.
+    #[serde(default)]
+    pub context: Option<String>,
+
+    /// Absolute path to the project. Optional only if the server was launched
+    /// with a default `--root`.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Provider: "anthropic" (default), "deepseek", "gemini", or "lemonade".
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Override the synthesizer (capable) model id.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Arguments to the `run_kaish` tool.
@@ -202,6 +227,37 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(report)]))
+    }
+
+    #[tool(
+        description = "Answer a question about a codebase with a capable model, \
+            grounded in optional supplied context (typically an `explore` report or \
+            pasted source). With context, the model treats it as primary evidence and \
+            uses a read-only kaish shell to verify or fill precise gaps; without \
+            context, it investigates directly. This is the synthesizer seam on its \
+            own — a real outside opinion you can seed with material `explore` or you \
+            gathered. Read-only. Args: question (required), context (optional), path \
+            (project dir; optional with a default root), provider \
+            (anthropic|deepseek|gemini|lemonade), and an optional model override."
+    )]
+    async fn synthesize(
+        &self,
+        Parameters(input): Parameters<SynthesizeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.resolve_root(input.path)?;
+        let provider = self.parse_provider(input.provider)?;
+
+        let defaults = ConsultConfig::default();
+        let cfg = ConsultConfig {
+            synth_model: input.model,
+            ..defaults
+        };
+
+        let answer = synthesize(&input.question, input.context.as_deref(), root, provider, &cfg)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(answer)]))
     }
 
     #[tool(

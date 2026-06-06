@@ -1,10 +1,45 @@
 //! Two-phase consult: offline prompt-builder test + an `#[ignore]`d live e2e.
 
 use kaibo::consult::{
-    consult, default_models, explore, synth_user_prompt, thinking_params, ConsultConfig,
-    THINKING_BUDGET,
+    consult, default_models, explore, synth_user_prompt, synthesize, synthesize_user_prompt,
+    thinking_params, ConsultConfig, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, Provider};
+
+#[test]
+fn synthesize_prompt_grounds_in_supplied_context() {
+    let p = synthesize_user_prompt("What blocks writes?", Some("src/sandbox.rs:95 read-only mount"));
+
+    assert!(p.contains("What blocks writes?"), "question present");
+    assert!(p.contains("src/sandbox.rs:95 read-only mount"), "context present");
+    assert!(p.to_lowercase().contains("context"), "context labelled");
+    // Question framed before the supplied context.
+    let q = p.find("What blocks writes?").unwrap();
+    let c = p.find("src/sandbox.rs:95 read-only mount").unwrap();
+    assert!(q < c, "question should precede the context");
+}
+
+#[test]
+fn synthesize_prompt_without_context_still_points_at_investigation() {
+    // The panel's "vacuous with empty context" worry: with no context the prompt
+    // must still drive a real investigation via run_kaish, not invite a guess.
+    let p = synthesize_user_prompt("What blocks writes?", None);
+    assert!(p.contains("What blocks writes?"));
+    assert!(
+        p.contains("run_kaish"),
+        "empty context must still steer to run_kaish, got: {p}"
+    );
+}
+
+#[test]
+fn synthesize_prompt_treats_blank_context_as_absent() {
+    // Whitespace-only context is no context — don't pretend there's evidence.
+    let p = synthesize_user_prompt("Q?", Some("  \n  "));
+    assert!(
+        p.contains("run_kaish"),
+        "blank context should behave like None, got: {p}"
+    );
+}
 
 #[test]
 fn synth_prompt_carries_question_and_report() {
@@ -125,6 +160,48 @@ async fn explore_unit_reports_from_the_real_tree() {
     assert!(
         lower.contains("sandbox.rs") || lower.contains("sandbox"),
         "the report should cite the sandbox source, got: {report}"
+    );
+}
+
+// Standalone `synthesize` (the seam behind the MCP `synthesize` tool): grounded
+// from supplied context, and — the panel's worry — still useful with no context
+// because run_kaish lets it investigate rather than guess.
+#[tokio::test]
+#[ignore = "hits the local lemonade server (synthesize); run with --ignored while it's up"]
+async fn synthesize_grounds_in_context_and_investigates_without_it() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let cfg = ConsultConfig::default();
+
+    // With a thin context: it should answer grounded, optionally confirming via run_kaish.
+    let with_ctx = synthesize(
+        "Which file enforces the read-only sandbox?",
+        Some("src/sandbox.rs builds a read-only kernel; the DENYLIST shadow-blocks touch/git."),
+        root,
+        Provider::Lemonade,
+        &cfg,
+    )
+    .await
+    .expect("synthesize with context should succeed");
+    eprintln!("=== SYNTH (with context) ===\n{with_ctx}\n");
+    assert!(
+        with_ctx.to_lowercase().contains("sandbox"),
+        "should answer about the sandbox file, got: {with_ctx}"
+    );
+
+    // With NO context: it must still investigate via run_kaish and answer grounded.
+    let no_ctx = synthesize(
+        "Which file enforces the read-only sandbox?",
+        None,
+        root,
+        Provider::Lemonade,
+        &cfg,
+    )
+    .await
+    .expect("synthesize without context should still investigate and succeed");
+    eprintln!("=== SYNTH (no context) ===\n{no_ctx}\n");
+    assert!(
+        no_ctx.to_lowercase().contains("sandbox"),
+        "empty-context synth must investigate and still answer, got: {no_ctx}"
     );
 }
 

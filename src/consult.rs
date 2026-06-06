@@ -27,6 +27,48 @@ use crate::explorer::RunKaish;
 use crate::kaish_syntax::KAISH_SYNTAX_CORE;
 use crate::sandbox::KaishWorker;
 
+/// Construct the rig client for `$provider` (loading its key, or the base URL for
+/// the local one) and bind it to `$client` for `$body`. The four provider client
+/// types differ, so this is the single place those arms live — `consult`,
+/// `explore`, and `synthesize` all dispatch through it. `$body` runs inside the
+/// arm, so it may `.await` and use `?`.
+macro_rules! with_provider_client {
+    ($provider:expr, |$client:ident| $body:expr) => {{
+        match $provider {
+            Provider::Anthropic => {
+                let key = credentials::load($provider)?;
+                let $client = anthropic::Client::new(&key)
+                    .map_err(|e| anyhow!("anthropic client init: {e}"))?;
+                $body
+            }
+            Provider::DeepSeek => {
+                let key = credentials::load($provider)?;
+                let $client = deepseek::Client::new(&key)
+                    .map_err(|e| anyhow!("deepseek client init: {e}"))?;
+                $body
+            }
+            Provider::Gemini => {
+                let key = credentials::load($provider)?;
+                let $client = gemini::Client::new(&key)
+                    .map_err(|e| anyhow!("gemini client init: {e}"))?;
+                $body
+            }
+            Provider::Lemonade => {
+                // Local OpenAI-compatible server: point rig's completions client at
+                // the lemonade base URL. The bearer token is required-but-ignored
+                // (lemonade does no auth), so any non-empty string serves.
+                let base_url = credentials::lemonade_base_url();
+                let $client = openai::CompletionsClient::builder()
+                    .api_key("lemonade")
+                    .base_url(&base_url)
+                    .build()
+                    .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
+                $body
+            }
+        }
+    }};
+}
+
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`KAISH_SYNTAX_CORE`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
@@ -366,35 +408,100 @@ pub async fn explore(
     let thinking = thinking_params(provider);
     let thinking = thinking.as_ref();
 
-    match provider {
-        Provider::Anthropic => {
-            let key = credentials::load(provider)?;
-            let client =
-                anthropic::Client::new(&key).map_err(|e| anyhow!("anthropic client init: {e}"))?;
-            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
-        }
-        Provider::DeepSeek => {
-            let key = credentials::load(provider)?;
-            let client =
-                deepseek::Client::new(&key).map_err(|e| anyhow!("deepseek client init: {e}"))?;
-            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
-        }
-        Provider::Gemini => {
-            let key = credentials::load(provider)?;
-            let client =
-                gemini::Client::new(&key).map_err(|e| anyhow!("gemini client init: {e}"))?;
-            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
-        }
-        Provider::Lemonade => {
-            let base_url = credentials::lemonade_base_url();
-            let client = openai::CompletionsClient::builder()
-                .api_key("lemonade")
-                .base_url(&base_url)
-                .build()
-                .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
-            explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
-        }
+    with_provider_client!(provider, |client| {
+        explore_with(&client, &explorer_model, &root, cfg, thinking, question).await
+    })
+}
+
+/// Build the standalone `synthesize` user prompt. Pure and offline-testable.
+///
+/// With `context`, frame it as primary evidence to ground in (question first, then
+/// context). With no context — or whitespace-only — steer the model to investigate
+/// directly via `run_kaish` rather than guess, so the answer stays grounded either
+/// way.
+pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
+    match context.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(context) => format!(
+            "Question:\n{question}\n\n\
+             Context (supplied material — typically a curated explorer report or \
+             pasted source):\n{context}\n\n\
+             Answer the question, grounded in the context above. Use the `run_kaish` \
+             tool to verify a citation or fetch a precise span the context points to \
+             but doesn't fully quote; cite concrete `file:line`."
+        ),
+        None => format!(
+            "Question:\n{question}\n\n\
+             No context was supplied. Investigate the project yourself with the \
+             `run_kaish` tool (a read-only kaish shell) and answer from what you find, \
+             citing concrete `file:line`."
+        ),
     }
+}
+
+/// Standalone synth preamble: interactive, with `run_kaish` as a first-class
+/// investigation tool (not just a fallback). Composes the shared
+/// [`KAISH_SYNTAX_CORE`] so the shell idioms and exit-code contract don't drift.
+pub fn synthesize_preamble() -> String {
+    format!(
+        "You answer a question about a codebase. {KAISH_SYNTAX_CORE}\n\n\
+         You may be given CONTEXT — a curated explorer report or pasted material. \
+         When context is present, treat it as primary evidence and ground your answer \
+         in it, using `run_kaish` to verify a citation or fetch a precise span it \
+         points to. When context is thin or absent, investigate directly with \
+         `run_kaish` and answer from what you find. Either way, cite concrete \
+         `file:line` locations so every claim traces back to evidence."
+    )
+}
+
+/// One synth loop against an already-constructed client: a capable model answers
+/// `user_prompt` with `{run_kaish}` available over a fresh kernel rooted at `root`.
+async fn synthesize_with<C>(
+    client: &C,
+    model: &str,
+    root: &Path,
+    cfg: &ConsultConfig,
+    thinking: Option<&Value>,
+    user_prompt: String,
+) -> Result<String>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+{
+    let tools: Vec<Box<dyn ToolDyn>> =
+        vec![Box::new(RunKaish::new(KaishWorker::spawn(root)?))];
+    run_phase(
+        client,
+        model,
+        &synthesize_preamble(),
+        cfg.max_tokens,
+        user_prompt,
+        cfg.synth_max_turns,
+        thinking,
+        tools,
+    )
+    .await
+}
+
+/// The standalone `synthesize` seam: a capable model answers `question`, grounded
+/// in an optional caller-supplied `context` (typically an `explore` report or
+/// pasted material), with `run_kaish` to verify or fill a precise gap. Defaults to
+/// the capable synth model — a real outside opinion, not the cheap explorer.
+pub async fn synthesize(
+    question: &str,
+    context: Option<&str>,
+    root: impl Into<PathBuf>,
+    provider: Provider,
+    cfg: &ConsultConfig,
+) -> Result<String> {
+    let root = root.into();
+    let (_, synth_model) = cfg.resolved_models(provider);
+    let thinking = thinking_params(provider);
+    let thinking = thinking.as_ref();
+    let user_prompt = synthesize_user_prompt(question, context);
+
+    with_provider_client!(provider, |client| {
+        synthesize_with(&client, &synth_model, &root, cfg, thinking, user_prompt).await
+    })
 }
 
 /// Run both phases against an already-constructed provider client.
@@ -462,42 +569,7 @@ pub async fn consult(
     let thinking = thinking_params(provider);
     let thinking = thinking.as_ref();
 
-    // Keyed providers load a key; the local one is reached by base URL instead,
-    // so credential loading is per-arm rather than shared up front.
-    match provider {
-        Provider::Anthropic => {
-            let key = credentials::load(provider)?;
-            let client =
-                anthropic::Client::new(&key).map_err(|e| anyhow!("anthropic client init: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
-                .await
-        }
-        Provider::DeepSeek => {
-            let key = credentials::load(provider)?;
-            let client =
-                deepseek::Client::new(&key).map_err(|e| anyhow!("deepseek client init: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
-                .await
-        }
-        Provider::Gemini => {
-            let key = credentials::load(provider)?;
-            let client =
-                gemini::Client::new(&key).map_err(|e| anyhow!("gemini client init: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
-                .await
-        }
-        Provider::Lemonade => {
-            // Local OpenAI-compatible server: point rig's completions client at
-            // the lemonade base URL. The bearer token is required-but-ignored —
-            // lemonade does no auth — so any non-empty string serves.
-            let base_url = credentials::lemonade_base_url();
-            let client = openai::CompletionsClient::builder()
-                .api_key("lemonade")
-                .base_url(&base_url)
-                .build()
-                .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
-            consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking)
-                .await
-        }
-    }
+    with_provider_client!(provider, |client| {
+        consult_with(&client, question, &root, &explorer_model, &synth_model, cfg, thinking).await
+    })
 }
