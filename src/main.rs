@@ -22,7 +22,7 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 
-    /// Default provider when a call omits it: anthropic | deepseek | gemini | lemonade.
+    /// Default provider when a call omits it: anthropic | deepseek | gemini | openai.
     #[arg(long, default_value = "anthropic")]
     provider: String,
 

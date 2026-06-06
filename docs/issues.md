@@ -88,7 +88,7 @@ self-correct a bad cite — the panel was unanimous a tool-less synth is too wea
 The strictly tool-less, non-interactive variant is still worth having for batch
 fan-out: submit → poll → read, modelled on gpal/cpal's job system. Uses the parked
 `SYNTH_ONESHOT_PREAMBLE` wording in the (now-deleted) plan. It's a **per-provider
-capability** like `thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, Lemonade ✗ —
+capability** like `thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, `openai` ✗ —
 `None` where unsupported. Open fork when built: many-questions/one-model vs
 one-question/many-models (the diverse-opinion panel made literal).
 
@@ -150,7 +150,7 @@ All four provider paths now have opt-in live tests (`tests/consult.rs`,
 
 ### A small local context window makes uncapped output acute
 A local server's context window can be far smaller than the model advertises
-(Gemma-4-26B reports `max_context_window` 262144; the lemonade box was briefly
+(Gemma-4-26B reports `max_context_window` 262144; the local server box was briefly
 serving it at `--ctx-size 4096` before we bumped it). The explorer dumps file
 contents over up to 50 turns, so on a tight window a single wide `cat`/`rg` blows
 it. kaibo now installs an 8 KB `OutputLimitConfig` via `KernelConfig::mcp()`
@@ -160,12 +160,21 @@ Thinking-on makes this tighter still: reasoning now also draws on the 16384
 `max_tokens`, so a local server needs a context window comfortably above input +
 reasoning + answer.
 
+### Only one `openai` endpoint can be live per process
+`Provider::Openai` resolves a single `OPENAI_BASE_URL` + `OPENAI_API_KEY`, so a
+server instance can talk to exactly one OpenAI-compatible endpoint at a time. You
+can override the *model* per call, but not the endpoint or key — you can't have,
+say, hosted GPT and local Gemma both selectable in one run. Supporting several
+would mean *named* instances (e.g. `openai:local`, `openai:gpt`) backed by a small
+registry (suffixed env vars or a config file), with the provider arg carrying the
+instance name. Deferred until a concrete two-endpoint need shows up.
+
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
 error. Validating available providers at startup (and noting them in the server
 instructions) would fail faster and tell a client what it can actually use. For
-lemonade this would mean a startup ping of `LEMONADE_BASE_URL/models` rather than a
-key check.
+the `openai` provider this would mean a startup ping of `OPENAI_BASE_URL/models`
+rather than a key check.
 
 ---
 

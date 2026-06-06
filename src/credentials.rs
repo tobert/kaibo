@@ -8,64 +8,64 @@
 //! - DeepSeek:  `DEEPSEEK_API_KEY`  / `~/.deepseek-key`
 //! - Gemini:    `GEMINI_API_KEY`    / `~/.gemini-api-key`
 //!
-//! [`Provider::Lemonade`] is the exception: a *local*, keyless server (an OpenAI-
-//! compatible endpoint, e.g. AMD's lemonade serving Gemma) addressed by a base
-//! URL, not an API key. It carries no key-file; [`load`] refuses it, and
-//! [`lemonade_base_url`] supplies the endpoint instead.
+//! [`Provider::Openai`] is the general case: any endpoint speaking the OpenAI
+//! wire protocol, addressed by [`openai_base_url`] (`OPENAI_BASE_URL`, default a
+//! local keyless server) rather than tied to a hosted service. Its key is
+//! *optional* — `OPENAI_API_KEY` / `~/.openai-key` when talking to a keyed
+//! endpoint, or a placeholder for the keyless local default (see [`openai_key`]).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-/// Where the local lemonade server's OpenAI-compatible API lives by default.
-/// The `/api/v1` suffix matters — rig posts to `{base_url}/chat/completions`.
-/// Override with the `LEMONADE_BASE_URL` env var (see [`lemonade_base_url`]).
-pub const DEFAULT_LEMONADE_BASE_URL: &str = "http://localhost:13305/api/v1";
+/// Default OpenAI-compatible endpoint: a local, keyless server (e.g. an OpenAI-
+/// compatible host such as AMD's Lemonade serving Gemma). The `/api/v1` suffix
+/// matters — rig posts to `{base_url}/chat/completions`. Override with the
+/// `OPENAI_BASE_URL` env var (see [`openai_base_url`]).
+pub const DEFAULT_OPENAI_BASE_URL: &str = "http://localhost:13305/api/v1";
 
-/// A model provider. Keyed providers (Anthropic/DeepSeek/Gemini) authenticate
-/// with an API key; [`Provider::Lemonade`] is a local server reached by URL.
+/// A model provider. The keyed providers (Anthropic/DeepSeek/Gemini) each speak
+/// their own wire protocol and require an API key. [`Provider::Openai`] is the
+/// generic OpenAI-compatible endpoint: any base URL speaking that protocol, with
+/// an *optional* key — keyless by default, since the default endpoint is local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Anthropic,
     DeepSeek,
     Gemini,
-    /// A local, keyless OpenAI-compatible server (lemonade, serving Gemma).
-    Lemonade,
+    /// Any OpenAI-compatible endpoint, addressed by base URL; key optional.
+    /// Defaults to a local keyless server (Gemma via an OpenAI-compatible host).
+    Openai,
 }
 
 impl Provider {
-    /// Whether this provider is a local, keyless endpoint addressed by base URL.
-    /// Local providers have no key-file and must not be passed to [`load`].
-    pub fn is_local(self) -> bool {
-        matches!(self, Provider::Lemonade)
+    /// Whether a missing credential is tolerated rather than a hard error. Only
+    /// the OpenAI-compatible provider is: its default endpoint is a local keyless
+    /// server, so an absent key falls back to a placeholder bearer token (see
+    /// [`openai_key`]). The keyed providers must fail loudly on a missing key.
+    pub fn key_optional(self) -> bool {
+        matches!(self, Provider::Openai)
     }
 
     /// The environment variable that overrides the key-file.
-    ///
-    /// Only meaningful for keyed providers; a local provider has no API key, so
-    /// this panics rather than invent one (see [`Provider::is_local`]).
     pub fn env_var(self) -> &'static str {
         match self {
             Provider::Anthropic => "ANTHROPIC_API_KEY",
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Gemini => "GEMINI_API_KEY",
-            Provider::Lemonade => {
-                unreachable!("Lemonade is local and keyless; gate on is_local() before env_var()")
-            }
+            Provider::Openai => "OPENAI_API_KEY",
         }
     }
 
-    /// The key-file's name within `$HOME`. Keyed providers only — see [`env_var`].
-    ///
-    /// [`env_var`]: Provider::env_var
+    /// The key-file's name within `$HOME`. For the OpenAI provider the key is
+    /// optional (see [`Provider::key_optional`]); the file is consulted only if
+    /// present.
     pub fn key_file_name(self) -> &'static str {
         match self {
             Provider::Anthropic => ".anthropic-key.txt",
             Provider::DeepSeek => ".deepseek-key",
             Provider::Gemini => ".gemini-api-key",
-            Provider::Lemonade => {
-                unreachable!("Lemonade is local and keyless; gate on is_local() before key_file()")
-            }
+            Provider::Openai => ".openai-key",
         }
     }
 
@@ -83,27 +83,51 @@ impl std::str::FromStr for Provider {
             "anthropic" | "claude" => Ok(Provider::Anthropic),
             "deepseek" => Ok(Provider::DeepSeek),
             "gemini" | "google" => Ok(Provider::Gemini),
-            // Accept the model names people actually say for the local server.
-            "lemonade" | "local" | "gemma" | "gemma4" => Ok(Provider::Lemonade),
+            // The OpenAI-compatible endpoint. Also accept the names people reach
+            // for when it points at the local keyless default (Gemma via Lemonade).
+            "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(Provider::Openai),
             other => Err(anyhow!(
-                "unknown provider {other:?} (expected anthropic, deepseek, gemini, or lemonade)"
+                "unknown provider {other:?} (expected anthropic, deepseek, gemini, or openai)"
             )),
         }
     }
 }
 
-/// Resolve the lemonade base URL from an explicit env value, defaulting when
-/// unset or blank. Pure so it can be tested without touching the environment.
+/// Resolve the OpenAI base URL from an explicit env value, defaulting when unset
+/// or blank. Pure so it can be tested without touching the environment.
 pub fn resolve_base_url(env_value: Option<&str>) -> String {
     match env_value {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => DEFAULT_LEMONADE_BASE_URL.to_string(),
+        _ => DEFAULT_OPENAI_BASE_URL.to_string(),
     }
 }
 
-/// The local lemonade endpoint, from `LEMONADE_BASE_URL` or the default.
-pub fn lemonade_base_url() -> String {
-    resolve_base_url(std::env::var("LEMONADE_BASE_URL").ok().as_deref())
+/// The OpenAI-compatible endpoint, from `OPENAI_BASE_URL` or the default.
+pub fn openai_base_url() -> String {
+    resolve_base_url(std::env::var("OPENAI_BASE_URL").ok().as_deref())
+}
+
+/// Placeholder bearer token for the keyless local default. The OpenAI client
+/// builder rejects an empty key, but a local server ignores the value entirely.
+pub const PLACEHOLDER_OPENAI_KEY: &str = "no-auth";
+
+/// Resolve the OpenAI bearer token: the configured key when present (env over
+/// file), else the placeholder. Pure for testing. Unlike [`resolve`], a missing
+/// credential is NOT an error — the default endpoint is a local keyless server,
+/// so we fall back rather than refuse.
+pub fn resolve_openai_key(env_value: Option<&str>, key_file: &Path) -> String {
+    resolve(env_value, key_file).unwrap_or_else(|_| PLACEHOLDER_OPENAI_KEY.to_string())
+}
+
+/// The OpenAI bearer token from `OPENAI_API_KEY` / `~/.openai-key`, or the
+/// placeholder when neither is set (the keyless local default).
+pub fn openai_key() -> String {
+    let key_file = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| Provider::Openai.key_file(&home))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/.openai-key"));
+    let env_value = std::env::var(Provider::Openai.env_var()).ok();
+    resolve_openai_key(env_value.as_deref(), &key_file)
 }
 
 /// Resolve a key from an explicit env value and a key-file, env winning.
@@ -137,12 +161,13 @@ pub fn resolve(env_value: Option<&str>, key_file: &Path) -> Result<String> {
 
 /// Load `provider`'s key from the real environment and `$HOME`.
 ///
-/// Local providers have no key; calling this for one is a programming error,
-/// surfaced as an error rather than silently sending an empty key to a server.
+/// The OpenAI provider's key is optional; calling this for it is a programming
+/// error — its key may legitimately be absent, so route through [`openai_key`],
+/// which falls back to a placeholder rather than refusing.
 pub fn load(provider: Provider) -> Result<String> {
-    if provider.is_local() {
+    if provider.key_optional() {
         return Err(anyhow!(
-            "{provider:?} is a local, keyless provider — use lemonade_base_url(), not load()"
+            "{provider:?} tolerates a missing key — use openai_key(), not load()"
         ));
     }
     let home = std::env::var_os("HOME")

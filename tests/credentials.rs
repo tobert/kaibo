@@ -4,7 +4,8 @@ use std::fs;
 use std::str::FromStr;
 
 use kaibo::credentials::{
-    load, resolve, resolve_base_url, Provider, DEFAULT_LEMONADE_BASE_URL,
+    load, resolve, resolve_base_url, resolve_openai_key, Provider, DEFAULT_OPENAI_BASE_URL,
+    PLACEHOLDER_OPENAI_KEY,
 };
 use tempfile::tempdir;
 
@@ -57,48 +58,69 @@ fn empty_file_is_an_error_not_an_empty_key() {
     assert!(err.to_string().contains("empty"), "got: {err}");
 }
 
-// --- Lemonade: a local, keyless provider addressed by base URL, not an API key.
+// --- OpenAI: any OpenAI-compatible endpoint, addressed by base URL; key optional.
 
 #[test]
-fn lemonade_parses_from_friendly_aliases() {
-    // The default provider clients call it gemma in conversation; accept the
-    // model-name aliases as well as the canonical "lemonade".
-    for s in ["lemonade", "Lemonade", "  GEMMA ", "gemma4", "local"] {
+fn openai_parses_from_friendly_aliases() {
+    // Canonical "openai", plus the names people reach for when it points at the
+    // local keyless default (Gemma served by Lemonade).
+    for s in ["openai", "OpenAI", "local", "lemonade", "  GEMMA ", "gemma4"] {
         assert_eq!(
             Provider::from_str(s).unwrap(),
-            Provider::Lemonade,
-            "{s:?} should parse as Lemonade"
+            Provider::Openai,
+            "{s:?} should parse as Openai"
         );
     }
 }
 
 #[test]
-fn lemonade_is_local_the_keyed_providers_are_not() {
-    assert!(Provider::Lemonade.is_local());
-    assert!(!Provider::Anthropic.is_local());
-    assert!(!Provider::DeepSeek.is_local());
-    assert!(!Provider::Gemini.is_local());
+fn only_openai_tolerates_a_missing_key() {
+    assert!(Provider::Openai.key_optional());
+    assert!(!Provider::Anthropic.key_optional());
+    assert!(!Provider::DeepSeek.key_optional());
+    assert!(!Provider::Gemini.key_optional());
 }
 
 #[test]
-fn load_refuses_a_local_provider_loudly() {
-    // A local provider has no API key; asking to load one is a programming
-    // error we want surfaced, not a silent empty key sent to a server.
-    let err = load(Provider::Lemonade).unwrap_err();
+fn load_refuses_the_key_optional_provider_loudly() {
+    // OpenAI's key may legitimately be absent; asking load() for it is a
+    // programming error we surface rather than letting it masquerade as a
+    // missing-credential failure. Callers must use openai_key() instead.
+    let err = load(Provider::Openai).unwrap_err();
     assert!(
-        err.to_string().to_lowercase().contains("local"),
+        err.to_string().to_lowercase().contains("openai_key"),
         "got: {err}"
     );
 }
 
 #[test]
-fn lemonade_base_url_defaults_when_env_absent_or_blank() {
-    assert_eq!(resolve_base_url(None), DEFAULT_LEMONADE_BASE_URL);
-    assert_eq!(resolve_base_url(Some("   ")), DEFAULT_LEMONADE_BASE_URL);
+fn openai_key_uses_a_configured_key_when_present() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join(".openai-key");
+    fs::write(&file, "sk-real\n").unwrap();
+
+    // Env wins over file, file used when env absent — same precedence as resolve().
+    assert_eq!(resolve_openai_key(Some("sk-env"), &file), "sk-env");
+    assert_eq!(resolve_openai_key(None, &file), "sk-real");
 }
 
 #[test]
-fn lemonade_base_url_env_wins_and_is_trimmed() {
+fn openai_key_falls_back_to_placeholder_when_unset() {
+    // The keyless local default: no env, no file -> a placeholder, NOT an error.
+    // (resolve() would error here; resolve_openai_key() must not.)
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    assert_eq!(resolve_openai_key(None, &missing), PLACEHOLDER_OPENAI_KEY);
+}
+
+#[test]
+fn openai_base_url_defaults_when_env_absent_or_blank() {
+    assert_eq!(resolve_base_url(None), DEFAULT_OPENAI_BASE_URL);
+    assert_eq!(resolve_base_url(Some("   ")), DEFAULT_OPENAI_BASE_URL);
+}
+
+#[test]
+fn openai_base_url_env_wins_and_is_trimmed() {
     assert_eq!(
         resolve_base_url(Some("  http://box:9000/api/v1\n")),
         "http://box:9000/api/v1"
@@ -114,4 +136,5 @@ fn provider_paths_match_amys_dotfiles() {
     );
     assert_eq!(Provider::DeepSeek.key_file(home), home.join(".deepseek-key"));
     assert_eq!(Provider::Gemini.key_file(home), home.join(".gemini-api-key"));
+    assert_eq!(Provider::Openai.key_file(home), home.join(".openai-key"));
 }

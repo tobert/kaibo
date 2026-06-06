@@ -20,10 +20,11 @@ loop. Every tool is that loop wearing different clothes:
 
 Each tool is independently gated by a `--no-<tool>` flag (all on by default;
 all-four-off is refused at startup). Multi-provider over `rig-core`: keyed
-Anthropic / DeepSeek / Gemini, plus **Lemonade** — a local, keyless
-OpenAI-compatible server (Gemma-4) reached by base URL (`LEMONADE_BASE_URL`,
-default `http://localhost:13305/api/v1`). kaibo never modifies the project and
-cannot run external commands.
+Anthropic / DeepSeek / Gemini, plus **`openai`** — any OpenAI-compatible endpoint
+reached by base URL (`OPENAI_BASE_URL`, default the local keyless
+`http://localhost:13305/api/v1` serving Gemma-4) with an *optional* key
+(`OPENAI_API_KEY` / `~/.openai-key`; a placeholder is sent when unset). kaibo
+never modifies the project and cannot run external commands.
 
 ## Invariants — do not weaken without a failing-first test
 

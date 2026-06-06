@@ -59,10 +59,11 @@ so it separates "grep the constant" from "understand the design".
 | `anthropic` | `claude-haiku-4-5` | `claude-sonnet-4-6` |
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-pro` |
 | `gemini` | `gemini-flash-lite-latest` | `gemini-3.5-flash` |
-| `lemonade` (local) | `Gemma-4-E4B-it-GGUF` | `Gemma-4-26B-A4B-it-GGUF` |
+| `openai` (local default) | `Gemma-4-E4B-it-GGUF` | `Gemma-4-26B-A4B-it-GGUF` |
 
 Defaults: explorer `max_turns=50`, synth `max_turns=8`. The three hosted
-providers ran concurrently; lemonade ran locally.
+providers ran concurrently; the local `openai` endpoint (Lemonade/Gemma) ran
+locally.
 
 ## Results (verbatim, thinking on)
 
@@ -177,7 +178,7 @@ providers ran concurrently; lemonade ran locally.
 > 6. **`mktemp`**
 >    * **Reason:** Generates and writes temporary files or directories directly, violating the read-only file system restriction.
 
-### Lemonade / Gemma-4 (local) — `Gemma-4-E4B-it-GGUF` → `Gemma-4-26B-A4B-it-GGUF`
+### `openai` (local) / Gemma-4 via Lemonade — `Gemma-4-E4B-it-GGUF` → `Gemma-4-26B-A4B-it-GGUF`
 
 Gemma already reasoned by default (lemonade's `--reasoning-format auto`), so
 thinking-on is no change for it — quoted here for completeness. (Latency note: this

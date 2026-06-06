@@ -98,7 +98,7 @@ pub struct ExploreInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Provider: "anthropic" (default), "deepseek", "gemini", or "lemonade".
+    /// Provider: "anthropic" (default), "deepseek", "gemini", or "openai".
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -127,7 +127,7 @@ pub struct SynthesizeInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Provider: "anthropic" (default), "deepseek", "gemini", or "lemonade".
+    /// Provider: "anthropic" (default), "deepseek", "gemini", or "openai".
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -238,7 +238,7 @@ impl KaiboHandler {
             from what they find with concrete `file:line` citations. Read-only: it \
             never modifies the project. Args: question (required), path (project dir; \
             optional if the server has a default root), provider \
-            (anthropic|deepseek|gemini|lemonade), and optional explorer_model / \
+            (anthropic|deepseek|gemini|openai), and optional explorer_model / \
             synth_model overrides."
     )]
     async fn consult(
@@ -273,7 +273,7 @@ impl KaiboHandler {
             write a polished final answer (use `consult` for that). Read-only: it \
             never modifies the project. Args: question (required), path (project dir; \
             optional if the server has a default root), provider \
-            (anthropic|deepseek|gemini|lemonade), and optional model / max_turns \
+            (anthropic|deepseek|gemini|openai), and optional model / max_turns \
             overrides."
     )]
     async fn explore(
@@ -306,7 +306,7 @@ impl KaiboHandler {
             own — a real outside opinion you can seed with material `explore` or you \
             gathered. Read-only. Args: question (required), context (optional), path \
             (project dir; optional with a default root), provider \
-            (anthropic|deepseek|gemini|lemonade), and an optional model override."
+            (anthropic|deepseek|gemini|openai), and an optional model override."
     )]
     async fn synthesize(
         &self,

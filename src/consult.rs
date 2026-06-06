@@ -10,7 +10,7 @@
 //!   rigid explorer→synth hand-off: the capable model decides when to delegate a
 //!   broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span directly.
 //!
-//! Provider choice (Anthropic / DeepSeek / Gemini / Lemonade) only changes which
+//! Provider choice (Anthropic / DeepSeek / Gemini / OpenAI) only changes which
 //! client is constructed (see `with_provider_client!`); the loop is shared
 //! generically via [`CompletionClient`]. Each tool gets its own fresh
 //! [`KaishWorker`] (a kernel rooted at the project), and so does every `explore′`
@@ -32,8 +32,9 @@ use crate::explorer::RunKaish;
 use crate::kaish_syntax::KAISH_SYNTAX_CORE;
 use crate::sandbox::KaishWorker;
 
-/// Construct the rig client for `$provider` (loading its key, or the base URL for
-/// the local one) and bind it to `$client` for `$body`. The four provider client
+/// Construct the rig client for `$provider` (loading its key, or the base URL and
+/// optional key for the OpenAI one) and bind it to `$client` for `$body`. The four
+/// provider client
 /// types differ, so this is the single place those arms live — `consult`,
 /// `explore`, and `synthesize` all dispatch through it. `$body` runs inside the
 /// arm, so it may `.await` and use `?`.
@@ -61,16 +62,17 @@ macro_rules! with_provider_client {
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
                 $body
             }
-            Provider::Lemonade => {
-                // Local OpenAI-compatible server: point rig's completions client at
-                // the lemonade base URL. The bearer token is required-but-ignored
-                // (lemonade does no auth), so any non-empty string serves.
-                let base_url = credentials::lemonade_base_url();
+            Provider::Openai => {
+                // Any OpenAI-compatible endpoint, addressed by base URL. The key
+                // is optional: `openai_key` returns the configured key or, for the
+                // keyless local default, a placeholder the server ignores.
+                let base_url = credentials::openai_base_url();
+                let key = credentials::openai_key();
                 let $client = openai::CompletionsClient::builder()
-                    .api_key("lemonade")
+                    .api_key(&key)
                     .base_url(&base_url)
                     .build()
-                    .map_err(|e| anyhow!("lemonade client init at {base_url}: {e}"))?;
+                    .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
                 $body
             }
         }
@@ -121,8 +123,9 @@ pub const THINKING_BUDGET: u64 = 8192;
 ///   id moves to a 3.x line this may need to switch (tracked in `docs/issues.md`).
 /// - **DeepSeek** — reasoner models (`*-pro`) emit `reasoning_content` on their own;
 ///   there is no request toggle. `None`.
-/// - **Lemonade/Gemma** — the local server already reasons (`--reasoning-format
-///   auto`); nothing to send. `None`.
+/// - **OpenAI** — the generic OpenAI-compatible path; the local Gemma default
+///   already reasons (`--reasoning-format auto`) and there's no portable toggle
+///   across arbitrary endpoints, so nothing to send. `None`.
 pub fn thinking_params(provider: Provider) -> Option<Value> {
     match provider {
         Provider::Anthropic => Some(json!({
@@ -136,7 +139,7 @@ pub fn thinking_params(provider: Provider) -> Option<Value> {
                 }
             }
         })),
-        Provider::DeepSeek | Provider::Lemonade => None,
+        Provider::DeepSeek | Provider::Openai => None,
     }
 }
 
@@ -149,9 +152,10 @@ pub fn default_models(provider: Provider) -> (&'static str, &'static str) {
         Provider::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
         // Gemini: LITE explorer; flash (not pro) synth — pro is API-flaky.
         Provider::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
-        // Local lemonade/Gemma: the small E4B drives the tool-heavy exploration,
-        // the 26B MoE writes the answer. Both carry the `tool-calling` label.
-        Provider::Lemonade => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
+        // OpenAI default endpoint is local Gemma: the small E4B drives the
+        // tool-heavy exploration, the 26B MoE writes the answer (both carry the
+        // `tool-calling` label). Override per call when pointing at a hosted host.
+        Provider::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
 
