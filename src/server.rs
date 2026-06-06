@@ -27,6 +27,33 @@ use crate::sandbox::KaishWorker;
 /// The one resource kaibo serves: the verbose kaish cheatsheet.
 const KAISH_SYNTAX_URI: &str = "kaibo://kaish-syntax";
 
+/// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
+///
+/// Composes to any posture: `{explore:false, synthesize:false}` ≈ the original
+/// consult-only surface; only `run_kaish` on ≈ "no code leaves the box, kaibo as a
+/// pure read-only shell". A server with *all* off is a misconfiguration — refused
+/// at startup (see `main`), not represented as a valid state here.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolGating {
+    pub consult: bool,
+    pub explore: bool,
+    pub synthesize: bool,
+    pub run_kaish: bool,
+}
+
+impl Default for ToolGating {
+    fn default() -> Self {
+        Self { consult: true, explore: true, synthesize: true, run_kaish: true }
+    }
+}
+
+impl ToolGating {
+    /// True iff every tool is disabled — the zero-tool server we refuse to start.
+    pub fn all_disabled(&self) -> bool {
+        !self.consult && !self.explore && !self.synthesize && !self.run_kaish
+    }
+}
+
 /// Arguments to the `consult` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConsultInput {
@@ -131,12 +158,45 @@ pub struct KaiboHandler {
 
 #[tool_router]
 impl KaiboHandler {
-    pub fn new(default_root: Option<PathBuf>, default_provider: Provider) -> Self {
+    pub fn new(
+        default_root: Option<PathBuf>,
+        default_provider: Provider,
+        gating: ToolGating,
+    ) -> Self {
+        // `#[tool_router]` gathers every #[tool] method at compile time; gating is a
+        // runtime choice, so build the full router and drop the disabled routes by
+        // name. (The methods stay compiled — no dead code — they're just not
+        // advertised or callable.)
+        let mut tool_router = Self::tool_router();
+        if !gating.consult {
+            tool_router.remove_route("consult");
+        }
+        if !gating.explore {
+            tool_router.remove_route("explore");
+        }
+        if !gating.synthesize {
+            tool_router.remove_route("synthesize");
+        }
+        if !gating.run_kaish {
+            tool_router.remove_route("run_kaish");
+        }
         Self {
             default_root,
             default_provider,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
+    }
+
+    /// Tool names this handler advertises, after gating. For tests/diagnostics.
+    pub fn advertised_tools(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Resolve a call's project root: the explicit `path`, else the server's

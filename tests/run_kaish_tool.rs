@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use kaibo::credentials::Provider;
-use kaibo::server::{KaiboHandler, RunKaishInput};
+use kaibo::server::{KaiboHandler, RunKaishInput, ToolGating};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::tempdir;
 
@@ -33,7 +33,7 @@ async fn run_tool(handler: &KaiboHandler, path: &Path, script: &str) -> String {
 
 fn handler_for(_root: &Path) -> KaiboHandler {
     // No default root: the test passes `path` explicitly each call.
-    KaiboHandler::new(None, Provider::Anthropic)
+    KaiboHandler::new(None, Provider::Anthropic, ToolGating::default())
 }
 
 #[tokio::test]

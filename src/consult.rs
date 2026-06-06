@@ -222,6 +222,7 @@ pub fn synth_user_prompt(question: &str, report: &str) -> String {
 /// `synthesize` ({run_kaish}), and the recomposed `consult` ({run_kaish,
 /// explore′}). Heterogeneous tools erase to `Box<dyn ToolDyn>`, so this stays
 /// monomorphic in its toolset. The caller owns each tool's worker lifetime.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 pub(crate) async fn run_phase<C>(
     client: &C,
     model: &str,
