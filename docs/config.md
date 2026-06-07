@@ -125,6 +125,7 @@ else is mechanical:
 | max output tokens | `defaults.max_tokens` *(per-profile override)* | `KAIBO_MAX_TOKENS` | — |
 | thinking budget | `defaults.thinking_budget` *(per-profile override)* | `KAIBO_THINKING_BUDGET` | — |
 | LLM request timeout (s) | `defaults.request_timeout_secs` *(per-profile override)* | `KAIBO_REQUEST_TIMEOUT_SECS` | — |
+| session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | disable extra builtins | `sandbox.disable_builtins` *(list; file-only)* | — | — |

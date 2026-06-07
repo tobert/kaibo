@@ -24,6 +24,7 @@
 //! alias that collides with a profile name are all hard errors at load.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -50,6 +51,10 @@ pub struct Defaults {
     /// overridable per profile (a slow local model wants more rope than a hosted
     /// API). See [`Profile::request_timeout`].
     pub request_timeout: Duration,
+    /// Max distinct multi-turn `consult` sessions held in memory at once. Eviction
+    /// is capacity-driven only (no TTL) — see [`crate::session`]. Server-wide, not
+    /// per profile (a session is a client thread, not a model trait).
+    pub session_capacity: NonZeroUsize,
 }
 
 impl Default for Defaults {
@@ -67,6 +72,9 @@ impl Default for Defaults {
             // it bounds a wedged provider that would otherwise hang forever
             // (non-streaming loop → no other brake). Tune per profile if needed.
             request_timeout: Duration::from_secs(900),
+            // 128 lean Q&A threads is a few KB of strings — generous for a personal
+            // server, and capacity (not time) is the only eviction pressure.
+            session_capacity: NonZeroUsize::new(128).expect("128 is nonzero"),
         }
     }
 }
@@ -271,7 +279,7 @@ impl Config {
 
     /// Merge a raw (file/env) config over the built-in registry and validate.
     fn merge(raw: RawConfig) -> Result<Self> {
-        let defaults = merge_defaults(raw.defaults.unwrap_or_default());
+        let defaults = merge_defaults(raw.defaults.unwrap_or_default())?;
 
         // Start from the built-in profiles, then apply the file's profile table.
         // Collect file-declared aliases as we go (the alias map is built once all
@@ -554,6 +562,7 @@ struct RawDefaults {
     max_tokens: Option<u64>,
     thinking_budget: Option<u64>,
     request_timeout_secs: Option<u64>,
+    session_capacity: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -621,9 +630,17 @@ impl RawProfile {
     }
 }
 
-fn merge_defaults(raw: RawDefaults) -> Defaults {
+fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
     let d = Defaults::default();
-    Defaults {
+    // A zero session_capacity can't make a valid LruCache and would mean "remember
+    // nothing", which is what omitting `session_id` already does — so it's never a
+    // real intent. Reject it at load rather than panicking on the first session.
+    let session_capacity = match raw.session_capacity {
+        Some(n) => NonZeroUsize::new(n)
+            .ok_or_else(|| anyhow!("[defaults] session_capacity must be > 0 (got 0)"))?,
+        None => d.session_capacity,
+    };
+    Ok(Defaults {
         explorer_max_turns: raw.explorer_max_turns.unwrap_or(d.explorer_max_turns),
         synth_max_turns: raw.synth_max_turns.unwrap_or(d.synth_max_turns),
         max_tokens: raw.max_tokens.unwrap_or(d.max_tokens),
@@ -632,7 +649,8 @@ fn merge_defaults(raw: RawDefaults) -> Defaults {
             .request_timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(d.request_timeout),
-    }
+        session_capacity,
+    })
 }
 
 fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
@@ -701,6 +719,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_REQUEST_TIMEOUT_SECS") {
         defaults.request_timeout_secs = Some(parse_env("KAIBO_REQUEST_TIMEOUT_SECS", &v)?);
+    }
+    if let Some(v) = get("KAIBO_SESSION_CAPACITY") {
+        defaults.session_capacity = Some(parse_env("KAIBO_SESSION_CAPACITY", &v)?);
     }
 
     let sandbox = raw.sandbox.get_or_insert_with(Default::default);

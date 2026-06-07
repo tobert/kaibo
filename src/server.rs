@@ -28,6 +28,7 @@ use crate::consult::{consult, explore, synthesize, ConsultConfig};
 use crate::explorer::format_output;
 use crate::kaish_syntax::{kaibo_sandbox_doc, kaibo_instructions, render_builtin_help, render_topic, topics};
 use crate::sandbox::{builtin_schemas, KaishWorker};
+use crate::session::{QaTurn, SessionStore};
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
 const KAISH_RES_PREFIX: &str = "kaibo://kaish/";
@@ -88,6 +89,13 @@ pub struct ConsultInput {
     /// Override the synthesizer (final-answer) model id.
     #[serde(default)]
     pub synth_model: Option<String>,
+
+    /// Opaque session id to make this a multi-turn consult. When set, kaibo replays
+    /// this session's prior `(question, answer)` pairs as context and records this
+    /// turn into it; the exploration still runs fresh. Omit it for a stateless,
+    /// one-shot consult. Sessions are evicted by capacity, not time.
+    #[serde(default)]
+    pub session_id: Option<String>,
 
     /// Max tool-loop turns for each delegated `explore′` sweep (default 50).
     #[serde(default)]
@@ -173,6 +181,9 @@ pub struct KaiboHandler {
     /// `kaibo://kaish/*` help resources and the composed onboarding instructions.
     /// `Arc` because rmcp clones the handler per request and these never change.
     tool_schemas: Arc<Vec<ToolSchema>>,
+    /// Multi-turn `consult` sessions. Internally an `Arc<Mutex<_>>`, so the
+    /// per-request handler clones all share one cache (see [`SessionStore`]).
+    sessions: SessionStore,
 }
 
 #[tool_router]
@@ -204,10 +215,12 @@ impl KaiboHandler {
                 tool_router.remove_route(name);
             }
         }
+        let sessions = SessionStore::new(config.defaults.session_capacity);
         Ok(Self {
             config: Arc::new(config),
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
+            sessions,
         })
     }
 
@@ -255,10 +268,12 @@ impl KaiboHandler {
             (cat/grep/rg/find/jq/pipelines): it reads precise spans directly and \
             delegates broad repo sweeps to a fast explorer sub-agent, then answers \
             from what they find with concrete `file:line` citations. Read-only: it \
-            never modifies the project. Args: question (required), path (project dir; \
-            optional if the server has a default root), provider \
-            (anthropic|deepseek|gemini|openai), and optional explorer_model / \
-            synth_model overrides."
+            never modifies the project. For a multi-turn conversation, pass a stable \
+            session_id: kaibo replays that session's prior question/answer pairs as \
+            context (the exploration still runs fresh each turn). Args: question \
+            (required), path (project dir; optional if the server has a default root), \
+            provider (anthropic|deepseek|gemini|openai), session_id (optional; opaque \
+            conversation key), and optional explorer_model / synth_model overrides."
     )]
     async fn consult(
         &self,
@@ -281,9 +296,24 @@ impl KaiboHandler {
             sandbox: self.config.sandbox.clone(),
         };
 
-        let out = consult(&input.question, root, &profile, &cfg)
+        // Multi-turn: replay this session's prior turns as context, then record this
+        // one. With no session_id the history is empty and nothing is stored — a
+        // stateless one-shot, unchanged. The lock lives only inside history()/record()
+        // and is never held across the consult await.
+        let history = match &input.session_id {
+            Some(id) => self.sessions.history(id),
+            None => Vec::new(),
+        };
+
+        let out = consult(&input.question, root, &profile, &cfg, &history)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        // Record only a *successful* turn — a failed consult shouldn't poison the
+        // thread with a half-answer the next turn would treat as established context.
+        if let Some(id) = input.session_id {
+            self.sessions.record(&id, QaTurn::new(input.question, out.answer.clone()));
+        }
 
         Ok(CallToolResult::success(vec![Content::text(out.answer)]))
     }

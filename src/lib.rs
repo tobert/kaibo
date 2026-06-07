@@ -16,3 +16,4 @@ pub mod explorer;
 pub mod kaish_syntax;
 pub mod sandbox;
 pub mod server;
+pub mod session;

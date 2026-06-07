@@ -14,22 +14,14 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-03 (caught up to kaish's four-crate split — `kaish-tool-api` /
-`kaish-vfs` / `kaish-tools-git` / `kaish-tools-host` — and the `Tool::execute`
-`&mut dyn ToolCtx` boundary).
+Last pass: 2026-06-07 (multi-turn `consult` sessions shipped — `session.rs`; folded
+out the shipped config work — named profiles, per-profile `base_url`,
+`api_key_env`/`api_key_file` — and fixed the dangling "P2 config entry" refs left
+behind when it landed).
 
 ---
 
 ## P1 — High-leverage features & robustness
-
-### Multi-turn sessions (the last v1 feature)
-`consult` is stateless: every call re-explores from scratch. dpal keeps cap-based
-LRU sessions (no TTL — Amy holds sessions open for days; eviction is
-capacity-driven only) storing lean `[question, answer]` pairs, and re-explores
-fresh each turn while passing prior pairs as context. We want the same: a
-`session_id` arg on `consult`, an in-memory `LruCache<SessionId, Vec<(Q,A)>>`,
-and the synth prompt seeded with prior turns. The exploration report stays
-ephemeral (never stored — it'd be stale bloat). Not yet built.
 
 ### `MaxTurnError` is fatal — degrade gracefully instead
 rig's `prompt().max_turns(n)` returns a hard error if the model doesn't conclude
@@ -59,6 +51,22 @@ Tracked in the `kaish-readonly-bypass` memory.
 ---
 
 ## P3 — Infra, perf, polish
+
+### Multi-turn session history is unbounded per session
+`SessionStore` (`session.rs`) caps the number of *sessions* (LRU, `session_capacity`)
+but keeps every `(question, answer)` pair in a session forever — matching dpal, which
+also doesn't cap per-thread depth. The pairs are lean, but a very long-running thread
+grows `consult_user_prompt`'s context monotonically; a local model's small window
+(see the context-window entry below) would feel it first. If it bites, keep the last
+N turns (or summarize older ones) rather than all — but measure a real long session
+before adding the knob.
+
+### Session record/replay glue has no offline test
+`session.rs` (LRU semantics) and `consult_user_prompt` (the prompt framing) are both
+unit-tested, but the `server.rs` consult-handler glue that reads history → feeds
+consult → records the turn is only exercised by the `#[ignore]`d live tests. The same
+mock `CompletionClient` the entry below wants (to prove `explore′` delegation) would
+also let us assert offline that a second turn sees the first turn's pair.
 
 ### Two kernel builds + two threads per consult
 Each phase spawns a fresh `KaishWorker` (explorer + synth = two OS threads, two
@@ -113,10 +121,9 @@ recorded here so we don't lose that our sandbox's hermeticity depends on it land
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they
 rot (rig 0.34's bundled `CLAUDE_*` / gemini consts are already retired — see the
 `claude-3-5-haiku-latest` 404 on 2026-06-03). Keep them in sync with the
-source-of-truth pal configs (`provider-model-ids` memory). → The "tiny config
-file" half of this is now designed: model ids move into profiles
-(`docs/config.md`). See the P2 config entry; the in-sync-with-pals discipline
-stays regardless.
+source-of-truth pal configs (`provider-model-ids` memory). → Model ids now live in
+profiles and are overridable per profile in `config.toml` (shipped; `docs/config.md`).
+The in-sync-with-pals discipline for the built-in defaults stays regardless.
 
 ### Thinking config tracks model generation (Gemini), and budgets are static
 Thinking is on by default, both phases (`consult.rs::thinking_params`): Anthropic
@@ -145,13 +152,6 @@ Thinking-on makes this tighter still: reasoning now also draws on the 16384
 `max_tokens`, so a local server needs a context window comfortably above input +
 reasoning + answer.
 
-### Only one `openai` endpoint can be live per process → designed
-`Provider::Openai` resolves a single `OPENAI_BASE_URL` + `OPENAI_API_KEY`, so a
-server instance can talk to exactly one OpenAI-compatible endpoint at a time. The
-headline driver for the config work: named profiles backed by a registry, the
-`provider` arg carrying the instance name. Designed in `docs/config.md`; tracked
-for implementation under the P2 config entry.
-
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
 error. Validating available providers at startup (and noting them in the server
@@ -163,12 +163,12 @@ rather than a key check.
 
 ## P4 — Eventually
 
-### Credential paths are fixed → designed (paths), deferred (secrets manager)
-`credentials.rs` reads `~/.anthropic-key.txt` / `~/.deepseek-key` /
-`~/.gemini-api-key` (env var overrides). Custom paths are now designed: a profile's
-`api_key_file` / `api_key_env` (`docs/config.md`, P2 config entry). A secrets
-manager is still out of scope — by design the TOML references keys, never inlines
-them, so "point at $SECRET_TOOL output" would be a future key-source variant.
+### A secrets-manager key source (deferred)
+Custom credential paths shipped — a profile's `api_key_env` / `api_key_file`
+override the built-in `~/.anthropic-key.txt` / `~/.deepseek-key` / `~/.gemini-api-key`
+defaults (`credentials.rs`, `docs/config.md`). A secrets *manager* is still out of
+scope: by design the TOML references keys, never inlines them, so "point at
+`$SECRET_TOOL` output" would be a future key-source variant alongside env/file.
 
 ### Provider-specific features are flattened
 The pals (gpal/dpal/cpal) deliberately pass through provider-specific features

@@ -223,6 +223,28 @@ fn zero_request_timeout_is_rejected_loudly() {
 }
 
 #[test]
+fn session_capacity_defaults_and_overrides_from_file() {
+    use std::num::NonZeroUsize;
+    // Absent → the built-in 128.
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.session_capacity, NonZeroUsize::new(128).unwrap());
+    // Set in [defaults] → honored.
+    let c = Config::from_toml_str("[defaults]\nsession_capacity = 7\n").unwrap();
+    assert_eq!(c.defaults.session_capacity, NonZeroUsize::new(7).unwrap());
+}
+
+#[test]
+fn zero_session_capacity_is_rejected_loudly() {
+    // A zero-capacity session cache can't be built and would mean "remember nothing"
+    // — which omitting session_id already does. Crash at load, not on first session.
+    let err = Config::from_toml_str("[defaults]\nsession_capacity = 0\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("session_capacity"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
 fn new_profile_inherits_its_kinds_key_source_and_models() {
     // A second anthropic profile with no model overrides should inherit the kind's
     // built-in models and key source — convenient, not a forced re-spec.

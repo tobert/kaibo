@@ -33,6 +33,7 @@ use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::sandbox::{KaishWorker, SandboxConfig};
+use crate::session::QaTurn;
 
 /// Construct the rig client for `$profile` (resolving its key, plus base URL for an
 /// OpenAI-compatible one) and bind it to `$client` for `$body`. The kind selects the
@@ -536,6 +537,35 @@ pub async fn synthesize(
     })
 }
 
+/// Build the consult driver's user prompt from the question and any prior session
+/// turns. Pure and offline-testable: this framing is the whole of the multi-turn
+/// hand-off, so it's worth pinning in a test.
+///
+/// With **no** history this is exactly the bare question — a stateless consult is
+/// byte-for-byte unchanged. With history, prepend the prior `(question, answer)`
+/// pairs as conversation context and steer the model to re-confirm any span a prior
+/// answer cited: the exploration runs fresh every turn (we never replay the stored
+/// report — it'd be stale), so the code is the ground truth, not the old answer.
+pub fn consult_user_prompt(question: &str, history: &[QaTurn]) -> String {
+    if history.is_empty() {
+        return question.to_string();
+    }
+    let mut prompt = String::from(
+        "This is a continuing conversation about the same codebase. Earlier turns, \
+         oldest first:\n\n",
+    );
+    for (i, turn) in history.iter().enumerate() {
+        prompt.push_str(&format!("[Turn {}]\nQ: {}\nA: {}\n\n", i + 1, turn.question, turn.answer));
+    }
+    prompt.push_str(&format!(
+        "Use the earlier turns for context and continuity. Investigate fresh and \
+         re-confirm any `file:line` an earlier answer cited before you rely on it — \
+         the code is the ground truth, not the prior answer. Now answer the current \
+         question:\n\n{question}"
+    ));
+    prompt
+}
+
 /// The recomposed `consult` driver: one capable model, two tools. Composes the
 /// shared [`kaish_syntax_core`] (for `run_kaish`) and frames `explore` as the way
 /// to cover breadth. Positive framing on purpose — weaker/local models loop on
@@ -597,7 +627,7 @@ where
 /// `explore′` sweeps returned (empty if the model read everything itself).
 async fn consult_with<C>(
     client: &C,
-    question: &str,
+    user_prompt: &str,
     root: &Path,
     explorer_model: &str,
     synth_model: &str,
@@ -616,7 +646,7 @@ where
         synth_model,
         &consult_preamble(),
         cfg.max_tokens,
-        question.to_string(),
+        user_prompt.to_string(),
         cfg.synth_max_turns,
         thinking,
         tools,
@@ -631,25 +661,30 @@ where
     Ok(ConsultOutput { answer, report })
 }
 
-/// Run a two-phase consult against `root` using `profile`.
+/// Run a consult against `root` using `profile`.
 ///
 /// Resolves the profile's key (env var or key-file) and takes its models, token
-/// budget, and thinking budget; `cfg` carries the per-call loop bounds.
+/// budget, and thinking budget; `cfg` carries the per-call loop bounds. `history`
+/// is the prior `(question, answer)` turns of a multi-turn session (empty for a
+/// stateless one-shot) — it seeds the driver's prompt but never the exploration,
+/// which always runs fresh. See [`consult_user_prompt`].
 pub async fn consult(
     question: &str,
     root: impl Into<PathBuf>,
     profile: &Profile,
     cfg: &ConsultConfig,
+    history: &[QaTurn],
 ) -> Result<ConsultOutput> {
     let root = root.into();
     // Thinking on, both phases, where the provider takes a request-time toggle.
     let thinking = thinking_params(profile.kind, profile.thinking_budget);
     let thinking = thinking.as_ref();
+    let user_prompt = consult_user_prompt(question, history);
 
     with_provider_client!(profile, |client| {
         consult_with(
             &client,
-            question,
+            &user_prompt,
             &root,
             &profile.explorer_model,
             &profile.synth_model,
@@ -681,5 +716,41 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
         assert!(names.iter().any(|n| n == "run_kaish"), "missing run_kaish, got {names:?}");
         assert!(names.iter().any(|n| n == "explore"), "missing explore′, got {names:?}");
+    }
+
+    /// No session history ⇒ the prompt is *exactly* the bare question. This pins the
+    /// promise that a stateless consult is byte-for-byte its pre-session behavior.
+    #[test]
+    fn empty_history_yields_the_bare_question() {
+        assert_eq!(consult_user_prompt("Where is the sandbox enforced?", &[]),
+                   "Where is the sandbox enforced?");
+    }
+
+    /// With history, every prior turn appears, the current question appears, and the
+    /// turns precede the current question (the model reads context before the ask).
+    #[test]
+    fn history_is_replayed_before_the_current_question_in_order() {
+        let history = vec![
+            QaTurn::new("What is kaish?", "A read-only shell (src/sandbox.rs)."),
+            QaTurn::new("Who calls it?", "consult drives it (src/consult.rs)."),
+        ];
+        let prompt = consult_user_prompt("And explore?", &history);
+
+        for needle in [
+            "What is kaish?",
+            "A read-only shell (src/sandbox.rs).",
+            "Who calls it?",
+            "consult drives it (src/consult.rs).",
+            "And explore?",
+        ] {
+            assert!(prompt.contains(needle), "prompt must carry {needle:?}:\n{prompt}");
+        }
+        // Ordering: the first prior turn comes before the second, and both come
+        // before the current question.
+        let first = prompt.find("What is kaish?").unwrap();
+        let second = prompt.find("Who calls it?").unwrap();
+        let current = prompt.find("And explore?").unwrap();
+        assert!(first < second, "turns must be oldest-first");
+        assert!(second < current, "history must precede the current question");
     }
 }

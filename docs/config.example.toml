@@ -44,6 +44,8 @@ explorer_max_turns = 50      # bounds each cheap explore′ sweep — cheap, let
 synth_max_turns    = 100     # bounds the consult driver loop (sweeps AND span reads)
 max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
 thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle
+session_capacity   = 128     # max multi-turn consult sessions held in memory (LRU,
+                             # capacity-evicted, no TTL); must be > 0
 
 # ---------------------------------------------------------------------------
 # [sandbox] — the read-only execution limits (see src/sandbox.rs)
