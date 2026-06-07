@@ -14,25 +14,11 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-07 (multi-turn `consult` sessions shipped — `session.rs`; folded
-out the shipped config work — named profiles, per-profile `base_url`,
-`api_key_env`/`api_key_file` — and fixed the dangling "P2 config entry" refs left
-behind when it landed).
-
----
-
-## P1 — High-leverage features & robustness
-
-### `MaxTurnError` is fatal — degrade gracefully instead
-rig's `prompt().max_turns(n)` returns a hard error if the model doesn't conclude
-within `n` turns, discarding all progress (`consult.rs::run_phase`). We bumped the
-explorer cap to 50 to make it rare, but a genuinely stuck explorer still fails the
-whole consult. Better: on cap-hit, force one final no-tools "write your report now
-from what you've seen" turn so the synth still gets *something*. rig doesn't hand
-back the partial transcript on error, so this likely needs a `PromptHook` (to
-capture messages each turn) or a hand-rolled turn loop over the lower-level
-completion API. Surfaced 2026-06-03: a broad multi-part question burned all 12
-turns (the old cap) and failed.
+Last pass: 2026-06-07 (turn-cap graceful degradation shipped — `consult.rs`:
+`MaxTurnsError` is no longer fatal, since rig 0.34 hands back the full transcript;
+`run_phase` now forces one final `ToolChoice::None` answer-now turn from the partial
+work. Folded out the prior P1 entry — its premise that rig discards the transcript
+was stale).
 
 ---
 

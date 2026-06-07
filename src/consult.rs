@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, ToolDefinition};
+use rig::completion::message::{ToolChoice, UserContent};
+use rig::completion::{Message, Prompt, PromptError, ToolDefinition};
 use rig::providers::{anthropic, deepseek, gemini, openai};
 use rig::tool::{Tool, ToolDyn};
 use serde::Deserialize;
@@ -222,16 +223,65 @@ pub fn synth_user_prompt(question: &str, report: &str) -> String {
     )
 }
 
-/// One model loop, parameterized by its toolset: build an agent with `preamble`,
-/// hand it `tools`, and run its bounded tool loop. Generic over the provider.
+/// The forced-finish instruction we append when a phase exhausts its turn cap.
+/// Deliberately repeated front and back: weaker/local models latch onto the most
+/// recent instruction, and a model that just spent every turn calling tools needs
+/// firm, redundant steering to stop and write. Positive framing where it counts
+/// ("write your full response now") bracketed by the hard constraint ("no more
+/// tools"), per the `positive-prompt-framing` discipline.
+const FINALIZE_NOTE: &str = "\
+STOP — you have reached your research limit and may not call any more tools. Using \
+only the evidence you have already gathered in this conversation, write your \
+COMPLETE final response now, with its concrete `file:line` citations. Do not call \
+any tool. Do not ask to continue. Write the full answer (or curated report) from \
+what you already have — right now.";
+
+/// Build the forced final turn from the transcript rig hands back at the turn cap.
 ///
-/// The toolset is injected (not hardcoded to `run_kaish`) so the same loop is the
-/// primitive behind every tool on the surface — `explore` ({run_kaish}),
-/// `synthesize` ({run_kaish}), and the recomposed `consult` ({run_kaish,
-/// explore′}). Heterogeneous tools erase to `Box<dyn ToolDyn>`, so this stays
-/// monomorphic in its toolset. The caller owns each tool's worker lifetime.
+/// Returns `(history, prompt)` for one more constrained completion: the prompt is
+/// the conversation's last message with [`FINALIZE_NOTE`] appended (so the model
+/// reads the "answer now" instruction last), and `history` is everything before it.
+///
+/// At the cap the transcript's last message is almost always the user's
+/// tool-results turn (the loop broke just as the model was about to call yet
+/// another tool), so the note rides along inside that same user message — we never
+/// emit two user turns back to back, which some providers reject. If the transcript
+/// somehow ends on an assistant turn, the note becomes a fresh trailing user turn
+/// instead (valid after an assistant message). Pure and offline-testable.
+fn finalize_prompt(mut chat_history: Vec<Message>) -> (Vec<Message>, Message) {
+    match chat_history.pop() {
+        Some(Message::User { mut content }) => {
+            content.push(UserContent::text(FINALIZE_NOTE));
+            (chat_history, Message::User { content })
+        }
+        Some(other) => {
+            chat_history.push(other);
+            (chat_history, Message::user(FINALIZE_NOTE))
+        }
+        None => (Vec::new(), Message::user(FINALIZE_NOTE)),
+    }
+}
+
+/// One model loop, parameterized by its toolset: build an agent with `preamble`,
+/// hand it the tools `make_tools` builds, and run its bounded tool loop. Generic
+/// over the provider.
+///
+/// The toolset is injected via a *factory* (not a prebuilt `Vec`, and not hardcoded
+/// to `run_kaish`) so the same loop is the primitive behind every tool on the
+/// surface — `explore` ({run_kaish}), `synthesize` ({run_kaish}), and the
+/// recomposed `consult` ({run_kaish, explore′}). The factory matters because of the
+/// turn-cap recovery below: a fresh toolset is built for the forced final turn, and
+/// `Box<dyn ToolDyn>` can't be cloned, so we rebuild rather than share. Each call
+/// spawns its own `KaishWorker`(s); the caller owns their lifetime.
+///
+/// **Turn-cap recovery.** When the model uses every turn without concluding, rig
+/// 0.34 returns `MaxTurnsError` carrying the *full transcript* (not the opaque
+/// failure the old code mapped to an error). Rather than discard all that work, we
+/// run one final constrained turn via [`finalize_after_max_turns`]: the tools stay
+/// declared so the accumulated tool_use/tool_result history stays valid, but
+/// `ToolChoice::None` forbids new calls — the model must answer from what it has.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
-pub(crate) async fn run_phase<C>(
+pub(crate) async fn run_phase<C, F>(
     client: &C,
     model: &str,
     preamble: &str,
@@ -239,11 +289,12 @@ pub(crate) async fn run_phase<C>(
     user_prompt: String,
     max_turns: usize,
     thinking: Option<&Value>,
-    tools: Vec<Box<dyn ToolDyn>>,
+    make_tools: F,
 ) -> Result<String>
 where
     C: CompletionClient,
     C::CompletionModel: 'static,
+    F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
 {
     let mut builder = client
         .agent(model)
@@ -253,23 +304,68 @@ where
     if let Some(params) = thinking {
         builder = builder.additional_params(params.clone());
     }
+    let agent = builder.tools(make_tools()?).build();
+    match agent.prompt(user_prompt).max_turns(max_turns).await {
+        Ok(answer) => Ok(answer),
+        Err(PromptError::MaxTurnsError { chat_history, .. }) => {
+            finalize_after_max_turns(
+                client,
+                model,
+                preamble,
+                max_tokens,
+                thinking,
+                make_tools()?,
+                *chat_history,
+                max_turns,
+            )
+            .await
+        }
+        Err(e) => Err(anyhow!("model loop failed: {e}")),
+    }
+}
+
+/// The forced final turn after a phase hit its turn cap: replay the partial
+/// transcript and make the model write its answer now, with tools declared (so the
+/// history validates) but [`ToolChoice::None`] forbidding any further call. See
+/// [`run_phase`]'s recovery note and [`finalize_prompt`].
+#[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
+async fn finalize_after_max_turns<C>(
+    client: &C,
+    model: &str,
+    preamble: &str,
+    max_tokens: u64,
+    thinking: Option<&Value>,
+    tools: Vec<Box<dyn ToolDyn>>,
+    chat_history: Vec<Message>,
+    max_turns: usize,
+) -> Result<String>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+{
+    let (history, prompt) = finalize_prompt(chat_history);
+    let mut builder = client
+        .agent(model)
+        .preamble(preamble)
+        .max_tokens(max_tokens)
+        .tool_choice(ToolChoice::None);
+    if let Some(params) = thinking {
+        builder = builder.additional_params(params.clone());
+    }
     let agent = builder.tools(tools).build();
+    // max_turns(1): one constrained completion. With tools forbidden the model can't
+    // loop, so a single round is enough — and if a provider ignores ToolChoice::None
+    // and still calls a tool, we surface that rather than recurse.
     agent
-        .prompt(user_prompt)
-        .max_turns(max_turns)
+        .prompt(prompt)
+        .with_history(history)
+        .max_turns(1)
         .await
         .map_err(|e| {
-            let msg = e.to_string();
-            // rig treats hitting the turn cap as a fatal error (no partial result).
-            // Make it actionable rather than opaque.
-            if msg.contains("max turn") {
-                anyhow!(
-                    "model used all {max_turns} tool turns without concluding — raise \
-                     the turn cap or narrow the question ({msg})"
-                )
-            } else {
-                anyhow!("model loop failed: {msg}")
-            }
+            anyhow!(
+                "model used all {max_turns} turns, and the forced final-answer turn \
+                 also failed to conclude: {e}"
+            )
         })
 }
 
@@ -373,11 +469,9 @@ where
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // A fresh kernel per call (the §2.1 cost note: a KaishWorker per explore′).
-        let worker = KaishWorker::spawn_with(&self.root, self.sandbox.clone())
-            .map_err(|e| RunExploreError(e.to_string()))?;
-        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(RunKaish::new(worker))];
         // Reuse the one loop — explore′ is just run_phase with the explorer model.
+        // A fresh kernel per worker build (the §2.1 cost note: a KaishWorker per
+        // explore′; run_phase may build a second for the turn-cap recovery turn).
         let report = run_phase(
             &self.client,
             &self.model,
@@ -386,7 +480,12 @@ where
             args.question,
             self.max_turns,
             self.thinking.as_ref(),
-            tools,
+            || -> Result<Vec<Box<dyn ToolDyn>>> {
+                Ok(vec![Box::new(RunKaish::new(KaishWorker::spawn_with(
+                    &self.root,
+                    self.sandbox.clone(),
+                )?))])
+            },
         )
         .await
         .map_err(|e| RunExploreError(format!("{e:#}")))?;
@@ -413,8 +512,6 @@ where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
-    let tools: Vec<Box<dyn ToolDyn>> =
-        vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))];
     run_phase(
         client,
         model,
@@ -423,7 +520,9 @@ where
         question.to_string(),
         cfg.explorer_max_turns,
         thinking,
-        tools,
+        || -> Result<Vec<Box<dyn ToolDyn>>> {
+            Ok(vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))])
+        },
     )
     .await
 }
@@ -501,8 +600,6 @@ where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
-    let tools: Vec<Box<dyn ToolDyn>> =
-        vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))];
     run_phase(
         client,
         model,
@@ -511,7 +608,9 @@ where
         user_prompt,
         cfg.synth_max_turns,
         thinking,
-        tools,
+        || -> Result<Vec<Box<dyn ToolDyn>>> {
+            Ok(vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))])
+        },
     )
     .await
 }
@@ -639,7 +738,6 @@ where
     C::CompletionModel: 'static,
 {
     let reports = Arc::new(Mutex::new(Vec::<String>::new()));
-    let tools = consult_tools(client, explorer_model, root, cfg, thinking, reports.clone())?;
 
     let answer = run_phase(
         client,
@@ -649,7 +747,9 @@ where
         user_prompt.to_string(),
         cfg.synth_max_turns,
         thinking,
-        tools,
+        // Rebuilt per call (main loop, and again if run_phase forces a final turn);
+        // every build shares the one `reports` sink so all explore′ sweeps aggregate.
+        || consult_tools(client, explorer_model, root, cfg, thinking, reports.clone()),
     )
     .await
     .context("consult loop")?;
@@ -716,6 +816,58 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
         assert!(names.iter().any(|n| n == "run_kaish"), "missing run_kaish, got {names:?}");
         assert!(names.iter().any(|n| n == "explore"), "missing explore′, got {names:?}");
+    }
+
+    /// Collect the text blocks of a user message (for asserting the finalize note).
+    fn user_text(msg: &Message) -> String {
+        match msg {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("expected a user message, got {msg:?}"),
+        }
+    }
+
+    /// The usual cap shape: the transcript ends on the user's tool-results turn. The
+    /// finalize note must ride *inside* that last user turn (not a new one — back-to-
+    /// back user turns break some providers), and history must shrink by exactly it.
+    #[test]
+    fn finalize_folds_note_into_trailing_user_turn() {
+        let history = vec![
+            Message::user("Original question"),
+            Message::assistant("calling a tool"),
+            Message::user("tool results"),
+        ];
+        let (rest, prompt) = finalize_prompt(history);
+
+        // The trailing user turn becomes the prompt and carries both its original
+        // content and the appended note.
+        let text = user_text(&prompt);
+        assert!(text.contains("tool results"), "original content kept: {text}");
+        assert!(text.contains(FINALIZE_NOTE), "note appended: {text}");
+        // History is everything before it — the trailing turn was consumed, not duplicated.
+        assert_eq!(rest.len(), 2, "trailing user turn consumed into the prompt");
+    }
+
+    /// Defensive shape: if the transcript ends on an assistant turn, we must not
+    /// mutate it — the note becomes a fresh trailing user turn (valid after an
+    /// assistant message) and the assistant turn stays in history.
+    #[test]
+    fn finalize_adds_user_turn_when_transcript_ends_on_assistant() {
+        let history = vec![Message::user("Q"), Message::assistant("partial thoughts")];
+        let (rest, prompt) = finalize_prompt(history);
+
+        assert!(user_text(&prompt).contains(FINALIZE_NOTE), "note is the new user turn");
+        assert_eq!(rest.len(), 2, "assistant turn kept in history");
+        assert!(
+            matches!(rest.last(), Some(Message::Assistant { .. })),
+            "assistant turn preserved at the tail"
+        );
     }
 
     /// No session history ⇒ the prompt is *exactly* the bare question. This pins the
