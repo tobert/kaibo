@@ -42,17 +42,6 @@ capture messages each turn) or a hand-rolled turn loop over the lower-level
 completion API. Surfaced 2026-06-03: a broad multi-part question burned all 12
 turns (the old cap) and failed.
 
-### A consult has no *whole-loop* wall-clock budget
-The two narrow brakes now exist — a 30s per-exec kaish timeout (`sandbox.rs`) and a
-per-request LLM deadline on the rig clients (`consult.rs`, `request_timeout`). What's
-still missing is a budget on the *whole* `run_phase` loop: a model that keeps making
-individually-fast-enough calls but never converges (or churns through `max_turns` of
-slow turns) can still run long. The per-request timeout doesn't catch that — each
-call is under the deadline. A `tokio::time::timeout` around the whole
-`agent.prompt(...).max_turns(...).await`, or a turn-budgeted deadline, would. Lower
-priority now that the indefinite-hang case is closed; this is the long-tail-of-slow
-case, not the wedged-forever case.
-
 ---
 
 ## P2 — Focused fixes & hardening
@@ -101,39 +90,6 @@ one-question/many-models (the diverse-opinion panel made literal).
 `tests/explorer_live.rs`. Retire it (and that test, or repoint it at
 `consult::explore`) once the new path has a few real miles on it — kept for now so
 there's a fallback if the recomposed path surprises us.
-
-### Idle-timeout via streaming — investigated, deliberately NOT done (scope to openai if ever)
-The per-request LLM deadline shipped: each rig client carries a `reqwest::Client`
-with `.timeout(profile.request_timeout)` (default 15 min, per-profile), so a provider
-that connects but never responds — the 2026-06-06 wedge, ~29 min on a local
-Gemma-4-26B — surfaces an error at the deadline instead of hanging. It's a *crude*
-backstop: rig's prompt loop is **non-streaming**, so the completion arrives in one
-shot and a wedged server is indistinguishable from a slow one — both are one long
-wait — so the deadline must sit above the slowest *legitimate* completion.
-
-We then looked at switching to rig's streaming loop to get an *idle* timeout (no
-token for N s → abort) and **decided against it wholesale.** Reasons, from reading
-rig 0.34 (`agent/prompt_request/{mod,streaming}.rs`, `providers/anthropic/*`):
-- **No real-time upside.** kaibo returns one final string per MCP call; partial
-  answers are low-value for a grounded-citation tool. Streaming's only real gain is
-  idle detection.
-- **It's a quality *downgrade* for the thinking-on paths.** Non-streaming pushes the
-  provider's complete assistant message back into history verbatim
-  (`mod.rs:454`), so Anthropic's *signed* thinking blocks round-trip atomically. The
-  streaming loop instead reassembles reasoning from unsigned deltas
-  (`streaming.rs:469-657`) — the documented home of "Anthropic rejects: signature
-  required" / Gemini delta-assembly / OpenAI ordering bugs. Switching would move our
-  thinking-on hosted calls onto the fragile branch for no benefit.
-- **It wouldn't fully fix the incident anyway.** That wedge was at *prefill* (no
-  token 1). A time-to-first-token deadline still can't tell a wedge from a legit
-  multi-minute big-context prefill.
-
-If idle detection is ever worth it, scope it to **`kind = openai` only**: that's
-where wedges actually happen (hosted APIs don't silently stall for half an hour), and
-`thinking_params(Openai) => None` (consult.rs) means the local path uses no signed
-reasoning blocks — so streaming there carries none of the reassembly fragility. Split
-the budget: generous TTFT deadline + tight inter-token idle. Until then the
-total-timeout backstop holds the line.
 
 ### A mock `CompletionClient` test that consult actually delegates to `explore′`
 Gemini's review noted: we pin the consult *toolset wiring* offline and exercise the
