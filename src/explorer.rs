@@ -150,8 +150,21 @@ pub async fn explore(
 ) -> Result<String> {
     let worker = KaishWorker::spawn(root)?;
 
-    let client =
-        anthropic::Client::new(api_key).map_err(|e| anyhow!("anthropic client init: {e}"))?;
+    // Legacy single-phase path (retirement tracked in docs/issues.md), but it still
+    // runs a non-streaming `agent.prompt(...)`, so it carries the same wedged-provider
+    // hang risk as `consult.rs`. Give it the same default per-request deadline rather
+    // than leave a known indefinite-hang path live. No Profile here, so seed from the
+    // documented default; the recomposed path is per-profile configurable.
+    let http = reqwest::Client::builder()
+        .timeout(crate::config::Defaults::default().request_timeout)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| anyhow!("http client init: {e}"))?;
+    let client = anthropic::Client::builder()
+        .api_key(api_key)
+        .http_client(http)
+        .build()
+        .map_err(|e| anyhow!("anthropic client init: {e}"))?;
 
     let agent = client
         .agent(cfg.model.as_str())

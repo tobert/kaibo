@@ -1220,6 +1220,7 @@ dependencies = [
  "async-trait",
  "clap",
  "kaish-kernel",
+ "reqwest",
  "rig-core",
  "rmcp",
  "serde",

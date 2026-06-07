@@ -29,6 +29,13 @@ anyhow = "1"
 # LLM providers + agent/tool loop. Native tools (no `rmcp` feature needed — kaibo
 # wraps kaish as an in-process rig Tool, not over MCP).
 rig-core = "0.34"
+# We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
+# per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
+# native timeout knob, and its prompt loop is non-streaming, so a wedged provider
+# would otherwise hang a tool call forever (see consult.rs / docs/issues.md).
+# Match rig's own reqwest: version 0.13, rustls TLS, no default-tls — feature
+# unification then keeps a single reqwest with one TLS backend.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the

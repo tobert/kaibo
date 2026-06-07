@@ -45,6 +45,11 @@ pub struct Defaults {
     pub synth_max_turns: usize,
     pub max_tokens: u64,
     pub thinking_budget: u64,
+    /// Per-request deadline on a single LLM completion call (a per-*HTTP-call*
+    /// bound, not the whole loop). Seeds every profile's `request_timeout`;
+    /// overridable per profile (a slow local model wants more rope than a hosted
+    /// API). See [`Profile::request_timeout`].
+    pub request_timeout: Duration,
 }
 
 impl Default for Defaults {
@@ -57,6 +62,11 @@ impl Default for Defaults {
             synth_max_turns: 100,
             max_tokens: 16384,
             thinking_budget: crate::consult::THINKING_BUDGET,
+            // 15 min. A single completion that takes longer is pathological for a
+            // hosted API and a generous ceiling for a slow local model; either way
+            // it bounds a wedged provider that would otherwise hang forever
+            // (non-streaming loop → no other brake). Tune per profile if needed.
+            request_timeout: Duration::from_secs(900),
         }
     }
 }
@@ -84,6 +94,13 @@ pub struct Profile {
     pub synth_model: String,
     pub max_tokens: u64,
     pub thinking_budget: u64,
+    /// Per-request deadline applied to this profile's HTTP client (`.timeout`):
+    /// the wall-clock ceiling on a single completion call. rig's prompt loop is
+    /// non-streaming and exposes no native timeout, so without this a provider
+    /// that connects but never responds wedges the call indefinitely — exactly
+    /// the 2026-06-06 stall (see `consult.rs` / `docs/issues.md`). Seeded from
+    /// [`Defaults::request_timeout`], overridable per profile.
+    pub request_timeout: Duration,
 }
 
 impl Profile {
@@ -310,6 +327,17 @@ impl Config {
                     p.max_tokens
                 );
             }
+            // A zero deadline means "time out instantly" — never a real intent, and
+            // it would brick every call. Catch it at load, not as a mystery failure
+            // on the first request. (There is no "disable" escape hatch: an infinite
+            // wait is the bug this field exists to prevent.)
+            if p.request_timeout.is_zero() {
+                bail!(
+                    "profile {:?}: request_timeout_secs must be > 0 — a zero deadline \
+                     times out every call instantly",
+                    p.name,
+                );
+            }
         }
 
         // Build the alias map and reject collisions loudly: built-in aliases first,
@@ -446,6 +474,7 @@ fn template_for_kind(kind: ProviderKind, defaults: &Defaults) -> Profile {
         synth_model: synth_model.to_string(),
         max_tokens: defaults.max_tokens,
         thinking_budget: defaults.thinking_budget,
+        request_timeout: defaults.request_timeout,
     }
 }
 
@@ -524,6 +553,7 @@ struct RawDefaults {
     synth_max_turns: Option<usize>,
     max_tokens: Option<u64>,
     thinking_budget: Option<u64>,
+    request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -539,6 +569,7 @@ struct RawProfile {
     synth_model: Option<String>,
     max_tokens: Option<u64>,
     thinking_budget: Option<u64>,
+    request_timeout_secs: Option<u64>,
 }
 
 impl RawProfile {
@@ -583,6 +614,9 @@ impl RawProfile {
         if let Some(v) = self.thinking_budget {
             p.thinking_budget = v;
         }
+        if let Some(v) = self.request_timeout_secs {
+            p.request_timeout = Duration::from_secs(v);
+        }
         Ok(())
     }
 }
@@ -594,6 +628,10 @@ fn merge_defaults(raw: RawDefaults) -> Defaults {
         synth_max_turns: raw.synth_max_turns.unwrap_or(d.synth_max_turns),
         max_tokens: raw.max_tokens.unwrap_or(d.max_tokens),
         thinking_budget: raw.thinking_budget.unwrap_or(d.thinking_budget),
+        request_timeout: raw
+            .request_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(d.request_timeout),
     }
 }
 
@@ -660,6 +698,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_THINKING_BUDGET") {
         defaults.thinking_budget = Some(parse_env("KAIBO_THINKING_BUDGET", &v)?);
+    }
+    if let Some(v) = get("KAIBO_REQUEST_TIMEOUT_SECS") {
+        defaults.request_timeout_secs = Some(parse_env("KAIBO_REQUEST_TIMEOUT_SECS", &v)?);
     }
 
     let sandbox = raw.sandbox.get_or_insert_with(Default::default);

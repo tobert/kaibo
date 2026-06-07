@@ -42,13 +42,16 @@ capture messages each turn) or a hand-rolled turn loop over the lower-level
 completion API. Surfaced 2026-06-03: a broad multi-part question burned all 12
 turns (the old cap) and failed.
 
-### A consult has no overall timeout
-`KaishWorker::run` (`sandbox.rs`) doesn't set a kernel exec timeout, and `consult`
-has no wall-clock budget. A hung provider API call or a pathological script can
-block a call indefinitely. kaish's kernel already supports per-exec timeouts
-(`ExecuteOptions::with_timeout`, used by kaish-mcp) — wire one into the worker, and
-consider an overall `consult` deadline. P1 because a hung MCP tool call is a bad
-client experience.
+### A consult has no *whole-loop* wall-clock budget
+The two narrow brakes now exist — a 30s per-exec kaish timeout (`sandbox.rs`) and a
+per-request LLM deadline on the rig clients (`consult.rs`, `request_timeout`). What's
+still missing is a budget on the *whole* `run_phase` loop: a model that keeps making
+individually-fast-enough calls but never converges (or churns through `max_turns` of
+slow turns) can still run long. The per-request timeout doesn't catch that — each
+call is under the deadline. A `tokio::time::timeout` around the whole
+`agent.prompt(...).max_turns(...).await`, or a turn-budgeted deadline, would. Lower
+priority now that the indefinite-hang case is closed; this is the long-tail-of-slow
+case, not the wedged-forever case.
 
 ---
 
@@ -99,24 +102,21 @@ one-question/many-models (the diverse-opinion panel made literal).
 `consult::explore`) once the new path has a few real miles on it — kept for now so
 there's a fallback if the recomposed path surprises us.
 
-### No overall wall-clock timeout on a tool call (per-exec timeout shipped)
-The 30s per-exec kaish timeout (`sandbox.rs`) bounds individual scripts, but the
-tool loop's *LLM API calls* have no deadline — a hung provider request wedges the
-MCP call indefinitely (both DeepSeek and Gemini flagged this in review). `run_kaish`
-is fine (no model). Wrap `run_phase`'s `agent.prompt(...).await` in
-`tokio::time::timeout`, or configure a total-request timeout on the rig clients.
-(Distinct from the older "consult has no overall timeout" P1 — same root, restated
-now that three model-driven tools share the gap.)
-
-Bumping this up: it bit hard in real use on 2026-06-06. A local `consult`
-(`provider = openai`, Gemma-4-26B synth) hung ~29 min with no result — the
-underlying llama-server had wedged (a 262144-token `--ctx-size --no-mmap` launch:
-GPU 2% busy, one CPU core spinning, never emitting tokens), and kaibo, having no
-LLM-call deadline, simply waited. A local capable-model `consult` is the worst case
-for this gap: weak model, no convergence, no brake. Note this is the *LLM-loop*
-timeout, separate from the per-script kaish timeout (which fired fine). A
-per-`run_phase` `tokio::time::timeout` wrapping `agent.prompt(...)` would have
-surfaced it in seconds instead of tens of minutes.
+### LLM idle-timeout needs streaming to distinguish wedged from slow
+The per-request LLM deadline shipped: each rig client now carries a
+`reqwest::Client` with `.timeout(profile.request_timeout)` (default 15 min,
+per-profile), so a provider that connects but never responds — the 2026-06-06 wedge,
+~29 min on a local Gemma-4-26B — now surfaces an error at the deadline instead of
+hanging. But it's a *crude* backstop: rig's prompt loop is **non-streaming**, so the
+whole completion arrives in one shot and a wedged server is indistinguishable from a
+slow-but-working one — both are one long wait. So the deadline must sit above the
+slowest *legitimate* single completion, which for a slow local big model is itself
+many minutes; it can't be tightened to catch a wedge in seconds without risking real
+work. The principled fix is to drive the loop over rig's **streaming** completion
+path and apply an *idle* timeout (no token for N seconds → abort): a working call
+keeps resetting the clock, a wedged one doesn't. Bigger change — streaming the agent
+loop, threading partial output — so deferred; the total-timeout backstop holds the
+line until then.
 
 ### A mock `CompletionClient` test that consult actually delegates to `explore′`
 Gemini's review noted: we pin the consult *toolset wiring* offline and exercise the

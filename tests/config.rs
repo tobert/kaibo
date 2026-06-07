@@ -19,6 +19,11 @@ fn builtin_reproduces_the_historical_defaults() {
     assert_eq!(c.defaults.synth_max_turns, 100);
     assert_eq!(c.defaults.max_tokens, 16384);
     assert_eq!(c.defaults.thinking_budget, 8192);
+    // The per-request LLM deadline default: 15 min (see Defaults::default).
+    assert_eq!(
+        c.defaults.request_timeout,
+        std::time::Duration::from_secs(900)
+    );
 
     // The four built-in profiles, named after their kind, with the model ids that
     // used to live in `default_models`.
@@ -36,6 +41,7 @@ fn builtin_reproduces_the_historical_defaults() {
         // Tunables inherit the defaults.
         assert_eq!(p.max_tokens, 16384);
         assert_eq!(p.thinking_budget, 8192);
+        assert_eq!(p.request_timeout, std::time::Duration::from_secs(900));
     }
 
     // Default provider is anthropic; no root unless configured.
@@ -149,6 +155,71 @@ fn per_profile_tunables_override_defaults_others_inherit() {
     assert_eq!(anthropic.max_tokens, 20000);
     assert_eq!(anthropic.thinking_budget, 9000);
     assert_eq!(c.defaults.max_tokens, 20000);
+}
+
+#[test]
+fn request_timeout_seeds_from_defaults_and_overrides_per_profile() {
+    // A slow local model wants a longer leash than a hosted API; the seam is a
+    // [defaults] seed that a profile may raise (or lower) on its own.
+    let c = Config::from_toml_str(
+        r#"
+        [defaults]
+        request_timeout_secs = 120
+
+        [profiles.slowlocal]
+        kind = "openai"
+        base_url = "http://localhost:13305/api/v1"
+        request_timeout_secs = 1800
+        "#,
+    )
+    .unwrap();
+
+    use std::time::Duration;
+    // The file-set default reseeds every built-in profile...
+    assert_eq!(c.defaults.request_timeout, Duration::from_secs(120));
+    assert_eq!(
+        c.resolve_profile("anthropic").unwrap().request_timeout,
+        Duration::from_secs(120)
+    );
+    // ...while the profile that overrode it keeps its own deadline.
+    assert_eq!(
+        c.resolve_profile("slowlocal").unwrap().request_timeout,
+        Duration::from_secs(1800)
+    );
+}
+
+#[test]
+fn request_timeout_env_overrides_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[defaults]\nrequest_timeout_secs = 120\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_REQUEST_TIMEOUT_SECS", "45")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.defaults.request_timeout, std::time::Duration::from_secs(45));
+    // And it reseeds profiles that didn't override.
+    assert_eq!(
+        c.resolve_profile("anthropic").unwrap().request_timeout,
+        std::time::Duration::from_secs(45)
+    );
+}
+
+#[test]
+fn zero_request_timeout_is_rejected_loudly() {
+    // A zero deadline times out every call instantly — a mistake, not a config. The
+    // no-silent-fallback directive: crash at load, don't brick calls at runtime.
+    let err = Config::from_toml_str(
+        r#"
+        [profiles.broken]
+        kind = "openai"
+        base_url = "http://localhost:1/v1"
+        request_timeout_secs = 0
+        "#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("request_timeout_secs"),
+        "got: {err:#}"
+    );
 }
 
 #[test]
@@ -358,6 +429,7 @@ fn key_optional_profile_falls_back_to_placeholder() {
         synth_model: "y".into(),
         max_tokens: 16384,
         thinking_budget: 8192,
+        request_timeout: std::time::Duration::from_secs(900),
     };
     assert_eq!(p.resolve_key().unwrap(), PLACEHOLDER_OPENAI_KEY);
 }
@@ -380,6 +452,7 @@ fn key_optional_profile_with_a_present_but_empty_key_file_errors() {
         synth_model: "y".into(),
         max_tokens: 16384,
         thinking_budget: 8192,
+        request_timeout: std::time::Duration::from_secs(900),
     };
     let err = p.resolve_key().unwrap_err();
     assert!(
@@ -486,6 +559,7 @@ fn required_key_with_no_source_is_an_error() {
         synth_model: "y".into(),
         max_tokens: 16384,
         thinking_budget: 8192,
+        request_timeout: std::time::Duration::from_secs(900),
     };
     assert!(p.resolve_key().is_err());
 }

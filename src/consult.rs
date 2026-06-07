@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rig::client::CompletionClient;
@@ -44,22 +45,44 @@ macro_rules! with_provider_client {
         // Bind once so `$profile` is evaluated a single time even though each arm
         // also reads it (key resolution, base URL).
         let profile = $profile;
+        // One HTTP backend, shared by whichever client the kind selects, carrying
+        // the per-request deadline. rig exposes no native timeout and its prompt
+        // loop is non-streaming, so a provider that connects but never responds
+        // would hang the whole call with no other brake — the 2026-06-06 wedge
+        // (~29 min; docs/issues.md). `timeout` bounds a single completion;
+        // `connect_timeout` fails a dead endpoint fast (capped at the deadline so a
+        // sub-10s profile timeout still dominates). Injected via rig's
+        // `.http_client(..)`; only one match arm runs, so the move is exclusive.
+        let http = reqwest::Client::builder()
+            .timeout(profile.request_timeout)
+            .connect_timeout(profile.request_timeout.min(Duration::from_secs(10)))
+            .build()
+            .map_err(|e| anyhow!("http client init: {e}"))?;
         match profile.kind {
             ProviderKind::Anthropic => {
                 let key = profile.resolve_key()?;
-                let $client = anthropic::Client::new(&key)
+                let $client = anthropic::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .build()
                     .map_err(|e| anyhow!("anthropic client init: {e}"))?;
                 $body
             }
             ProviderKind::DeepSeek => {
                 let key = profile.resolve_key()?;
-                let $client = deepseek::Client::new(&key)
+                let $client = deepseek::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .build()
                     .map_err(|e| anyhow!("deepseek client init: {e}"))?;
                 $body
             }
             ProviderKind::Gemini => {
                 let key = profile.resolve_key()?;
-                let $client = gemini::Client::new(&key)
+                let $client = gemini::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .build()
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
                 $body
             }
@@ -72,6 +95,7 @@ macro_rules! with_provider_client {
                 let $client = openai::CompletionsClient::builder()
                     .api_key(&key)
                     .base_url(&base_url)
+                    .http_client(http)
                     .build()
                     .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
                 $body

@@ -51,6 +51,15 @@ Profile       = { name, kind, base_url?, key source, models, per-profile tunable
   or Sonnet profile has far more output/reasoning headroom than local Gemma on a
   tight context window. A profile omits them to inherit `[defaults]`. (`max_turns`
   stays a `[defaults]` + per-call concern — it bounds the *loop*, not the model.)
+- **`request_timeout_secs` is a per-profile override** (default 900 = 15 min) of the
+  per-request LLM deadline: the wall-clock ceiling on a *single* completion call.
+  rig's prompt loop is non-streaming and has no native timeout, so a provider that
+  connects but never responds would otherwise hang the whole tool call (it once
+  waited ~29 min on a wedged local server). It's per-profile because a slow local
+  model legitimately wants a longer leash than a hosted API. **Caveat:** because the
+  call is non-streaming, this can't tell a *wedged* server from a *slow-but-working*
+  one — both look like one long wait — so keep it above your slowest legitimate
+  single completion. A value of `0` is rejected at load (it would time out instantly).
 
 ### Built-in profiles (the default registry)
 
@@ -115,6 +124,7 @@ else is mechanical:
 | synth max turns | `defaults.synth_max_turns` | `KAIBO_SYNTH_MAX_TURNS` | *(per-call only)* |
 | max output tokens | `defaults.max_tokens` *(per-profile override)* | `KAIBO_MAX_TOKENS` | — |
 | thinking budget | `defaults.thinking_budget` *(per-profile override)* | `KAIBO_THINKING_BUDGET` | — |
+| LLM request timeout (s) | `defaults.request_timeout_secs` *(per-profile override)* | `KAIBO_REQUEST_TIMEOUT_SECS` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | disable extra builtins | `sandbox.disable_builtins` *(list; file-only)* | — | — |
