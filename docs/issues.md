@@ -102,21 +102,38 @@ one-question/many-models (the diverse-opinion panel made literal).
 `consult::explore`) once the new path has a few real miles on it — kept for now so
 there's a fallback if the recomposed path surprises us.
 
-### LLM idle-timeout needs streaming to distinguish wedged from slow
-The per-request LLM deadline shipped: each rig client now carries a
-`reqwest::Client` with `.timeout(profile.request_timeout)` (default 15 min,
-per-profile), so a provider that connects but never responds — the 2026-06-06 wedge,
-~29 min on a local Gemma-4-26B — now surfaces an error at the deadline instead of
-hanging. But it's a *crude* backstop: rig's prompt loop is **non-streaming**, so the
-whole completion arrives in one shot and a wedged server is indistinguishable from a
-slow-but-working one — both are one long wait. So the deadline must sit above the
-slowest *legitimate* single completion, which for a slow local big model is itself
-many minutes; it can't be tightened to catch a wedge in seconds without risking real
-work. The principled fix is to drive the loop over rig's **streaming** completion
-path and apply an *idle* timeout (no token for N seconds → abort): a working call
-keeps resetting the clock, a wedged one doesn't. Bigger change — streaming the agent
-loop, threading partial output — so deferred; the total-timeout backstop holds the
-line until then.
+### Idle-timeout via streaming — investigated, deliberately NOT done (scope to openai if ever)
+The per-request LLM deadline shipped: each rig client carries a `reqwest::Client`
+with `.timeout(profile.request_timeout)` (default 15 min, per-profile), so a provider
+that connects but never responds — the 2026-06-06 wedge, ~29 min on a local
+Gemma-4-26B — surfaces an error at the deadline instead of hanging. It's a *crude*
+backstop: rig's prompt loop is **non-streaming**, so the completion arrives in one
+shot and a wedged server is indistinguishable from a slow one — both are one long
+wait — so the deadline must sit above the slowest *legitimate* completion.
+
+We then looked at switching to rig's streaming loop to get an *idle* timeout (no
+token for N s → abort) and **decided against it wholesale.** Reasons, from reading
+rig 0.34 (`agent/prompt_request/{mod,streaming}.rs`, `providers/anthropic/*`):
+- **No real-time upside.** kaibo returns one final string per MCP call; partial
+  answers are low-value for a grounded-citation tool. Streaming's only real gain is
+  idle detection.
+- **It's a quality *downgrade* for the thinking-on paths.** Non-streaming pushes the
+  provider's complete assistant message back into history verbatim
+  (`mod.rs:454`), so Anthropic's *signed* thinking blocks round-trip atomically. The
+  streaming loop instead reassembles reasoning from unsigned deltas
+  (`streaming.rs:469-657`) — the documented home of "Anthropic rejects: signature
+  required" / Gemini delta-assembly / OpenAI ordering bugs. Switching would move our
+  thinking-on hosted calls onto the fragile branch for no benefit.
+- **It wouldn't fully fix the incident anyway.** That wedge was at *prefill* (no
+  token 1). A time-to-first-token deadline still can't tell a wedge from a legit
+  multi-minute big-context prefill.
+
+If idle detection is ever worth it, scope it to **`kind = openai` only**: that's
+where wedges actually happen (hosted APIs don't silently stall for half an hour), and
+`thinking_params(Openai) => None` (consult.rs) means the local path uses no signed
+reasoning blocks — so streaming there carries none of the reassembly fragility. Split
+the budget: generous TTFT deadline + tight inter-token idle. Until then the
+total-timeout backstop holds the line.
 
 ### A mock `CompletionClient` test that consult actually delegates to `explore′`
 Gemini's review noted: we pin the consult *toolset wiring* offline and exercise the
