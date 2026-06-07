@@ -63,8 +63,14 @@ impl Default for Defaults {
         // ConsultConfig::default + THINKING_BUDGET) so a config-less run is
         // byte-for-byte the prior behavior.
         Self {
-            explorer_max_turns: 50,
-            synth_max_turns: 100,
+            // High on purpose: a capable model rarely wastes turns, and hitting the
+            // cap is no longer fatal — `run_phase` forces one final answer-now turn
+            // from the partial transcript rather than discarding the work. So we'd
+            // rather give the loop room (100 goes quickly in the explorer) than have
+            // it bail early. The explorer sweeps breadth; the synth driver both
+            // delegates sweeps and reads spans, so it gets the larger budget.
+            explorer_max_turns: 100,
+            synth_max_turns: 200,
             max_tokens: 16384,
             thinking_budget: crate::consult::THINKING_BUDGET,
             // 15 min. A single completion that takes longer is pathological for a

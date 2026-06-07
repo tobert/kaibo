@@ -17,7 +17,8 @@ Conventions:
 Last pass: 2026-06-07 (turn-cap graceful degradation shipped — `consult.rs`:
 `MaxTurnsError` is no longer fatal, since rig 0.34 hands back the full transcript;
 `run_phase` now forces one final `ToolChoice::None` answer-now turn from the partial
-work. Folded out the prior P1 entry — its premise that rig discards the transcript
+work, and caps raised to explorer 100 / synth 200 now that hitting them is no longer
+fatal. Folded out the prior P1 entry — its premise that rig discards the transcript
 was stale).
 
 ---

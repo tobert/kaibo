@@ -14,9 +14,11 @@ use kaibo::server::ToolGating;
 fn builtin_reproduces_the_historical_defaults() {
     let c = Config::builtin();
 
-    // Defaults match the old ConsultConfig + THINKING_BUDGET exactly.
-    assert_eq!(c.defaults.explorer_max_turns, 50);
-    assert_eq!(c.defaults.synth_max_turns, 100);
+    // Turn caps are set high on purpose (a capable model rarely wastes turns and a
+    // cap-hit now degrades gracefully rather than failing) — see Defaults::default.
+    assert_eq!(c.defaults.explorer_max_turns, 100);
+    assert_eq!(c.defaults.synth_max_turns, 200);
+    // Token/thinking budgets still match the old ConsultConfig + THINKING_BUDGET.
     assert_eq!(c.defaults.max_tokens, 16384);
     assert_eq!(c.defaults.thinking_budget, 8192);
     // The per-request LLM deadline default: 15 min (see Defaults::default).
