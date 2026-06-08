@@ -504,8 +504,8 @@ where
 }
 
 /// The `explore` unit: a cheap model drives `{run_kaish}` over `root` and returns
-/// a curated report. The standalone seam behind the MCP `explore` tool — multi-
-/// provider, unlike the legacy Anthropic-only [`crate::explorer::explore`].
+/// a curated report. The standalone seam behind the MCP `explore` tool — built on
+/// the generalized [`run_phase`] and multi-provider, so it works for any profile.
 pub async fn explore(
     question: &str,
     root: impl Into<PathBuf>,

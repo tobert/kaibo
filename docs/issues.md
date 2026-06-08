@@ -73,13 +73,6 @@ capability** like `thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, `open
 `None` where unsupported. Open fork when built: many-questions/one-model vs
 one-question/many-models (the diverse-opinion panel made literal).
 
-### Retire the legacy single-phase `explorer::explore()`
-`explorer.rs::explore()` is Anthropic-only and now shadowed by the multi-provider
-`consult::explore` unit built on the generalized `run_phase`. Its only caller is
-`tests/explorer_live.rs`. Retire it (and that test, or repoint it at
-`consult::explore`) once the new path has a few real miles on it — kept for now so
-there's a fallback if the recomposed path surprises us.
-
 ### Explorer sandbox isn't fully hermetic from the host env
 Surfaced 2026-06-03 catching up to kaish's four-crate split. Several kaish builtins
 read the host environment directly instead of the kernel scope: tilde expansion in

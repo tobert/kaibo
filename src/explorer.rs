@@ -4,58 +4,14 @@
 //! It sees exactly one tool — [`RunKaish`] (`run_kaish`) — and uses kaish's
 //! builtins and pipelines for all reading, searching, and parsing. Writes,
 //! `git`/`touch`, and external commands are refused by [`crate::sandbox`].
-//!
-//! v0 is single-phase: the explorer answers directly. The synthesizer phase
-//! (curated report → second model) lands next, per the dpal pattern.
 
-use std::path::PathBuf;
-
-use anyhow::{anyhow, Result};
-use rig::client::CompletionClient;
-use rig::completion::{Prompt, ToolDefinition};
-use rig::providers::anthropic;
+use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::kaish_syntax::{kaish_syntax_core, run_kaish_tool_description};
+use crate::kaish_syntax::run_kaish_tool_description;
 use crate::sandbox::{KaishOutput, KaishWorker};
-
-/// System prompt for the explorer. Composes the shared [`kaish_syntax_core`] (so
-/// the shell idioms and exit-code contract never drift) with the explorer's task.
-pub fn explorer_preamble() -> String {
-    let core = kaish_syntax_core();
-    format!(
-        "You are a code explorer. {core}\n\n\
-         Work iteratively: look, then narrow. When you have enough, answer the \
-         question directly and concretely, citing concrete paths and `file:line` \
-         where you can."
-    )
-}
-
-/// Tunables for one explore pass.
-#[derive(Debug, Clone)]
-pub struct ExploreConfig {
-    /// Provider model id (passed verbatim to the API).
-    pub model: String,
-    /// Max tool-loop turns before the model must conclude.
-    pub max_turns: usize,
-    /// Max output tokens per model turn.
-    pub max_tokens: u64,
-}
-
-impl Default for ExploreConfig {
-    fn default() -> Self {
-        // A cheap, fast model is the right default for exploration grunt-work.
-        // (rig 0.34's bundled CLAUDE_* consts point at retired 3.x ids — use a
-        // current alias directly.)
-        Self {
-            model: "claude-haiku-4-5".to_string(),
-            max_turns: 12,
-            max_tokens: 4096,
-        }
-    }
-}
 
 /// The single tool the explorer drives: run a kaish script in the sandbox.
 pub struct RunKaish {
@@ -138,44 +94,4 @@ pub(crate) fn format_output(o: &KaishOutput) -> String {
         }
     }
     s
-}
-
-/// Run one explore pass: spin a read-only kaish over `root`, let an Anthropic
-/// model investigate `question` through `run_kaish`, and return its answer.
-pub async fn explore(
-    question: &str,
-    root: impl Into<PathBuf>,
-    api_key: &str,
-    cfg: &ExploreConfig,
-) -> Result<String> {
-    let worker = KaishWorker::spawn(root)?;
-
-    // Legacy single-phase path (retirement tracked in docs/issues.md), but it still
-    // runs a non-streaming `agent.prompt(...)`, so it carries the same wedged-provider
-    // hang risk as `consult.rs`. Give it the same default per-request deadline rather
-    // than leave a known indefinite-hang path live. No Profile here, so seed from the
-    // documented default; the recomposed path is per-profile configurable.
-    let http = reqwest::Client::builder()
-        .timeout(crate::config::Defaults::default().request_timeout)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| anyhow!("http client init: {e}"))?;
-    let client = anthropic::Client::builder()
-        .api_key(api_key)
-        .http_client(http)
-        .build()
-        .map_err(|e| anyhow!("anthropic client init: {e}"))?;
-
-    let agent = client
-        .agent(cfg.model.as_str())
-        .preamble(&explorer_preamble())
-        .max_tokens(cfg.max_tokens)
-        .tool(RunKaish::new(worker))
-        .build();
-
-    agent
-        .prompt(question)
-        .max_turns(cfg.max_turns)
-        .await
-        .map_err(|e| anyhow!("explorer loop failed: {e}"))
 }
