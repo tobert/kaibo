@@ -108,24 +108,12 @@ Thinking is on by default, both phases (`consult.rs::thinking_params`): Anthropi
 All four provider paths now have opt-in live tests (`tests/consult.rs`,
 `#[ignore]`d, gated on a key/endpoint) and passed with thinking on.
 
-### A small local context window makes uncapped output acute
-A local server's context window can be far smaller than the model advertises
-(Gemma-4-26B reports `max_context_window` 262144; the local server box was briefly
-serving it at `--ctx-size 4096` before we bumped it). The explorer dumps file
-contents over up to 50 turns, so on a tight window a single wide `cat`/`rg` blows
-it. kaibo now installs an 8 KB `OutputLimitConfig` via `KernelConfig::mcp()`
-(`sandbox.rs`), so a single wide `cat`/`rg` can't flood — but 50 capped turns still
-accumulate, and that matters more for local models than for the hosted providers.
-Thinking-on makes this tighter still: reasoning now also draws on the 16384
-`max_tokens`, so a local server needs a context window comfortably above input +
-reasoning + answer.
-
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
 error. Validating available providers at startup (and noting them in the server
 instructions) would fail faster and tell a client what it can actually use. For
 the `openai` provider this would mean a startup ping of `OPENAI_BASE_URL/models`
-rather than a key check.
+rather than a key check. This can come along with adding an MCP resource for listing models.
 
 ---
 
@@ -138,9 +126,3 @@ defaults (`credentials.rs`, `docs/config.md`). A secrets *manager* is still out 
 scope: by design the TOML references keys, never inlines them, so "point at
 `$SECRET_TOOL` output" would be a future key-source variant alongside env/file.
 
-### Provider-specific features are flattened
-The pals (gpal/dpal/cpal) deliberately pass through provider-specific features
-(deepseek `reasoning_content`, gemini search, prompt caching). kaibo's consult is
-lowest-common-denominator across providers by design — the value here is the kaish
-exploration, not feature pass-through. If a specific feature (e.g. prompt caching
-on the synth model, which is the expensive one) proves high-value, expose it.
