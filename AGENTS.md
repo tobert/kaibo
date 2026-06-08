@@ -45,6 +45,19 @@ commands.
 
 - **TDD.** Tests that can and will fail. The sandbox boundary gets failing-first
   tests — and we prove they have teeth (empty the `DENYLIST`, watch them fail).
+- **Model loops are tested offline.** A scripted `CompletionClient` in
+  `src/test_support.rs` (`#[cfg(test)]`) drives the *real* consult loop with no
+  network — delegation→report aggregation, session replay, turn-cap recovery. It's
+  **content-driven, not consumption-ordered**: a responder branches on the inbound
+  `CompletionRequest` (preamble, transcript, `tool_choice`) keyed by model id, the way
+  a real model reads the whole request each call. That's deliberate — rig runs a
+  turn's tool calls with `buffer_unordered`, so a queue-pop mock ("Nth call → Nth
+  step") would race the day a turn emits two tool calls or someone bumps concurrency,
+  and the finalize replay (`tool_choice::None` ⇒ answer-now) falls out for free.
+  Two primitives — response strategy + a request log — so new cases (multi-sweep,
+  model routing, error injection) are new responders, not harness changes. Inject via
+  the generic seams (`run_phase`, `consult_with`, `consult_session_turn`); the public
+  `consult`/`explore`/`synthesize` build the real client behind `with_provider_client!`.
 - **`docs/issues.md` is the live tracker.** Skim it before new work. Delete
   entries when they ship — don't mark them done; git history is the record.
 - **`kaish-kernel` is a path dep** (`../kaish/crates/kaish-kernel`), under active
@@ -53,6 +66,30 @@ commands.
 - **Provider model ids drift.** Built-in defaults seed the profile registry in
   `config.rs::default_models`; rig's bundled model consts are often retired.
   Cross-check the pal configs. Per-profile overrides live in the XDG `config.toml`.
+
+## Driving the models
+
+How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherits them.
+
+- **Thinking ON by default**, every model that supports it, both phases (Anthropic
+  `thinking`, Gemini `thinkingConfig`, DeepSeek reasoners; in rig via
+  `AgentBuilder::additional_params`). The depth is worth the latency/tokens — the
+  provider probe showed thinking-capable answers materially deeper than thin ones.
+- **Large token headroom**, because reasoning eats the *completion* budget. Default
+  `max_tokens` generously (16k+, not 4k) for every phase — thinking-on means a thin
+  budget starves the answer (a Gemma probe spent all 300 `max_tokens` on
+  `reasoning_content` and returned empty `content`, `finish_reason: length`). If one
+  provider rejects a large value (some DeepSeek models cap ~8k), cap *that arm*, not
+  the global. Interaction shape behind this: few high-value turns, not long chats —
+  spend the budget on depth per turn.
+- **Positive prompt framing.** In preambles, tool descriptions, and cheatsheets,
+  reinforce the behavior we *want* resident in the weights — say it a few ways —
+  rather than prohibiting what we don't: "ground every claim, cite the `file:line`"
+  over "never invent citations", and treat naming the edge of the evidence as a
+  normal grounded move. Blanket "never X" can light up the very pathway it names and
+  make weaker/local models (Gemma especially) fixate or loop. Lead the kaish
+  cheatsheet with the good idioms (`cat -n`, `rg -n`, numbered spans — they produce
+  the accurate `file:line`s we reward), not a flat builtin list.
 
 ## Commit style
 

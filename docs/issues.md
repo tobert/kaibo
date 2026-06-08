@@ -14,7 +14,18 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-08 (read-only denylist retired — kaish landed the upstream fix
+Last pass: 2026-06-08 (offline mock harness shipped — a scripted `CompletionClient`
+(`src/test_support.rs`, content-driven so it's robust to rig's `buffer_unordered`
+tool execution and the finalize replay) now drives the *real* consult loop with no
+network. Closed two test-gap entries: an e2e proving a `consult` `explore` tool call
+genuinely drives the nested `explore′` agent and aggregates into
+`ConsultOutput.report`, and the session record/replay glue. That glue moved out of
+`server.rs` down past the provider macro into a generic `consult::consult_session_turn`
+— `consult()` now owns sessions (`Option<Session>` = stateless one-shot when `None`),
+so the history→consult→record dance is offline-tested, including the "a failed turn
+records nothing" invariant. Bonus: turn-cap `finalize_after_max_turns` recovery is now
+offline-tested too. Folded out both P3 test-gap entries). 2026-06-08 (read-only
+denylist retired — kaish landed the upstream fix
 (`touch` routes its mtime bump through a `set_mtime` backend op the read-only mount
 rejects; `mktemp` resolves its parent through the VFS, so it lands in ephemeral
 `MemoryFs`, never real `/tmp`). kaibo dropped the hardcoded `DENYLIST` entirely; the
@@ -45,13 +56,6 @@ grows `consult_user_prompt`'s context monotonically; a local model's small windo
 N turns (or summarize older ones) rather than all — but measure a real long session
 before adding the knob.
 
-### Session record/replay glue has no offline test
-`session.rs` (LRU semantics) and `consult_user_prompt` (the prompt framing) are both
-unit-tested, but the `server.rs` consult-handler glue that reads history → feeds
-consult → records the turn is only exercised by the `#[ignore]`d live tests. The same
-mock `CompletionClient` the entry below wants (to prove `explore′` delegation) would
-also let us assert offline that a second turn sees the first turn's pair.
-
 ### Two kernel builds + two threads per consult
 Each phase spawns a fresh `KaishWorker` (explorer + synth = two OS threads, two
 read-only kernel builds) so the synth starts clean at the root (`consult.rs`). Fine
@@ -75,12 +79,6 @@ one-question/many-models (the diverse-opinion panel made literal).
 `tests/explorer_live.rs`. Retire it (and that test, or repoint it at
 `consult::explore`) once the new path has a few real miles on it — kept for now so
 there's a fallback if the recomposed path surprises us.
-
-### A mock `CompletionClient` test that consult actually delegates to `explore′`
-Gemini's review noted: we pin the consult *toolset wiring* offline and exercise the
-*loop* live, but nothing offline proves the model's tool calls actually drive the
-nested `explore′` agent and aggregate into `ConsultOutput.report`. A mock client
-that forces an `explore` tool call would close that gap without live-model flakiness.
 
 ### Explorer sandbox isn't fully hermetic from the host env
 Surfaced 2026-06-03 catching up to kaish's four-crate split. Several kaish builtins
