@@ -1150,6 +1150,105 @@ mod tests {
         );
     }
 
+    /// Thinking params must reach *every* model call — the consult driver and each
+    /// nested `explore′`. All other tests pass `None` for thinking, so a regression
+    /// that dropped `additional_params` in `run_phase`, or stopped `RunExplore`
+    /// forwarding `self.thinking` to its nested loop, would slip through. These
+    /// shapes are provider-specific and have already drifted once (`docs/issues.md`).
+    #[tokio::test]
+    async fn thinking_params_reach_both_the_driver_and_every_sweep() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+        // A representative toggle shape (Anthropic's). The mock doesn't interpret it —
+        // we only assert it survives the plumbing into the request, unchanged.
+        let thinking = json!({ "thinking": { "type": "enabled", "budget_tokens": 4096 } });
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if transcript_text(req).contains("REPORT") {
+                    Ok(text_response("ANSWER"))
+                } else {
+                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                }
+            })
+            .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, Some(&thinking))
+            .await
+            .unwrap();
+
+        // Both roles were actually exercised (so the loop below isn't vacuous)...
+        assert!(!client.requests_for(SYNTH).is_empty(), "driver ran");
+        assert!(!client.requests_for(EXPLORER).is_empty(), "a sweep ran");
+        // ...and every request carried the thinking shape, unchanged.
+        for r in client.requests() {
+            assert_eq!(
+                r.additional_params.as_ref(),
+                Some(&thinking),
+                "model {:?} must carry the thinking params, got: {:?}",
+                r.model,
+                r.additional_params
+            );
+        }
+    }
+
+    /// `run_phase` builds the toolset twice — once for the main loop, again for the
+    /// forced finalize turn. The `reports` sink is created once in `consult_with` and
+    /// `clone()`d into each build, so a sweep that completed before the cap must
+    /// survive into the final `ConsultOutput.report`. Delegate once, then burn turns
+    /// on `run_kaish` until the cap forces a finalize (the second build) — the first
+    /// sweep's report must still be there.
+    #[tokio::test]
+    async fn a_sweeps_report_survives_the_finalize_toolset_rebuild() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(text_response("FINAL"))
+                } else if !transcript_text(req).contains("REPORT-E") {
+                    // First turn: delegate one sweep (pushes to the shared sink).
+                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                } else {
+                    // Already swept; keep burning turns without re-delegating, so the
+                    // cap fires and forces the second toolset build.
+                    Ok(tool_call_response("k", "run_kaish", json!({ "script": "cat src/foo.rs" })))
+                }
+            })
+            .on_model(EXPLORER, |_req| Ok(text_response("REPORT-E: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig { synth_max_turns: 2, ..ConsultConfig::default() };
+
+        let out = consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, None)
+            .await
+            .unwrap();
+
+        // The teeth: were `reports` rebuilt per `make_tools` call instead of shared,
+        // the pre-cap sweep would be lost and this would be empty.
+        assert!(
+            out.report.contains("REPORT-E"),
+            "the pre-cap sweep's report must survive the finalize rebuild, got: {:?}",
+            out.report
+        );
+        assert_eq!(
+            client.requests_for(EXPLORER).len(),
+            1,
+            "exactly one sweep was delegated (the rest burned run_kaish)"
+        );
+        assert!(
+            client.requests_for(SYNTH).iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
+            "the cap must have forced a finalize turn (the second toolset build)"
+        );
+        assert!(out.answer.contains("FINAL"), "finalize produced the answer");
+    }
+
     /// Session glue, end to end and offline: a second turn must *see* the first
     /// turn's `(question, answer)` pair in its prompt, and both turns must accumulate
     /// in the store. This is the `server.consult` history→consult→record dance,
