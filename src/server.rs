@@ -29,7 +29,7 @@ use crate::consult::{consult, explore, synthesize, ConsultConfig};
 use crate::explorer::format_output;
 use crate::kaish_syntax::{kaibo_sandbox_doc, kaibo_instructions, render_builtin_help, render_topic, topics};
 use crate::sandbox::{builtin_schemas, KaishWorker};
-use crate::session::{QaTurn, SessionStore};
+use crate::session::SessionStore;
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
 const KAISH_RES_PREFIX: &str = "kaibo://kaish/";
@@ -308,24 +308,15 @@ impl KaiboHandler {
             sandbox: self.config.sandbox.clone(),
         };
 
-        // Multi-turn: replay this session's prior turns as context, then record this
-        // one. With no session_id the history is empty and nothing is stored — a
-        // stateless one-shot, unchanged. The lock lives only inside history()/record()
-        // and is never held across the consult await.
-        let history = match &input.session_id {
-            Some(id) => self.sessions.history(id),
-            None => Vec::new(),
-        };
+        // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
+        // record this one); without one it's a stateless one-shot. The replay/record
+        // glue lives in `consult_session_turn` (offline-tested) — the session mutex is
+        // only ever touched there, never held across the consult await.
+        let session = input.session_id.as_deref().map(|id| (&self.sessions, id));
 
-        let out = consult(&input.question, root, &profile, &cfg, &history)
+        let out = consult(&input.question, root, &profile, &cfg, session)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-
-        // Record only a *successful* turn — a failed consult shouldn't poison the
-        // thread with a half-answer the next turn would treat as established context.
-        if let Some(id) = input.session_id {
-            self.sessions.record(&id, QaTurn::new(input.question, out.answer.clone()));
-        }
 
         Ok(consult_result(out.answer, out.report, input.include_report))
     }

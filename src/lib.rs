@@ -17,3 +17,8 @@ pub mod kaish_syntax;
 pub mod sandbox;
 pub mod server;
 pub mod session;
+
+/// A scripted, offline stand-in for a provider client, for driving the consult loop
+/// deterministically in unit tests. Test-only — never compiled into the binary.
+#[cfg(test)]
+pub mod test_support;

@@ -34,7 +34,7 @@ use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::sandbox::{KaishWorker, SandboxConfig};
-use crate::session::QaTurn;
+use crate::session::{QaTurn, SessionStore};
 
 /// Construct the rig client for `$profile` (resolving its key, plus base URL for an
 /// OpenAI-compatible one) and bind it to `$client` for `$body`. The kind selects the
@@ -761,30 +761,74 @@ where
     Ok(ConsultOutput { answer, report })
 }
 
+/// A consult turn's session binding: the store and the session id. `None` is a
+/// stateless one-shot — no prior turns replayed, nothing recorded. `Some` makes it
+/// multi-turn: replay this session's history into the prompt, record the answer.
+pub type Session<'a> = (&'a SessionStore, &'a str);
+
+/// One sessioned (or stateless) consult turn against an already-constructed client.
+///
+/// This is the whole multi-turn glue, made generic so it's driven offline by a mock
+/// client in tests (the public [`consult`] builds the real client and wraps this):
+/// read the session's prior turns → frame the prompt with them → run the consult →
+/// record the answer. The exploration always runs fresh; only the lean
+/// `(question, answer)` pairs are replayed. Recording happens *after* a successful
+/// turn (`?` short-circuits a failure), so a failed consult never poisons the thread
+/// with a half-answer the next turn would treat as established context.
+#[allow(clippy::too_many_arguments)] // mirrors consult_with's loop inputs plus the session
+pub(crate) async fn consult_session_turn<C>(
+    client: &C,
+    session: Option<Session<'_>>,
+    question: &str,
+    root: &Path,
+    explorer_model: &str,
+    synth_model: &str,
+    cfg: &ConsultConfig,
+    thinking: Option<&Value>,
+) -> Result<ConsultOutput>
+where
+    C: CompletionClient + Clone + Send + Sync + 'static,
+    C::CompletionModel: 'static,
+{
+    let history = match session {
+        Some((store, id)) => store.history(id),
+        None => Vec::new(),
+    };
+    let user_prompt = consult_user_prompt(question, &history);
+
+    let out =
+        consult_with(client, &user_prompt, root, explorer_model, synth_model, cfg, thinking).await?;
+
+    if let Some((store, id)) = session {
+        store.record(id, QaTurn::new(question, out.answer.clone()));
+    }
+    Ok(out)
+}
+
 /// Run a consult against `root` using `profile`.
 ///
 /// Resolves the profile's key (env var or key-file) and takes its models, token
-/// budget, and thinking budget; `cfg` carries the per-call loop bounds. `history`
-/// is the prior `(question, answer)` turns of a multi-turn session (empty for a
-/// stateless one-shot) — it seeds the driver's prompt but never the exploration,
-/// which always runs fresh. See [`consult_user_prompt`].
+/// budget, and thinking budget; `cfg` carries the per-call loop bounds. `session`
+/// binds this turn to a multi-turn thread (replay prior turns, record this one) or is
+/// `None` for a stateless one-shot. The session seeds the driver's prompt but never
+/// the exploration, which always runs fresh. See [`consult_session_turn`].
 pub async fn consult(
     question: &str,
     root: impl Into<PathBuf>,
     profile: &Profile,
     cfg: &ConsultConfig,
-    history: &[QaTurn],
+    session: Option<Session<'_>>,
 ) -> Result<ConsultOutput> {
     let root = root.into();
     // Thinking on, both phases, where the provider takes a request-time toggle.
     let thinking = thinking_params(profile.kind, profile.thinking_budget);
     let thinking = thinking.as_ref();
-    let user_prompt = consult_user_prompt(question, history);
 
     with_provider_client!(profile, |client| {
-        consult_with(
+        consult_session_turn(
             &client,
-            &user_prompt,
+            session,
+            question,
             &root,
             &profile.explorer_model,
             &profile.synth_model,
@@ -798,7 +842,314 @@ pub async fn consult(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
+        transcript_text, ScriptedClient,
+    };
+    use crate::session::SessionStore;
+    use std::fs;
+    use std::num::NonZeroUsize;
     use tempfile::tempdir;
+
+    fn store() -> SessionStore {
+        SessionStore::new(NonZeroUsize::new(4).unwrap())
+    }
+
+    /// A driver that answers immediately (no tools), echoing the current question into
+    /// its answer so a later turn's replayed history is easy to spot. Keeps the
+    /// session tests focused on the glue, not the loop. `consult_user_prompt` puts the
+    /// current question last, so the final non-empty line is it.
+    fn echo_client(model: &str) -> ScriptedClient {
+        ScriptedClient::builder()
+            .on_model(model, |req| {
+                let shown = transcript_text(req);
+                let question =
+                    shown.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                Ok(text_response(format!("ANSWER[{question}]")))
+            })
+            .build()
+    }
+
+    /// A project root with one real file carrying a known marker, so the kaish reads
+    /// in the e2e below hit real bytes — not a stub.
+    fn project_with_marker() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/foo.rs"), "fn target_marker() {}\n").unwrap();
+        dir
+    }
+
+    /// The load-bearing e2e: a scripted consult that delegates a sweep to `explore′`,
+    /// reads a span itself, and answers — driving the *real* loop end to end with no
+    /// network. This proves what the offline wiring test below cannot: the driver's
+    /// `explore` tool call actually runs the nested explorer agent (which itself runs
+    /// real kaish), and its report aggregates into `ConsultOutput.report`. If
+    /// delegation silently broke, `report` would come back empty and this fails.
+    #[tokio::test]
+    async fn consult_delegates_to_explore_and_aggregates_the_report() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+        const REPORT: &str = "EXPLORER_REPORT: src/foo.rs:1 fn target_marker";
+
+        let client = ScriptedClient::builder()
+            // The consult driver: delegate first, then read a span itself, then answer.
+            // Content-driven, so it's robust to the loop's turn structure: it decides
+            // from what it has already been shown, not from a call counter.
+            .on_model(SYNTH, |req| {
+                assert!(has_tool(req, "run_kaish"), "driver must have run_kaish");
+                assert!(has_tool(req, "explore"), "driver must have explore′");
+                let seen = transcript_text(req);
+                if !seen.contains("EXPLORER_REPORT") {
+                    // Haven't delegated yet → delegate a broad sweep.
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "where is target_marker defined?" }),
+                    ))
+                } else if !seen.contains("target_marker() {}") {
+                    // Report in hand, but confirm the span directly via run_kaish.
+                    Ok(tool_call_response(
+                        "t-read",
+                        "run_kaish",
+                        json!({ "script": "cat -n src/foo.rs" }),
+                    ))
+                } else {
+                    // Have the report and the confirmed span → answer.
+                    Ok(text_response(
+                        "ANSWER: target_marker is defined at src/foo.rs:1.",
+                    ))
+                }
+            })
+            // The explorer sub-agent: run real kaish once, then write its report.
+            .on_model(EXPLORER, |req| {
+                // Only run_kaish — the explorer has no nested explore′.
+                assert!(has_tool(req, "run_kaish"), "explorer must have run_kaish");
+                assert!(!has_tool(req, "explore"), "explorer must NOT nest explore′");
+                let seen = transcript_text(req);
+                if !seen.contains("target_marker") {
+                    Ok(tool_call_response(
+                        "t-rg",
+                        "run_kaish",
+                        json!({ "script": "rg -n target_marker src" }),
+                    ))
+                } else {
+                    Ok(text_response(REPORT))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        let out = consult_with(
+            &client,
+            "Where is target_marker defined?",
+            dir.path(),
+            EXPLORER,
+            SYNTH,
+            &cfg,
+            None,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        // The driver concluded with its final answer.
+        assert!(
+            out.answer.contains("target_marker is defined at src/foo.rs:1"),
+            "answer should be the driver's final text, got: {:?}",
+            out.answer
+        );
+        // The teeth: the explorer's report aggregated into ConsultOutput.report. A
+        // non-empty report here means the `explore` tool call genuinely drove the
+        // nested explorer agent and the reports sink collected it.
+        assert!(
+            out.report.contains("EXPLORER_REPORT"),
+            "explorer's report must aggregate into ConsultOutput.report, got: {:?}",
+            out.report
+        );
+
+        // And the routing held: the cheap model saw the *report* preamble (explorer
+        // role), the capable model saw the *consult* preamble (driver role).
+        let explorer_reqs = client.requests_for(EXPLORER);
+        assert!(!explorer_reqs.is_empty(), "explorer model was actually invoked");
+        assert!(
+            explorer_reqs[0].preamble.as_deref().unwrap_or("").contains("code explorer"),
+            "explorer got the report preamble: {:?}",
+            explorer_reqs[0].preamble
+        );
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs[0].preamble.as_deref().unwrap_or("").contains("second tool, `explore`"),
+            "driver got the consult preamble: {:?}",
+            synth_reqs[0].preamble
+        );
+    }
+
+    /// Turn-cap recovery, offline: a model that never stops calling tools must still
+    /// yield an answer. We cap the loop low and script a driver that *always* calls a
+    /// tool — until it's shown `ToolChoice::None` (the forced finalize turn), where it
+    /// writes its answer. This proves `run_phase` → `finalize_after_max_turns` turns a
+    /// `MaxTurnsError` into a real answer from the partial transcript, a path the live
+    /// tests can only hit by luck.
+    #[tokio::test]
+    async fn turn_cap_forces_a_final_answer_from_partial_work() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    // Forbidden from calling tools — answer from what we have.
+                    Ok(text_response("FORCED FINAL ANSWER: src/foo.rs:1"))
+                } else {
+                    // Keep burning turns; never conclude on our own.
+                    Ok(tool_call_response("t", "run_kaish", json!({ "script": "cat src/foo.rs" })))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig { synth_max_turns: 2, ..ConsultConfig::default() };
+
+        let out = consult_with(
+            &client,
+            "A question the model never finishes answering",
+            dir.path(),
+            "explorer-unused",
+            SYNTH,
+            &cfg,
+            None,
+        )
+        .await
+        .expect("turn-cap recovery should still produce an answer");
+
+        assert!(
+            out.answer.contains("FORCED FINAL ANSWER"),
+            "the forced finalize turn must produce the answer, got: {:?}",
+            out.answer
+        );
+        // And the recovery path actually ran: some request carried ToolChoice::None.
+        assert!(
+            client.requests_for(SYNTH).iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
+            "a forced finalize turn (ToolChoice::None) must have been issued"
+        );
+    }
+
+    /// Session glue, end to end and offline: a second turn must *see* the first
+    /// turn's `(question, answer)` pair in its prompt, and both turns must accumulate
+    /// in the store. This is the `server.consult` history→consult→record dance,
+    /// now `consult_session_turn`, driven by a mock — the seam the live `#[ignore]`d
+    /// tests couldn't pin without a real model.
+    #[tokio::test]
+    async fn a_second_turn_replays_the_first_turns_pair_and_records() {
+        const SYNTH: &str = "synth";
+        let client = echo_client(SYNTH);
+        let sessions = store();
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+        let sid = "thread-1";
+
+        // Turn 1.
+        let out1 = consult_session_turn(
+            &client,
+            Some((&sessions, sid)),
+            "Q1 what is kaish",
+            dir.path(),
+            "explorer",
+            SYNTH,
+            &cfg,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out1.answer, "ANSWER[Q1 what is kaish]");
+        assert_eq!(
+            sessions.history(sid),
+            vec![QaTurn::new("Q1 what is kaish", "ANSWER[Q1 what is kaish]")],
+            "turn 1 must be recorded"
+        );
+
+        // Turn 2.
+        let out2 = consult_session_turn(
+            &client,
+            Some((&sessions, sid)),
+            "Q2 who calls it",
+            dir.path(),
+            "explorer",
+            SYNTH,
+            &cfg,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The teeth: turn 2's request carried turn 1's Q and A into the prompt.
+        let turn2_req = &client.requests_for(SYNTH)[1];
+        assert!(
+            turn2_req.user_text.contains("Q1 what is kaish"),
+            "turn 2 must replay turn 1's question: {:?}",
+            turn2_req.user_text
+        );
+        assert!(
+            turn2_req.user_text.contains("ANSWER[Q1 what is kaish]"),
+            "turn 2 must replay turn 1's answer: {:?}",
+            turn2_req.user_text
+        );
+        assert_eq!(out2.answer, "ANSWER[Q2 who calls it]");
+        assert_eq!(sessions.history(sid).len(), 2, "both turns accumulate in the thread");
+    }
+
+    /// A failed turn must NOT record — a half-answer can't be allowed to poison the
+    /// thread as established context the next turn would trust. (The invariant the
+    /// `server.rs:325` comment used to assert only in prose.)
+    #[tokio::test]
+    async fn a_failed_turn_does_not_record() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |_req| Err(provider_error("scripted failure")))
+            .build();
+        let sessions = store();
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+        let sid = "doomed";
+
+        let result = consult_session_turn(
+            &client,
+            Some((&sessions, sid)),
+            "Q that fails",
+            dir.path(),
+            "explorer",
+            SYNTH,
+            &cfg,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "a provider error must surface, not be swallowed");
+        assert!(
+            sessions.history(sid).is_empty(),
+            "a failed turn must leave the thread untouched, got: {:?}",
+            sessions.history(sid)
+        );
+    }
+
+    /// A stateless turn (`session: None`) records nothing and replays nothing — the
+    /// one-shot path stays byte-for-byte its pre-session self.
+    #[tokio::test]
+    async fn a_stateless_turn_records_nothing() {
+        const SYNTH: &str = "synth";
+        let client = echo_client(SYNTH);
+        let sessions = store();
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+
+        let out = consult_session_turn(
+            &client, None, "lone question", dir.path(), "explorer", SYNTH, &cfg, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.answer, "ANSWER[lone question]");
+        assert_eq!(sessions.session_count(), 0, "a stateless turn creates no session");
+    }
 
     /// The recomposed consult must drive BOTH tools: a direct `run_kaish` and the
     /// delegated `explore′`. Pin the wiring offline — no model, just the toolset.

@@ -190,7 +190,7 @@ async fn recomposed_consult_runs_against_local_gemma() {
         root,
         &profile("openai"),
         &cfg,
-        &[],
+        None,
     )
     .await
     .expect("consult against local gemma should succeed");
@@ -289,7 +289,7 @@ async fn two_phase_consult_via_deepseek() {
         env!("CARGO_MANIFEST_DIR"),
         &profile("deepseek"),
         &ConsultConfig::default(),
-        &[],
+        None,
     )
     .await
     .expect("deepseek consult should succeed");
@@ -313,7 +313,7 @@ async fn two_phase_consult_via_gemini() {
         env!("CARGO_MANIFEST_DIR"),
         &profile("gemini"),
         &ConsultConfig::default(),
-        &[],
+        None,
     )
     .await
     .expect("gemini consult should succeed");
@@ -342,7 +342,7 @@ async fn two_phase_consult_answers_from_the_real_tree() {
         root,
         &profile("anthropic"),
         &cfg,
-        &[],
+        None,
     )
     .await
     .expect("consult should succeed");
