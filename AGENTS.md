@@ -90,6 +90,19 @@ How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherit
   make weaker/local models (Gemma especially) fixate or loop. Lead the kaish
   cheatsheet with the good idioms (`cat -n`, `rg -n`, numbered spans — they produce
   the accurate `file:line`s we reward), not a flat builtin list.
+- **Trust grounded evidence; steer toward acquisition, not verification.** When a
+  phase is handed context (an explorer report, a prior turn, pasted source), frame
+  a grounded `file:line` as *trusted* — the explorer read the real span and is
+  rewarded for accurate cites, so a capable synth re-deriving it just burns the
+  turn budget the cheap-explorer → capable-synth split exists to save. The behavior
+  to install is *get more when the context isn't enough* (an unquoted span, a whole
+  file or large chunk for the full picture, a detail left open, anything the
+  question reaches past) — not *re-confirm what's likely right*. This is also the
+  better anti-bias posture: bias lives in a report's gaps and framing, not its cited
+  facts, so the cure is investigation that *extends* the context, not re-checking it.
+  Keep a "the code is the only ground truth" tiebreaker for genuine conflicts (it
+  fires only when one is noticed; it doesn't send the model hunting). See the synth
+  prompts in `consult.rs` (`synthesize_preamble`, `synthesize_user_prompt`).
 
 ## Commit style
 
