@@ -523,24 +523,27 @@ pub async fn explore(
 
 /// Build the standalone `synthesize` user prompt. Pure and offline-testable.
 ///
-/// With `context`, frame it as a strong lead — a place to start and claims to
-/// re-confirm against the code, not the edge of the evidence (question first, then
-/// context). With no context — or whitespace-only — steer the model to investigate
-/// directly via `run_kaish` rather than guess, so the answer stays grounded either
-/// way.
+/// With `context`, frame it as trusted starting evidence — a grounded `file:line`
+/// rarely needs re-deriving — and steer the model to reach for `run_kaish` when it
+/// needs *more* than the context gives (a span, a whole file, a detail left open),
+/// not to re-verify what's likely right (question first, then context). With no
+/// context — or whitespace-only — steer the model to investigate directly via
+/// `run_kaish` rather than guess, so the answer stays grounded either way.
 pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
     match context.map(str::trim).filter(|c| !c.is_empty()) {
         Some(context) => format!(
             "Question:\n{question}\n\n\
              Context (supplied material — typically a curated explorer report or \
              pasted source):\n{context}\n\n\
-             Answer the question, grounded in concrete `file:line` evidence. Treat \
-             the context as a strong starting point — leads to follow and claims to \
-             confirm — not the limit of what you can check. Use the `run_kaish` tool \
-             freely: re-confirm the context's claims against the code, read the spans \
-             it cites, and investigate anything it left open or didn't cover. Where \
-             the code and the context disagree, the code wins. Cite concrete \
-             `file:line` for every claim."
+             Answer the question, grounded in concrete `file:line` evidence. The \
+             context is your starting evidence — when it cites a `file:line`, trust \
+             it; a grounded citation rarely needs re-deriving. Reach for the \
+             `run_kaish` tool when you need more than the context gives you: a span \
+             it references but doesn't quote, a whole file or a large span when you \
+             need the full picture, a detail it left open, or anything the question \
+             asks that it didn't cover. If the code you read and the context \
+             genuinely disagree, the code wins — the code is the only ground truth. \
+             Cite concrete `file:line` for every claim."
         ),
         None => format!(
             "Question:\n{question}\n\n\
@@ -551,8 +554,9 @@ pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
     }
 }
 
-/// Standalone synth preamble: interactive, with `run_kaish` as a first-class
-/// investigation tool (not just a fallback). Composes the shared
+/// Standalone synth preamble: interactive, framing supplied context as trusted
+/// starting evidence and `run_kaish` as the way to *get more* when the context
+/// isn't enough — including whole files and large spans. Composes the shared
 /// [`kaish_syntax_core`] so the shell idioms and exit-code contract don't drift.
 pub fn synthesize_preamble() -> String {
     let core = kaish_syntax_core();
@@ -560,14 +564,16 @@ pub fn synthesize_preamble() -> String {
         "You answer a question about a codebase, grounded in evidence and citing \
          concrete `file:line`. {core}\n\n\
          You may be given CONTEXT — a curated explorer report or pasted material. \
-         Treat it as a strong lead: a place to start and claims worth confirming, not \
-         the edge of what you can check. The `run_kaish` tool is yours to drive \
-         directly whenever you want — re-confirm the context's claims against the \
-         code, read the spans it cites, and investigate anything it left open, \
-         regardless of how much context you were given. Re-confirming a supplied \
-         claim against the code is the normal move, not an exception; where the code \
-         and the context disagree, the code wins. Ground every claim in a concrete \
-         `file:line`."
+         Treat it as your starting evidence: when it cites a concrete `file:line`, \
+         trust it — a grounded citation rarely needs re-deriving. The `run_kaish` \
+         tool is yours to drive directly whenever the context isn't enough: fetch a \
+         span it references but doesn't quote, read a whole file or a large span when \
+         you need the full picture, chase a detail it left open, or investigate \
+         anything the question reaches that the context didn't cover. Getting more \
+         evidence when you need it is the normal move; you're never limited to what \
+         you were handed. Where the code you read and the context genuinely disagree, \
+         the code wins — the code is the only ground truth that matters. Ground every \
+         claim in a concrete `file:line`."
     )
 }
 

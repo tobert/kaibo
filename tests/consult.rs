@@ -26,15 +26,18 @@ fn synthesize_prompt_grounds_in_supplied_context() {
     let q = p.find("What blocks writes?").unwrap();
     let c = p.find("src/sandbox.rs:95 read-only mount").unwrap();
     assert!(q < c, "question should precede the context");
-    // P2 framing: supplied context is a lead to re-confirm against the code, not
-    // the edge of the evidence. Pin that the prompt still offers direct
-    // investigation and steers toward confirming — a revert to "verify the cited
-    // span only" framing must fail here.
+    // Framing: a grounded citation is trusted; `run_kaish` is for *getting more*
+    // when the context isn't enough — not for re-verifying what's likely right.
+    // Pin both halves so a revert toward "verify the cited span" framing, or a
+    // revert that drops the get-more license, fails here.
     assert!(p.contains("run_kaish"), "investigation tool offered even with context");
     let lower = p.to_lowercase();
+    assert!(lower.contains("trust"), "a grounded citation should be trusted, got: {p}");
     assert!(
-        lower.contains("re-confirm") || lower.contains("against the code"),
-        "supplied context must be framed as confirmable against the code, got: {p}"
+        lower.contains("more than the context")
+            || lower.contains("didn't cover")
+            || lower.contains("left open"),
+        "supplied context must steer toward fetching more, not re-verifying, got: {p}"
     );
 }
 
