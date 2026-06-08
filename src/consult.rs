@@ -122,17 +122,6 @@ pub fn report_preamble() -> String {
     )
 }
 
-/// Synth preamble: answer from the report, reach for tools only to fill a gap.
-pub const SYNTH_PREAMBLE: &str = "\
-You answer a question about a codebase. You are given the user's question and a \
-CURATED REPORT from an explorer who already investigated the READ-ONLY project. \
-Write the final answer, grounded in the report and citing concrete `file:line`.
-
-You also have the `run_kaish` tool (read-only kaish shell) as a FALLBACK: use it \
-sparingly to fetch or confirm a precise span the report pointed to but didn't fully \
-quote. Do not re-explore from scratch — the report is primary, the tool is a \
-backstop for a specific gap.";
-
 /// Token budget for model "thinking"/reasoning, for the providers that expose a
 /// request-time toggle. Sized well under [`ConsultConfig`]'s `max_tokens` so the
 /// reasoning never starves the actual answer (a thinking model that spends its
@@ -208,19 +197,6 @@ impl Default for ConsultConfig {
 pub struct ConsultOutput {
     pub answer: String,
     pub report: String,
-}
-
-/// Build the synth's user prompt from the question and the explorer's report.
-///
-/// Pure and offline-testable: this is the entire explorer→synth hand-off, and
-/// getting the framing right matters, so it's worth pinning in a test.
-pub fn synth_user_prompt(question: &str, report: &str) -> String {
-    format!(
-        "Question:\n{question}\n\n\
-         Explorer's curated report:\n{report}\n\n\
-         Using the report (and the run_kaish fallback only if a specific detail is \
-         missing), write the final answer to the question."
-    )
 }
 
 /// The forced-finish instruction we append when a phase exhausts its turn cap.
@@ -547,7 +523,8 @@ pub async fn explore(
 
 /// Build the standalone `synthesize` user prompt. Pure and offline-testable.
 ///
-/// With `context`, frame it as primary evidence to ground in (question first, then
+/// With `context`, frame it as a strong lead — a place to start and claims to
+/// re-confirm against the code, not the edge of the evidence (question first, then
 /// context). With no context — or whitespace-only — steer the model to investigate
 /// directly via `run_kaish` rather than guess, so the answer stays grounded either
 /// way.
@@ -557,9 +534,13 @@ pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
             "Question:\n{question}\n\n\
              Context (supplied material — typically a curated explorer report or \
              pasted source):\n{context}\n\n\
-             Answer the question, grounded in the context above. Use the `run_kaish` \
-             tool to verify a citation or fetch a precise span the context points to \
-             but doesn't fully quote; cite concrete `file:line`."
+             Answer the question, grounded in concrete `file:line` evidence. Treat \
+             the context as a strong starting point — leads to follow and claims to \
+             confirm — not the limit of what you can check. Use the `run_kaish` tool \
+             freely: re-confirm the context's claims against the code, read the spans \
+             it cites, and investigate anything it left open or didn't cover. Where \
+             the code and the context disagree, the code wins. Cite concrete \
+             `file:line` for every claim."
         ),
         None => format!(
             "Question:\n{question}\n\n\
@@ -576,13 +557,17 @@ pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
 pub fn synthesize_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You answer a question about a codebase. {core}\n\n\
+        "You answer a question about a codebase, grounded in evidence and citing \
+         concrete `file:line`. {core}\n\n\
          You may be given CONTEXT — a curated explorer report or pasted material. \
-         When context is present, treat it as primary evidence and ground your answer \
-         in it, using `run_kaish` to verify a citation or fetch a precise span it \
-         points to. When context is thin or absent, investigate directly with \
-         `run_kaish` and answer from what you find. Either way, cite concrete \
-         `file:line` locations so every claim traces back to evidence."
+         Treat it as a strong lead: a place to start and claims worth confirming, not \
+         the edge of what you can check. The `run_kaish` tool is yours to drive \
+         directly whenever you want — re-confirm the context's claims against the \
+         code, read the spans it cites, and investigate anything it left open, \
+         regardless of how much context you were given. Re-confirming a supplied \
+         claim against the code is the normal move, not an exception; where the code \
+         and the context disagree, the code wins. Ground every claim in a concrete \
+         `file:line`."
     )
 }
 

@@ -2,7 +2,7 @@
 
 use kaibo::config::{default_models, Config, Profile};
 use kaibo::consult::{
-    consult, explore, synth_user_prompt, synthesize, synthesize_user_prompt, thinking_params,
+    consult, explore, synthesize, synthesize_user_prompt, thinking_params,
     ConsultConfig, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
@@ -26,6 +26,16 @@ fn synthesize_prompt_grounds_in_supplied_context() {
     let q = p.find("What blocks writes?").unwrap();
     let c = p.find("src/sandbox.rs:95 read-only mount").unwrap();
     assert!(q < c, "question should precede the context");
+    // P2 framing: supplied context is a lead to re-confirm against the code, not
+    // the edge of the evidence. Pin that the prompt still offers direct
+    // investigation and steers toward confirming — a revert to "verify the cited
+    // span only" framing must fail here.
+    assert!(p.contains("run_kaish"), "investigation tool offered even with context");
+    let lower = p.to_lowercase();
+    assert!(
+        lower.contains("re-confirm") || lower.contains("against the code"),
+        "supplied context must be framed as confirmable against the code, got: {p}"
+    );
 }
 
 #[test]
@@ -48,22 +58,6 @@ fn synthesize_prompt_treats_blank_context_as_absent() {
         p.contains("run_kaish"),
         "blank context should behave like None, got: {p}"
     );
-}
-
-#[test]
-fn synth_prompt_carries_question_and_report() {
-    let p = synth_user_prompt("What blocks writes?", "src/sandbox.rs: read-only mount");
-
-    // Both halves of the hand-off must be present and labelled, so the synth
-    // can tell the user's question from the explorer's evidence.
-    assert!(p.contains("What blocks writes?"));
-    assert!(p.contains("src/sandbox.rs: read-only mount"));
-    assert!(p.contains("Question:"));
-    assert!(p.contains("report"));
-    // The question must appear before the report (framing order matters).
-    let q = p.find("What blocks writes?").unwrap();
-    let r = p.find("src/sandbox.rs: read-only mount").unwrap();
-    assert!(q < r, "question should precede the report in the prompt");
 }
 
 #[test]
