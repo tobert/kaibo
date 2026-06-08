@@ -22,6 +22,7 @@ use rmcp::service::RequestContext;
 use rmcp::ErrorData as McpError;
 use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::config::{Config, Profile};
 use crate::consult::{consult, explore, synthesize, ConsultConfig};
@@ -105,6 +106,15 @@ pub struct ConsultInput {
     /// drives the whole investigation, delegating sweeps and reading spans).
     #[serde(default)]
     pub synth_max_turns: Option<usize>,
+
+    /// Surface the explorer's aggregated report (the `explore′` sweeps the consult
+    /// delegated) as `structured_content` alongside the answer. Off by default: the
+    /// report can be large and most clients feed structured content to the model, so
+    /// a normal consult stays lean — opt in for "show your work" / debugging the
+    /// hand-off. When on, the report rides separately and is surfaced even if empty
+    /// (an empty report is itself the signal that the consult delegated no sweep).
+    #[serde(default)]
+    pub include_report: bool,
 }
 
 /// Arguments to the `explore` tool.
@@ -273,7 +283,9 @@ impl KaiboHandler {
             context (the exploration still runs fresh each turn). Args: question \
             (required), path (project dir; optional if the server has a default root), \
             provider (anthropic|deepseek|gemini|openai), session_id (optional; opaque \
-            conversation key), and optional explorer_model / synth_model overrides."
+            conversation key), include_report (optional; attach the explorer's \
+            report as structured_content for debugging the hand-off), and optional \
+            explorer_model / synth_model overrides."
     )]
     async fn consult(
         &self,
@@ -315,7 +327,7 @@ impl KaiboHandler {
             self.sessions.record(&id, QaTurn::new(input.question, out.answer.clone()));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(out.answer)]))
+        Ok(consult_result(out.answer, out.report, input.include_report))
     }
 
     #[tool(
@@ -552,6 +564,21 @@ fn read_kaibo_resource(uri: &str, schemas: &[ToolSchema]) -> Result<ReadResource
     })
 }
 
+/// Assemble the `consult` tool result. The answer is always the text content
+/// (unchanged from a bare consult). The explorer's aggregated report — the
+/// `explore′` sweeps the driver delegated — rides along as `structured_content`
+/// only when the caller set `include_report`, keeping a normal call lean. When
+/// requested it is surfaced even if empty: an empty report is the honest signal
+/// that the consult read every span itself and delegated no sweep, which is
+/// distinct from the caller not asking at all. Pure and offline-testable.
+fn consult_result(answer: String, report: String, include_report: bool) -> CallToolResult {
+    let mut result = CallToolResult::success(vec![Content::text(answer)]);
+    if include_report {
+        result.structured_content = Some(json!({ "report": report }));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +655,55 @@ mod tests {
             read_kaibo_resource("kaibo://nope", &[]).is_err(),
             "an unknown URI must be a not-found error, not an empty success"
         );
+    }
+
+    /// The text channel of a result (the answer). Panics if it isn't a single
+    /// text block, which is the only shape `consult_result` produces.
+    fn answer_text(result: &CallToolResult) -> String {
+        assert_eq!(result.content.len(), 1, "consult result is a single text block");
+        result.content[0]
+            .as_text()
+            .expect("consult answer is text content")
+            .text
+            .clone()
+    }
+
+    /// Default path: no report requested ⇒ the answer is the whole result and no
+    /// structured content rides along (a lean call, byte-for-byte its pre-flag shape).
+    #[test]
+    fn consult_result_omits_report_unless_requested() {
+        let result = consult_result("the answer".into(), "FILE:1 evidence".into(), false);
+        assert_eq!(answer_text(&result), "the answer");
+        assert!(
+            result.structured_content.is_none(),
+            "report must not leak into a default call: {:?}",
+            result.structured_content
+        );
+    }
+
+    /// Opt-in: the report is surfaced as structured_content under `report`, while the
+    /// answer stays the text channel — the report rides *separately*, not duplicated
+    /// into the answer the model reads.
+    #[test]
+    fn consult_result_attaches_report_when_requested() {
+        let result = consult_result("ans".into(), "src/x.rs:1 the snippet".into(), true);
+        assert_eq!(answer_text(&result), "ans", "answer stays the text channel");
+        assert!(
+            !answer_text(&result).contains("the snippet"),
+            "report must not be folded into the answer text"
+        );
+        let sc = result.structured_content.expect("report was requested");
+        assert_eq!(sc["report"], "src/x.rs:1 the snippet", "report rides under `report`");
+    }
+
+    /// Opt-in with an empty report (the consult delegated no sweep): still surfaced.
+    /// Emptiness is the signal — present-but-empty means "asked, no sweep happened",
+    /// which a caller must be able to tell apart from "never asked" (None).
+    #[test]
+    fn consult_result_surfaces_empty_report_when_requested() {
+        let result = consult_result("ans".into(), String::new(), true);
+        let sc = result.structured_content.expect("requested even when empty");
+        assert_eq!(sc["report"], "", "an empty report is surfaced honestly");
     }
 
     #[test]

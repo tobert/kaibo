@@ -14,7 +14,11 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-07 (turn-cap graceful degradation shipped — `consult.rs`:
+Last pass: 2026-06-08 (explorer report surfacing shipped — `consult`'s
+`ConsultOutput.report` now rides as `structured_content` when a call sets
+`include_report`, off by default so a normal consult stays lean; `server.rs`
+`consult_result` is the pure, offline-tested seam. Folded out its P3 entry).
+2026-06-07 (turn-cap graceful degradation shipped — `consult.rs`:
 `MaxTurnsError` is no longer fatal, since rig 0.34 hands back the full transcript;
 `run_phase` now forces one final `ToolChoice::None` answer-now turn from the partial
 work, and caps raised to explorer 100 / synth 200 now that hitting them is no longer
@@ -61,13 +65,6 @@ read-only kernel builds) so the synth starts clean at the root (`consult.rs`). F
 for now, but a busy server rebuilds kernels constantly. Consider a small worker
 pool, or resetting one kernel's cwd between phases instead of rebuilding. Measure
 before optimizing.
-
-### The explorer's report is discarded at the MCP boundary
-`ConsultOutput` carries both `answer` and `report`, but the server returns only the
-answer text (`server.rs`). The curated report is useful for debugging the
-hand-off and for "show your work" — surface it as `structured_content` or a
-`kaibo://consult/last` resource, ideally behind a flag so it doesn't bloat every
-client context.
 
 ### `synthesize_batch` — a tool-less, batchable synth variant (deferred from the tool-surface work)
 The standalone `synthesize` we shipped is *interactive* (`{run_kaish}`) so it can
