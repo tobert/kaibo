@@ -36,18 +36,6 @@ was stale).
 
 ## P3 — Infra, perf, polish
 
-### `writes_into_project_do_not_touch_disk` may lack teeth
-Surfaced 2026-06-08 while teeth-proofing the denylist retirement: mounting the
-project writable (`LocalFs::new` instead of `read_only`) made the `touch`/`rm`
-sandbox tests fail as expected — but `writes_into_project_do_not_touch_disk`
-(`tests/sandbox.rs`: `echo pwned > newfile.txt`) still *passed*. If the read-only
-mount were the thing stopping it, a writable mount would let the redirect create a
-real file and the test would fail. It didn't, which means the redirect write
-doesn't resolve through the project mount at all (kaish redirect/cwd path), so the
-test asserts something that holds regardless of the mount. Confirm where a `>`
-redirect lands in the sandbox and either repoint the test at the path it actually
-writes (so it has teeth on the read-only guard) or document why it's vacuous.
-
 ### Multi-turn session history is unbounded per session
 `SessionStore` (`session.rs`) caps the number of *sessions* (LRU, `session_capacity`)
 but keeps every `(question, answer)` pair in a session forever — matching dpal, which

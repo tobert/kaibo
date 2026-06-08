@@ -43,16 +43,32 @@ async fn rm_on_project_file_is_denied_and_file_survives() {
     assert_eq!(fs::read_to_string(&victim).unwrap(), "do not delete me\n");
 }
 
-/// Writing/redirecting into the project tree must not create a real file.
+/// Redirecting into the project tree must not create a real file. The target is an
+/// ABSOLUTE path into the project so the redirect resolves to the read-only LocalFs
+/// mount — a bare relative `> f` is a red herring here: kaish resolves a relative
+/// redirect target against `/` (the MemoryFs catch-all), not the shell cwd, so it
+/// lands in ephemeral memory and never touches the mount at all (tracked in kaish
+/// `docs/issues.md`: "Output redirects ignore cwd"). Teeth: mount the project
+/// writable (`LocalFs::new`) and this fails — the read-only mount is the only thing
+/// refusing the write. The path comes from a `tempdir` (host-independent); we give
+/// it a non-dotted prefix so no path component trips kaish's dot-filename
+/// mis-tokenization.
 #[tokio::test(flavor = "current_thread")]
 async fn writes_into_project_do_not_touch_disk() {
-    let dir = tempdir().unwrap();
+    let dir = tempfile::Builder::new().prefix("kaibo-ro").tempdir().unwrap();
     let kernel = build_readonly_kernel(dir.path()).unwrap();
 
-    let _ = run(&kernel, "echo pwned > newfile.txt").await.unwrap();
+    let target = dir.path().join("newfile.txt");
+    let script = format!("echo pwned > {}", target.display());
+    let r = run(&kernel, &script).await.unwrap();
 
+    assert!(!r.ok(), "a redirect into the read-only project must be refused, got {r:?}");
     assert!(
-        !dir.path().join("newfile.txt").exists(),
+        r.err.contains("read-only"),
+        "the refusal should cite the read-only mount, got {r:?}"
+    );
+    assert!(
+        !target.exists(),
         "a redirect into the read-only project must not create a real file"
     );
 }
