@@ -45,6 +45,27 @@ was stale).
 
 ---
 
+## P2 — Focused fixes & hardening
+
+### Make the agent prompts say plainly: you may always explore on your own
+Surfaced 2026-06-08. kaibo's whole value is *grounded* answers, and an agent that
+leans on supplied context instead of going to the code inherits whatever bias that
+context carried. Some prompts steer the opposite way. The clearest offenders are
+**dead legacy** from the old two-phase pipeline and have no callers — `SYNTH_PREAMBLE`
+(`consult.rs:126`) and `synth_user_prompt` (`consult.rs:217`) both frame `run_kaish`
+as a "backstop for a specific gap … Do not re-explore from scratch — the report is
+primary". Delete them, or repurpose, but don't let that framing seed the live ones.
+The live builders are softer but still hedge: `synthesize_user_prompt`
+(`consult.rs:554`) scopes the tool to "verify a citation or fetch a precise span the
+context points to" when context is present; `synthesize_preamble` (`consult.rs:576`)
+only invites direct investigation "when context is thin or absent". `consult_preamble`
+(`consult.rs:672`) is the model to match — it frames `explore`/`run_kaish` as
+first-class. **Action:** Amy to read the prompts; then audit every preamble and
+user-prompt so each makes explicit that the agent may investigate the project
+directly *regardless of supplied context*, and that re-confirming a provided claim
+against the code is the normal, expected move — not an exception. Reduces bias; aligns
+with the positive-framing discipline in AGENTS.md ("Driving the models").
+
 ## P3 — Infra, perf, polish
 
 ### Multi-turn session history is unbounded per session
