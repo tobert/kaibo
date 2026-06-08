@@ -69,6 +69,11 @@ pub struct RecordedRequest {
     /// Concatenated text of every `User` message in the history (oldest→newest),
     /// joined by newlines — enough to assert a prior turn's Q&A reached the prompt.
     pub user_text: String,
+    /// Like `user_text` but *also* including tool-result text — what the model was
+    /// actually shown. Use this to assert a prior tool call's output (a `run_kaish`
+    /// result, an `explore′` report) survived into a later turn, e.g. that the forced
+    /// finalize turn carries the partial work rather than a blank history.
+    pub transcript: String,
     /// Provider-specific params (e.g. the thinking toggle) forwarded by `run_phase`.
     pub additional_params: Option<Value>,
     pub max_tokens: Option<u64>,
@@ -83,6 +88,7 @@ impl RecordedRequest {
             preamble: preamble(req),
             tool_names: req.tools.iter().map(|t| t.name.clone()).collect(),
             user_text: user_text(req),
+            transcript: transcript_text(req),
             additional_params: req.additional_params.clone(),
             max_tokens: req.max_tokens,
             tool_choice: req.tool_choice.clone(),

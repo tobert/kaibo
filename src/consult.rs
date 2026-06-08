@@ -985,6 +985,113 @@ mod tests {
         );
     }
 
+    /// Multi-sweep: a driver that delegates to `explore′` more than once must
+    /// aggregate every report into `ConsultOutput.report`, joined by the `---`
+    /// separator. The single-delegation e2e can't see this — one report makes any
+    /// join string look right.
+    #[tokio::test]
+    async fn multiple_sweeps_aggregate_into_one_report_joined_by_separator() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                // Delegate twice (distinguishable sub-questions), then answer. Count
+                // the reports already gathered to decide which step we're on.
+                let sweeps = transcript_text(req).matches("REPORT-").count();
+                match sweeps {
+                    0 => Ok(tool_call_response(
+                        "s1",
+                        "explore",
+                        json!({ "question": "find the sandbox" }),
+                    )),
+                    1 => Ok(tool_call_response(
+                        "s2",
+                        "explore",
+                        json!({ "question": "find the kaish syntax" }),
+                    )),
+                    _ => Ok(text_response("ANSWER from both sweeps")),
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                // Each sweep answers immediately with a distinguishable report, keyed
+                // off its sub-question (which is the explorer's whole prompt).
+                if transcript_text(req).contains("sandbox") {
+                    Ok(text_response("REPORT-SANDBOX: src/sandbox.rs:1"))
+                } else {
+                    Ok(text_response("REPORT-KAISH: src/kaish_syntax.rs:1"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        let out =
+            consult_with(&client, "two-part question", dir.path(), EXPLORER, SYNTH, &cfg, None)
+                .await
+                .unwrap();
+
+        assert!(out.report.contains("REPORT-SANDBOX"), "first sweep present: {:?}", out.report);
+        assert!(out.report.contains("REPORT-KAISH"), "second sweep present: {:?}", out.report);
+        assert_eq!(
+            out.report.matches("---").count(),
+            1,
+            "exactly one `---` between two reports, got: {:?}",
+            out.report
+        );
+        assert_eq!(
+            client.requests_for(EXPLORER).len(),
+            2,
+            "the driver must have delegated two distinct sweeps"
+        );
+    }
+
+    /// A dying `explore′` sweep must not sink the whole consult: the driver sees the
+    /// failure in its transcript and answers from what it has, the report sink stays
+    /// empty, and — the teeth for the harness's record-before-respond promise — the
+    /// failed explorer request is still logged.
+    #[tokio::test]
+    async fn a_failed_sweep_surfaces_and_the_driver_recovers() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                // Delegate once; once the failure has come back, answer from direct work.
+                if transcript_text(req).contains("simulated provider outage") {
+                    Ok(text_response("ANSWER: explore failed, answered from direct reads"))
+                } else {
+                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                }
+            })
+            .on_model(EXPLORER, |_req| Err(provider_error("simulated provider outage")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        let out = consult_with(&client, "a question", dir.path(), EXPLORER, SYNTH, &cfg, None)
+            .await
+            .expect("a failed sweep must not fail the whole consult");
+
+        // The driver only reaches this answer by *seeing* the error in its transcript
+        // (its branch requires it) — so the answer text proves the failure surfaced.
+        assert!(
+            out.answer.contains("answered from direct reads"),
+            "driver should recover after the sweep failed, got: {:?}",
+            out.answer
+        );
+        // The sweep errored before `RunExplore` pushed to the sink, so the report is
+        // empty — distinct from a sweep that ran and found nothing.
+        assert!(out.report.is_empty(), "a failed sweep contributes no report: {:?}", out.report);
+        // Record-before-respond: the failing explorer call was still captured.
+        assert!(
+            !client.requests_for(EXPLORER).is_empty(),
+            "the failed explorer request must still be logged"
+        );
+    }
+
     /// Turn-cap recovery, offline: a model that never stops calling tools must still
     /// yield an answer. We cap the loop low and script a driver that *always* calls a
     /// tool — until it's shown `ToolChoice::None` (the forced finalize turn), where it
@@ -1027,9 +1134,19 @@ mod tests {
             out.answer
         );
         // And the recovery path actually ran: some request carried ToolChoice::None.
+        let finalize = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .find(|r| r.tool_choice == Some(ToolChoice::None))
+            .expect("a forced finalize turn (ToolChoice::None) must have been issued");
+        // The teeth: the finalize turn must carry the *partial work* — the run_kaish
+        // results the driver accumulated before the cap — not a blank history. The
+        // answer is hardcoded in the responder, so without this a regression that fed
+        // `finalize_after_max_turns` an empty transcript would still pass.
         assert!(
-            client.requests_for(SYNTH).iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
-            "a forced finalize turn (ToolChoice::None) must have been issued"
+            finalize.transcript.contains("target_marker"),
+            "finalize turn must replay the accumulated tool work, got transcript: {:?}",
+            finalize.transcript
         );
     }
 
@@ -1156,8 +1273,10 @@ mod tests {
     #[test]
     fn consult_toolset_has_both_run_kaish_and_explore() {
         let dir = tempdir().unwrap();
-        // Construction is offline (no network): the key is never validated here.
-        let client = anthropic::Client::new("test-key").unwrap();
+        // The scripted client satisfies the same trait bounds with no network and no
+        // key-format requirement — so this stays a pure toolset-wiring test, not a
+        // hostage to rig's anthropic constructor.
+        let client = ScriptedClient::builder().build();
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
