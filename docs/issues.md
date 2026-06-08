@@ -119,6 +119,27 @@ rather than a key check. This can come along with adding an MCP resource for lis
 
 ## P4 — Eventually
 
+### Config-overrideable system prompts (deferred until a non-Amy user asks)
+Every model-facing string is hardcoded in Rust today: the three phase preambles
+(`consult.rs` `report_preamble`/`synthesize_preamble`/`consult_preamble`, each
+interpolating `kaish_syntax_core()`), the per-call framers (`synthesize_user_prompt`,
+`consult_user_prompt`), `FINALIZE_NOTE`, and the shared cheatsheet in
+`kaish_syntax.rs` (`KAISH_SANDBOX_ADDENDUM` + the `kaish-help`-sourced contract). No
+config path reaches any of them. The seam is already there: `ConsultConfig`
+(`consult.rs`) is threaded into every phase fn, so a resolved `prompts` set could ride
+on it and replace the `&consult_preamble()` literals at the `.preamble()` call in
+`run_phase`; on the config side a `[prompts]` table would slot in exactly like
+`[defaults]`. Deferred because Amy is the only user and edits the source directly —
+build it when someone else needs it. Three forks to settle *when* asked, not now:
+- **Granularity** — server-wide `[prompts]` vs per-profile (prompt framing is
+  model-sensitive: Gemma fixates on prohibitions where capable models don't, per the
+  positive-framing discipline, so per-profile has a real case) vs both.
+- **Replace scope** — override the role text only and keep injecting
+  `kaish_syntax_core()` (safe: can't silently drop the grounding/exit-code contract)
+  vs full-preamble raw replace vs per-field opt-in.
+- **Source** — `*_file` path (keeps `config.toml` readable, prompts as real files)
+  vs inline `"""…"""` vs both, mirroring `api_key_env`/`api_key_file`.
+
 ### A secrets-manager key source (deferred)
 Custom credential paths shipped — a profile's `api_key_env` / `api_key_file`
 override the built-in `~/.anthropic-key.txt` / `~/.deepseek-key` / `~/.gemini-api-key`
