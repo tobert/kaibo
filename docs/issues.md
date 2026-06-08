@@ -14,7 +14,14 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-08 (explorer report surfacing shipped — `consult`'s
+Last pass: 2026-06-08 (read-only denylist retired — kaish landed the upstream fix
+(`touch` routes its mtime bump through a `set_mtime` backend op the read-only mount
+rejects; `mktemp` resolves its parent through the VFS, so it lands in ephemeral
+`MemoryFs`, never real `/tmp`). kaibo dropped the hardcoded `DENYLIST` entirely; the
+read-only invariant is now wholly structural (mount + MemoryFs + compiled-out axes).
+`Blocked` survives only as the engine for config-driven `[sandbox].disable_builtins`.
+Tests reworked to assert structural teeth and proved by mounting the project writable.
+Folded out the P2 entry). 2026-06-08 (explorer report surfacing shipped — `consult`'s
 `ConsultOutput.report` now rides as `structured_content` when a call sets
 `include_report`, off by default so a normal consult stays lean; `server.rs`
 `consult_result` is the pure, offline-tested seam. Folded out its P3 entry).
@@ -24,20 +31,6 @@ Last pass: 2026-06-08 (explorer report surfacing shipped — `consult`'s
 work, and caps raised to explorer 100 / synth 200 now that hitting them is no longer
 fatal. Folded out the prior P1 entry — its premise that rig discards the transcript
 was stale).
-
----
-
-## P2 — Focused fixes & hardening
-
-### `touch` / `mktemp` still bypass the read-only mount
-Under the `localfs`-only build, the only compiled builtins that reach real state
-directly are `touch` (`std::fs` mtime on existing files) and `mktemp` (real temp
-files) — kaibo shadow-blocks both via `sandbox.rs::apply_denylist`. The cleaner fix
-is upstream in kaish: make `touch`/`mktemp` honor the mount's read-only flag (they
-already check `ctx.backend` first; the `std::fs` fallthrough is the leak), or offer
-a `register_readonly_builtins` profile so kaibo can drop the shadow entirely. Much
-smaller than it was — `git`/`exec`/`spawn`/`kill`/`ps` are now compile-time absent.
-Tracked in the `kaish-readonly-bypass` memory.
 
 ---
 

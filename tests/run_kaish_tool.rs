@@ -2,10 +2,11 @@
 //! #[tool]. Same invariant as `tests/sandbox.rs`, but exercised the way a real MCP
 //! caller hits it — through `KaiboHandler`, not rig's internal `RunKaish`.
 //!
-//! Teeth (manual, as in `tests/sandbox.rs`): temporarily set
-//! `sandbox::DENYLIST = &[]` and the `touch`/`git` assertions below fail — those
-//! builtins reach real state directly and only the denylist catches them. The
-//! `rm`/redirect cases get their teeth from the read-only mount independently.
+//! Teeth (manual, as in `tests/sandbox.rs`): temporarily mount the project
+//! writable (`LocalFs::new` instead of `LocalFs::read_only` in `sandbox.rs`) and
+//! the `touch`/`rm` assertions below fail — every mutation is refused structurally
+//! by the read-only mount, not an honor-system denylist. `git` is refused because
+//! its axis isn't compiled in.
 
 use std::fs;
 use std::path::Path;
@@ -75,7 +76,7 @@ async fn redirect_write_does_not_touch_disk() {
 }
 
 #[tokio::test]
-async fn touch_on_existing_file_is_denylist_blocked() {
+async fn touch_on_existing_file_is_refused_by_the_mount() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("real.txt");
     fs::write(&target, "x\n").unwrap();
@@ -86,8 +87,8 @@ async fn touch_on_existing_file_is_denylist_blocked() {
 
     assert!(!text.contains("exit: 0"), "touch must be refused, got: {text}");
     assert!(
-        text.contains("read-only sandbox"),
-        "the denylist (not the mount) should catch the std::fs mtime path, got: {text}"
+        text.contains("read-only"),
+        "the read-only mount should reject the mtime bump, got: {text}"
     );
     let after = fs::metadata(&target).unwrap().modified().unwrap();
     assert_eq!(before, after, "the real file's mtime must not change");

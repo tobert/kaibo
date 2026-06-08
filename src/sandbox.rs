@@ -1,29 +1,37 @@
 //! The read-only kaish sandbox the explorer model runs inside.
 //!
-//! Safety is layered, with the heaviest lever at compile time:
+//! Safety is layered, with the heaviest lever at compile time. The read-only
+//! invariant is carried entirely by structural levers — there is no hardcoded
+//! builtin denylist; every mutation path is refused by construction:
 //!
 //! 0. **Minimal feature surface (primary).** kaibo depends on kaish-kernel with
 //!    only the `localfs` axis; `subprocess`, `git`, `host`, and `os-integration`
 //!    are OFF (see Cargo.toml). So `exec`/`spawn`/`kill`/`git`/`ps` are *never
 //!    compiled in* — the dangerous surface doesn't exist, it isn't merely blocked.
 //! 1. The project root is mounted with [`LocalFs::read_only`], so every write,
-//!    delete, `mkdir`, etc. routed through the backend returns `PermissionDenied`
-//!    at the VFS layer — regardless of which builtin issued it. This stops
-//!    `rm`/`mv`/`cp`/`mkdir`/`tee`/`write`.
+//!    delete, `mkdir`, `touch` (its mtime bump now routes through the backend's
+//!    `set_mtime`, which the read-only mount rejects), etc. returns
+//!    `PermissionDenied` at the VFS layer — regardless of which builtin issued it.
+//!    This stops `rm`/`mv`/`cp`/`mkdir`/`tee`/`write`/`touch`.
 //! 2. `/` is [`MemoryFs`], so paths *outside* the project resolve to ephemeral
-//!    in-memory scratch that vanishes with the kernel and never touches disk.
+//!    in-memory scratch that vanishes with the kernel and never touches disk —
+//!    including where `mktemp` lands (it resolves its parent through the VFS, so a
+//!    temp file is created in memory, never on the real `/tmp`).
 //! 3. [`KernelConfig::with_allow_external_commands(false)`] — belt-and-suspenders
 //!    now that `subprocess` is off; refuses any external-command path.
-//! 4. [`DENYLIST`] shadow-blocks the builtins that reach real state *directly*,
-//!    bypassing the backend. Under `localfs`-only the live ones are `touch`
-//!    (`std::fs` mtime) and `mktemp` (real temp files); the rest are
-//!    defense-in-depth, firing only if a heavier axis is ever enabled.
 //!
-//! `ToolRegistry` has no `unregister`, but `register` overwrites by name, so we
-//! shadow each denied builtin with [`Blocked`] — a wrapper that keeps the real
-//! tool's schema (help/validation stay intact) but refuses to execute. A proper
-//! `register_readonly_builtins`/`unregister` upstream would let us drop them from
-//! the schema entirely; tracked as a nicety, not a gate.
+//! There used to be a fourth lever: a hardcoded `DENYLIST` shadow-blocking `touch`
+//! and `mktemp`, which reached real state directly via `std::fs` and bypassed the
+//! mount. That leak was fixed upstream in kaish (`touch` routes mtime through a new
+//! `set_mtime` backend op; `mktemp` resolves its parent through the VFS instead of
+//! the host), so the shadow is gone — structural beats honor-system, and we no
+//! longer carry a list that masks whether the real guard works.
+//!
+//! The [`Blocked`] wrapper survives for one job: the config-driven
+//! `[sandbox].disable_builtins`, which lets an operator make the box *stricter* by
+//! shadowing a builtin that would otherwise work (e.g. forbid `cat`). `ToolRegistry`
+//! has no `unregister`, but `register` overwrites by name, so [`Blocked`] keeps the
+//! real tool's schema (help/validation stay intact) while refusing to execute.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,15 +43,6 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig};
-
-/// Builtins that bypass the read-only backend to touch real state directly, so
-/// the [`LocalFs::read_only`] mount can't stop them (audited for
-/// `std::fs`/`git2`/`Command`/signal use). Under the `localfs`-only build, only
-/// `touch` and `mktemp` are actually compiled — the others (`git`/`spawn`/`exec`/
-/// `kill`) live on heavier axes that are off, so `register.get` returns `None` and
-/// they're skipped. They stay in the list as defense-in-depth: if someone enables
-/// `subprocess`/`git` later, the block is already in place.
-pub const DENYLIST: &[&str] = &["git", "touch", "spawn", "exec", "kill", "mktemp"];
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
 struct Blocked {
@@ -77,16 +76,16 @@ impl Tool for Blocked {
     }
 }
 
-/// Shadow-block the [`DENYLIST`] builtins plus any caller-supplied `extra` names.
+/// Shadow-block the caller-supplied `disable` builtins (the config's
+/// `[sandbox].disable_builtins`).
 ///
-/// `extra` is the config's `[sandbox].disable_builtins`: it can only *add* to the
-/// block set, never remove from it — config makes the box stricter, never looser.
-/// The hardcoded `DENYLIST` is the read-only invariant and is always applied. An
-/// `extra` name that isn't a registered builtin is a no-op *here* (already
-/// validated loudly at startup, see [`builtin_names`]).
-fn apply_denylist(registry: &mut ToolRegistry, extra: &[String]) {
-    let names = DENYLIST.iter().copied().chain(extra.iter().map(String::as_str));
-    for name in names {
+/// This can only make the box *stricter* — it adds blocks, never removes the
+/// structural read-only guards (the mount, MemoryFs, compiled-out axes). A name
+/// that isn't a registered builtin is a no-op *here* (already validated loudly at
+/// startup, see [`builtin_names`]). The read-only invariant needs no entries here:
+/// every mutation is refused structurally (see the module doc).
+fn apply_disabled_builtins(registry: &mut ToolRegistry, disable: &[String]) {
+    for name in disable {
         if let Some(inner) = registry.get(name) {
             registry.register_arc(Arc::new(Blocked { inner }));
         }
@@ -110,16 +109,17 @@ pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
 
 /// Tunable read-only-sandbox limits, set via `[sandbox]` in config.toml.
 ///
-/// These can only make the box *stricter* — `disable_builtins` adds to the
-/// hardcoded [`DENYLIST`], never removes from it, and the dangerous axes aren't
-/// even compiled in. The read-only invariant is not a config knob.
+/// These can only make the box *stricter* — `disable_builtins` shadow-blocks
+/// additional builtins, and the dangerous axes aren't even compiled in. The
+/// read-only invariant is structural (the mount, MemoryFs, compiled-out axes) and
+/// is not a config knob.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     /// Per-kaish-script wall-clock budget; exceeding it exits 124.
     pub exec_timeout: Duration,
     /// Max bytes of script output before truncation (exit 3 + head/tail sample).
     pub output_limit_bytes: usize,
-    /// Builtins to shadow-block *in addition* to the read-only [`DENYLIST`].
+    /// Builtins to shadow-block on top of the structural read-only guards.
     pub disable_builtins: Vec<String>,
 }
 
@@ -185,12 +185,14 @@ pub fn build_readonly_kernel_with(
         .with_output_limit(output_limit);
 
     // `with_backend` ignores config.vfs_mode and routes all non-`/v/*` paths
-    // through our read-only backend. `configure_tools` runs after the default
-    // builtins are registered, so the denylist shadows win. The extra disabled
-    // builtins are union'd with the hardcoded DENYLIST.
-    let extra = sandbox.disable_builtins.clone();
-    Kernel::with_backend(backend, config, |_| {}, move |reg| apply_denylist(reg, &extra))
-        .context("failed to build read-only kaish kernel")
+    // through our read-only backend (the read-only invariant). `configure_tools`
+    // runs after the default builtins are registered, so any config-driven
+    // `disable_builtins` shadows win.
+    let disable = sandbox.disable_builtins.clone();
+    Kernel::with_backend(backend, config, |_| {}, move |reg| {
+        apply_disabled_builtins(reg, &disable)
+    })
+    .context("failed to build read-only kaish kernel")
 }
 
 /// The schemas of every builtin kaibo's kernel registers, sorted by name.
@@ -199,9 +201,10 @@ pub fn build_readonly_kernel_with(
 /// resources) and the composed onboarding instructions. The set is static for a
 /// given build — it depends only on the compiled feature axes, not on the project
 /// root or VFS mode — so we read it from a throwaway `isolated()` kernel (pure
-/// in-memory, no backend) rather than spinning a full read-only mount. The
-/// `DENYLIST` builtins still appear here: shadow-blocking preserves their schema
-/// (only execution is refused), so the help surface matches what's registered.
+/// in-memory, no backend) rather than spinning a full read-only mount. Any
+/// config-disabled builtins still appear here: shadow-blocking preserves their
+/// schema (only execution is refused), so the help surface matches what's
+/// registered.
 pub fn builtin_schemas() -> Result<Vec<ToolSchema>> {
     let kernel = Kernel::new(KernelConfig::isolated().with_skip_validation(true))
         .context("failed to build schema kernel")?;

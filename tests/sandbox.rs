@@ -5,7 +5,7 @@
 
 use std::fs;
 
-use kaibo::sandbox::{build_readonly_kernel, run};
+use kaibo::sandbox::{build_readonly_kernel, build_readonly_kernel_with, run, SandboxConfig};
 use tempfile::tempdir;
 
 /// Reads through the sandbox work and see the live project tree.
@@ -87,8 +87,11 @@ async fn touch_new_file_is_denied() {
     );
 }
 
-/// `touch` on an *existing* file takes the `std::fs` mtime path that bypasses the
-/// backend mount — only the denylist stops it. Teeth: the real mtime must not move.
+/// `touch` on an *existing* file bumps its mtime — the path that used to escape via
+/// raw `std::fs` and bypass the mount. The upstream fix routes that bump through the
+/// backend's `set_mtime`, which the read-only mount rejects, so kaibo no longer
+/// needs a shadow-block. Teeth: the refusal cites the read-only filesystem AND the
+/// real mtime must not move (a regression in the upstream routing would move it).
 #[tokio::test(flavor = "current_thread")]
 async fn touch_existing_file_cannot_bump_mtime() {
     let dir = tempdir().unwrap();
@@ -101,15 +104,40 @@ async fn touch_existing_file_cannot_bump_mtime() {
 
     assert!(!r.ok(), "touch on existing file must be denied, code={}", r.code);
     assert!(
-        r.err.contains("read-only sandbox"),
-        "the denylist (not the mount) should catch the std::fs mtime path, got err={:?}",
+        r.err.contains("read-only"),
+        "the read-only mount should reject the mtime bump, got err={:?}",
         r.err
     );
     let after = fs::metadata(&target).unwrap().modified().unwrap();
     assert_eq!(before, after, "the real file's mtime must not change");
 }
 
-/// `git` writes the real `.git` via libgit2, bypassing the mount entirely.
+/// `mktemp` used to create a *real* temp file via `std::fs`. The upstream fix
+/// resolves its parent dir through the VFS, so in kaibo's sandbox it lands in the
+/// ephemeral `MemoryFs` mounted at `/` (there is no writable real mount), never on
+/// the host's `/tmp`. Teeth: whatever path it hands back must NOT exist on the real
+/// filesystem — if the resolution ever fell back to host `std::fs`, it would.
+#[tokio::test(flavor = "current_thread")]
+async fn mktemp_lands_in_memory_not_real_disk() {
+    let dir = tempdir().unwrap();
+    let kernel = build_readonly_kernel(dir.path()).unwrap();
+
+    let r = run(&kernel, "mktemp").await.unwrap();
+    assert!(r.ok(), "mktemp should succeed into ephemeral memory, got {r:?}");
+
+    let out = r.text_out();
+    let path = out.trim();
+    assert!(!path.is_empty(), "mktemp should print the temp path it created, got {r:?}");
+    assert!(
+        !std::path::Path::new(path).exists(),
+        "mktemp must not create a file on the real filesystem, but {path} exists"
+    );
+}
+
+/// `git` would write a real `.git` via libgit2, bypassing the mount entirely — but
+/// it lives on the `git` axis, which kaibo doesn't compile, so it isn't even a
+/// registered builtin. Pin that it stays gone: `git init` is refused and no repo
+/// appears (a regression that pulled the axis in would make a real `.git`).
 #[tokio::test(flavor = "current_thread")]
 async fn git_is_blocked_and_inits_no_repo() {
     let dir = tempdir().unwrap();
@@ -123,8 +151,9 @@ async fn git_is_blocked_and_inits_no_repo() {
     );
 }
 
-/// `spawn` would launch a real external process — the escape hatch the
-/// external-command flag doesn't cover. It must be denied.
+/// `spawn` would launch a real external process — but it lives on the `subprocess`
+/// axis, which kaibo doesn't compile, so it isn't a registered builtin. It must be
+/// refused (a regression that enabled the axis would let it run).
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_is_blocked() {
     let dir = tempdir().unwrap();
@@ -134,28 +163,37 @@ async fn spawn_is_blocked() {
     assert!(!r.ok(), "spawn must be denied, got code={}", r.code);
 }
 
-/// The exit-code contract a caller-facing `run_kaish` advertises: a *sandbox
-/// block* is exit 126, and that's distinguishable from an ordinary *script
-/// failure*. An automated caller keys off this to tell "the boundary refused you"
-/// from "your command failed", so pin that 126 is not just "any non-zero".
+/// The exit-code contract a caller-facing `run_kaish` advertises: a *shadow block*
+/// is exit 126, distinguishable from an ordinary *script failure*. An automated
+/// caller keys off this to tell "the sandbox refused you" from "your command
+/// failed", so pin that 126 is not just "any non-zero". The read-only invariant
+/// itself is now structural — a denied write surfaces as the VFS permission-denied
+/// code (see the `touch`/`rm` tests) — so we drive the 126 path through the one
+/// mechanism that still emits it: a config-disabled builtin.
 #[tokio::test(flavor = "current_thread")]
-async fn blocked_is_126_and_distinct_from_a_plain_failure() {
+async fn shadow_block_is_126_and_distinct_from_a_plain_failure() {
     let dir = tempdir().unwrap();
-    let kernel = build_readonly_kernel(dir.path()).unwrap();
+    fs::write(dir.path().join("f.txt"), "hi\n").unwrap();
 
-    // A denylisted builtin → 126 + the sandbox marker.
-    let blocked = run(&kernel, "touch anything.txt").await.unwrap();
+    // Disable an otherwise-working builtin so the shadow (Blocked → 126) fires.
+    let sandbox = SandboxConfig {
+        disable_builtins: vec!["cat".to_string()],
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
+
+    // The shadow-blocked builtin → 126 + the sandbox marker.
+    let blocked = run(&kernel, "cat f.txt").await.unwrap();
     assert_eq!(blocked.code, 126, "a sandbox block must be exit 126, got {blocked:?}");
     assert!(
-        blocked.err.contains("read-only sandbox"),
-        "the 126 must carry the sandbox marker (126 also means POSIX not-executable), got {:?}",
-        blocked.err
+        blocked.err.contains("read-only sandbox") || blocked.text_out().contains("read-only sandbox"),
+        "the 126 must carry the sandbox marker (126 also means POSIX not-executable), got {blocked:?}"
     );
 
-    // An ordinary read failure → non-zero but NOT 126, so it can't be mistaken
-    // for a block.
-    let failed = run(&kernel, "cat does-not-exist.txt").await.unwrap();
-    assert!(!failed.ok(), "reading a missing file must fail, got {failed:?}");
+    // An ordinary failure (a still-enabled builtin on a missing file) → non-zero
+    // but NOT 126, so it can't be mistaken for a block.
+    let failed = run(&kernel, "grep needle does-not-exist.txt").await.unwrap();
+    assert!(!failed.ok(), "grep on a missing file must fail, got {failed:?}");
     assert_ne!(
         failed.code, 126,
         "a plain failure must not collide with the 126 sandbox-block code, got {failed:?}"

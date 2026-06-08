@@ -245,7 +245,7 @@ async fn synthesize_grounds_in_context_and_investigates_without_it() {
     // With a thin context: it should answer grounded, optionally confirming via run_kaish.
     let with_ctx = synthesize(
         "Which file enforces the read-only sandbox?",
-        Some("src/sandbox.rs builds a read-only kernel; the DENYLIST shadow-blocks touch/git."),
+        Some("src/sandbox.rs builds a read-only kernel; the LocalFs read-only mount refuses every write."),
         root,
         &p,
         &cfg,
