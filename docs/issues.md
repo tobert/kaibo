@@ -14,7 +14,14 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-08 (offline mock harness shipped — a scripted `CompletionClient`
+Last pass: 2026-06-08 (host-env hermeticity entry retired — the kaish-side fixes it
+tracked all landed: tilde `~`/`~/path` and bare `cd` now consult the kernel scope
+`HOME` (kaibo seeds none, so they stay literal — no host-path disclosure), `~user`/
+`/proc` are `host`-gated (off here), and a new structural guard makes any
+`with_backend` kernel refuse host side channels — output spill is forced in-memory and
+background-job output files are suppressed, so neither bypasses the read-only mount onto
+the real filesystem. The read-only invariant is now wholly structural. Folded out the P3
+entry). 2026-06-08 (offline mock harness shipped — a scripted `CompletionClient`
 (`src/test_support.rs`, content-driven so it's robust to rig's `buffer_unordered`
 tool execution and the finalize replay) now drives the *real* consult loop with no
 network. Closed two test-gap entries: an e2e proving a `consult` `explore` tool call
@@ -72,18 +79,6 @@ fan-out: submit → poll → read, modelled on gpal/cpal's job system. Uses the 
 capability** like `thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, `openai` ✗ —
 `None` where unsupported. Open fork when built: many-questions/one-model vs
 one-question/many-models (the diverse-opinion panel made literal).
-
-### Explorer sandbox isn't fully hermetic from the host env
-Surfaced 2026-06-03 catching up to kaish's four-crate split. Several kaish builtins
-read the host environment directly instead of the kernel scope: tilde expansion in
-`interpreter/eval.rs` (`~`/`~/path`), `cd` with no args (`cd.rs`), and the
-`~user`→`/etc/passwd` lookup (now gated behind the `host` capability, which kaibo
-doesn't enable). For kaibo these are *read* disclosures, not write bypasses — `~`
-expands to the host home path string, which then resolves through `/`=`MemoryFs` to
-ephemeral scratch, so no real off-project file is read — but the host home *path* is
-disclosed to the explorer model. The fix is kaish-side (consult the scope `HOME`,
-not `std::env`) and is tracked in kaish's own `docs/issues.md` P2 hermetic pass;
-recorded here so we don't lose that our sandbox's hermeticity depends on it landing.
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they
