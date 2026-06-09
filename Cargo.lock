@@ -1247,6 +1247,8 @@ dependencies = [
 [[package]]
 name = "kaish-glob"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b960286516392090a9d161750cdce3777d7d44d90362bb67c834827c13d0efdf"
 dependencies = [
  "async-trait",
  "ignore",
@@ -1256,6 +1258,8 @@ dependencies = [
 [[package]]
 name = "kaish-help"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab583adf0ad802a9529e02d5b0cc0d24e01ed858bc14fcb1577e9d39f275fed5"
 dependencies = [
  "kaish-types",
 ]
@@ -1263,6 +1267,8 @@ dependencies = [
 [[package]]
 name = "kaish-kernel"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abf3a77cc80e16622645dfe27302c3277a0cace2e61f786aa28d3e57543e835f"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1306,6 +1312,8 @@ dependencies = [
 [[package]]
 name = "kaish-tool-api"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c64ac24f480b033a8c311f2b7fd10b8596be3843b0038eb502ffeb4dd7238c93"
 dependencies = [
  "async-trait",
  "clap",
@@ -1315,6 +1323,8 @@ dependencies = [
 [[package]]
 name = "kaish-types"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5610627d6f17bce0163a7ae70a00610902f45b4f722db48a44e214154fc8c1f"
 dependencies = [
  "serde",
  "serde_json",
@@ -1325,6 +1335,8 @@ dependencies = [
 [[package]]
 name = "kaish-vfs"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9519ea9680479a65712eedb67e040e5dd3a56aec88e69358b703deaf2de05f"
 dependencies = [
  "async-trait",
  "kaish-types",
