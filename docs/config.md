@@ -51,6 +51,14 @@ Profile       = { name, kind, base_url?, key source, models, per-profile tunable
   or Sonnet profile has far more output/reasoning headroom than local Gemma on a
   tight context window. A profile omits them to inherit `[defaults]`. (`max_turns`
   stays a `[defaults]` + per-call concern — it bounds the *loop*, not the model.)
+- **`explorer_temperature`, `synth_temperature`, and `top_p` are per-profile
+  sampling overrides** of the `[defaults]` values (defaults `0.1` / `0.3` / `0.95`).
+  Temperature is per *role*: the explorer gathers exact citations, so it runs cold;
+  the synth composes the answer, so it gets a touch more room. They're sent to every
+  provider that accepts them — top-level for Anthropic/DeepSeek/OpenAI, under
+  `generationConfig` (camelCase `topP`) for Gemini. Per-profile because a local model
+  may want different sampling than a hosted one. Temperature must be in `[0.0, 2.0]`
+  and `top_p` in `(0.0, 1.0]`; an out-of-range value is rejected at load, not clamped.
 - **`request_timeout_secs` is a per-profile override** (default 900 = 15 min) of the
   per-request LLM deadline: the wall-clock ceiling on a *single* completion call.
   rig's prompt loop is non-streaming and has no native timeout, so a provider that
@@ -124,6 +132,9 @@ else is mechanical:
 | synth max turns | `defaults.synth_max_turns` | `KAIBO_SYNTH_MAX_TURNS` | *(per-call only)* |
 | max output tokens | `defaults.max_tokens` *(per-profile override)* | `KAIBO_MAX_TOKENS` | — |
 | thinking budget | `defaults.thinking_budget` *(per-profile override)* | `KAIBO_THINKING_BUDGET` | — |
+| explorer temperature | `defaults.explorer_temperature` *(per-profile override)* | `KAIBO_EXPLORER_TEMPERATURE` | — |
+| synth temperature | `defaults.synth_temperature` *(per-profile override)* | `KAIBO_SYNTH_TEMPERATURE` | — |
+| nucleus top_p | `defaults.top_p` *(per-profile override)* | `KAIBO_TOP_P` | — |
 | LLM request timeout (s) | `defaults.request_timeout_secs` *(per-profile override)* | `KAIBO_REQUEST_TIMEOUT_SECS` | — |
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |

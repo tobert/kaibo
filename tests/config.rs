@@ -160,6 +160,60 @@ fn per_profile_tunables_override_defaults_others_inherit() {
 }
 
 #[test]
+fn sampling_defaults_and_overrides_per_profile() {
+    // Built-in defaults: cold explorer, warmer synth, mild top_p.
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.explorer_temperature, 0.1);
+    assert_eq!(c.defaults.synth_temperature, 0.3);
+    assert_eq!(c.defaults.top_p, 0.95);
+
+    let c = Config::from_toml_str(
+        r#"
+        [defaults]
+        synth_temperature = 0.5
+
+        [profiles.gpt]
+        kind = "openai"
+        base_url = "https://api.openai.com/v1"
+        explorer_temperature = 0.0
+        top_p = 0.8
+        "#,
+    )
+    .unwrap();
+
+    // gpt overrides explorer_temperature and top_p; inherits the file's synth_temperature.
+    let gpt = c.resolve_profile("gpt").unwrap();
+    assert_eq!(gpt.explorer_temperature, 0.0);
+    assert_eq!(gpt.synth_temperature, 0.5);
+    assert_eq!(gpt.top_p, 0.8);
+    // A profile that overrode nothing inherits the file default (synth) and built-in rest.
+    let anthropic = c.resolve_profile("anthropic").unwrap();
+    assert_eq!(anthropic.synth_temperature, 0.5);
+    assert_eq!(anthropic.explorer_temperature, 0.1);
+    assert_eq!(anthropic.top_p, 0.95);
+}
+
+#[test]
+fn out_of_range_sampling_is_a_loud_error() {
+    // No silent clamp: a temperature past the accepted band is a typo, caught at load.
+    let err = Config::from_toml_str(
+        "[profiles.gpt]\nkind = \"openai\"\nbase_url = \"https://x/v1\"\nsynth_temperature = 3.0\n",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("synth_temperature") && err.to_string().contains("[0.0, 2.0]"),
+        "got: {err}"
+    );
+
+    // top_p must be a probability in (0, 1] — zero is rejected.
+    let err = Config::from_toml_str(
+        "[profiles.gpt]\nkind = \"openai\"\nbase_url = \"https://x/v1\"\ntop_p = 0.0\n",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("top_p") && err.to_string().contains("(0.0, 1.0]"), "got: {err}");
+}
+
+#[test]
 fn request_timeout_seeds_from_defaults_and_overrides_per_profile() {
     // A slow local model wants a longer leash than a hosted API; the seam is a
     // [defaults] seed that a profile may raise (or lower) on its own.
@@ -453,6 +507,9 @@ fn key_optional_profile_falls_back_to_placeholder() {
         synth_model: "y".into(),
         max_tokens: 16384,
         thinking_budget: 8192,
+        explorer_temperature: 0.1,
+        synth_temperature: 0.3,
+        top_p: 0.95,
         request_timeout: std::time::Duration::from_secs(900),
     };
     assert_eq!(p.resolve_key().unwrap(), PLACEHOLDER_OPENAI_KEY);
@@ -476,6 +533,9 @@ fn key_optional_profile_with_a_present_but_empty_key_file_errors() {
         synth_model: "y".into(),
         max_tokens: 16384,
         thinking_budget: 8192,
+        explorer_temperature: 0.1,
+        synth_temperature: 0.3,
+        top_p: 0.95,
         request_timeout: std::time::Duration::from_secs(900),
     };
     let err = p.resolve_key().unwrap_err();
@@ -583,6 +643,9 @@ fn required_key_with_no_source_is_an_error() {
         synth_model: "y".into(),
         max_tokens: 16384,
         thinking_budget: 8192,
+        explorer_temperature: 0.1,
+        synth_temperature: 0.3,
+        top_p: 0.95,
         request_timeout: std::time::Duration::from_secs(900),
     };
     assert!(p.resolve_key().is_err());

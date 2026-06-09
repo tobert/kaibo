@@ -94,16 +94,17 @@ profile, asked per *phase* against its own model — so a Gemini synth/explorer 
 straddle the 3-line capability boundary each get the right shape. Thinking is
 model-aware (Gemini 3-line → `thinkingLevel`, 2.5/3.5 → `thinkingBudget`). Remaining
 knobs to land on the same seam:
-- **temperature / topP — kaibo still sets neither.** gemini-cli pins its codebase
-  investigator at `temperature: 0.1, topP: 0.95` (`codebase-investigator.ts:98`) —
-  low temp for deterministic code reading. A natural `Dialect` knob; Gemini may
-  want it more than Anthropic. Probe before defaulting it on.
-- **DeepSeek V4 thinking toggle — verify, maybe an improvement.** `Dialect::thinking`
-  returns `None` for DeepSeek; correct as far as rig 0.34 (its `deepseek::Client`
-  parses `reasoning_content` but plumbs no request toggle). Open question: does
-  DeepSeek's *current* V4 API accept a request-time thinking/reasoning param? If so,
-  `additional_params` would pass it through the deepseek client. Probe the live API —
-  don't assume the no-op is still complete.
+- **DeepSeek V4 thinking toggle — confirmed, implement.** `Dialect::request_params`
+  returns no thinking params for DeepSeek, but that's now stale: DeepSeek's V4 API
+  (`deepseek-v4-flash`/`-pro`, the hybrid successors) added a request-time toggle.
+  Send top-level `{"thinking": {"type": "enabled"}, "reasoning_effort": "high"}` —
+  rig 0.34 `#[serde(flatten)]`s `additional_params` into the body, so it lands top-
+  level (verified `deepseek.rs:463`). `reasoning_content` still carries the CoT
+  (already mapped by rig). Caveat: a tool-call turn must echo its `reasoning_content`
+  back or the API 400s. Also: legacy `deepseek-chat`/`-reasoner` ids deprecate
+  2026-07-24 (alias v4-flash modes) — kaibo's defaults already moved to v4. Docs:
+  https://api-docs.deepseek.com/guides/thinking_mode. Possible per-role tune:
+  `reasoning_effort: "max"` for the capable synth/consult arm.
 - **Static budget.** `THINKING_BUDGET` (8192) and `max_tokens` (16384) are constants,
   not per-model/per-phase. Fine today; if a provider caps output below 16384 it'll
   400 (DeepSeek accepted 16384 in testing) — cap that arm rather than lowering the

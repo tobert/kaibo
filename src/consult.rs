@@ -178,33 +178,105 @@ pub fn thinking_params(kind: ProviderKind, model: &str, budget: u64) -> Option<V
     }
 }
 
+/// The phase a request is for. Temperature is role-sensitive: the explorer gathers
+/// exact citations (cold), the synth composes the answer (a touch warmer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Explorer,
+    Synth,
+}
+
+/// All of a request's model-shaping params merged into one `additional_params` blob:
+/// thinking (per [`thinking_params`]) plus sampling. Per provider, sampling lives
+/// where that wire format puts it — under `generationConfig` for Gemini (camelCase
+/// `topP`), top-level for Anthropic/DeepSeek/OpenAI (rig flattens it into the body).
+/// `None` only when nothing at all is set (no thinking, no sampling).
+pub fn request_params(
+    kind: ProviderKind,
+    model: &str,
+    budget: u64,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+) -> Option<Value> {
+    let mut params = thinking_params(kind, model, budget).unwrap_or_else(|| json!({}));
+    let obj = params.as_object_mut().expect("thinking_params yields an object or {}");
+    let mut wrote = !obj.is_empty();
+
+    if kind == ProviderKind::Gemini {
+        if temperature.is_some() || top_p.is_some() {
+            let gc = obj
+                .entry("generationConfig")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("generationConfig is an object");
+            if let Some(t) = temperature {
+                gc.insert("temperature".into(), json!(t));
+            }
+            if let Some(p) = top_p {
+                gc.insert("topP".into(), json!(p));
+            }
+            wrote = true;
+        }
+    } else {
+        if let Some(t) = temperature {
+            obj.insert("temperature".into(), json!(t));
+            wrote = true;
+        }
+        if let Some(p) = top_p {
+            obj.insert("top_p".into(), json!(p));
+            wrote = true;
+        }
+    }
+
+    wrote.then_some(params)
+}
+
 /// How kaibo shapes requests for the models of one [`Profile`] — the single home for
 /// per-model request tuning. Resolved once from a profile, then asked for *each
-/// phase's own* model: a profile whose explorer and synth straddle a capability line
-/// (a Gemini 2.x flash explorer with a Gemini 3 synth, say) gets each arm fit
-/// correctly, rather than one shape computed once and shared. Carries thinking today;
-/// temperature/topP are the next knobs to land here (`docs/issues.md`).
+/// phase's own* model and role: a profile whose explorer and synth straddle a
+/// capability line (a Gemini 2.x flash explorer with a Gemini 3 synth, say) gets each
+/// arm fit correctly, rather than one shape computed once and shared.
 #[derive(Debug, Clone)]
 pub struct Dialect {
     kind: ProviderKind,
     thinking_budget: u64,
+    explorer_temperature: Option<f64>,
+    synth_temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 impl Dialect {
-    /// Bind a kind and a thinking budget directly (the seam tests reach for).
+    /// Bind a kind and a thinking budget with no sampling overrides (the seam tests
+    /// reach for, and any path that only cares about thinking).
     pub fn new(kind: ProviderKind, thinking_budget: u64) -> Self {
-        Self { kind, thinking_budget }
+        Self {
+            kind,
+            thinking_budget,
+            explorer_temperature: None,
+            synth_temperature: None,
+            top_p: None,
+        }
     }
 
-    /// The usual path: take the kind and budget a resolved profile carries.
+    /// The usual path: take the kind, budget, and sampling a resolved profile carries.
     pub fn from_profile(profile: &Profile) -> Self {
-        Self::new(profile.kind, profile.thinking_budget)
+        Self {
+            kind: profile.kind,
+            thinking_budget: profile.thinking_budget,
+            explorer_temperature: Some(profile.explorer_temperature),
+            synth_temperature: Some(profile.synth_temperature),
+            top_p: profile.top_p.into(),
+        }
     }
 
-    /// Thinking params for `model` under this dialect, or `None` when the model
-    /// reasons without a request toggle. The per-phase resolution point.
-    pub fn thinking(&self, model: &str) -> Option<Value> {
-        thinking_params(self.kind, model, self.thinking_budget)
+    /// The full `additional_params` for `model` in `role`, or `None` when there's
+    /// nothing to send. The per-phase resolution point.
+    pub fn request_params(&self, model: &str, role: Role) -> Option<Value> {
+        let temperature = match role {
+            Role::Explorer => self.explorer_temperature,
+            Role::Synth => self.synth_temperature,
+        };
+        request_params(self.kind, model, self.thinking_budget, temperature, self.top_p)
     }
 }
 
@@ -562,7 +634,8 @@ pub async fn explore(
 ) -> Result<String> {
     let root = root.into();
     // Single-model phase: resolve thinking against the explorer's own model.
-    let thinking = Dialect::from_profile(profile).thinking(&profile.explorer_model);
+    let thinking =
+        Dialect::from_profile(profile).request_params(&profile.explorer_model, Role::Explorer);
     let thinking = thinking.as_ref();
 
     with_provider_client!(profile, |client| {
@@ -668,7 +741,8 @@ pub async fn synthesize(
 ) -> Result<String> {
     let root = root.into();
     // Single-model phase: resolve thinking against the synth's own model.
-    let thinking = Dialect::from_profile(profile).thinking(&profile.synth_model);
+    let thinking =
+        Dialect::from_profile(profile).request_params(&profile.synth_model, Role::Synth);
     let thinking = thinking.as_ref();
     let user_prompt = synthesize_user_prompt(question, context);
 
@@ -753,7 +827,7 @@ where
         explorer_model,
         cfg.max_tokens,
         cfg.explorer_max_turns,
-        dialect.thinking(explorer_model),
+        dialect.request_params(explorer_model, Role::Explorer),
         root,
         cfg.sandbox.clone(),
         reports,
@@ -781,9 +855,10 @@ where
     C::CompletionModel: 'static,
 {
     let reports = Arc::new(Mutex::new(Vec::<String>::new()));
-    // Per-phase: the driver runs the synth model, the sweeps the explorer model — each
-    // gets thinking fit to *its* model, not one shape computed once and shared.
-    let synth_thinking = dialect.thinking(synth_model);
+    // Per-phase: the driver runs the synth model/role, the sweeps the explorer
+    // model/role — each gets thinking + sampling fit to *itself*, not one shape
+    // computed once and shared.
+    let synth_thinking = dialect.request_params(synth_model, Role::Synth);
 
     let answer = run_phase(
         client,

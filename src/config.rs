@@ -40,12 +40,22 @@ use crate::server::ToolGating;
 /// Loop/budget tunables shared by every profile. `max_tokens` and `thinking_budget`
 /// are *also* overridable per profile (they track the model, not the server); the
 /// turn caps stay here and per-call (they bound the loop, not the model).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: temperatures are `f64`. `PartialEq` is enough for the tests.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Defaults {
     pub explorer_max_turns: usize,
     pub synth_max_turns: usize,
     pub max_tokens: u64,
     pub thinking_budget: u64,
+    /// Sampling temperature per role: the explorer gathers exact citations, so it
+    /// runs cold (deterministic); the synth composes the answer, so it gets a touch
+    /// more room. Sent to every provider that accepts it (top-level for Anthropic/
+    /// DeepSeek/OpenAI, under `generationConfig` for Gemini). Overridable per profile.
+    pub explorer_temperature: f64,
+    pub synth_temperature: f64,
+    /// Nucleus sampling, both roles. Mild by default; the temperature is the main
+    /// lever. Overridable per profile.
+    pub top_p: f64,
     /// Per-request deadline on a single LLM completion call (a per-*HTTP-call*
     /// bound, not the whole loop). Seeds every profile's `request_timeout`;
     /// overridable per profile (a slow local model wants more rope than a hosted
@@ -73,6 +83,11 @@ impl Default for Defaults {
             synth_max_turns: 200,
             max_tokens: 16384,
             thinking_budget: crate::consult::THINKING_BUDGET,
+            // Cold explorer for exact citations; a slightly warmer synth for the
+            // answer prose. Low across the board — kaibo grounds, it doesn't riff.
+            explorer_temperature: 0.1,
+            synth_temperature: 0.3,
+            top_p: 0.95,
             // 15 min. A single completion that takes longer is pathological for a
             // hosted API and a generous ceiling for a slow local model; either way
             // it bounds a wedged provider that would otherwise hang forever
@@ -88,7 +103,8 @@ impl Default for Defaults {
 // --- A resolved profile ----------------------------------------------------
 
 /// A fully-resolved provider profile: a named instance of a [`ProviderKind`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: temperatures are `f64`. `PartialEq` is enough for the tests.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     /// The profile's name (the value the `provider` arg carries).
     pub name: String,
@@ -108,6 +124,13 @@ pub struct Profile {
     pub synth_model: String,
     pub max_tokens: u64,
     pub thinking_budget: u64,
+    /// Per-role sampling temperature and shared nucleus `top_p` — the request-shaping
+    /// knobs the [`crate::consult::Dialect`] reads. Seeded from [`Defaults`],
+    /// overridable per profile (a local model may want different sampling than a
+    /// hosted one). See `docs/config.md`.
+    pub explorer_temperature: f64,
+    pub synth_temperature: f64,
+    pub top_p: f64,
     /// Per-request deadline applied to this profile's HTTP client (`.timeout`):
     /// the wall-clock ceiling on a single completion call. rig's prompt loop is
     /// non-streaming and exposes no native timeout, so without this a provider
@@ -352,6 +375,21 @@ impl Config {
                     p.name,
                 );
             }
+            // Sampling knobs out of range are config typos, not intents — catch them
+            // at load. Temperature spans providers (Anthropic 0–1, OpenAI/Gemini up
+            // to 2); we accept the widest sane band and let the provider reject a
+            // value it specifically dislikes. `top_p` is a probability in (0, 1].
+            for (label, t) in [
+                ("explorer_temperature", p.explorer_temperature),
+                ("synth_temperature", p.synth_temperature),
+            ] {
+                if !(0.0..=2.0).contains(&t) {
+                    bail!("profile {:?}: {label} ({t}) must be in [0.0, 2.0]", p.name);
+                }
+            }
+            if !(0.0 < p.top_p && p.top_p <= 1.0) {
+                bail!("profile {:?}: top_p ({}) must be in (0.0, 1.0]", p.name, p.top_p);
+            }
         }
 
         // Build the alias map and reject collisions loudly: built-in aliases first,
@@ -488,6 +526,9 @@ fn template_for_kind(kind: ProviderKind, defaults: &Defaults) -> Profile {
         synth_model: synth_model.to_string(),
         max_tokens: defaults.max_tokens,
         thinking_budget: defaults.thinking_budget,
+        explorer_temperature: defaults.explorer_temperature,
+        synth_temperature: defaults.synth_temperature,
+        top_p: defaults.top_p,
         request_timeout: defaults.request_timeout,
     }
 }
@@ -567,6 +608,9 @@ struct RawDefaults {
     synth_max_turns: Option<usize>,
     max_tokens: Option<u64>,
     thinking_budget: Option<u64>,
+    explorer_temperature: Option<f64>,
+    synth_temperature: Option<f64>,
+    top_p: Option<f64>,
     request_timeout_secs: Option<u64>,
     session_capacity: Option<usize>,
 }
@@ -584,6 +628,9 @@ struct RawProfile {
     synth_model: Option<String>,
     max_tokens: Option<u64>,
     thinking_budget: Option<u64>,
+    explorer_temperature: Option<f64>,
+    synth_temperature: Option<f64>,
+    top_p: Option<f64>,
     request_timeout_secs: Option<u64>,
 }
 
@@ -629,6 +676,15 @@ impl RawProfile {
         if let Some(v) = self.thinking_budget {
             p.thinking_budget = v;
         }
+        if let Some(v) = self.explorer_temperature {
+            p.explorer_temperature = v;
+        }
+        if let Some(v) = self.synth_temperature {
+            p.synth_temperature = v;
+        }
+        if let Some(v) = self.top_p {
+            p.top_p = v;
+        }
         if let Some(v) = self.request_timeout_secs {
             p.request_timeout = Duration::from_secs(v);
         }
@@ -651,6 +707,9 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
         synth_max_turns: raw.synth_max_turns.unwrap_or(d.synth_max_turns),
         max_tokens: raw.max_tokens.unwrap_or(d.max_tokens),
         thinking_budget: raw.thinking_budget.unwrap_or(d.thinking_budget),
+        explorer_temperature: raw.explorer_temperature.unwrap_or(d.explorer_temperature),
+        synth_temperature: raw.synth_temperature.unwrap_or(d.synth_temperature),
+        top_p: raw.top_p.unwrap_or(d.top_p),
         request_timeout: raw
             .request_timeout_secs
             .map(Duration::from_secs)
@@ -722,6 +781,15 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_THINKING_BUDGET") {
         defaults.thinking_budget = Some(parse_env("KAIBO_THINKING_BUDGET", &v)?);
+    }
+    if let Some(v) = get("KAIBO_EXPLORER_TEMPERATURE") {
+        defaults.explorer_temperature = Some(parse_env("KAIBO_EXPLORER_TEMPERATURE", &v)?);
+    }
+    if let Some(v) = get("KAIBO_SYNTH_TEMPERATURE") {
+        defaults.synth_temperature = Some(parse_env("KAIBO_SYNTH_TEMPERATURE", &v)?);
+    }
+    if let Some(v) = get("KAIBO_TOP_P") {
+        defaults.top_p = Some(parse_env("KAIBO_TOP_P", &v)?);
     }
     if let Some(v) = get("KAIBO_REQUEST_TIMEOUT_SECS") {
         defaults.request_timeout_secs = Some(parse_env("KAIBO_REQUEST_TIMEOUT_SECS", &v)?);

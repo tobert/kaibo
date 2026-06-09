@@ -2,7 +2,7 @@
 
 use kaibo::config::{default_models, Config, Profile};
 use kaibo::consult::{
-    consult, explore, synthesize, synthesize_user_prompt, thinking_params,
+    consult, explore, request_params, synthesize, synthesize_user_prompt, thinking_params,
     ConsultConfig, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
@@ -117,6 +117,36 @@ fn thinking_budget_is_threaded_through_not_hardcoded() {
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
     let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", 4096).expect("gemini toggle");
     assert_eq!(g["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
+}
+
+#[test]
+fn request_params_places_sampling_where_each_wire_format_wants_it() {
+    // Gemini: temperature + topP (camelCase) ride under generationConfig, alongside
+    // the thinkingConfig — one merged blob, not two.
+    let g = request_params(ProviderKind::Gemini, "gemini-2.5-flash", THINKING_BUDGET, Some(0.1), Some(0.95))
+        .expect("gemini params");
+    let gc = &g["generationConfig"];
+    assert_eq!(gc["temperature"], 0.1);
+    assert_eq!(gc["topP"], 0.95, "Gemini uses camelCase topP");
+    assert_eq!(gc["thinkingConfig"]["thinkingBudget"], THINKING_BUDGET, "thinking still rides along");
+    assert!(g.get("temperature").is_none(), "must not leak to top level for Gemini");
+
+    // Anthropic: temperature + snake_case top_p at the top level, beside the thinking block.
+    let a = request_params(ProviderKind::Anthropic, "claude-sonnet-4-6", 4096, Some(0.3), Some(0.95))
+        .expect("anthropic params");
+    assert_eq!(a["temperature"], 0.3);
+    assert_eq!(a["top_p"], 0.95);
+    assert_eq!(a["thinking"]["budget_tokens"], 4096);
+
+    // OpenAI: no thinking toggle, but sampling still goes top-level.
+    let o = request_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", 0, Some(0.2), Some(0.9))
+        .expect("openai sampling");
+    assert_eq!(o["temperature"], 0.2);
+    assert_eq!(o["top_p"], 0.9);
+    assert!(o.get("thinking").is_none());
+
+    // Nothing set anywhere → None (the leaf passes no additional_params at all).
+    assert!(request_params(ProviderKind::Openai, "m", 0, None, None).is_none());
 }
 
 #[test]
