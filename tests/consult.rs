@@ -66,15 +66,15 @@ fn synthesize_prompt_treats_blank_context_as_absent() {
 #[test]
 fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
     // Anthropic: extended thinking via a top-level `thinking` block (rig flattens
-    // additional_params into the Messages request). The budget is now a parameter.
-    let a = thinking_params(ProviderKind::Anthropic, THINKING_BUDGET)
+    // additional_params into the Messages request). Model id is ignored.
+    let a = thinking_params(ProviderKind::Anthropic, "claude-sonnet-4-6", THINKING_BUDGET)
         .expect("anthropic has a thinking toggle");
     assert_eq!(a["thinking"]["type"], "enabled");
     assert_eq!(a["thinking"]["budget_tokens"], THINKING_BUDGET);
 
-    // Gemini: nested under generationConfig.thinkingConfig with camelCase keys —
+    // Gemini 2.5: nested under generationConfig.thinkingConfig with camelCase keys —
     // rig parses these into a typed GenerationConfig, so the shape must be exact.
-    let g = thinking_params(ProviderKind::Gemini, THINKING_BUDGET)
+    let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", THINKING_BUDGET)
         .expect("gemini has a thinking toggle");
     assert_eq!(
         g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
@@ -87,11 +87,35 @@ fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
 }
 
 #[test]
+fn gemini_3_line_takes_thinking_level_not_budget() {
+    // Gemini 3 officially uses `thinkingLevel` (mutually exclusive with budget); rig's
+    // typed ThinkingConfig carries both, serializing the level as snake_case "high".
+    // The boundary is empirical: the pure 3-line flips, but `gemini-3.5-flash` (a
+    // confirmed-working default on budget) and 2.x stay on budget — switching them
+    // would silently regress a request that works (docs/issues.md).
+    let g3 = thinking_params(ProviderKind::Gemini, "gemini-3-pro-preview", THINKING_BUDGET)
+        .expect("gemini 3 has a thinking toggle");
+    let tc = &g3["generationConfig"]["thinkingConfig"];
+    assert_eq!(tc["thinkingLevel"], "high", "the 3-line wants a level");
+    assert!(tc.get("thinkingBudget").is_none(), "level and budget are mutually exclusive");
+    assert_eq!(tc["includeThoughts"], true);
+
+    // The minor 3.5 line and 2.x stay on budget (the conservative, evidence-backed arm).
+    for id in ["gemini-3.5-flash", "gemini-2.5-pro"] {
+        let g = thinking_params(ProviderKind::Gemini, id, THINKING_BUDGET).expect("toggle");
+        let tc = &g["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], THINKING_BUDGET, "{id} stays on budget");
+        assert!(tc.get("thinkingLevel").is_none(), "{id} must not send a level");
+    }
+}
+
+#[test]
 fn thinking_budget_is_threaded_through_not_hardcoded() {
     // A per-profile budget must reach the request, not the old global constant.
-    let a = thinking_params(ProviderKind::Anthropic, 4096).expect("anthropic toggle");
+    let a = thinking_params(ProviderKind::Anthropic, "claude-sonnet-4-6", 4096)
+        .expect("anthropic toggle");
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
-    let g = thinking_params(ProviderKind::Gemini, 4096).expect("gemini toggle");
+    let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", 4096).expect("gemini toggle");
     assert_eq!(g["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
 }
 
@@ -99,8 +123,8 @@ fn thinking_budget_is_threaded_through_not_hardcoded() {
 fn kinds_that_reason_without_a_toggle_get_no_params() {
     // DeepSeek reasoner models and the local Gemma default (its --reasoning-format
     // auto) already reason; there is no request-time switch to flip, so: None.
-    assert!(thinking_params(ProviderKind::DeepSeek, THINKING_BUDGET).is_none());
-    assert!(thinking_params(ProviderKind::Openai, THINKING_BUDGET).is_none());
+    assert!(thinking_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET).is_none());
+    assert!(thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET).is_none());
 }
 
 #[test]

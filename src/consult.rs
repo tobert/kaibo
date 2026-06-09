@@ -129,34 +129,82 @@ pub fn report_preamble() -> String {
 /// Anthropic additionally *requires* `max_tokens > budget_tokens`.
 pub const THINKING_BUDGET: u64 = 8192;
 
-/// Provider-specific request params that turn **thinking on**, or `None` when the
-/// provider reasons without a switch.
+/// Does this Gemini id belong to the *pure* 3-line (e.g. `gemini-3-pro-preview`),
+/// which takes `thinkingLevel` rather than the 2.5-era `thinkingBudget`?
+///
+/// The boundary is **empirical, not nominal**: `gemini-3.5-flash` *accepted*
+/// `thinkingBudget` in the 2026-06-06 live test, so switching it to `thinkingLevel`
+/// would be a silent regression of a working default. We only flip the ids the
+/// official API + gemini-cli confirm want a level — `gemini-3-…` — and leave the
+/// `3.5` minor line (and 2.x) on budget. Any new id past these wants a live probe,
+/// not a guess. See `docs/issues.md` "Per-model request shaping".
+fn is_gemini3_level(model: &str) -> bool {
+    model == "gemini-3" || model.starts_with("gemini-3-")
+}
+
+/// Per-(provider, model) request params that turn **thinking on**, or `None` when the
+/// model reasons without a switch. Model-aware: within Gemini, the 3-line takes
+/// `thinkingLevel` while 2.5/3.5 take `thinkingBudget` (mutually exclusive — rig's
+/// typed `ThinkingConfig` carries both fields). Usually reached via [`Dialect`],
+/// which binds the kind+budget and resolves each phase against its own model.
 ///
 /// - **Anthropic** — a top-level `thinking` block; rig flattens `additional_params`
 ///   straight into the Messages request.
 /// - **Gemini** — `generationConfig.thinkingConfig` (camelCase; rig parses this
-///   into a typed `GenerationConfig`, so the shape must be exact). Note: Gemini 3
-///   models take `thinkingLevel` instead of `thinkingBudget` — if a default model
-///   id moves to a 3.x line this may need to switch (tracked in `docs/issues.md`).
+///   into a typed `GenerationConfig`, so the shape must be exact). `thinkingLevel`
+///   for the 3-line ([`is_gemini3_level`]), else `thinkingBudget`.
 /// - **DeepSeek** — reasoner models (`*-pro`) emit `reasoning_content` on their own;
-///   there is no request toggle. `None`.
+///   there is no request toggle. `None`. (Whether DeepSeek's V4 API gained a
+///   request-time toggle is an open probe — `docs/issues.md`.)
 /// - **OpenAI** — the generic OpenAI-compatible path; the local Gemma default
 ///   already reasons (`--reasoning-format auto`) and there's no portable toggle
 ///   across arbitrary endpoints, so nothing to send. `None`.
-pub fn thinking_params(kind: ProviderKind, budget: u64) -> Option<Value> {
+pub fn thinking_params(kind: ProviderKind, model: &str, budget: u64) -> Option<Value> {
     match kind {
         ProviderKind::Anthropic => Some(json!({
             "thinking": { "type": "enabled", "budget_tokens": budget }
         })),
-        ProviderKind::Gemini => Some(json!({
-            "generationConfig": {
-                "thinkingConfig": {
-                    "thinkingBudget": budget,
-                    "includeThoughts": true
-                }
-            }
-        })),
+        ProviderKind::Gemini => {
+            // 3-line: thinkingLevel (mutually exclusive with budget). "high" matches
+            // gemini-cli's investigator; rig deserializes it to ThinkingLevel::High.
+            let thinking_config = if is_gemini3_level(model) {
+                json!({ "thinkingLevel": "high", "includeThoughts": true })
+            } else {
+                json!({ "thinkingBudget": budget, "includeThoughts": true })
+            };
+            Some(json!({ "generationConfig": { "thinkingConfig": thinking_config } }))
+        }
         ProviderKind::DeepSeek | ProviderKind::Openai => None,
+    }
+}
+
+/// How kaibo shapes requests for the models of one [`Profile`] — the single home for
+/// per-model request tuning. Resolved once from a profile, then asked for *each
+/// phase's own* model: a profile whose explorer and synth straddle a capability line
+/// (a Gemini 2.x flash explorer with a Gemini 3 synth, say) gets each arm fit
+/// correctly, rather than one shape computed once and shared. Carries thinking today;
+/// temperature/topP are the next knobs to land here (`docs/issues.md`).
+#[derive(Debug, Clone)]
+pub struct Dialect {
+    kind: ProviderKind,
+    thinking_budget: u64,
+}
+
+impl Dialect {
+    /// Bind a kind and a thinking budget directly (the seam tests reach for).
+    pub fn new(kind: ProviderKind, thinking_budget: u64) -> Self {
+        Self { kind, thinking_budget }
+    }
+
+    /// The usual path: take the kind and budget a resolved profile carries.
+    pub fn from_profile(profile: &Profile) -> Self {
+        Self::new(profile.kind, profile.thinking_budget)
+    }
+
+    /// Thinking params for `model` under this dialect, or `None` when the model
+    /// reasons without a request toggle. The per-phase resolution point.
+    pub fn thinking(&self, model: &str) -> Option<Value> {
+        thinking_params(self.kind, model, self.thinking_budget)
     }
 }
 
@@ -513,7 +561,8 @@ pub async fn explore(
     cfg: &ConsultConfig,
 ) -> Result<String> {
     let root = root.into();
-    let thinking = thinking_params(profile.kind, profile.thinking_budget);
+    // Single-model phase: resolve thinking against the explorer's own model.
+    let thinking = Dialect::from_profile(profile).thinking(&profile.explorer_model);
     let thinking = thinking.as_ref();
 
     with_provider_client!(profile, |client| {
@@ -618,7 +667,8 @@ pub async fn synthesize(
     cfg: &ConsultConfig,
 ) -> Result<String> {
     let root = root.into();
-    let thinking = thinking_params(profile.kind, profile.thinking_budget);
+    // Single-model phase: resolve thinking against the synth's own model.
+    let thinking = Dialect::from_profile(profile).thinking(&profile.synth_model);
     let thinking = thinking.as_ref();
     let user_prompt = synthesize_user_prompt(question, context);
 
@@ -684,7 +734,7 @@ fn consult_tools<C>(
     explorer_model: &str,
     root: &Path,
     cfg: &ConsultConfig,
-    thinking: Option<&Value>,
+    dialect: &Dialect,
     reports: Arc<Mutex<Vec<String>>>,
 ) -> Result<Vec<Box<dyn ToolDyn>>>
 where
@@ -696,12 +746,14 @@ where
     // explore′ for delegated breadth: same explore unit, wrapped as a tool, pointed
     // at the cheap explorer model. Bounded by explorer_max_turns per sweep; no cap
     // on how many times consult may delegate (Amy's call — watch real behavior).
+    // Thinking resolved against the explorer's own model, which may differ in
+    // generation from the synth driver's.
     let explore = RunExplore::new(
         client.clone(),
         explorer_model,
         cfg.max_tokens,
         cfg.explorer_max_turns,
-        thinking.cloned(),
+        dialect.thinking(explorer_model),
         root,
         cfg.sandbox.clone(),
         reports,
@@ -722,13 +774,16 @@ async fn consult_with<C>(
     explorer_model: &str,
     synth_model: &str,
     cfg: &ConsultConfig,
-    thinking: Option<&Value>,
+    dialect: &Dialect,
 ) -> Result<ConsultOutput>
 where
     C: CompletionClient + Clone + Send + Sync + 'static,
     C::CompletionModel: 'static,
 {
     let reports = Arc::new(Mutex::new(Vec::<String>::new()));
+    // Per-phase: the driver runs the synth model, the sweeps the explorer model — each
+    // gets thinking fit to *its* model, not one shape computed once and shared.
+    let synth_thinking = dialect.thinking(synth_model);
 
     let answer = run_phase(
         client,
@@ -737,10 +792,10 @@ where
         cfg.max_tokens,
         user_prompt.to_string(),
         cfg.synth_max_turns,
-        thinking,
+        synth_thinking.as_ref(),
         // Rebuilt per call (main loop, and again if run_phase forces a final turn);
         // every build shares the one `reports` sink so all explore′ sweeps aggregate.
-        || consult_tools(client, explorer_model, root, cfg, thinking, reports.clone()),
+        || consult_tools(client, explorer_model, root, cfg, dialect, reports.clone()),
     )
     .await
     .context("consult loop")?;
@@ -775,7 +830,7 @@ pub(crate) async fn consult_session_turn<C>(
     explorer_model: &str,
     synth_model: &str,
     cfg: &ConsultConfig,
-    thinking: Option<&Value>,
+    dialect: &Dialect,
 ) -> Result<ConsultOutput>
 where
     C: CompletionClient + Clone + Send + Sync + 'static,
@@ -788,7 +843,7 @@ where
     let user_prompt = consult_user_prompt(question, &history);
 
     let out =
-        consult_with(client, &user_prompt, root, explorer_model, synth_model, cfg, thinking).await?;
+        consult_with(client, &user_prompt, root, explorer_model, synth_model, cfg, dialect).await?;
 
     if let Some((store, id)) = session {
         store.record(id, QaTurn::new(question, out.answer.clone()));
@@ -811,9 +866,9 @@ pub async fn consult(
     session: Option<Session<'_>>,
 ) -> Result<ConsultOutput> {
     let root = root.into();
-    // Thinking on, both phases, where the provider takes a request-time toggle.
-    let thinking = thinking_params(profile.kind, profile.thinking_budget);
-    let thinking = thinking.as_ref();
+    // Two phases, two models: pass the dialect down so each resolves thinking against
+    // its own model (the driver vs the cheap explorer can straddle a capability line).
+    let dialect = Dialect::from_profile(profile);
 
     with_provider_client!(profile, |client| {
         consult_session_turn(
@@ -824,7 +879,7 @@ pub async fn consult(
             &profile.explorer_model,
             &profile.synth_model,
             cfg,
-            thinking,
+            &dialect,
         )
         .await
     })
@@ -844,6 +899,13 @@ mod tests {
 
     fn store() -> SessionStore {
         SessionStore::new(NonZeroUsize::new(4).unwrap())
+    }
+
+    /// A dialect that emits no thinking params — for the tests that exercise the loop
+    /// wiring (report aggregation, sessions, turn caps) and don't care about thinking.
+    /// `openai` reasons without a request toggle, so `thinking()` is always `None`.
+    fn no_thinking() -> Dialect {
+        Dialect::new(ProviderKind::Openai, 0)
     }
 
     /// A driver that answers immediately (no tools), echoing the current question into
@@ -939,7 +1001,7 @@ mod tests {
             EXPLORER,
             SYNTH,
             &cfg,
-            None,
+            &no_thinking(),
         )
         .await
         .expect("scripted consult should succeed");
@@ -1019,7 +1081,7 @@ mod tests {
         let cfg = ConsultConfig::default();
 
         let out =
-            consult_with(&client, "two-part question", dir.path(), EXPLORER, SYNTH, &cfg, None)
+            consult_with(&client, "two-part question", dir.path(), EXPLORER, SYNTH, &cfg, &no_thinking())
                 .await
                 .unwrap();
 
@@ -1062,7 +1124,7 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        let out = consult_with(&client, "a question", dir.path(), EXPLORER, SYNTH, &cfg, None)
+        let out = consult_with(&client, "a question", dir.path(), EXPLORER, SYNTH, &cfg, &no_thinking())
             .await
             .expect("a failed sweep must not fail the whole consult");
 
@@ -1114,7 +1176,7 @@ mod tests {
             "explorer-unused",
             SYNTH,
             &cfg,
-            None,
+            &no_thinking(),
         )
         .await
         .expect("turn-cap recovery should still produce an answer");
@@ -1150,9 +1212,11 @@ mod tests {
     async fn thinking_params_reach_both_the_driver_and_every_sweep() {
         const SYNTH: &str = "capable-synth";
         const EXPLORER: &str = "cheap-explorer";
-        // A representative toggle shape (Anthropic's). The mock doesn't interpret it —
-        // we only assert it survives the plumbing into the request, unchanged.
-        let thinking = json!({ "thinking": { "type": "enabled", "budget_tokens": 4096 } });
+        // Anthropic dialect: both phases resolve to the same top-level `thinking`
+        // block (Anthropic ignores the model id). The mock doesn't interpret it — we
+        // only assert it survives the plumbing into *every* request, unchanged.
+        let dialect = Dialect::new(ProviderKind::Anthropic, 4096);
+        let expected = json!({ "thinking": { "type": "enabled", "budget_tokens": 4096 } });
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
@@ -1168,7 +1232,7 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, Some(&thinking))
+        consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, &dialect)
             .await
             .unwrap();
 
@@ -1179,11 +1243,55 @@ mod tests {
         for r in client.requests() {
             assert_eq!(
                 r.additional_params.as_ref(),
-                Some(&thinking),
+                Some(&expected),
                 "model {:?} must carry the thinking params, got: {:?}",
                 r.model,
                 r.additional_params
             );
+        }
+    }
+
+    /// The per-phase payoff: when a Gemini profile's synth and explorer straddle the
+    /// 3-line capability boundary, each request must carry the thinking shape fit to
+    /// *its own* model — the driver `thinkingLevel`, the sweep `thinkingBudget`. A
+    /// regression that resolved thinking once (per profile) and shared it — the old
+    /// `consult.rs:815` shape — would put one model's params on the other's request.
+    #[tokio::test]
+    async fn each_phase_gets_thinking_fit_to_its_own_model() {
+        const SYNTH: &str = "gemini-3-pro-preview"; // 3-line → thinkingLevel
+        const EXPLORER: &str = "gemini-2.5-flash"; // 2.5 → thinkingBudget
+        let dialect = Dialect::new(ProviderKind::Gemini, 4096);
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if transcript_text(req).contains("REPORT") {
+                    Ok(text_response("ANSWER"))
+                } else {
+                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                }
+            })
+            .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, &dialect)
+            .await
+            .unwrap();
+
+        let tc = |r: &crate::test_support::RecordedRequest| {
+            r.additional_params.as_ref().unwrap()["generationConfig"]["thinkingConfig"].clone()
+        };
+        for r in client.requests_for(SYNTH) {
+            let cfg = tc(&r);
+            assert_eq!(cfg["thinkingLevel"], "high", "3-line driver wants a level");
+            assert!(cfg.get("thinkingBudget").is_none(), "level and budget are exclusive");
+        }
+        for r in client.requests_for(EXPLORER) {
+            let cfg = tc(&r);
+            assert_eq!(cfg["thinkingBudget"], 4096, "2.5 explorer wants a budget");
+            assert!(cfg.get("thinkingLevel").is_none(), "level and budget are exclusive");
         }
     }
 
@@ -1217,7 +1325,7 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig { synth_max_turns: 2, ..ConsultConfig::default() };
 
-        let out = consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, None)
+        let out = consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, &no_thinking())
             .await
             .unwrap();
 
@@ -1263,7 +1371,7 @@ mod tests {
             "explorer",
             SYNTH,
             &cfg,
-            None,
+            &no_thinking(),
         )
         .await
         .unwrap();
@@ -1283,7 +1391,7 @@ mod tests {
             "explorer",
             SYNTH,
             &cfg,
-            None,
+            &no_thinking(),
         )
         .await
         .unwrap();
@@ -1326,7 +1434,7 @@ mod tests {
             "explorer",
             SYNTH,
             &cfg,
-            None,
+            &no_thinking(),
         )
         .await;
 
@@ -1349,7 +1457,7 @@ mod tests {
         let cfg = ConsultConfig::default();
 
         let out = consult_session_turn(
-            &client, None, "lone question", dir.path(), "explorer", SYNTH, &cfg, None,
+            &client, None, "lone question", dir.path(), "explorer", SYNTH, &cfg, &no_thinking(),
         )
         .await
         .unwrap();
@@ -1370,7 +1478,7 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
-        let tools = consult_tools(&client, "explorer-model", dir.path(), &cfg, None, reports)
+        let tools = consult_tools(&client, "explorer-model", dir.path(), &cfg, &no_thinking(), reports)
             .expect("building the consult toolset should succeed");
 
         let names: Vec<String> = tools.iter().map(|t| t.name()).collect();

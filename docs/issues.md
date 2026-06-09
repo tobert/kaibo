@@ -88,20 +88,61 @@ source-of-truth pal configs (`provider-model-ids` memory). → Model ids now liv
 profiles and are overridable per profile in `config.toml` (shipped; `docs/config.md`).
 The in-sync-with-pals discipline for the built-in defaults stays regardless.
 
-### Thinking config tracks model generation (Gemini), and budgets are static
-Thinking is on by default, both phases (`consult.rs::thinking_params`): Anthropic
-`thinking`, Gemini `generationConfig.thinkingConfig`. Two watch-items:
-- **Gemini 2.5 vs 3.** kaibo sends `thinkingBudget` (the 2.5 field). `gemini-3.5-flash`
-  accepted it in the 2026-06-06 live test, but Gemini *3* officially uses
-  `thinkingLevel` (mutually exclusive with budget). If a default id moves fully to a
-  3.x line that rejects `thinkingBudget`, switch that arm to `thinkingLevel`.
+### Per-model request shaping (the `Dialect` seam): remaining knobs
+The `Dialect` (`consult.rs`) now resolves request params per (kind, model) from a
+profile, asked per *phase* against its own model — so a Gemini synth/explorer that
+straddle the 3-line capability boundary each get the right shape. Thinking is
+model-aware (Gemini 3-line → `thinkingLevel`, 2.5/3.5 → `thinkingBudget`). Remaining
+knobs to land on the same seam:
+- **temperature / topP — kaibo still sets neither.** gemini-cli pins its codebase
+  investigator at `temperature: 0.1, topP: 0.95` (`codebase-investigator.ts:98`) —
+  low temp for deterministic code reading. A natural `Dialect` knob; Gemini may
+  want it more than Anthropic. Probe before defaulting it on.
+- **DeepSeek V4 thinking toggle — verify, maybe an improvement.** `Dialect::thinking`
+  returns `None` for DeepSeek; correct as far as rig 0.34 (its `deepseek::Client`
+  parses `reasoning_content` but plumbs no request toggle). Open question: does
+  DeepSeek's *current* V4 API accept a request-time thinking/reasoning param? If so,
+  `additional_params` would pass it through the deepseek client. Probe the live API —
+  don't assume the no-op is still complete.
 - **Static budget.** `THINKING_BUDGET` (8192) and `max_tokens` (16384) are constants,
   not per-model/per-phase. Fine today; if a provider caps output below 16384 it'll
   400 (DeepSeek accepted 16384 in testing) — cap that arm rather than lowering the
-  global, per the `large-token-headroom` memory.
+  global, per the `large-token-headroom` memory. The `Dialect` is the place to make
+  these per-model when one provider forces it.
+- **Gemini 3.5 boundary is empirical.** The classifier (`is_gemini3_level`) flips
+  only the pure `gemini-3-*` line to `thinkingLevel`; `gemini-3.5-flash` stays on
+  budget because the 2026-06-06 live test confirmed budget works there. If a future
+  3.5 build *rejects* budget, widen the classifier — but confirm with a live probe,
+  don't guess.
 
-All four provider paths now have opt-in live tests (`tests/consult.rs`,
-`#[ignore]`d, gated on a key/endpoint) and passed with thinking on.
+All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
+gated on a key/endpoint) and passed with thinking on — the probes above extend these.
+
+### Per-model prose fitting — gemini-cli probe candidates (params-first, prose-later)
+Once the params seam lands, probe whether Gemini's *prose* underperforms Anthropic's
+before forking any preamble. Candidates lifted from gemini-cli's codebase-investigator
+(`packages/core/src/agents/codebase-investigator.ts`), the direct twin of kaibo's
+`explore`, ranked by expected lift:
+- **Structured report + a worked few-shot example** (`:166-189`). Its final report is
+  a JSON schema (`RelevantLocations:[{FilePath,Reasoning,KeySymbols}]`) with a full
+  filled-in example *in the prompt*. kaibo's explorer returns free-text "a curated
+  report"; weaker models follow a *shown* shape far better than a described one. This
+  touches the explorer→synth hand-off seam (`report_preamble`), so it's the highest-
+  value and highest-blast-radius probe.
+- **"Treat confusion as a signal to dig deeper"** (`:146`) — imperative curiosity;
+  kaibo's "get more when context isn't enough", made directive. Positive framing.
+- **Completeness pressure** (`:140,147`) — "don't stop at the first relevant file…
+  complete and minimal set." For the cheap explorer (coverage is its job) this may be
+  the right lean for Gemini.
+- **Tension to test, not adopt:** gemini-cli uses `DO / DO NOT` bullets freely *with
+  Gemini* and it works — against our positive-framing discipline. Hypothesis: that
+  caution is **Gemma-specific, not Gemini-wide**. If Gemini tolerates prohibitions,
+  its prose can be more directive than the local-Gemma profile's. Measure.
+- **`<scratchpad>` mandate** (`:151-160`) — high variance: a strong scaffold for a
+  less self-directed model, but pulls toward long chats, against "few high-value
+  turns" and the turn cap. Probe last.
+- **Debug affordance:** a `WRITE_SYSTEM_MD`-style dump of the assembled prompt to a
+  file (gemini-cli's `GEMINI_WRITE_SYSTEM_MD`) — handy once prompts compose per model.
 
 ### Server doesn't report which providers are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
@@ -115,6 +156,8 @@ rather than a key check. This can come along with adding an MCP resource for lis
 ## P4 — Eventually
 
 ### Config-overrideable system prompts (deferred until a non-Amy user asks)
+Note: the in-tree `Dialect` seam (P3, "Per-model request shaping") is the *same*
+resolution point this would extend — build that first; config override rides it.
 Every model-facing string is hardcoded in Rust today: the three phase preambles
 (`consult.rs` `report_preamble`/`synthesize_preamble`/`consult_preamble`, each
 interpolating `kaish_syntax_core()`), the per-call framers (`synthesize_user_prompt`,
