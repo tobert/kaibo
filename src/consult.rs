@@ -153,9 +153,12 @@ fn is_gemini3_level(model: &str) -> bool {
 /// - **Gemini** — `generationConfig.thinkingConfig` (camelCase; rig parses this
 ///   into a typed `GenerationConfig`, so the shape must be exact). `thinkingLevel`
 ///   for the 3-line ([`is_gemini3_level`]), else `thinkingBudget`.
-/// - **DeepSeek** — reasoner models (`*-pro`) emit `reasoning_content` on their own;
-///   there is no request toggle. `None`. (Whether DeepSeek's V4 API gained a
-///   request-time toggle is an open probe — `docs/issues.md`.)
+/// - **DeepSeek** — the V4 hybrids (`deepseek-v4-flash`/`-pro`) toggle thinking at
+///   request time: top-level `thinking.type` + `reasoning_effort`. rig flattens
+///   `additional_params` into the body, so both land top-level; rig also round-trips
+///   the response `reasoning_content` back on outgoing turns, so tool-call loops
+///   don't trip DeepSeek's "echo the CoT or 400" rule. The budget doesn't apply —
+///   DeepSeek controls depth by effort level, not a token budget.
 /// - **OpenAI** — the generic OpenAI-compatible path; the local Gemma default
 ///   already reasons (`--reasoning-format auto`) and there's no portable toggle
 ///   across arbitrary endpoints, so nothing to send. `None`.
@@ -174,7 +177,14 @@ pub fn thinking_params(kind: ProviderKind, model: &str, budget: u64) -> Option<V
             };
             Some(json!({ "generationConfig": { "thinkingConfig": thinking_config } }))
         }
-        ProviderKind::DeepSeek | ProviderKind::Openai => None,
+        ProviderKind::DeepSeek => Some(json!({
+            // Explicit-on (it's the V4 default, but say it so intent survives a default
+            // flip). "high" is the documented sweet spot; "max" is reserved for heavy
+            // agent runs (a possible per-role tune — docs/issues.md).
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": "high"
+        })),
+        ProviderKind::Openai => None,
     }
 }
 

@@ -145,15 +145,34 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     assert_eq!(o["top_p"], 0.9);
     assert!(o.get("thinking").is_none());
 
+    // DeepSeek: thinking toggle and sampling coexist, all top-level.
+    let d = request_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET, Some(0.3), Some(0.95))
+        .expect("deepseek params");
+    assert_eq!(d["thinking"]["type"], "enabled");
+    assert_eq!(d["reasoning_effort"], "high");
+    assert_eq!(d["temperature"], 0.3);
+    assert_eq!(d["top_p"], 0.95);
+
     // Nothing set anywhere → None (the leaf passes no additional_params at all).
     assert!(request_params(ProviderKind::Openai, "m", 0, None, None).is_none());
 }
 
 #[test]
-fn kinds_that_reason_without_a_toggle_get_no_params() {
-    // DeepSeek reasoner models and the local Gemma default (its --reasoning-format
-    // auto) already reason; there is no request-time switch to flip, so: None.
-    assert!(thinking_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET).is_none());
+fn deepseek_v4_toggles_thinking_with_reasoning_effort() {
+    // DeepSeek V4 is a request-time hybrid: top-level thinking + reasoning_effort
+    // (rig flattens additional_params into the body, so top-level is where they go).
+    // The budget is irrelevant here — depth is an effort level, not a token count.
+    let d = thinking_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET)
+        .expect("deepseek v4 toggles thinking at request time");
+    assert_eq!(d["thinking"]["type"], "enabled");
+    assert_eq!(d["reasoning_effort"], "high");
+    assert!(d.get("generationConfig").is_none(), "DeepSeek is not Gemini-shaped");
+}
+
+#[test]
+fn the_generic_openai_path_sends_no_thinking_toggle() {
+    // The local Gemma default (its --reasoning-format auto) already reasons, and
+    // there's no portable toggle across arbitrary OpenAI-compatible endpoints: None.
     assert!(thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET).is_none());
 }
 

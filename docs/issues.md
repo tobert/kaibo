@@ -94,17 +94,11 @@ profile, asked per *phase* against its own model — so a Gemini synth/explorer 
 straddle the 3-line capability boundary each get the right shape. Thinking is
 model-aware (Gemini 3-line → `thinkingLevel`, 2.5/3.5 → `thinkingBudget`). Remaining
 knobs to land on the same seam:
-- **DeepSeek V4 thinking toggle — confirmed, implement.** `Dialect::request_params`
-  returns no thinking params for DeepSeek, but that's now stale: DeepSeek's V4 API
-  (`deepseek-v4-flash`/`-pro`, the hybrid successors) added a request-time toggle.
-  Send top-level `{"thinking": {"type": "enabled"}, "reasoning_effort": "high"}` —
-  rig 0.34 `#[serde(flatten)]`s `additional_params` into the body, so it lands top-
-  level (verified `deepseek.rs:463`). `reasoning_content` still carries the CoT
-  (already mapped by rig). Caveat: a tool-call turn must echo its `reasoning_content`
-  back or the API 400s. Also: legacy `deepseek-chat`/`-reasoner` ids deprecate
-  2026-07-24 (alias v4-flash modes) — kaibo's defaults already moved to v4. Docs:
-  https://api-docs.deepseek.com/guides/thinking_mode. Possible per-role tune:
-  `reasoning_effort: "max"` for the capable synth/consult arm.
+- **DeepSeek `reasoning_effort` per role (possible tune).** kaibo sends
+  `reasoning_effort: "high"` for both phases. DeepSeek auto-selects `"max"` for heavy
+  agent runs; if the capable `consult`/`synthesize` arm wants more depth, bump that
+  arm to `"max"` (the `Dialect` already resolves per role). Probe whether it's worth
+  the latency before defaulting it.
 - **Static budget.** `THINKING_BUDGET` (8192) and `max_tokens` (16384) are constants,
   not per-model/per-phase. Fine today; if a provider caps output below 16384 it'll
   400 (DeepSeek accepted 16384 in testing) — cap that arm rather than lowering the
