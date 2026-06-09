@@ -319,3 +319,25 @@ pub fn has_tool(req: &CompletionRequest, name: &str) -> bool {
 pub fn is_finalize_turn(req: &CompletionRequest) -> bool {
     req.tool_choice == Some(ToolChoice::None)
 }
+
+/// A [`ProgressSink`](crate::progress::ProgressSink) that records every event, so a
+/// loop test can prove the deep loop (a delegated sweep, a direct `run_kaish` read)
+/// actually emitted progress. The production sink renders these onto the MCP wire;
+/// here we just capture them and assert.
+#[derive(Debug, Default)]
+pub struct RecordingSink {
+    events: Mutex<Vec<crate::progress::PhaseEvent>>,
+}
+
+impl RecordingSink {
+    /// A snapshot of the events emitted so far, in order.
+    pub fn events(&self) -> Vec<crate::progress::PhaseEvent> {
+        self.events.lock().expect("recording sink poisoned").clone()
+    }
+}
+
+impl crate::progress::ProgressSink for RecordingSink {
+    fn emit(&self, event: crate::progress::PhaseEvent) {
+        self.events.lock().expect("recording sink poisoned").push(event);
+    }
+}

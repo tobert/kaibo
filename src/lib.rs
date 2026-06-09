@@ -14,6 +14,8 @@ pub mod consult;
 pub mod credentials;
 pub mod explorer;
 pub mod kaish_syntax;
+pub mod mcp_log;
+pub mod progress;
 pub mod sandbox;
 pub mod server;
 pub mod session;

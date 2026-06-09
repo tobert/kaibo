@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,12 +14,12 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     AnnotateAble, CallToolResult, Content, Implementation, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ProtocolVersion, RawResource,
-    RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-    ServerCapabilities, ServerInfo,
+    ListResourcesResult, LoggingLevel, Meta, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, ProtocolVersion, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
-use rmcp::service::RequestContext;
+use rmcp::service::{Peer, RequestContext};
 use rmcp::ErrorData as McpError;
 use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
@@ -28,6 +29,8 @@ use crate::config::{Config, Profile};
 use crate::consult::{consult, explore, synthesize, ConsultConfig};
 use crate::explorer::format_output;
 use crate::kaish_syntax::{kaibo_sandbox_doc, kaibo_instructions, render_builtin_help, render_topic, topics};
+use crate::mcp_log;
+use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::SessionStore;
 
@@ -194,6 +197,11 @@ pub struct KaiboHandler {
     /// Multi-turn `consult` sessions. Internally an `Arc<Mutex<_>>`, so the
     /// per-request handler clones all share one cache (see [`SessionStore`]).
     sessions: SessionStore,
+    /// The client's MCP log floor (a [`mcp_log::rank`]), written by `logging/setLevel`
+    /// and read by the log-drain task. `Arc<AtomicU8>` so every per-request handler
+    /// clone — and the drain task in `main` — share the one cell; a `setLevel` on any
+    /// request takes effect immediately for the whole server.
+    mcp_log_level: Arc<AtomicU8>,
 }
 
 #[tool_router]
@@ -231,7 +239,20 @@ impl KaiboHandler {
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
+            mcp_log_level: Arc::new(AtomicU8::new(mcp_log::rank(mcp_log::DEFAULT_LEVEL))),
         })
+    }
+
+    /// A handle to the shared MCP log floor, for the drain task in `main` to read.
+    /// Cloned, not borrowed, because the drain outlives this `&self`.
+    pub fn mcp_log_level(&self) -> Arc<AtomicU8> {
+        self.mcp_log_level.clone()
+    }
+
+    /// Set the MCP log floor. The body of `set_level`, split out so the level logic is
+    /// testable without fabricating a `RequestContext` (which needs a non-public peer).
+    pub fn apply_log_level(&self, level: LoggingLevel) {
+        self.mcp_log_level.store(mcp_log::rank(level), Ordering::Relaxed);
     }
 
     /// Tool names this handler advertises, after gating. For tests/diagnostics.
@@ -290,6 +311,8 @@ impl KaiboHandler {
     async fn consult(
         &self,
         Parameters(input): Parameters<ConsultInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         // Resolve the profile, then layer per-call model overrides onto the clone.
@@ -300,12 +323,16 @@ impl KaiboHandler {
         if let Some(m) = input.synth_model {
             profile.synth_model = m;
         }
+        // Progress rides the whole investigation: sweeps and direct reads emit beats
+        // onto the wire when the client supplied a token, else a no-op sink.
+        let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
             explorer_max_turns: input.explorer_max_turns.unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             max_tokens: profile.max_tokens,
             sandbox: self.config.sandbox.clone(),
+            progress: progress.clone(),
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -314,9 +341,11 @@ impl KaiboHandler {
         // only ever touched there, never held across the consult await.
         let session = input.session_id.as_deref().map(|id| (&self.sessions, id));
 
+        progress.emit(PhaseEvent::PhaseStarted { phase: "consult" });
         let out = consult(&input.question, root, &profile, &cfg, session)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
         Ok(consult_result(out.answer, out.report, input.include_report))
     }
@@ -336,23 +365,29 @@ impl KaiboHandler {
     async fn explore(
         &self,
         Parameters(input): Parameters<ExploreInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         let mut profile = self.resolve_profile(input.provider)?;
         if let Some(m) = input.model {
             profile.explorer_model = m;
         }
+        let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
             explorer_max_turns: input.max_turns.unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: defaults.synth_max_turns,
             max_tokens: profile.max_tokens,
             sandbox: self.config.sandbox.clone(),
+            progress: progress.clone(),
         };
 
+        progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
         let report = explore(&input.question, root, &profile, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
 
         Ok(CallToolResult::success(vec![Content::text(report)]))
     }
@@ -371,23 +406,29 @@ impl KaiboHandler {
     async fn synthesize(
         &self,
         Parameters(input): Parameters<SynthesizeInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         let mut profile = self.resolve_profile(input.provider)?;
         if let Some(m) = input.model {
             profile.synth_model = m;
         }
+        let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
             explorer_max_turns: defaults.explorer_max_turns,
             synth_max_turns: defaults.synth_max_turns,
             max_tokens: profile.max_tokens,
             sandbox: self.config.sandbox.clone(),
+            progress: progress.clone(),
         };
 
+        progress.emit(PhaseEvent::PhaseStarted { phase: "synthesize" });
         let answer = synthesize(&input.question, input.context.as_deref(), root, &profile, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        progress.emit(PhaseEvent::PhaseFinished { phase: "synthesize" });
 
         Ok(CallToolResult::success(vec![Content::text(answer)]))
     }
@@ -432,6 +473,10 @@ impl rmcp::ServerHandler for KaiboHandler {
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                // kaibo mirrors its `tracing` logs onto the MCP `notifications/message`
+                // channel (see `mcp_log`); advertising `logging` is what lets a client
+                // tune the floor with `logging/setLevel`.
+                .enable_logging()
                 .build(),
             // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
             server_info: Implementation {
@@ -444,6 +489,19 @@ impl rmcp::ServerHandler for KaiboHandler {
             },
             instructions: Some(kaibo_instructions(&self.tool_schemas)),
         }
+    }
+
+    /// Honor `logging/setLevel`: record the client's chosen floor so the log-drain
+    /// task forwards only records at or above it. The default implementation returns
+    /// `method_not_found`, which would make our advertised `logging` capability a lie —
+    /// this is the half that makes it real.
+    async fn set_level(
+        &self,
+        params: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.apply_log_level(params.level);
+        Ok(())
     }
 
     async fn list_resources(
@@ -570,9 +628,83 @@ fn consult_result(answer: String, report: String, include_report: bool) -> CallT
     result
 }
 
+/// The MCP token the client attached for progress, if any. Per the spec, progress
+/// notifications are sent *only* when the client opted in by putting a
+/// `progressToken` in the request `_meta`; absent one, we stay silent. Pure so the
+/// opt-in/opt-out decision is testable without a live request.
+fn progress_token(meta: &Meta) -> Option<ProgressToken> {
+    meta.get_progress_token()
+}
+
+/// Render one [`PhaseEvent`] as an MCP progress notification under `token`. `seq` is
+/// the monotonically increasing `progress` value the spec requires (it "should
+/// increase every time progress is made, even if the total is unknown"); `total`
+/// stays `None` because a consult's step count isn't known up front. Pure — the
+/// counting and wiring live in [`ProgressReporter`]; this is just the shape.
+fn progress_param(token: ProgressToken, seq: u64, event: &PhaseEvent) -> ProgressNotificationParam {
+    ProgressNotificationParam {
+        progress_token: token,
+        progress: seq as f64,
+        total: None,
+        message: Some(event.message()),
+    }
+}
+
+/// Pick the sink for one tool call: a live [`ProgressReporter`] when the client
+/// asked for progress (sent a token), else [`NullSink`]. Gating at construction
+/// means the no-progress path never even allocates a counter or touches the peer.
+fn progress_sink(peer: Peer<RoleServer>, meta: &Meta) -> Arc<dyn ProgressSink> {
+    match progress_token(meta) {
+        Some(token) => Arc::new(ProgressReporter::new(peer, token)),
+        None => Arc::new(NullSink),
+    }
+}
+
+/// Renders [`PhaseEvent`]s onto the MCP wire as `notifications/progress`, holding the
+/// peer, the client's progress token, and the monotonic counter the spec wants.
+///
+/// `emit` is sync (the loop calls it from inside `async` tool calls and must not
+/// block on a progress hop), but `notify_progress` is async — so each event is
+/// fired on a detached task. Notifications are best-effort: a send that loses the
+/// ordering race still carries its own increasing `progress`, so the client can
+/// order by it, and a failed send is dropped rather than allowed to sink the call.
+#[derive(Clone)]
+struct ProgressReporter {
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+    seq: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for ProgressReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressReporter").field("token", &self.token).finish_non_exhaustive()
+    }
+}
+
+impl ProgressReporter {
+    fn new(peer: Peer<RoleServer>, token: ProgressToken) -> Self {
+        Self { peer, token, seq: Arc::new(AtomicU64::new(0)) }
+    }
+}
+
+impl ProgressSink for ProgressReporter {
+    fn emit(&self, event: PhaseEvent) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let param = progress_param(self.token.clone(), seq, &event);
+        let peer = self.peer.clone();
+        // Fire-and-forget: don't make the loop await a notification it doesn't depend
+        // on. A dead transport just drops it.
+        tokio::spawn(async move {
+            let _ = peer.notify_progress(param).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::NumberOrString;
+    use rmcp::ServerHandler;
 
     /// A small stand-in builtin set so resource rendering is offline-testable.
     fn sample_schemas() -> Vec<ToolSchema> {
@@ -580,6 +712,69 @@ mod tests {
             ToolSchema::new("cat", "Read a file"),
             ToolSchema::new("rg", "Recursive grep"),
         ]
+    }
+
+    fn handler() -> KaiboHandler {
+        KaiboHandler::new(Config::builtin()).expect("handler builds")
+    }
+
+    /// Progress is opt-in: with no `progressToken` in `_meta` we send nothing, so the
+    /// sink must be the no-op. (A `consult` with no token is byte-for-byte its old
+    /// silent self.)
+    #[test]
+    fn no_token_means_no_progress_token() {
+        assert!(progress_token(&Meta::default()).is_none());
+    }
+
+    /// A token in `_meta` is the opt-in — we surface it so a reporter can be built.
+    #[test]
+    fn a_progress_token_in_meta_is_surfaced() {
+        let token = ProgressToken(NumberOrString::Number(7));
+        let meta = Meta::with_progress_token(token.clone());
+        assert_eq!(progress_token(&meta), Some(token));
+    }
+
+    /// The progress payload carries the client's token, a monotonic `progress`, an
+    /// unknown `total`, and the event's human line — the shape the spec wants.
+    #[test]
+    fn progress_param_carries_seq_and_message() {
+        let token = ProgressToken(NumberOrString::String("abc".into()));
+        let event = PhaseEvent::SweepStarted { question: "where is X?".into() };
+        let p = progress_param(token.clone(), 3, &event);
+        assert_eq!(p.progress_token, token);
+        assert_eq!(p.progress, 3.0);
+        assert!(p.total.is_none(), "a consult's step count isn't known up front");
+        assert_eq!(p.message.as_deref(), Some("exploring: where is X?"));
+    }
+
+    /// The server advertises the `logging` capability — the half of MCP logging the
+    /// client sees at initialize. Without it, a client never knows it can `setLevel`.
+    #[test]
+    fn advertises_the_logging_capability() {
+        let info = handler().get_info();
+        assert!(
+            info.capabilities.logging.is_some(),
+            "logging capability must be advertised, got {:?}",
+            info.capabilities
+        );
+    }
+
+    /// `setLevel` actually moves the shared floor the drain reads. Starts at the
+    /// default (info); raising it to `error` stores the higher rank.
+    #[test]
+    fn set_level_updates_the_shared_floor() {
+        let h = handler();
+        assert_eq!(
+            h.mcp_log_level().load(Ordering::Relaxed),
+            mcp_log::rank(mcp_log::DEFAULT_LEVEL),
+            "the floor starts at the default level"
+        );
+        h.apply_log_level(LoggingLevel::Error);
+        assert_eq!(
+            h.mcp_log_level().load(Ordering::Relaxed),
+            mcp_log::rank(LoggingLevel::Error),
+            "setLevel must move the floor the drain task reads"
+        );
     }
 
     #[test]

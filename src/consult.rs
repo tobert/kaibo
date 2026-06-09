@@ -33,6 +33,7 @@ use crate::config::Profile;
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::kaish_syntax::kaish_syntax_core;
+use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, SessionStore};
 
@@ -307,6 +308,13 @@ pub struct ConsultConfig {
     pub max_tokens: u64,
     /// Read-only sandbox limits applied to every kaish worker this phase spawns.
     pub sandbox: SandboxConfig,
+    /// Where the phase's liveness goes: each delegated sweep and direct kaish read
+    /// emits a [`PhaseEvent`] here. The server installs an adapter that renders these
+    /// as MCP progress notifications when the caller asked for them; otherwise it's
+    /// [`NullSink`], a no-op — so a stateless one-shot is byte-for-byte its old self.
+    /// It rides on `ConsultConfig` because that's the one bundle already threaded into
+    /// every phase fn and the toolset builders.
+    pub progress: Arc<dyn ProgressSink>,
 }
 
 impl Default for ConsultConfig {
@@ -317,6 +325,7 @@ impl Default for ConsultConfig {
             synth_max_turns: d.synth_max_turns,
             max_tokens: d.max_tokens,
             sandbox: SandboxConfig::default(),
+            progress: Arc::new(NullSink),
         }
     }
 }
@@ -395,6 +404,7 @@ pub(crate) async fn run_phase<C, F>(
     user_prompt: String,
     max_turns: usize,
     thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
     make_tools: F,
 ) -> Result<String>
 where
@@ -414,6 +424,9 @@ where
     match agent.prompt(user_prompt).max_turns(max_turns).await {
         Ok(answer) => Ok(answer),
         Err(PromptError::MaxTurnsError { chat_history, .. }) => {
+            // The loop hit its cap and is about to write a forced final answer —
+            // tell the caller, so a watching client sees "wrapping up" not silence.
+            progress.emit(PhaseEvent::TurnCapReached);
             finalize_after_max_turns(
                 client,
                 model,
@@ -498,6 +511,10 @@ pub struct RunExplore<C> {
     /// sweeps found (the recomposed `consult`'s `report`) and a test can observe
     /// that a delegation actually happened.
     reports: Arc<Mutex<Vec<String>>>,
+    /// Liveness for the sweep: brackets each delegation with start/finish, and is
+    /// handed to the nested kernel's `run_kaish` so the sub-agent's own reads show
+    /// through too (a delegated sweep is where a long consult spends its silence).
+    progress: Arc<dyn ProgressSink>,
 }
 
 impl<C> RunExplore<C> {
@@ -511,6 +528,7 @@ impl<C> RunExplore<C> {
         root: impl Into<PathBuf>,
         sandbox: SandboxConfig,
         reports: Arc<Mutex<Vec<String>>>,
+        progress: Arc<dyn ProgressSink>,
     ) -> Self {
         Self {
             client,
@@ -521,6 +539,7 @@ impl<C> RunExplore<C> {
             root: root.into(),
             sandbox,
             reports,
+            progress,
         }
     }
 }
@@ -575,10 +594,15 @@ where
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Bracket the delegation: the start carries the sub-question, the finish fires
+        // on both success and failure (the `?` below short-circuits, so emit it before
+        // unwrapping the result).
+        self.progress.emit(PhaseEvent::SweepStarted { question: args.question.clone() });
         // Reuse the one loop — explore′ is just run_phase with the explorer model.
         // A fresh kernel per worker build (the §2.1 cost note: a KaishWorker per
         // explore′; run_phase may build a second for the turn-cap recovery turn).
-        let report = run_phase(
+        // The sub-agent's `run_kaish` carries the same sink, so its reads surface too.
+        let result = run_phase(
             &self.client,
             &self.model,
             &report_preamble(),
@@ -586,15 +610,17 @@ where
             args.question,
             self.max_turns,
             self.thinking.as_ref(),
+            self.progress.as_ref(),
             || -> Result<Vec<Box<dyn ToolDyn>>> {
-                Ok(vec![Box::new(RunKaish::new(KaishWorker::spawn_with(
-                    &self.root,
-                    self.sandbox.clone(),
-                )?))])
+                Ok(vec![Box::new(RunKaish::with_progress(
+                    KaishWorker::spawn_with(&self.root, self.sandbox.clone())?,
+                    self.progress.clone(),
+                ))])
             },
         )
-        .await
-        .map_err(|e| RunExploreError(format!("{e:#}")))?;
+        .await;
+        self.progress.emit(PhaseEvent::SweepFinished);
+        let report = result.map_err(|e| RunExploreError(format!("{e:#}")))?;
         // Lock poisoning means another delegation panicked — surface it, don't mask.
         self.reports
             .lock()
@@ -626,8 +652,12 @@ where
         question.to_string(),
         cfg.explorer_max_turns,
         thinking,
+        cfg.progress.as_ref(),
         || -> Result<Vec<Box<dyn ToolDyn>>> {
-            Ok(vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))])
+            Ok(vec![Box::new(RunKaish::with_progress(
+                KaishWorker::spawn_with(root, cfg.sandbox.clone())?,
+                cfg.progress.clone(),
+            ))])
         },
     )
     .await
@@ -731,8 +761,12 @@ where
         user_prompt,
         cfg.synth_max_turns,
         thinking,
+        cfg.progress.as_ref(),
         || -> Result<Vec<Box<dyn ToolDyn>>> {
-            Ok(vec![Box::new(RunKaish::new(KaishWorker::spawn_with(root, cfg.sandbox.clone())?))])
+            Ok(vec![Box::new(RunKaish::with_progress(
+                KaishWorker::spawn_with(root, cfg.sandbox.clone())?,
+                cfg.progress.clone(),
+            ))])
         },
     )
     .await
@@ -825,7 +859,8 @@ where
     C: CompletionClient + Clone + Send + Sync + 'static,
     C::CompletionModel: 'static,
 {
-    // run_kaish for precise reads by the consult model itself.
+    // run_kaish for precise reads by the consult model itself — carries the sink so
+    // the driver's own reads show up as progress alongside the delegated sweeps'.
     let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
     // explore′ for delegated breadth: same explore unit, wrapped as a tool, pointed
     // at the cheap explorer model. Bounded by explorer_max_turns per sweep; no cap
@@ -841,8 +876,12 @@ where
         root,
         cfg.sandbox.clone(),
         reports,
+        cfg.progress.clone(),
     );
-    Ok(vec![Box::new(RunKaish::new(worker)), Box::new(explore)])
+    Ok(vec![
+        Box::new(RunKaish::with_progress(worker, cfg.progress.clone())),
+        Box::new(explore),
+    ])
 }
 
 /// Run a `consult` against an already-constructed provider client.
@@ -878,6 +917,7 @@ where
         user_prompt.to_string(),
         cfg.synth_max_turns,
         synth_thinking.as_ref(),
+        cfg.progress.as_ref(),
         // Rebuilt per call (main loop, and again if run_phase forces a final turn);
         // every build shares the one `reports` sink so all explore′ sweeps aggregate.
         || consult_tools(client, explorer_model, root, cfg, dialect, reports.clone()),
@@ -975,7 +1015,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, ScriptedClient,
+        transcript_text, RecordingSink, ScriptedClient,
     };
     use crate::session::SessionStore;
     use std::fs;
@@ -1121,6 +1161,112 @@ mod tests {
             "driver got the consult preamble: {:?}",
             synth_reqs[0].preamble
         );
+    }
+
+    /// Progress reaches the *deep* loop. The same delegate-then-read flow as the e2e
+    /// above, but driven through a [`RecordingSink`] on `ConsultConfig`: the sink must
+    /// see the sweep bracket (start/finish), the nested explorer's own `run_kaish`
+    /// read, and the driver's direct `run_kaish` read. This is the teeth for the whole
+    /// threading job — were the sink dropped anywhere between `ConsultConfig` and the
+    /// tools (or not forwarded into the nested explorer), one of these would be missing.
+    #[tokio::test]
+    async fn progress_events_reach_the_sweep_and_both_kaish_reads() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let seen = transcript_text(req);
+                if !seen.contains("EXPLORER_REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "where is target_marker defined?" }),
+                    ))
+                } else if !seen.contains("target_marker() {}") {
+                    Ok(tool_call_response(
+                        "t-read",
+                        "run_kaish",
+                        json!({ "script": "cat -n src/foo.rs" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: src/foo.rs:1"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                // Branch on tool *output* (run_kaish prefixes "exit:"), not on the
+                // question text — the sub-question itself contains "target_marker", so
+                // a content check on that would skip the read we're here to observe.
+                if !transcript_text(req).contains("exit:") {
+                    Ok(tool_call_response(
+                        "t-rg",
+                        "run_kaish",
+                        json!({ "script": "rg -n target_marker src" }),
+                    ))
+                } else {
+                    Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig { progress: sink.clone(), ..ConsultConfig::default() };
+
+        consult_with(
+            &client,
+            "Where is target_marker?",
+            dir.path(),
+            EXPLORER,
+            SYNTH,
+            &cfg,
+            &no_thinking(),
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let events = sink.events();
+        assert!(
+            events.contains(&PhaseEvent::SweepStarted {
+                question: "where is target_marker defined?".into()
+            }),
+            "the delegation must announce its start: {events:?}"
+        );
+        assert!(
+            events.contains(&PhaseEvent::SweepFinished),
+            "the delegation must announce its finish: {events:?}"
+        );
+        assert!(
+            events.contains(&PhaseEvent::KaishRun { script: "rg -n target_marker src".into() }),
+            "the nested explorer's read must surface (sink threaded into the sub-agent): {events:?}"
+        );
+        assert!(
+            events.contains(&PhaseEvent::KaishRun { script: "cat -n src/foo.rs".into() }),
+            "the driver's own direct read must surface: {events:?}"
+        );
+        // Ordering sanity: the sweep starts before its nested read, which precedes the
+        // sweep finishing — the bracket actually brackets.
+        let pos = |want: &PhaseEvent| events.iter().position(|e| e == want).unwrap();
+        let start = pos(&PhaseEvent::SweepStarted {
+            question: "where is target_marker defined?".into(),
+        });
+        let nested = pos(&PhaseEvent::KaishRun { script: "rg -n target_marker src".into() });
+        let finish = pos(&PhaseEvent::SweepFinished);
+        assert!(start < nested && nested < finish, "sweep must bracket its nested read: {events:?}");
+    }
+
+    /// A stateless consult (default `ConsultConfig`) emits to the [`NullSink`] — no
+    /// panic, no observable effect. The opt-out path stays a true no-op.
+    #[tokio::test]
+    async fn the_default_sink_is_a_silent_no_op() {
+        const SYNTH: &str = "synth";
+        let client = echo_client(SYNTH);
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+        // No token, no recording sink — just prove the default path runs clean.
+        consult_with(&client, "q", dir.path(), "explorer", SYNTH, &cfg, &no_thinking())
+            .await
+            .unwrap();
     }
 
     /// Multi-sweep: a driver that delegates to `explore′` more than once must

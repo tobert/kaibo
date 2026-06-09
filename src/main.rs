@@ -17,6 +17,7 @@ use rmcp::transport::io::stdio;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use kaibo::config::{Config, ToolDisables};
+use kaibo::mcp_log::{self, McpBridgeLayer};
 use kaibo::server::KaiboHandler;
 
 #[derive(Parser)]
@@ -86,13 +87,19 @@ async fn main() -> Result<()> {
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
-    // the config's `server.log`.
+    // the config's `server.log`. The bridge layer additionally mirrors kaibo-target
+    // events to the MCP `notifications/message` channel via this channel; the drain
+    // task (spawned after `serve`, once the peer exists) forwards them. Records logged
+    // before then — startup — buffer here and flush when draining begins, so the
+    // client sees them too.
+    let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(config.log.clone())),
         )
+        .with(McpBridgeLayer::new(log_tx))
         .init();
 
     if let Some(root) = &config.root {
@@ -128,7 +135,12 @@ async fn main() -> Result<()> {
     );
 
     let handler = KaiboHandler::new(config)?;
+    // Grab the shared log floor before `serve` consumes the handler; the drain task
+    // reads it so a client `setLevel` retunes verbosity live.
+    let log_level = handler.mcp_log_level();
     let service = handler.serve(stdio()).await?;
+    // The peer exists now (initialize is done): start forwarding buffered + live logs.
+    tokio::spawn(mcp_log::drain(log_rx, log_level, service.peer().clone()));
     service.waiting().await?;
 
     tracing::info!("kaibo shutting down");

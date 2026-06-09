@@ -5,22 +5,38 @@
 //! builtins and pipelines for all reading, searching, and parsing. Writes,
 //! `git`/`touch`, and external commands are refused by [`crate::sandbox`].
 
+use std::sync::Arc;
+
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::kaish_syntax::run_kaish_tool_description;
+use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishOutput, KaishWorker};
 
 /// The single tool the explorer drives: run a kaish script in the sandbox.
 pub struct RunKaish {
     worker: KaishWorker,
+    /// Where a "ran a kaish script" beat goes. Each `call` is real forward motion in
+    /// an otherwise-silent loop, so it's the natural progress heartbeat. [`NullSink`]
+    /// when the caller wants no progress.
+    progress: Arc<dyn ProgressSink>,
 }
 
 impl RunKaish {
+    /// A `run_kaish` tool with no progress surface — the bare construction for paths
+    /// that don't report (and the obvious default).
     pub fn new(worker: KaishWorker) -> Self {
-        Self { worker }
+        Self::with_progress(worker, Arc::new(NullSink))
+    }
+
+    /// A `run_kaish` tool that announces each script it runs to `progress`. The loop
+    /// builds it with the phase's sink so a long, quiet investigation still shows
+    /// life on the MCP wire.
+    pub fn with_progress(worker: KaishWorker, progress: Arc<dyn ProgressSink>) -> Self {
+        Self { worker, progress }
     }
 }
 
@@ -67,6 +83,9 @@ impl Tool for RunKaish {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Announce the read before running it — the beat fires even if the script
+        // then errors, which is exactly the liveness a stuck call wants to show.
+        self.progress.emit(PhaseEvent::KaishRun { script: args.script.clone() });
         let out = self
             .worker
             .run(args.script)
