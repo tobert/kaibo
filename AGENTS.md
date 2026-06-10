@@ -122,8 +122,9 @@ a why was stated). A few sentences of reasoning beat a bullet list of files.
 - **Subject:** imperative, the decision or outcome — not "update sandbox.rs".
 - **Body:** the reasoning and tradeoffs. Cite a decision's source when it matters.
 - Don't narrate the code; point to `docs/issues.md` for follow-ups.
-- End every message with:
-  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+- End every message with a `Co-Authored-By:` trailer crediting the model that
+  actually did the work (might not be a Claude — we are a community here), e.g.
+  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
 
 Example:
 
