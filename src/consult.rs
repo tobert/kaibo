@@ -200,8 +200,10 @@ pub enum Role {
 /// All of a request's model-shaping params merged into one `additional_params` blob:
 /// thinking (per [`thinking_params`]) plus sampling. Per provider, sampling lives
 /// where that wire format puts it — under `generationConfig` for Gemini (camelCase
-/// `topP`), top-level for Anthropic/DeepSeek/OpenAI (rig flattens it into the body).
-/// `None` only when nothing at all is set (no thinking, no sampling).
+/// `topP`), top-level for DeepSeek/OpenAI (rig flattens it into the body). **Anthropic
+/// is the exception:** it 400s on a custom `temperature` (and restricts `top_p`/`top_k`)
+/// while thinking is on, so sampling is dropped there whenever a `thinking` block is
+/// present — thinking wins. `None` only when nothing at all is set.
 pub fn request_params(
     kind: ProviderKind,
     model: &str,
@@ -229,13 +231,24 @@ pub fn request_params(
             wrote = true;
         }
     } else {
-        if let Some(t) = temperature {
-            obj.insert("temperature".into(), json!(t));
-            wrote = true;
-        }
-        if let Some(p) = top_p {
-            obj.insert("top_p".into(), json!(p));
-            wrote = true;
+        // Anthropic 400s on any `temperature != 1` (and restricts top_p/top_k) whenever
+        // extended thinking is on: "temperature may only be set to 1 when thinking is
+        // enabled". Thinking is the higher-value default (see "Driving the models" in
+        // AGENTS.md), so it wins — drop the sampling knobs while a `thinking` block is
+        // present rather than drop thinking to honor a per-role temperature. Keyed on the
+        // block's presence, not the provider, so an Anthropic-without-thinking path (none
+        // today) would send sampling again, and DeepSeek/OpenAI — which accept sampling
+        // alongside reasoning — are unaffected.
+        let anthropic_thinking = kind == ProviderKind::Anthropic && obj.contains_key("thinking");
+        if !anthropic_thinking {
+            if let Some(t) = temperature {
+                obj.insert("temperature".into(), json!(t));
+                wrote = true;
+            }
+            if let Some(p) = top_p {
+                obj.insert("top_p".into(), json!(p));
+                wrote = true;
+            }
         }
     }
 

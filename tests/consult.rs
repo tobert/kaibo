@@ -131,12 +131,16 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     assert_eq!(gc["thinkingConfig"]["thinkingBudget"], THINKING_BUDGET, "thinking still rides along");
     assert!(g.get("temperature").is_none(), "must not leak to top level for Gemini");
 
-    // Anthropic: temperature + snake_case top_p at the top level, beside the thinking block.
+    // Anthropic: thinking wins — sampling is dropped. The Messages API 400s on any
+    // `temperature != 1` (and restricts top_p/top_k) whenever thinking is enabled
+    // ("temperature may only be set to 1 when thinking is enabled"). Thinking is the
+    // higher-value default (AGENTS.md "Driving the models"), so we keep it and let the
+    // per-role sampling go inert rather than 400 the request.
     let a = request_params(ProviderKind::Anthropic, "claude-sonnet-4-6", 4096, Some(0.3), Some(0.95))
         .expect("anthropic params");
-    assert_eq!(a["temperature"], 0.3);
-    assert_eq!(a["top_p"], 0.95);
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
+    assert!(a.get("temperature").is_none(), "temperature must not ride alongside thinking for Anthropic");
+    assert!(a.get("top_p").is_none(), "top_p must not ride alongside thinking for Anthropic");
 
     // OpenAI: no thinking toggle, but sampling still goes top-level.
     let o = request_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", 0, Some(0.2), Some(0.9))
@@ -155,6 +159,29 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
 
     // Nothing set anywhere → None (the leaf passes no additional_params at all).
     assert!(request_params(ProviderKind::Openai, "m", 0, None, None).is_none());
+}
+
+#[test]
+fn anthropic_thinking_suppresses_sampling_or_the_api_400s() {
+    // Regression for the live 400: "temperature may only be set to 1 when thinking is
+    // enabled". Anthropic rejects custom temperature (and restricts top_p/top_k) while
+    // extended thinking is on. Thinking is on for every Anthropic profile by default,
+    // and temperature has a default on every profile, so the per-role sampling feature
+    // collides with thinking on the very first call. Thinking wins; sampling drops.
+    let a = request_params(ProviderKind::Anthropic, "claude-sonnet-4-6", THINKING_BUDGET, Some(0.3), Some(0.95))
+        .expect("anthropic still sends the thinking block");
+    assert_eq!(a["thinking"]["type"], "enabled");
+    assert_eq!(a["thinking"]["budget_tokens"], THINKING_BUDGET);
+    assert!(a.get("temperature").is_none(), "temperature would 400 alongside thinking");
+    assert!(a.get("top_p").is_none(), "top_p is dropped with it, for the same reason");
+
+    // The suppression is keyed on the thinking block being present, not on the provider
+    // alone: contrast DeepSeek, which also enables thinking but *accepts* sampling, so
+    // its knobs ride through untouched.
+    let d = request_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET, Some(0.3), Some(0.95))
+        .expect("deepseek params");
+    assert_eq!(d["temperature"], 0.3, "DeepSeek keeps sampling even with thinking on");
+    assert_eq!(d["top_p"], 0.95);
 }
 
 #[test]

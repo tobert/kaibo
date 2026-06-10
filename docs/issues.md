@@ -109,6 +109,17 @@ knobs to land on the same seam:
   budget because the 2026-06-06 live test confirmed budget works there. If a future
   3.5 build *rejects* budget, widen the classifier — but confirm with a live probe,
   don't guess.
+- **Anthropic thinking shape is model-blind (latent 400 on the newest Opus).**
+  `thinking_params` hardcodes `thinking:{type:"enabled",budget_tokens}` for *all*
+  Anthropic models. That's fine for the default `claude-sonnet-4-6` (enabled/budget is
+  deprecated-but-functional there), but Opus 4.7/4.8 *removed* it — they 400 and require
+  `thinking:{type:"adaptive"}` (depth via `output_config.effort`), and they also reject
+  `temperature`/`top_p`/`top_k` outright (not just under thinking). So a profile pointed
+  at a 4.7/4.8 model would 400 on the thinking block itself, before our new sampling-drop
+  even matters. Surfaced 2026-06-10 while fixing the thinking+temperature 400. Fix on the
+  same `Dialect` seam when an Anthropic profile actually targets those models: make the
+  Anthropic arm model-aware (adaptive vs enabled/budget) the way Gemini's already is, and
+  confirm against a live probe before guessing the model boundary.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
