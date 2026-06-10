@@ -143,50 +143,240 @@ fn is_gemini3_level(model: &str) -> bool {
     model == "gemini-3" || model.starts_with("gemini-3-")
 }
 
-/// Per-(provider, model) request params that turn **thinking on**, or `None` when the
-/// model reasons without a switch. Model-aware: within Gemini, the 3-line takes
-/// `thinkingLevel` while 2.5/3.5 take `thinkingBudget` (mutually exclusive — rig's
-/// typed `ThinkingConfig` carries both fields). Usually reached via [`Dialect`],
-/// which binds the kind+budget and resolves each phase against its own model.
+/// The per-role thinking-depth lever for the models that expose one as a request
+/// param (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`).
+/// A passthrough string the provider validates — like a model id — so a new level
+/// lands without a code change. Default for both roles unless a profile tunes it.
+pub const DEFAULT_EFFORT: &str = "high";
+
+/// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
+/// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
 ///
-/// - **Anthropic** — a top-level `thinking` block; rig flattens `additional_params`
-///   straight into the Messages request.
-/// - **Gemini** — `generationConfig.thinkingConfig` (camelCase; rig parses this
-///   into a typed `GenerationConfig`, so the shape must be exact). `thinkingLevel`
-///   for the 3-line ([`is_gemini3_level`]), else `thinkingBudget`.
-/// - **DeepSeek** — the V4 hybrids (`deepseek-v4-flash`/`-pro`) toggle thinking at
-///   request time: top-level `thinking.type` + `reasoning_effort`. rig flattens
-///   `additional_params` into the body, so both land top-level; rig also round-trips
-///   the response `reasoning_content` back on outgoing turns, so tool-call loops
-///   don't trip DeepSeek's "echo the CoT or 400" rule. The budget doesn't apply —
-///   DeepSeek controls depth by effort level, not a token budget.
-/// - **OpenAI** — the generic OpenAI-compatible path; the local Gemma default
-///   already reasons (`--reasoning-format auto`) and there's no portable toggle
-///   across arbitrary endpoints, so nothing to send. `None`.
-pub fn thinking_params(kind: ProviderKind, model: &str, budget: u64) -> Option<Value> {
-    match kind {
-        ProviderKind::Anthropic => Some(json!({
-            "thinking": { "type": "enabled", "budget_tokens": budget }
-        })),
-        ProviderKind::Gemini => {
-            // 3-line: thinkingLevel (mutually exclusive with budget). "high" matches
-            // gemini-cli's investigator; rig deserializes it to ThinkingLevel::High.
-            let thinking_config = if is_gemini3_level(model) {
-                json!({ "thinkingLevel": "high", "includeThoughts": true })
-            } else {
-                json!({ "thinkingBudget": budget, "includeThoughts": true })
-            };
-            Some(json!({ "generationConfig": { "thinkingConfig": thinking_config } }))
+/// **Empirical — confirm by probe** (the discipline of [`is_gemini3_level`]): Opus
+/// 4.7/4.8 and Fable 5 *reject* enabled/budget and sampling outright (400); Opus 4.6 /
+/// Sonnet 4.6 take adaptive too — it's the recommended shape, `budget_tokens` is
+/// deprecated there. Everything older, and Haiku 4.5, stays on enabled/budget. Matched
+/// by `contains` (not `starts_with`, unlike `is_gemini3_level`) so a vendor-prefixed id
+/// still resolves. Add ids as they ship; a profile can force a tier via `thinking_style`.
+fn is_anthropic_adaptive(model: &str) -> bool {
+    ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"]
+        .iter()
+        .any(|tier| model.contains(tier))
+}
+
+/// How a given (provider, model) expresses "think" on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingStyle {
+    /// Anthropic legacy: `{thinking:{type:"enabled",budget_tokens:N}}`.
+    AnthropicBudget,
+    /// Anthropic 4.6+: `{thinking:{type:"adaptive"}}` + `output_config.effort`.
+    AnthropicAdaptive,
+    /// Gemini 3-line: `generationConfig.thinkingConfig.thinkingLevel`.
+    GeminiLevel,
+    /// Gemini 2.5/3.5: `generationConfig.thinkingConfig.thinkingBudget`.
+    GeminiBudget,
+    /// DeepSeek V4 hybrids: `{thinking:{type:"enabled"}, reasoning_effort:<role>}`.
+    DeepSeekEffort,
+    /// No request-time toggle (the generic OpenAI path).
+    None,
+}
+
+/// Where this provider's wire format puts sampling (`temperature`/`top_p`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SamplingPlacement {
+    /// Gemini nests it under `generationConfig` (camelCase `topP`).
+    GeminiGenerationConfig,
+    /// Anthropic/DeepSeek/OpenAI take it top-level (rig flattens into the body).
+    TopLevel,
+}
+
+/// Force a model's thinking style, overriding the built-in classifier. `Auto` (the
+/// default) classifies from the model id; the others pin a tier — the escape hatch for
+/// a new or misclassified Anthropic model (see `docs/config.md`). Carried on a
+/// [`Profile`] and resolved per phase via [`Dialect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingStyleOverride {
+    #[default]
+    Auto,
+    Adaptive,
+    Budget,
+}
+
+impl std::str::FromStr for ThinkingStyleOverride {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "adaptive" => Ok(Self::Adaptive),
+            "budget" => Ok(Self::Budget),
+            other => Err(anyhow!(
+                "thinking_style {other:?} is not one of auto|adaptive|budget"
+            )),
         }
-        ProviderKind::DeepSeek => Some(json!({
-            // Explicit-on (it's the V4 default, but say it so intent survives a default
-            // flip). "high" is the documented sweet spot; "max" is reserved for heavy
-            // agent runs (a possible per-role tune — docs/issues.md).
-            "thinking": { "type": "enabled" },
-            "reasoning_effort": "high"
-        })),
-        ProviderKind::Openai => None,
     }
+}
+
+/// The request shape one (provider, model) wants — the unified, per-model home for
+/// request tuning. [`resolve`](ModelShape::resolve) classifies it (honoring an
+/// override); [`to_params`](ModelShape::to_params) emits the `additional_params` blob
+/// with the per-phase budget, sampling, and effort. This is what lets a profile whose
+/// explorer and synth straddle a capability line (a budget-tier Haiku explorer with an
+/// adaptive Sonnet 4.6 synth, say) fit each arm correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelShape {
+    thinking: ThinkingStyle,
+    /// Does this model accept sampling *while thinking is on*? Anthropic 400s on a
+    /// custom temperature under thinking (any tier — "temperature may only be set to 1
+    /// when thinking is enabled"; 4.7/4.8/Fable reject it outright), so `false` there;
+    /// DeepSeek/Gemini/OpenAI accept sampling alongside reasoning.
+    sampling_under_thinking: bool,
+    sampling_placement: SamplingPlacement,
+}
+
+impl ModelShape {
+    /// Resolve the shape for `model` under `kind`, honoring an explicit override.
+    pub fn resolve(kind: ProviderKind, model: &str, ovr: ThinkingStyleOverride) -> Self {
+        let thinking = match kind {
+            ProviderKind::Anthropic => {
+                let adaptive = match ovr {
+                    ThinkingStyleOverride::Auto => is_anthropic_adaptive(model),
+                    ThinkingStyleOverride::Adaptive => true,
+                    ThinkingStyleOverride::Budget => false,
+                };
+                if adaptive {
+                    ThinkingStyle::AnthropicAdaptive
+                } else {
+                    ThinkingStyle::AnthropicBudget
+                }
+            }
+            ProviderKind::Gemini => {
+                if is_gemini3_level(model) {
+                    ThinkingStyle::GeminiLevel
+                } else {
+                    ThinkingStyle::GeminiBudget
+                }
+            }
+            ProviderKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
+            ProviderKind::Openai => ThinkingStyle::None,
+        };
+        let (sampling_under_thinking, sampling_placement) = match kind {
+            ProviderKind::Anthropic => (false, SamplingPlacement::TopLevel),
+            ProviderKind::Gemini => (true, SamplingPlacement::GeminiGenerationConfig),
+            ProviderKind::DeepSeek | ProviderKind::Openai => (true, SamplingPlacement::TopLevel),
+        };
+        Self {
+            thinking,
+            sampling_under_thinking,
+            sampling_placement,
+        }
+    }
+
+    /// Just the thinking block (no sampling), with the default effort — the body of the
+    /// [`thinking_params`] wrapper.
+    fn thinking_only(&self, budget: u64) -> Option<Value> {
+        let mut obj = serde_json::Map::new();
+        self.write_thinking(&mut obj, budget, DEFAULT_EFFORT);
+        (!obj.is_empty()).then_some(Value::Object(obj))
+    }
+
+    /// The full `additional_params` blob — thinking (with its effort sink where the
+    /// model has one) plus sampling — or `None` when nothing is set. `effort` is the
+    /// per-role depth lever; it lands only where the style takes it (Anthropic adaptive
+    /// → `output_config.effort`; DeepSeek → `reasoning_effort`), ignored elsewhere.
+    pub fn to_params(
+        &self,
+        budget: u64,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        effort: &str,
+    ) -> Option<Value> {
+        let mut obj = serde_json::Map::new();
+        self.write_thinking(&mut obj, budget, effort);
+        let thinking_on = self.thinking != ThinkingStyle::None;
+
+        // Drop sampling when thinking is on and this model won't accept it under
+        // thinking — generalizes the Anthropic case (a custom temperature 400s under
+        // thinking; thinking is the higher-value default, so it wins). DeepSeek/Gemini/
+        // OpenAI accept sampling alongside reasoning, so they keep it.
+        let drop_sampling = thinking_on && !self.sampling_under_thinking;
+        if !drop_sampling {
+            match self.sampling_placement {
+                SamplingPlacement::GeminiGenerationConfig => {
+                    if temperature.is_some() || top_p.is_some() {
+                        let gc = obj
+                            .entry("generationConfig")
+                            .or_insert_with(|| json!({}))
+                            .as_object_mut()
+                            .expect("generationConfig is an object");
+                        if let Some(t) = temperature {
+                            gc.insert("temperature".into(), json!(t));
+                        }
+                        if let Some(p) = top_p {
+                            gc.insert("topP".into(), json!(p));
+                        }
+                    }
+                }
+                SamplingPlacement::TopLevel => {
+                    if let Some(t) = temperature {
+                        obj.insert("temperature".into(), json!(t));
+                    }
+                    if let Some(p) = top_p {
+                        obj.insert("top_p".into(), json!(p));
+                    }
+                }
+            }
+        }
+        (!obj.is_empty()).then_some(Value::Object(obj))
+    }
+
+    /// Write this style's thinking block (and its per-role effort sink) into `obj`.
+    fn write_thinking(&self, obj: &mut serde_json::Map<String, Value>, budget: u64, effort: &str) {
+        match self.thinking {
+            ThinkingStyle::AnthropicBudget => {
+                obj.insert(
+                    "thinking".into(),
+                    json!({ "type": "enabled", "budget_tokens": budget }),
+                );
+            }
+            ThinkingStyle::AnthropicAdaptive => {
+                obj.insert("thinking".into(), json!({ "type": "adaptive" }));
+                // rig 0.34 flattens additional_params into the Messages body; its typed
+                // `output_config` field models only `{format}` and stays `None` (kaibo
+                // sets no output schema), so this flattened key is the only `output_config`
+                // emitted. If kaibo ever adds structured output, revisit — two keys 400.
+                obj.insert("output_config".into(), json!({ "effort": effort }));
+            }
+            ThinkingStyle::GeminiLevel => {
+                // "high" matches gemini-cli's investigator; rig deserializes it to
+                // ThinkingLevel::High. (Gemini depth is the level, not `effort`.)
+                obj.insert(
+                    "generationConfig".into(),
+                    json!({ "thinkingConfig": { "thinkingLevel": "high", "includeThoughts": true } }),
+                );
+            }
+            ThinkingStyle::GeminiBudget => {
+                obj.insert(
+                    "generationConfig".into(),
+                    json!({ "thinkingConfig": { "thinkingBudget": budget, "includeThoughts": true } }),
+                );
+            }
+            ThinkingStyle::DeepSeekEffort => {
+                // Explicit-on (the V4 default, but stated so intent survives a default
+                // flip). rig flattens both top-level and round-trips the response
+                // `reasoning_content` so tool loops don't trip DeepSeek's echo-or-400 rule.
+                obj.insert("thinking".into(), json!({ "type": "enabled" }));
+                obj.insert("reasoning_effort".into(), json!(effort));
+            }
+            ThinkingStyle::None => {}
+        }
+    }
+}
+
+/// Per-(provider, model) thinking params, or `None` when the model reasons without a
+/// request toggle. Thin wrapper over [`ModelShape`] using the built-in classifier and
+/// the default effort; the per-phase path with overrides goes through [`Dialect`].
+pub fn thinking_params(kind: ProviderKind, model: &str, budget: u64) -> Option<Value> {
+    ModelShape::resolve(kind, model, ThinkingStyleOverride::Auto).thinking_only(budget)
 }
 
 /// The phase a request is for. Temperature is role-sensitive: the explorer gathers
@@ -197,13 +387,10 @@ pub enum Role {
     Synth,
 }
 
-/// All of a request's model-shaping params merged into one `additional_params` blob:
-/// thinking (per [`thinking_params`]) plus sampling. Per provider, sampling lives
-/// where that wire format puts it — under `generationConfig` for Gemini (camelCase
-/// `topP`), top-level for DeepSeek/OpenAI (rig flattens it into the body). **Anthropic
-/// is the exception:** it 400s on a custom `temperature` (and restricts `top_p`/`top_k`)
-/// while thinking is on, so sampling is dropped there whenever a `thinking` block is
-/// present — thinking wins. `None` only when nothing at all is set.
+/// All of a request's model-shaping params (thinking + sampling) merged into one
+/// `additional_params` blob. Thin wrapper over [`ModelShape::to_params`] using the
+/// built-in classifier and the default effort; the per-phase path with profile
+/// overrides goes through [`Dialect`].
 pub fn request_params(
     kind: ProviderKind,
     model: &str,
@@ -211,84 +398,55 @@ pub fn request_params(
     temperature: Option<f64>,
     top_p: Option<f64>,
 ) -> Option<Value> {
-    let mut params = thinking_params(kind, model, budget).unwrap_or_else(|| json!({}));
-    let obj = params.as_object_mut().expect("thinking_params yields an object or {}");
-    let mut wrote = !obj.is_empty();
-
-    if kind == ProviderKind::Gemini {
-        if temperature.is_some() || top_p.is_some() {
-            let gc = obj
-                .entry("generationConfig")
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .expect("generationConfig is an object");
-            if let Some(t) = temperature {
-                gc.insert("temperature".into(), json!(t));
-            }
-            if let Some(p) = top_p {
-                gc.insert("topP".into(), json!(p));
-            }
-            wrote = true;
-        }
-    } else {
-        // Anthropic 400s on any `temperature != 1` (and restricts top_p/top_k) whenever
-        // extended thinking is on: "temperature may only be set to 1 when thinking is
-        // enabled". Thinking is the higher-value default (see "Driving the models" in
-        // AGENTS.md), so it wins — drop the sampling knobs while a `thinking` block is
-        // present rather than drop thinking to honor a per-role temperature. Keyed on the
-        // block's presence, not the provider, so an Anthropic-without-thinking path (none
-        // today) would send sampling again, and DeepSeek/OpenAI — which accept sampling
-        // alongside reasoning — are unaffected.
-        let anthropic_thinking = kind == ProviderKind::Anthropic && obj.contains_key("thinking");
-        if !anthropic_thinking {
-            if let Some(t) = temperature {
-                obj.insert("temperature".into(), json!(t));
-                wrote = true;
-            }
-            if let Some(p) = top_p {
-                obj.insert("top_p".into(), json!(p));
-                wrote = true;
-            }
-        }
-    }
-
-    wrote.then_some(params)
+    ModelShape::resolve(kind, model, ThinkingStyleOverride::Auto)
+        .to_params(budget, temperature, top_p, DEFAULT_EFFORT)
 }
 
 /// How kaibo shapes requests for the models of one [`Profile`] — the single home for
 /// per-model request tuning. Resolved once from a profile, then asked for *each
 /// phase's own* model and role: a profile whose explorer and synth straddle a
-/// capability line (a Gemini 2.x flash explorer with a Gemini 3 synth, say) gets each
-/// arm fit correctly, rather than one shape computed once and shared.
+/// capability line (a budget-tier Haiku explorer with an adaptive Sonnet 4.6 synth, or
+/// a Gemini 2.x flash explorer with a Gemini 3 synth) gets each arm fit correctly,
+/// rather than one shape computed once and shared.
 #[derive(Debug, Clone)]
 pub struct Dialect {
     kind: ProviderKind,
     thinking_budget: u64,
+    thinking_style: ThinkingStyleOverride,
     explorer_temperature: Option<f64>,
     synth_temperature: Option<f64>,
+    explorer_effort: String,
+    synth_effort: String,
     top_p: Option<f64>,
 }
 
 impl Dialect {
-    /// Bind a kind and a thinking budget with no sampling overrides (the seam tests
-    /// reach for, and any path that only cares about thinking).
+    /// Bind a kind and a thinking budget with no sampling overrides and default effort
+    /// (the seam tests reach for, and any path that only cares about thinking).
     pub fn new(kind: ProviderKind, thinking_budget: u64) -> Self {
         Self {
             kind,
             thinking_budget,
+            thinking_style: ThinkingStyleOverride::Auto,
             explorer_temperature: None,
             synth_temperature: None,
+            explorer_effort: DEFAULT_EFFORT.to_string(),
+            synth_effort: DEFAULT_EFFORT.to_string(),
             top_p: None,
         }
     }
 
-    /// The usual path: take the kind, budget, and sampling a resolved profile carries.
+    /// The usual path: take the kind, budget, thinking-style override, sampling, and
+    /// per-role effort a resolved profile carries.
     pub fn from_profile(profile: &Profile) -> Self {
         Self {
             kind: profile.kind,
             thinking_budget: profile.thinking_budget,
+            thinking_style: profile.thinking_style,
             explorer_temperature: Some(profile.explorer_temperature),
             synth_temperature: Some(profile.synth_temperature),
+            explorer_effort: profile.explorer_effort.clone(),
+            synth_effort: profile.synth_effort.clone(),
             top_p: profile.top_p.into(),
         }
     }
@@ -296,11 +454,16 @@ impl Dialect {
     /// The full `additional_params` for `model` in `role`, or `None` when there's
     /// nothing to send. The per-phase resolution point.
     pub fn request_params(&self, model: &str, role: Role) -> Option<Value> {
-        let temperature = match role {
-            Role::Explorer => self.explorer_temperature,
-            Role::Synth => self.synth_temperature,
+        let (temperature, effort) = match role {
+            Role::Explorer => (self.explorer_temperature, self.explorer_effort.as_str()),
+            Role::Synth => (self.synth_temperature, self.synth_effort.as_str()),
         };
-        request_params(self.kind, model, self.thinking_budget, temperature, self.top_p)
+        ModelShape::resolve(self.kind, model, self.thinking_style).to_params(
+            self.thinking_budget,
+            temperature,
+            self.top_p,
+            effort,
+        )
     }
 }
 

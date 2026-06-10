@@ -1,12 +1,7 @@
 # AGENTS.md — kaibo (解剖)
 
-Critical orientation for agents working on kaibo. Short by design; the code and
-`docs/issues.md` are ground truth.
-
-## What kaibo is
-
-A stdio MCP server that answers questions about a codebase with grounded, cited
-answers, read-only. **One primitive, four tools.** The primitive is `run_phase`
+Kaibo is a stdio MCP server that answers questions about a codebase with grounded,
+cited answers, read-only. **One primitive, four tools.** The primitive is `run_phase`
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
 loop. Every tool is that loop wearing different clothes:
 
@@ -75,13 +70,23 @@ How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherit
   `thinking`, Gemini `thinkingConfig`, DeepSeek reasoners; in rig via
   `AgentBuilder::additional_params`). The depth is worth the latency/tokens — the
   provider probe showed thinking-capable answers materially deeper than thin ones.
+- **Request shaping is model-aware, not just provider-aware** (`ModelShape` in
+  `consult.rs`). The thinking block fits the *model*: Anthropic's adaptive tier (Opus
+  4.6+/Sonnet 4.6/Fable 5) takes `{type:"adaptive"}` + `output_config.effort` and
+  rejects `budget_tokens`/sampling outright; older Anthropic + Haiku 4.5 take
+  enabled-budget; Gemini's 3-line takes `thinkingLevel`, 2.5/3.5 `thinkingBudget`.
+  Reasoning depth is **per-role effort** (`explorer_effort`/`synth_effort`, default
+  `high`) mapped to each provider's field. Boundaries are empirical — a built-in
+  classifier with a `thinking_style` config escape hatch; confirm a new model with a
+  live probe, don't guess (`tests/consult.rs` has the `#[ignore]`d Anthropic probes).
 - **Large token headroom**, because reasoning eats the *completion* budget. Default
   `max_tokens` generously (16k+, not 4k) for every phase — thinking-on means a thin
   budget starves the answer (a Gemma probe spent all 300 `max_tokens` on
   `reasoning_content` and returned empty `content`, `finish_reason: length`). If one
-  provider rejects a large value (some DeepSeek models cap ~8k), cap *that arm*, not
-  the global. Interaction shape behind this: few high-value turns, not long chats —
-  spend the budget on depth per turn.
+  provider rejects a large value, cap *that arm*, not the global (older DeepSeek
+  reasoners capped low; the V4 hybrids advertise 384K output, so the cap is
+  per-model — confirm before assuming). Interaction shape behind this: few
+  high-value turns, not long chats — spend the budget on depth per turn.
 - **Positive prompt framing.** In preambles, tool descriptions, and cheatsheets,
   reinforce the behavior we *want* resident in the weights — say it a few ways —
   rather than prohibiting what we don't: "ground every claim, cite the `file:line`"

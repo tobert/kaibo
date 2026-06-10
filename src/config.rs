@@ -31,6 +31,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
+use crate::consult::ThinkingStyleOverride;
 use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
@@ -56,6 +57,16 @@ pub struct Defaults {
     /// Nucleus sampling, both roles. Mild by default; the temperature is the main
     /// lever. Overridable per profile.
     pub top_p: f64,
+    /// Per-role reasoning effort for the models that take one as a request param
+    /// (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`).
+    /// A passthrough string — the provider validates it. Default `"high"` both roles;
+    /// bump `synth_effort` to `"max"`/`"xhigh"` per profile for heavier synth runs.
+    pub explorer_effort: String,
+    pub synth_effort: String,
+    /// Force the Anthropic thinking style (`auto`/`adaptive`/`budget`) instead of the
+    /// built-in classifier — the escape hatch for a new or misclassified model.
+    /// Server-wide default; overridable per profile. A no-op for non-Anthropic kinds.
+    pub thinking_style: ThinkingStyleOverride,
     /// Per-request deadline on a single LLM completion call (a per-*HTTP-call*
     /// bound, not the whole loop). Seeds every profile's `request_timeout`;
     /// overridable per profile (a slow local model wants more rope than a hosted
@@ -88,6 +99,12 @@ impl Default for Defaults {
             explorer_temperature: 0.1,
             synth_temperature: 0.3,
             top_p: 0.95,
+            // "high" is valid on both effort-taking providers (Anthropic adaptive,
+            // DeepSeek) and matches DeepSeek's prior hardcoded value, so a config-less
+            // run is unchanged. `Auto` classifies the thinking style from the model id.
+            explorer_effort: crate::consult::DEFAULT_EFFORT.to_string(),
+            synth_effort: crate::consult::DEFAULT_EFFORT.to_string(),
+            thinking_style: ThinkingStyleOverride::Auto,
             // 15 min. A single completion that takes longer is pathological for a
             // hosted API and a generous ceiling for a slow local model; either way
             // it bounds a wedged provider that would otherwise hang forever
@@ -131,6 +148,13 @@ pub struct Profile {
     pub explorer_temperature: f64,
     pub synth_temperature: f64,
     pub top_p: f64,
+    /// Per-role reasoning effort and the thinking-style override — the model-aware
+    /// request-shaping knobs the [`crate::consult::Dialect`] reads alongside the
+    /// sampling fields. Seeded from [`Defaults`], overridable per profile. See
+    /// `docs/config.md`.
+    pub explorer_effort: String,
+    pub synth_effort: String,
+    pub thinking_style: ThinkingStyleOverride,
     /// Per-request deadline applied to this profile's HTTP client (`.timeout`):
     /// the wall-clock ceiling on a single completion call. rig's prompt loop is
     /// non-streaming and exposes no native timeout, so without this a provider
@@ -529,6 +553,9 @@ fn template_for_kind(kind: ProviderKind, defaults: &Defaults) -> Profile {
         explorer_temperature: defaults.explorer_temperature,
         synth_temperature: defaults.synth_temperature,
         top_p: defaults.top_p,
+        explorer_effort: defaults.explorer_effort.clone(),
+        synth_effort: defaults.synth_effort.clone(),
+        thinking_style: defaults.thinking_style,
         request_timeout: defaults.request_timeout,
     }
 }
@@ -611,6 +638,9 @@ struct RawDefaults {
     explorer_temperature: Option<f64>,
     synth_temperature: Option<f64>,
     top_p: Option<f64>,
+    explorer_effort: Option<String>,
+    synth_effort: Option<String>,
+    thinking_style: Option<String>,
     request_timeout_secs: Option<u64>,
     session_capacity: Option<usize>,
 }
@@ -631,6 +661,9 @@ struct RawProfile {
     explorer_temperature: Option<f64>,
     synth_temperature: Option<f64>,
     top_p: Option<f64>,
+    explorer_effort: Option<String>,
+    synth_effort: Option<String>,
+    thinking_style: Option<String>,
     request_timeout_secs: Option<u64>,
 }
 
@@ -685,6 +718,17 @@ impl RawProfile {
         if let Some(v) = self.top_p {
             p.top_p = v;
         }
+        if let Some(v) = &self.explorer_effort {
+            p.explorer_effort = v.clone();
+        }
+        if let Some(v) = &self.synth_effort {
+            p.synth_effort = v.clone();
+        }
+        if let Some(v) = &self.thinking_style {
+            p.thinking_style = v
+                .parse()
+                .with_context(|| format!("profile {:?} thinking_style", p.name))?;
+        }
         if let Some(v) = self.request_timeout_secs {
             p.request_timeout = Duration::from_secs(v);
         }
@@ -710,6 +754,12 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
         explorer_temperature: raw.explorer_temperature.unwrap_or(d.explorer_temperature),
         synth_temperature: raw.synth_temperature.unwrap_or(d.synth_temperature),
         top_p: raw.top_p.unwrap_or(d.top_p),
+        explorer_effort: raw.explorer_effort.unwrap_or(d.explorer_effort),
+        synth_effort: raw.synth_effort.unwrap_or(d.synth_effort),
+        thinking_style: match raw.thinking_style {
+            Some(s) => s.parse().context("[defaults] thinking_style")?,
+            None => d.thinking_style,
+        },
         request_timeout: raw
             .request_timeout_secs
             .map(Duration::from_secs)
@@ -790,6 +840,17 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_TOP_P") {
         defaults.top_p = Some(parse_env("KAIBO_TOP_P", &v)?);
+    }
+    // Effort and thinking_style are strings (provider-validated / parsed at merge),
+    // so no numeric parse here — just fold the raw value in.
+    if let Some(v) = get("KAIBO_EXPLORER_EFFORT") {
+        defaults.explorer_effort = Some(v);
+    }
+    if let Some(v) = get("KAIBO_SYNTH_EFFORT") {
+        defaults.synth_effort = Some(v);
+    }
+    if let Some(v) = get("KAIBO_THINKING_STYLE") {
+        defaults.thinking_style = Some(v);
     }
     if let Some(v) = get("KAIBO_REQUEST_TIMEOUT_SECS") {
         defaults.request_timeout_secs = Some(parse_env("KAIBO_REQUEST_TIMEOUT_SECS", &v)?);

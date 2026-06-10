@@ -214,6 +214,50 @@ fn out_of_range_sampling_is_a_loud_error() {
 }
 
 #[test]
+fn effort_and_thinking_style_default_and_override() {
+    use kaibo::consult::ThinkingStyleOverride;
+
+    // Built-in defaults: "high" both roles, Auto classification.
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.explorer_effort, "high");
+    assert_eq!(c.defaults.synth_effort, "high");
+    assert_eq!(c.defaults.thinking_style, ThinkingStyleOverride::Auto);
+
+    let c = Config::from_toml_str(
+        r#"
+        [defaults]
+        synth_effort = "max"
+
+        [profiles.anthropic]
+        explorer_effort = "low"
+        thinking_style = "adaptive"
+        "#,
+    )
+    .unwrap();
+
+    // anthropic overrides explorer_effort and thinking_style; inherits the file's synth_effort.
+    let a = c.resolve_profile("anthropic").unwrap();
+    assert_eq!(a.explorer_effort, "low");
+    assert_eq!(a.synth_effort, "max");
+    assert_eq!(a.thinking_style, ThinkingStyleOverride::Adaptive);
+    // A profile that overrode nothing inherits the file default (synth) and built-in rest.
+    let d = c.resolve_profile("deepseek").unwrap();
+    assert_eq!(d.synth_effort, "max");
+    assert_eq!(d.explorer_effort, "high");
+    assert_eq!(d.thinking_style, ThinkingStyleOverride::Auto);
+}
+
+#[test]
+fn bad_thinking_style_is_a_loud_error() {
+    // No silent fallback: a value outside auto|adaptive|budget is a typo, caught at load.
+    let err = Config::from_toml_str("[profiles.anthropic]\nthinking_style = \"bogus\"\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("thinking_style") && format!("{err:#}").contains("bogus"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
 fn request_timeout_seeds_from_defaults_and_overrides_per_profile() {
     // A slow local model wants a longer leash than a hosted API; the seam is a
     // [defaults] seed that a profile may raise (or lower) on its own.
@@ -510,6 +554,9 @@ fn key_optional_profile_falls_back_to_placeholder() {
         explorer_temperature: 0.1,
         synth_temperature: 0.3,
         top_p: 0.95,
+        explorer_effort: "high".into(),
+        synth_effort: "high".into(),
+        thinking_style: kaibo::consult::ThinkingStyleOverride::Auto,
         request_timeout: std::time::Duration::from_secs(900),
     };
     assert_eq!(p.resolve_key().unwrap(), PLACEHOLDER_OPENAI_KEY);
@@ -536,6 +583,9 @@ fn key_optional_profile_with_a_present_but_empty_key_file_errors() {
         explorer_temperature: 0.1,
         synth_temperature: 0.3,
         top_p: 0.95,
+        explorer_effort: "high".into(),
+        synth_effort: "high".into(),
+        thinking_style: kaibo::consult::ThinkingStyleOverride::Auto,
         request_timeout: std::time::Duration::from_secs(900),
     };
     let err = p.resolve_key().unwrap_err();
@@ -646,6 +696,9 @@ fn required_key_with_no_source_is_an_error() {
         explorer_temperature: 0.1,
         synth_temperature: 0.3,
         top_p: 0.95,
+        explorer_effort: "high".into(),
+        synth_effort: "high".into(),
+        thinking_style: kaibo::consult::ThinkingStyleOverride::Auto,
         request_timeout: std::time::Duration::from_secs(900),
     };
     assert!(p.resolve_key().is_err());

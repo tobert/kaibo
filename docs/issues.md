@@ -89,16 +89,11 @@ profiles and are overridable per profile in `config.toml` (shipped; `docs/config
 The in-sync-with-pals discipline for the built-in defaults stays regardless.
 
 ### Per-model request shaping (the `Dialect` seam): remaining knobs
-The `Dialect` (`consult.rs`) now resolves request params per (kind, model) from a
-profile, asked per *phase* against its own model — so a Gemini synth/explorer that
-straddle the 3-line capability boundary each get the right shape. Thinking is
-model-aware (Gemini 3-line → `thinkingLevel`, 2.5/3.5 → `thinkingBudget`). Remaining
-knobs to land on the same seam:
-- **DeepSeek `reasoning_effort` per role (possible tune).** kaibo sends
-  `reasoning_effort: "high"` for both phases. DeepSeek auto-selects `"max"` for heavy
-  agent runs; if the capable `consult`/`synthesize` arm wants more depth, bump that
-  arm to `"max"` (the `Dialect` already resolves per role). Probe whether it's worth
-  the latency before defaulting it.
+The `Dialect` → `ModelShape` (`consult.rs`) resolves request params per (kind, model)
+from a profile, asked per *phase* against its own model. Thinking is model-aware across
+all providers (Anthropic adaptive vs enabled-budget, Gemini 3-line `thinkingLevel` vs
+2.5/3.5 `thinkingBudget`), reasoning depth is per-role effort, and a `thinking_style`
+config knob overrides the Anthropic classifier. Remaining knobs to land on the same seam:
 - **Static budget.** `THINKING_BUDGET` (8192) and `max_tokens` (16384) are constants,
   not per-model/per-phase. Fine today; if a provider caps output below 16384 it'll
   400 (DeepSeek accepted 16384 in testing) — cap that arm rather than lowering the
@@ -109,17 +104,10 @@ knobs to land on the same seam:
   budget because the 2026-06-06 live test confirmed budget works there. If a future
   3.5 build *rejects* budget, widen the classifier — but confirm with a live probe,
   don't guess.
-- **Anthropic thinking shape is model-blind (latent 400 on the newest Opus).**
-  `thinking_params` hardcodes `thinking:{type:"enabled",budget_tokens}` for *all*
-  Anthropic models. That's fine for the default `claude-sonnet-4-6` (enabled/budget is
-  deprecated-but-functional there), but Opus 4.7/4.8 *removed* it — they 400 and require
-  `thinking:{type:"adaptive"}` (depth via `output_config.effort`), and they also reject
-  `temperature`/`top_p`/`top_k` outright (not just under thinking). So a profile pointed
-  at a 4.7/4.8 model would 400 on the thinking block itself, before our new sampling-drop
-  even matters. Surfaced 2026-06-10 while fixing the thinking+temperature 400. Fix on the
-  same `Dialect` seam when an Anthropic profile actually targets those models: make the
-  Anthropic arm model-aware (adaptive vs enabled/budget) the way Gemini's already is, and
-  confirm against a live probe before guessing the model boundary.
+- **Anthropic adaptive boundary is empirical.** `is_anthropic_adaptive` flips Opus
+  4.6+/Sonnet 4.6/Fable 5 to adaptive (the rest stay enabled-budget). Add ids as models
+  ship, or set `thinking_style` per profile to override; confirm a new id with the
+  `#[ignore]`d Opus-4.8 probe rather than guessing.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.

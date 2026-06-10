@@ -54,11 +54,24 @@ Profile       = { name, kind, base_url?, key source, models, per-profile tunable
 - **`explorer_temperature`, `synth_temperature`, and `top_p` are per-profile
   sampling overrides** of the `[defaults]` values (defaults `0.1` / `0.3` / `0.95`).
   Temperature is per *role*: the explorer gathers exact citations, so it runs cold;
-  the synth composes the answer, so it gets a touch more room. They're sent to every
-  provider that accepts them — top-level for Anthropic/DeepSeek/OpenAI, under
-  `generationConfig` (camelCase `topP`) for Gemini. Per-profile because a local model
-  may want different sampling than a hosted one. Temperature must be in `[0.0, 2.0]`
-  and `top_p` in `(0.0, 1.0]`; an out-of-range value is rejected at load, not clamped.
+  the synth composes the answer, so it gets a touch more room. Sent where a model
+  accepts them — top-level for DeepSeek/OpenAI, under `generationConfig` (camelCase
+  `topP`) for Gemini. **Anthropic drops sampling whenever thinking is on** (every
+  Anthropic profile, by default): the Messages API 400s on a custom `temperature`
+  under thinking, and thinking is the higher-value default, so it wins. Temperature
+  must be in `[0.0, 2.0]` and `top_p` in `(0.0, 1.0]`; an out-of-range value is
+  rejected at load, not clamped.
+- **`explorer_effort` and `synth_effort` are per-role reasoning-depth overrides**
+  (default `"high"` both roles) for the models that take an effort param: Anthropic's
+  adaptive tier (→ `output_config.effort`) and DeepSeek (→ `reasoning_effort`). A
+  passthrough string the provider validates (like a model id), so a new level lands
+  without a code change — bump `synth_effort` to `"max"`/`"xhigh"` for heavier synth
+  runs. Ignored by models with no effort sink (budget-tier Anthropic, Gemini, OpenAI).
+- **`thinking_style` forces the Anthropic thinking shape** (`auto` | `adaptive` |
+  `budget`, default `auto`) instead of the built-in classifier. `auto` picks adaptive
+  for Opus 4.6+/Sonnet 4.6/Fable 5 and enabled-budget for older models + Haiku 4.5;
+  set `adaptive` or `budget` to override when a new or misclassified model ships. A
+  no-op for non-Anthropic kinds. An unknown value is a loud load error.
 - **`request_timeout_secs` is a per-profile override** (default 900 = 15 min) of the
   per-request LLM deadline: the wall-clock ceiling on a *single* completion call.
   rig's prompt loop is non-streaming and has no native timeout, so a provider that
@@ -135,6 +148,9 @@ else is mechanical:
 | explorer temperature | `defaults.explorer_temperature` *(per-profile override)* | `KAIBO_EXPLORER_TEMPERATURE` | — |
 | synth temperature | `defaults.synth_temperature` *(per-profile override)* | `KAIBO_SYNTH_TEMPERATURE` | — |
 | nucleus top_p | `defaults.top_p` *(per-profile override)* | `KAIBO_TOP_P` | — |
+| explorer effort | `defaults.explorer_effort` *(per-profile override)* | `KAIBO_EXPLORER_EFFORT` | — |
+| synth effort | `defaults.synth_effort` *(per-profile override)* | `KAIBO_SYNTH_EFFORT` | — |
+| thinking style | `defaults.thinking_style` *(per-profile override)* | `KAIBO_THINKING_STYLE` | — |
 | LLM request timeout (s) | `defaults.request_timeout_secs` *(per-profile override)* | `KAIBO_REQUEST_TIMEOUT_SECS` | — |
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |

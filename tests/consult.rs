@@ -3,7 +3,8 @@
 use kaibo::config::{default_models, Config, Profile};
 use kaibo::consult::{
     consult, explore, request_params, synthesize, synthesize_user_prompt, thinking_params,
-    ConsultConfig, THINKING_BUDGET,
+    ConsultConfig, Dialect, ModelShape, Role, ThinkingStyleOverride, DEFAULT_EFFORT,
+    THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
 
@@ -65,12 +66,18 @@ fn synthesize_prompt_treats_blank_context_as_absent() {
 
 #[test]
 fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
-    // Anthropic: extended thinking via a top-level `thinking` block (rig flattens
-    // additional_params into the Messages request). Model id is ignored.
-    let a = thinking_params(ProviderKind::Anthropic, "claude-sonnet-4-6", THINKING_BUDGET)
-        .expect("anthropic has a thinking toggle");
-    assert_eq!(a["thinking"]["type"], "enabled");
-    assert_eq!(a["thinking"]["budget_tokens"], THINKING_BUDGET);
+    // Anthropic is model-aware: Haiku 4.5 (and older) take the legacy enabled/budget
+    // block; Sonnet 4.6 (and newer) take adaptive thinking. Both via a top-level block
+    // rig flattens into the Messages request.
+    let budget = thinking_params(ProviderKind::Anthropic, "claude-haiku-4-5", THINKING_BUDGET)
+        .expect("anthropic budget-tier has a thinking toggle");
+    assert_eq!(budget["thinking"]["type"], "enabled");
+    assert_eq!(budget["thinking"]["budget_tokens"], THINKING_BUDGET);
+
+    let adaptive = thinking_params(ProviderKind::Anthropic, "claude-sonnet-4-6", THINKING_BUDGET)
+        .expect("anthropic adaptive-tier has a thinking toggle");
+    assert_eq!(adaptive["thinking"]["type"], "adaptive");
+    assert!(adaptive["thinking"].get("budget_tokens").is_none(), "adaptive carries no budget");
 
     // Gemini 2.5: nested under generationConfig.thinkingConfig with camelCase keys —
     // rig parses these into a typed GenerationConfig, so the shape must be exact.
@@ -111,8 +118,9 @@ fn gemini_3_line_takes_thinking_level_not_budget() {
 
 #[test]
 fn thinking_budget_is_threaded_through_not_hardcoded() {
-    // A per-profile budget must reach the request, not the old global constant.
-    let a = thinking_params(ProviderKind::Anthropic, "claude-sonnet-4-6", 4096)
+    // A per-profile budget must reach the request, not the old global constant. Use a
+    // budget-tier Anthropic model (Haiku 4.5) — the adaptive tier carries no budget.
+    let a = thinking_params(ProviderKind::Anthropic, "claude-haiku-4-5", 4096)
         .expect("anthropic toggle");
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
     let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", 4096).expect("gemini toggle");
@@ -131,12 +139,13 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     assert_eq!(gc["thinkingConfig"]["thinkingBudget"], THINKING_BUDGET, "thinking still rides along");
     assert!(g.get("temperature").is_none(), "must not leak to top level for Gemini");
 
-    // Anthropic: thinking wins — sampling is dropped. The Messages API 400s on any
-    // `temperature != 1` (and restricts top_p/top_k) whenever thinking is enabled
+    // Anthropic: thinking wins — sampling is dropped (any tier). The Messages API 400s on
+    // any `temperature != 1` (and restricts top_p/top_k) whenever thinking is enabled
     // ("temperature may only be set to 1 when thinking is enabled"). Thinking is the
     // higher-value default (AGENTS.md "Driving the models"), so we keep it and let the
-    // per-role sampling go inert rather than 400 the request.
-    let a = request_params(ProviderKind::Anthropic, "claude-sonnet-4-6", 4096, Some(0.3), Some(0.95))
+    // per-role sampling go inert rather than 400 the request. (Budget tier here; the
+    // adaptive tier drops sampling the same way — see anthropic_newest_models_*.)
+    let a = request_params(ProviderKind::Anthropic, "claude-haiku-4-5", 4096, Some(0.3), Some(0.95))
         .expect("anthropic params");
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
     assert!(a.get("temperature").is_none(), "temperature must not ride alongside thinking for Anthropic");
@@ -168,20 +177,106 @@ fn anthropic_thinking_suppresses_sampling_or_the_api_400s() {
     // extended thinking is on. Thinking is on for every Anthropic profile by default,
     // and temperature has a default on every profile, so the per-role sampling feature
     // collides with thinking on the very first call. Thinking wins; sampling drops.
-    let a = request_params(ProviderKind::Anthropic, "claude-sonnet-4-6", THINKING_BUDGET, Some(0.3), Some(0.95))
+    // (Budget tier shown; the adaptive tier drops sampling identically.)
+    let a = request_params(ProviderKind::Anthropic, "claude-haiku-4-5", THINKING_BUDGET, Some(0.3), Some(0.95))
         .expect("anthropic still sends the thinking block");
     assert_eq!(a["thinking"]["type"], "enabled");
     assert_eq!(a["thinking"]["budget_tokens"], THINKING_BUDGET);
     assert!(a.get("temperature").is_none(), "temperature would 400 alongside thinking");
     assert!(a.get("top_p").is_none(), "top_p is dropped with it, for the same reason");
 
-    // The suppression is keyed on the thinking block being present, not on the provider
-    // alone: contrast DeepSeek, which also enables thinking but *accepts* sampling, so
-    // its knobs ride through untouched.
+    // The suppression is keyed on whether the model accepts sampling under thinking, not
+    // on the provider alone: contrast DeepSeek, which also enables thinking but *accepts*
+    // sampling, so its knobs ride through untouched.
     let d = request_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET, Some(0.3), Some(0.95))
         .expect("deepseek params");
     assert_eq!(d["temperature"], 0.3, "DeepSeek keeps sampling even with thinking on");
     assert_eq!(d["top_p"], 0.95);
+}
+
+#[test]
+fn anthropic_newest_models_get_adaptive_thinking() {
+    // Opus 4.7/4.8 and Fable 5 *require* adaptive: enabled/budget AND temperature/top_p
+    // all 400. Each gets `{thinking:{type:adaptive}, output_config:{effort}}` and no
+    // sampling. (Mirrors the live "fix anthropic" goal — these would 400 on the old shape.)
+    for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"] {
+        let a = request_params(ProviderKind::Anthropic, model, THINKING_BUDGET, Some(0.3), Some(0.95))
+            .unwrap_or_else(|| panic!("{model} sends a thinking block"));
+        assert_eq!(a["thinking"]["type"], "adaptive", "{model} wants adaptive");
+        assert!(a["thinking"].get("budget_tokens").is_none(), "{model} rejects budget_tokens");
+        assert_eq!(a["output_config"]["effort"], DEFAULT_EFFORT, "{model} carries effort");
+        assert!(a.get("temperature").is_none(), "{model} rejects temperature");
+        assert!(a.get("top_p").is_none(), "{model} rejects top_p");
+    }
+}
+
+#[test]
+fn anthropic_classifier_boundary() {
+    // Pin the empirical boundary so a drift is a failing test, not a silent 400.
+    let thinking_type = |model: &str| {
+        request_params(ProviderKind::Anthropic, model, THINKING_BUDGET, None, None)
+            .unwrap_or_else(|| panic!("{model} sends a thinking block"))["thinking"]["type"]
+            .as_str()
+            .expect("thinking.type is a string")
+            .to_string()
+    };
+    for model in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-fable-5"] {
+        assert_eq!(thinking_type(model), "adaptive", "{model} is the adaptive tier");
+    }
+    for model in ["claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5", "claude-opus-4-1"] {
+        assert_eq!(thinking_type(model), "enabled", "{model} stays on enabled/budget");
+    }
+}
+
+#[test]
+fn effort_is_per_role_and_provider_mapped() {
+    // Effort lands only where the model takes it, at that provider's wire field.
+    let anthropic = ModelShape::resolve(ProviderKind::Anthropic, "claude-opus-4-8", ThinkingStyleOverride::Auto)
+        .to_params(THINKING_BUDGET, None, None, "xhigh")
+        .expect("adaptive params");
+    assert_eq!(anthropic["output_config"]["effort"], "xhigh");
+
+    let deepseek = ModelShape::resolve(ProviderKind::DeepSeek, "deepseek-v4-pro", ThinkingStyleOverride::Auto)
+        .to_params(THINKING_BUDGET, None, None, "max")
+        .expect("deepseek params");
+    assert_eq!(deepseek["reasoning_effort"], "max");
+
+    // Budget-tier Anthropic and Gemini have no effort sink — the value is ignored, not leaked.
+    let budget = ModelShape::resolve(ProviderKind::Anthropic, "claude-haiku-4-5", ThinkingStyleOverride::Auto)
+        .to_params(THINKING_BUDGET, None, None, "xhigh")
+        .expect("budget params");
+    assert!(budget.get("output_config").is_none(), "budget tier has no effort sink");
+    let gemini = ModelShape::resolve(ProviderKind::Gemini, "gemini-2.5-flash", ThinkingStyleOverride::Auto)
+        .to_params(THINKING_BUDGET, None, None, "xhigh")
+        .expect("gemini params");
+    assert!(gemini.get("reasoning_effort").is_none(), "Gemini has no effort sink");
+    assert!(gemini.get("output_config").is_none());
+
+    // Per-role resolution through the Dialect: explorer and synth get their own effort.
+    let mut p = profile("anthropic");
+    p.explorer_effort = "low".into();
+    p.synth_effort = "max".into();
+    let dialect = Dialect::from_profile(&p);
+    let explorer = dialect.request_params("claude-opus-4-8", Role::Explorer).expect("explorer params");
+    let synth = dialect.request_params("claude-opus-4-8", Role::Synth).expect("synth params");
+    assert_eq!(explorer["output_config"]["effort"], "low", "explorer effort");
+    assert_eq!(synth["output_config"]["effort"], "max", "synth effort");
+}
+
+#[test]
+fn thinking_style_override_forces_a_tier() {
+    // The escape hatch both ways: force an older model onto adaptive, or a newest model
+    // back onto budget, when the classifier is wrong or a new id ships.
+    let forced_adaptive = ModelShape::resolve(ProviderKind::Anthropic, "claude-sonnet-4-5", ThinkingStyleOverride::Adaptive)
+        .to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT)
+        .expect("forced adaptive");
+    assert_eq!(forced_adaptive["thinking"]["type"], "adaptive", "override beats the classifier");
+
+    let forced_budget = ModelShape::resolve(ProviderKind::Anthropic, "claude-opus-4-8", ThinkingStyleOverride::Budget)
+        .to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT)
+        .expect("forced budget");
+    assert_eq!(forced_budget["thinking"]["type"], "enabled", "override beats the classifier");
+    assert_eq!(forced_budget["thinking"]["budget_tokens"], THINKING_BUDGET);
 }
 
 #[test]
@@ -446,6 +541,39 @@ async fn two_phase_consult_answers_from_the_real_tree() {
 
     eprintln!("=== REPORT (explorer) ===\n{}\n", out.report);
     eprintln!("=== ANSWER (synth) ===\n{}\n", out.answer);
+
+    let lower = out.answer.to_lowercase();
+    assert!(
+        lower.contains("sandbox") || lower.contains("read-only") || lower.contains("read only"),
+        "answer should explain the read-only sandbox mechanism, got: {}",
+        out.answer
+    );
+}
+
+#[tokio::test]
+#[ignore = "hits the Anthropic API on Opus 4.8 (adaptive-only tier); run with --ignored and a key"]
+async fn adaptive_only_anthropic_model_round_trips() {
+    // The real proof of the "fix anthropic" work: Opus 4.8 *rejects* the old
+    // enabled/budget thinking block AND sampling outright (400). Pin both phases to it so
+    // a regression in the adaptive shape (or the output_config.effort flatten through rig)
+    // surfaces as a live 400 here, not in production — what the offline tests can't prove.
+    if let Err(e) = load(ProviderKind::Anthropic) {
+        panic!("no Anthropic credential for live test: {e}");
+    }
+
+    let mut p = profile("anthropic");
+    p.explorer_model = "claude-opus-4-8".into();
+    p.synth_model = "claude-opus-4-8".into();
+
+    let out = consult(
+        "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        env!("CARGO_MANIFEST_DIR"),
+        &p,
+        &ConsultConfig::default(),
+        None,
+    )
+    .await
+    .expect("adaptive-only Opus 4.8 consult should succeed (no 400 on the thinking shape)");
 
     let lower = out.answer.to_lowercase();
     assert!(
