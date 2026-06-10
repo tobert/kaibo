@@ -138,6 +138,7 @@ else is mechanical:
 |---|---|---|---|
 | config file location | — | `KAIBO_CONFIG` | `--config <path>` |
 | default root | `server.root` | `KAIBO_ROOT` | `--root` |
+| additional allowed trees | `server.allow_paths` *(list)* | `KAIBO_ALLOW_PATHS` *(colon-separated)* | `--allow-path DIR` *(repeatable)* |
 | default provider/profile | `server.provider` | `KAIBO_PROVIDER` | `--provider` |
 | disable a tool | `server.tools.<t> = false` | `KAIBO_NO_<T>` | `--no-<t>` |
 | log filter | `server.log` | `RUST_LOG` *(wins)* / `KAIBO_LOG` | — |
@@ -195,6 +196,72 @@ Loading rules, in the spirit of "crashing beats silent corruption":
 
 Project-local layering (a repo-root `.kaibo.toml` merged over the user config) is a
 plausible later layer — noted, not in this first cut.
+
+## Path containment
+
+**Always on.** Every tool call's `path` argument (or the server `--root` when `path`
+is omitted) is resolved — `std::fs::canonicalize` expands symlinks and collapses `..`
+— and then checked against the **allowed set**. A path that doesn't fall at-or-under
+one of the allowed trees is `invalid_params`, naming the allowed trees and the three
+knobs that widen them.
+
+**The allowed set** is constructed at startup from the canonicalized `--root` plus
+every canonicalized `--allow-path`. When both are absent the allowed set defaults to
+the canonicalized launch cwd. MCP clients start stdio servers with cwd = workspace,
+so the zero-config case scopes itself to the project naturally, without any operator
+action. The default isn't silent: the resolved allowed set is reported in a startup
+log line and in the `## Scope` section of the server's MCP `instructions` (visible in
+every `initialize` response), and at `kaibo://config`.
+
+**Widening the boundary:**
+
+```toml
+# config.toml
+[server]
+allow_paths = ["/home/atobey/shared-libs", "/data/fixtures"]
+```
+
+```sh
+# env — colon-separated like PATH
+KAIBO_ALLOW_PATHS=/home/atobey/shared-libs:/data/fixtures kaibo
+
+# CLI — repeatable
+kaibo --allow-path /home/atobey/shared-libs --allow-path /data/fixtures
+```
+
+A non-empty CLI `--allow-path` set replaces the env/file layer entirely (same
+precedence rule as `--root`). To lift all limits: `--allow-path /`.
+
+**Containment ≠ defaulting.** With no `--root`, an omitted `path` still errors
+("no `path` provided and the server has no default `--root`") — the launch cwd
+bounds what you *may ask about*, it never becomes what you *asked about*. The error
+is `invalid_params`, surfaced where the caller can read it.
+
+**Resolution.** `resolve_root` (`src/server.rs`) returns the *canonicalized* path,
+so the kaish VFS mount target is always resolved. A nonexistent or non-directory
+entry in `--root` / `--allow-path` is a loud construction error at startup.
+
+## kaibo://config
+
+An MCP resource at the URI `kaibo://config` (`application/toml`) exposes the server's
+resolved runtime state. Reading it before making calls tells the calling model (or an
+operator) the full picture:
+
+- `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
+- `default_root` — the `--root` value, if set
+- `default_provider` — which profile is used when a call omits `provider`
+- `tools` — which of the four tools are currently advertised
+- `sandbox` — exec timeout, output cap, and any extra disabled builtins
+- `profiles` — each provider profile: its kind, models, key source env var name and
+  key file path (never the resolved key value), `key_optional`, `base_url` (openai
+  kind only), and reasoning-depth fields
+
+**Secret-safety contract:** `kaibo://config` includes key *source metadata* — the
+env var name and file path an operator configured — but never the resolved key value.
+Keys are resolved lazily at call time from `credentials.rs` and never cached in the
+`Config` struct, so the render function has no field that holds a secret. The
+`api_key_env` and `api_key_file` names are included deliberately: an operator
+debugging a missing-key error needs to see what source the profile is pointing at.
 
 ## Code shape (for the implementation follow-up)
 

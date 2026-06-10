@@ -229,6 +229,12 @@ impl Profile {
 pub struct Config {
     /// Default project root when a call omits `path` (`--root` / `KAIBO_ROOT`).
     pub root: Option<PathBuf>,
+    /// Additional allowed path trees beyond `root`. A per-call `path` must
+    /// canonicalize to at-or-under `root` OR one of these trees. Empty means
+    /// "only root (or cwd fallback) is allowed". Set via `--allow-path`,
+    /// `KAIBO_ALLOW_PATHS` (colon-separated), or `[server] allow_paths` in
+    /// config.toml. Non-empty CLI list replaces lower layers.
+    pub allow_paths: Vec<PathBuf>,
     /// Default profile name when a call omits `provider`.
     pub default_provider: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -433,10 +439,17 @@ impl Config {
         let default_provider = server.provider.unwrap_or_else(|| "anthropic".to_string());
         let log = server.log.unwrap_or_else(|| "kaibo=info".to_string());
         let root = server.root.map(PathBuf::from);
+        let allow_paths = server
+            .allow_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
 
         let cfg = Self {
             root,
+            allow_paths,
             default_provider,
             log,
             tools,
@@ -459,12 +472,13 @@ impl Config {
 
     /// Apply CLI overrides (highest precedence). Called from `main` after load.
     /// CLI can only *disable* a tool (the `--no-<tool>` flags); enabling is the job
-    /// of the file/env/built-in layers.
+    /// of the file/env/built-in layers. A non-empty `allow_paths` replaces lower layers.
     pub fn apply_cli(
         &mut self,
         root: Option<PathBuf>,
         provider: Option<String>,
         disable: ToolDisables,
+        allow_paths: Vec<PathBuf>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
@@ -483,6 +497,10 @@ impl Config {
         }
         if disable.run_kaish {
             self.tools.run_kaish = false;
+        }
+        // Non-empty CLI allow_paths replaces lower layers (env/file).
+        if !allow_paths.is_empty() {
+            self.allow_paths = allow_paths;
         }
     }
 }
@@ -614,6 +632,10 @@ struct RawSandbox {
 #[serde(deny_unknown_fields)]
 struct RawServer {
     root: Option<String>,
+    /// Additional allowed path trees: a per-call `path` must canonicalize to
+    /// at-or-under `root` OR one of these. Env override: `KAIBO_ALLOW_PATHS`
+    /// (colon-separated). CLI override: repeatable `--allow-path DIR`.
+    allow_paths: Option<Vec<String>>,
     provider: Option<String>,
     log: Option<String>,
     tools: Option<RawTools>,
@@ -798,6 +820,16 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     let server = raw.server.get_or_insert_with(Default::default);
     if let Some(v) = get("KAIBO_ROOT") {
         server.root = Some(v);
+    }
+    if let Some(v) = get("KAIBO_ALLOW_PATHS") {
+        // Colon-separated like PATH; an empty component is silently skipped.
+        let paths: Vec<String> = std::env::split_paths(&v)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        if !paths.is_empty() {
+            server.allow_paths = Some(paths);
+        }
     }
     if let Some(v) = get("KAIBO_PROVIDER") {
         server.provider = Some(v);

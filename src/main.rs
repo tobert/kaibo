@@ -28,9 +28,20 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Default project root to explore when a call omits `path`.
+    /// Default project root to explore when a call omits `path`. Also joins the
+    /// containment allowed set: a call's `path` must resolve to at-or-under --root
+    /// or one of the --allow-path trees. With neither flag the allowed set defaults
+    /// to the launch cwd (MCP clients start stdio servers with cwd = workspace).
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
+
+    /// Additional allowed path tree. Repeatable. A per-call `path` must resolve
+    /// to at-or-under --root or one of these; use --allow-path / to lift all
+    /// limits. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
+    /// [server] allow_paths in config.toml. A non-empty set of --allow-path flags
+    /// replaces the env/file layer.
+    #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append)]
+    allow_path: Vec<PathBuf>,
 
     /// Default provider/profile when a call omits it (a built-in kind name or a
     /// profile defined in config.toml). Built-ins: anthropic | deepseek | gemini |
@@ -74,7 +85,8 @@ async fn main() -> Result<()> {
     };
 
     // CLI is the top layer: overlay it over the loaded config. `disable` carries the
-    // --no-<tool> flags (true = the user asked to drop that tool).
+    // --no-<tool> flags (true = the user asked to drop that tool). A non-empty
+    // `allow_path` list replaces the env/file layer.
     config.apply_cli(
         args.root.clone(),
         args.provider.clone(),
@@ -84,6 +96,7 @@ async fn main() -> Result<()> {
             synthesize: args.no_synthesize,
             run_kaish: args.no_run_kaish,
         },
+        args.allow_path.clone(),
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
@@ -101,10 +114,6 @@ async fn main() -> Result<()> {
         )
         .with(McpBridgeLayer::new(log_tx))
         .init();
-
-    if let Some(root) = &config.root {
-        anyhow::ensure!(root.is_dir(), "root is not a directory: {}", root.display());
-    }
 
     // A zero-tool server is a misconfiguration, not a mode: refuse it loudly here,
     // before serve(), with a non-zero exit so a supervisor catches it. We prefer
@@ -129,12 +138,19 @@ async fn main() -> Result<()> {
     tracing::info!(
         provider = %config.default_provider,
         root = ?config.root.as_ref().map(|p| p.display().to_string()),
+        allow_paths = ?config.allow_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         profiles = ?config.profiles.keys().collect::<Vec<_>>(),
         gating = ?config.tools,
         "starting kaibo MCP server on stdio"
     );
 
     let handler = KaiboHandler::new(config)?;
+    // Log the resolved (canonicalized) allowed set so the operator can verify the
+    // containment boundary without inspecting config files.
+    tracing::info!(
+        allowed_set = ?handler.allowed_set().iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "containment boundary"
+    );
     // Grab the shared log floor before `serve` consumes the handler; the drain task
     // reads it so a client `setLevel` retunes verbosity live.
     let log_level = handler.mcp_log_level();

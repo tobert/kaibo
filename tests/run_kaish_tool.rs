@@ -32,9 +32,12 @@ async fn run_tool(handler: &KaiboHandler, path: &Path, script: &str) -> String {
         .join("\n")
 }
 
-fn handler_for(_root: &Path) -> KaiboHandler {
-    // No default root: the test passes `path` explicitly each call.
-    KaiboHandler::new(Config::builtin()).expect("handler builds")
+fn handler_for(root: &Path) -> KaiboHandler {
+    // Include the tempdir in the allowed set so containment passes — the test
+    // verifies sandbox behavior (read-only mount, builtins), not containment.
+    let mut config = Config::builtin();
+    config.allow_paths = vec![root.to_path_buf()];
+    KaiboHandler::new(config).expect("handler builds")
 }
 
 #[tokio::test]

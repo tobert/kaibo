@@ -22,6 +22,12 @@
 # Default project root when a call omits `path`. Omit to require `path` per call.
 # root = "/home/atobey/src/kaibo"
 
+# Additional allowed path trees beyond root. A per-call `path` must resolve to
+# at-or-under root OR one of these trees. With neither set, the server defaults
+# to the launch cwd. Also settable via --allow-path (CLI) or KAIBO_ALLOW_PATHS
+# (colon-separated env var); a non-empty CLI list replaces the env/file layer.
+# allow_paths = ["/home/atobey/shared-libs", "/data/shared"]
+
 # Default profile (by name) when a call omits `provider`.
 provider = "anthropic"
 

@@ -15,12 +15,15 @@
 //! progressively learn more kaish — syntax, scatter, the builtin index, a single
 //! builtin's parameters — without spending a tool turn.
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use kaish_kernel::help::{
     compose, get_help, list_topics, tool_help, HelpTopic, Recipe, SchemaContent,
 };
 use kaish_kernel::tools::ToolSchema;
+
+use crate::config::Config;
 
 /// The kaibo-specific half of the core: the read-only boundary, the exit-code
 /// contract, the no-cwd rule, and the line-number idioms that make citations
@@ -111,6 +114,46 @@ pub fn kaibo_instructions(schemas: &[ToolSchema]) -> String {
          `kaibo://kaish/scatter`, and the rest — or `kaibo://kaish/builtin/<name>` for \
          one builtin. `kaibo://kaish/sandbox` states kaibo's read-only contract and \
          exit codes. It's all in the shell too: `help`, `help syntax`, `help <builtin>`."
+    )
+}
+
+/// Like [`kaibo_instructions`] but with a **scope section** appended so the calling
+/// model always knows:
+/// - the default root (or that every call must pass one),
+/// - the allowed trees a per-call `path` must be at-or-under, and
+/// - that `kaibo://config` has the full picture.
+///
+/// Used by `get_info` so every `initialize` handshake surfaces the server's
+/// containment posture. Unit-testable: pass your own `Config` and `allowed_set`
+/// rather than fabricating a `RequestContext`.
+pub fn kaibo_instructions_with_scope(
+    schemas: &[ToolSchema],
+    config: &Config,
+    allowed_set: &[PathBuf],
+) -> String {
+    let base = kaibo_instructions(schemas);
+
+    // Scope section: always accurate, never ambiguous.
+    let root_line = match &config.root {
+        Some(r) => format!("- **Default root:** `{}`", r.display()),
+        None => "- **Default root:** none — every call must pass a `path` argument.".to_string(),
+    };
+    let allowed_lines: String = allowed_set
+        .iter()
+        .map(|p| format!("  - `{}`", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "{base}\n\n\
+         ## Scope\n\
+         This server's path containment is always on. A per-call `path` must \
+         canonicalize to at-or-under one of the allowed trees below.\n\n\
+         {root_line}\n\
+         - **Allowed trees:**\n\
+         {allowed_lines}\n\n\
+         Read `kaibo://config` for the full resolved runtime configuration — \
+         default provider, gated tools, sandbox limits, and all provider profiles."
     )
 }
 

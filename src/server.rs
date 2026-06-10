@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -28,7 +28,9 @@ use serde_json::json;
 use crate::config::{Config, Profile};
 use crate::consult::{consult, explore, synthesize, ConsultConfig};
 use crate::explorer::format_output;
-use crate::kaish_syntax::{kaibo_sandbox_doc, kaibo_instructions, render_builtin_help, render_topic, topics};
+use crate::kaish_syntax::{
+    kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
+};
 use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
@@ -42,6 +44,9 @@ const SANDBOX_URI: &str = "kaibo://kaish/sandbox";
 const BUILTIN_PREFIX: &str = "kaibo://kaish/builtin/";
 /// The URI template advertised for the per-builtin resources.
 const BUILTIN_URI_TEMPLATE: &str = "kaibo://kaish/builtin/{name}";
+/// The resolved runtime configuration: allowed paths, default provider, gated tools,
+/// sandbox limits, and profiles with their kind and key sources (never key values).
+const CONFIG_URI: &str = "kaibo://config";
 
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
@@ -77,7 +82,8 @@ pub struct ConsultInput {
     pub question: String,
 
     /// Absolute path to the project to explore. Optional only if the server was
-    /// launched with a default `--root`.
+    /// launched with a default `--root`. Must be at-or-under an allowed tree; see
+    /// `kaibo://config` for the server's current allowed set and how to widen it.
     #[serde(default)]
     pub path: Option<String>,
 
@@ -127,7 +133,8 @@ pub struct ExploreInput {
     pub question: String,
 
     /// Absolute path to the project. Optional only if the server was launched
-    /// with a default `--root`.
+    /// with a default `--root`. Must be at-or-under an allowed tree; see
+    /// `kaibo://config` for the server's current allowed set and how to widen it.
     #[serde(default)]
     pub path: Option<String>,
 
@@ -156,7 +163,8 @@ pub struct SynthesizeInput {
     pub context: Option<String>,
 
     /// Absolute path to the project. Optional only if the server was launched
-    /// with a default `--root`.
+    /// with a default `--root`. Must be at-or-under an allowed tree; see
+    /// `kaibo://config` for the server's current allowed set and how to widen it.
     #[serde(default)]
     pub path: Option<String>,
 
@@ -176,8 +184,9 @@ pub struct RunKaishInput {
     pub script: String,
 
     /// Absolute path to the project. Optional only if the server was launched
-    /// with a default `--root`. Each call starts at this root — there is no
-    /// persistent cwd across calls.
+    /// with a default `--root`. Must be at-or-under an allowed tree; see
+    /// `kaibo://config` for the server's current allowed set and how to widen it.
+    /// Each call starts at this root — there is no persistent cwd across calls.
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -202,6 +211,11 @@ pub struct KaiboHandler {
     /// clone — and the drain task in `main` — share the one cell; a `setLevel` on any
     /// request takes effect immediately for the whole server.
     mcp_log_level: Arc<AtomicU8>,
+    /// The canonicalized allowed path trees. A per-call path must canonicalize to
+    /// at-or-under one of these. Computed once at construction from config.root and
+    /// config.allow_paths; falls back to the canonicalized cwd when both are empty.
+    /// `Arc` because rmcp clones the handler per request.
+    allowed_set: Arc<Vec<PathBuf>>,
 }
 
 #[tool_router]
@@ -209,6 +223,11 @@ impl KaiboHandler {
     /// Build the handler from a resolved [`Config`]. Snapshots the kernel's builtin
     /// schemas up front (a cheap in-memory kernel); a failure here is a broken build,
     /// surfaced at startup rather than papered over with an empty help surface.
+    ///
+    /// Computes the canonicalized allowed set here so containment is structural: every
+    /// tool call routes through `resolve_root`, which checks this set. A nonexistent
+    /// or non-directory entry in root / allow_paths is a loud construction error —
+    /// a path that can't be canonicalized can't bound anything.
     pub fn new(config: Config) -> Result<Self> {
         let gating = config.tools;
         // `#[tool_router]` gathers every #[tool] method at compile time; gating is a
@@ -233,6 +252,38 @@ impl KaiboHandler {
                 tool_router.remove_route(name);
             }
         }
+
+        // Build the canonicalized allowed set. Each entry must be canonicalized now
+        // so `resolve_root`'s Path::starts_with check is sound (symlinks resolved,
+        // `..` collapsed). A nonexistent path can't bound anything — loud error.
+        let mut allowed: Vec<PathBuf> = Vec::new();
+        if let Some(root) = &config.root {
+            let canon = std::fs::canonicalize(root)
+                .with_context(|| format!("canonicalizing --root {}", root.display()))?;
+            if !canon.is_dir() {
+                anyhow::bail!("--root {} is not a directory", canon.display());
+            }
+            allowed.push(canon);
+        }
+        for p in &config.allow_paths {
+            let canon = std::fs::canonicalize(p)
+                .with_context(|| format!("canonicalizing --allow-path {}", p.display()))?;
+            if !canon.is_dir() {
+                anyhow::bail!("--allow-path {} is not a directory", canon.display());
+            }
+            allowed.push(canon);
+        }
+        // When no root and no allow_paths are given, fall back to the launch cwd.
+        // MCP clients start stdio servers with cwd = workspace, so the zero-config
+        // case scopes itself to the project naturally.
+        if allowed.is_empty() {
+            let cwd = std::env::current_dir()
+                .context("could not determine current directory for default allowed set")?;
+            let canon = std::fs::canonicalize(&cwd)
+                .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
+            allowed.push(canon);
+        }
+
         let sessions = SessionStore::new(config.defaults.session_capacity);
         Ok(Self {
             config: Arc::new(config),
@@ -240,6 +291,7 @@ impl KaiboHandler {
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
             mcp_log_level: Arc::new(AtomicU8::new(mcp_log::rank(mcp_log::DEFAULT_LEVEL))),
+            allowed_set: Arc::new(allowed),
         })
     }
 
@@ -267,18 +319,76 @@ impl KaiboHandler {
         names
     }
 
-    /// Resolve a call's project root: the explicit `path`, else the server's
-    /// `--root`. A call with neither is a parameter error, not a silent default.
+    /// The canonicalized allowed path trees for this handler. Every tool call's
+    /// resolved path must be at-or-under one of these. Exposed for tests and for
+    /// startup logging / the `kaibo://config` resource.
+    pub fn allowed_set(&self) -> Vec<PathBuf> {
+        (*self.allowed_set).clone()
+    }
+
+    /// Resolve a call's project root with containment enforcement:
+    ///
+    /// 1. Select the raw path: the explicit `path` arg, else the server's `--root`.
+    ///    An omitted `path` with no `--root` is a parameter error — not a silent
+    ///    default (containment does not change this existing behavior).
+    /// 2. Canonicalize the selected path (resolves symlinks and `..`). A path that
+    ///    doesn't exist is `invalid_params` with the canonicalize error.
+    /// 3. Require the canonicalized path to be at-or-under one of the allowed trees.
+    ///    A violation is `invalid_params` naming the allowed trees and the three
+    ///    widening knobs (`--allow-path`, `KAIBO_ALLOW_PATHS`, `[server] allow_paths`).
+    ///
+    /// Returns the CANONICALIZED path so the kaish mount target is always resolved.
     fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
-        match path {
-            Some(p) => Ok(PathBuf::from(p)),
+        // Step 1: select the raw path.
+        let raw = match path {
+            Some(p) => PathBuf::from(p),
             None => self.config.root.clone().ok_or_else(|| {
                 McpError::invalid_params(
                     "no `path` provided and the server has no default --root",
                     None,
                 )
-            }),
+            })?,
+        };
+
+        // Step 2: canonicalize — resolves symlinks and `..` so starts_with is sound.
+        let canon = std::fs::canonicalize(&raw).map_err(|e| {
+            McpError::invalid_params(
+                format!("path {} could not be resolved: {e}", raw.display()),
+                None,
+            )
+        })?;
+
+        // Step 2b: require a directory, symmetric with the construction-time check on
+        // --root and --allow-path entries. A file path passes canonicalization and
+        // containment but makes a degenerate session (cwd is a file); reject it here
+        // at the parameter boundary with a clear error rather than failing deep in kaish.
+        if !canon.is_dir() {
+            return Err(McpError::invalid_params(
+                format!("path {} is not a directory", canon.display()),
+                None,
+            ));
         }
+
+        // Step 3: containment check — must be at-or-under an allowed tree.
+        let allowed = &self.allowed_set;
+        if allowed.iter().any(|tree| canon.starts_with(tree)) {
+            return Ok(canon);
+        }
+
+        // Violation: name the allowed set and the three widening knobs.
+        let trees: Vec<String> = allowed.iter().map(|p| p.display().to_string()).collect();
+        Err(McpError::invalid_params(
+            format!(
+                "path {} resolves to {}, which is outside the allowed set [{}]. \
+                 To widen the boundary: pass --allow-path DIR on the command line, \
+                 set KAIBO_ALLOW_PATHS=DIR (colon-separated), or add \
+                 `[server] allow_paths = [\"DIR\"]` in config.toml.",
+                raw.display(),
+                canon.display(),
+                trees.join(", "),
+            ),
+            None,
+        ))
     }
 
     /// Resolve a call's provider profile: the explicit name (looked up in the
@@ -487,7 +597,11 @@ impl rmcp::ServerHandler for KaiboHandler {
                 icons: None,
                 website_url: None,
             },
-            instructions: Some(kaibo_instructions(&self.tool_schemas)),
+            instructions: Some(kaibo_instructions_with_scope(
+                &self.tool_schemas,
+                &self.config,
+                &self.allowed_set,
+            )),
         }
     }
 
@@ -531,7 +645,12 @@ impl rmcp::ServerHandler for KaiboHandler {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        read_kaibo_resource(&request.uri, &self.tool_schemas)
+        read_kaibo_resource_with_config(
+            &request.uri,
+            &self.tool_schemas,
+            &self.config,
+            &self.allowed_set,
+        )
     }
 }
 
@@ -546,16 +665,33 @@ fn markdown_resource(uri: &str, name: &str, description: &str) -> rmcp::model::R
     .no_annotation()
 }
 
-/// The resources kaibo advertises: its own read-only sandbox doc plus one per kaish
-/// help topic (sourced from `kaish-help`'s registry, so the list tracks upstream).
-/// Pure (no `self`, no transport) so the dispatch is unit-testable without
-/// fabricating a `RequestContext`.
+/// The resources kaibo advertises: the runtime config, the read-only sandbox doc,
+/// and one per kaish help topic (sourced from `kaish-help`'s registry, so the list
+/// tracks upstream). Pure (no `self`, no transport) so the dispatch is unit-testable
+/// without fabricating a `RequestContext`.
 fn kaibo_resources() -> Vec<rmcp::model::Resource> {
-    let mut resources = vec![markdown_resource(
-        SANDBOX_URI,
-        "kaibo read-only sandbox",
-        "kaibo's read-only boundary: line-number browsing idioms and the exit-code contract.",
-    )];
+    let mut resources = vec![
+        // The resolved runtime config: allowed paths, default provider, gated tools,
+        // sandbox limits, and each profile with its kind, models, and key sources
+        // (never key values). Read this to understand the server's current posture.
+        RawResource {
+            mime_type: Some("application/toml".to_string()),
+            description: Some(
+                "kaibo's resolved runtime configuration: allowed path trees, default \
+                 provider, gated tools, sandbox limits, and each provider profile with \
+                 its kind, models, and key sources. Read this to understand the server's \
+                 current posture before making calls."
+                    .to_string(),
+            ),
+            ..RawResource::new(CONFIG_URI, "kaibo: runtime config")
+        }
+        .no_annotation(),
+        markdown_resource(
+            SANDBOX_URI,
+            "kaibo read-only sandbox",
+            "kaibo's read-only boundary: line-number browsing idioms and the exit-code contract.",
+        ),
+    ];
     for (topic, description) in topics() {
         resources.push(markdown_resource(
             &format!("{KAISH_RES_PREFIX}{topic}"),
@@ -603,9 +739,200 @@ fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     None
 }
 
-/// Read one kaibo resource by URI. An unknown URI is a not-found error, not a
-/// silent empty result — a caller asking for the wrong thing should hear so.
-fn read_kaibo_resource(uri: &str, schemas: &[ToolSchema]) -> Result<ReadResourceResult, McpError> {
+/// Render the `kaibo://config` TOML document. Shows the resolved runtime state —
+/// allowed trees, default provider, gated tools, sandbox limits, each profile's
+/// kind/models/key sources — so a calling model or operator sees the server's
+/// current posture at a glance.
+///
+/// SECRET-SAFETY CONTRACT: this function renders key SOURCE metadata (env var names,
+/// key file paths — the operator-configured pointers) but NEVER the resolved key
+/// values. The profile struct stores sources, not secrets; this renderer reads only
+/// those source fields. If Config ever gains a resolved-key cache, do not read it here.
+/// Tests in this file assert the contract holds.
+fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
+    use serde::Serialize;
+    use std::collections::BTreeMap;
+
+    // Dedicated render-only shapes — plain Serialize structs that carry exactly what
+    // the resource must expose and nothing more. Keeps the contract explicit.
+
+    #[derive(Serialize)]
+    struct ConfigDoc {
+        /// Allowed path trees: a per-call path must be at-or-under one of these.
+        allowed_paths: Vec<String>,
+        /// Default root (the --root value), if set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_root: Option<String>,
+        /// Default provider/profile name.
+        default_provider: String,
+        /// Which tools are currently advertised.
+        tools: ToolsDoc,
+        /// Read-only sandbox limits.
+        sandbox: SandboxDoc,
+        /// Provider profiles: kind, models, key sources (never key values).
+        profiles: BTreeMap<String, ProfileDoc>,
+    }
+
+    #[derive(Serialize)]
+    struct ToolsDoc {
+        consult: bool,
+        explore: bool,
+        synthesize: bool,
+        run_kaish: bool,
+    }
+
+    #[derive(Serialize)]
+    struct SandboxDoc {
+        exec_timeout_secs: u64,
+        output_limit_bytes: usize,
+        /// Builtins shadow-blocked beyond the structural read-only guards.
+        disable_builtins: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    struct ProfileDoc {
+        kind: String,
+        explorer_model: String,
+        synth_model: String,
+        max_tokens: u64,
+        thinking_budget: u64,
+        explorer_temperature: f64,
+        synth_temperature: f64,
+        top_p: f64,
+        /// Env var name whose value is the API key (checked first). The NAME, not
+        /// the value — the operator configured this pointer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        /// Key file path as configured (`~` unexpanded; expansion happens at
+        /// key-resolution time). Used when the env var is unset/blank.
+        /// The PATH, not its contents.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        api_key_file: Option<String>,
+        /// True when a missing key falls back to a placeholder (keyless endpoint).
+        key_optional: bool,
+        /// Resolved endpoint for openai-kind profiles. Shows the effective URL the
+        /// client will dial (explicit base_url, else OPENAI_BASE_URL, else the
+        /// built-in default), matching the "resolved runtime state" promise.
+        /// Only present for openai-kind profiles.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        explorer_effort: String,
+        synth_effort: String,
+        thinking_style: String,
+        request_timeout_secs: u64,
+    }
+
+    let profiles: BTreeMap<String, ProfileDoc> = config
+        .profiles
+        .iter()
+        .map(|(name, p)| {
+            // Exhaustive destructure — any new Profile field is a compile error here,
+            // forcing an explicit render-or-skip decision (including the secret-safety
+            // review for any field that might resolve a key value).
+            let Profile {
+                name: _,
+                kind,
+                base_url,
+                api_key_env,
+                api_key_file,
+                key_optional,
+                explorer_model,
+                synth_model,
+                max_tokens,
+                thinking_budget,
+                explorer_temperature,
+                synth_temperature,
+                top_p,
+                explorer_effort,
+                synth_effort,
+                thinking_style,
+                request_timeout,
+            } = p;
+            // For openai-kind profiles, render the resolved endpoint URL so the
+            // resource matches its "resolved runtime state" claim. Other kinds have
+            // fixed endpoints baked into rig — no operator-relevant base_url to show.
+            let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
+                Some(p.resolved_base_url())
+            } else {
+                base_url.clone()
+            };
+            let doc = ProfileDoc {
+                kind: format!("{:?}", kind).to_lowercase(),
+                explorer_model: explorer_model.clone(),
+                synth_model: synth_model.clone(),
+                max_tokens: *max_tokens,
+                thinking_budget: *thinking_budget,
+                explorer_temperature: *explorer_temperature,
+                synth_temperature: *synth_temperature,
+                top_p: *top_p,
+                // KEY SOURCE ONLY — env var name or file path, never the value.
+                api_key_env: api_key_env.clone(),
+                api_key_file: api_key_file.clone(),
+                key_optional: *key_optional,
+                base_url: rendered_base_url,
+                explorer_effort: explorer_effort.clone(),
+                synth_effort: synth_effort.clone(),
+                thinking_style: format!("{:?}", thinking_style).to_lowercase(),
+                request_timeout_secs: request_timeout.as_secs(),
+            };
+            (name.clone(), doc)
+        })
+        .collect();
+
+    let doc = ConfigDoc {
+        allowed_paths: allowed_set.iter().map(|p| p.display().to_string()).collect(),
+        default_root: config.root.as_ref().map(|p| p.display().to_string()),
+        default_provider: config.default_provider.clone(),
+        tools: ToolsDoc {
+            consult: config.tools.consult,
+            explore: config.tools.explore,
+            synthesize: config.tools.synthesize,
+            run_kaish: config.tools.run_kaish,
+        },
+        sandbox: SandboxDoc {
+            exec_timeout_secs: config.sandbox.exec_timeout.as_secs(),
+            output_limit_bytes: config.sandbox.output_limit_bytes,
+            disable_builtins: config.sandbox.disable_builtins.clone(),
+        },
+        profiles,
+    };
+
+    // Serialize to TOML. If the TOML serializer rejects something (unlikely given
+    // all fields are primitive strings/ints/bools), crash loudly rather than return
+    // a silently truncated or misleading document — the caller would get a half-truth.
+    let body = toml::to_string_pretty(&doc)
+        .expect("config render structs are TOML-serializable; if this panics, a field type changed");
+    // Prepend a comment block that explains how to widen the allowed set — the tool
+    // descriptions promise kaibo://config tells a caller how to do this.
+    format!(
+        "# kaibo resolved runtime configuration\n\
+         # To widen the allowed path set:\n\
+         #   CLI:    --allow-path DIR  (repeatable)\n\
+         #   env:    KAIBO_ALLOW_PATHS=DIR:DIR2  (colon-separated)\n\
+         #   config: [server] allow_paths = [\"DIR\"] in config.toml\n\
+         # A non-empty --allow-path list replaces the env/file layer.\n\n\
+         {body}"
+    )
+}
+
+/// Read one kaibo resource by URI, with the runtime config and allowed set threaded
+/// in for `kaibo://config`. The pure path (kaish/*, sandbox) routes through
+/// `render_resource` (line below); the config arm renders via `render_config_resource`.
+///
+/// This is the handler-level dispatch: call it from `read_resource` so the config
+/// resource gets its config.
+fn read_kaibo_resource_with_config(
+    uri: &str,
+    schemas: &[ToolSchema],
+    config: &Config,
+    allowed_set: &[PathBuf],
+) -> Result<ReadResourceResult, McpError> {
+    if uri == CONFIG_URI {
+        let body = render_config_resource(config, allowed_set);
+        return Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(body, uri)],
+        });
+    }
     let body = render_resource(uri, schemas)
         .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
     Ok(ReadResourceResult {
@@ -803,7 +1130,11 @@ mod tests {
     }
 
     fn read_text(uri: &str, schemas: &[ToolSchema]) -> String {
-        let result = read_kaibo_resource(uri, schemas).expect("known uri must read");
+        // Use the config-aware dispatch for all URIs — same path the handler takes.
+        let config = Config::builtin();
+        let allowed: Vec<PathBuf> = Vec::new();
+        let result = read_kaibo_resource_with_config(uri, schemas, &config, &allowed)
+            .expect("known uri must read");
         match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
@@ -829,16 +1160,26 @@ mod tests {
         let schemas = sample_schemas();
         let text = read_text(&format!("{BUILTIN_PREFIX}rg"), &schemas);
         assert!(text.contains("rg"), "builtin help should name the tool:\n{text}");
+        let config = Config::builtin();
+        let allowed: Vec<PathBuf> = Vec::new();
         assert!(
-            read_kaibo_resource(&format!("{BUILTIN_PREFIX}nope"), &schemas).is_err(),
+            read_kaibo_resource_with_config(
+                &format!("{BUILTIN_PREFIX}nope"),
+                &schemas,
+                &config,
+                &allowed
+            )
+            .is_err(),
             "an unregistered builtin must be a not-found error"
         );
     }
 
     #[test]
     fn unknown_resource_uri_is_an_error() {
+        let config = Config::builtin();
+        let allowed: Vec<PathBuf> = Vec::new();
         assert!(
-            read_kaibo_resource("kaibo://nope", &[]).is_err(),
+            read_kaibo_resource_with_config("kaibo://nope", &[], &config, &allowed).is_err(),
             "an unknown URI must be a not-found error, not an empty success"
         );
     }
@@ -894,6 +1235,7 @@ mod tests {
 
     #[test]
     fn instructions_compose_the_canonical_onboarding_and_point_at_resources() {
+        use crate::kaish_syntax::kaibo_instructions;
         let text = kaibo_instructions(&sample_schemas());
         assert!(text.contains("kaibo"), "instructions should introduce kaibo");
         // The canonical onboarding spine from kaish-help.
@@ -905,6 +1247,206 @@ mod tests {
         assert!(
             text.contains("kaibo://kaish/"),
             "instructions should point at the kaish resources"
+        );
+    }
+
+    // --- kaibo://config resource tests ---------------------------------------
+
+    /// The config resource must appear in the listing with the correct URI and a
+    /// useful description. Failing until `kaibo://config` is added to
+    /// `kaibo_resources()`.
+    #[test]
+    fn config_resource_is_listed() {
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        assert!(
+            uris.iter().any(|u| u == CONFIG_URI),
+            "kaibo_resources() must list kaibo://config, got {uris:?}"
+        );
+        // The resource entry for the config must also have a description.
+        let config_res = kaibo_resources()
+            .into_iter()
+            .find(|r| r.raw.uri == CONFIG_URI)
+            .expect("config resource must be listed");
+        assert!(
+            config_res.raw.description.is_some(),
+            "kaibo://config resource must have a description"
+        );
+    }
+
+    /// The config resource body must contain the key structural fields a calling
+    /// model or operator expects: allowed paths, default_provider, gated tools,
+    /// sandbox limits, and profiles with their kind and key sources.
+    #[test]
+    fn config_resource_renders_expected_fields() {
+        let config = Config::builtin();
+        let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
+        let body = render_config_resource(&config, &allowed);
+        // Structural presence checks — the resource is TOML or a document, not prose.
+        for needle in ["allowed_paths", "default_provider", "tools", "sandbox", "profiles"] {
+            assert!(
+                body.contains(needle),
+                "config resource must contain {needle:?}:\n{body}"
+            );
+        }
+        // The allowed path we passed must appear.
+        assert!(
+            body.contains("/tmp/test-allowed"),
+            "config resource must show the allowed set:\n{body}"
+        );
+        // Profiles include the built-in four.
+        for profile_name in ["anthropic", "deepseek", "gemini", "openai"] {
+            assert!(
+                body.contains(profile_name),
+                "config resource must list the {profile_name} profile:\n{body}"
+            );
+        }
+        // Key SOURCES (env var name / file path) must appear — operators configured
+        // them and need to see them for diagnostics.
+        assert!(
+            body.contains("ANTHROPIC_API_KEY") || body.contains("api_key_env"),
+            "config resource must show key source env var names:\n{body}"
+        );
+    }
+
+    /// SECRET-SAFETY: the config resource must expose key SOURCE metadata (env var
+    /// names, file paths), but NEVER the resolved key values.  We set a sentinel in
+    /// the environment and in a temp file, render the resource, and assert the
+    /// sentinel appears nowhere in the output.
+    ///
+    /// `set_var`/`remove_var` are UB when other threads call `getenv` concurrently
+    /// (glibc). A mutex serializes the env-touching half against any sibling unit
+    /// test in this binary that touches env (there are none today, but the lock is
+    /// cheap and structural). The file half needs no mutex.
+    #[test]
+    fn config_resource_never_exposes_key_values() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        const SENTINEL: &str = "SUPER_SECRET_KEY_VALUE_12345_CANARY";
+        // Module-level lock — serializes all set_var/remove_var in this test binary.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        let var_name = "KAIBO_TEST_SECRET_ENV_VAR_CANARY";
+        let allowed = vec![std::path::PathBuf::from("/tmp")];
+
+        // Build the config outside the lock (no env access yet).
+        let toml = format!("[profiles.anthropic]\napi_key_env = \"{var_name}\"\n");
+        let config = Config::from_toml_str(&toml).expect("valid config");
+
+        // Set the sentinel in env and render inside the lock.
+        let body = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            // SAFETY: holding the lock means no other test in this binary mutates env.
+            #[allow(deprecated)]
+            unsafe {
+                std::env::set_var(var_name, SENTINEL);
+            }
+            let b = render_config_resource(&config, &allowed);
+            #[allow(deprecated)]
+            unsafe {
+                std::env::remove_var(var_name);
+            }
+            b
+        };
+
+        // The env var *name* must appear (operator needs to see what's configured).
+        assert!(
+            body.contains(var_name),
+            "config resource must show the env var name (not value):\n{body}"
+        );
+        // The sentinel value must NOT appear — this is the invariant.
+        assert!(
+            !body.contains(SENTINEL),
+            "config resource must NEVER expose the API key value; \
+             sentinel found in:\n{body}"
+        );
+
+        // The file half needs no env access — no lock needed.
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        write!(tmp, "{SENTINEL}").expect("write sentinel");
+        let file_path = tmp.path().to_string_lossy().to_string();
+        let toml2 = format!("[profiles.anthropic]\napi_key_file = \"{file_path}\"\n");
+        let config2 = Config::from_toml_str(&toml2).expect("valid config");
+        let body2 = render_config_resource(&config2, &allowed);
+        // The file path (source pointer) may appear, but not the file contents.
+        assert!(
+            !body2.contains(SENTINEL),
+            "config resource must NEVER expose key file contents; \
+             sentinel found in:\n{body2}"
+        );
+    }
+
+    /// `read_kaibo_resource` extended: kaibo://config must be readable via the
+    /// handler-level path (which threads config + allowed_set through).
+    #[test]
+    fn read_kaibo_config_resource_is_readable() {
+        let config = Config::builtin();
+        let allowed = handler().allowed_set();
+        let body_str = render_config_resource(&config, &allowed);
+        // Sanity: the rendered document has something in it.
+        assert!(!body_str.is_empty(), "config resource body must not be empty");
+        // The dispatch must not return not-found for this URI.
+        let result =
+            read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed);
+        assert!(result.is_ok(), "kaibo://config must be readable, got {result:?}");
+    }
+
+    // --- Scope section in instructions ---------------------------------------
+
+    /// Instructions must include a scope section that names the allowed trees and
+    /// points at kaibo://config. Failing until kaibo_instructions_with_scope is
+    /// added and get_info wires it in.
+    #[test]
+    fn instructions_scope_section_names_allowed_paths() {
+        let schemas = sample_schemas();
+        let allowed = vec![
+            std::path::PathBuf::from("/projects/myapp"),
+            std::path::PathBuf::from("/data/shared"),
+        ];
+        let config = Config::builtin();
+        let text = kaibo_instructions_with_scope(&schemas, &config, &allowed);
+        // The scope section must name each allowed path.
+        assert!(
+            text.contains("/projects/myapp"),
+            "scope section must name the first allowed path:\n{text}"
+        );
+        assert!(
+            text.contains("/data/shared"),
+            "scope section must name the second allowed path:\n{text}"
+        );
+        // Points at the config resource for the full picture.
+        assert!(
+            text.contains(CONFIG_URI),
+            "scope section must mention kaibo://config:\n{text}"
+        );
+    }
+
+    /// When there is a default root, the scope section must say so rather than
+    /// saying "no default root".
+    #[test]
+    fn instructions_scope_section_names_default_root() {
+        let schemas = sample_schemas();
+        let mut config = Config::builtin();
+        config.root = Some(std::path::PathBuf::from("/projects/myapp"));
+        let allowed = vec![std::path::PathBuf::from("/projects/myapp")];
+        let text = kaibo_instructions_with_scope(&schemas, &config, &allowed);
+        assert!(
+            text.contains("/projects/myapp"),
+            "scope section must name the configured root:\n{text}"
+        );
+    }
+
+    /// When no default root is set the scope section must be honest about it.
+    #[test]
+    fn instructions_scope_section_states_no_default_root_when_absent() {
+        let schemas = sample_schemas();
+        let mut config = Config::builtin();
+        config.root = None;
+        let allowed = vec![std::path::PathBuf::from("/tmp")];
+        let text = kaibo_instructions_with_scope(&schemas, &config, &allowed);
+        // Must explain that every call must pass a path.
+        assert!(
+            text.to_lowercase().contains("every call") || text.contains("no default"),
+            "scope section must note the absence of a default root:\n{text}"
         );
     }
 }

@@ -14,7 +14,9 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-08 (host-env hermeticity entry retired — the kaish-side fixes it
+Last pass: 2026-06-10 (path containment + config discovery shipped — always-on
+path containment with launch-cwd default, `kaibo://config` resource, and scope
+section in server instructions). 2026-06-08 (host-env hermeticity entry retired — the kaish-side fixes it
 tracked all landed: tilde `~`/`~/path` and bare `cd` now consult the kernel scope
 `HOME` (kaibo seeds none, so they stay literal — no host-path disclosure), `~user`/
 `/proc` are `host`-gated (off here), and a new structural guard makes any
@@ -49,6 +51,38 @@ Folded out the P2 entry). 2026-06-08 (explorer report surfacing shipped — `con
 work, and caps raised to explorer 100 / synth 200 now that hitting them is no longer
 fatal. Folded out the prior P1 entry — its premise that rig discards the transcript
 was stale).
+
+---
+
+## P2 — Focused fixes & hardening
+
+### Unquota'd `/` MemoryFs scratch: redirection writes unbounded bytes into RAM
+**Proven live, 2026-06-10**: against the running server,
+`run_kaish` with `for i in $(seq 1 200); do cat src/consult.rs >> /tmp/grow; done`
+exited **0** with 17.4 MB in `/tmp/grow` in ~1s — scale the loop bound and it's
+gigabytes. The per-script output cap bounds what returns to the *caller*; a
+redirect lands in the `/` `MemoryFs` (`kaish-vfs/src/memory.rs`, a plain
+`RwLock<HashMap>` with no size check on `write`), bounded only by the 30s exec
+timeout and the call-scoped kernel lifetime. A consult's explorer holds its
+kernel for the whole phase loop (50–100 turns), so one steered or pathological
+investigation can drive real host memory pressure — that's the user surprise.
+(The output-*spill* path is NOT part of this: `SpillMode::Memory` truncates,
+bounded — initial version of this entry overstated it.)
+
+Fix shape (settled 2026-06-10, design in kaish `docs/kaish-overlayfs.md`
+"Byte accounting"): **kaish-side, always-on** — counting lives inside each
+memory-resident fs (`resident_bytes()`, exact net accounting under the fs's own
+lock), limiting is a shared `ByteBudget` with profile defaults riding
+`KernelConfig` the way `OutputLimitConfig::mcp()` already does. This superseded
+the earlier kaibo-local `QuotaFs` wrapper idea (a wrapper undercounts overlay
+bases, and opt-in guards drift). kaibo's part once kaish ships it: pick up the
+new kaish-kernel (currently on published 0.8.0, Cargo.toml — needs a release or
+a path-dep flip), thread `[sandbox].scratch_limit_bytes` → the kernel budget
+(stricter-only, like the rest of `SandboxConfig`; default generous, e.g. 64 MB
+— scratch is a feature, runaway growth is the bug), and land the failing-first
+test: the probe above expecting the loud ENOSPC-style refusal; prove teeth by
+lifting the budget and watching it fail. Escalates to P1 (blocking) when
+overlay workspaces land: long-lived kernels remove the call-lifetime bound.
 
 ---
 

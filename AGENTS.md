@@ -31,7 +31,10 @@ commands.
   read-only mount, `MemoryFs` at `/`, external commands disabled, and a `DENYLIST`
   of builtins that reach real state *directly* and bypass the mount (git, touch,
   spawn, exec, kill, mktemp — see the module doc-comment). Any change here keeps
-  `tests/sandbox.rs` green and adds a test that can fail.
+  `tests/sandbox.rs` green and adds a test that can fail. Read-*scope* is also
+  bounded: every call's path must canonicalize (symlinks, `..` resolved) into the
+  allowed set (`--root` / `--allow-path`, launch cwd when unset), enforced in
+  `server.rs::resolve_root` with tests in `tests/containment.rs`.
 - **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.

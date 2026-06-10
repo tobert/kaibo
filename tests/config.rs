@@ -525,6 +525,7 @@ fn cli_overrides_win_over_everything() {
         Some("openai".to_string()),
         // Only --no-explore was passed.
         ToolDisables { explore: true, ..Default::default() },
+        vec![], // no --allow-path flags
     );
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
     assert_eq!(c.default_provider, "openai");
@@ -532,6 +533,25 @@ fn cli_overrides_win_over_everything() {
     assert!(c.tools.consult);
     assert!(!c.tools.explore);
     assert!(c.tools.run_kaish);
+}
+
+/// An empty CLI `--allow-path` list (no flags passed) must NOT replace the lower
+/// layers (env/file allow_paths). The guard at `apply_cli` is `if !allow_paths.is_empty()`
+/// — this test pins it so an accidental unconditional assignment would kill the env/file
+/// knobs without any test catching it.
+#[test]
+fn empty_cli_allow_paths_preserves_lower_layers() {
+    let mut c = Config::builtin();
+    // Pre-seed allow_paths as if they came from env or a config file.
+    c.allow_paths = vec![std::path::PathBuf::from("/tmp/from-env")];
+    // Apply CLI with no --allow-path flags (empty list).
+    c.apply_cli(None, None, ToolDisables::default(), vec![]);
+    // The env/file-layer value must survive.
+    assert!(
+        c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/from-env")),
+        "empty CLI allow_paths must not replace env/file layers, got {:?}",
+        c.allow_paths
+    );
 }
 
 // --- Key resolution --------------------------------------------------------
