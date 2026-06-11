@@ -48,6 +48,15 @@ const BUILTIN_URI_TEMPLATE: &str = "kaibo://kaish/builtin/{name}";
 /// sandbox limits, backends with their key sources (never key values), and casts
 /// with their resolved slots.
 const CONFIG_URI: &str = "kaibo://config";
+/// The annotated config *template* — every knob with its default, commented. The
+/// companion to `kaibo://config` (which shows the *resolved* state): this is what a
+/// user copies to `~/.config/kaibo/config.toml`. Most useful on a fresh install,
+/// where the setup guidance points at it.
+const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
+/// `docs/config.example.toml`, embedded at compile time so it ships *inside* the
+/// binary — `cargo install kaibo` lays down no docs, so reading the file at runtime
+/// would 404 at exactly the fresh-install moment the example matters most.
+const CONFIG_EXAMPLE_TOML: &str = include_str!("../docs/config.example.toml");
 
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
@@ -774,10 +783,15 @@ impl rmcp::ServerHandler for KaiboHandler {
                 icons: None,
                 website_url: None,
             },
+            // Judge provider usability from the live environment so a fresh install
+            // (no key, no config) gets setup guidance in the handshake. Read once here,
+            // at initialize — the same point the rest of config is bound; reconnecting
+            // is what re-reads a newly-set key.
             instructions: Some(kaibo_instructions_with_scope(
                 &self.tool_schemas,
                 &self.config,
                 &self.allowed_set,
+                self.config.default_cast_usability(|k| std::env::var(k).ok()),
             )),
         }
     }
@@ -861,6 +875,20 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
                     .to_string(),
             ),
             ..RawResource::new(CONFIG_URI, "kaibo: runtime config")
+        }
+        .no_annotation(),
+        // The annotated config template — every knob, commented, ready to copy to
+        // ~/.config/kaibo/config.toml. The setup guidance on a fresh install points here.
+        RawResource {
+            mime_type: Some("application/toml".to_string()),
+            description: Some(
+                "An annotated kaibo config template: every option with its default and a \
+                 comment, plus example backends and casts. Copy to \
+                 ~/.config/kaibo/config.toml and edit. Pairs with kaibo://config, which \
+                 shows the *resolved* runtime state."
+                    .to_string(),
+            ),
+            ..RawResource::new(CONFIG_EXAMPLE_URI, "kaibo: config example")
         }
         .no_annotation(),
         markdown_resource(
@@ -1218,6 +1246,12 @@ fn read_kaibo_resource_with_config(
             contents: vec![ResourceContents::text(body, uri)],
         });
     }
+    if uri == CONFIG_EXAMPLE_URI {
+        // Static, config-independent — the embedded template verbatim.
+        return Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(CONFIG_EXAMPLE_TOML, uri)],
+        });
+    }
     let body = render_resource(uri, schemas)
         .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
     Ok(ReadResourceResult {
@@ -1566,6 +1600,38 @@ mod tests {
         );
     }
 
+    // --- kaibo://config/example resource tests -------------------------------
+
+    /// The embedded config example is listed and readable, and — the drift guard —
+    /// it must still parse as a valid `Config`. The day someone changes a config
+    /// field and forgets the example, this fails instead of shipping a template that
+    /// errors when a fresh user copies it.
+    #[test]
+    fn config_example_resource_is_listed_readable_and_valid() {
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        assert!(
+            uris.iter().any(|u| u == CONFIG_EXAMPLE_URI),
+            "kaibo_resources() must list kaibo://config/example, got {uris:?}"
+        );
+
+        let config = Config::builtin();
+        let allowed = vec![std::path::PathBuf::from("/tmp")];
+        let result = read_kaibo_resource_with_config(CONFIG_EXAMPLE_URI, &[], &config, &allowed)
+            .expect("example resource must be readable");
+        let body = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            other => panic!("expected text contents, got {other:?}"),
+        };
+        // It's the real template (a recognizable anchor), and it parses — so a fresh
+        // user who copies it verbatim gets a working config, not a load error.
+        assert!(
+            body.contains("[backends.anthropic]"),
+            "example must be the annotated template:\n{body}"
+        );
+        crate::config::Config::from_toml_str(&body)
+            .expect("the embedded config example must parse as a valid Config");
+    }
+
     // --- kaibo://config resource tests ---------------------------------------
 
     /// The config resource must appear in the listing with the correct URI and a
@@ -1792,7 +1858,12 @@ mod tests {
             std::path::PathBuf::from("/data/shared"),
         ];
         let config = Config::builtin();
-        let text = kaibo_instructions_with_scope(&schemas, &config, &allowed);
+        let text = kaibo_instructions_with_scope(
+            &schemas,
+            &config,
+            &allowed,
+            crate::config::CastUsability::Ready,
+        );
         // The scope section must name each allowed path.
         assert!(
             text.contains("/projects/myapp"),
@@ -1817,7 +1888,12 @@ mod tests {
         let mut config = Config::builtin();
         config.root = Some(std::path::PathBuf::from("/projects/myapp"));
         let allowed = vec![std::path::PathBuf::from("/projects/myapp")];
-        let text = kaibo_instructions_with_scope(&schemas, &config, &allowed);
+        let text = kaibo_instructions_with_scope(
+            &schemas,
+            &config,
+            &allowed,
+            crate::config::CastUsability::Ready,
+        );
         assert!(
             text.contains("/projects/myapp"),
             "scope section must name the configured root:\n{text}"
@@ -1831,7 +1907,12 @@ mod tests {
         let mut config = Config::builtin();
         config.root = None;
         let allowed = vec![std::path::PathBuf::from("/tmp")];
-        let text = kaibo_instructions_with_scope(&schemas, &config, &allowed);
+        let text = kaibo_instructions_with_scope(
+            &schemas,
+            &config,
+            &allowed,
+            crate::config::CastUsability::Ready,
+        );
         // Must explain that every call must pass a path.
         assert!(
             text.to_lowercase().contains("every call") || text.contains("no default"),

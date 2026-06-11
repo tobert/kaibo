@@ -149,6 +149,20 @@ async fn main() -> Result<()> {
         gating = ?config.tools,
         "starting kaibo MCP server on stdio"
     );
+    // A fresh install (no key, no config) starts fine but can't reach a model — say so
+    // loudly here so an operator watching stderr sees it, not just the client model in
+    // the handshake instructions. run_kaish still works; the model-backed tools don't.
+    if matches!(
+        config.default_cast_usability(|k| std::env::var(k).ok()),
+        kaibo::config::CastUsability::Unconfigured
+    ) {
+        tracing::warn!(
+            cast = %config.default_cast,
+            "no API key for the default cast — consult/explore/synthesize will fail until \
+             you set a provider key (env var or key file) and reconnect; run_kaish works now. \
+             See the kaibo://config/example resource."
+        );
+    }
 
     let handler = KaiboHandler::new(config)?;
     // Log the resolved (canonicalized) allowed set so the operator can verify the

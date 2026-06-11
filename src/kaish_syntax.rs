@@ -23,7 +23,7 @@ use kaish_kernel::help::{
 };
 use kaish_kernel::tools::ToolSchema;
 
-use crate::config::Config;
+use crate::config::{CastUsability, Config};
 
 /// The kaibo-specific half of the core: the read-only boundary, the exit-code
 /// contract, the no-cwd rule, and the line-number idioms that make citations
@@ -117,20 +117,88 @@ pub fn kaibo_instructions(schemas: &[ToolSchema]) -> String {
     )
 }
 
+/// The setup-guidance block prepended to the instructions when the default cast has
+/// no usable provider (a fresh `cargo install` with no key set). Steers toward an env
+/// var or a key file — *never* pasting the key into the chat — names the default cast's
+/// backends and their key sources, points at the example resource, and reminds the user
+/// to reconnect the server (which only re-reads the environment and config at startup).
+///
+/// Positive framing: it leads with what *works now* (`run_kaish` needs no provider) and
+/// what to do, not a wall of "you can't". Best-effort on the backend list — if the
+/// default cast doesn't resolve we still emit the general steps.
+fn setup_section(config: &Config) -> String {
+    let mut lines = Vec::new();
+    if let Ok(cast) = config.resolve_cast(&config.default_cast) {
+        let mut seen = std::collections::BTreeSet::new();
+        for slot in cast.slots.values() {
+            if let Ok(b) = config.resolve_backend(&slot.backend) {
+                if seen.insert(b.name.clone()) {
+                    let env = b.api_key_env.as_deref().unwrap_or("(none)");
+                    let file = b.api_key_file.as_deref().unwrap_or("(none)");
+                    lines.push(format!(
+                        "  - backend `{}` ({}) — set env `{}`, or write the key to `{}`",
+                        b.name,
+                        b.kind.canonical_name(),
+                        env,
+                        file
+                    ));
+                }
+            }
+        }
+    }
+    let backends = if lines.is_empty() {
+        "  - the default cast names no backends yet — set `cast` in config.toml".to_string()
+    } else {
+        lines.join("\n")
+    };
+
+    format!(
+        "## Setup needed — no model provider configured\n\
+         kaibo's default cast `{cast}` has no usable API key, so `consult`, `explore`, \
+         and `synthesize` can't reach a model yet. `run_kaish` works right now — it drives \
+         the read-only shell with no model in the loop — so you can browse the code while \
+         you set a key.\n\n\
+         Give the default cast a key. Prefer an **environment variable** or a **key file** \
+         — kaibo reads either at startup, so the key stays out of this conversation:\n\
+         {backends}\n\n\
+         Keep the API key out of the chat: set the env var or key file yourself in your \
+         shell, don't paste it to the model (if you do, that's your call — kaibo doesn't \
+         need to see it). Then **reconnect the kaibo MCP server** so it re-reads the \
+         environment and config — they're read once at startup. In Claude Code: run `/mcp` \
+         and reconnect kaibo; other hosts have their own reload.\n\n\
+         Prefer a different provider? Pass `provider=\"<name>\"` on a call (a backend or \
+         cast — e.g. a local keyless endpoint), or set `cast` in config. The full annotated \
+         example is the `kaibo://config/example` resource; it belongs at \
+         `~/.config/kaibo/config.toml` (or `$XDG_CONFIG_HOME/kaibo/config.toml`). Read \
+         `kaibo://config` for the current resolved state.",
+        cast = config.default_cast,
+    )
+}
+
 /// Like [`kaibo_instructions`] but with a **scope section** appended so the calling
 /// model always knows:
 /// - the default root (or that every call must pass one),
 /// - the allowed trees a per-call `path` must be at-or-under, and
 /// - that `kaibo://config` has the full picture.
 ///
+/// When `usability` is [`CastUsability::Unconfigured`] (a fresh install with no key),
+/// a [`setup_section`] is prepended so the calling model can walk the user through
+/// configuration. `Ready`/`LocalUnverified` get the normal instructions unchanged.
+///
 /// Used by `get_info` so every `initialize` handshake surfaces the server's
-/// containment posture. Unit-testable: pass your own `Config` and `allowed_set`
-/// rather than fabricating a `RequestContext`.
+/// containment posture. Unit-testable: pass your own `Config`, `allowed_set`, and
+/// `usability` rather than fabricating a `RequestContext` or reading the environment.
 pub fn kaibo_instructions_with_scope(
     schemas: &[ToolSchema],
     config: &Config,
     allowed_set: &[PathBuf],
+    usability: CastUsability,
 ) -> String {
+    // The unconfigured-install banner leads, so a fresh user sees it first.
+    let setup = match usability {
+        CastUsability::Unconfigured => format!("{}\n\n", setup_section(config)),
+        CastUsability::Ready | CastUsability::LocalUnverified => String::new(),
+    };
     let base = kaibo_instructions(schemas);
 
     // Scope section: always accurate, never ambiguous.
@@ -145,7 +213,7 @@ pub fn kaibo_instructions_with_scope(
         .join("\n");
 
     format!(
-        "{base}\n\n\
+        "{setup}{base}\n\n\
          ## Scope\n\
          This server's path containment is always on. A per-call `path` must \
          canonicalize to at-or-under one of the allowed trees below.\n\n\
@@ -207,7 +275,10 @@ mod tests {
         // it must appear verbatim. This fails the moment the compose recipe breaks
         // or the layering drops it.
         let contract = kaish_operating_contract();
-        assert!(!contract.is_empty(), "the canonical contract must compose to something");
+        assert!(
+            !contract.is_empty(),
+            "the canonical contract must compose to something"
+        );
         assert!(
             core.contains(contract),
             "core must embed the canonical kaish contract verbatim"
@@ -265,14 +336,76 @@ mod tests {
         );
         // A static topic renders without schemas.
         let syntax = render_topic("syntax", &[]);
-        assert!(syntax.contains("Variables"), "syntax topic should cover Variables:\n{syntax}");
+        assert!(
+            syntax.contains("Variables"),
+            "syntax topic should cover Variables:\n{syntax}"
+        );
+    }
+
+    /// A fresh install (Unconfigured) gets the setup banner: it leads, names the
+    /// default cast's key sources, steers the key out of the chat, points at the
+    /// example resource, and tells the user to reconnect the server.
+    #[test]
+    fn instructions_lead_with_setup_when_unconfigured() {
+        let config = Config::builtin(); // default cast "anthropic"
+        let text = kaibo_instructions_with_scope(
+            &[],
+            &config,
+            &[PathBuf::from("/tmp")],
+            CastUsability::Unconfigured,
+        );
+        assert!(
+            text.contains("Setup needed"),
+            "must flag the setup state:\n{text}"
+        );
+        // The banner leads — a fresh user sees it before the rest.
+        assert!(
+            text.trim_start().starts_with("## Setup needed"),
+            "setup banner must come first:\n{text}"
+        );
+        // Names the default cast's backend key sources (env + file), steers privacy,
+        // keeps run_kaish usable, points at the example, and asks for a reconnect.
+        for needle in [
+            "ANTHROPIC_API_KEY",
+            "key file",
+            "run_kaish",
+            "kaibo://config/example",
+            "/mcp",
+        ] {
+            assert!(
+                text.contains(needle),
+                "setup banner must mention {needle:?}:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("out of the chat") || text.contains("don't paste"),
+            "setup banner must steer the key out of the conversation:\n{text}"
+        );
+    }
+
+    /// A configured install (Ready) — and an unprobed-local one (LocalUnverified) —
+    /// get the normal instructions, no setup banner nagging them.
+    #[test]
+    fn instructions_omit_setup_when_usable() {
+        let config = Config::builtin();
+        for usability in [CastUsability::Ready, CastUsability::LocalUnverified] {
+            let text =
+                kaibo_instructions_with_scope(&[], &config, &[PathBuf::from("/tmp")], usability);
+            assert!(
+                !text.contains("Setup needed"),
+                "{usability:?} must not get the setup banner:\n{text}"
+            );
+        }
     }
 
     #[test]
     fn builtin_help_resolves_a_known_tool_and_rejects_an_unknown_one() {
         let schemas = vec![ToolSchema::new("cat", "Read a file")];
         let cat = render_builtin_help("cat", &schemas).expect("cat is registered");
-        assert!(cat.contains("cat"), "builtin help should name the tool:\n{cat}");
+        assert!(
+            cat.contains("cat"),
+            "builtin help should name the tool:\n{cat}"
+        );
         assert!(
             render_builtin_help("definitely-not-a-builtin", &schemas).is_none(),
             "an unregistered builtin must render to None, not a stub"

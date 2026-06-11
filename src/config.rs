@@ -353,6 +353,53 @@ impl Backend {
             .clone()
             .unwrap_or_else(credentials::openai_base_url)
     }
+
+    /// Whether this backend has a usable credential, judged *without* committing to a
+    /// network call or pulling the secret into the answer path — the non-fatal sibling
+    /// of [`resolve_key`](Self::resolve_key). It mirrors the same precedence (env var,
+    /// then key file, then `key_optional`) but reports a verdict instead of returning
+    /// the secret or erroring. The env lookup is injected so the classification is
+    /// testable without touching the real environment.
+    ///
+    /// A *present-but-broken* key file still reads as [`KeyStatus::Present`] here: it's
+    /// a configured credential, and `resolve_key` is the one that surfaces its breakage
+    /// loudly at call time. We deliberately don't read the file's contents — existence
+    /// is enough to say "the user set this up".
+    pub fn key_status(&self, get_env: impl Fn(&str) -> Option<String>) -> KeyStatus {
+        // env wins, when set and non-blank — same rule as resolve_key.
+        if let Some(name) = self.api_key_env.as_deref() {
+            if let Some(v) = get_env(name) {
+                if !v.trim().is_empty() {
+                    return KeyStatus::Present;
+                }
+            }
+        }
+        // then a configured key file, if it exists (contents unread — see above).
+        if let Some(file) = self.api_key_file.as_deref().map(expand_tilde) {
+            if file.exists() {
+                return KeyStatus::Present;
+            }
+        }
+        if self.key_optional {
+            KeyStatus::Placeholder
+        } else {
+            KeyStatus::Missing
+        }
+    }
+}
+
+/// A backend's credential availability, judged offline by [`Backend::key_status`].
+/// The basis for the unconfigured-install setup guidance — never used to gate a call
+/// (that's `resolve_key`'s loud, at-call-time job).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// A key is configured: the env var is set and non-blank, or the key file exists.
+    Present,
+    /// No key, but the backend is keyless (`key_optional`) — a placeholder bearer is
+    /// sent. Usable only if the endpoint is actually up, which we don't probe.
+    Placeholder,
+    /// No key and the backend requires one — a call would fail loudly at `resolve_key`.
+    Missing,
 }
 
 // --- Casts ------------------------------------------------------------------
@@ -382,6 +429,23 @@ impl Cast {
         self.slot(role)
             .ok_or_else(|| anyhow!("cast {:?} has no {} slot", self.name, role.key()))
     }
+}
+
+/// Whether a cast can actually serve its model-backed tools, judged offline (no
+/// network call) from its slots' backends — the basis for the unconfigured-install
+/// setup guidance. `run_kaish` needs no backend, so it works in every state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastUsability {
+    /// Every slot's backend has a configured key. The happy path — no nagging.
+    Ready,
+    /// No slot is outright missing a key, but at least one rides a keyless
+    /// placeholder endpoint we haven't probed. Treated as configured (the user chose
+    /// local, or set up some keys), so no setup banner — an unreachable endpoint
+    /// still fails loudly at call time.
+    LocalUnverified,
+    /// At least one slot's backend needs a key and has none — the fresh install with
+    /// nothing set up. The only state that lights up the setup guidance.
+    Unconfigured,
 }
 
 // --- The whole config ------------------------------------------------------
@@ -500,6 +564,53 @@ impl Config {
             "unknown backend {name:?}; known backends: {}",
             names.join(", ")
         ))
+    }
+
+    /// Judge whether `cast` can serve its model-backed tools, *without* a network
+    /// call — the basis for the unconfigured-install setup guidance. A cast is only
+    /// [`CastUsability::Unconfigured`] when a slot's backend needs a key and has none;
+    /// one keyless local endpoint reads as [`CastUsability::LocalUnverified`]
+    /// (configured, just unprobed) so an env-only or deliberate-local setup is never
+    /// nagged. Partial setup counts as broken: *any* slot missing a key wins. The env
+    /// lookup is injected for testability. An empty cast (no slots) reads as `Ready`
+    /// here — its missing roles fail loudly per-tool at call time, not our concern.
+    pub fn cast_usability(
+        &self,
+        cast: &Cast,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> CastUsability {
+        let mut any_placeholder = false;
+        for slot in cast.slots.values() {
+            // A slot's backend ref resolved at merge time, so this lookup can't fail;
+            // skip defensively rather than panic if that invariant ever changes.
+            let Ok(backend) = self.resolve_backend(&slot.backend) else {
+                continue;
+            };
+            match backend.key_status(&get_env) {
+                KeyStatus::Missing => return CastUsability::Unconfigured,
+                KeyStatus::Placeholder => any_placeholder = true,
+                KeyStatus::Present => {}
+            }
+        }
+        if any_placeholder {
+            CastUsability::LocalUnverified
+        } else {
+            CastUsability::Ready
+        }
+    }
+
+    /// [`cast_usability`](Self::cast_usability) for the default cast — what `get_info`
+    /// reads to decide whether to surface setup guidance. If the default cast somehow
+    /// doesn't resolve (it's validated to at startup), treat it as `Unconfigured` so we
+    /// guide rather than pretend everything is fine.
+    pub fn default_cast_usability(
+        &self,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> CastUsability {
+        match self.resolve_cast(&self.default_cast) {
+            Ok(cast) => self.cast_usability(cast, get_env),
+            Err(_) => CastUsability::Unconfigured,
+        }
     }
 
     /// alias → canonical backend name. Part of the resolved runtime state: an
@@ -1420,6 +1531,113 @@ mod tests {
                 assert_eq!(slot.backend, name, "built-in casts are single-backend");
             }
         }
+    }
+
+    // --- usability: the unconfigured-install signal ---------------------------
+    //
+    // These point every keyed backend's `api_key_file` at a path that cannot exist,
+    // so the verdict depends ONLY on the injected env lookup — never on whether the
+    // test machine happens to have ~/.anthropic-key.txt. (Amy keeps real key files;
+    // a naive built-in test would pass on her box and fail in CI, or vice versa.)
+    const NO_KEY_FILES: &str = r#"
+        [backends.anthropic]
+        api_key_file = "/nonexistent-kaibo-test/anthropic"
+        [backends.deepseek]
+        api_key_file = "/nonexistent-kaibo-test/deepseek"
+        [backends.gemini]
+        api_key_file = "/nonexistent-kaibo-test/gemini"
+        [backends.openai]
+        api_key_file = "/nonexistent-kaibo-test/openai"
+    "#;
+
+    /// No env key + no key file on a *keyed* backend ⇒ Unconfigured (the fresh
+    /// install). This is the state that must light up setup guidance.
+    #[test]
+    fn cast_usability_unconfigured_when_keyed_backend_has_no_key() {
+        let cfg = Config::from_toml_str(&format!(
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"anthropic/m2\""
+        ))
+        .unwrap();
+        let cast = cfg.resolve_cast("t").unwrap();
+        assert_eq!(
+            cfg.cast_usability(cast, |_| None),
+            CastUsability::Unconfigured
+        );
+    }
+
+    /// The same config flips to Ready the moment the env var carries a key — so an
+    /// env-only setup (no config file) is never nagged.
+    #[test]
+    fn cast_usability_ready_when_env_key_present() {
+        let cfg = Config::from_toml_str(&format!(
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"anthropic/m2\""
+        ))
+        .unwrap();
+        let cast = cfg.resolve_cast("t").unwrap();
+        let env = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
+        assert_eq!(cfg.cast_usability(cast, env), CastUsability::Ready);
+        // A blank env value doesn't count as present — falls through to the file.
+        let blank = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "   ".to_string());
+        assert_eq!(cfg.cast_usability(cast, blank), CastUsability::Unconfigured);
+    }
+
+    /// A keyless (`key_optional`) backend with no key reads as LocalUnverified, not
+    /// Unconfigured — we don't probe localhost, and the user may have chosen local.
+    #[test]
+    fn cast_usability_local_unverified_for_keyless_placeholder() {
+        let cfg = Config::from_toml_str(&format!(
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"openai/m1\"\nsynth=\"openai/m2\""
+        ))
+        .unwrap();
+        let cast = cfg.resolve_cast("t").unwrap();
+        assert_eq!(
+            cfg.cast_usability(cast, |_| None),
+            CastUsability::LocalUnverified
+        );
+    }
+
+    /// Partial setup is broken: one slot keyed-and-present, the other keyed-and-missing
+    /// ⇒ Unconfigured. (Amy's call — a half-configured cast can't answer.)
+    #[test]
+    fn cast_usability_unconfigured_if_any_slot_missing() {
+        let cfg = Config::from_toml_str(&format!(
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"deepseek/m2\""
+        ))
+        .unwrap();
+        let cast = cfg.resolve_cast("t").unwrap();
+        let env = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
+        assert_eq!(cfg.cast_usability(cast, env), CastUsability::Unconfigured);
+    }
+
+    /// Present + placeholder (no Missing) ⇒ LocalUnverified: a deliberate keyed-explorer
+    /// + local-synth chimera is configured, not a fresh install.
+    #[test]
+    fn cast_usability_local_unverified_when_mixing_present_and_placeholder() {
+        let cfg = Config::from_toml_str(&format!(
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"openai/m2\""
+        ))
+        .unwrap();
+        let cast = cfg.resolve_cast("t").unwrap();
+        let env = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
+        assert_eq!(
+            cfg.cast_usability(cast, env),
+            CastUsability::LocalUnverified
+        );
+    }
+
+    /// `default_cast_usability` reads the *default* cast, so it tracks `server.cast`.
+    #[test]
+    fn default_cast_usability_follows_the_default_cast() {
+        let cfg = Config::from_toml_str(&format!(
+            "{NO_KEY_FILES}\n[server]\ncast=\"t\"\n\
+             [casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"anthropic/m2\""
+        ))
+        .unwrap();
+        assert_eq!(cfg.default_cast, "t");
+        assert_eq!(
+            cfg.default_cast_usability(|_| None),
+            CastUsability::Unconfigured
+        );
     }
 
     /// The built-in aliases register at BOTH levels: `claude` resolves as a cast
