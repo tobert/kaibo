@@ -5,11 +5,12 @@
 
 use std::path::PathBuf;
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
+use rmcp::ErrorData as McpError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -20,20 +21,19 @@ use rmcp::model::{
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
-use rmcp::ErrorData as McpError;
-use rmcp::{tool, tool_handler, tool_router, RoleServer};
+use rmcp::{RoleServer, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::{Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig};
+use crate::consult::{Arm, ConsultConfig, consult, explore, synthesize};
 use crate::explorer::format_output;
 use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
 use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink};
-use crate::sandbox::{builtin_schemas, KaishWorker};
+use crate::sandbox::{KaishWorker, builtin_schemas};
 use crate::session::SessionStore;
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -973,6 +973,8 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
     struct SandboxDoc {
         exec_timeout_secs: u64,
         output_limit_bytes: usize,
+        /// Cap on the `/` scratch MemoryFs in bytes; a write past it fails loudly.
+        scratch_limit_bytes: u64,
         /// Builtins shadow-blocked beyond the structural read-only guards.
         disable_builtins: Vec<String>,
     }
@@ -1123,6 +1125,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
     let crate::sandbox::SandboxConfig {
         exec_timeout,
         output_limit_bytes,
+        scratch_limit_bytes,
         disable_builtins,
     } = &config.sandbox;
     let crate::config::Defaults {
@@ -1155,6 +1158,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),
             output_limit_bytes: *output_limit_bytes,
+            scratch_limit_bytes: *scratch_limit_bytes,
             disable_builtins: disable_builtins.clone(),
         },
         defaults: DefaultsDoc {
@@ -1317,8 +1321,8 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::NumberOrString;
     use rmcp::ServerHandler;
+    use rmcp::model::NumberOrString;
 
     /// A small stand-in builtin set so resource rendering is offline-testable.
     fn sample_schemas() -> Vec<ToolSchema> {

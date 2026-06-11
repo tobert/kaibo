@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
-use kaish_kernel::vfs::{LocalFs, MemoryFs, VfsRouter};
+use kaish_kernel::vfs::{ByteBudget, LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig};
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
@@ -107,6 +107,14 @@ pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 /// `[sandbox].output_limit_bytes`.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
 
+/// Default cap on the `/` scratch `MemoryFs` (64 MB). Scratch is a feature — a
+/// redirect or `mktemp` lands here, never on the read-only project — but unbounded
+/// it's a host-memory liability: a steered or pathological explorer holds its
+/// kernel for a whole phase loop, and `for … >> /grow` writes RAM until the exec
+/// timeout. The budget makes that loud (ENOSPC-style) instead. Generous on purpose;
+/// override via `[sandbox].scratch_limit_bytes` (stricter is the usual move).
+pub const DEFAULT_SCRATCH_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Tunable read-only-sandbox limits, set via `[sandbox]` in config.toml.
 ///
 /// These can only make the box *stricter* — `disable_builtins` shadow-blocks
@@ -119,6 +127,9 @@ pub struct SandboxConfig {
     pub exec_timeout: Duration,
     /// Max bytes of script output before truncation (exit 3 + head/tail sample).
     pub output_limit_bytes: usize,
+    /// Cap on the `/` scratch `MemoryFs` in bytes; a write past it fails loudly
+    /// (`StorageFull`), never silently eating RAM. See [`DEFAULT_SCRATCH_LIMIT_BYTES`].
+    pub scratch_limit_bytes: u64,
     /// Builtins to shadow-block on top of the structural read-only guards.
     pub disable_builtins: Vec<String>,
 }
@@ -128,6 +139,7 @@ impl Default for SandboxConfig {
         Self {
             exec_timeout: KAISH_EXEC_TIMEOUT,
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            scratch_limit_bytes: DEFAULT_SCRATCH_LIMIT_BYTES,
             disable_builtins: Vec::new(),
         }
     }
@@ -153,7 +165,10 @@ pub fn build_readonly_kernel_with_timeout(
 ) -> Result<Kernel> {
     build_readonly_kernel_with(
         root,
-        &SandboxConfig { exec_timeout: timeout, ..SandboxConfig::default() },
+        &SandboxConfig {
+            exec_timeout: timeout,
+            ..SandboxConfig::default()
+        },
     )
 }
 
@@ -166,8 +181,16 @@ pub fn build_readonly_kernel_with(
     let mount_point = root.to_string_lossy().to_string();
 
     let mut vfs = VfsRouter::new();
-    // Ephemeral scratch for anything outside the project; never hits disk.
-    vfs.mount("/", MemoryFs::new());
+    // Ephemeral scratch for anything outside the project; never hits disk. Bounded
+    // by an owned, labeled budget so a runaway redirect (`for … >> /grow`) fails
+    // ENOSPC-style instead of eating host RAM for the kernel's whole lifetime. The
+    // budget rides the mount, not `KernelConfig` — the `with_backend` path below
+    // ignores `vfs_budget_bytes`, the embedder owns the VFS.
+    let scratch_budget = Arc::new(ByteBudget::labeled(
+        sandbox.scratch_limit_bytes,
+        "kaibo-scratch",
+    ));
+    vfs.mount("/", MemoryFs::with_budget(scratch_budget));
     // The project itself: real files, read-only.
     vfs.mount(&mount_point, LocalFs::read_only(&root));
 
@@ -189,9 +212,12 @@ pub fn build_readonly_kernel_with(
     // runs after the default builtins are registered, so any config-driven
     // `disable_builtins` shadows win.
     let disable = sandbox.disable_builtins.clone();
-    Kernel::with_backend(backend, config, |_| {}, move |reg| {
-        apply_disabled_builtins(reg, &disable)
-    })
+    Kernel::with_backend(
+        backend,
+        config,
+        |_| {},
+        move |reg| apply_disabled_builtins(reg, &disable),
+    )
     .context("failed to build read-only kaish kernel")
 }
 
@@ -285,7 +311,10 @@ impl KaishWorker {
             // generous stack rather than the default 2 MiB worker stack.
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = init_tx.send(Err(format!("runtime build failed: {e}")));
@@ -335,7 +364,10 @@ impl KaishWorker {
     pub async fn run(&self, script: impl Into<String>) -> Result<KaishOutput> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.jobs
-            .send(Job { script: script.into(), reply })
+            .send(Job {
+                script: script.into(),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("kaish worker thread is gone"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("kaish worker dropped the reply"))

@@ -268,6 +268,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
+| scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |
 | disable extra builtins | `sandbox.disable_builtins` *(list; file-only)* | — | — |
 
 **Two deliberate exceptions to the rule:**
@@ -384,7 +385,7 @@ operator) the full picture:
 - `default_root` — the `--root` value, if set
 - `default_cast` — which cast is used when a call omits `cast`
 - `tools` — which of the four tools are currently advertised
-- `sandbox` — exec timeout, output cap, and any extra disabled builtins
+- `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins
 - `defaults` — the global tunables every slot falls back to (rendered so the
   per-slot values below read as deltas against it)
 - `backends` — each connection: its kind, the *resolved* `base_url` (openai kind),

@@ -30,11 +30,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::consult::{ModelCaps, ThinkingStyleOverride};
-use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
+use crate::credentials::{self, PLACEHOLDER_OPENAI_KEY, ProviderKind};
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
 
@@ -746,6 +746,18 @@ impl Config {
             .map(PathBuf::from)
             .collect();
         let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
+        // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
+        // every redirect — which breaks normal explorer operation, so it's never a
+        // real intent (there's no "unbounded" escape hatch by design: an unbounded
+        // scratch is the bug this cap exists to prevent). Loud at load, not as a
+        // baffling StorageFull on the first redirect.
+        if sandbox.scratch_limit_bytes == 0 {
+            bail!(
+                "[sandbox] scratch_limit_bytes must be > 0 — a zero budget refuses \
+                 every scratch write (mktemp, redirects); lower it to bound RAM, but \
+                 not to zero"
+            );
+        }
 
         let cfg = Self {
             root,
@@ -949,6 +961,8 @@ struct RawConfig {
 struct RawSandbox {
     exec_timeout_secs: Option<u64>,
     output_limit_bytes: Option<usize>,
+    /// Cap on the `/` scratch MemoryFs. Env: `KAIBO_SCRATCH_LIMIT_BYTES`.
+    scratch_limit_bytes: Option<u64>,
     /// Builtins to disable on top of the read-only denylist (file-only; no env).
     disable_builtins: Option<Vec<String>>,
 }
@@ -1185,6 +1199,7 @@ fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
             .map(Duration::from_secs)
             .unwrap_or(d.exec_timeout),
         output_limit_bytes: raw.output_limit_bytes.unwrap_or(d.output_limit_bytes),
+        scratch_limit_bytes: raw.scratch_limit_bytes.unwrap_or(d.scratch_limit_bytes),
         disable_builtins: raw.disable_builtins.unwrap_or(d.disable_builtins),
     }
 }
@@ -1292,6 +1307,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_OUTPUT_LIMIT_BYTES") {
         sandbox.output_limit_bytes = Some(parse_env_int("KAIBO_OUTPUT_LIMIT_BYTES", &v)?);
+    }
+    if let Some(v) = get("KAIBO_SCRATCH_LIMIT_BYTES") {
+        sandbox.scratch_limit_bytes = Some(parse_env_int("KAIBO_SCRATCH_LIMIT_BYTES", &v)?);
     }
     // disable_builtins is a list — file-only, no env form.
     Ok(())
@@ -1723,15 +1741,54 @@ mod tests {
         assert!(err.contains("anthropic"), "got: {err}");
     }
 
+    // --- scratch budget ---------------------------------------------------------
+
+    /// `[sandbox].scratch_limit_bytes` overrides the default cap on the `/` scratch
+    /// MemoryFs; absent, the generous built-in default stands.
+    #[test]
+    fn scratch_limit_bytes_overrides_the_default() {
+        let cfg = Config::from_toml_str("[sandbox]\nscratch_limit_bytes = 1024\n").unwrap();
+        assert_eq!(cfg.sandbox.scratch_limit_bytes, 1024);
+        // Default when unset.
+        let cfg = Config::builtin();
+        assert_eq!(
+            cfg.sandbox.scratch_limit_bytes,
+            crate::sandbox::DEFAULT_SCRATCH_LIMIT_BYTES
+        );
+    }
+
+    /// A zero scratch budget refuses every scratch write — never a real intent, so
+    /// it's a loud load error, not a baffling StorageFull on the first redirect.
+    #[test]
+    fn a_zero_scratch_limit_is_a_load_error() {
+        let err = Config::from_toml_str("[sandbox]\nscratch_limit_bytes = 0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scratch_limit_bytes"), "got: {err}");
+        assert!(err.contains("> 0"), "got: {err}");
+    }
+
+    /// `KAIBO_SCRATCH_LIMIT_BYTES` folds in over the file (env > file).
+    #[test]
+    fn env_scratch_limit_bytes_overrides_the_file() {
+        let cfg = Config::load_with(None, None, |k| {
+            (k == "KAIBO_SCRATCH_LIMIT_BYTES").then(|| "2048".to_string())
+        })
+        .unwrap();
+        assert_eq!(cfg.sandbox.scratch_limit_bytes, 2048);
+    }
+
     /// A typo'd role key in a cast stanza is a loud load error (deny_unknown_fields).
     #[test]
     fn an_unknown_role_key_in_a_cast_is_a_load_error() {
-        assert!(Config::from_toml_str(
-            r#"
+        assert!(
+            Config::from_toml_str(
+                r#"
             [casts.x]
             explorrer = "anthropic/claude-haiku-4-5"
             "#,
-        )
-        .is_err());
+            )
+            .is_err()
+        );
     }
 }

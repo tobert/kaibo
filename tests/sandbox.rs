@@ -5,7 +5,7 @@
 
 use std::fs;
 
-use kaibo::sandbox::{build_readonly_kernel, build_readonly_kernel_with, run, SandboxConfig};
+use kaibo::sandbox::{SandboxConfig, build_readonly_kernel, build_readonly_kernel_with, run};
 use tempfile::tempdir;
 
 /// Reads through the sandbox work and see the live project tree.
@@ -17,7 +17,12 @@ async fn reads_see_real_files() {
     let kernel = build_readonly_kernel(dir.path()).unwrap();
     let r = run(&kernel, "cat hello.txt").await.unwrap();
 
-    assert!(r.ok(), "cat should succeed, got code={} err={:?}", r.code, r.err);
+    assert!(
+        r.ok(),
+        "cat should succeed, got code={} err={:?}",
+        r.code,
+        r.err
+    );
     assert!(
         r.text_out().contains("kai the crab"),
         "cat should return file contents, got: {:?}",
@@ -45,24 +50,30 @@ async fn rm_on_project_file_is_denied_and_file_survives() {
 
 /// Redirecting into the project tree must not create a real file. The target is an
 /// ABSOLUTE path into the project so the redirect resolves to the read-only LocalFs
-/// mount — a bare relative `> f` is a red herring here: kaish resolves a relative
-/// redirect target against `/` (the MemoryFs catch-all), not the shell cwd, so it
-/// lands in ephemeral memory and never touches the mount at all (tracked in kaish
-/// `docs/issues.md`: "Output redirects ignore cwd"). Teeth: mount the project
+/// mount deterministically. (As of kaish 0.8.1 a bare relative `> f` resolves against
+/// cwd — here the project root — so it would also be refused as read-only; earlier
+/// kaish resolved relative targets against `/` and they landed in scratch instead.
+/// The absolute path pins the mount under test regardless.) Teeth: mount the project
 /// writable (`LocalFs::new`) and this fails — the read-only mount is the only thing
 /// refusing the write. The path comes from a `tempdir` (host-independent); we give
 /// it a non-dotted prefix so no path component trips kaish's dot-filename
 /// mis-tokenization.
 #[tokio::test(flavor = "current_thread")]
 async fn writes_into_project_do_not_touch_disk() {
-    let dir = tempfile::Builder::new().prefix("kaibo-ro").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("kaibo-ro")
+        .tempdir()
+        .unwrap();
     let kernel = build_readonly_kernel(dir.path()).unwrap();
 
     let target = dir.path().join("newfile.txt");
     let script = format!("echo pwned > {}", target.display());
     let r = run(&kernel, &script).await.unwrap();
 
-    assert!(!r.ok(), "a redirect into the read-only project must be refused, got {r:?}");
+    assert!(
+        !r.ok(),
+        "a redirect into the read-only project must be refused, got {r:?}"
+    );
     assert!(
         r.err.contains("read-only"),
         "the refusal should cite the read-only mount, got {r:?}"
@@ -118,7 +129,11 @@ async fn touch_existing_file_cannot_bump_mtime() {
     let kernel = build_readonly_kernel(dir.path()).unwrap();
     let r = run(&kernel, "touch real.txt").await.unwrap();
 
-    assert!(!r.ok(), "touch on existing file must be denied, code={}", r.code);
+    assert!(
+        !r.ok(),
+        "touch on existing file must be denied, code={}",
+        r.code
+    );
     assert!(
         r.err.contains("read-only"),
         "the read-only mount should reject the mtime bump, got err={:?}",
@@ -139,11 +154,17 @@ async fn mktemp_lands_in_memory_not_real_disk() {
     let kernel = build_readonly_kernel(dir.path()).unwrap();
 
     let r = run(&kernel, "mktemp").await.unwrap();
-    assert!(r.ok(), "mktemp should succeed into ephemeral memory, got {r:?}");
+    assert!(
+        r.ok(),
+        "mktemp should succeed into ephemeral memory, got {r:?}"
+    );
 
     let out = r.text_out();
     let path = out.trim();
-    assert!(!path.is_empty(), "mktemp should print the temp path it created, got {r:?}");
+    assert!(
+        !path.is_empty(),
+        "mktemp should print the temp path it created, got {r:?}"
+    );
     assert!(
         !std::path::Path::new(path).exists(),
         "mktemp must not create a file on the real filesystem, but {path} exists"
@@ -200,19 +221,70 @@ async fn shadow_block_is_126_and_distinct_from_a_plain_failure() {
 
     // The shadow-blocked builtin → 126 + the sandbox marker.
     let blocked = run(&kernel, "cat f.txt").await.unwrap();
-    assert_eq!(blocked.code, 126, "a sandbox block must be exit 126, got {blocked:?}");
+    assert_eq!(
+        blocked.code, 126,
+        "a sandbox block must be exit 126, got {blocked:?}"
+    );
     assert!(
-        blocked.err.contains("read-only sandbox") || blocked.text_out().contains("read-only sandbox"),
+        blocked.err.contains("read-only sandbox")
+            || blocked.text_out().contains("read-only sandbox"),
         "the 126 must carry the sandbox marker (126 also means POSIX not-executable), got {blocked:?}"
     );
 
     // An ordinary failure (a still-enabled builtin on a missing file) → non-zero
     // but NOT 126, so it can't be mistaken for a block.
-    let failed = run(&kernel, "grep needle does-not-exist.txt").await.unwrap();
-    assert!(!failed.ok(), "grep on a missing file must fail, got {failed:?}");
+    let failed = run(&kernel, "grep needle does-not-exist.txt")
+        .await
+        .unwrap();
+    assert!(
+        !failed.ok(),
+        "grep on a missing file must fail, got {failed:?}"
+    );
     assert_ne!(
         failed.code, 126,
         "a plain failure must not collide with the 126 sandbox-block code, got {failed:?}"
+    );
+}
+
+/// The `/` scratch MemoryFs is bounded: a redirect that writes past the configured
+/// `scratch_limit_bytes` fails loudly (ENOSPC-style) instead of eating host RAM for
+/// the kernel's whole lifetime — the unbounded-scratch surprise tracked in
+/// `docs/issues.md`. The target is an ABSOLUTE path outside the project mount, so the
+/// router sends it to the `/` MemoryFs (the budgeted mount) rather than the read-only
+/// project mount; a bare relative target would now resolve against cwd (the project)
+/// and be refused as read-only instead. Teeth: the generous default budget below
+/// swallows the same write, so it's the cap — not some other refusal — doing the work.
+#[tokio::test(flavor = "current_thread")]
+async fn scratch_writes_past_the_budget_are_refused() {
+    let dir = tempfile::Builder::new()
+        .prefix("kaibo-ro")
+        .tempdir()
+        .unwrap();
+
+    // A tiny budget, then a redirect that overruns it in one write.
+    let tight = SandboxConfig {
+        scratch_limit_bytes: 16,
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &tight).unwrap();
+    let overrun = "echo this-line-is-well-over-sixteen-bytes-long > /scratch-grow";
+    let r = run(&kernel, overrun).await.unwrap();
+    assert!(
+        !r.ok(),
+        "a write past the scratch budget must be refused, got {r:?}"
+    );
+    assert!(
+        r.err.contains("budget") || r.text_out().contains("budget"),
+        "the refusal should cite the exhausted scratch budget, got {r:?}"
+    );
+
+    // Teeth: the same write under the generous default budget succeeds — so the
+    // refusal above was the cap, not a redirect or read-only artifact.
+    let roomy = build_readonly_kernel_with(dir.path(), &SandboxConfig::default()).unwrap();
+    let r = run(&roomy, overrun).await.unwrap();
+    assert!(
+        r.ok(),
+        "the same write must succeed under the default budget, got {r:?}"
     );
 }
 

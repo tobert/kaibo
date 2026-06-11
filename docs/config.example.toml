@@ -90,6 +90,10 @@ session_capacity = 128       # max multi-turn consult sessions held in memory (L
 [sandbox]
 exec_timeout_secs  = 30      # per-kaish-script wall clock; exit 124 on overrun
 output_limit_bytes = 8192    # per-script output cap; exit 3 + head/tail sample
+# Cap on the `/` scratch MemoryFs (redirects, mktemp). A write past it fails loudly
+# (StorageFull), never silently eating host RAM. Default 64 MiB; must be > 0 — there
+# is no "unbounded" setting, an unbounded scratch is the bug this prevents.
+scratch_limit_bytes = 67108864
 # Builtins to shadow-block ON TOP OF the read-only denylist (exit 126 if invoked).
 # This only makes the box STRICTER — it can't re-enable the read-only denylist
 # (git/touch/spawn/exec/kill/mktemp), and the dangerous axes aren't compiled in.

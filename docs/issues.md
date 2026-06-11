@@ -14,7 +14,20 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-11 (backends/casts split SHIPPED — `docs/casts.md` stands as
+Last pass: 2026-06-11 (kaish 0.8.1 bump + scratch ByteBudget SHIPPED — the dep
+moved to published `kaish-kernel = "0.8.1"` (clean, no API breakage), and the
+unbounded-`/`-scratch surprise is closed: `[sandbox].scratch_limit_bytes` (env
+`KAIBO_SCRATCH_LIMIT_BYTES`, default 64 MB, must be > 0 — no "unbounded" escape)
+threads an owned labeled `ByteBudget` onto the scratch `MemoryFs` via
+`MemoryFs::with_budget` at `sandbox.rs` construction, so a runaway redirect fails
+loudly (`StorageFull`) instead of eating host RAM for the kernel's lifetime.
+`ByteBudget` rides `kaish_kernel::vfs` — no direct kaish-vfs dep. Failing-first
+test in `tests/sandbox.rs` (proven teeth by swapping in an unbounded mount). Folded
+out the P2 entry. Bonus from the bump: kaish fixed "redirects ignore cwd", so a
+bare relative `> f` now resolves against cwd — the sandbox tests target absolute
+scratch paths accordingly. A DeepSeek review of the backends/casts config also
+landed one fix: the table slot form now trims `backend`/`id` like the string-ref
+form, so identical intent doesn't hinge on spelling). 2026-06-11 (backends/casts split SHIPPED — `docs/casts.md` stands as
 the design record: `Profile` dissolved into `[backends.<name>]` (connections) +
 `[casts.<name>]` (role → `"backend/model-id"`, freely cross-backend), calls
 select casts via the `cast` param, each slot resolves to its own `Arm` (client +
@@ -176,42 +189,6 @@ the alias behavior — its alias tests go with it; the duplicate-field test
 becomes a plain unknown-field test (inputs are deny_unknown_fields, so a stale
 `provider` turns into a loud invalid-params error, which is the desired end
 state).
-
-### Unquota'd `/` MemoryFs scratch: redirection writes unbounded bytes into RAM
-**Proven live, 2026-06-10**: against the running server,
-`run_kaish` with `for i in $(seq 1 200); do cat src/consult.rs >> /tmp/grow; done`
-exited **0** with 17.4 MB in `/tmp/grow` in ~1s — scale the loop bound and it's
-gigabytes. The per-script output cap bounds what returns to the *caller*; a
-redirect lands in the `/` `MemoryFs` (`kaish-vfs/src/memory.rs`, a plain
-`RwLock<HashMap>` with no size check on `write`), bounded only by the 30s exec
-timeout and the call-scoped kernel lifetime. A consult's explorer holds its
-kernel for the whole phase loop (50–100 turns), so one steered or pathological
-investigation can drive real host memory pressure — that's the user surprise.
-(The output-*spill* path is NOT part of this: `SpillMode::Memory` truncates,
-bounded — initial version of this entry overstated it.)
-
-Fix shape (settled 2026-06-10, design in kaish `docs/kaish-overlayfs.md`
-"Byte accounting"): **kaish-side, always-on** — counting lives inside each
-memory-resident fs (`resident_bytes()`, exact net accounting under the fs's own
-lock), limiting is a shared `ByteBudget` with profile defaults riding
-`KernelConfig` the way `OutputLimitConfig::mcp()` already does. This superseded
-the earlier kaibo-local `QuotaFs` wrapper idea (a wrapper undercounts overlay
-bases, and opt-in guards drift). **kaish landed `ByteBudget` 2026-06-10**
-(re-exported from kaish-vfs), so kaibo's half is unblocked and gains urgency from
-the media-spine plan (P1 above): media artifacts in scratch are megabytes by
-design, not just pathological loops. 2026-06-11: waiting on a kaish 0.8.1
-release (entry recorded in kaish `docs/issues.md`, including a one-line
-`ByteBudget` re-export from kaish-kernel so kaibo needs no direct kaish-vfs
-dep). Attach point confirmed: kaibo builds its own scratch `MemoryFs`
-(`sandbox.rs:170`), so the budget goes in via `MemoryFs::with_budget` at
-construction — `KernelConfig.vfs_budget_bytes` never enters the `with_backend`
-path. kaibo's part once 0.8.1 lands: bump the registry dep, thread
-`[sandbox].scratch_limit_bytes` → an owned labeled budget on the scratch mount
-(stricter-only, like the rest of `SandboxConfig`; default generous, e.g. 64 MB
-— scratch is a feature, runaway growth is the bug), and land the failing-first
-test: the probe above expecting the loud ENOSPC-style refusal; prove teeth by
-lifting the budget and watching it fail. Escalates to P1 (blocking) when
-overlay workspaces land: long-lived kernels remove the call-lifetime bound.
 
 ---
 
