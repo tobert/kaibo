@@ -4,8 +4,11 @@
 # or point at it with --config <path> / KAIBO_CONFIG.
 #
 # EVERYTHING here is optional. With no config file at all, kaibo runs exactly as it
-# does today: the four built-in profiles below (anthropic/deepseek/gemini/openai)
-# are already present in code; this file only OVERRIDES fields or ADDS profiles.
+# does today: four built-in BACKENDS (connections: anthropic/deepseek/gemini/openai)
+# and four same-named single-backend CASTS (compositions: role → "backend/model-id")
+# ship in code; this file only OVERRIDES fields or ADDS backends and casts.
+# `[profiles]` is gone — a config that still carries it is a load error pointing at
+# docs/casts.md.
 #
 # Precedence, highest wins:
 #   MCP per-call input  >  CLI flag  >  env var (KAIBO_*)  >  this file  >  built-in
@@ -16,7 +19,7 @@
 # OPENAI_BASE_URL. RUST_LOG is also kept as-is.
 
 # ---------------------------------------------------------------------------
-# [server] — process-level defaults (the things --root / --provider / --no-* set)
+# [server] — process-level defaults (the things --root / --cast / --no-* set)
 # ---------------------------------------------------------------------------
 [server]
 # Default project root when a call omits `path`. Omit to require `path` per call.
@@ -28,8 +31,9 @@
 # (colon-separated env var); a non-empty CLI list replaces the env/file layer.
 # allow_paths = ["/home/atobey/shared-libs", "/data/shared"]
 
-# Default profile (by name) when a call omits `provider`.
-provider = "anthropic"
+# Default cast (by name or alias) when a call omits `cast`. The old `provider`
+# key is a load error (unknown field) — see docs/casts.md for the rename map.
+cast = "anthropic"
 
 # tracing/EnvFilter directive used when RUST_LOG is unset.
 log = "kaibo=info"
@@ -43,14 +47,41 @@ synthesize = true
 run_kaish  = true
 
 # ---------------------------------------------------------------------------
-# [defaults] — tunables shared by all profiles (each profile may override below)
+# [defaults] — tunables every cast slot falls back to. The model-tracking knobs
+# (max_tokens, thinking_budget, temperature, effort, thinking_style) can also be
+# overridden per slot (table form, below); request_timeout_secs per backend.
 # ---------------------------------------------------------------------------
 [defaults]
-explorer_max_turns = 50      # bounds each cheap explore′ sweep — cheap, let it rip
-synth_max_turns    = 100     # bounds the consult driver loop (sweeps AND span reads)
+explorer_max_turns = 100     # bounds each cheap explore′ sweep — cheap, let it rip
+synth_max_turns    = 200     # bounds the consult driver loop (sweeps AND span reads)
 max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
 thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle
-session_capacity   = 128     # max multi-turn consult sessions held in memory (LRU,
+
+# Sampling, per role: the explorer gathers exact citations (cold); the synth
+# composes the answer (a touch warmer). Temperature in [0.0, 2.0], top_p in
+# (0.0, 1.0] — out of range is a load error, not a clamp. Anthropic drops
+# sampling whenever thinking is on (the API rejects the combination).
+explorer_temperature = 0.1
+synth_temperature    = 0.3
+top_p                = 0.95
+
+# Reasoning depth, per role, for the models that take an effort param (Anthropic
+# adaptive tier, DeepSeek). A passthrough string the provider validates — bump
+# synth_effort to "max"/"xhigh" for heavier runs without a kaibo release.
+explorer_effort = "high"
+synth_effort    = "high"
+
+# Force the Anthropic thinking shape ("auto" | "adaptive" | "budget") instead of
+# the built-in model classifier — the escape hatch for a new or misclassified id.
+thinking_style = "auto"
+
+# Per-request LLM deadline (seconds): the wall-clock ceiling on ONE completion
+# call. Seeds every backend; override per backend for a slow local model. Keep it
+# above your slowest legitimate single completion — a non-streaming call can't
+# tell wedged from slow. 0 is rejected at load.
+request_timeout_secs = 900
+
+session_capacity = 128       # max multi-turn consult sessions held in memory (LRU,
                              # capacity-evicted, no TTL); must be > 0
 
 # ---------------------------------------------------------------------------
@@ -66,70 +97,128 @@ output_limit_bytes = 8192    # per-script output cap; exit 3 + head/tail sample
 # disable_builtins = ["rg", "find"]
 
 # ---------------------------------------------------------------------------
-# [profiles.<name>] — named instances. `kind` picks the wire protocol/rig client
-# (anthropic | deepseek | gemini | openai); everything else is per-instance.
+# [backends.<name>] — CONNECTIONS only: `kind` picks the wire protocol/rig client
+# (anthropic | deepseek | gemini | openai); the rest describes the wire (endpoint,
+# key source, per-request deadline). Models live on cast slots, never here.
 #
 # Keys are referenced, never inlined: api_key_env names an env var, api_key_file a
 # path (~ ok). env wins over file. key_optional=true falls back to a placeholder
-# bearer token (keyless local servers).
+# bearer token (keyless local servers). base_url is only legal on the openai kind
+# (rig fixes the keyed endpoints — a base_url there is a loud load error).
 # ---------------------------------------------------------------------------
 
-# --- The four built-ins, shown with their current defaults. You only need to list
-#     a profile here to CHANGE something; these blocks are illustrative. ---
+# --- The four built-ins, shown with their current defaults. You only need to
+#     list a backend here to CHANGE something; these blocks are illustrative.
+#     Their alias names (claude, google, local, lemonade, gemma, gemma4) are
+#     reserved at both levels — naming a new backend or cast after one is a
+#     loud collision error. ---
 
-[profiles.anthropic]
+[backends.anthropic]                         # alias: claude
 kind = "anthropic"
-aliases = ["claude"]
 api_key_env  = "ANTHROPIC_API_KEY"
 api_key_file = "~/.anthropic-key.txt"
-explorer_model = "claude-haiku-4-5"
-synth_model    = "claude-sonnet-4-6"
 
-[profiles.deepseek]
+[backends.deepseek]
 kind = "deepseek"
 api_key_env  = "DEEPSEEK_API_KEY"
 api_key_file = "~/.deepseek-key"
-explorer_model = "deepseek-v4-flash"
-synth_model    = "deepseek-v4-pro"
 
-[profiles.gemini]
+[backends.gemini]                            # alias: google
 kind = "gemini"
-aliases = ["google"]
 api_key_env  = "GEMINI_API_KEY"
 api_key_file = "~/.gemini-api-key"
-explorer_model = "gemini-flash-lite-latest"
-synth_model    = "gemini-3.5-flash"   # flash, not pro — pro is API-flaky
 
-[profiles.openai]
+[backends.openai]                            # aliases: local, lemonade, gemma, gemma4
 kind = "openai"
-aliases = ["local", "lemonade", "gemma", "gemma4"]
 base_url = "http://localhost:13305/api/v1"   # also overridable via OPENAI_BASE_URL
 api_key_env  = "OPENAI_API_KEY"
 api_key_file = "~/.openai-key"
 key_optional = true                          # keyless local default → placeholder
-explorer_model = "Gemma-4-E4B-it-GGUF"       # small E4B drives tool-heavy explore
-synth_model    = "Gemma-4-26B-A4B-it-GGUF"   # 26B MoE writes the answer
 
-# --- The reason this file exists: more than one openai-kind backend, all live,
-#     each selected by name (`--provider gpt`, `--provider llama`). ---
+# --- New backends: any number of openai-kind endpoints, each its own connection.
+#     A new backend must declare its `kind`; it seeds that kind's default key
+#     sources, then your fields apply on top. A new openai-kind backend must also
+#     set `base_url` (the OPENAI_BASE_URL / local-default fallback belongs to the
+#     built-in `openai` backend alone — a forgotten base_url is a load error, not
+#     a silent dial of the wrong server). ---
 
 # Hosted OpenAI, keyed.
-[profiles.gpt]
+[backends.gpt]
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 key_optional = false
-explorer_model = "gpt-5-mini"
-synth_model    = "gpt-5"
-# max_tokens / thinking_budget are per-profile: they track the model, not the
-# server. A hosted model has headroom local Gemma doesn't — override the defaults.
-max_tokens      = 32768
-thinking_budget = 16384
 
-# A second local llama.cpp server on another port, keyless.
-[profiles.llama]
+# A second local llama.cpp server on another port, keyless. A slow local model
+# legitimately wants a longer per-request leash than a hosted API.
+[backends.llama]
 kind = "openai"
 base_url = "http://localhost:8080/v1"
 key_optional = true
-explorer_model = "qwen2.5-coder-7b"
-synth_model    = "qwen2.5-coder-32b"
+request_timeout_secs = 1800
+
+# A local image server — also just an openai-kind connection.
+[backends.sd]
+kind = "openai"
+base_url = "http://localhost:7860/v1"
+key_optional = true
+
+# ---------------------------------------------------------------------------
+# [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
+# what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
+#
+# Roles: explorer, synth (the agent phases), image, tts (production roles for the
+# media builtins as they land). A typo'd role is a loud load error. A cast may
+# omit roles — the tool that needs a missing role fails at call time, naming the
+# gap ("cast `tts-box` has no synth slot"); absent = capability absent.
+#
+# Slot forms:
+#   role = "backend/model-id"                                  # the common case
+#   role = { backend = "…", id = "…", vision = true, … }       # pins + tunables
+# The first "/" splits a string ref, so HuggingFace-style ids keep their inner
+# slash. A slot ref borrows the backend's CONNECTION only — it never follows
+# another cast, so chains and cycles are structurally impossible. An unknown
+# backend in a slot is a load error naming the known backends.
+# ---------------------------------------------------------------------------
+
+# --- The reason casts exist: a chimera — each role on the backend that serves
+#     it best, selected as one name (`cast = "chimera"`). ---
+
+[casts.chimera]
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
+synth    = "claude/claude-sonnet-4-6"       # the voice that answers
+image    = "sd/sdxl-turbo"                  # image gen stays local
+tts      = "gemini/gemini-2.5-flash-tts"
+
+# --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
+#     the local-default `openai` backend. ---
+
+[casts.local-only]
+explorer = "gemma/Gemma-4-E4B-it-GGUF"
+synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
+image    = "sd/sdxl-turbo"
+
+# --- The table form, part 1: capability pins. `vision = true` overrides the
+#     built-in classifier (Anthropic/Gemini multimodal-in, DeepSeek text-only,
+#     generic openai endpoints vision-off until you say otherwise — kaibo can't
+#     know what's behind an arbitrary id, so opt in, don't guess). ---
+
+[casts.vlm]
+explorer = "llama/qwen2.5-coder-7b"                              # bare ref: just the id
+synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
+
+# --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
+#     per-role value for THIS slot only; knobs you omit fall back. Available:
+#     max_tokens, thinking_budget, temperature, effort, thinking_style — they
+#     track the model, not the server. A typo'd knob is a loud load error. ---
+
+[casts.deep-dive]
+aliases  = ["deep"]                          # casts (and backends) take aliases
+explorer = "deepseek/deepseek-v4-flash"
+synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
+
+# --- Hosted GPT end to end, both roles on the keyed backend above. ---
+
+[casts.gpt]
+explorer = "gpt/gpt-5-mini"
+synth    = "gpt/gpt-5"

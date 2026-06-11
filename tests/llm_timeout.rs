@@ -6,15 +6,17 @@
 //! non-streaming, so the only brake is a per-request HTTP timeout on the client.
 //!
 //! This test stands up a "black hole" server (accepts the TCP connection, then
-//! never writes a byte) and points an `openai`-kind profile at it with a short
-//! `request_timeout`. With the deadline wired, the call surfaces an error near
-//! the deadline; without it, the call hangs — so an outer guard turns a
-//! regression into a fast failure instead of a hung suite.
+//! never writes a byte) and points an `openai`-kind backend at it with a short
+//! `request_timeout` (the deadline rides the *backend* — it describes the wire —
+//! and `Arm::from_slot` bakes it into the arm's HTTP client). With the deadline
+//! wired, the call surfaces an error near the deadline; without it, the call
+//! hangs — so an outer guard turns a regression into a fast failure instead of a
+//! hung suite.
 
 use std::time::{Duration, Instant};
 
-use kaibo::config::{Config, Profile};
-use kaibo::consult::{synthesize, ConsultConfig};
+use kaibo::config::{Config, ModelRole};
+use kaibo::consult::{synthesize, Arm, ConsultConfig};
 use tokio::net::TcpListener;
 
 /// Bind an ephemeral port and accept connections forever without ever replying —
@@ -37,15 +39,23 @@ async fn black_hole() -> (String, tokio::task::JoinHandle<()>) {
 async fn synthesize_aborts_when_the_provider_never_responds() {
     let (base_url, _server) = black_hole().await;
 
-    // An openai-kind profile aimed at the black hole, keyless, with a short
+    // The built-in openai backend aimed at the black hole, keyless, with a short
     // deadline so the test is quick but the mechanism is the production one.
-    let mut p: Profile = Config::builtin()
-        .resolve_profile("openai")
-        .expect("built-in openai profile")
+    let cfg = Config::builtin();
+    let mut backend = cfg
+        .resolve_backend("openai")
+        .expect("built-in openai backend")
         .clone();
-    p.base_url = Some(base_url);
-    p.key_optional = true;
-    p.request_timeout = Duration::from_secs(2);
+    backend.base_url = Some(base_url);
+    backend.key_optional = true;
+    backend.request_timeout = Duration::from_secs(2);
+
+    let cast = cfg.resolve_cast("openai").expect("built-in openai cast");
+    let slot = cast
+        .require_slot(ModelRole::Synth)
+        .expect("openai cast has a synth slot");
+    let arm = Arm::from_slot(&backend, slot, ModelRole::Synth, &cfg.defaults)
+        .expect("arm against the black hole builds");
 
     // Outer guard: if the per-request deadline regresses, the call hangs and this
     // fires, failing fast rather than wedging the whole suite.
@@ -56,7 +66,7 @@ async fn synthesize_aborts_when_the_provider_never_responds() {
             "What does the sandbox prevent?",
             Some("src/sandbox.rs builds a read-only kernel."),
             env!("CARGO_MANIFEST_DIR"),
-            &p,
+            &arm,
             &ConsultConfig::default(),
         ),
     )

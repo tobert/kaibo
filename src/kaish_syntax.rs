@@ -153,7 +153,8 @@ pub fn kaibo_instructions_with_scope(
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
          Read `kaibo://config` for the full resolved runtime configuration — \
-         default provider, gated tools, sandbox limits, and all provider profiles."
+         default cast, gated tools, sandbox limits, and every backend and cast \
+         (with their aliases)."
     )
 }
 

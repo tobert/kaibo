@@ -48,7 +48,7 @@ impl ProviderKind {
     }
 
     /// The canonical lower-case name of this kind — also the name of its built-in
-    /// profile (so a bare `--provider anthropic` resolves to the built-in).
+    /// backend and cast (so a bare `--cast anthropic` resolves to the built-ins).
     pub fn canonical_name(self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "anthropic",

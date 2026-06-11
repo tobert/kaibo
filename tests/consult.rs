@@ -1,27 +1,49 @@
-//! Two-phase consult: offline prompt-builder test + an `#[ignore]`d live e2e.
+//! Consult over resolved arms: offline prompt/shape tests, a mixed-cast routing
+//! e2e over two scripted clients, and the `#[ignore]`d live probes.
 
-use kaibo::config::{default_models, Config, Profile};
+use std::sync::{Arc, Mutex};
+
+use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
 use kaibo::consult::{
-    consult, explore, request_params, synthesize, synthesize_user_prompt, thinking_params,
-    ConsultConfig, Dialect, ModelShape, Role, ThinkingStyleOverride, DEFAULT_EFFORT,
-    THINKING_BUDGET,
+    consult, explore, request_params, synthesize, synthesize_user_prompt, thinking_params, Arm,
+    ConsultConfig, ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
+use serde_json::{json, Value};
 
-/// A built-in profile by name, for the live tests below.
-fn profile(name: &str) -> Profile {
-    Config::builtin()
-        .resolve_profile(name)
-        .unwrap_or_else(|e| panic!("built-in profile {name:?}: {e}"))
-        .clone()
+/// Resolve one of `cast`'s slots into a live arm — the same resolution the server
+/// performs, for the live tests below. Constructs a real rig client (and so
+/// resolves the backend's key), which is why only the `#[ignore]`d tests call it.
+fn arm_from(cfg: &Config, cast: &str, role: ModelRole) -> Arm {
+    let cast = cfg
+        .resolve_cast(cast)
+        .unwrap_or_else(|e| panic!("resolve cast: {e}"));
+    let slot = cast
+        .require_slot(role)
+        .unwrap_or_else(|e| panic!("slot: {e}"));
+    let backend = cfg
+        .resolve_backend(&slot.backend)
+        .unwrap_or_else(|e| panic!("backend: {e}"));
+    Arm::from_slot(backend, slot, role, &cfg.defaults).unwrap_or_else(|e| panic!("arm: {e}"))
+}
+
+/// A built-in cast's arm by name, for the live tests below.
+fn builtin_arm(cast: &str, role: ModelRole) -> Arm {
+    arm_from(&Config::builtin(), cast, role)
 }
 
 #[test]
 fn synthesize_prompt_grounds_in_supplied_context() {
-    let p = synthesize_user_prompt("What blocks writes?", Some("src/sandbox.rs:95 read-only mount"));
+    let p = synthesize_user_prompt(
+        "What blocks writes?",
+        Some("src/sandbox.rs:95 read-only mount"),
+    );
 
     assert!(p.contains("What blocks writes?"), "question present");
-    assert!(p.contains("src/sandbox.rs:95 read-only mount"), "context present");
+    assert!(
+        p.contains("src/sandbox.rs:95 read-only mount"),
+        "context present"
+    );
     assert!(p.to_lowercase().contains("context"), "context labelled");
     // Question framed before the supplied context.
     let q = p.find("What blocks writes?").unwrap();
@@ -31,9 +53,15 @@ fn synthesize_prompt_grounds_in_supplied_context() {
     // when the context isn't enough — not for re-verifying what's likely right.
     // Pin both halves so a revert toward "verify the cited span" framing, or a
     // revert that drops the get-more license, fails here.
-    assert!(p.contains("run_kaish"), "investigation tool offered even with context");
+    assert!(
+        p.contains("run_kaish"),
+        "investigation tool offered even with context"
+    );
     let lower = p.to_lowercase();
-    assert!(lower.contains("trust"), "a grounded citation should be trusted, got: {p}");
+    assert!(
+        lower.contains("trust"),
+        "a grounded citation should be trusted, got: {p}"
+    );
     assert!(
         lower.contains("more than the context")
             || lower.contains("didn't cover")
@@ -74,10 +102,17 @@ fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
     assert_eq!(budget["thinking"]["type"], "enabled");
     assert_eq!(budget["thinking"]["budget_tokens"], THINKING_BUDGET);
 
-    let adaptive = thinking_params(ProviderKind::Anthropic, "claude-sonnet-4-6", THINKING_BUDGET)
-        .expect("anthropic adaptive-tier has a thinking toggle");
+    let adaptive = thinking_params(
+        ProviderKind::Anthropic,
+        "claude-sonnet-4-6",
+        THINKING_BUDGET,
+    )
+    .expect("anthropic adaptive-tier has a thinking toggle");
     assert_eq!(adaptive["thinking"]["type"], "adaptive");
-    assert!(adaptive["thinking"].get("budget_tokens").is_none(), "adaptive carries no budget");
+    assert!(
+        adaptive["thinking"].get("budget_tokens").is_none(),
+        "adaptive carries no budget"
+    );
 
     // Gemini 2.5: nested under generationConfig.thinkingConfig with camelCase keys —
     // rig parses these into a typed GenerationConfig, so the shape must be exact.
@@ -100,44 +135,72 @@ fn gemini_3_line_takes_thinking_level_not_budget() {
     // The boundary is empirical: the pure 3-line flips, but `gemini-3.5-flash` (a
     // confirmed-working default on budget) and 2.x stay on budget — switching them
     // would silently regress a request that works (docs/issues.md).
-    let g3 = thinking_params(ProviderKind::Gemini, "gemini-3-pro-preview", THINKING_BUDGET)
-        .expect("gemini 3 has a thinking toggle");
+    let g3 = thinking_params(
+        ProviderKind::Gemini,
+        "gemini-3-pro-preview",
+        THINKING_BUDGET,
+    )
+    .expect("gemini 3 has a thinking toggle");
     let tc = &g3["generationConfig"]["thinkingConfig"];
     assert_eq!(tc["thinkingLevel"], "high", "the 3-line wants a level");
-    assert!(tc.get("thinkingBudget").is_none(), "level and budget are mutually exclusive");
+    assert!(
+        tc.get("thinkingBudget").is_none(),
+        "level and budget are mutually exclusive"
+    );
     assert_eq!(tc["includeThoughts"], true);
 
     // The minor 3.5 line and 2.x stay on budget (the conservative, evidence-backed arm).
     for id in ["gemini-3.5-flash", "gemini-2.5-pro"] {
         let g = thinking_params(ProviderKind::Gemini, id, THINKING_BUDGET).expect("toggle");
         let tc = &g["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], THINKING_BUDGET, "{id} stays on budget");
-        assert!(tc.get("thinkingLevel").is_none(), "{id} must not send a level");
+        assert_eq!(
+            tc["thinkingBudget"], THINKING_BUDGET,
+            "{id} stays on budget"
+        );
+        assert!(
+            tc.get("thinkingLevel").is_none(),
+            "{id} must not send a level"
+        );
     }
 }
 
 #[test]
 fn thinking_budget_is_threaded_through_not_hardcoded() {
-    // A per-profile budget must reach the request, not the old global constant. Use a
+    // A per-slot budget must reach the request, not the old global constant. Use a
     // budget-tier Anthropic model (Haiku 4.5) — the adaptive tier carries no budget.
     let a = thinking_params(ProviderKind::Anthropic, "claude-haiku-4-5", 4096)
         .expect("anthropic toggle");
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
     let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", 4096).expect("gemini toggle");
-    assert_eq!(g["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
+    assert_eq!(
+        g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        4096
+    );
 }
 
 #[test]
 fn request_params_places_sampling_where_each_wire_format_wants_it() {
     // Gemini: temperature + topP (camelCase) ride under generationConfig, alongside
     // the thinkingConfig — one merged blob, not two.
-    let g = request_params(ProviderKind::Gemini, "gemini-2.5-flash", THINKING_BUDGET, Some(0.1), Some(0.95))
-        .expect("gemini params");
+    let g = request_params(
+        ProviderKind::Gemini,
+        "gemini-2.5-flash",
+        THINKING_BUDGET,
+        Some(0.1),
+        Some(0.95),
+    )
+    .expect("gemini params");
     let gc = &g["generationConfig"];
     assert_eq!(gc["temperature"], 0.1);
     assert_eq!(gc["topP"], 0.95, "Gemini uses camelCase topP");
-    assert_eq!(gc["thinkingConfig"]["thinkingBudget"], THINKING_BUDGET, "thinking still rides along");
-    assert!(g.get("temperature").is_none(), "must not leak to top level for Gemini");
+    assert_eq!(
+        gc["thinkingConfig"]["thinkingBudget"], THINKING_BUDGET,
+        "thinking still rides along"
+    );
+    assert!(
+        g.get("temperature").is_none(),
+        "must not leak to top level for Gemini"
+    );
 
     // Anthropic: thinking wins — sampling is dropped (any tier). The Messages API 400s on
     // any `temperature != 1` (and restricts top_p/top_k) whenever thinking is enabled
@@ -145,22 +208,46 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     // higher-value default (AGENTS.md "Driving the models"), so we keep it and let the
     // per-role sampling go inert rather than 400 the request. (Budget tier here; the
     // adaptive tier drops sampling the same way — see anthropic_newest_models_*.)
-    let a = request_params(ProviderKind::Anthropic, "claude-haiku-4-5", 4096, Some(0.3), Some(0.95))
-        .expect("anthropic params");
+    let a = request_params(
+        ProviderKind::Anthropic,
+        "claude-haiku-4-5",
+        4096,
+        Some(0.3),
+        Some(0.95),
+    )
+    .expect("anthropic params");
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
-    assert!(a.get("temperature").is_none(), "temperature must not ride alongside thinking for Anthropic");
-    assert!(a.get("top_p").is_none(), "top_p must not ride alongside thinking for Anthropic");
+    assert!(
+        a.get("temperature").is_none(),
+        "temperature must not ride alongside thinking for Anthropic"
+    );
+    assert!(
+        a.get("top_p").is_none(),
+        "top_p must not ride alongside thinking for Anthropic"
+    );
 
     // OpenAI: no thinking toggle, but sampling still goes top-level.
-    let o = request_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", 0, Some(0.2), Some(0.9))
-        .expect("openai sampling");
+    let o = request_params(
+        ProviderKind::Openai,
+        "Gemma-4-E4B-it-GGUF",
+        0,
+        Some(0.2),
+        Some(0.9),
+    )
+    .expect("openai sampling");
     assert_eq!(o["temperature"], 0.2);
     assert_eq!(o["top_p"], 0.9);
     assert!(o.get("thinking").is_none());
 
     // DeepSeek: thinking toggle and sampling coexist, all top-level.
-    let d = request_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET, Some(0.3), Some(0.95))
-        .expect("deepseek params");
+    let d = request_params(
+        ProviderKind::DeepSeek,
+        "deepseek-v4-pro",
+        THINKING_BUDGET,
+        Some(0.3),
+        Some(0.95),
+    )
+    .expect("deepseek params");
     assert_eq!(d["thinking"]["type"], "enabled");
     assert_eq!(d["reasoning_effort"], "high");
     assert_eq!(d["temperature"], 0.3);
@@ -174,23 +261,44 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
 fn anthropic_thinking_suppresses_sampling_or_the_api_400s() {
     // Regression for the live 400: "temperature may only be set to 1 when thinking is
     // enabled". Anthropic rejects custom temperature (and restricts top_p/top_k) while
-    // extended thinking is on. Thinking is on for every Anthropic profile by default,
-    // and temperature has a default on every profile, so the per-role sampling feature
+    // extended thinking is on. Thinking is on for every Anthropic slot by default,
+    // and temperature has a default on every slot, so the per-role sampling feature
     // collides with thinking on the very first call. Thinking wins; sampling drops.
     // (Budget tier shown; the adaptive tier drops sampling identically.)
-    let a = request_params(ProviderKind::Anthropic, "claude-haiku-4-5", THINKING_BUDGET, Some(0.3), Some(0.95))
-        .expect("anthropic still sends the thinking block");
+    let a = request_params(
+        ProviderKind::Anthropic,
+        "claude-haiku-4-5",
+        THINKING_BUDGET,
+        Some(0.3),
+        Some(0.95),
+    )
+    .expect("anthropic still sends the thinking block");
     assert_eq!(a["thinking"]["type"], "enabled");
     assert_eq!(a["thinking"]["budget_tokens"], THINKING_BUDGET);
-    assert!(a.get("temperature").is_none(), "temperature would 400 alongside thinking");
-    assert!(a.get("top_p").is_none(), "top_p is dropped with it, for the same reason");
+    assert!(
+        a.get("temperature").is_none(),
+        "temperature would 400 alongside thinking"
+    );
+    assert!(
+        a.get("top_p").is_none(),
+        "top_p is dropped with it, for the same reason"
+    );
 
     // The suppression is keyed on whether the model accepts sampling under thinking, not
     // on the provider alone: contrast DeepSeek, which also enables thinking but *accepts*
     // sampling, so its knobs ride through untouched.
-    let d = request_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET, Some(0.3), Some(0.95))
-        .expect("deepseek params");
-    assert_eq!(d["temperature"], 0.3, "DeepSeek keeps sampling even with thinking on");
+    let d = request_params(
+        ProviderKind::DeepSeek,
+        "deepseek-v4-pro",
+        THINKING_BUDGET,
+        Some(0.3),
+        Some(0.95),
+    )
+    .expect("deepseek params");
+    assert_eq!(
+        d["temperature"], 0.3,
+        "DeepSeek keeps sampling even with thinking on"
+    );
     assert_eq!(d["top_p"], 0.95);
 }
 
@@ -200,12 +308,27 @@ fn anthropic_newest_models_get_adaptive_thinking() {
     // all 400. Each gets `{thinking:{type:adaptive}, output_config:{effort}}` and no
     // sampling. (Mirrors the live "fix anthropic" goal — these would 400 on the old shape.)
     for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"] {
-        let a = request_params(ProviderKind::Anthropic, model, THINKING_BUDGET, Some(0.3), Some(0.95))
-            .unwrap_or_else(|| panic!("{model} sends a thinking block"));
+        let a = request_params(
+            ProviderKind::Anthropic,
+            model,
+            THINKING_BUDGET,
+            Some(0.3),
+            Some(0.95),
+        )
+        .unwrap_or_else(|| panic!("{model} sends a thinking block"));
         assert_eq!(a["thinking"]["type"], "adaptive", "{model} wants adaptive");
-        assert!(a["thinking"].get("budget_tokens").is_none(), "{model} rejects budget_tokens");
-        assert_eq!(a["output_config"]["effort"], DEFAULT_EFFORT, "{model} carries effort");
-        assert!(a.get("temperature").is_none(), "{model} rejects temperature");
+        assert!(
+            a["thinking"].get("budget_tokens").is_none(),
+            "{model} rejects budget_tokens"
+        );
+        assert_eq!(
+            a["output_config"]["effort"], DEFAULT_EFFORT,
+            "{model} carries effort"
+        );
+        assert!(
+            a.get("temperature").is_none(),
+            "{model} rejects temperature"
+        );
         assert!(a.get("top_p").is_none(), "{model} rejects top_p");
     }
 }
@@ -220,46 +343,111 @@ fn anthropic_classifier_boundary() {
             .expect("thinking.type is a string")
             .to_string()
     };
-    for model in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-fable-5"] {
-        assert_eq!(thinking_type(model), "adaptive", "{model} is the adaptive tier");
+    for model in [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-fable-5",
+    ] {
+        assert_eq!(
+            thinking_type(model),
+            "adaptive",
+            "{model} is the adaptive tier"
+        );
     }
-    for model in ["claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5", "claude-opus-4-1"] {
-        assert_eq!(thinking_type(model), "enabled", "{model} stays on enabled/budget");
+    for model in [
+        "claude-haiku-4-5",
+        "claude-opus-4-5",
+        "claude-sonnet-4-5",
+        "claude-opus-4-1",
+    ] {
+        assert_eq!(
+            thinking_type(model),
+            "enabled",
+            "{model} stays on enabled/budget"
+        );
     }
 }
 
 #[test]
 fn effort_is_per_role_and_provider_mapped() {
     // Effort lands only where the model takes it, at that provider's wire field.
-    let anthropic = ModelShape::resolve(ProviderKind::Anthropic, "claude-opus-4-8", ThinkingStyleOverride::Auto)
-        .to_params(THINKING_BUDGET, None, None, "xhigh")
-        .expect("adaptive params");
+    let anthropic = ModelShape::resolve(
+        ProviderKind::Anthropic,
+        "claude-opus-4-8",
+        ThinkingStyleOverride::Auto,
+    )
+    .to_params(THINKING_BUDGET, None, None, "xhigh")
+    .expect("adaptive params");
     assert_eq!(anthropic["output_config"]["effort"], "xhigh");
 
-    let deepseek = ModelShape::resolve(ProviderKind::DeepSeek, "deepseek-v4-pro", ThinkingStyleOverride::Auto)
-        .to_params(THINKING_BUDGET, None, None, "max")
-        .expect("deepseek params");
+    let deepseek = ModelShape::resolve(
+        ProviderKind::DeepSeek,
+        "deepseek-v4-pro",
+        ThinkingStyleOverride::Auto,
+    )
+    .to_params(THINKING_BUDGET, None, None, "max")
+    .expect("deepseek params");
     assert_eq!(deepseek["reasoning_effort"], "max");
 
     // Budget-tier Anthropic and Gemini have no effort sink — the value is ignored, not leaked.
-    let budget = ModelShape::resolve(ProviderKind::Anthropic, "claude-haiku-4-5", ThinkingStyleOverride::Auto)
-        .to_params(THINKING_BUDGET, None, None, "xhigh")
-        .expect("budget params");
-    assert!(budget.get("output_config").is_none(), "budget tier has no effort sink");
-    let gemini = ModelShape::resolve(ProviderKind::Gemini, "gemini-2.5-flash", ThinkingStyleOverride::Auto)
-        .to_params(THINKING_BUDGET, None, None, "xhigh")
-        .expect("gemini params");
-    assert!(gemini.get("reasoning_effort").is_none(), "Gemini has no effort sink");
+    let budget = ModelShape::resolve(
+        ProviderKind::Anthropic,
+        "claude-haiku-4-5",
+        ThinkingStyleOverride::Auto,
+    )
+    .to_params(THINKING_BUDGET, None, None, "xhigh")
+    .expect("budget params");
+    assert!(
+        budget.get("output_config").is_none(),
+        "budget tier has no effort sink"
+    );
+    let gemini = ModelShape::resolve(
+        ProviderKind::Gemini,
+        "gemini-2.5-flash",
+        ThinkingStyleOverride::Auto,
+    )
+    .to_params(THINKING_BUDGET, None, None, "xhigh")
+    .expect("gemini params");
+    assert!(
+        gemini.get("reasoning_effort").is_none(),
+        "Gemini has no effort sink"
+    );
     assert!(gemini.get("output_config").is_none());
 
-    // Per-role resolution through the Dialect: explorer and synth get their own effort.
-    let mut p = profile("anthropic");
-    p.explorer_effort = "low".into();
-    p.synth_effort = "max".into();
-    let dialect = Dialect::from_profile(&p);
-    let explorer = dialect.request_params("claude-opus-4-8", Role::Explorer).expect("explorer params");
-    let synth = dialect.request_params("claude-opus-4-8", Role::Synth).expect("synth params");
-    assert_eq!(explorer["output_config"]["effort"], "low", "explorer effort");
+    // Per-role resolution through the slot fallback: with no per-slot override, the
+    // explorer and synth arms of the *same* slot resolve their own [defaults] effort
+    // (the seam `Arm::from_slot` reads — Dialect dissolved into per-arm shaping).
+    let d = Defaults {
+        explorer_effort: "low".into(),
+        synth_effort: "max".into(),
+        ..Default::default()
+    };
+    let slot = ModelSlot::bare("anthropic", "claude-opus-4-8");
+
+    let et = slot.tunables(ModelRole::Explorer, &d);
+    let st = slot.tunables(ModelRole::Synth, &d);
+    let explorer = ModelShape::resolve(ProviderKind::Anthropic, &slot.id, et.thinking_style)
+        .to_params(
+            et.thinking_budget,
+            Some(et.temperature),
+            Some(et.top_p),
+            &et.effort,
+        )
+        .expect("explorer params");
+    let synth = ModelShape::resolve(ProviderKind::Anthropic, &slot.id, st.thinking_style)
+        .to_params(
+            st.thinking_budget,
+            Some(st.temperature),
+            Some(st.top_p),
+            &st.effort,
+        )
+        .expect("synth params");
+    assert_eq!(
+        explorer["output_config"]["effort"], "low",
+        "explorer effort"
+    );
     assert_eq!(synth["output_config"]["effort"], "max", "synth effort");
 }
 
@@ -267,15 +455,29 @@ fn effort_is_per_role_and_provider_mapped() {
 fn thinking_style_override_forces_a_tier() {
     // The escape hatch both ways: force an older model onto adaptive, or a newest model
     // back onto budget, when the classifier is wrong or a new id ships.
-    let forced_adaptive = ModelShape::resolve(ProviderKind::Anthropic, "claude-sonnet-4-5", ThinkingStyleOverride::Adaptive)
-        .to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT)
-        .expect("forced adaptive");
-    assert_eq!(forced_adaptive["thinking"]["type"], "adaptive", "override beats the classifier");
+    let forced_adaptive = ModelShape::resolve(
+        ProviderKind::Anthropic,
+        "claude-sonnet-4-5",
+        ThinkingStyleOverride::Adaptive,
+    )
+    .to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT)
+    .expect("forced adaptive");
+    assert_eq!(
+        forced_adaptive["thinking"]["type"], "adaptive",
+        "override beats the classifier"
+    );
 
-    let forced_budget = ModelShape::resolve(ProviderKind::Anthropic, "claude-opus-4-8", ThinkingStyleOverride::Budget)
-        .to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT)
-        .expect("forced budget");
-    assert_eq!(forced_budget["thinking"]["type"], "enabled", "override beats the classifier");
+    let forced_budget = ModelShape::resolve(
+        ProviderKind::Anthropic,
+        "claude-opus-4-8",
+        ThinkingStyleOverride::Budget,
+    )
+    .to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT)
+    .expect("forced budget");
+    assert_eq!(
+        forced_budget["thinking"]["type"], "enabled",
+        "override beats the classifier"
+    );
     assert_eq!(forced_budget["thinking"]["budget_tokens"], THINKING_BUDGET);
 }
 
@@ -288,31 +490,64 @@ fn deepseek_v4_toggles_thinking_with_reasoning_effort() {
         .expect("deepseek v4 toggles thinking at request time");
     assert_eq!(d["thinking"]["type"], "enabled");
     assert_eq!(d["reasoning_effort"], "high");
-    assert!(d.get("generationConfig").is_none(), "DeepSeek is not Gemini-shaped");
+    assert!(
+        d.get("generationConfig").is_none(),
+        "DeepSeek is not Gemini-shaped"
+    );
 }
 
 #[test]
 fn the_generic_openai_path_sends_no_thinking_toggle() {
     // The local Gemma default (its --reasoning-format auto) already reasons, and
     // there's no portable toggle across arbitrary OpenAI-compatible endpoints: None.
-    assert!(thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET).is_none());
+    assert!(
+        thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET).is_none()
+    );
 }
 
 #[test]
-fn default_config_gives_large_headroom_above_the_thinking_budget() {
-    let cfg = ConsultConfig::default();
-    // Amy's default: few high-value turns, generous output budget.
+fn default_headroom_sits_large_above_the_thinking_budget() {
+    // Amy's default: few high-value turns, generous output budget. The headroom now
+    // rides each arm (seeded from [defaults] via the slot fallback), not ConsultConfig.
+    let d = Defaults::default();
     assert!(
-        cfg.max_tokens >= 16384,
+        d.max_tokens >= 16384,
         "want generous headroom, got {}",
-        cfg.max_tokens
+        d.max_tokens
     );
     // Anthropic requires max_tokens strictly greater than the thinking budget.
-    assert!(cfg.max_tokens > THINKING_BUDGET);
+    assert!(d.max_tokens > THINKING_BUDGET);
+    // And a bare slot inherits exactly that headroom — the value an Arm carries.
+    let t = ModelSlot::bare("anthropic", "claude-fable-5").tunables(ModelRole::Synth, &d);
+    assert_eq!(
+        t.max_tokens, d.max_tokens,
+        "the slot fallback is [defaults]"
+    );
+    assert!(t.max_tokens > t.thinking_budget);
 }
 
 #[test]
-fn builtin_openai_profile_is_cheap_gemma_explorer_strong_gemma_synth() {
+fn model_caps_classify_per_kind_and_honor_the_override() {
+    // Capability data on the same seam as ModelShape: classified per (kind,
+    // model), with an explicit config override as the escape hatch. Boundaries
+    // are empirical — confirm a new model with a live probe, don't guess.
+
+    // Every current Anthropic and Gemini completion id is multimodal-in.
+    assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", None).vision);
+    assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-haiku-4-5", None).vision);
+    assert!(ModelCaps::resolve(ProviderKind::Gemini, "gemini-3.5-flash", None).vision);
+    // DeepSeek chat/reasoner are text-only on the wire.
+    assert!(!ModelCaps::resolve(ProviderKind::DeepSeek, "deepseek-v4-pro", None).vision);
+    // A generic OpenAI-compatible endpoint can front anything; vision is opt-in
+    // per slot rather than guessed from an arbitrary id.
+    assert!(!ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", None).vision);
+    assert!(ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true)).vision);
+    // The override pins in both directions.
+    assert!(!ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", Some(false)).vision);
+}
+
+#[test]
+fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
     // The chosen mapping for the local default endpoint: small E4B drives the
     // tool-heavy exploration, the larger 26B writes the answer — the cheap-
     // explorer/strong-synth pattern, local edition.
@@ -320,49 +555,385 @@ fn builtin_openai_profile_is_cheap_gemma_explorer_strong_gemma_synth() {
     assert_eq!(explorer, "Gemma-4-E4B-it-GGUF");
     assert_eq!(synth, "Gemma-4-26B-A4B-it-GGUF");
 
-    // And the built-in `openai` profile resolves to exactly those.
-    let p = profile("openai");
-    assert_eq!(p.explorer_model, explorer);
-    assert_eq!(p.synth_model, synth);
-    assert_eq!(p.kind, ProviderKind::Openai);
+    // And the built-in `openai` cast resolves to exactly those, on the openai backend.
+    let cfg = Config::builtin();
+    let cast = cfg.resolve_cast("openai").expect("built-in openai cast");
+    let e = cast
+        .require_slot(ModelRole::Explorer)
+        .expect("explorer slot");
+    let s = cast.require_slot(ModelRole::Synth).expect("synth slot");
+    assert_eq!(e.id, explorer);
+    assert_eq!(s.id, synth);
+    let backend = cfg.resolve_backend(&s.backend).expect("slot backend");
+    assert_eq!(backend.kind, ProviderKind::Openai);
 }
 
-// Validation of the secondary-profile path: load the real user config
-// (~/.config/kaibo/config.toml), resolve a *non-built-in* openai profile, and run
-// its synth model against Lemonade. Proves config → profile → client wiring for a
-// second model on the same provider — the headline feature, exercised live.
+// ---- a minimal scripted client ----------------------------------------------
+//
+// The offline harness in `src/test_support.rs` is `#[cfg(test)]` — compiled into
+// the lib's own unit tests only, never into the library this integration binary
+// links (deliberate: it must not ship). So this file carries its own minimal
+// scripted client and injects it through the same public seam the server uses for
+// live clients: `Arm::new`. Same discipline as the lib harness: content-driven
+// responders that branch on the inbound request, not consumption-ordered queues.
+
+type Responder = Arc<
+    dyn Fn(
+            &rig::completion::CompletionRequest,
+        )
+            -> Result<rig::completion::CompletionResponse<()>, rig::completion::CompletionError>
+        + Send
+        + Sync,
+>;
+
+/// A snapshot of one inbound request: which model the loop addressed and the
+/// request shape that rode along — enough to prove per-arm routing and shaping.
+#[derive(Debug, Clone)]
+struct Seen {
+    preamble: Option<String>,
+    max_tokens: Option<u64>,
+    additional_params: Option<Value>,
+}
+
+/// A scripted client that serves exactly ONE model. If the consult loop ever
+/// routes another model id here, `completion` panics — the teeth of the
+/// mixed-cast routing test: two of these stand in for two distinct backends.
+#[derive(Clone)]
+struct ScriptedClient {
+    expect_model: String,
+    responder: Responder,
+    log: Arc<Mutex<Vec<Seen>>>,
+}
+
+impl ScriptedClient {
+    fn new<F>(expect_model: &str, responder: F) -> Self
+    where
+        F: Fn(
+                &rig::completion::CompletionRequest,
+            )
+                -> Result<rig::completion::CompletionResponse<()>, rig::completion::CompletionError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            expect_model: expect_model.to_string(),
+            responder: Arc::new(responder),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Every request this client served, in call order.
+    fn seen(&self) -> Vec<Seen> {
+        self.log.lock().expect("scripted log poisoned").clone()
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedModel {
+    id: String,
+    client: ScriptedClient,
+}
+
+/// Streaming placeholder: kaibo never streams; exists only for the trait bounds.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct NoStream;
+
+impl rig::completion::GetTokenUsage for NoStream {
+    fn token_usage(&self) -> Option<rig::completion::Usage> {
+        None
+    }
+}
+
+impl rig::client::CompletionClient for ScriptedClient {
+    type CompletionModel = ScriptedModel;
+}
+
+impl rig::completion::CompletionModel for ScriptedModel {
+    type Response = ();
+    type StreamingResponse = NoStream;
+    type Client = ScriptedClient;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self {
+            id: model.into(),
+            client: client.clone(),
+        }
+    }
+
+    async fn completion(
+        &self,
+        request: rig::completion::CompletionRequest,
+    ) -> Result<rig::completion::CompletionResponse<()>, rig::completion::CompletionError> {
+        assert_eq!(
+            self.id, self.client.expect_model,
+            "this client serves only {:?} — the loop routed a phase to the wrong client",
+            self.client.expect_model
+        );
+        self.client
+            .log
+            .lock()
+            .expect("scripted log poisoned")
+            .push(Seen {
+                preamble: request.preamble.clone().or_else(|| {
+                    request.chat_history.iter().find_map(|m| match m {
+                        rig::completion::message::Message::System { content } => {
+                            Some(content.clone())
+                        }
+                        _ => None,
+                    })
+                }),
+                max_tokens: request.max_tokens,
+                additional_params: request.additional_params.clone(),
+            });
+        (self.client.responder)(&request)
+    }
+
+    async fn stream(
+        &self,
+        _request: rig::completion::CompletionRequest,
+    ) -> Result<
+        rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig::completion::CompletionError,
+    > {
+        unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
+    }
+}
+
+/// A final text answer — ends the tool loop.
+fn text_response(text: impl Into<String>) -> rig::completion::CompletionResponse<()> {
+    rig::completion::CompletionResponse {
+        choice: rig::OneOrMany::one(rig::completion::message::AssistantContent::text(text)),
+        usage: rig::completion::Usage::new(),
+        raw_response: (),
+        message_id: None,
+    }
+}
+
+/// A single tool call — drives one more loop turn.
+fn tool_call_response(
+    id: &str,
+    name: &str,
+    args: Value,
+) -> rig::completion::CompletionResponse<()> {
+    rig::completion::CompletionResponse {
+        choice: rig::OneOrMany::one(rig::completion::message::AssistantContent::tool_call(
+            id, name, args,
+        )),
+        usage: rig::completion::Usage::new(),
+        raw_response: (),
+        message_id: None,
+    }
+}
+
+/// True if the request declares a tool named `name`.
+fn has_tool(req: &rig::completion::CompletionRequest, name: &str) -> bool {
+    req.tools.iter().any(|t| t.name == name)
+}
+
+/// Everything the model was shown in user turns — `User` text *and* tool-result
+/// text — oldest→newest, so a responder can branch on a report's arrival.
+fn transcript_text(req: &rig::completion::CompletionRequest) -> String {
+    use rig::completion::message::{Message, ToolResultContent, UserContent};
+    req.chat_history
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.clone()),
+                        UserContent::ToolResult(tr) => Some(
+                            tr.content
+                                .iter()
+                                .filter_map(|rc| match rc {
+                                    ToolResultContent::Text(t) => Some(t.text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The mixed-cast proof, offline: a consult whose explorer arm and synth arm ride
+/// two *different* clients — two backends in miniature, each refusing to serve any
+/// model but its own — through the public `consult` seam. The driver delegates a
+/// sweep to `explore′` (which must land on the explorer's client), the report
+/// crosses back, and the answer concludes on the synth's client. Each phase also
+/// carries ITS arm's request shape (`max_tokens`, `additional_params`), per-arm by
+/// construction — the chimera promise of docs/casts.md, proven with no network.
+#[tokio::test]
+async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
+    const EXPLORER_MODEL: &str = "deepseek-v4-flash";
+    const SYNTH_MODEL: &str = "claude-sonnet-4-6";
+    const REPORT: &str = "MIXED_REPORT: src/foo.rs:1 fn target_marker";
+
+    let explorer_client = ScriptedClient::new(EXPLORER_MODEL, |req| {
+        // The delegated sweep: run_kaish only, no nested explore′.
+        assert!(has_tool(req, "run_kaish"), "explorer gets run_kaish");
+        assert!(!has_tool(req, "explore"), "explorer must not nest explore′");
+        Ok(text_response(REPORT))
+    });
+    let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
+        assert!(
+            has_tool(req, "run_kaish") && has_tool(req, "explore"),
+            "the driver gets both tools"
+        );
+        if transcript_text(req).contains("MIXED_REPORT") {
+            // The cross-client report came back → answer.
+            Ok(text_response("ANSWER: target_marker at src/foo.rs:1"))
+        } else {
+            // Delegate a sweep — this must run on the *other* client.
+            Ok(tool_call_response(
+                "t-explore",
+                "explore",
+                json!({ "question": "find target_marker" }),
+            ))
+        }
+    });
+
+    // Each arm carries its own request shape, as `Arm::from_slot` would fit per slot
+    // (a DeepSeek-shaped explorer, an adaptive-Anthropic synth).
+    let explorer_params = json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "high" });
+    let synth_params = json!({ "thinking": { "type": "adaptive" } });
+    let explorer = Arm::new(
+        explorer_client.clone(),
+        EXPLORER_MODEL,
+        8192,
+        Some(explorer_params.clone()),
+        ModelCaps { vision: false },
+    );
+    let synth = Arm::new(
+        synth_client.clone(),
+        SYNTH_MODEL,
+        16384,
+        Some(synth_params.clone()),
+        ModelCaps { vision: true },
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/foo.rs"), "fn target_marker() {}\n").unwrap();
+
+    let out = consult(
+        "Where is target_marker defined?",
+        dir.path(),
+        &explorer,
+        &synth,
+        &ConsultConfig::default(),
+        None,
+    )
+    .await
+    .expect("mixed-cast scripted consult should succeed");
+
+    assert!(
+        out.answer.contains("src/foo.rs:1"),
+        "the synth's final text is the answer, got: {:?}",
+        out.answer
+    );
+    assert!(
+        out.report.contains("MIXED_REPORT"),
+        "the cross-client sweep's report aggregated, got: {:?}",
+        out.report
+    );
+
+    // Routing teeth: both clients actually served (each one panics inside
+    // `completion` on any other model id, so non-empty logs + a green run mean
+    // every phase landed on exactly its own client).
+    let e = explorer_client.seen();
+    let s = synth_client.seen();
+    assert!(!e.is_empty(), "the explorer client was driven");
+    assert!(!s.is_empty(), "the synth client was driven");
+
+    // Per-arm request shaping: each phase carried ITS arm's params and headroom.
+    for r in &e {
+        assert_eq!(
+            r.additional_params.as_ref(),
+            Some(&explorer_params),
+            "explorer requests carry the explorer arm's params"
+        );
+        assert_eq!(r.max_tokens, Some(8192), "explorer headroom is its arm's");
+    }
+    for r in &s {
+        assert_eq!(
+            r.additional_params.as_ref(),
+            Some(&synth_params),
+            "synth requests carry the synth arm's params"
+        );
+        assert_eq!(r.max_tokens, Some(16384), "synth headroom is its arm's");
+    }
+
+    // Role framing crossed with the routing: the explorer's client saw the report
+    // preamble, the synth's client the consult-driver preamble.
+    assert!(
+        e[0].preamble.as_deref().unwrap_or("").contains("explorer"),
+        "explorer client got the report preamble: {:?}",
+        e[0].preamble
+    );
+    assert!(
+        s[0].preamble
+            .as_deref()
+            .unwrap_or("")
+            .contains("second tool, `explore`"),
+        "synth client got the consult preamble: {:?}",
+        s[0].preamble
+    );
+}
+
+// Validation of the user-config path: load the real user config
+// (~/.config/kaibo/config.toml), resolve a *non-built-in* cast, and run its synth
+// slot against Lemonade. Proves config → cast → backend → arm wiring for a second
+// model on the same backend — the headline feature, exercised live.
 #[tokio::test]
 #[ignore = "loads ~/.config/kaibo/config.toml and hits local Lemonade (GLM); run with --ignored while it's up"]
-async fn secondary_local_profile_from_user_config_runs() {
-    // Part 1 — the user config file parses and its extra profiles resolve to the
+async fn secondary_local_cast_from_user_config_runs() {
+    // Part 1 — the user config file parses and its extra casts resolve to the
     // right model + endpoint (no network).
     let cfg = Config::load(None).expect("load user config from the XDG default path");
     let glm = cfg
-        .resolve_profile("glm")
-        .expect("the user config should define a `glm` profile")
-        .clone();
-    assert_eq!(glm.synth_model, "GLM-4.5-Air-UD-Q4K-XL-GGUF");
-    assert_eq!(glm.resolved_base_url(), "http://localhost:13305/api/v1");
-    assert_eq!(glm.kind, ProviderKind::Openai);
-    let qwen = cfg.resolve_profile("qwen").expect("a `qwen` profile");
-    assert_eq!(qwen.synth_model, "Qwen3-Coder-Next-GGUF");
+        .resolve_cast("glm")
+        .expect("the user config should define a `glm` cast");
+    let glm_synth = glm
+        .require_slot(ModelRole::Synth)
+        .expect("the glm cast has a synth slot");
+    assert_eq!(glm_synth.id, "GLM-4.5-Air-UD-Q4K-XL-GGUF");
+    let backend = cfg
+        .resolve_backend(&glm_synth.backend)
+        .expect("the glm synth slot's backend resolves");
+    assert_eq!(backend.resolved_base_url(), "http://localhost:13305/api/v1");
+    assert_eq!(backend.kind, ProviderKind::Openai);
+    let qwen = cfg.resolve_cast("qwen").expect("a `qwen` cast");
+    assert_eq!(
+        qwen.require_slot(ModelRole::Synth).expect("qwen synth").id,
+        "Qwen3-Coder-Next-GGUF"
+    );
 
-    // Part 2 — run a *second* profile live to prove the resolve → client → call path
-    // end-to-end. The GLM/Qwen builds don't always load on Lemonade; Gemma does, so
-    // validate against a profile that selects a Gemma synth distinct from any
-    // built-in default. (If GLM/Qwen are loadable, point synth_model back at them.)
-    let mut secondary = glm.clone();
-    secondary.synth_model = "Gemma-4-E4B-it-GGUF".to_string();
+    // Part 2 — run a *second* model on that backend live to prove the resolve →
+    // client → call path end-to-end. The GLM/Qwen builds don't always load on
+    // Lemonade; Gemma does, so swap the id within the slot's backend (exactly what
+    // a per-call bare model override does — pins drop, the new id classifies fresh).
+    let secondary = ModelSlot::bare(glm_synth.backend.clone(), "Gemma-4-E4B-it-GGUF");
+    let arm = Arm::from_slot(backend, &secondary, ModelRole::Synth, &cfg.defaults)
+        .expect("secondary arm builds");
     let answer = synthesize(
         "In one sentence, what does kaibo's read-only sandbox prevent?",
         Some("src/sandbox.rs builds a read-only kernel; writes and external commands are refused."),
         env!("CARGO_MANIFEST_DIR"),
-        &secondary,
+        &arm,
         &ConsultConfig::default(),
     )
     .await
-    .expect("secondary-profile synthesize against Lemonade should succeed");
-    eprintln!("=== SECONDARY PROFILE ANSWER ===\n{answer}\n");
+    .expect("secondary-cast synthesize against Lemonade should succeed");
+    eprintln!("=== SECONDARY CAST ANSWER ===\n{answer}\n");
     assert!(!answer.trim().is_empty(), "expected a non-empty answer");
 }
 
@@ -380,7 +951,8 @@ async fn recomposed_consult_runs_against_local_gemma() {
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         root,
-        &profile("openai"),
+        &builtin_arm("openai", ModelRole::Explorer),
+        &builtin_arm("openai", ModelRole::Synth),
         &cfg,
         None,
     )
@@ -410,7 +982,7 @@ async fn explore_unit_reports_from_the_real_tree() {
     let report = explore(
         "Which source file enforces the read-only sandbox, and name one builtin it blocks?",
         env!("CARGO_MANIFEST_DIR"),
-        &profile("openai"),
+        &builtin_arm("openai", ModelRole::Explorer),
         &ConsultConfig::default(),
     )
     .await
@@ -432,14 +1004,14 @@ async fn explore_unit_reports_from_the_real_tree() {
 async fn synthesize_grounds_in_context_and_investigates_without_it() {
     let root = env!("CARGO_MANIFEST_DIR");
     let cfg = ConsultConfig::default();
-    let p = profile("openai");
+    let arm = builtin_arm("openai", ModelRole::Synth);
 
     // With a thin context: it should answer grounded, optionally confirming via run_kaish.
     let with_ctx = synthesize(
         "Which file enforces the read-only sandbox?",
         Some("src/sandbox.rs builds a read-only kernel; the LocalFs read-only mount refuses every write."),
         root,
-        &p,
+        &arm,
         &cfg,
     )
     .await
@@ -455,7 +1027,7 @@ async fn synthesize_grounds_in_context_and_investigates_without_it() {
         "Which file enforces the read-only sandbox?",
         None,
         root,
-        &p,
+        &arm,
         &cfg,
     )
     .await
@@ -471,7 +1043,7 @@ async fn synthesize_grounds_in_context_and_investigates_without_it() {
 // Anthropic's thinking blocks round-tripping through the tool loop, and Gemini's
 // thinkingConfig shape (thinkingBudget vs the Gemini-3 thinkingLevel split).
 #[tokio::test]
-#[ignore = "hits the DeepSeek API (explore + synth); run with --ignored and a key"]
+#[ignore = "hits the DeepSeek API (consult); run with --ignored and a key"]
 async fn two_phase_consult_via_deepseek() {
     if let Err(e) = load(ProviderKind::DeepSeek) {
         panic!("no DeepSeek credential for live test: {e}");
@@ -479,7 +1051,8 @@ async fn two_phase_consult_via_deepseek() {
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         env!("CARGO_MANIFEST_DIR"),
-        &profile("deepseek"),
+        &builtin_arm("deepseek", ModelRole::Explorer),
+        &builtin_arm("deepseek", ModelRole::Synth),
         &ConsultConfig::default(),
         None,
     )
@@ -495,7 +1068,7 @@ async fn two_phase_consult_via_deepseek() {
 }
 
 #[tokio::test]
-#[ignore = "hits the Gemini API (explore + synth); run with --ignored and a key"]
+#[ignore = "hits the Gemini API (consult); run with --ignored and a key"]
 async fn two_phase_consult_via_gemini() {
     if let Err(e) = load(ProviderKind::Gemini) {
         panic!("no Gemini credential for live test: {e}");
@@ -503,7 +1076,8 @@ async fn two_phase_consult_via_gemini() {
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         env!("CARGO_MANIFEST_DIR"),
-        &profile("gemini"),
+        &builtin_arm("gemini", ModelRole::Explorer),
+        &builtin_arm("gemini", ModelRole::Synth),
         &ConsultConfig::default(),
         None,
     )
@@ -519,7 +1093,7 @@ async fn two_phase_consult_via_gemini() {
 }
 
 #[tokio::test]
-#[ignore = "hits the Anthropic API (explore + synth); run with --ignored and a key"]
+#[ignore = "hits the Anthropic API (consult); run with --ignored and a key"]
 async fn two_phase_consult_answers_from_the_real_tree() {
     // Surface a clear message if the credential is missing, before the API call.
     if let Err(e) = load(ProviderKind::Anthropic) {
@@ -532,7 +1106,8 @@ async fn two_phase_consult_answers_from_the_real_tree() {
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         root,
-        &profile("anthropic"),
+        &builtin_arm("anthropic", ModelRole::Explorer),
+        &builtin_arm("anthropic", ModelRole::Synth),
         &cfg,
         None,
     )
@@ -554,21 +1129,28 @@ async fn two_phase_consult_answers_from_the_real_tree() {
 #[ignore = "hits the Anthropic API on Opus 4.8 (adaptive-only tier); run with --ignored and a key"]
 async fn adaptive_only_anthropic_model_round_trips() {
     // The real proof of the "fix anthropic" work: Opus 4.8 *rejects* the old
-    // enabled/budget thinking block AND sampling outright (400). Pin both phases to it so
-    // a regression in the adaptive shape (or the output_config.effort flatten through rig)
-    // surfaces as a live 400 here, not in production — what the offline tests can't prove.
+    // enabled/budget thinking block AND sampling outright (400). Pin both phases to it
+    // (a bare slot on the anthropic backend — exactly what a per-call model override
+    // builds) so a regression in the adaptive shape (or the output_config.effort
+    // flatten through rig) surfaces as a live 400 here, not in production — what the
+    // offline tests can't prove.
     if let Err(e) = load(ProviderKind::Anthropic) {
         panic!("no Anthropic credential for live test: {e}");
     }
 
-    let mut p = profile("anthropic");
-    p.explorer_model = "claude-opus-4-8".into();
-    p.synth_model = "claude-opus-4-8".into();
+    let cfg = Config::builtin();
+    let backend = cfg.resolve_backend("anthropic").expect("anthropic backend");
+    let slot = ModelSlot::bare("anthropic", "claude-opus-4-8");
+    let explorer = Arm::from_slot(backend, &slot, ModelRole::Explorer, &cfg.defaults)
+        .expect("explorer arm on opus 4.8");
+    let synth = Arm::from_slot(backend, &slot, ModelRole::Synth, &cfg.defaults)
+        .expect("synth arm on opus 4.8");
 
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         env!("CARGO_MANIFEST_DIR"),
-        &p,
+        &explorer,
+        &synth,
         &ConsultConfig::default(),
         None,
     )

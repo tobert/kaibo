@@ -26,10 +26,34 @@ fn default_advertises_all_four_tools() {
 #[test]
 fn each_flag_removes_exactly_its_own_tool() {
     let cases = [
-        ("consult", ToolGating { consult: false, ..Default::default() }),
-        ("explore", ToolGating { explore: false, ..Default::default() }),
-        ("synthesize", ToolGating { synthesize: false, ..Default::default() }),
-        ("run_kaish", ToolGating { run_kaish: false, ..Default::default() }),
+        (
+            "consult",
+            ToolGating {
+                consult: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "explore",
+            ToolGating {
+                explore: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "synthesize",
+            ToolGating {
+                synthesize: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "run_kaish",
+            ToolGating {
+                run_kaish: false,
+                ..Default::default()
+            },
+        ),
     ];
     for (disabled, gating) in cases {
         let tools = advertised(gating);
@@ -39,17 +63,29 @@ fn each_flag_removes_exactly_its_own_tool() {
         );
         // Every *other* tool must still be advertised — gating one doesn't touch the rest.
         for &t in ALL_TOOLS.iter().filter(|&&t| t != disabled) {
-            assert!(tools.contains(&t.to_string()), "{t} should remain, got {tools:?}");
+            assert!(
+                tools.contains(&t.to_string()),
+                "{t} should remain, got {tools:?}"
+            );
         }
     }
 }
 
 #[test]
 fn all_disabled_is_detected() {
-    let none_on = ToolGating { consult: false, explore: false, synthesize: false, run_kaish: false };
+    let none_on = ToolGating {
+        consult: false,
+        explore: false,
+        synthesize: false,
+        run_kaish: false,
+    };
     assert!(none_on.all_disabled());
     // Any single tool on means it's a usable server, not the refused state.
-    assert!(!ToolGating { run_kaish: true, ..none_on }.all_disabled());
+    assert!(!ToolGating {
+        run_kaish: true,
+        ..none_on
+    }
+    .all_disabled());
 }
 
 /// The startup guard, end to end: launching with all four `--no-*` flags must exit
@@ -57,8 +93,18 @@ fn all_disabled_is_detected() {
 /// has to be able to catch a zero-tool misconfiguration.
 #[test]
 fn all_four_disabled_refuses_to_start() {
+    // Isolate from the developer's real ~/.config/kaibo/config.toml: point
+    // XDG_CONFIG_HOME at an empty dir so the binary runs on built-ins and the
+    // failure under test (zero tools) is the only one in play.
+    let empty_config = tempfile::tempdir().expect("tempdir for an isolated XDG_CONFIG_HOME");
     let out = Command::new(env!("CARGO_BIN_EXE_kaibo"))
-        .args(["--no-consult", "--no-explore", "--no-synthesize", "--no-run-kaish"])
+        .env("XDG_CONFIG_HOME", empty_config.path())
+        .args([
+            "--no-consult",
+            "--no-explore",
+            "--no-synthesize",
+            "--no-run-kaish",
+        ])
         .output()
         .expect("should be able to run the kaibo binary");
 

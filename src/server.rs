@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -25,8 +25,8 @@ use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::{Config, Profile};
-use crate::consult::{consult, explore, synthesize, ConsultConfig};
+use crate::config::{Cast, Config, ModelRole, ModelSlot};
+use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig};
 use crate::explorer::format_output;
 use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
@@ -44,8 +44,9 @@ const SANDBOX_URI: &str = "kaibo://kaish/sandbox";
 const BUILTIN_PREFIX: &str = "kaibo://kaish/builtin/";
 /// The URI template advertised for the per-builtin resources.
 const BUILTIN_URI_TEMPLATE: &str = "kaibo://kaish/builtin/{name}";
-/// The resolved runtime configuration: allowed paths, default provider, gated tools,
-/// sandbox limits, and profiles with their kind and key sources (never key values).
+/// The resolved runtime configuration: allowed paths, default cast, gated tools,
+/// sandbox limits, backends with their key sources (never key values), and casts
+/// with their resolved slots.
 const CONFIG_URI: &str = "kaibo://config";
 
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
@@ -64,7 +65,12 @@ pub struct ToolGating {
 
 impl Default for ToolGating {
     fn default() -> Self {
-        Self { consult: true, explore: true, synthesize: true, run_kaish: true }
+        Self {
+            consult: true,
+            explore: true,
+            synthesize: true,
+            run_kaish: true,
+        }
     }
 }
 
@@ -75,8 +81,12 @@ impl ToolGating {
     }
 }
 
-/// Arguments to the `consult` tool.
+/// Arguments to the `consult` tool. `deny_unknown_fields` (here and on every tool
+/// input): a typo'd or misplaced argument must be a loud invalid-params error —
+/// serde would otherwise drop it and the call would run on configured defaults
+/// while the caller believes the override applied. Serde aliases stay accepted.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConsultInput {
     /// The question to investigate about the project.
     pub question: String,
@@ -87,18 +97,35 @@ pub struct ConsultInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Provider/profile: a built-in kind ("anthropic" (default), "deepseek",
-    /// "gemini", "openai") or a profile name from config.toml.
-    #[serde(default)]
-    pub provider: Option<String>,
+    /// Cast: a built-in name ("anthropic" (default), "deepseek", "gemini",
+    /// "openai") or a cast from config.toml. `provider` is accepted as a
+    /// transitional alias for this field; sending both is a loud error.
+    #[serde(default, alias = "provider")]
+    pub cast: Option<String>,
 
-    /// Override the explorer (investigation) model id.
+    /// Override the explorer (investigation) model id. Sent verbatim — an id
+    /// containing "/" (HuggingFace-style org/model) is still one id. Keeps the
+    /// slot's configured backend unless `explorer_backend` retargets it.
     #[serde(default)]
     pub explorer_model: Option<String>,
 
-    /// Override the synthesizer (final-answer) model id.
+    /// Run the explorer override on this backend (name or alias) instead of the
+    /// slot's configured one. Requires `explorer_model`; together they replace
+    /// the slot wholesale, so this also works on a role the cast doesn't carry.
+    #[serde(default)]
+    pub explorer_backend: Option<String>,
+
+    /// Override the synthesizer (final-answer) model id. Sent verbatim — an id
+    /// containing "/" is still one id. Keeps the slot's configured backend
+    /// unless `synth_backend` retargets it.
     #[serde(default)]
     pub synth_model: Option<String>,
+
+    /// Run the synth override on this backend (name or alias) instead of the
+    /// slot's configured one. Requires `synth_model`; together they replace the
+    /// slot wholesale, so this also works on a role the cast doesn't carry.
+    #[serde(default)]
+    pub synth_backend: Option<String>,
 
     /// Opaque session id to make this a multi-turn consult. When set, kaibo replays
     /// this session's prior `(question, answer)` pairs as context and records this
@@ -126,8 +153,10 @@ pub struct ConsultInput {
     pub include_report: bool,
 }
 
-/// Arguments to the `explore` tool.
+/// Arguments to the `explore` tool. See [`ConsultInput`] for the
+/// `deny_unknown_fields` rationale.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExploreInput {
     /// The question to investigate about the project.
     pub question: String,
@@ -138,21 +167,31 @@ pub struct ExploreInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Provider: "anthropic" (default), "deepseek", "gemini", or "openai".
-    #[serde(default)]
-    pub provider: Option<String>,
+    /// Cast: "anthropic" (default), "deepseek", "gemini", "openai", or a cast
+    /// from config.toml. `provider` is accepted as a transitional alias.
+    #[serde(default, alias = "provider")]
+    pub cast: Option<String>,
 
-    /// Override the explorer model id.
+    /// Override the explorer model id. Sent verbatim — an id containing "/" is
+    /// still one id. Keeps the slot's configured backend unless `backend`
+    /// retargets it.
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Run the model override on this backend (name or alias) instead of the
+    /// slot's configured one. Requires `model`.
+    #[serde(default)]
+    pub backend: Option<String>,
 
     /// Max tool-loop turns for the explorer (default 50 — it's cheap, let it rip).
     #[serde(default)]
     pub max_turns: Option<usize>,
 }
 
-/// Arguments to the `synthesize` tool.
+/// Arguments to the `synthesize` tool. See [`ConsultInput`] for the
+/// `deny_unknown_fields` rationale.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SynthesizeInput {
     /// The question to answer.
     pub question: String,
@@ -168,17 +207,27 @@ pub struct SynthesizeInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Provider: "anthropic" (default), "deepseek", "gemini", or "openai".
-    #[serde(default)]
-    pub provider: Option<String>,
+    /// Cast: "anthropic" (default), "deepseek", "gemini", "openai", or a cast
+    /// from config.toml. `provider` is accepted as a transitional alias.
+    #[serde(default, alias = "provider")]
+    pub cast: Option<String>,
 
-    /// Override the synthesizer (capable) model id.
+    /// Override the synthesizer (capable) model id. Sent verbatim — an id
+    /// containing "/" is still one id. Keeps the slot's configured backend
+    /// unless `backend` retargets it.
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Run the model override on this backend (name or alias) instead of the
+    /// slot's configured one. Requires `model`.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
-/// Arguments to the `run_kaish` tool.
+/// Arguments to the `run_kaish` tool. See [`ConsultInput`] for the
+/// `deny_unknown_fields` rationale.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RunKaishInput {
     /// The kaish (sh-like) script to run against the read-only project.
     pub script: String,
@@ -194,8 +243,8 @@ pub struct RunKaishInput {
 /// kaibo's MCP handler. Cheap to clone (rmcp clones it per request).
 #[derive(Clone)]
 pub struct KaiboHandler {
-    /// The resolved configuration: profile registry, defaults, default root and
-    /// provider. `Arc` because rmcp clones the handler per request and it's
+    /// The resolved configuration: backend + cast registries, defaults, default
+    /// root and cast. `Arc` because rmcp clones the handler per request and it's
     /// immutable after startup.
     config: Arc<Config>,
     tool_router: ToolRouter<Self>,
@@ -304,7 +353,8 @@ impl KaiboHandler {
     /// Set the MCP log floor. The body of `set_level`, split out so the level logic is
     /// testable without fabricating a `RequestContext` (which needs a non-public peer).
     pub fn apply_log_level(&self, level: LoggingLevel) {
-        self.mcp_log_level.store(mcp_log::rank(level), Ordering::Relaxed);
+        self.mcp_log_level
+            .store(mcp_log::rank(level), Ordering::Relaxed);
     }
 
     /// Tool names this handler advertises, after gating. For tests/diagnostics.
@@ -391,16 +441,110 @@ impl KaiboHandler {
         ))
     }
 
-    /// Resolve a call's provider profile: the explicit name (looked up in the
-    /// registry, by name or alias), else the server's default profile. An unknown
-    /// name is a parameter error naming the available profiles. Returns an owned
-    /// clone so the caller can layer per-call model overrides onto it.
-    fn resolve_profile(&self, provider: Option<String>) -> Result<Profile, McpError> {
-        let name = provider.unwrap_or_else(|| self.config.default_provider.clone());
+    /// Resolve a call's cast: the explicit name (looked up in the registry, by
+    /// name or alias), else the server's default cast. An unknown name is a
+    /// parameter error naming the available casts. Returns an owned clone so the
+    /// caller can layer per-call model overrides onto it.
+    fn resolve_cast(&self, cast: Option<String>) -> Result<Cast, McpError> {
+        let name = cast.unwrap_or_else(|| self.config.default_cast.clone());
         self.config
-            .resolve_profile(&name)
+            .resolve_cast(&name)
             .cloned()
             .map_err(|e| McpError::invalid_params(e.to_string(), None))
+    }
+
+    /// Apply a per-call model override to one of `cast`'s slots.
+    ///
+    /// The model id rides *verbatim* — an id containing `/` (HuggingFace-style
+    /// `org/model`) is still one id, never parsed for a backend, so an org prefix
+    /// that happens to match a backend alias (`google/…`, `gemma/…`) can never
+    /// silently retarget the call. Retargeting is the explicit `backend` arg's
+    /// job: when set, it resolves (aliases included) and the slot is replaced
+    /// wholesale, which also works on a role the cast doesn't carry. Either way
+    /// the configured slot's pins/tunables are dropped — they described the
+    /// *configured* model; the new id classifies fresh.
+    fn override_model(
+        &self,
+        cast: &mut Cast,
+        role: ModelRole,
+        model: &str,
+        backend: Option<&str>,
+    ) -> Result<(), McpError> {
+        let model = model.trim();
+        if model.is_empty() {
+            // Same loud rule config load applies to slots (config.rs): an empty
+            // model id is a typo, never an intent — it would otherwise surface
+            // as a baffling provider 404 mid-call.
+            return Err(McpError::invalid_params(
+                format!("the {} model id is empty", role.key()),
+                None,
+            ));
+        }
+        let backend = match backend {
+            Some(name) => self
+                .config
+                .resolve_backend(name)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+                .name
+                .clone(),
+            None => cast.slot(role).map(|s| s.backend.clone()).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!(
+                        "cast {:?} has no {} slot to override — pass the matching \
+                         backend override arg to target one",
+                        cast.name,
+                        role.key()
+                    ),
+                    None,
+                )
+            })?,
+        };
+        cast.slots.insert(role, ModelSlot::bare(backend, model));
+        Ok(())
+    }
+
+    /// The tool-input face of [`override_model`](Self::override_model): folds one
+    /// tool's `(model, backend)` override args onto `cast`'s `role` slot. A
+    /// backend arg without its model arg is a loud parameter error naming both
+    /// spellings — there is no configured id to guess at on a foreign backend.
+    fn apply_model_override(
+        &self,
+        cast: &mut Cast,
+        role: ModelRole,
+        model: Option<&str>,
+        backend: Option<&str>,
+        model_arg: &str,
+        backend_arg: &str,
+    ) -> Result<(), McpError> {
+        match (model, backend) {
+            (Some(model), backend) => self.override_model(cast, role, model, backend),
+            (None, Some(_)) => Err(McpError::invalid_params(
+                format!(
+                    "{backend_arg} was sent without {model_arg} — a backend override \
+                     needs the model id to run there"
+                ),
+                None,
+            )),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Resolve one of `cast`'s slots into a live [`Arm`] for `role`. A missing
+    /// slot is the loud call-time gap ("cast `x` has no synth slot" — absent =
+    /// capability absent); a backend that fails to build (key resolution,
+    /// client init) is an internal error.
+    fn arm(&self, cast: &Cast, role: ModelRole) -> Result<Arm, McpError> {
+        let slot = cast
+            .require_slot(role)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // The slot's backend ref is canonical (load) or alias-resolved (override),
+        // so a failure here is a server bug, not a caller mistake.
+        let backend = self
+            .config
+            .resolve_backend(&slot.backend)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Arm::from_slot(backend, slot, role, &self.config.defaults)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
     #[tool(
@@ -413,10 +557,12 @@ impl KaiboHandler {
             session_id: kaibo replays that session's prior question/answer pairs as \
             context (the exploration still runs fresh each turn). Args: question \
             (required), path (project dir; optional if the server has a default root), \
-            provider (anthropic|deepseek|gemini|openai), session_id (optional; opaque \
-            conversation key), include_report (optional; attach the explorer's \
-            report as structured_content for debugging the hand-off), and optional \
-            explorer_model / synth_model overrides."
+            cast (a built-in name — anthropic|deepseek|gemini|openai — or a cast \
+            from config.toml), session_id (optional; opaque conversation key), \
+            include_report (optional; attach the explorer's report as \
+            structured_content for debugging the hand-off), and optional \
+            explorer_model / synth_model overrides (a model id, sent verbatim; \
+            add explorer_backend / synth_backend to retarget the slot's backend)."
     )]
     async fn consult(
         &self,
@@ -425,22 +571,36 @@ impl KaiboHandler {
         meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-        // Resolve the profile, then layer per-call model overrides onto the clone.
-        let mut profile = self.resolve_profile(input.provider)?;
-        if let Some(m) = input.explorer_model {
-            profile.explorer_model = m;
-        }
-        if let Some(m) = input.synth_model {
-            profile.synth_model = m;
-        }
+        // Resolve the cast, layer per-call model overrides onto the clone, then
+        // resolve each phase's slot into its own arm (client + request shape).
+        let mut cast = self.resolve_cast(input.cast)?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            input.explorer_model.as_deref(),
+            input.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            input.synth_model.as_deref(),
+            input.synth_backend.as_deref(),
+            "synth_model",
+            "synth_backend",
+        )?;
+        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        let synth = self.arm(&cast, ModelRole::Synth)?;
         // Progress rides the whole investigation: sweeps and direct reads emit beats
         // onto the wire when the client supplied a token, else a no-op sink.
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
-            explorer_max_turns: input.explorer_max_turns.unwrap_or(defaults.explorer_max_turns),
+            explorer_max_turns: input
+                .explorer_max_turns
+                .unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
-            max_tokens: profile.max_tokens,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
         };
@@ -452,7 +612,7 @@ impl KaiboHandler {
         let session = input.session_id.as_deref().map(|id| (&self.sessions, id));
 
         progress.emit(PhaseEvent::PhaseStarted { phase: "consult" });
-        let out = consult(&input.question, root, &profile, &cfg, session)
+        let out = consult(&input.question, root, &explorer, &synth, &cfg, session)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
@@ -468,9 +628,9 @@ impl KaiboHandler {
             This is the explorer seam on its own: it gathers evidence, it does not \
             write a polished final answer (use `consult` for that). Read-only: it \
             never modifies the project. Args: question (required), path (project dir; \
-            optional if the server has a default root), provider \
-            (anthropic|deepseek|gemini|openai), and optional model / max_turns \
-            overrides."
+            optional if the server has a default root), cast \
+            (anthropic|deepseek|gemini|openai or a cast from config.toml), and \
+            optional model (with optional backend) / max_turns overrides."
     )]
     async fn explore(
         &self,
@@ -479,22 +639,27 @@ impl KaiboHandler {
         meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-        let mut profile = self.resolve_profile(input.provider)?;
-        if let Some(m) = input.model {
-            profile.explorer_model = m;
-        }
+        let mut cast = self.resolve_cast(input.cast)?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            input.model.as_deref(),
+            input.backend.as_deref(),
+            "model",
+            "backend",
+        )?;
+        let arm = self.arm(&cast, ModelRole::Explorer)?;
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
             explorer_max_turns: input.max_turns.unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: defaults.synth_max_turns,
-            max_tokens: profile.max_tokens,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
         };
 
         progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
-        let report = explore(&input.question, root, &profile, &cfg)
+        let report = explore(&input.question, root, &arm, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
@@ -510,8 +675,9 @@ impl KaiboHandler {
             context, it investigates directly. This is the synthesizer seam on its \
             own — a real outside opinion you can seed with material `explore` or you \
             gathered. Read-only. Args: question (required), context (optional), path \
-            (project dir; optional with a default root), provider \
-            (anthropic|deepseek|gemini|openai), and an optional model override."
+            (project dir; optional with a default root), cast \
+            (anthropic|deepseek|gemini|openai or a cast from config.toml), and an \
+            optional model (with optional backend) override."
     )]
     async fn synthesize(
         &self,
@@ -520,25 +686,34 @@ impl KaiboHandler {
         meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
-        let mut profile = self.resolve_profile(input.provider)?;
-        if let Some(m) = input.model {
-            profile.synth_model = m;
-        }
+        let mut cast = self.resolve_cast(input.cast)?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            input.model.as_deref(),
+            input.backend.as_deref(),
+            "model",
+            "backend",
+        )?;
+        let arm = self.arm(&cast, ModelRole::Synth)?;
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
             explorer_max_turns: defaults.explorer_max_turns,
             synth_max_turns: defaults.synth_max_turns,
-            max_tokens: profile.max_tokens,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
         };
 
-        progress.emit(PhaseEvent::PhaseStarted { phase: "synthesize" });
-        let answer = synthesize(&input.question, input.context.as_deref(), root, &profile, &cfg)
+        progress.emit(PhaseEvent::PhaseStarted {
+            phase: "synthesize",
+        });
+        let answer = synthesize(&input.question, input.context.as_deref(), root, &arm, &cfg)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        progress.emit(PhaseEvent::PhaseFinished { phase: "synthesize" });
+        progress.emit(PhaseEvent::PhaseFinished {
+            phase: "synthesize",
+        });
 
         Ok(CallToolResult::success(vec![Content::text(answer)]))
     }
@@ -571,7 +746,9 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format_output(&out))]))
+        Ok(CallToolResult::success(vec![Content::text(format_output(
+            &out,
+        ))]))
     }
 }
 
@@ -671,16 +848,16 @@ fn markdown_resource(uri: &str, name: &str, description: &str) -> rmcp::model::R
 /// without fabricating a `RequestContext`.
 fn kaibo_resources() -> Vec<rmcp::model::Resource> {
     let mut resources = vec![
-        // The resolved runtime config: allowed paths, default provider, gated tools,
-        // sandbox limits, and each profile with its kind, models, and key sources
-        // (never key values). Read this to understand the server's current posture.
+        // The resolved runtime config: allowed paths, default cast, gated tools,
+        // sandbox limits, backends (kind + key sources, never key values), and
+        // casts with resolved slots. Read this to understand the server's posture.
         RawResource {
             mime_type: Some("application/toml".to_string()),
             description: Some(
                 "kaibo's resolved runtime configuration: allowed path trees, default \
-                 provider, gated tools, sandbox limits, and each provider profile with \
-                 its kind, models, and key sources. Read this to understand the server's \
-                 current posture before making calls."
+                 cast, gated tools, sandbox limits, each backend with its kind and \
+                 key sources, and each cast with its resolved slots. Read this to \
+                 understand the server's current posture before making calls."
                     .to_string(),
             ),
             ..RawResource::new(CONFIG_URI, "kaibo: runtime config")
@@ -740,13 +917,14 @@ fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
 }
 
 /// Render the `kaibo://config` TOML document. Shows the resolved runtime state —
-/// allowed trees, default provider, gated tools, sandbox limits, each profile's
-/// kind/models/key sources — so a calling model or operator sees the server's
-/// current posture at a glance.
+/// allowed trees, default cast, gated tools, sandbox limits, tunable defaults,
+/// each backend's kind/endpoint/key sources, and each cast's slots as
+/// `"backend/id"` with *resolved* caps — so a calling model or operator sees the
+/// server's current posture at a glance.
 ///
 /// SECRET-SAFETY CONTRACT: this function renders key SOURCE metadata (env var names,
 /// key file paths — the operator-configured pointers) but NEVER the resolved key
-/// values. The profile struct stores sources, not secrets; this renderer reads only
+/// values. The backend struct stores sources, not secrets; this renderer reads only
 /// those source fields. If Config ever gains a resolved-key cache, do not read it here.
 /// Tests in this file assert the contract holds.
 fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
@@ -763,14 +941,24 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         /// Default root (the --root value), if set.
         #[serde(skip_serializing_if = "Option::is_none")]
         default_root: Option<String>,
-        /// Default provider/profile name.
-        default_provider: String,
+        /// Default cast name (what a call omitting `cast` gets).
+        default_cast: String,
         /// Which tools are currently advertised.
         tools: ToolsDoc,
         /// Read-only sandbox limits.
         sandbox: SandboxDoc,
-        /// Provider profiles: kind, models, key sources (never key values).
-        profiles: BTreeMap<String, ProfileDoc>,
+        /// The [defaults] tunables every slot falls back to.
+        defaults: DefaultsDoc,
+        /// alias → canonical backend name. Aliases are valid slot-ref prefixes
+        /// and per-call backend overrides, so callers must be able to discover
+        /// them here — built-in and file-declared both.
+        backend_aliases: BTreeMap<String, String>,
+        /// Backends (connections): kind, endpoint, key sources (never key values).
+        backends: BTreeMap<String, BackendDoc>,
+        /// alias → canonical cast name (each a valid `cast` call-param value).
+        cast_aliases: BTreeMap<String, String>,
+        /// Casts (compositions): slots as "backend/id" with resolved caps.
+        casts: BTreeMap<String, CastDoc>,
     }
 
     #[derive(Serialize)]
@@ -790,15 +978,29 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
     }
 
     #[derive(Serialize)]
-    struct ProfileDoc {
-        kind: String,
-        explorer_model: String,
-        synth_model: String,
+    struct DefaultsDoc {
+        explorer_max_turns: usize,
+        synth_max_turns: usize,
         max_tokens: u64,
         thinking_budget: u64,
         explorer_temperature: f64,
         synth_temperature: f64,
         top_p: f64,
+        explorer_effort: String,
+        synth_effort: String,
+        thinking_style: String,
+        request_timeout_secs: u64,
+        session_capacity: usize,
+    }
+
+    #[derive(Serialize)]
+    struct BackendDoc {
+        kind: String,
+        /// Resolved endpoint for openai-kind backends (explicit base_url, else
+        /// OPENAI_BASE_URL, else the built-in default) — the "resolved runtime
+        /// state" promise. Other kinds have fixed endpoints baked into rig.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
         /// Env var name whose value is the API key (checked first). The NAME, not
         /// the value — the operator configured this pointer.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -810,98 +1012,177 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         api_key_file: Option<String>,
         /// True when a missing key falls back to a placeholder (keyless endpoint).
         key_optional: bool,
-        /// Resolved endpoint for openai-kind profiles. Shows the effective URL the
-        /// client will dial (explicit base_url, else OPENAI_BASE_URL, else the
-        /// built-in default), matching the "resolved runtime state" promise.
-        /// Only present for openai-kind profiles.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        base_url: Option<String>,
-        explorer_effort: String,
-        synth_effort: String,
-        thinking_style: String,
         request_timeout_secs: u64,
     }
 
-    let profiles: BTreeMap<String, ProfileDoc> = config
-        .profiles
+    /// One cast slot: the `"backend/id"` ref plus its *resolved* capabilities
+    /// (slot pin applied, else the classifier on the slot's backend kind) and any
+    /// per-slot tunable overrides actually set — the effective runtime state.
+    #[derive(Serialize)]
+    struct SlotDoc {
+        model: String,
+        vision: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_budget: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_style: Option<String>,
+    }
+
+    /// A cast's role table, keyed by role. Only configured roles appear.
+    type CastDoc = BTreeMap<&'static str, SlotDoc>;
+
+    let backends: BTreeMap<String, BackendDoc> = config
+        .backends
         .iter()
-        .map(|(name, p)| {
-            // Exhaustive destructure — any new Profile field is a compile error here,
-            // forcing an explicit render-or-skip decision (including the secret-safety
-            // review for any field that might resolve a key value).
-            let Profile {
+        .map(|(name, b)| {
+            // Exhaustive destructure — any new Backend field is a compile error
+            // here, forcing an explicit render-or-skip decision (including the
+            // secret-safety review for any field that might resolve a key value).
+            let crate::config::Backend {
                 name: _,
                 kind,
                 base_url,
                 api_key_env,
                 api_key_file,
                 key_optional,
-                explorer_model,
-                synth_model,
-                max_tokens,
-                thinking_budget,
-                explorer_temperature,
-                synth_temperature,
-                top_p,
-                explorer_effort,
-                synth_effort,
-                thinking_style,
                 request_timeout,
-            } = p;
-            // For openai-kind profiles, render the resolved endpoint URL so the
-            // resource matches its "resolved runtime state" claim. Other kinds have
-            // fixed endpoints baked into rig — no operator-relevant base_url to show.
+            } = b;
             let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
-                Some(p.resolved_base_url())
+                Some(b.resolved_base_url())
             } else {
                 base_url.clone()
             };
-            let doc = ProfileDoc {
+            let doc = BackendDoc {
                 kind: format!("{:?}", kind).to_lowercase(),
-                explorer_model: explorer_model.clone(),
-                synth_model: synth_model.clone(),
-                max_tokens: *max_tokens,
-                thinking_budget: *thinking_budget,
-                explorer_temperature: *explorer_temperature,
-                synth_temperature: *synth_temperature,
-                top_p: *top_p,
+                base_url: rendered_base_url,
                 // KEY SOURCE ONLY — env var name or file path, never the value.
                 api_key_env: api_key_env.clone(),
                 api_key_file: api_key_file.clone(),
                 key_optional: *key_optional,
-                base_url: rendered_base_url,
-                explorer_effort: explorer_effort.clone(),
-                synth_effort: synth_effort.clone(),
-                thinking_style: format!("{:?}", thinking_style).to_lowercase(),
                 request_timeout_secs: request_timeout.as_secs(),
             };
             (name.clone(), doc)
         })
         .collect();
 
+    let casts: BTreeMap<String, CastDoc> = config
+        .casts
+        .iter()
+        .map(|(name, cast)| {
+            let slots: CastDoc = cast
+                .slots
+                .iter()
+                .map(|(role, slot)| {
+                    // Exhaustive destructure, same discipline as Backend above.
+                    let ModelSlot {
+                        backend: _,
+                        id: _,
+                        vision: _,
+                        max_tokens,
+                        thinking_budget,
+                        temperature,
+                        effort,
+                        thinking_style,
+                    } = slot;
+                    let caps = config
+                        .slot_caps(slot)
+                        .expect("a loaded cast's slot backend resolves");
+                    (
+                        role.key(),
+                        SlotDoc {
+                            model: slot.qualified(),
+                            vision: caps.vision,
+                            max_tokens: *max_tokens,
+                            thinking_budget: *thinking_budget,
+                            temperature: *temperature,
+                            effort: effort.clone(),
+                            thinking_style: thinking_style.map(|s| format!("{s:?}").to_lowercase()),
+                        },
+                    )
+                })
+                .collect();
+            (name.clone(), slots)
+        })
+        .collect();
+
+    // Exhaustive destructures, same discipline as Backend/ModelSlot above: a new
+    // field on any of these is a compile error here, forcing an explicit
+    // render-or-skip decision instead of silently vanishing from the resource.
+    let &ToolGating {
+        consult,
+        explore,
+        synthesize,
+        run_kaish,
+    } = &config.tools;
+    let crate::sandbox::SandboxConfig {
+        exec_timeout,
+        output_limit_bytes,
+        disable_builtins,
+    } = &config.sandbox;
+    let crate::config::Defaults {
+        explorer_max_turns,
+        synth_max_turns,
+        max_tokens,
+        thinking_budget,
+        explorer_temperature,
+        synth_temperature,
+        top_p,
+        explorer_effort,
+        synth_effort,
+        thinking_style,
+        request_timeout,
+        session_capacity,
+    } = &config.defaults;
     let doc = ConfigDoc {
-        allowed_paths: allowed_set.iter().map(|p| p.display().to_string()).collect(),
+        allowed_paths: allowed_set
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         default_root: config.root.as_ref().map(|p| p.display().to_string()),
-        default_provider: config.default_provider.clone(),
+        default_cast: config.default_cast.clone(),
         tools: ToolsDoc {
-            consult: config.tools.consult,
-            explore: config.tools.explore,
-            synthesize: config.tools.synthesize,
-            run_kaish: config.tools.run_kaish,
+            consult,
+            explore,
+            synthesize,
+            run_kaish,
         },
         sandbox: SandboxDoc {
-            exec_timeout_secs: config.sandbox.exec_timeout.as_secs(),
-            output_limit_bytes: config.sandbox.output_limit_bytes,
-            disable_builtins: config.sandbox.disable_builtins.clone(),
+            exec_timeout_secs: exec_timeout.as_secs(),
+            output_limit_bytes: *output_limit_bytes,
+            disable_builtins: disable_builtins.clone(),
         },
-        profiles,
+        defaults: DefaultsDoc {
+            explorer_max_turns: *explorer_max_turns,
+            synth_max_turns: *synth_max_turns,
+            max_tokens: *max_tokens,
+            thinking_budget: *thinking_budget,
+            explorer_temperature: *explorer_temperature,
+            synth_temperature: *synth_temperature,
+            top_p: *top_p,
+            explorer_effort: explorer_effort.clone(),
+            synth_effort: synth_effort.clone(),
+            thinking_style: format!("{thinking_style:?}").to_lowercase(),
+            request_timeout_secs: request_timeout.as_secs(),
+            session_capacity: session_capacity.get(),
+        },
+        backend_aliases: config.backend_aliases().clone(),
+        backends,
+        cast_aliases: config.cast_aliases().clone(),
+        casts,
     };
 
     // Serialize to TOML. If the TOML serializer rejects something (unlikely given
     // all fields are primitive strings/ints/bools), crash loudly rather than return
     // a silently truncated or misleading document — the caller would get a half-truth.
-    let body = toml::to_string_pretty(&doc)
-        .expect("config render structs are TOML-serializable; if this panics, a field type changed");
+    let body = toml::to_string_pretty(&doc).expect(
+        "config render structs are TOML-serializable; if this panics, a field type changed",
+    );
     // Prepend a comment block that explains how to widen the allowed set — the tool
     // descriptions promise kaibo://config tells a caller how to do this.
     format!(
@@ -1004,13 +1285,19 @@ struct ProgressReporter {
 
 impl std::fmt::Debug for ProgressReporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProgressReporter").field("token", &self.token).finish_non_exhaustive()
+        f.debug_struct("ProgressReporter")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
     }
 }
 
 impl ProgressReporter {
     fn new(peer: Peer<RoleServer>, token: ProgressToken) -> Self {
-        Self { peer, token, seq: Arc::new(AtomicU64::new(0)) }
+        Self {
+            peer,
+            token,
+            seq: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -1066,11 +1353,16 @@ mod tests {
     #[test]
     fn progress_param_carries_seq_and_message() {
         let token = ProgressToken(NumberOrString::String("abc".into()));
-        let event = PhaseEvent::SweepStarted { question: "where is X?".into() };
+        let event = PhaseEvent::SweepStarted {
+            question: "where is X?".into(),
+        };
         let p = progress_param(token.clone(), 3, &event);
         assert_eq!(p.progress_token, token);
         assert_eq!(p.progress, 3.0);
-        assert!(p.total.is_none(), "a consult's step count isn't known up front");
+        assert!(
+            p.total.is_none(),
+            "a consult's step count isn't known up front"
+        );
         assert_eq!(p.message.as_deref(), Some("exploring: where is X?"));
     }
 
@@ -1124,7 +1416,9 @@ mod tests {
     fn advertises_the_per_builtin_template() {
         let templates = kaibo_resource_templates();
         assert!(
-            templates.iter().any(|t| t.raw.uri_template == BUILTIN_URI_TEMPLATE),
+            templates
+                .iter()
+                .any(|t| t.raw.uri_template == BUILTIN_URI_TEMPLATE),
             "must advertise the per-builtin URI template"
         );
     }
@@ -1152,14 +1446,20 @@ mod tests {
     #[test]
     fn reads_a_topic_resource() {
         let text = read_text(&format!("{KAISH_RES_PREFIX}syntax"), &[]);
-        assert!(text.contains("Variables"), "syntax topic should cover Variables:\n{text}");
+        assert!(
+            text.contains("Variables"),
+            "syntax topic should cover Variables:\n{text}"
+        );
     }
 
     #[test]
     fn reads_a_builtin_resource_and_rejects_an_unknown_builtin() {
         let schemas = sample_schemas();
         let text = read_text(&format!("{BUILTIN_PREFIX}rg"), &schemas);
-        assert!(text.contains("rg"), "builtin help should name the tool:\n{text}");
+        assert!(
+            text.contains("rg"),
+            "builtin help should name the tool:\n{text}"
+        );
         let config = Config::builtin();
         let allowed: Vec<PathBuf> = Vec::new();
         assert!(
@@ -1187,7 +1487,11 @@ mod tests {
     /// The text channel of a result (the answer). Panics if it isn't a single
     /// text block, which is the only shape `consult_result` produces.
     fn answer_text(result: &CallToolResult) -> String {
-        assert_eq!(result.content.len(), 1, "consult result is a single text block");
+        assert_eq!(
+            result.content.len(),
+            1,
+            "consult result is a single text block"
+        );
         result.content[0]
             .as_text()
             .expect("consult answer is text content")
@@ -1220,7 +1524,10 @@ mod tests {
             "report must not be folded into the answer text"
         );
         let sc = result.structured_content.expect("report was requested");
-        assert_eq!(sc["report"], "src/x.rs:1 the snippet", "report rides under `report`");
+        assert_eq!(
+            sc["report"], "src/x.rs:1 the snippet",
+            "report rides under `report`"
+        );
     }
 
     /// Opt-in with an empty report (the consult delegated no sweep): still surfaced.
@@ -1229,7 +1536,9 @@ mod tests {
     #[test]
     fn consult_result_surfaces_empty_report_when_requested() {
         let result = consult_result("ans".into(), String::new(), true);
-        let sc = result.structured_content.expect("requested even when empty");
+        let sc = result
+            .structured_content
+            .expect("requested even when empty");
         assert_eq!(sc["report"], "", "an empty report is surfaced honestly");
     }
 
@@ -1237,7 +1546,10 @@ mod tests {
     fn instructions_compose_the_canonical_onboarding_and_point_at_resources() {
         use crate::kaish_syntax::kaibo_instructions;
         let text = kaibo_instructions(&sample_schemas());
-        assert!(text.contains("kaibo"), "instructions should introduce kaibo");
+        assert!(
+            text.contains("kaibo"),
+            "instructions should introduce kaibo"
+        );
         // The canonical onboarding spine from kaish-help.
         assert!(
             text.contains("How kaish works"),
@@ -1274,15 +1586,24 @@ mod tests {
     }
 
     /// The config resource body must contain the key structural fields a calling
-    /// model or operator expects: allowed paths, default_provider, gated tools,
-    /// sandbox limits, and profiles with their kind and key sources.
+    /// model or operator expects: allowed paths, default_cast, gated tools,
+    /// sandbox limits, backends with kind and key sources, and casts with their
+    /// slots rendered as "backend/id" carrying resolved caps.
     #[test]
     fn config_resource_renders_expected_fields() {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
         let body = render_config_resource(&config, &allowed);
         // Structural presence checks — the resource is TOML or a document, not prose.
-        for needle in ["allowed_paths", "default_provider", "tools", "sandbox", "profiles"] {
+        for needle in [
+            "allowed_paths",
+            "default_cast",
+            "tools",
+            "sandbox",
+            "defaults",
+            "backends",
+            "casts",
+        ] {
             assert!(
                 body.contains(needle),
                 "config resource must contain {needle:?}:\n{body}"
@@ -1293,19 +1614,78 @@ mod tests {
             body.contains("/tmp/test-allowed"),
             "config resource must show the allowed set:\n{body}"
         );
-        // Profiles include the built-in four.
-        for profile_name in ["anthropic", "deepseek", "gemini", "openai"] {
+        // Backends and casts include the built-in four.
+        for name in ["anthropic", "deepseek", "gemini", "openai"] {
             assert!(
-                body.contains(profile_name),
-                "config resource must list the {profile_name} profile:\n{body}"
+                body.contains(&format!("[backends.{name}]")),
+                "config resource must list the {name} backend:\n{body}"
+            );
+            assert!(
+                body.contains(&format!("casts.{name}")),
+                "config resource must list the {name} cast:\n{body}"
             );
         }
+        // Slots render as "backend/id" with their RESOLVED caps (the classifier on
+        // the slot's backend kind: Anthropic sees, DeepSeek is blind).
+        assert!(
+            body.contains("anthropic/claude-sonnet-4-6"),
+            "slots render as backend/id:\n{body}"
+        );
+        let anthropic_synth = body
+            .find("anthropic/claude-sonnet-4-6")
+            .map(|i| &body[i..i + 120])
+            .unwrap();
+        assert!(
+            anthropic_synth.contains("vision = true"),
+            "anthropic slot carries resolved vision=true:\n{anthropic_synth}"
+        );
+        let deepseek_synth = body
+            .find("deepseek/deepseek-v4-pro")
+            .map(|i| &body[i..i + 120])
+            .unwrap();
+        assert!(
+            deepseek_synth.contains("vision = false"),
+            "deepseek slot carries resolved vision=false:\n{deepseek_synth}"
+        );
         // Key SOURCES (env var name / file path) must appear — operators configured
         // them and need to see them for diagnostics.
         assert!(
-            body.contains("ANTHROPIC_API_KEY") || body.contains("api_key_env"),
+            body.contains("ANTHROPIC_API_KEY"),
             "config resource must show key source env var names:\n{body}"
         );
+    }
+
+    /// The alias registries are part of the resolved runtime state: an alias is a
+    /// valid `cast` value and slot-ref prefix, so a caller reading `kaibo://config`
+    /// must be able to discover them — built-ins and file-declared both.
+    #[test]
+    fn config_resource_renders_backend_and_cast_aliases() {
+        let config = Config::from_toml_str(
+            r#"
+            [backends.big]
+            kind = "openai"
+            base_url = "http://localhost:9001/v1"
+            aliases = ["heavy"]
+
+            [casts.team]
+            aliases = ["fast"]
+            synth = "heavy/qwen3-235b"
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[]);
+        for needle in ["[backend_aliases]", "[cast_aliases]"] {
+            assert!(body.contains(needle), "must render {needle}:\n{body}");
+        }
+        // Built-in aliases at both levels, and the file-declared ones.
+        for needle in [
+            r#"claude = "anthropic""#,
+            r#"google = "gemini""#,
+            r#"heavy = "big""#,
+            r#"fast = "team""#,
+        ] {
+            assert!(body.contains(needle), "must render {needle}:\n{body}");
+        }
     }
 
     /// SECRET-SAFETY: the config resource must expose key SOURCE metadata (env var
@@ -1329,7 +1709,7 @@ mod tests {
         let allowed = vec![std::path::PathBuf::from("/tmp")];
 
         // Build the config outside the lock (no env access yet).
-        let toml = format!("[profiles.anthropic]\napi_key_env = \"{var_name}\"\n");
+        let toml = format!("[backends.anthropic]\napi_key_env = \"{var_name}\"\n");
         let config = Config::from_toml_str(&toml).expect("valid config");
 
         // Set the sentinel in env and render inside the lock.
@@ -1364,7 +1744,7 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
         write!(tmp, "{SENTINEL}").expect("write sentinel");
         let file_path = tmp.path().to_string_lossy().to_string();
-        let toml2 = format!("[profiles.anthropic]\napi_key_file = \"{file_path}\"\n");
+        let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
         let config2 = Config::from_toml_str(&toml2).expect("valid config");
         let body2 = render_config_resource(&config2, &allowed);
         // The file path (source pointer) may appear, but not the file contents.
@@ -1383,11 +1763,16 @@ mod tests {
         let allowed = handler().allowed_set();
         let body_str = render_config_resource(&config, &allowed);
         // Sanity: the rendered document has something in it.
-        assert!(!body_str.is_empty(), "config resource body must not be empty");
+        assert!(
+            !body_str.is_empty(),
+            "config resource body must not be empty"
+        );
         // The dispatch must not return not-found for this URI.
-        let result =
-            read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed);
-        assert!(result.is_ok(), "kaibo://config must be readable, got {result:?}");
+        let result = read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed);
+        assert!(
+            result.is_ok(),
+            "kaibo://config must be readable, got {result:?}"
+        );
     }
 
     // --- Scope section in instructions ---------------------------------------
@@ -1448,5 +1833,214 @@ mod tests {
             text.to_lowercase().contains("every call") || text.contains("no default"),
             "scope section must note the absence of a default root:\n{text}"
         );
+    }
+
+    // --- The cast param and its transitional `provider` alias ------------------
+
+    /// `cast` is the param's name; a client still sending `provider` must land on
+    /// the same field (the serde alias), not be silently dropped into the default.
+    #[test]
+    fn provider_alias_still_selects_the_cast() {
+        let input: ConsultInput =
+            serde_json::from_value(json!({ "question": "q", "provider": "gemini" }))
+                .expect("provider alias must deserialize");
+        assert_eq!(input.cast.as_deref(), Some("gemini"));
+        let input: ConsultInput =
+            serde_json::from_value(json!({ "question": "q", "cast": "deepseek" })).unwrap();
+        assert_eq!(input.cast.as_deref(), Some("deepseek"));
+        // The other two inputs carry the same alias.
+        let input: ExploreInput =
+            serde_json::from_value(json!({ "question": "q", "provider": "openai" })).unwrap();
+        assert_eq!(input.cast.as_deref(), Some("openai"));
+        let input: SynthesizeInput =
+            serde_json::from_value(json!({ "question": "q", "provider": "claude" })).unwrap();
+        assert_eq!(input.cast.as_deref(), Some("claude"));
+    }
+
+    /// Sending BOTH spellings is a loud duplicate-field error — two selectors
+    /// disagreeing must never silently pick a winner.
+    #[test]
+    fn sending_both_cast_and_provider_is_a_duplicate_field_error() {
+        let err = serde_json::from_value::<ConsultInput>(
+            json!({ "question": "q", "cast": "anthropic", "provider": "gemini" }),
+        )
+        .expect_err("both spellings must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "want a duplicate-field error, got: {err}"
+        );
+    }
+
+    // --- Per-call model overrides over a cast -----------------------------------
+
+    /// A bare-id override swaps the id within the slot: the backend is kept, the
+    /// caps pin and per-slot tunables are dropped (the new id classifies fresh).
+    #[test]
+    fn a_bare_override_keeps_the_backend_and_drops_the_pins() {
+        let config = Config::from_toml_str(
+            r#"
+            [casts.pinned]
+            synth = { backend = "openai", id = "llava", vision = true, max_tokens = 999 }
+            "#,
+        )
+        .unwrap();
+        let h = KaiboHandler::new(config).unwrap();
+        let mut cast = h.resolve_cast(Some("pinned".into())).unwrap();
+        h.override_model(&mut cast, ModelRole::Synth, "other-model", None)
+            .unwrap();
+        let slot = cast.slot(ModelRole::Synth).unwrap();
+        assert_eq!(slot.backend, "openai", "backend kept");
+        assert_eq!(slot.id, "other-model");
+        assert_eq!(slot.vision, None, "caps pin dropped — classifies fresh");
+        assert_eq!(slot.max_tokens, None, "per-slot tunables dropped");
+    }
+
+    /// The explicit backend arg retargets the slot's backend (aliases resolve),
+    /// enabling a call-time chimera.
+    #[test]
+    fn a_backend_arg_retargets_the_slot() {
+        let h = handler();
+        let mut cast = h.resolve_cast(Some("anthropic".into())).unwrap();
+        h.override_model(
+            &mut cast,
+            ModelRole::Explorer,
+            "deepseek-v4-flash",
+            Some("deepseek"),
+        )
+        .unwrap();
+        let slot = cast.slot(ModelRole::Explorer).unwrap();
+        assert_eq!(slot.backend, "deepseek");
+        assert_eq!(slot.id, "deepseek-v4-flash");
+        // Aliases resolve to the canonical backend.
+        h.override_model(
+            &mut cast,
+            ModelRole::Synth,
+            "claude-opus-4-8",
+            Some("claude"),
+        )
+        .unwrap();
+        assert_eq!(cast.slot(ModelRole::Synth).unwrap().backend, "anthropic");
+        // An unknown backend is a loud parameter error naming the known set.
+        let err = h
+            .override_model(&mut cast, ModelRole::Synth, "some-model", Some("nope"))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown backend"), "got: {err}");
+    }
+
+    /// A model id containing `/` is still just a model id: a HuggingFace-style
+    /// org prefix ("google/…") must ride verbatim to the slot's configured
+    /// backend, never be reinterpreted as a backend ref — "google" is a gemini
+    /// alias, and silently retargeting the call there is the bug class the house
+    /// rules name. Retargeting is the explicit backend arg's job.
+    #[test]
+    fn an_org_prefixed_model_id_stays_on_the_slots_backend() {
+        let h = handler();
+        let mut cast = h.resolve_cast(Some("openai".into())).unwrap();
+        h.override_model(
+            &mut cast,
+            ModelRole::Explorer,
+            "google/gemma-3-27b-it",
+            None,
+        )
+        .unwrap();
+        let slot = cast.slot(ModelRole::Explorer).unwrap();
+        assert_eq!(slot.backend, "openai", "the configured backend is kept");
+        assert_eq!(slot.id, "google/gemma-3-27b-it", "the id rides verbatim");
+    }
+
+    /// An empty or whitespace model override is a typo, never an intent — the
+    /// same loud rule config load applies to slots (it would otherwise surface
+    /// as a baffling provider 404 mid-call).
+    #[test]
+    fn an_empty_model_override_is_a_loud_parameter_error() {
+        let h = handler();
+        let mut cast = h.resolve_cast(Some("anthropic".into())).unwrap();
+        for value in ["", "   "] {
+            let err = h
+                .override_model(&mut cast, ModelRole::Synth, value, None)
+                .expect_err("an empty model id must be rejected");
+            assert!(err.to_string().contains("model id is empty"), "got: {err}");
+        }
+    }
+
+    /// A backend override without its model id has nothing to address there —
+    /// loud error, not a guess at the configured id on a foreign backend.
+    #[test]
+    fn a_backend_override_without_a_model_is_a_loud_parameter_error() {
+        let h = handler();
+        let mut cast = h.resolve_cast(Some("anthropic".into())).unwrap();
+        let err = h
+            .apply_model_override(
+                &mut cast,
+                ModelRole::Synth,
+                None,
+                Some("deepseek"),
+                "synth_model",
+                "synth_backend",
+            )
+            .expect_err("backend without model must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("synth_backend"), "names the arg, got: {msg}");
+        assert!(msg.contains("synth_model"), "names the fix, got: {msg}");
+    }
+
+    /// A bare override on a role the cast doesn't carry can't keep a backend that
+    /// isn't there — loud error naming the gap and the backend-arg escape hatch.
+    #[test]
+    fn a_bare_override_on_a_missing_slot_is_a_loud_error() {
+        let config = Config::from_toml_str(
+            r#"
+            [casts.synthless]
+            explorer = "deepseek/deepseek-v4-flash"
+            "#,
+        )
+        .unwrap();
+        let h = KaiboHandler::new(config).unwrap();
+        let mut cast = h.resolve_cast(Some("synthless".into())).unwrap();
+        let err = h
+            .override_model(&mut cast, ModelRole::Synth, "bare-id", None)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("has no synth slot"), "got: {msg}");
+        assert!(
+            msg.contains("backend"),
+            "names the escape hatch, got: {msg}"
+        );
+        // With a backend arg the override works even on the missing slot.
+        h.override_model(
+            &mut cast,
+            ModelRole::Synth,
+            "claude-sonnet-4-6",
+            Some("anthropic"),
+        )
+        .unwrap();
+        assert!(cast.slot(ModelRole::Synth).is_some());
+    }
+
+    /// A cast missing the role a tool needs fails loudly at call time, naming
+    /// the gap — absent = capability absent.
+    #[test]
+    fn arming_a_missing_slot_names_the_gap() {
+        let config = Config::from_toml_str(
+            r#"
+            [casts.synthless]
+            explorer = "deepseek/deepseek-v4-flash"
+            "#,
+        )
+        .unwrap();
+        let h = KaiboHandler::new(config).unwrap();
+        let cast = h.resolve_cast(Some("synthless".into())).unwrap();
+        let err = h.arm(&cast, ModelRole::Synth).unwrap_err();
+        assert!(err.to_string().contains("has no synth slot"), "got: {err}");
+    }
+
+    /// An unknown cast name is a parameter error naming the known casts.
+    #[test]
+    fn an_unknown_cast_is_a_parameter_error_naming_the_known_casts() {
+        let h = handler();
+        let err = h.resolve_cast(Some("nope".into())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown cast"), "got: {msg}");
+        assert!(msg.contains("anthropic"), "got: {msg}");
     }
 }

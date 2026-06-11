@@ -10,13 +10,17 @@
 //!   rigid explorer→synth hand-off: the capable model decides when to delegate a
 //!   broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span directly.
 //!
-//! Provider choice (Anthropic / DeepSeek / Gemini / OpenAI) only changes which
-//! client is constructed (see `with_provider_client!`); the loop is shared
-//! generically via [`CompletionClient`]. Each tool gets its own fresh
-//! [`KaishWorker`] (a kernel rooted at the project), and so does every `explore′`
-//! delegation.
+//! Each phase arrives as a resolved [`Arm`]: its own client (type-erased — the
+//! decided plumbing fork, `docs/casts.md`), model, request params, and caps. The
+//! server resolves a cast's slots into arms ([`Arm::from_slot`]); a cast whose
+//! explorer and synth live on different backends — different wire protocols,
+//! even — runs each phase on its own client through the same loop primitive.
+//! Each tool gets its own fresh [`KaishWorker`] (a kernel rooted at the
+//! project), and so does every `explore′` delegation.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,83 +33,13 @@ use rig::tool::{Tool, ToolDyn};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::Profile;
+use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, SessionStore};
-
-/// Construct the rig client for `$profile` (resolving its key, plus base URL for an
-/// OpenAI-compatible one) and bind it to `$client` for `$body`. The kind selects the
-/// client type; the *profile* carries the endpoint, key source, and models — so two
-/// `openai` profiles build two distinct clients. This is the single place those four
-/// client types live — `consult`, `explore`, and `synthesize` all dispatch through
-/// it. `$body` runs inside the arm, so it may `.await` and use `?`.
-macro_rules! with_provider_client {
-    ($profile:expr, |$client:ident| $body:expr) => {{
-        // Bind once so `$profile` is evaluated a single time even though each arm
-        // also reads it (key resolution, base URL).
-        let profile = $profile;
-        // One HTTP backend, shared by whichever client the kind selects, carrying
-        // the per-request deadline. rig exposes no native timeout and its prompt
-        // loop is non-streaming, so a provider that connects but never responds
-        // would hang the whole call with no other brake — the 2026-06-06 wedge
-        // (~29 min; docs/issues.md). `timeout` bounds a single completion;
-        // `connect_timeout` fails a dead endpoint fast (capped at the deadline so a
-        // sub-10s profile timeout still dominates). Injected via rig's
-        // `.http_client(..)`; only one match arm runs, so the move is exclusive.
-        let http = reqwest::Client::builder()
-            .timeout(profile.request_timeout)
-            .connect_timeout(profile.request_timeout.min(Duration::from_secs(10)))
-            .build()
-            .map_err(|e| anyhow!("http client init: {e}"))?;
-        match profile.kind {
-            ProviderKind::Anthropic => {
-                let key = profile.resolve_key()?;
-                let $client = anthropic::Client::builder()
-                    .api_key(&key)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("anthropic client init: {e}"))?;
-                $body
-            }
-            ProviderKind::DeepSeek => {
-                let key = profile.resolve_key()?;
-                let $client = deepseek::Client::builder()
-                    .api_key(&key)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("deepseek client init: {e}"))?;
-                $body
-            }
-            ProviderKind::Gemini => {
-                let key = profile.resolve_key()?;
-                let $client = gemini::Client::builder()
-                    .api_key(&key)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("gemini client init: {e}"))?;
-                $body
-            }
-            ProviderKind::Openai => {
-                // Any OpenAI-compatible endpoint, addressed by the profile's base
-                // URL. The key is optional for a keyless profile: `resolve_key`
-                // returns the configured key or a placeholder the server ignores.
-                let base_url = profile.resolved_base_url();
-                let key = profile.resolve_key()?;
-                let $client = openai::CompletionsClient::builder()
-                    .api_key(&key)
-                    .base_url(&base_url)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
-                $body
-            }
-        }
-    }};
-}
 
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
@@ -146,7 +80,8 @@ fn is_gemini3_level(model: &str) -> bool {
 /// The per-role thinking-depth lever for the models that expose one as a request
 /// param (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`).
 /// A passthrough string the provider validates — like a model id — so a new level
-/// lands without a code change. Default for both roles unless a profile tunes it.
+/// lands without a code change. Default for both roles unless a slot or the
+/// per-role `[defaults]` tunes it.
 pub const DEFAULT_EFFORT: &str = "high";
 
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
@@ -157,11 +92,53 @@ pub const DEFAULT_EFFORT: &str = "high";
 /// Sonnet 4.6 take adaptive too — it's the recommended shape, `budget_tokens` is
 /// deprecated there. Everything older, and Haiku 4.5, stays on enabled/budget. Matched
 /// by `contains` (not `starts_with`, unlike `is_gemini3_level`) so a vendor-prefixed id
-/// still resolves. Add ids as they ship; a profile can force a tier via `thinking_style`.
+/// still resolves. Add ids as they ship; a slot (or `[defaults]`) can force a tier
+/// via `thinking_style`.
 fn is_anthropic_adaptive(model: &str) -> bool {
     ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"]
         .iter()
         .any(|tier| model.contains(tier))
+}
+
+/// What one (provider, model) can perceive — capability data on the same seam as
+/// [`ModelShape`], resolved per model slot: an explicit config override wins, else
+/// the built-in classifier. Toolsets are assembled from resolved caps (a vision
+/// model gets `view_image` when vision-in lands; a blind model never sees the
+/// tool), so a capability mismatch is structural, not a runtime surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCaps {
+    /// Accepts image parts in model context (vision-in).
+    pub vision: bool,
+}
+
+impl ModelCaps {
+    /// Resolve the caps for `model` under `kind`. `vision_override` is the per-slot
+    /// config escape hatch (`vision = true/false` in the role table) — it pins the
+    /// answer in both directions; `None` asks the classifier.
+    pub fn resolve(kind: ProviderKind, model: &str, vision_override: Option<bool>) -> Self {
+        let vision = vision_override.unwrap_or_else(|| is_vision_capable(kind, model));
+        Self { vision }
+    }
+}
+
+/// The built-in vision classifier. **Empirical — confirm by probe** (the discipline
+/// of [`is_anthropic_adaptive`]): boundaries reflect what the providers actually
+/// serve today, and a wrong guess fails loud at the provider, not silent here.
+fn is_vision_capable(kind: ProviderKind, _model: &str) -> bool {
+    match kind {
+        // Every current Claude completion id is multimodal-in (vision shipped with
+        // Claude 3; no text-only ids remain in the lineup).
+        ProviderKind::Anthropic => true,
+        // The gemini-* completion line is natively multimodal across 2.x/3.x.
+        ProviderKind::Gemini => true,
+        // DeepSeek chat/reasoner are text-only on the wire (docs/issues.md, media
+        // spine): images attached to a blind model must fail loud, not get dropped.
+        ProviderKind::DeepSeek => false,
+        // A generic OpenAI-compatible endpoint can front anything; vision is opt-in
+        // per slot (`vision = true` in the role table) rather than guessed from an
+        // arbitrary id.
+        ProviderKind::Openai => false,
+    }
 }
 
 /// How a given (provider, model) expresses "think" on the wire.
@@ -192,8 +169,8 @@ enum SamplingPlacement {
 
 /// Force a model's thinking style, overriding the built-in classifier. `Auto` (the
 /// default) classifies from the model id; the others pin a tier — the escape hatch for
-/// a new or misclassified Anthropic model (see `docs/config.md`). Carried on a
-/// [`Profile`] and resolved per phase via [`Dialect`].
+/// a new or misclassified Anthropic model (see `docs/config.md`). Carried on a cast
+/// slot (falling back to `[defaults]`) and resolved per arm via [`Arm::from_slot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkingStyleOverride {
     #[default]
@@ -219,7 +196,7 @@ impl std::str::FromStr for ThinkingStyleOverride {
 /// The request shape one (provider, model) wants — the unified, per-model home for
 /// request tuning. [`resolve`](ModelShape::resolve) classifies it (honoring an
 /// override); [`to_params`](ModelShape::to_params) emits the `additional_params` blob
-/// with the per-phase budget, sampling, and effort. This is what lets a profile whose
+/// with the per-phase budget, sampling, and effort. This is what lets a cast whose
 /// explorer and synth straddle a capability line (a budget-tier Haiku explorer with an
 /// adaptive Sonnet 4.6 synth, say) fit each arm correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,8 +258,9 @@ impl ModelShape {
 
     /// The full `additional_params` blob — thinking (with its effort sink where the
     /// model has one) plus sampling — or `None` when nothing is set. `effort` is the
-    /// per-role depth lever; it lands only where the style takes it (Anthropic adaptive
-    /// → `output_config.effort`; DeepSeek → `reasoning_effort`), ignored elsewhere.
+    /// per-role depth lever; it lands where the style takes it (Anthropic adaptive
+    /// → `output_config.effort`; DeepSeek → `reasoning_effort`; the Gemini 3-line
+    /// → `thinkingLevel`), ignored elsewhere.
     pub fn to_params(
         &self,
         budget: u64,
@@ -347,11 +325,15 @@ impl ModelShape {
                 obj.insert("output_config".into(), json!({ "effort": effort }));
             }
             ThinkingStyle::GeminiLevel => {
-                // "high" matches gemini-cli's investigator; rig deserializes it to
-                // ThinkingLevel::High. (Gemini depth is the level, not `effort`.)
+                // The 3-line's depth lever IS the per-role effort: the values align
+                // ("high"/"low" are valid levels; the default "high" matches
+                // gemini-cli's investigator, rig deserializes it to
+                // ThinkingLevel::High), and like every effort it's a passthrough
+                // string the provider validates. Dropping it for a hardcoded
+                // "high" would silently ignore a slot's `effort = "low"`.
                 obj.insert(
                     "generationConfig".into(),
-                    json!({ "thinkingConfig": { "thinkingLevel": "high", "includeThoughts": true } }),
+                    json!({ "thinkingConfig": { "thinkingLevel": effort, "includeThoughts": true } }),
                 );
             }
             ThinkingStyle::GeminiBudget => {
@@ -374,23 +356,16 @@ impl ModelShape {
 
 /// Per-(provider, model) thinking params, or `None` when the model reasons without a
 /// request toggle. Thin wrapper over [`ModelShape`] using the built-in classifier and
-/// the default effort; the per-phase path with overrides goes through [`Dialect`].
+/// the default effort; the per-phase path with slot overrides goes through
+/// [`Arm::from_slot`].
 pub fn thinking_params(kind: ProviderKind, model: &str, budget: u64) -> Option<Value> {
     ModelShape::resolve(kind, model, ThinkingStyleOverride::Auto).thinking_only(budget)
 }
 
-/// The phase a request is for. Temperature is role-sensitive: the explorer gathers
-/// exact citations (cold), the synth composes the answer (a touch warmer).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Explorer,
-    Synth,
-}
-
 /// All of a request's model-shaping params (thinking + sampling) merged into one
 /// `additional_params` blob. Thin wrapper over [`ModelShape::to_params`] using the
-/// built-in classifier and the default effort; the per-phase path with profile
-/// overrides goes through [`Dialect`].
+/// built-in classifier and the default effort; the per-phase path with slot
+/// overrides goes through [`Arm::from_slot`].
 pub fn request_params(
     kind: ProviderKind,
     model: &str,
@@ -398,79 +373,263 @@ pub fn request_params(
     temperature: Option<f64>,
     top_p: Option<f64>,
 ) -> Option<Value> {
-    ModelShape::resolve(kind, model, ThinkingStyleOverride::Auto)
-        .to_params(budget, temperature, top_p, DEFAULT_EFFORT)
+    ModelShape::resolve(kind, model, ThinkingStyleOverride::Auto).to_params(
+        budget,
+        temperature,
+        top_p,
+        DEFAULT_EFFORT,
+    )
 }
 
-/// How kaibo shapes requests for the models of one [`Profile`] — the single home for
-/// per-model request tuning. Resolved once from a profile, then asked for *each
-/// phase's own* model and role: a profile whose explorer and synth straddle a
-/// capability line (a budget-tier Haiku explorer with an adaptive Sonnet 4.6 synth, or
-/// a Gemini 2.x flash explorer with a Gemini 3 synth) gets each arm fit correctly,
-/// rather than one shape computed once and shared.
-#[derive(Debug, Clone)]
-pub struct Dialect {
-    kind: ProviderKind,
-    thinking_budget: u64,
-    thinking_style: ThinkingStyleOverride,
-    explorer_temperature: Option<f64>,
-    synth_temperature: Option<f64>,
-    explorer_effort: String,
-    synth_effort: String,
-    top_p: Option<f64>,
+// --- The Arm seam ------------------------------------------------------------
+
+/// The toolset factory a phase loop rebuilds its tools from (once for the main
+/// loop, again for the turn-cap finalize turn — see [`run_phase`]).
+type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<Box<dyn ToolDyn>>> + Send + Sync);
+
+/// The object-safe seam one [`Arm`] runs its loops through: a (client, model)
+/// pair erased behind a vtable. rig's provider clients are distinct concrete
+/// types; monomorphizing every phase combination would be a kinds² macro product
+/// (the decided plumbing fork, `docs/casts.md`) — the calls are network-bound,
+/// so dynamic dispatch here is free. The one implementation, [`ClientArm`],
+/// forwards to the generic [`run_phase`], which stays the offline-testable
+/// primitive.
+trait PhaseRunner: Send + Sync {
+    #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
+    fn run_phase<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        user_prompt: String,
+        max_turns: usize,
+        params: Option<&'a Value>,
+        progress: &'a dyn ProgressSink,
+        make_tools: ToolFactory<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 }
 
-impl Dialect {
-    /// Bind a kind and a thinking budget with no sampling overrides and default effort
-    /// (the seam tests reach for, and any path that only cares about thinking).
-    pub fn new(kind: ProviderKind, thinking_budget: u64) -> Self {
+/// The concrete (client, model) pair behind the [`PhaseRunner`] vtable.
+struct ClientArm<C> {
+    client: C,
+    model: String,
+}
+
+impl<C> PhaseRunner for ClientArm<C>
+where
+    C: CompletionClient + Clone + Send + Sync + 'static,
+    C::CompletionModel: 'static,
+{
+    fn run_phase<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        user_prompt: String,
+        max_turns: usize,
+        params: Option<&'a Value>,
+        progress: &'a dyn ProgressSink,
+        make_tools: ToolFactory<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(run_phase(
+            &self.client,
+            &self.model,
+            preamble,
+            max_tokens,
+            user_prompt,
+            max_turns,
+            params,
+            progress,
+            make_tools,
+        ))
+    }
+}
+
+/// One resolved phase arm: its own client + model + request params + caps. The
+/// unit `consult`/`explore`/`synthesize` receive — they never learn about
+/// backends or casts. The server resolves a cast's slots into arms
+/// ([`Arm::from_slot`]); tests inject any [`CompletionClient`] (the scripted
+/// offline one included) via [`Arm::new`], which is what keeps the mock harness
+/// driving the *real* loop with no network.
+#[derive(Clone)]
+pub struct Arm {
+    runner: Arc<dyn PhaseRunner>,
+    /// The model id this arm addresses (diagnostics; the runner carries its own).
+    pub model: String,
+    /// Output headroom for this arm's completions. **Thinking is on**, so
+    /// reasoning eats this budget — it sits well above the thinking budget baked
+    /// into `params`, validated at config load.
+    pub max_tokens: u64,
+    /// The resolved `additional_params` blob (thinking + sampling + effort), fit
+    /// to this arm's model by [`ModelShape`]. `None` when nothing is sent.
+    pub params: Option<Value>,
+    /// What this arm's model can perceive — the seam toolset assembly reads (a
+    /// vision arm gets `view_image` when vision-in lands; a blind one never sees
+    /// the tool).
+    pub caps: ModelCaps,
+}
+
+impl std::fmt::Debug for Arm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Arm")
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("params", &self.params)
+            .field("caps", &self.caps)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Arm {
+    /// Wrap an already-constructed client as an arm. The injection seam: the
+    /// server's live arms and the tests' scripted ones meet the loop here.
+    pub fn new<C>(
+        client: C,
+        model: impl Into<String>,
+        max_tokens: u64,
+        params: Option<Value>,
+        caps: ModelCaps,
+    ) -> Self
+    where
+        C: CompletionClient + Clone + Send + Sync + 'static,
+        C::CompletionModel: 'static,
+    {
+        let model = model.into();
         Self {
-            kind,
-            thinking_budget,
-            thinking_style: ThinkingStyleOverride::Auto,
-            explorer_temperature: None,
-            synth_temperature: None,
-            explorer_effort: DEFAULT_EFFORT.to_string(),
-            synth_effort: DEFAULT_EFFORT.to_string(),
-            top_p: None,
+            runner: Arc::new(ClientArm {
+                client,
+                model: model.clone(),
+            }),
+            model,
+            max_tokens,
+            params,
+            caps,
         }
     }
 
-    /// The usual path: take the kind, budget, thinking-style override, sampling, and
-    /// per-role effort a resolved profile carries.
-    pub fn from_profile(profile: &Profile) -> Self {
-        Self {
-            kind: profile.kind,
-            thinking_budget: profile.thinking_budget,
-            thinking_style: profile.thinking_style,
-            explorer_temperature: Some(profile.explorer_temperature),
-            synth_temperature: Some(profile.synth_temperature),
-            explorer_effort: profile.explorer_effort.clone(),
-            synth_effort: profile.synth_effort.clone(),
-            top_p: profile.top_p.into(),
+    /// Resolve one cast slot into a live arm: construct the backend's rig client
+    /// (resolving its key, plus base URL for an OpenAI-compatible one) and fit
+    /// the request shape to the *slot's* model with the *slot's* tunables (each
+    /// falling back to the per-role `[defaults]`). This is the single place the
+    /// four concrete client types live; a cast whose phases straddle any
+    /// capability line — different kinds, even — is fit per-arm by construction.
+    pub fn from_slot(
+        backend: &Backend,
+        slot: &ModelSlot,
+        role: ModelRole,
+        defaults: &Defaults,
+    ) -> Result<Self> {
+        let t = slot.tunables(role, defaults);
+        // Re-assert the budget rule at the single live construction point: config
+        // load validates every *configured* slot, but per-call overrides build
+        // bare slots that never saw it — an inverted pair must be the same
+        // keyworded boundary error here, not a provider 400 mid-call. Checked
+        // before key resolution so it fires with no key configured.
+        if matches!(backend.kind, ProviderKind::Anthropic | ProviderKind::Gemini)
+            && t.thinking_budget >= t.max_tokens
+        {
+            return Err(anyhow!(
+                "model {:?} (backend {:?}): thinking_budget ({}) must be < max_tokens \
+                 ({}) — reasoning would starve the answer (Anthropic rejects it \
+                 outright)",
+                slot.id,
+                backend.name,
+                t.thinking_budget,
+                t.max_tokens
+            ));
+        }
+        let params = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style).to_params(
+            t.thinking_budget,
+            Some(t.temperature),
+            Some(t.top_p),
+            &t.effort,
+        );
+        let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
+
+        // One HTTP backend carrying the per-request deadline. rig exposes no
+        // native timeout and its prompt loop is non-streaming, so a provider that
+        // connects but never responds would hang the whole call with no other
+        // brake — the 2026-06-06 wedge (~29 min; docs/issues.md). `timeout`
+        // bounds a single completion; `connect_timeout` fails a dead endpoint
+        // fast (capped at the deadline so a sub-10s backend timeout still
+        // dominates). Injected via rig's `.http_client(..)`.
+        let http = reqwest::Client::builder()
+            .timeout(backend.request_timeout)
+            .connect_timeout(backend.request_timeout.min(Duration::from_secs(10)))
+            .build()
+            .map_err(|e| anyhow!("http client init: {e}"))?;
+
+        match backend.kind {
+            ProviderKind::Anthropic => {
+                let key = backend.resolve_key()?;
+                let client = anthropic::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .build()
+                    .map_err(|e| anyhow!("anthropic client init: {e}"))?;
+                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+            }
+            ProviderKind::DeepSeek => {
+                let key = backend.resolve_key()?;
+                let client = deepseek::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .build()
+                    .map_err(|e| anyhow!("deepseek client init: {e}"))?;
+                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+            }
+            ProviderKind::Gemini => {
+                let key = backend.resolve_key()?;
+                let client = gemini::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .build()
+                    .map_err(|e| anyhow!("gemini client init: {e}"))?;
+                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+            }
+            ProviderKind::Openai => {
+                // Any OpenAI-compatible endpoint, addressed by the backend's base
+                // URL. The key is optional for a keyless backend: `resolve_key`
+                // returns the configured key or a placeholder the server ignores.
+                let base_url = backend.resolved_base_url();
+                let key = backend.resolve_key()?;
+                let client = openai::CompletionsClient::builder()
+                    .api_key(&key)
+                    .base_url(&base_url)
+                    .http_client(http)
+                    .build()
+                    .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
+                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+            }
         }
     }
 
-    /// The full `additional_params` for `model` in `role`, or `None` when there's
-    /// nothing to send. The per-phase resolution point.
-    pub fn request_params(&self, model: &str, role: Role) -> Option<Value> {
-        let (temperature, effort) = match role {
-            Role::Explorer => (self.explorer_temperature, self.explorer_effort.as_str()),
-            Role::Synth => (self.synth_temperature, self.synth_effort.as_str()),
-        };
-        ModelShape::resolve(self.kind, model, self.thinking_style).to_params(
-            self.thinking_budget,
-            temperature,
-            self.top_p,
-            effort,
-        )
+    /// Run one bounded tool loop on this arm: its client, model, params, and
+    /// `max_tokens`, with the caller's preamble/prompt/turn-cap/toolset.
+    pub(crate) async fn run(
+        &self,
+        preamble: &str,
+        user_prompt: String,
+        max_turns: usize,
+        progress: &dyn ProgressSink,
+        make_tools: ToolFactory<'_>,
+    ) -> Result<String> {
+        self.runner
+            .run_phase(
+                preamble,
+                self.max_tokens,
+                user_prompt,
+                max_turns,
+                self.params.as_ref(),
+                progress,
+                make_tools,
+            )
+            .await
     }
 }
 
-/// Per-call loop tunables for a phase. Models, `max_tokens`, and the thinking budget
-/// now live on the [`Profile`] (they track the provider/model); what remains here
-/// are the loop bounds the caller may dial per request, plus the resolved
-/// `max_tokens` the phase passes straight through to the API.
+/// Per-call loop tunables for a phase. Model-tracking knobs (`max_tokens`, the
+/// thinking budget, sampling) ride each [`Arm`] (they track the slot's model);
+/// what remains here are the loop bounds the caller may dial per request, the
+/// sandbox limits, and the progress sink.
 #[derive(Debug, Clone)]
 pub struct ConsultConfig {
     /// Bounds each cheap `explore′` sweep — it's cheap, let it rip.
@@ -478,10 +637,6 @@ pub struct ConsultConfig {
     /// Bounds the recomposed consult's *whole* driver loop (it delegates sweeps AND
     /// reads spans), so it must be generous — a multi-part question blew the old 8.
     pub synth_max_turns: usize,
-    /// Output headroom, resolved from the profile. **Thinking is on**, so reasoning
-    /// eats this budget — it must sit well above the profile's thinking budget or the
-    /// answer gets truncated to empty.
-    pub max_tokens: u64,
     /// Read-only sandbox limits applied to every kaish worker this phase spawns.
     pub sandbox: SandboxConfig,
     /// Where the phase's liveness goes: each delegated sweep and direct kaish read
@@ -499,7 +654,6 @@ impl Default for ConsultConfig {
         Self {
             explorer_max_turns: d.explorer_max_turns,
             synth_max_turns: d.synth_max_turns,
-            max_tokens: d.max_tokens,
             sandbox: SandboxConfig::default(),
             progress: Arc::new(NullSink),
         }
@@ -665,8 +819,9 @@ where
 }
 
 /// `explore′` — the explorer unit wrapped as a rig [`Tool`] the consult loop can
-/// call. Its `call` runs a *nested* agent: a cheap model driving `{run_kaish}`
-/// over a fresh kernel, returning a curated report. This is what lets the capable
+/// call. Its `call` runs a *nested* agent: the explorer [`Arm`] (a cheap model,
+/// possibly on a different backend than the driver) driving `{run_kaish}` over a
+/// fresh kernel, returning a curated report. This is what lets the capable
 /// `consult` model delegate a broad repo sweep instead of reading every span
 /// itself.
 ///
@@ -674,12 +829,10 @@ where
 /// thread and never crosses the `.await` here — only the `Send` worker handle
 /// does — so `call`'s future is `Send`, as rig requires. `tests/explore_send.rs`
 /// pins this at compile time.
-pub struct RunExplore<C> {
-    client: C,
-    model: String,
-    max_tokens: u64,
+pub struct RunExplore {
+    /// The explorer's resolved arm: its own client, model, params, `max_tokens`.
+    arm: Arm,
     max_turns: usize,
-    thinking: Option<Value>,
     root: PathBuf,
     /// Sandbox limits for the fresh kernel each delegated sweep spawns.
     sandbox: SandboxConfig,
@@ -693,25 +846,18 @@ pub struct RunExplore<C> {
     progress: Arc<dyn ProgressSink>,
 }
 
-impl<C> RunExplore<C> {
-    #[allow(clippy::too_many_arguments)]
+impl RunExplore {
     pub fn new(
-        client: C,
-        model: impl Into<String>,
-        max_tokens: u64,
+        arm: Arm,
         max_turns: usize,
-        thinking: Option<Value>,
         root: impl Into<PathBuf>,
         sandbox: SandboxConfig,
         reports: Arc<Mutex<Vec<String>>>,
         progress: Arc<dyn ProgressSink>,
     ) -> Self {
         Self {
-            client,
-            model: model.into(),
-            max_tokens,
+            arm,
             max_turns,
-            thinking,
             root: root.into(),
             sandbox,
             reports,
@@ -738,11 +884,7 @@ impl std::fmt::Display for RunExploreError {
 
 impl std::error::Error for RunExploreError {}
 
-impl<C> Tool for RunExplore<C>
-where
-    C: CompletionClient + Send + Sync,
-    C::CompletionModel: 'static,
-{
+impl Tool for RunExplore {
     const NAME: &'static str = "explore";
     type Error = RunExploreError;
     type Args = RunExploreArgs;
@@ -773,28 +915,28 @@ where
         // Bracket the delegation: the start carries the sub-question, the finish fires
         // on both success and failure (the `?` below short-circuits, so emit it before
         // unwrapping the result).
-        self.progress.emit(PhaseEvent::SweepStarted { question: args.question.clone() });
-        // Reuse the one loop — explore′ is just run_phase with the explorer model.
+        self.progress.emit(PhaseEvent::SweepStarted {
+            question: args.question.clone(),
+        });
+        // Reuse the one loop — explore′ is just the explorer arm's run_phase.
         // A fresh kernel per worker build (the §2.1 cost note: a KaishWorker per
         // explore′; run_phase may build a second for the turn-cap recovery turn).
         // The sub-agent's `run_kaish` carries the same sink, so its reads surface too.
-        let result = run_phase(
-            &self.client,
-            &self.model,
-            &report_preamble(),
-            self.max_tokens,
-            args.question,
-            self.max_turns,
-            self.thinking.as_ref(),
-            self.progress.as_ref(),
-            || -> Result<Vec<Box<dyn ToolDyn>>> {
-                Ok(vec![Box::new(RunKaish::with_progress(
-                    KaishWorker::spawn_with(&self.root, self.sandbox.clone())?,
-                    self.progress.clone(),
-                ))])
-            },
-        )
-        .await;
+        let result = self
+            .arm
+            .run(
+                &report_preamble(),
+                args.question,
+                self.max_turns,
+                self.progress.as_ref(),
+                &|| -> Result<Vec<Box<dyn ToolDyn>>> {
+                    Ok(vec![Box::new(RunKaish::with_progress(
+                        KaishWorker::spawn_with(&self.root, self.sandbox.clone())?,
+                        self.progress.clone(),
+                    ))])
+                },
+            )
+            .await;
         self.progress.emit(PhaseEvent::SweepFinished);
         let report = result.map_err(|e| RunExploreError(format!("{e:#}")))?;
         // Lock poisoning means another delegation panicked — surface it, don't mask.
@@ -806,57 +948,29 @@ where
     }
 }
 
-/// One explore loop against an already-constructed client: a cheap model drives
-/// `{run_kaish}` over a fresh kernel rooted at `root`, returning a curated report.
-async fn explore_with<C>(
-    client: &C,
-    model: &str,
-    root: &Path,
-    cfg: &ConsultConfig,
-    thinking: Option<&Value>,
+/// The `explore` unit: a cheap model drives `{run_kaish}` over `root` and returns
+/// a curated report. The standalone seam behind the MCP `explore` tool — built on
+/// the one loop primitive via the resolved explorer [`Arm`].
+pub async fn explore(
     question: &str,
-) -> Result<String>
-where
-    C: CompletionClient,
-    C::CompletionModel: 'static,
-{
-    run_phase(
-        client,
-        model,
+    root: impl Into<PathBuf>,
+    arm: &Arm,
+    cfg: &ConsultConfig,
+) -> Result<String> {
+    let root = root.into();
+    arm.run(
         &report_preamble(),
-        cfg.max_tokens,
         question.to_string(),
         cfg.explorer_max_turns,
-        thinking,
         cfg.progress.as_ref(),
-        || -> Result<Vec<Box<dyn ToolDyn>>> {
+        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
             Ok(vec![Box::new(RunKaish::with_progress(
-                KaishWorker::spawn_with(root, cfg.sandbox.clone())?,
+                KaishWorker::spawn_with(&root, cfg.sandbox.clone())?,
                 cfg.progress.clone(),
             ))])
         },
     )
     .await
-}
-
-/// The `explore` unit: a cheap model drives `{run_kaish}` over `root` and returns
-/// a curated report. The standalone seam behind the MCP `explore` tool — built on
-/// the generalized [`run_phase`] and multi-provider, so it works for any profile.
-pub async fn explore(
-    question: &str,
-    root: impl Into<PathBuf>,
-    profile: &Profile,
-    cfg: &ConsultConfig,
-) -> Result<String> {
-    let root = root.into();
-    // Single-model phase: resolve thinking against the explorer's own model.
-    let thinking =
-        Dialect::from_profile(profile).request_params(&profile.explorer_model, Role::Explorer);
-    let thinking = thinking.as_ref();
-
-    with_provider_client!(profile, |client| {
-        explore_with(&client, &profile.explorer_model, &root, cfg, thinking, question).await
-    })
 }
 
 /// Build the standalone `synthesize` user prompt. Pure and offline-testable.
@@ -915,60 +1029,32 @@ pub fn synthesize_preamble() -> String {
     )
 }
 
-/// One synth loop against an already-constructed client: a capable model answers
-/// `user_prompt` with `{run_kaish}` available over a fresh kernel rooted at `root`.
-async fn synthesize_with<C>(
-    client: &C,
-    model: &str,
-    root: &Path,
+/// The standalone `synthesize` seam: a capable model answers `question`, grounded
+/// in an optional caller-supplied `context` (typically an `explore` report or
+/// pasted material), with `run_kaish` to verify or fill a precise gap. Takes the
+/// resolved synth [`Arm`] — a real outside opinion, not the cheap explorer.
+pub async fn synthesize(
+    question: &str,
+    context: Option<&str>,
+    root: impl Into<PathBuf>,
+    arm: &Arm,
     cfg: &ConsultConfig,
-    thinking: Option<&Value>,
-    user_prompt: String,
-) -> Result<String>
-where
-    C: CompletionClient,
-    C::CompletionModel: 'static,
-{
-    run_phase(
-        client,
-        model,
+) -> Result<String> {
+    let root = root.into();
+    let user_prompt = synthesize_user_prompt(question, context);
+    arm.run(
         &synthesize_preamble(),
-        cfg.max_tokens,
         user_prompt,
         cfg.synth_max_turns,
-        thinking,
         cfg.progress.as_ref(),
-        || -> Result<Vec<Box<dyn ToolDyn>>> {
+        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
             Ok(vec![Box::new(RunKaish::with_progress(
-                KaishWorker::spawn_with(root, cfg.sandbox.clone())?,
+                KaishWorker::spawn_with(&root, cfg.sandbox.clone())?,
                 cfg.progress.clone(),
             ))])
         },
     )
     .await
-}
-
-/// The standalone `synthesize` seam: a capable model answers `question`, grounded
-/// in an optional caller-supplied `context` (typically an `explore` report or
-/// pasted material), with `run_kaish` to verify or fill a precise gap. Defaults to
-/// the capable synth model — a real outside opinion, not the cheap explorer.
-pub async fn synthesize(
-    question: &str,
-    context: Option<&str>,
-    root: impl Into<PathBuf>,
-    profile: &Profile,
-    cfg: &ConsultConfig,
-) -> Result<String> {
-    let root = root.into();
-    // Single-model phase: resolve thinking against the synth's own model.
-    let thinking =
-        Dialect::from_profile(profile).request_params(&profile.synth_model, Role::Synth);
-    let thinking = thinking.as_ref();
-    let user_prompt = synthesize_user_prompt(question, context);
-
-    with_provider_client!(profile, |client| {
-        synthesize_with(&client, &profile.synth_model, &root, cfg, thinking, user_prompt).await
-    })
 }
 
 /// Build the consult driver's user prompt from the question and any prior session
@@ -989,7 +1075,12 @@ pub fn consult_user_prompt(question: &str, history: &[QaTurn]) -> String {
          oldest first:\n\n",
     );
     for (i, turn) in history.iter().enumerate() {
-        prompt.push_str(&format!("[Turn {}]\nQ: {}\nA: {}\n\n", i + 1, turn.question, turn.answer));
+        prompt.push_str(&format!(
+            "[Turn {}]\nQ: {}\nA: {}\n\n",
+            i + 1,
+            turn.question,
+            turn.answer
+        ));
     }
     prompt.push_str(&format!(
         "Use the earlier turns for context and continuity. Investigate fresh and \
@@ -1021,34 +1112,25 @@ pub fn consult_preamble() -> String {
 }
 
 /// Build the recomposed `consult` toolset: `{run_kaish, explore′}`. Factored out so
-/// the wiring (both tools present, explore′ pointed at the cheap model) is
+/// the wiring (both tools present, explore′ pointed at the explorer arm) is
 /// unit-testable without a live model. `reports` collects each `explore′` sweep.
-fn consult_tools<C>(
-    client: &C,
-    explorer_model: &str,
+fn consult_tools(
+    explorer: &Arm,
     root: &Path,
     cfg: &ConsultConfig,
-    dialect: &Dialect,
     reports: Arc<Mutex<Vec<String>>>,
-) -> Result<Vec<Box<dyn ToolDyn>>>
-where
-    C: CompletionClient + Clone + Send + Sync + 'static,
-    C::CompletionModel: 'static,
-{
+) -> Result<Vec<Box<dyn ToolDyn>>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
     let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
-    // explore′ for delegated breadth: same explore unit, wrapped as a tool, pointed
-    // at the cheap explorer model. Bounded by explorer_max_turns per sweep; no cap
-    // on how many times consult may delegate (Amy's call — watch real behavior).
-    // Thinking resolved against the explorer's own model, which may differ in
-    // generation from the synth driver's.
+    // explore′ for delegated breadth: the same explore unit, wrapped as a tool,
+    // pointed at the explorer arm — its own client, model, and request shape,
+    // which may live on a different backend than the driver's. Bounded by
+    // explorer_max_turns per sweep; no cap on how many times consult may delegate
+    // (Amy's call — watch real behavior).
     let explore = RunExplore::new(
-        client.clone(),
-        explorer_model,
-        cfg.max_tokens,
+        explorer.clone(),
         cfg.explorer_max_turns,
-        dialect.request_params(explorer_model, Role::Explorer),
         root,
         cfg.sandbox.clone(),
         reports,
@@ -1060,46 +1142,36 @@ where
     ])
 }
 
-/// Run a `consult` against an already-constructed provider client.
+/// Run a `consult` over two resolved arms.
 ///
 /// One loop, two tools — no rigid explorer→synth hand-off. The capable model
 /// decides when to delegate a sweep to the cheap `explore′` vs. read a span
-/// directly with `run_kaish`. `ConsultOutput.report` aggregates whatever the
-/// `explore′` sweeps returned (empty if the model read everything itself).
-async fn consult_with<C>(
-    client: &C,
+/// directly with `run_kaish`. Each arm carries its own client and request shape,
+/// so a mixed cast routes each phase to its own backend through the same loop.
+/// `ConsultOutput.report` aggregates whatever the `explore′` sweeps returned
+/// (empty if the model read everything itself).
+pub(crate) async fn consult_with(
     user_prompt: &str,
     root: &Path,
-    explorer_model: &str,
-    synth_model: &str,
+    explorer: &Arm,
+    synth: &Arm,
     cfg: &ConsultConfig,
-    dialect: &Dialect,
-) -> Result<ConsultOutput>
-where
-    C: CompletionClient + Clone + Send + Sync + 'static,
-    C::CompletionModel: 'static,
-{
+) -> Result<ConsultOutput> {
     let reports = Arc::new(Mutex::new(Vec::<String>::new()));
-    // Per-phase: the driver runs the synth model/role, the sweeps the explorer
-    // model/role — each gets thinking + sampling fit to *itself*, not one shape
-    // computed once and shared.
-    let synth_thinking = dialect.request_params(synth_model, Role::Synth);
 
-    let answer = run_phase(
-        client,
-        synth_model,
-        &consult_preamble(),
-        cfg.max_tokens,
-        user_prompt.to_string(),
-        cfg.synth_max_turns,
-        synth_thinking.as_ref(),
-        cfg.progress.as_ref(),
-        // Rebuilt per call (main loop, and again if run_phase forces a final turn);
-        // every build shares the one `reports` sink so all explore′ sweeps aggregate.
-        || consult_tools(client, explorer_model, root, cfg, dialect, reports.clone()),
-    )
-    .await
-    .context("consult loop")?;
+    let answer = synth
+        .run(
+            &consult_preamble(),
+            user_prompt.to_string(),
+            cfg.synth_max_turns,
+            cfg.progress.as_ref(),
+            // Rebuilt per call (main loop, and again if run_phase forces a final
+            // turn); every build shares the one `reports` sink so all explore′
+            // sweeps aggregate.
+            &|| consult_tools(explorer, root, cfg, reports.clone()),
+        )
+        .await
+        .context("consult loop")?;
 
     let report = reports
         .lock()
@@ -1113,38 +1185,30 @@ where
 /// multi-turn: replay this session's history into the prompt, record the answer.
 pub type Session<'a> = (&'a SessionStore, &'a str);
 
-/// One sessioned (or stateless) consult turn against an already-constructed client.
+/// One sessioned (or stateless) consult turn over two resolved arms.
 ///
-/// This is the whole multi-turn glue, made generic so it's driven offline by a mock
-/// client in tests (the public [`consult`] builds the real client and wraps this):
-/// read the session's prior turns → frame the prompt with them → run the consult →
-/// record the answer. The exploration always runs fresh; only the lean
-/// `(question, answer)` pairs are replayed. Recording happens *after* a successful
-/// turn (`?` short-circuits a failure), so a failed consult never poisons the thread
-/// with a half-answer the next turn would treat as established context.
-#[allow(clippy::too_many_arguments)] // mirrors consult_with's loop inputs plus the session
-pub(crate) async fn consult_session_turn<C>(
-    client: &C,
+/// This is the whole multi-turn glue, driven offline by scripted arms in tests
+/// (the public [`consult`] is a thin named wrapper): read the session's prior
+/// turns → frame the prompt with them → run the consult → record the answer. The
+/// exploration always runs fresh; only the lean `(question, answer)` pairs are
+/// replayed. Recording happens *after* a successful turn (`?` short-circuits a
+/// failure), so a failed consult never poisons the thread with a half-answer the
+/// next turn would treat as established context.
+pub(crate) async fn consult_session_turn(
     session: Option<Session<'_>>,
     question: &str,
     root: &Path,
-    explorer_model: &str,
-    synth_model: &str,
+    explorer: &Arm,
+    synth: &Arm,
     cfg: &ConsultConfig,
-    dialect: &Dialect,
-) -> Result<ConsultOutput>
-where
-    C: CompletionClient + Clone + Send + Sync + 'static,
-    C::CompletionModel: 'static,
-{
+) -> Result<ConsultOutput> {
     let history = match session {
         Some((store, id)) => store.history(id),
         None => Vec::new(),
     };
     let user_prompt = consult_user_prompt(question, &history);
 
-    let out =
-        consult_with(client, &user_prompt, root, explorer_model, synth_model, cfg, dialect).await?;
+    let out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
 
     if let Some((store, id)) = session {
         store.record(id, QaTurn::new(question, out.answer.clone()));
@@ -1152,48 +1216,33 @@ where
     Ok(out)
 }
 
-/// Run a consult against `root` using `profile`.
+/// Run a consult against `root` over the resolved `explorer` and `synth` arms.
 ///
-/// Resolves the profile's key (env var or key-file) and takes its models, token
-/// budget, and thinking budget; `cfg` carries the per-call loop bounds. `session`
+/// The server resolves a cast's slots into the arms ([`Arm::from_slot`] — keys,
+/// endpoints, request shapes); `cfg` carries the per-call loop bounds. `session`
 /// binds this turn to a multi-turn thread (replay prior turns, record this one) or is
 /// `None` for a stateless one-shot. The session seeds the driver's prompt but never
 /// the exploration, which always runs fresh. See [`consult_session_turn`].
 pub async fn consult(
     question: &str,
     root: impl Into<PathBuf>,
-    profile: &Profile,
+    explorer: &Arm,
+    synth: &Arm,
     cfg: &ConsultConfig,
     session: Option<Session<'_>>,
 ) -> Result<ConsultOutput> {
     let root = root.into();
-    // Two phases, two models: pass the dialect down so each resolves thinking against
-    // its own model (the driver vs the cheap explorer can straddle a capability line).
-    let dialect = Dialect::from_profile(profile);
-
-    with_provider_client!(profile, |client| {
-        consult_session_turn(
-            &client,
-            session,
-            question,
-            &root,
-            &profile.explorer_model,
-            &profile.synth_model,
-            cfg,
-            &dialect,
-        )
-        .await
-    })
+    consult_session_turn(session, question, &root, explorer, synth, cfg).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionStore;
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
         transcript_text, RecordingSink, ScriptedClient,
     };
-    use crate::session::SessionStore;
     use std::fs;
     use std::num::NonZeroUsize;
     use tempfile::tempdir;
@@ -1202,11 +1251,24 @@ mod tests {
         SessionStore::new(NonZeroUsize::new(4).unwrap())
     }
 
-    /// A dialect that emits no thinking params — for the tests that exercise the loop
-    /// wiring (report aggregation, sessions, turn caps) and don't care about thinking.
-    /// `openai` reasons without a request toggle, so `thinking()` is always `None`.
-    fn no_thinking() -> Dialect {
-        Dialect::new(ProviderKind::Openai, 0)
+    /// An arm over the scripted client with no thinking params — for the tests
+    /// that exercise the loop wiring (report aggregation, sessions, turn caps)
+    /// and don't care about request shaping.
+    fn arm(client: &ScriptedClient, model: &str) -> Arm {
+        arm_with(client, model, None)
+    }
+
+    /// An arm carrying explicit `additional_params` — the request-shaping tests'
+    /// injection point (each arm gets params fit to *its* model, as the server's
+    /// `Arm::from_slot` would resolve them).
+    fn arm_with(client: &ScriptedClient, model: &str, params: Option<Value>) -> Arm {
+        Arm::new(
+            client.clone(),
+            model,
+            16384,
+            params,
+            ModelCaps { vision: false },
+        )
     }
 
     /// A driver that answers immediately (no tools), echoing the current question into
@@ -1217,8 +1279,12 @@ mod tests {
         ScriptedClient::builder()
             .on_model(model, |req| {
                 let shown = transcript_text(req);
-                let question =
-                    shown.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                let question = shown
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
                 Ok(text_response(format!("ANSWER[{question}]")))
             })
             .build()
@@ -1296,20 +1362,19 @@ mod tests {
         let cfg = ConsultConfig::default();
 
         let out = consult_with(
-            &client,
             "Where is target_marker defined?",
             dir.path(),
-            EXPLORER,
-            SYNTH,
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
             &cfg,
-            &no_thinking(),
         )
         .await
         .expect("scripted consult should succeed");
 
         // The driver concluded with its final answer.
         assert!(
-            out.answer.contains("target_marker is defined at src/foo.rs:1"),
+            out.answer
+                .contains("target_marker is defined at src/foo.rs:1"),
             "answer should be the driver's final text, got: {:?}",
             out.answer
         );
@@ -1325,15 +1390,26 @@ mod tests {
         // And the routing held: the cheap model saw the *report* preamble (explorer
         // role), the capable model saw the *consult* preamble (driver role).
         let explorer_reqs = client.requests_for(EXPLORER);
-        assert!(!explorer_reqs.is_empty(), "explorer model was actually invoked");
         assert!(
-            explorer_reqs[0].preamble.as_deref().unwrap_or("").contains("code explorer"),
+            !explorer_reqs.is_empty(),
+            "explorer model was actually invoked"
+        );
+        assert!(
+            explorer_reqs[0]
+                .preamble
+                .as_deref()
+                .unwrap_or("")
+                .contains("code explorer"),
             "explorer got the report preamble: {:?}",
             explorer_reqs[0].preamble
         );
         let synth_reqs = client.requests_for(SYNTH);
         assert!(
-            synth_reqs[0].preamble.as_deref().unwrap_or("").contains("second tool, `explore`"),
+            synth_reqs[0]
+                .preamble
+                .as_deref()
+                .unwrap_or("")
+                .contains("second tool, `explore`"),
             "driver got the consult preamble: {:?}",
             synth_reqs[0].preamble
         );
@@ -1387,16 +1463,17 @@ mod tests {
 
         let dir = project_with_marker();
         let sink = Arc::new(RecordingSink::default());
-        let cfg = ConsultConfig { progress: sink.clone(), ..ConsultConfig::default() };
+        let cfg = ConsultConfig {
+            progress: sink.clone(),
+            ..ConsultConfig::default()
+        };
 
         consult_with(
-            &client,
             "Where is target_marker?",
             dir.path(),
-            EXPLORER,
-            SYNTH,
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
             &cfg,
-            &no_thinking(),
         )
         .await
         .expect("scripted consult should succeed");
@@ -1417,7 +1494,9 @@ mod tests {
             "the nested explorer's read must surface (sink threaded into the sub-agent): {events:?}"
         );
         assert!(
-            events.contains(&PhaseEvent::KaishRun { script: "cat -n src/foo.rs".into() }),
+            events.contains(&PhaseEvent::KaishRun {
+                script: "cat -n src/foo.rs".into()
+            }),
             "the driver's own direct read must surface: {events:?}"
         );
         // Ordering sanity: the sweep starts before its nested read, which precedes the
@@ -1426,9 +1505,14 @@ mod tests {
         let start = pos(&PhaseEvent::SweepStarted {
             question: "where is target_marker defined?".into(),
         });
-        let nested = pos(&PhaseEvent::KaishRun { script: "rg -n target_marker src".into() });
+        let nested = pos(&PhaseEvent::KaishRun {
+            script: "rg -n target_marker src".into(),
+        });
         let finish = pos(&PhaseEvent::SweepFinished);
-        assert!(start < nested && nested < finish, "sweep must bracket its nested read: {events:?}");
+        assert!(
+            start < nested && nested < finish,
+            "sweep must bracket its nested read: {events:?}"
+        );
     }
 
     /// A stateless consult (default `ConsultConfig`) emits to the [`NullSink`] — no
@@ -1440,9 +1524,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig::default();
         // No token, no recording sink — just prove the default path runs clean.
-        consult_with(&client, "q", dir.path(), "explorer", SYNTH, &cfg, &no_thinking())
-            .await
-            .unwrap();
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .unwrap();
     }
 
     /// Multi-sweep: a driver that delegates to `explore′` more than once must
@@ -1487,13 +1577,26 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        let out =
-            consult_with(&client, "two-part question", dir.path(), EXPLORER, SYNTH, &cfg, &no_thinking())
-                .await
-                .unwrap();
+        let out = consult_with(
+            "two-part question",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
-        assert!(out.report.contains("REPORT-SANDBOX"), "first sweep present: {:?}", out.report);
-        assert!(out.report.contains("REPORT-KAISH"), "second sweep present: {:?}", out.report);
+        assert!(
+            out.report.contains("REPORT-SANDBOX"),
+            "first sweep present: {:?}",
+            out.report
+        );
+        assert!(
+            out.report.contains("REPORT-KAISH"),
+            "second sweep present: {:?}",
+            out.report
+        );
         assert_eq!(
             out.report.matches("---").count(),
             1,
@@ -1520,20 +1623,34 @@ mod tests {
             .on_model(SYNTH, |req| {
                 // Delegate once; once the failure has come back, answer from direct work.
                 if transcript_text(req).contains("simulated provider outage") {
-                    Ok(text_response("ANSWER: explore failed, answered from direct reads"))
+                    Ok(text_response(
+                        "ANSWER: explore failed, answered from direct reads",
+                    ))
                 } else {
-                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                    Ok(tool_call_response(
+                        "s1",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
                 }
             })
-            .on_model(EXPLORER, |_req| Err(provider_error("simulated provider outage")))
+            .on_model(EXPLORER, |_req| {
+                Err(provider_error("simulated provider outage"))
+            })
             .build();
 
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        let out = consult_with(&client, "a question", dir.path(), EXPLORER, SYNTH, &cfg, &no_thinking())
-            .await
-            .expect("a failed sweep must not fail the whole consult");
+        let out = consult_with(
+            "a question",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("a failed sweep must not fail the whole consult");
 
         // The driver only reaches this answer by *seeing* the error in its transcript
         // (its branch requires it) — so the answer text proves the failure surfaced.
@@ -1544,7 +1661,11 @@ mod tests {
         );
         // The sweep errored before `RunExplore` pushed to the sink, so the report is
         // empty — distinct from a sweep that ran and found nothing.
-        assert!(out.report.is_empty(), "a failed sweep contributes no report: {:?}", out.report);
+        assert!(
+            out.report.is_empty(),
+            "a failed sweep contributes no report: {:?}",
+            out.report
+        );
         // Record-before-respond: the failing explorer call was still captured.
         assert!(
             !client.requests_for(EXPLORER).is_empty(),
@@ -1568,22 +1689,27 @@ mod tests {
                     Ok(text_response("FORCED FINAL ANSWER: src/foo.rs:1"))
                 } else {
                     // Keep burning turns; never conclude on our own.
-                    Ok(tool_call_response("t", "run_kaish", json!({ "script": "cat src/foo.rs" })))
+                    Ok(tool_call_response(
+                        "t",
+                        "run_kaish",
+                        json!({ "script": "cat src/foo.rs" }),
+                    ))
                 }
             })
             .build();
 
         let dir = project_with_marker();
-        let cfg = ConsultConfig { synth_max_turns: 2, ..ConsultConfig::default() };
+        let cfg = ConsultConfig {
+            synth_max_turns: 2,
+            ..ConsultConfig::default()
+        };
 
         let out = consult_with(
-            &client,
             "A question the model never finishes answering",
             dir.path(),
-            "explorer-unused",
-            SYNTH,
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
             &cfg,
-            &no_thinking(),
         )
         .await
         .expect("turn-cap recovery should still produce an answer");
@@ -1613,16 +1739,15 @@ mod tests {
     /// Thinking params must reach *every* model call — the consult driver and each
     /// nested `explore′`. All other tests pass `None` for thinking, so a regression
     /// that dropped `additional_params` in `run_phase`, or stopped `RunExplore`
-    /// forwarding `self.thinking` to its nested loop, would slip through. These
+    /// forwarding its arm's params to the nested loop, would slip through. These
     /// shapes are provider-specific and have already drifted once (`docs/issues.md`).
     #[tokio::test]
     async fn thinking_params_reach_both_the_driver_and_every_sweep() {
         const SYNTH: &str = "capable-synth";
         const EXPLORER: &str = "cheap-explorer";
-        // Anthropic dialect: both phases resolve to the same top-level `thinking`
-        // block (Anthropic ignores the model id). The mock doesn't interpret it — we
+        // Anthropic budget tier: both arms resolve to the same top-level `thinking`
+        // block (the ids classify legacy/budget). The mock doesn't interpret it — we
         // only assert it survives the plumbing into *every* request, unchanged.
-        let dialect = Dialect::new(ProviderKind::Anthropic, 4096);
         let expected = json!({ "thinking": { "type": "enabled", "budget_tokens": 4096 } });
 
         let client = ScriptedClient::builder()
@@ -1630,7 +1755,11 @@ mod tests {
                 if transcript_text(req).contains("REPORT") {
                     Ok(text_response("ANSWER"))
                 } else {
-                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                    Ok(tool_call_response(
+                        "s1",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
                 }
             })
             .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
@@ -1639,9 +1768,23 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, &dialect)
-            .await
-            .unwrap();
+        consult_with(
+            "q",
+            dir.path(),
+            &arm_with(
+                &client,
+                EXPLORER,
+                thinking_params(ProviderKind::Anthropic, EXPLORER, 4096),
+            ),
+            &arm_with(
+                &client,
+                SYNTH,
+                thinking_params(ProviderKind::Anthropic, SYNTH, 4096),
+            ),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
         // Both roles were actually exercised (so the loop below isn't vacuous)...
         assert!(!client.requests_for(SYNTH).is_empty(), "driver ran");
@@ -1658,23 +1801,26 @@ mod tests {
         }
     }
 
-    /// The per-phase payoff: when a Gemini profile's synth and explorer straddle the
+    /// The per-phase payoff: when a cast's synth and explorer straddle the Gemini
     /// 3-line capability boundary, each request must carry the thinking shape fit to
     /// *its own* model — the driver `thinkingLevel`, the sweep `thinkingBudget`. A
-    /// regression that resolved thinking once (per profile) and shared it — the old
-    /// `consult.rs:815` shape — would put one model's params on the other's request.
+    /// regression that resolved thinking once and shared it — the old
+    /// profile-level shape — would put one model's params on the other's request.
     #[tokio::test]
     async fn each_phase_gets_thinking_fit_to_its_own_model() {
         const SYNTH: &str = "gemini-3-pro-preview"; // 3-line → thinkingLevel
         const EXPLORER: &str = "gemini-2.5-flash"; // 2.5 → thinkingBudget
-        let dialect = Dialect::new(ProviderKind::Gemini, 4096);
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
                 if transcript_text(req).contains("REPORT") {
                     Ok(text_response("ANSWER"))
                 } else {
-                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                    Ok(tool_call_response(
+                        "s1",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
                 }
             })
             .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
@@ -1683,9 +1829,23 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, &dialect)
-            .await
-            .unwrap();
+        consult_with(
+            "q",
+            dir.path(),
+            &arm_with(
+                &client,
+                EXPLORER,
+                thinking_params(ProviderKind::Gemini, EXPLORER, 4096),
+            ),
+            &arm_with(
+                &client,
+                SYNTH,
+                thinking_params(ProviderKind::Gemini, SYNTH, 4096),
+            ),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
         let tc = |r: &crate::test_support::RecordedRequest| {
             r.additional_params.as_ref().unwrap()["generationConfig"]["thinkingConfig"].clone()
@@ -1693,13 +1853,199 @@ mod tests {
         for r in client.requests_for(SYNTH) {
             let cfg = tc(&r);
             assert_eq!(cfg["thinkingLevel"], "high", "3-line driver wants a level");
-            assert!(cfg.get("thinkingBudget").is_none(), "level and budget are exclusive");
+            assert!(
+                cfg.get("thinkingBudget").is_none(),
+                "level and budget are exclusive"
+            );
         }
         for r in client.requests_for(EXPLORER) {
             let cfg = tc(&r);
             assert_eq!(cfg["thinkingBudget"], 4096, "2.5 explorer wants a budget");
-            assert!(cfg.get("thinkingLevel").is_none(), "level and budget are exclusive");
+            assert!(
+                cfg.get("thinkingLevel").is_none(),
+                "level and budget are exclusive"
+            );
         }
+    }
+
+    /// The mixed-cast payoff: each phase runs on its OWN client. Two distinct
+    /// scripted clients — the synth's knows only the synth model, the explorer's
+    /// only the explorer model — so any cross-routing panics ("no responder").
+    /// Each arm also carries its own `max_tokens`, and every request must show
+    /// its own arm's value: the per-arm resolution the cast split exists for.
+    #[tokio::test]
+    async fn a_mixed_cast_routes_each_phase_to_its_own_client() {
+        const SYNTH: &str = "claude-synth";
+        const EXPLORER: &str = "deepseek-explorer";
+
+        let synth_client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if transcript_text(req).contains("REPORT") {
+                    Ok(text_response("ANSWER from the other wire"))
+                } else {
+                    Ok(tool_call_response(
+                        "s1",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
+                }
+            })
+            .build();
+        let explorer_client = ScriptedClient::builder()
+            .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+        let explorer_arm = Arm::new(
+            explorer_client.clone(),
+            EXPLORER,
+            4096,
+            None,
+            ModelCaps { vision: false },
+        );
+        let synth_arm = Arm::new(
+            synth_client.clone(),
+            SYNTH,
+            32768,
+            None,
+            ModelCaps { vision: true },
+        );
+
+        let out = consult_with("q", dir.path(), &explorer_arm, &synth_arm, &cfg)
+            .await
+            .expect("mixed-cast consult should succeed");
+
+        assert!(out.answer.contains("ANSWER from the other wire"));
+        assert!(out.report.contains("REPORT"), "the sweep crossed clients");
+        // Routing held: each client saw only its own phase…
+        assert!(!synth_client.requests_for(SYNTH).is_empty());
+        assert!(!explorer_client.requests_for(EXPLORER).is_empty());
+        assert!(
+            synth_client.requests_for(EXPLORER).is_empty(),
+            "the synth client must never serve the explorer model"
+        );
+        assert!(
+            explorer_client.requests_for(SYNTH).is_empty(),
+            "the explorer client must never serve the synth model"
+        );
+        // …and each request carried ITS arm's max_tokens, not a shared value.
+        for r in synth_client.requests() {
+            assert_eq!(
+                r.max_tokens,
+                Some(32768),
+                "synth arm budget on {:?}",
+                r.model
+            );
+        }
+        for r in explorer_client.requests() {
+            assert_eq!(
+                r.max_tokens,
+                Some(4096),
+                "explorer arm budget on {:?}",
+                r.model
+            );
+        }
+    }
+
+    /// `Arm::from_slot`, offline: the keyless openai kind builds with no network
+    /// and no key, taking the slot's tunables (with per-role fallback), the
+    /// caps pin, and the model id. The openai shape sends sampling but no
+    /// thinking block.
+    #[test]
+    fn arm_from_slot_resolves_slot_tunables_and_caps() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "local".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some("http://localhost:13305/api/v1".into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+        };
+        let slot = ModelSlot {
+            vision: Some(true),
+            max_tokens: Some(2048),
+            temperature: Some(0.7),
+            ..ModelSlot::bare("local", "llava-someday")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("keyless openai arm builds offline");
+        assert_eq!(arm.model, "llava-someday");
+        assert_eq!(arm.max_tokens, 2048, "slot max_tokens override wins");
+        assert!(arm.caps.vision, "the vision pin survives into the arm");
+        let params = arm.params.expect("openai sends sampling");
+        assert_eq!(params["temperature"], 0.7, "slot temperature override wins");
+        assert_eq!(params["top_p"], defaults.top_p);
+        assert!(
+            params.get("thinking").is_none(),
+            "openai kind has no thinking toggle"
+        );
+
+        // The bare slot falls back to the per-role defaults.
+        let bare = ModelSlot::bare("local", "m");
+        let arm = Arm::from_slot(&backend, &bare, ModelRole::Explorer, &defaults).unwrap();
+        assert_eq!(arm.max_tokens, defaults.max_tokens);
+        assert!(!arm.caps.vision, "openai kind classifies blind by default");
+        assert_eq!(
+            arm.params.unwrap()["temperature"],
+            defaults.explorer_temperature,
+            "explorer role takes the explorer-side default"
+        );
+    }
+
+    /// The Gemini 3-line's depth lever IS the per-role effort: a slot's `effort`
+    /// must land as `thinkingLevel` (the values align — "high"/"low" are valid
+    /// levels), not be silently dropped into a hardcoded max-depth. A user
+    /// setting `effort = "low"` on a gemini-3 slot means it.
+    #[test]
+    fn gemini_level_takes_the_per_role_effort_as_its_thinking_level() {
+        let shape = ModelShape::resolve(
+            ProviderKind::Gemini,
+            "gemini-3-pro-preview",
+            ThinkingStyleOverride::Auto,
+        );
+        let params = shape.to_params(8192, None, None, "low").unwrap();
+        assert_eq!(
+            params["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low",
+            "the slot's effort is the level"
+        );
+        // The default effort keeps today's wire shape byte-for-byte.
+        let params = shape.to_params(8192, None, None, DEFAULT_EFFORT).unwrap();
+        assert_eq!(
+            params["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+    }
+
+    /// `Arm::from_slot` is the single live construction point, and per-call
+    /// overrides build slots that never saw config load's budget validation —
+    /// so the thinking_budget < max_tokens rule must hold here too, as the same
+    /// keyworded boundary error, not a provider 400 mid-call. Validated before
+    /// key resolution, so it fires with no key configured.
+    #[test]
+    fn arm_from_slot_rejects_an_inverted_thinking_budget() {
+        let defaults = crate::config::Defaults {
+            max_tokens: 4096,
+            thinking_budget: 8192, // inverted vs max_tokens
+            ..crate::config::Defaults::default()
+        };
+        let backend = crate::config::Backend {
+            name: "anthropic".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: false,
+            request_timeout: Duration::from_secs(30),
+        };
+        let slot = ModelSlot::bare("anthropic", "claude-haiku-4-5");
+        let err = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults)
+            .expect_err("an inverted budget must be caught at arm construction");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("thinking_budget"), "got: {msg}");
+        assert!(msg.contains("max_tokens"), "got: {msg}");
     }
 
     /// `run_phase` builds the toolset twice — once for the main loop, again for the
@@ -1719,22 +2065,39 @@ mod tests {
                     Ok(text_response("FINAL"))
                 } else if !transcript_text(req).contains("REPORT-E") {
                     // First turn: delegate one sweep (pushes to the shared sink).
-                    Ok(tool_call_response("s1", "explore", json!({ "question": "find it" })))
+                    Ok(tool_call_response(
+                        "s1",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
                 } else {
                     // Already swept; keep burning turns without re-delegating, so the
                     // cap fires and forces the second toolset build.
-                    Ok(tool_call_response("k", "run_kaish", json!({ "script": "cat src/foo.rs" })))
+                    Ok(tool_call_response(
+                        "k",
+                        "run_kaish",
+                        json!({ "script": "cat src/foo.rs" }),
+                    ))
                 }
             })
             .on_model(EXPLORER, |_req| Ok(text_response("REPORT-E: src/foo.rs:1")))
             .build();
 
         let dir = project_with_marker();
-        let cfg = ConsultConfig { synth_max_turns: 2, ..ConsultConfig::default() };
+        let cfg = ConsultConfig {
+            synth_max_turns: 2,
+            ..ConsultConfig::default()
+        };
 
-        let out = consult_with(&client, "q", dir.path(), EXPLORER, SYNTH, &cfg, &no_thinking())
-            .await
-            .unwrap();
+        let out = consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
         // The teeth: were `reports` rebuilt per `make_tools` call instead of shared,
         // the pre-cap sweep would be lost and this would be empty.
@@ -1749,7 +2112,10 @@ mod tests {
             "exactly one sweep was delegated (the rest burned run_kaish)"
         );
         assert!(
-            client.requests_for(SYNTH).iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
+            client
+                .requests_for(SYNTH)
+                .iter()
+                .any(|r| r.tool_choice == Some(ToolChoice::None)),
             "the cap must have forced a finalize turn (the second toolset build)"
         );
         assert!(out.answer.contains("FINAL"), "finalize produced the answer");
@@ -1771,14 +2137,12 @@ mod tests {
 
         // Turn 1.
         let out1 = consult_session_turn(
-            &client,
             Some((&sessions, sid)),
             "Q1 what is kaish",
             dir.path(),
-            "explorer",
-            SYNTH,
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
             &cfg,
-            &no_thinking(),
         )
         .await
         .unwrap();
@@ -1791,14 +2155,12 @@ mod tests {
 
         // Turn 2.
         let out2 = consult_session_turn(
-            &client,
             Some((&sessions, sid)),
             "Q2 who calls it",
             dir.path(),
-            "explorer",
-            SYNTH,
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
             &cfg,
-            &no_thinking(),
         )
         .await
         .unwrap();
@@ -1816,7 +2178,11 @@ mod tests {
             turn2_req.user_text
         );
         assert_eq!(out2.answer, "ANSWER[Q2 who calls it]");
-        assert_eq!(sessions.history(sid).len(), 2, "both turns accumulate in the thread");
+        assert_eq!(
+            sessions.history(sid).len(),
+            2,
+            "both turns accumulate in the thread"
+        );
     }
 
     /// A failed turn must NOT record — a half-answer can't be allowed to poison the
@@ -1834,18 +2200,19 @@ mod tests {
         let sid = "doomed";
 
         let result = consult_session_turn(
-            &client,
             Some((&sessions, sid)),
             "Q that fails",
             dir.path(),
-            "explorer",
-            SYNTH,
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
             &cfg,
-            &no_thinking(),
         )
         .await;
 
-        assert!(result.is_err(), "a provider error must surface, not be swallowed");
+        assert!(
+            result.is_err(),
+            "a provider error must surface, not be swallowed"
+        );
         assert!(
             sessions.history(sid).is_empty(),
             "a failed turn must leave the thread untouched, got: {:?}",
@@ -1864,13 +2231,22 @@ mod tests {
         let cfg = ConsultConfig::default();
 
         let out = consult_session_turn(
-            &client, None, "lone question", dir.path(), "explorer", SYNTH, &cfg, &no_thinking(),
+            None,
+            "lone question",
+            dir.path(),
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
         )
         .await
         .unwrap();
 
         assert_eq!(out.answer, "ANSWER[lone question]");
-        assert_eq!(sessions.session_count(), 0, "a stateless turn creates no session");
+        assert_eq!(
+            sessions.session_count(),
+            0,
+            "a stateless turn creates no session"
+        );
     }
 
     /// The recomposed consult must drive BOTH tools: a direct `run_kaish` and the
@@ -1885,12 +2261,18 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
-        let tools = consult_tools(&client, "explorer-model", dir.path(), &cfg, &no_thinking(), reports)
+        let tools = consult_tools(&arm(&client, "explorer-model"), dir.path(), &cfg, reports)
             .expect("building the consult toolset should succeed");
 
         let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.iter().any(|n| n == "run_kaish"), "missing run_kaish, got {names:?}");
-        assert!(names.iter().any(|n| n == "explore"), "missing explore′, got {names:?}");
+        assert!(
+            names.iter().any(|n| n == "run_kaish"),
+            "missing run_kaish, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "explore"),
+            "missing explore′, got {names:?}"
+        );
     }
 
     /// Collect the text blocks of a user message (for asserting the finalize note).
@@ -1923,7 +2305,10 @@ mod tests {
         // The trailing user turn becomes the prompt and carries both its original
         // content and the appended note.
         let text = user_text(&prompt);
-        assert!(text.contains("tool results"), "original content kept: {text}");
+        assert!(
+            text.contains("tool results"),
+            "original content kept: {text}"
+        );
         assert!(text.contains(FINALIZE_NOTE), "note appended: {text}");
         // History is everything before it — the trailing turn was consumed, not duplicated.
         assert_eq!(rest.len(), 2, "trailing user turn consumed into the prompt");
@@ -1937,7 +2322,10 @@ mod tests {
         let history = vec![Message::user("Q"), Message::assistant("partial thoughts")];
         let (rest, prompt) = finalize_prompt(history);
 
-        assert!(user_text(&prompt).contains(FINALIZE_NOTE), "note is the new user turn");
+        assert!(
+            user_text(&prompt).contains(FINALIZE_NOTE),
+            "note is the new user turn"
+        );
         assert_eq!(rest.len(), 2, "assistant turn kept in history");
         assert!(
             matches!(rest.last(), Some(Message::Assistant { .. })),
@@ -1949,8 +2337,10 @@ mod tests {
     /// promise that a stateless consult is byte-for-byte its pre-session behavior.
     #[test]
     fn empty_history_yields_the_bare_question() {
-        assert_eq!(consult_user_prompt("Where is the sandbox enforced?", &[]),
-                   "Where is the sandbox enforced?");
+        assert_eq!(
+            consult_user_prompt("Where is the sandbox enforced?", &[]),
+            "Where is the sandbox enforced?"
+        );
     }
 
     /// With history, every prior turn appears, the current question appears, and the
@@ -1970,7 +2360,10 @@ mod tests {
             "consult drives it (src/consult.rs).",
             "And explore?",
         ] {
-            assert!(prompt.contains(needle), "prompt must carry {needle:?}:\n{prompt}");
+            assert!(
+                prompt.contains(needle),
+                "prompt must carry {needle:?}:\n{prompt}"
+            );
         }
         // Ordering: the first prior turn comes before the second, and both come
         // before the current question.
@@ -1978,6 +2371,9 @@ mod tests {
         let second = prompt.find("Who calls it?").unwrap();
         let current = prompt.find("And explore?").unwrap();
         assert!(first < second, "turns must be oldest-first");
-        assert!(second < current, "history must precede the current question");
+        assert!(
+            second < current,
+            "history must precede the current question"
+        );
     }
 }

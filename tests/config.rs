@@ -1,14 +1,22 @@
-//! Config loading: merge precedence, the two-`openai`-endpoints regression, and
-//! the loud-failure invariants. Pure where possible — `from_toml_str` touches no
-//! env or filesystem; the env/CLI layers are exercised through injectable seams.
+//! Config loading for the backends/casts split: built-in equivalence, chimera
+//! casts, alias resolution at both levels, and the loud-failure invariants.
+//! Pure where possible — `from_toml_str` touches no env or filesystem; the
+//! env/CLI layers are exercised through injectable seams. The contract is
+//! `docs/casts.md`.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use kaibo::config::{default_models, Config, Profile, ToolDisables};
+use kaibo::config::{
+    default_models, parse_slot_ref, Backend, Config, ModelRole, ModelSlot, ToolDisables,
+};
+use kaibo::consult::ThinkingStyleOverride;
 use kaibo::credentials::{openai_base_url, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use kaibo::server::ToolGating;
 
-// --- Built-ins reproduce historical behavior ------------------------------
+// --- Built-in equivalence ---------------------------------------------------
+// A missing config file and `cast = "anthropic"` reproduce kaibo's historical
+// behavior byte-for-byte (docs/casts.md "Built-in equivalence").
 
 #[test]
 fn builtin_reproduces_the_historical_defaults() {
@@ -22,201 +30,403 @@ fn builtin_reproduces_the_historical_defaults() {
     assert_eq!(c.defaults.max_tokens, 16384);
     assert_eq!(c.defaults.thinking_budget, 8192);
     // The per-request LLM deadline default: 15 min (see Defaults::default).
-    assert_eq!(
-        c.defaults.request_timeout,
-        std::time::Duration::from_secs(900)
-    );
+    assert_eq!(c.defaults.request_timeout, Duration::from_secs(900));
 
-    // The four built-in profiles, named after their kind, with the model ids that
-    // used to live in `default_models`.
+    // Four built-in backends + four same-named single-backend casts, carrying
+    // the model ids that used to live on the profiles.
     for kind in [
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
         ProviderKind::Openai,
     ] {
-        let p = c.resolve_profile(kind.canonical_name()).unwrap();
+        let name = kind.canonical_name();
+        let backend = c.resolve_backend(name).unwrap();
+        assert_eq!(backend.kind, kind);
+        assert_eq!(backend.request_timeout, Duration::from_secs(900));
+
+        let cast = c.resolve_cast(name).unwrap();
         let (explorer, synth) = default_models(kind);
-        assert_eq!(p.kind, kind);
-        assert_eq!(p.explorer_model, explorer, "{kind:?} explorer");
-        assert_eq!(p.synth_model, synth, "{kind:?} synth");
-        // Tunables inherit the defaults.
-        assert_eq!(p.max_tokens, 16384);
-        assert_eq!(p.thinking_budget, 8192);
-        assert_eq!(p.request_timeout, std::time::Duration::from_secs(900));
+        let e = cast.require_slot(ModelRole::Explorer).unwrap();
+        let s = cast.require_slot(ModelRole::Synth).unwrap();
+        assert_eq!(e.id, explorer, "{kind:?} explorer");
+        assert_eq!(s.id, synth, "{kind:?} synth");
+        // Built-in casts are single-backend, named after their kind.
+        assert_eq!(e.backend, name);
+        assert_eq!(s.backend, name);
+
+        // Tunables inherit the defaults: a bare built-in slot resolves to the
+        // historical values for both roles.
+        let et = e.tunables(ModelRole::Explorer, &c.defaults);
+        let st = s.tunables(ModelRole::Synth, &c.defaults);
+        assert_eq!(et.max_tokens, 16384);
+        assert_eq!(et.thinking_budget, 8192);
+        assert_eq!(et.temperature, 0.1, "{kind:?} cold explorer");
+        assert_eq!(st.temperature, 0.3, "{kind:?} warmer synth");
+        assert_eq!(et.top_p, 0.95);
+        assert_eq!(et.effort, "high");
+        assert_eq!(st.effort, "high");
+        assert_eq!(et.thinking_style, ThinkingStyleOverride::Auto);
     }
 
-    // Default provider is anthropic; no root unless configured.
-    assert_eq!(c.default_provider, "anthropic");
+    // Default cast is anthropic; no root unless configured; all tools on.
+    assert_eq!(c.default_cast, "anthropic");
     assert!(c.root.is_none());
-    assert_eq!(c.tools, expect_all_tools());
-}
-
-fn expect_all_tools() -> ToolGating {
-    ToolGating::default()
+    assert_eq!(c.tools, ToolGating::default());
 }
 
 #[test]
-fn builtin_aliases_resolve() {
+fn a_missing_default_path_yields_builtins_not_an_error() {
+    // No file at the default location is fine — kaibo runs out of the box, and
+    // the result is byte-for-byte the built-in registry.
+    let c = Config::load_with(None, Some("/nonexistent/kaibo/config.toml".into()), |_| {
+        None
+    })
+    .expect("absent default config must not error");
+    let builtin = Config::builtin();
+    assert_eq!(c.default_cast, builtin.default_cast);
+    assert_eq!(c.defaults, builtin.defaults);
+    assert_eq!(c.backends, builtin.backends);
+    assert_eq!(c.casts, builtin.casts);
+}
+
+#[test]
+fn a_missing_explicit_path_is_an_error() {
+    // An explicit --config / KAIBO_CONFIG that doesn't exist is a mistake, loud.
+    let err =
+        Config::load_with(Some("/nonexistent/kaibo.toml".into()), None, |_| None).unwrap_err();
+    assert!(format!("{err:#}").contains("not found"), "got: {err:#}");
+}
+
+// --- Alias resolution at both levels -----------------------------------------
+// The built-in profile aliases became BOTH cast aliases (so `cast = "claude"`
+// resolves) and backend aliases (so a slot ref `claude/<id>` resolves).
+
+#[test]
+fn builtin_aliases_resolve_at_both_levels() {
     let c = Config::builtin();
-    assert_eq!(c.resolve_profile("claude").unwrap().kind, ProviderKind::Anthropic);
-    assert_eq!(c.resolve_profile("google").unwrap().kind, ProviderKind::Gemini);
+    // Cast level.
+    assert_eq!(c.resolve_cast("claude").unwrap().name, "anthropic");
+    assert_eq!(c.resolve_cast("google").unwrap().name, "gemini");
     for a in ["local", "lemonade", "gemma", "gemma4"] {
         assert_eq!(
-            c.resolve_profile(a).unwrap().kind,
-            ProviderKind::Openai,
-            "{a:?} should alias openai"
+            c.resolve_cast(a).unwrap().name,
+            "openai",
+            "{a:?} should alias the openai cast"
+        );
+    }
+    // Backend level.
+    assert_eq!(c.resolve_backend("claude").unwrap().name, "anthropic");
+    assert_eq!(c.resolve_backend("google").unwrap().name, "gemini");
+    for a in ["local", "lemonade", "gemma", "gemma4"] {
+        assert_eq!(
+            c.resolve_backend(a).unwrap().name,
+            "openai",
+            "{a:?} should alias the openai backend"
         );
     }
 }
 
-// --- The headline: two openai endpoints, both live -------------------------
+#[test]
+fn a_slot_ref_written_against_an_alias_canonicalizes() {
+    // "claude/<id>" in a slot resolves through the backend alias map and is
+    // stored canonical, so caps classify and `kaibo://config` renders the same
+    // slot regardless of which spelling the file used.
+    let c = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = "claude/claude-opus-4-8"
+        "#,
+    )
+    .unwrap();
+    let slot = c
+        .resolve_cast("x")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap();
+    assert_eq!(slot.backend, "anthropic");
+    assert_eq!(slot.qualified(), "anthropic/claude-opus-4-8");
+    // And the slot classifies on the (anthropic) backend kind.
+    assert!(c.slot_caps(slot).unwrap().vision);
+}
 
 #[test]
-fn two_openai_profiles_resolve_to_distinct_endpoints() {
-    // The regression that proves the enum-as-selector bug is fixed: one process,
-    // two OpenAI-compatible backends, each selected by name with its own endpoint.
-    let toml = r#"
-        [profiles.gpt]
+fn file_declared_aliases_resolve_at_both_levels() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.big]
+        kind = "openai"
+        base_url = "http://localhost:9001/v1"
+        aliases = ["heavy"]
+
+        [casts.team]
+        aliases = ["fast", "smart"]
+        synth = "heavy/qwen3-235b"
+        "#,
+    )
+    .unwrap();
+    // The backend alias resolves directly AND inside a slot ref.
+    assert_eq!(c.resolve_backend("heavy").unwrap().name, "big");
+    let slot = c
+        .resolve_cast("team")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap();
+    assert_eq!(slot.backend, "big", "slot ref through a file alias");
+    // The cast aliases resolve.
+    assert_eq!(c.resolve_cast("fast").unwrap().name, "team");
+    assert_eq!(c.resolve_cast("smart").unwrap().name, "team");
+}
+
+// --- The headline: a chimera cast --------------------------------------------
+
+#[test]
+fn a_chimera_cast_spans_backends_with_both_slot_forms() {
+    // The use case the split exists for (docs/casts.md "Why"): deepseek explorer,
+    // claude synth, local image gen — one composed thing selected by one name.
+    let c = Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "openai"
+        base_url = "http://localhost:7860/v1"
+        key_optional = true
+
+        [casts.chimera]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
+        image = "sd/sdxl-turbo"
+        tts = "gemini/gemini-2.5-flash-tts"
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("chimera").unwrap();
+    let e = cast.require_slot(ModelRole::Explorer).unwrap();
+    let s = cast.require_slot(ModelRole::Synth).unwrap();
+    let i = cast.require_slot(ModelRole::Image).unwrap();
+    let t = cast.require_slot(ModelRole::Tts).unwrap();
+
+    // String form parses as backend/id; table form carries its tunables.
+    assert_eq!(e.qualified(), "deepseek/deepseek-v4-flash");
+    assert_eq!(s.qualified(), "anthropic/claude-opus-4-8");
+    assert_eq!(s.effort.as_deref(), Some("max"));
+    assert_eq!(s.max_tokens, Some(32768));
+    assert_eq!(i.qualified(), "sd/sdxl-turbo");
+    assert_eq!(t.qualified(), "gemini/gemini-2.5-flash-tts");
+
+    // Four slots, four different backends — the fused profile could never say this.
+    let backends: std::collections::BTreeSet<&str> = [e, s, i, t]
+        .iter()
+        .map(|slot| slot.backend.as_str())
+        .collect();
+    assert_eq!(backends.len(), 4, "every role on its own backend");
+}
+
+#[test]
+fn slot_refs_split_on_the_first_slash_only() {
+    // HuggingFace-style ids keep their inner slash: only the FIRST `/` splits.
+    let (backend, id) = parse_slot_ref("openai/Qwen/Qwen3-32B").unwrap();
+    assert_eq!(backend, "openai");
+    assert_eq!(id, "Qwen/Qwen3-32B");
+    // And the same through the TOML string form.
+    let c = Config::from_toml_str(
+        r#"
+        [casts.hf]
+        synth = "openai/Qwen/Qwen3-32B"
+        "#,
+    )
+    .unwrap();
+    let slot = c
+        .resolve_cast("hf")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap();
+    assert_eq!(slot.id, "Qwen/Qwen3-32B");
+
+    let err = parse_slot_ref("no-slash-here").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("must be \"backend/model-id\""),
+        "got: {err:#}"
+    );
+    assert!(parse_slot_ref("/id-only").is_err());
+    assert!(parse_slot_ref("backend/").is_err());
+}
+
+#[test]
+fn a_file_cast_stanza_merges_role_wise_over_a_builtin() {
+    // Retarget just the anthropic synth; the explorer keeps its built-in id.
+    let c = Config::from_toml_str(
+        r#"
+        [casts.anthropic]
+        synth = "anthropic/claude-opus-4-8"
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("anthropic").unwrap();
+    assert_eq!(
+        cast.require_slot(ModelRole::Synth).unwrap().id,
+        "claude-opus-4-8"
+    );
+    assert_eq!(
+        cast.require_slot(ModelRole::Explorer).unwrap().id,
+        default_models(ProviderKind::Anthropic).0
+    );
+}
+
+#[test]
+fn media_roles_are_absent_until_configured() {
+    // Absent = capability absent, not an error (docs/casts.md): built-in casts
+    // carry only the agent roles, and require_slot names the gap loudly.
+    let c = Config::builtin();
+    let cast = c.resolve_cast("anthropic").unwrap();
+    assert!(cast.slot(ModelRole::Image).is_none());
+    assert!(cast.slot(ModelRole::Tts).is_none());
+    let err = cast.require_slot(ModelRole::Tts).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("has no tts slot"),
+        "got: {err:#}"
+    );
+}
+
+// --- Caps classify on the SLOT's backend kind ---------------------------------
+
+#[test]
+fn caps_classify_on_the_slots_backend_kind() {
+    // A chimera's slots straddle a capability line: the deepseek explorer is
+    // blind, the anthropic synth sees — each classified on ITS backend's kind.
+    let c = Config::from_toml_str(
+        r#"
+        [casts.chimera]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth = "claude/claude-sonnet-4-6"
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("chimera").unwrap();
+    let e = cast.require_slot(ModelRole::Explorer).unwrap();
+    let s = cast.require_slot(ModelRole::Synth).unwrap();
+    assert!(!c.slot_caps(e).unwrap().vision, "deepseek is text-only");
+    assert!(c.slot_caps(s).unwrap().vision, "anthropic is multimodal-in");
+}
+
+#[test]
+fn a_vision_pin_on_a_slot_wins_over_the_classifier() {
+    // The escape hatch pins in BOTH directions: a vision model behind a generic
+    // openai endpoint opts in; a pin can also force a seeing kind blind.
+    let c = Config::from_toml_str(
+        r#"
+        [casts.x]
+        explorer = { backend = "openai", id = "llava-13b", vision = true }
+        synth = { backend = "anthropic", id = "claude-sonnet-4-6", vision = false }
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("x").unwrap();
+    let e = cast.require_slot(ModelRole::Explorer).unwrap();
+    let s = cast.require_slot(ModelRole::Synth).unwrap();
+    assert!(
+        c.slot_caps(e).unwrap().vision,
+        "openai-kind classifies blind; the pin opts in"
+    );
+    assert!(
+        !c.slot_caps(s).unwrap().vision,
+        "anthropic classifies seeing; the pin opts out"
+    );
+}
+
+// --- Two openai endpoints, both live (the regression that motivated profiles) --
+
+#[test]
+fn two_openai_backends_resolve_to_distinct_endpoints() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.gpt]
         kind = "openai"
         base_url = "https://api.openai.com/v1"
-        explorer_model = "gpt-5-mini"
-        synth_model = "gpt-5"
 
-        [profiles.llama]
+        [backends.llama]
         kind = "openai"
         base_url = "http://localhost:8080/v1"
-        explorer_model = "qwen2.5-coder-7b"
-        synth_model = "qwen2.5-coder-32b"
-    "#;
-    let c = Config::from_toml_str(toml).unwrap();
 
-    let gpt = c.resolve_profile("gpt").unwrap();
-    let llama = c.resolve_profile("llama").unwrap();
+        [casts.hosted]
+        synth = "gpt/gpt-5"
 
-    // The profile name is the TOML key.
-    assert_eq!(gpt.name, "gpt");
-    assert_eq!(llama.name, "llama");
+        [casts.kitchen]
+        synth = "llama/qwen2.5-coder-32b"
+        "#,
+    )
+    .unwrap();
+    let gpt = c.resolve_backend("gpt").unwrap();
+    let llama = c.resolve_backend("llama").unwrap();
     assert_eq!(gpt.kind, ProviderKind::Openai);
     assert_eq!(llama.kind, ProviderKind::Openai);
     assert_eq!(gpt.resolved_base_url(), "https://api.openai.com/v1");
     assert_eq!(llama.resolved_base_url(), "http://localhost:8080/v1");
-    assert_ne!(gpt.resolved_base_url(), llama.resolved_base_url());
-    assert_eq!(gpt.synth_model, "gpt-5");
-    assert_eq!(llama.synth_model, "qwen2.5-coder-32b");
-
-    // The four built-ins are still present alongside the new profiles.
-    assert!(c.resolve_profile("anthropic").is_ok());
-    assert!(c.resolve_profile("openai").is_ok());
-}
-
-// --- Merge precedence ------------------------------------------------------
-
-#[test]
-fn file_overrides_a_builtin_profile_field_only() {
-    // Retarget just the openai synth model; everything else stays built-in.
-    let c = Config::from_toml_str(
-        r#"
-        [profiles.openai]
-        synth_model = "my-local-big-model"
-        "#,
-    )
-    .unwrap();
-    let p = c.resolve_profile("openai").unwrap();
-    assert_eq!(p.synth_model, "my-local-big-model");
-    // Untouched fields keep the built-in values. No explicit base_url → the
-    // resolved URL is whatever OPENAI_BASE_URL/default yields (env-robust check).
-    assert_eq!(p.explorer_model, "Gemma-4-E4B-it-GGUF");
-    assert_eq!(p.resolved_base_url(), openai_base_url());
+    // The built-ins are still present alongside.
+    assert!(c.resolve_backend("anthropic").is_ok());
+    assert!(c.resolve_cast("openai").is_ok());
 }
 
 #[test]
-fn per_profile_tunables_override_defaults_others_inherit() {
+fn a_builtin_openai_backend_without_base_url_uses_the_env_default() {
+    // No explicit base_url → the resolved URL is whatever OPENAI_BASE_URL/default
+    // yields (env-robust check).
+    let c = Config::builtin();
+    let b = c.resolve_backend("openai").unwrap();
+    assert_eq!(b.resolved_base_url(), openai_base_url());
+}
+
+// --- Per-slot tunables: override or inherit the per-role [defaults] -----------
+
+#[test]
+fn per_slot_tunables_override_defaults_others_inherit() {
     let c = Config::from_toml_str(
         r#"
         [defaults]
         max_tokens = 20000
         thinking_budget = 9000
-
-        [profiles.gpt]
-        kind = "openai"
-        base_url = "https://api.openai.com/v1"
-        max_tokens = 32768
-        thinking_budget = 16384
-        "#,
-    )
-    .unwrap();
-
-    // gpt overrides both tunables...
-    let gpt = c.resolve_profile("gpt").unwrap();
-    assert_eq!(gpt.max_tokens, 32768);
-    assert_eq!(gpt.thinking_budget, 16384);
-
-    // ...while a profile that didn't override inherits the (file-set) defaults.
-    let anthropic = c.resolve_profile("anthropic").unwrap();
-    assert_eq!(anthropic.max_tokens, 20000);
-    assert_eq!(anthropic.thinking_budget, 9000);
-    assert_eq!(c.defaults.max_tokens, 20000);
-}
-
-#[test]
-fn sampling_defaults_and_overrides_per_profile() {
-    // Built-in defaults: cold explorer, warmer synth, mild top_p.
-    let c = Config::from_toml_str("").unwrap();
-    assert_eq!(c.defaults.explorer_temperature, 0.1);
-    assert_eq!(c.defaults.synth_temperature, 0.3);
-    assert_eq!(c.defaults.top_p, 0.95);
-
-    let c = Config::from_toml_str(
-        r#"
-        [defaults]
         synth_temperature = 0.5
 
-        [profiles.gpt]
-        kind = "openai"
-        base_url = "https://api.openai.com/v1"
-        explorer_temperature = 0.0
-        top_p = 0.8
+        [casts.tuned]
+        explorer = { backend = "deepseek", id = "deepseek-v4-flash", temperature = 0.0 }
+        synth = { backend = "anthropic", id = "claude-opus-4-8", max_tokens = 32768, thinking_budget = 16384 }
         "#,
     )
     .unwrap();
+    let cast = c.resolve_cast("tuned").unwrap();
 
-    // gpt overrides explorer_temperature and top_p; inherits the file's synth_temperature.
-    let gpt = c.resolve_profile("gpt").unwrap();
-    assert_eq!(gpt.explorer_temperature, 0.0);
-    assert_eq!(gpt.synth_temperature, 0.5);
-    assert_eq!(gpt.top_p, 0.8);
-    // A profile that overrode nothing inherits the file default (synth) and built-in rest.
-    let anthropic = c.resolve_profile("anthropic").unwrap();
-    assert_eq!(anthropic.synth_temperature, 0.5);
-    assert_eq!(anthropic.explorer_temperature, 0.1);
-    assert_eq!(anthropic.top_p, 0.95);
+    // The synth slot overrides both budget knobs; temperature inherits the
+    // file-set synth default.
+    let st = cast
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .tunables(ModelRole::Synth, &c.defaults);
+    assert_eq!(st.max_tokens, 32768);
+    assert_eq!(st.thinking_budget, 16384);
+    assert_eq!(st.temperature, 0.5);
+
+    // The explorer slot overrides only temperature; budgets inherit [defaults].
+    let et = cast
+        .require_slot(ModelRole::Explorer)
+        .unwrap()
+        .tunables(ModelRole::Explorer, &c.defaults);
+    assert_eq!(et.temperature, 0.0);
+    assert_eq!(et.max_tokens, 20000);
+    assert_eq!(et.thinking_budget, 9000);
+
+    // A built-in cast that overrode nothing inherits the file-set defaults too.
+    let a = c
+        .resolve_cast("anthropic")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .tunables(ModelRole::Synth, &c.defaults);
+    assert_eq!(a.max_tokens, 20000);
+    assert_eq!(a.thinking_budget, 9000);
+    assert_eq!(a.temperature, 0.5);
 }
 
 #[test]
-fn out_of_range_sampling_is_a_loud_error() {
-    // No silent clamp: a temperature past the accepted band is a typo, caught at load.
-    let err = Config::from_toml_str(
-        "[profiles.gpt]\nkind = \"openai\"\nbase_url = \"https://x/v1\"\nsynth_temperature = 3.0\n",
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("synth_temperature") && err.to_string().contains("[0.0, 2.0]"),
-        "got: {err}"
-    );
-
-    // top_p must be a probability in (0, 1] — zero is rejected.
-    let err = Config::from_toml_str(
-        "[profiles.gpt]\nkind = \"openai\"\nbase_url = \"https://x/v1\"\ntop_p = 0.0\n",
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("top_p") && err.to_string().contains("(0.0, 1.0]"), "got: {err}");
-}
-
-#[test]
-fn effort_and_thinking_style_default_and_override() {
-    use kaibo::consult::ThinkingStyleOverride;
-
+fn effort_and_thinking_style_default_and_override_per_slot() {
     // Built-in defaults: "high" both roles, Auto classification.
     let c = Config::from_toml_str("").unwrap();
     assert_eq!(c.defaults.explorer_effort, "high");
@@ -228,62 +438,553 @@ fn effort_and_thinking_style_default_and_override() {
         [defaults]
         synth_effort = "max"
 
-        [profiles.anthropic]
-        explorer_effort = "low"
-        thinking_style = "adaptive"
+        [casts.anthropic]
+        explorer = { backend = "anthropic", id = "claude-haiku-4-5", effort = "low", thinking_style = "adaptive" }
         "#,
     )
     .unwrap();
+    let cast = c.resolve_cast("anthropic").unwrap();
+    // The explorer slot overrides effort and thinking_style.
+    let et = cast
+        .require_slot(ModelRole::Explorer)
+        .unwrap()
+        .tunables(ModelRole::Explorer, &c.defaults);
+    assert_eq!(et.effort, "low");
+    assert_eq!(et.thinking_style, ThinkingStyleOverride::Adaptive);
+    // The untouched synth slot inherits the file's synth_effort and Auto style.
+    let st = cast
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .tunables(ModelRole::Synth, &c.defaults);
+    assert_eq!(st.effort, "max");
+    assert_eq!(st.thinking_style, ThinkingStyleOverride::Auto);
+}
 
-    // anthropic overrides explorer_effort and thinking_style; inherits the file's synth_effort.
-    let a = c.resolve_profile("anthropic").unwrap();
-    assert_eq!(a.explorer_effort, "low");
-    assert_eq!(a.synth_effort, "max");
-    assert_eq!(a.thinking_style, ThinkingStyleOverride::Adaptive);
-    // A profile that overrode nothing inherits the file default (synth) and built-in rest.
-    let d = c.resolve_profile("deepseek").unwrap();
-    assert_eq!(d.synth_effort, "max");
-    assert_eq!(d.explorer_effort, "high");
-    assert_eq!(d.thinking_style, ThinkingStyleOverride::Auto);
+// --- Loud failures (crash over silent degrade) --------------------------------
+
+#[test]
+fn malformed_toml_is_an_error() {
+    assert!(Config::from_toml_str("this is not = = valid toml").is_err());
 }
 
 #[test]
-fn bad_thinking_style_is_a_loud_error() {
-    // No silent fallback: a value outside auto|adaptive|budget is a typo, caught at load.
-    let err = Config::from_toml_str("[profiles.anthropic]\nthinking_style = \"bogus\"\n").unwrap_err();
+fn a_profiles_table_is_a_tombstone_naming_the_contract() {
+    // [profiles] is deleted, not deprecated: a leftover table — any shape — is a
+    // load error pointing at docs/casts.md, never a silent reinterpretation.
+    let err = Config::from_toml_str(
+        r#"
+        [profiles.anthropic]
+        synth_model = "claude-opus-4-8"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("[profiles]"), "got: {msg}");
+    assert!(msg.contains("docs/casts.md"), "got: {msg}");
+    assert!(msg.contains("[backends"), "got: {msg}");
+    assert!(msg.contains("[casts"), "got: {msg}");
+}
+
+#[test]
+fn env_kaibo_provider_is_a_tombstone_naming_kaibo_cast() {
+    // The old selector env var must not be silently ignored into the default cast.
+    let err = Config::load_with(None, None, |k| {
+        (k == "KAIBO_PROVIDER").then(|| "anthropic".to_string())
+    })
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("KAIBO_PROVIDER"), "got: {msg}");
+    assert!(msg.contains("KAIBO_CAST"), "got: {msg}");
+}
+
+#[test]
+fn an_unknown_backend_in_a_slot_names_the_known_backends() {
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = "nope/some-model"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("unknown backend \"nope\""), "got: {msg}");
+    assert!(msg.contains("known backends"), "got: {msg}");
+    for known in ["anthropic", "deepseek", "gemini", "openai"] {
+        assert!(msg.contains(known), "should name {known}, got: {msg}");
+    }
+}
+
+#[test]
+fn an_unknown_role_key_in_a_cast_is_rejected() {
+    // The role keys are struct fields under deny_unknown_fields: a typo'd role
+    // must fail loudly, not silently configure nothing.
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        explorr = "anthropic/claude-haiku-4-5"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("explorr"), "names the bad key, got: {msg}");
+}
+
+#[test]
+fn a_typoed_slot_tunable_is_rejected_naming_the_key() {
+    // The table form is deny_unknown_fields too — a misspelled knob must not
+    // silently vanish, and the error must name the fix (the bad key and the
+    // valid knobs), not hide it behind untagged-enum dispatch ("data did not
+    // match any variant" names neither).
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "anthropic", id = "claude-sonnet-4-6", max_tokenz = 9000 }
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("max_tokenz"), "names the bad key, got: {msg}");
     assert!(
-        format!("{err:#}").contains("thinking_style") && format!("{err:#}").contains("bogus"),
+        msg.contains("max_tokens"),
+        "names the valid knobs, got: {msg}"
+    );
+}
+
+#[test]
+fn an_empty_model_id_is_rejected_loudly() {
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "anthropic", id = " " }
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("model id is empty"), "got: {msg}");
+    assert!(msg.contains("synth"), "names the role, got: {msg}");
+}
+
+#[test]
+fn alias_collisions_are_loud_at_each_level() {
+    // A user cast named like a built-in cast alias collides.
+    let err = Config::from_toml_str(
+        r#"
+        [casts.claude]
+        synth = "anthropic/claude-opus-4-8"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("cast alias \"claude\""), "got: {msg}");
+    assert!(msg.contains("collides"), "got: {msg}");
+
+    // A user backend named like a built-in backend alias collides. (base_url set
+    // so the new-openai-backend rule doesn't fire first — the collision is the
+    // thing under test.)
+    let err = Config::from_toml_str(
+        "[backends.google]\nkind = \"openai\"\nbase_url = \"http://localhost:1/v1\"\n",
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("backend alias \"google\""), "got: {msg}");
+    assert!(msg.contains("collides"), "got: {msg}");
+
+    // A file alias colliding with a real built-in name is rejected.
+    let err = Config::from_toml_str(
+        r#"
+        [casts.mine]
+        aliases = ["anthropic"]
+        synth = "anthropic/claude-sonnet-4-6"
+        "#,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("collides"), "got: {err:#}");
+
+    // Two casts claiming the same alias collide ("claimed by both").
+    let err = Config::from_toml_str(
+        r#"
+        [casts.a]
+        aliases = ["fast"]
+        synth = "anthropic/claude-sonnet-4-6"
+        [casts.b]
+        aliases = ["fast"]
+        synth = "deepseek/deepseek-v4-pro"
+        "#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("claimed by both"),
         "got: {err:#}"
     );
 }
 
 #[test]
-fn request_timeout_seeds_from_defaults_and_overrides_per_profile() {
+fn base_url_on_a_keyed_backend_is_rejected() {
+    // rig fixes the keyed kinds' endpoints; a base_url there is a config mistake.
+    let err = Config::from_toml_str(
+        r#"
+        [backends.anthropic]
+        base_url = "https://example.test/v1"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("base_url"), "got: {msg}");
+    assert!(msg.contains("only the `openai` kind"), "got: {msg}");
+}
+
+#[test]
+fn a_new_backend_without_a_kind_is_rejected() {
+    let err = Config::from_toml_str(
+        r#"
+        [backends.mystery]
+        base_url = "http://localhost:1/v1"
+        "#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("must declare a `kind`"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
+fn redeclaring_a_backends_kind_differently_is_rejected() {
+    let err = Config::from_toml_str("[backends.anthropic]\nkind = \"gemini\"\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("already exists as kind"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
+fn a_new_openai_backend_without_base_url_is_rejected_loudly() {
+    // A user-declared openai-kind backend with a forgotten base_url would
+    // silently dial the global default endpoint (OPENAI_BASE_URL or the local
+    // llama.cpp server) — a wrong-server 404 mid-call. Only the built-in
+    // `openai` backend keeps that fallback; a new stanza must say where it points.
+    let err = Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "openai"
+        key_optional = true
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("base_url"),
+        "names the missing key, got: {msg}"
+    );
+    assert!(msg.contains("sd"), "names the backend, got: {msg}");
+    // The built-in `openai` backend keeps the env/default fallback: overriding
+    // it without base_url stays valid, and a config-less load is unchanged.
+    let c = Config::from_toml_str("[backends.openai]\nkey_optional = false\n").unwrap();
+    assert!(c.resolve_backend("openai").unwrap().base_url.is_none());
+}
+
+#[test]
+fn zero_request_timeout_is_rejected_loudly() {
+    // A zero deadline times out every call instantly — a mistake, not a config.
+    let err = Config::from_toml_str(
+        r#"
+        [backends.broken]
+        kind = "openai"
+        base_url = "http://localhost:1/v1"
+        request_timeout_secs = 0
+        "#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("request_timeout_secs must be > 0"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
+fn an_inverted_thinking_budget_is_rejected_at_the_resolved_slot() {
+    // Anthropic requires max_tokens > thinking_budget; catch the inverted pair at
+    // load, not as a runtime 400 — validated on the slot's RESOLVED values.
+
+    // Per-slot override pair, inverted.
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "anthropic", id = "claude-sonnet-4-6", max_tokens = 1000, thinking_budget = 2000 }
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("thinking_budget (2000)"), "got: {msg}");
+    assert!(msg.contains("max_tokens (1000)"), "got: {msg}");
+
+    // The inversion can also arrive purely through [defaults]: a global
+    // max_tokens below the default 8192 budget breaks the built-in anthropic
+    // and gemini slots at resolution time.
+    let err = Config::from_toml_str("[defaults]\nmax_tokens = 4096\n").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("thinking_budget"),
+        "got: {err:#}"
+    );
+
+    // The same inverted pair on a non-thinking-budget kind is accepted.
+    Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "openai", id = "m", max_tokens = 1000, thinking_budget = 2000 }
+        "#,
+    )
+    .expect("openai-kind slots have no budget/headroom coupling");
+}
+
+#[test]
+fn an_unknown_default_cast_is_rejected() {
+    let err = Config::from_toml_str(
+        r#"
+        [server]
+        cast = "does-not-exist"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("does-not-exist"), "got: {msg}");
+    assert!(msg.contains("server.cast"), "got: {msg}");
+}
+
+#[test]
+fn the_old_server_provider_key_is_rejected() {
+    // `[server] provider` was renamed to `cast`; deny_unknown_fields makes the
+    // stale key a loud load error instead of a silently ignored selector.
+    let err = Config::from_toml_str(
+        r#"
+        [server]
+        provider = "anthropic"
+        "#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("provider"),
+        "names the stale key, got: {err:#}"
+    );
+}
+
+#[test]
+fn out_of_range_sampling_is_a_loud_error() {
+    // No silent clamp: a temperature past the accepted band is a typo, caught at load.
+    let err = Config::from_toml_str("[defaults]\nsynth_temperature = 3.0\n").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("synth_temperature") && msg.contains("[0.0, 2.0]"),
+        "got: {msg}"
+    );
+
+    // top_p must be a probability in (0, 1] — zero is rejected.
+    let err = Config::from_toml_str("[defaults]\ntop_p = 0.0\n").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("top_p") && msg.contains("(0.0, 1.0]"),
+        "got: {msg}"
+    );
+
+    // The per-slot temperature gets the same band check.
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "openai", id = "m", temperature = 3.0 }
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("temperature") && msg.contains("[0.0, 2.0]"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn bad_thinking_style_is_a_loud_error() {
+    // No silent fallback: a value outside auto|adaptive|budget is a typo.
+    let err = Config::from_toml_str("[defaults]\nthinking_style = \"bogus\"\n").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("thinking_style") && msg.contains("bogus"),
+        "got: {msg}"
+    );
+    // Per-slot too.
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "anthropic", id = "m", thinking_style = "bogus" }
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("thinking_style") && msg.contains("bogus"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn an_unknown_key_is_rejected() {
+    // deny_unknown_fields: a typo'd knob must fail loudly, not silently no-op.
+    let err = Config::from_toml_str(
+        r#"
+        [server]
+        cazt = "openai"
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+        msg.contains("cazt") || msg.contains("unknown"),
+        "got: {msg}"
+    );
+}
+
+// --- File / env / CLI layering -------------------------------------------------
+
+#[test]
+fn env_kaibo_cast_overrides_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[server]\ncast = \"openai\"\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_CAST", "gemini")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.default_cast, "gemini");
+}
+
+#[test]
+fn cli_cast_wins_over_env_and_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[server]\ncast = \"openai\"\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_CAST", "gemini")].into_iter().collect();
+    let mut c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    c.apply_cli(
+        Some("/tmp/proj".into()),
+        Some("deepseek".to_string()),
+        // Only --no-explore was passed.
+        ToolDisables {
+            explore: true,
+            ..Default::default()
+        },
+        vec![], // no --allow-path flags
+    );
+    assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
+    assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
+    // Only explore is dropped; the rest stay enabled.
+    assert!(c.tools.consult);
+    assert!(!c.tools.explore);
+    assert!(c.tools.run_kaish);
+}
+
+/// An empty CLI `--allow-path` list (no flags passed) must NOT replace the lower
+/// layers (env/file allow_paths). The guard at `apply_cli` is `if !allow_paths.is_empty()`
+/// — this test pins it so an accidental unconditional assignment would kill the env/file
+/// knobs without any test catching it.
+#[test]
+fn empty_cli_allow_paths_preserves_lower_layers() {
+    let mut c = Config::builtin();
+    // Pre-seed allow_paths as if they came from env or a config file.
+    c.allow_paths = vec![std::path::PathBuf::from("/tmp/from-env")];
+    // Apply CLI with no --allow-path flags (empty list).
+    c.apply_cli(None, None, ToolDisables::default(), vec![]);
+    // The env/file-layer value must survive.
+    assert!(
+        c.allow_paths
+            .iter()
+            .any(|p| p == std::path::Path::new("/tmp/from-env")),
+        "empty CLI allow_paths must not replace env/file layers, got {:?}",
+        c.allow_paths
+    );
+}
+
+#[test]
+fn env_overrides_file_defaults_and_flows_into_slot_tunables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[defaults]\nmax_tokens = 11111\n").unwrap();
+
+    // Both values sit above the 8192 thinking budget, so the built-in anthropic
+    // slots stay valid; the point under test is env-over-file precedence.
+    let env: HashMap<&str, &str> = [("KAIBO_MAX_TOKENS", "22222")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.defaults.max_tokens, 22222);
+    // And the env'd default flows into a slot that inherits it.
+    let t = c
+        .resolve_cast("anthropic")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .tunables(ModelRole::Synth, &c.defaults);
+    assert_eq!(t.max_tokens, 22222);
+}
+
+#[test]
+fn a_non_numeric_env_tunable_is_a_loud_error() {
+    let env: HashMap<&str, &str> = [("KAIBO_MAX_TOKENS", "lots")].into_iter().collect();
+    let err = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("KAIBO_MAX_TOKENS"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
+fn an_env_integer_tunable_above_i64_max_is_a_loud_error() {
+    // TOML integers are i64, so the config-*file* path structurally can't carry
+    // a larger value — but env can, and a quintillion-token budget is never an
+    // intent. It would also panic the first `kaibo://config` read (the render
+    // serializes the resolved value back to TOML). Loud at load instead.
+    for (var, value) in [
+        ("KAIBO_MAX_TOKENS", "9223372036854775808"), // i64::MAX + 1
+        ("KAIBO_THINKING_BUDGET", "18446744073709551615"), // u64::MAX
+        ("KAIBO_REQUEST_TIMEOUT_SECS", "9223372036854775808"),
+        ("KAIBO_EXEC_TIMEOUT_SECS", "9223372036854775808"),
+        ("KAIBO_OUTPUT_LIMIT_BYTES", "9223372036854775808"),
+    ] {
+        let env: HashMap<&str, &str> = [(var, value)].into_iter().collect();
+        let err = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string()))
+            .expect_err(&format!("{var}={value} must be rejected at load"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains(var), "names the variable, got: {msg}");
+    }
+    // The boundary itself stays valid (i64::MAX is representable in TOML).
+    let env: HashMap<&str, &str> = [("KAIBO_MAX_TOKENS", "9223372036854775807")]
+        .into_iter()
+        .collect();
+    let c = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.defaults.max_tokens, i64::MAX as u64);
+}
+
+// --- request_timeout: defaults seed backends; per-backend override -------------
+
+#[test]
+fn request_timeout_seeds_from_defaults_and_overrides_per_backend() {
     // A slow local model wants a longer leash than a hosted API; the seam is a
-    // [defaults] seed that a profile may raise (or lower) on its own.
+    // [defaults] seed that a backend may raise (or lower) on its own.
     let c = Config::from_toml_str(
         r#"
         [defaults]
         request_timeout_secs = 120
 
-        [profiles.slowlocal]
+        [backends.slowlocal]
         kind = "openai"
         base_url = "http://localhost:13305/api/v1"
         request_timeout_secs = 1800
         "#,
     )
     .unwrap();
-
-    use std::time::Duration;
-    // The file-set default reseeds every built-in profile...
+    // The file-set default reseeds every built-in backend...
     assert_eq!(c.defaults.request_timeout, Duration::from_secs(120));
     assert_eq!(
-        c.resolve_profile("anthropic").unwrap().request_timeout,
+        c.resolve_backend("anthropic").unwrap().request_timeout,
         Duration::from_secs(120)
     );
-    // ...while the profile that overrode it keeps its own deadline.
+    // ...while the backend that overrode it keeps its own deadline.
     assert_eq!(
-        c.resolve_profile("slowlocal").unwrap().request_timeout,
+        c.resolve_backend("slowlocal").unwrap().request_timeout,
         Duration::from_secs(1800)
     );
 }
@@ -295,32 +996,15 @@ fn request_timeout_env_overrides_file() {
     std::fs::write(&path, "[defaults]\nrequest_timeout_secs = 120\n").unwrap();
     let env: HashMap<&str, &str> = [("KAIBO_REQUEST_TIMEOUT_SECS", "45")].into_iter().collect();
     let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
-    assert_eq!(c.defaults.request_timeout, std::time::Duration::from_secs(45));
-    // And it reseeds profiles that didn't override.
+    assert_eq!(c.defaults.request_timeout, Duration::from_secs(45));
+    // And it reseeds backends that didn't override.
     assert_eq!(
-        c.resolve_profile("anthropic").unwrap().request_timeout,
-        std::time::Duration::from_secs(45)
+        c.resolve_backend("anthropic").unwrap().request_timeout,
+        Duration::from_secs(45)
     );
 }
 
-#[test]
-fn zero_request_timeout_is_rejected_loudly() {
-    // A zero deadline times out every call instantly — a mistake, not a config. The
-    // no-silent-fallback directive: crash at load, don't brick calls at runtime.
-    let err = Config::from_toml_str(
-        r#"
-        [profiles.broken]
-        kind = "openai"
-        base_url = "http://localhost:1/v1"
-        request_timeout_secs = 0
-        "#,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{err:#}").contains("request_timeout_secs"),
-        "got: {err:#}"
-    );
-}
+// --- Session capacity -----------------------------------------------------------
 
 #[test]
 fn session_capacity_defaults_and_overrides_from_file() {
@@ -344,283 +1028,67 @@ fn zero_session_capacity_is_rejected_loudly() {
     );
 }
 
-#[test]
-fn new_profile_inherits_its_kinds_key_source_and_models() {
-    // A second anthropic profile with no model overrides should inherit the kind's
-    // built-in models and key source — convenient, not a forced re-spec.
-    let c = Config::from_toml_str(
-        r#"
-        [profiles.work-claude]
-        kind = "anthropic"
-        "#,
-    )
-    .unwrap();
-    let p = c.resolve_profile("work-claude").unwrap();
-    let (explorer, synth) = default_models(ProviderKind::Anthropic);
-    assert_eq!(p.explorer_model, explorer);
-    assert_eq!(p.synth_model, synth);
-    assert_eq!(p.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
-}
+// --- Key resolution (now a Backend concern) --------------------------------------
 
-#[test]
-fn file_declared_aliases_resolve() {
-    let c = Config::from_toml_str(
-        r#"
-        [profiles.big]
-        kind = "openai"
-        base_url = "http://localhost:9001/v1"
-        aliases = ["heavy", "smart"]
-        "#,
-    )
-    .unwrap();
-    assert_eq!(c.resolve_profile("heavy").unwrap().name, "big");
-    assert_eq!(c.resolve_profile("smart").unwrap().name, "big");
-}
-
-// --- Loud failures (crash over silent degrade) -----------------------------
-
-#[test]
-fn malformed_toml_is_an_error() {
-    assert!(Config::from_toml_str("this is not = = valid toml").is_err());
-}
-
-#[test]
-fn an_unknown_key_is_rejected() {
-    // deny_unknown_fields: a typo'd knob must fail loudly, not silently no-op.
-    let err = Config::from_toml_str(
-        r#"
-        [server]
-        provder = "openai"
-        "#,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{err:#}").to_lowercase().contains("provder")
-            || format!("{err:#}").to_lowercase().contains("unknown"),
-        "got: {err:#}"
-    );
-}
-
-#[test]
-fn base_url_on_a_keyed_kind_is_rejected() {
-    let err = Config::from_toml_str(
-        r#"
-        [profiles.weird]
-        kind = "anthropic"
-        base_url = "https://example.test/v1"
-        "#,
-    )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("base_url"), "got: {err:#}");
-}
-
-#[test]
-fn a_new_profile_without_a_kind_is_rejected() {
-    let err = Config::from_toml_str(
-        r#"
-        [profiles.mystery]
-        synth_model = "x"
-        "#,
-    )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("kind"), "got: {err:#}");
-}
-
-#[test]
-fn an_unknown_default_provider_is_rejected() {
-    let err = Config::from_toml_str(
-        r#"
-        [server]
-        provider = "does-not-exist"
-        "#,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{err:#}").contains("does-not-exist"),
-        "got: {err:#}"
-    );
-}
-
-#[test]
-fn an_alias_colliding_with_a_profile_name_is_rejected() {
-    let err = Config::from_toml_str(
-        r#"
-        [profiles.foo]
-        kind = "openai"
-        base_url = "http://localhost:1/v1"
-        aliases = ["anthropic"]
-        "#,
-    )
-    .unwrap_err();
-    assert!(format!("{err:#}").to_lowercase().contains("alias"), "got: {err:#}");
-}
-
-// --- File / env / CLI layering --------------------------------------------
-
-#[test]
-fn a_missing_default_path_yields_builtins_not_an_error() {
-    // No file at the default location is fine — kaibo runs out of the box.
-    let c = Config::load_with(
-        None,
-        Some("/nonexistent/kaibo/config.toml".into()),
-        |_| None,
-    )
-    .expect("absent default config must not error");
-    assert_eq!(c.default_provider, "anthropic");
-    assert!(c.resolve_profile("openai").is_ok());
-}
-
-#[test]
-fn a_missing_explicit_path_is_an_error() {
-    // An explicit --config / KAIBO_CONFIG that doesn't exist is a mistake, loud.
-    let err = Config::load_with(Some("/nonexistent/kaibo.toml".into()), None, |_| None)
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("not found"), "got: {err:#}");
-}
-
-#[test]
-fn env_overrides_file_defaults() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(
-        &path,
-        r#"
-        [server]
-        provider = "openai"
-        [defaults]
-        max_tokens = 11111
-        "#,
-    )
-    .unwrap();
-
-    // Both values sit above the 8192 thinking budget, so the resulting anthropic
-    // profile stays valid; the point under test is env-over-file precedence.
-    let env: HashMap<&str, &str> = [
-        ("KAIBO_PROVIDER", "anthropic"),
-        ("KAIBO_MAX_TOKENS", "22222"),
-    ]
-    .into_iter()
-    .collect();
-
-    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
-    // env wins over the file.
-    assert_eq!(c.default_provider, "anthropic");
-    assert_eq!(c.defaults.max_tokens, 22222);
-    // And the env'd default flows into a profile that inherits it.
-    assert_eq!(c.resolve_profile("anthropic").unwrap().max_tokens, 22222);
-}
-
-#[test]
-fn a_non_numeric_env_tunable_is_a_loud_error() {
-    let env: HashMap<&str, &str> = [("KAIBO_MAX_TOKENS", "lots")].into_iter().collect();
-    let err = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap_err();
-    assert!(format!("{err:#}").contains("KAIBO_MAX_TOKENS"), "got: {err:#}");
-}
-
-#[test]
-fn cli_overrides_win_over_everything() {
-    let mut c = Config::builtin();
-    c.apply_cli(
-        Some("/tmp/proj".into()),
-        Some("openai".to_string()),
-        // Only --no-explore was passed.
-        ToolDisables { explore: true, ..Default::default() },
-        vec![], // no --allow-path flags
-    );
-    assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
-    assert_eq!(c.default_provider, "openai");
-    // Only explore is dropped; the rest stay enabled.
-    assert!(c.tools.consult);
-    assert!(!c.tools.explore);
-    assert!(c.tools.run_kaish);
-}
-
-/// An empty CLI `--allow-path` list (no flags passed) must NOT replace the lower
-/// layers (env/file allow_paths). The guard at `apply_cli` is `if !allow_paths.is_empty()`
-/// — this test pins it so an accidental unconditional assignment would kill the env/file
-/// knobs without any test catching it.
-#[test]
-fn empty_cli_allow_paths_preserves_lower_layers() {
-    let mut c = Config::builtin();
-    // Pre-seed allow_paths as if they came from env or a config file.
-    c.allow_paths = vec![std::path::PathBuf::from("/tmp/from-env")];
-    // Apply CLI with no --allow-path flags (empty list).
-    c.apply_cli(None, None, ToolDisables::default(), vec![]);
-    // The env/file-layer value must survive.
-    assert!(
-        c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/from-env")),
-        "empty CLI allow_paths must not replace env/file layers, got {:?}",
-        c.allow_paths
-    );
-}
-
-// --- Key resolution --------------------------------------------------------
-
-#[test]
-fn key_optional_profile_falls_back_to_placeholder() {
-    // A keyless profile whose env var is unset resolves to the placeholder, not an
-    // error — the local-server case.
-    let p = Profile {
+fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {
+    Backend {
         name: "local".into(),
         kind: ProviderKind::Openai,
         base_url: Some("http://localhost:1/v1".into()),
         api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
-        api_key_file: None,
-        key_optional: true,
-        explorer_model: "x".into(),
-        synth_model: "y".into(),
-        max_tokens: 16384,
-        thinking_budget: 8192,
-        explorer_temperature: 0.1,
-        synth_temperature: 0.3,
-        top_p: 0.95,
-        explorer_effort: "high".into(),
-        synth_effort: "high".into(),
-        thinking_style: kaibo::consult::ThinkingStyleOverride::Auto,
-        request_timeout: std::time::Duration::from_secs(900),
-    };
-    assert_eq!(p.resolve_key().unwrap(), PLACEHOLDER_OPENAI_KEY);
+        api_key_file,
+        key_optional,
+        request_timeout: Duration::from_secs(900),
+    }
 }
 
 #[test]
-fn key_optional_profile_with_a_present_but_empty_key_file_errors() {
+fn key_optional_backend_falls_back_to_placeholder() {
+    // A keyless backend whose env var is unset resolves to the placeholder, not an
+    // error — the local-server case.
+    let b = local_backend(None, true);
+    assert_eq!(b.resolve_key().unwrap(), PLACEHOLDER_OPENAI_KEY);
+}
+
+#[test]
+fn key_optional_backend_with_a_present_but_empty_key_file_errors() {
     // The no-silent-fallback invariant: a key file that's THERE but empty is a
     // mistake, not "keyless" — it must error, not quietly use the placeholder.
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("blank-key");
     std::fs::write(&file, "   \n").unwrap();
-    let p = Profile {
-        name: "local".into(),
-        kind: ProviderKind::Openai,
-        base_url: Some("http://localhost:1/v1".into()),
-        api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
-        api_key_file: Some(file.to_string_lossy().into_owned()),
-        key_optional: true,
-        explorer_model: "x".into(),
-        synth_model: "y".into(),
-        max_tokens: 16384,
-        thinking_budget: 8192,
-        explorer_temperature: 0.1,
-        synth_temperature: 0.3,
-        top_p: 0.95,
-        explorer_effort: "high".into(),
-        synth_effort: "high".into(),
-        thinking_style: kaibo::consult::ThinkingStyleOverride::Auto,
-        request_timeout: std::time::Duration::from_secs(900),
-    };
-    let err = p.resolve_key().unwrap_err();
+    let b = local_backend(Some(file.to_string_lossy().into_owned()), true);
+    let err = b.resolve_key().unwrap_err();
     assert!(
         format!("{err:#}").contains("empty"),
         "a present-but-empty key file must error even when key_optional, got: {err:#}"
     );
 }
 
-// --- [sandbox] -------------------------------------------------------------
+#[test]
+fn required_key_with_no_source_is_an_error() {
+    let b = Backend {
+        name: "needs-key".into(),
+        kind: ProviderKind::Anthropic,
+        base_url: None,
+        api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
+        api_key_file: None,
+        key_optional: false,
+        request_timeout: Duration::from_secs(900),
+    };
+    let err = b.resolve_key().unwrap_err();
+    assert!(
+        format!("{err:#}").contains("needs-key"),
+        "the error names the backend, got: {err:#}"
+    );
+}
+
+// --- [sandbox] -------------------------------------------------------------------
 
 #[test]
 fn sandbox_defaults_when_unconfigured() {
     let c = Config::builtin();
-    assert_eq!(c.sandbox.exec_timeout, std::time::Duration::from_secs(30));
+    assert_eq!(c.sandbox.exec_timeout, Duration::from_secs(30));
     assert_eq!(c.sandbox.output_limit_bytes, 8 * 1024);
     assert!(c.sandbox.disable_builtins.is_empty());
 }
@@ -636,9 +1104,12 @@ fn sandbox_section_parses() {
         "#,
     )
     .unwrap();
-    assert_eq!(c.sandbox.exec_timeout, std::time::Duration::from_secs(5));
+    assert_eq!(c.sandbox.exec_timeout, Duration::from_secs(5));
     assert_eq!(c.sandbox.output_limit_bytes, 4096);
-    assert_eq!(c.sandbox.disable_builtins, vec!["rg".to_string(), "find".to_string()]);
+    assert_eq!(
+        c.sandbox.disable_builtins,
+        vec!["rg".to_string(), "find".to_string()]
+    );
 }
 
 #[test]
@@ -648,7 +1119,7 @@ fn sandbox_env_overrides_file() {
     std::fs::write(&path, "[sandbox]\nexec_timeout_secs = 30\n").unwrap();
     let env: HashMap<&str, &str> = [("KAIBO_EXEC_TIMEOUT_SECS", "7")].into_iter().collect();
     let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
-    assert_eq!(c.sandbox.exec_timeout, std::time::Duration::from_secs(7));
+    assert_eq!(c.sandbox.exec_timeout, Duration::from_secs(7));
 }
 
 #[test]
@@ -681,45 +1152,48 @@ fn validate_against_builtins_accepts_a_known_subset() {
     assert!(c.validate_against_builtins(&known).is_ok());
 }
 
+// --- The shipped example config ---------------------------------------------------
+
 #[test]
-fn thinking_budget_at_or_above_max_tokens_is_rejected() {
-    // Anthropic requires max_tokens > thinking_budget; catch the inverted config at
-    // load, not as a runtime 400.
-    let err = Config::from_toml_str(
-        r#"
-        [profiles.bad]
-        kind = "anthropic"
-        max_tokens = 4096
-        thinking_budget = 8192
-        "#,
-    )
-    .unwrap_err();
+fn the_shipped_example_config_parses() {
+    // docs/config.example.toml documents the full surface; if it drifts from the
+    // parser it teaches users a config that crashes at load. Keep it honest.
+    let toml = include_str!("../docs/config.example.toml");
+    let c = Config::from_toml_str(toml).expect("docs/config.example.toml must load");
+    // Spot-check the headline example (docs/casts.md): the chimera cast spanning
+    // backends, with at least the agent roles plus a media role.
+    let chimera = c
+        .resolve_cast("chimera")
+        .expect("the example defines [casts.chimera]");
+    let e = chimera.require_slot(ModelRole::Explorer).unwrap();
+    let s = chimera.require_slot(ModelRole::Synth).unwrap();
+    assert_eq!(e.backend, "deepseek", "explorer sweeps on deepseek");
+    assert_eq!(
+        s.backend, "anthropic",
+        "synth answers on anthropic (claude/… refs canonicalize)"
+    );
     assert!(
-        format!("{err:#}").contains("thinking_budget"),
-        "got: {err:#}"
+        chimera.slot(ModelRole::Image).is_some(),
+        "the example carries a media role"
+    );
+    assert_ne!(
+        e.backend, s.backend,
+        "the example demonstrates a cross-backend cast"
     );
 }
 
+// --- ModelSlot conveniences (the pieces server.rs overrides lean on) ---------------
+
 #[test]
-fn required_key_with_no_source_is_an_error() {
-    let p = Profile {
-        name: "needs-key".into(),
-        kind: ProviderKind::Anthropic,
-        base_url: None,
-        api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
-        api_key_file: None,
-        key_optional: false,
-        explorer_model: "x".into(),
-        synth_model: "y".into(),
-        max_tokens: 16384,
-        thinking_budget: 8192,
-        explorer_temperature: 0.1,
-        synth_temperature: 0.3,
-        top_p: 0.95,
-        explorer_effort: "high".into(),
-        synth_effort: "high".into(),
-        thinking_style: kaibo::consult::ThinkingStyleOverride::Auto,
-        request_timeout: std::time::Duration::from_secs(900),
-    };
-    assert!(p.resolve_key().is_err());
+fn a_bare_slot_carries_no_pins_or_tunables() {
+    // `ModelSlot::bare` is the shape a per-call model override produces: the new
+    // id classifies fresh, so no pin or tunable from the old slot may ride along.
+    let slot = ModelSlot::bare("openai", "some-model");
+    assert_eq!(slot.qualified(), "openai/some-model");
+    assert_eq!(slot.vision, None);
+    assert_eq!(slot.max_tokens, None);
+    assert_eq!(slot.thinking_budget, None);
+    assert_eq!(slot.temperature, None);
+    assert_eq!(slot.effort, None);
+    assert_eq!(slot.thinking_style, None);
 }

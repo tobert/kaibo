@@ -21,7 +21,11 @@ use kaibo::mcp_log::{self, McpBridgeLayer};
 use kaibo::server::KaiboHandler;
 
 #[derive(Parser)]
-#[command(name = "kaibo", version, about = "kaibo (解剖) — read-only codebase consult MCP server (stdio)")]
+#[command(
+    name = "kaibo",
+    version,
+    about = "kaibo (解剖) — read-only codebase consult MCP server (stdio)"
+)]
 struct Args {
     /// Path to config.toml. Overrides $KAIBO_CONFIG; default is
     /// $XDG_CONFIG_HOME/kaibo/config.toml (absent → built-in defaults).
@@ -43,11 +47,12 @@ struct Args {
     #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append)]
     allow_path: Vec<PathBuf>,
 
-    /// Default provider/profile when a call omits it (a built-in kind name or a
-    /// profile defined in config.toml). Built-ins: anthropic | deepseek | gemini |
-    /// openai.
+    /// Default cast when a call omits it (a built-in name or a cast defined in
+    /// config.toml). Built-ins: anthropic | deepseek | gemini | openai (plus
+    /// aliases: claude, google, local, …). Replaces the old --provider flag
+    /// (clap rejects the unknown flag loudly).
     #[arg(long)]
-    provider: Option<String>,
+    cast: Option<String>,
 
     /// Don't advertise the `consult` tool.
     #[arg(long)]
@@ -89,7 +94,7 @@ async fn main() -> Result<()> {
     // `allow_path` list replaces the env/file layer.
     config.apply_cli(
         args.root.clone(),
-        args.provider.clone(),
+        args.cast.clone(),
         ToolDisables {
             consult: args.no_consult,
             explore: args.no_explore,
@@ -125,21 +130,22 @@ async fn main() -> Result<()> {
          [server.tools] entry)."
     );
 
-    // The resolved default provider must name a real profile — fail fast rather than
-    // surface a missing profile mid-call.
+    // The resolved default cast must name a real cast — fail fast rather than
+    // surface a missing cast mid-call.
     config
-        .resolve_profile(&config.default_provider)
-        .map_err(|e| anyhow::anyhow!("default provider: {e}"))?;
+        .resolve_cast(&config.default_cast)
+        .map_err(|e| anyhow::anyhow!("default cast: {e}"))?;
 
     // Any [sandbox].disable_builtins must name a builtin that actually exists in this
     // build — a typo must crash here, not silently leave the builtin enabled.
     config.validate_against_builtins(&kaibo::sandbox::builtin_names()?)?;
 
     tracing::info!(
-        provider = %config.default_provider,
+        cast = %config.default_cast,
         root = ?config.root.as_ref().map(|p| p.display().to_string()),
         allow_paths = ?config.allow_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        profiles = ?config.profiles.keys().collect::<Vec<_>>(),
+        backends = ?config.backends.keys().collect::<Vec<_>>(),
+        casts = ?config.casts.keys().collect::<Vec<_>>(),
         gating = ?config.tools,
         "starting kaibo MCP server on stdio"
     );

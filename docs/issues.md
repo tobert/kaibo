@@ -14,7 +14,26 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-10 (path containment + config discovery shipped — always-on
+Last pass: 2026-06-11 (backends/casts split SHIPPED — `docs/casts.md` stands as
+the design record: `Profile` dissolved into `[backends.<name>]` (connections) +
+`[casts.<name>]` (role → `"backend/model-id"`, freely cross-backend), calls
+select casts via the `cast` param, each slot resolves to its own `Arm` (client +
+request shape) behind the decided vtable seam. Built-in equivalence holds (four
+backends + four same-named casts; a missing config file reproduces the old
+behavior), `[profiles]`/`KAIBO_PROVIDER`/`--provider` are loud tombstones, and
+the review-pass fixes landed: per-call overrides take a verbatim model id plus
+an explicit backend arg (no `"backend/id"` call-arg parsing — a bare HF org
+prefix must never silently retarget through a backend alias), tool inputs are
+deny_unknown_fields, `kaibo://config` renders the alias registries, and a new
+openai-kind backend must declare base_url. Folded out the P1 entry; the
+`provider`-alias removal note moved to its own P2 entry below). 2026-06-11
+(media-spine foundations shipped — the role table
+(`[profiles.<name>.models]`, `ModelRole`/`ModelSlot` in `config.rs`; flat
+`explorer_model`/`synth_model` keys stay valid, both-spellings is a loud error)
+and capabilities-as-data (`ModelCaps` + vision classifier in `consult.rs`,
+per-slot `vision` pin, resolved caps rendered at `kaibo://config`). Sequencing
+step (2) of the P1 media-spine entry folded out; vision-in is next and nothing
+in it waits on kaish). 2026-06-10 (path containment + config discovery shipped — always-on
 path containment with launch-cwd default, `kaibo://config` resource, and scope
 section in server instructions). 2026-06-08 (host-env hermeticity entry retired — the kaish-side fixes it
 tracked all landed: tilde `~`/`~/path` and bare `cd` now consult the kernel scope
@@ -54,7 +73,109 @@ was stale).
 
 ---
 
+## P1 — High-leverage features & robustness
+
+### Media spine + pal merge: vision-in first, production tools as kaish builtins
+Direction settled 2026-06-10 (conversation w/ Amy): kaibo absorbs the pals' model
+tools over time — image gen/image2image, tts, eventually more — specialized via
+config the way models already are. The user asks for it all in one place; the shell
+is the workflow layer. Rationale recorded here so it survives the conversation.
+
+**Architecture rules (the cheap decisions made now):**
+
+- **Perception vs production.** A tool whose output the model must *see*
+  (`view_image`) is a **rig tool** — the only channel that carries image parts into
+  model context is the rig tool-result envelope (`ToolResultContent::from_tool_output`
+  parses `{"response":…, "parts":[{"type":"image","data":…,"mime_type":…}]}` —
+  rig-core 0.34 `completion/message.rs:864`; the Anthropic and Gemini arms map image
+  parts natively both directions, `providers/gemini/completion.rs:455,1135`). A tool
+  whose output is an *artifact* (`image2image <in> <out>`, `tts "…"`) is a **kaish
+  builtin**: async `Tool::execute` + `register_arc` is already kaibo's own pattern
+  (`Blocked`, `sandbox.rs`), paths compose with redirects/pipes/loops, and `run_kaish`
+  callers get production tools with no model in the loop at all.
+- **Media moves by VFS path; base64 only at the edges** (provider wire, MCP
+  content). Scratch `MemoryFs` is the working bus — bounded now that kaish landed
+  `ByteBudget` (kaish-vfs, 2026-06-10; kaibo pickup tracked in the P2 entry below).
+  A future `--out-dir` adds a third mount: project **ro** / scratch **rw-bounded** /
+  `/out` **rw** mapped to a user-specified real directory, off by default.
+  Read-only-is-the-product survives precisely: the project mount stays ro; bytes
+  land on the real filesystem only where the user explicitly pointed. Failing-first
+  tests when it lands: writes outside `/out` refused; project ro even with out-dir set.
+- **Delivery over MCP:** small images inline as `Content::image` (rmcp 0.16,
+  `model/content.rs:165`); large objects flush to `/out` and return as
+  `RawContent::ResourceLink` (`model/content.rs:140`) instead of base64 blobs.
+- **Capabilities are data on the `ModelShape` seam** — SHIPPED
+  2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
+  `vision` pin in the role table, resolved caps at `kaibo://config`. What
+  remains is the *consumption*: toolsets assembled from resolved caps (a vision
+  model gets `view_image`; a kernel gets the `tts` builtin only when a
+  tts-capable role is configured — absent, not erroring; images attached to a
+  blind model fail loud). That lands with vision-in.
+- **Roles outgrow explorer/synth** — SHIPPED 2026-06-11: the role table
+  (explorer, synth, image, tts; `ModelRole`/`ModelSlot` in `config.rs`),
+  spelled `[casts.<name>]` since the backends/casts split shipped. Media slots
+  are stored but unconsumed until the production builtins land.
+  `explore`/`synthesize` remain the agent costumes over `run_phase`; new
+  capabilities are injected tools or builtins, never new loops.
+
+**Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11; vision-in's
+toolset assembly and the production builtins both land on resolved cast slots,
+so it fronted the queue. (1) vision-in — `view_image` rig tool reading *through
+the kaish VFS* (one access path; containment + ro stay structural), caller
+images by path-in-scope and inline base64 both, toolset assembly reads the
+synth arm's resolved caps, `consult_result` assembles `Vec<Content>`, mock
+responders assert/emit image parts so media is offline-tested like everything
+else. (2) First production builtin (image2image or tts) + out-dir +
+ResourceLink delivery. Additive after that.
+
+**Open design points:** session history records `[image: path, mime]` markers, not
+blobs; image size caps with loud errors (no resize dep). Per-builtin timeout tuning
+is its own P1 entry below — a blocker for any model-backed builtin. **Explicitly deferred:**
+search/code-exec tools, file-store/context-cache plays, batch synth (its P3 entry
+stands), any image-processing crate.
+
+### Per-builtin timeouts: the 30s script timeout cannot serve model-backed builtins
+The kernel exec timeout is one global knob: `KAISH_EXEC_TIMEOUT` (30s,
+`sandbox.rs:103`) threaded via `with_request_timeout` (`sandbox.rs:184`),
+overridable only wholesale (`[sandbox].exec_timeout_secs` /
+`KAIBO_EXEC_TIMEOUT_SECS`, `config.rs`). 30s is *way* too small for complex
+pro-model calls — image gen and pro-tier completions routinely run minutes — so
+every production builtin (image2image, tts; P1 media-spine entry above) would be
+killed mid-flight with exit 124. But the fix is not raising the global: that one
+knob is doing two jobs — killing runaway scripts (30s is right) and bounding
+provider patience (30s is wrong) — and stretching it to minutes hands a
+`while true` loop the same minutes.
+
+Fix shape: split the jobs. Model-backed builtins get their own timeout budget
+(per-builtin or per-tool-class, config-overridable, generous default — minutes,
+not seconds), aligned with the per-backend `request_timeout` already governing
+rig's HTTP calls so the kernel never undercuts a legitimate in-flight provider
+call; plain script execution keeps the tight 30s. Mechanism question answered
+2026-06-11: enforcement is a kernel-side watchdog, strictly per-execute — a
+timer task sleeps the whole duration and fires the cancel token (kaish
+`kernel.rs:1511,1618-1625`); `ExecuteOptions.timeout` resizes per-script but
+nothing can suspend it mid-script, so this *does* need a kaish-kernel seam.
+Design recorded in kaish `docs/issues.md` ("Watchdog seam: a per-builtin
+'patient' budget", targets 0.8.2): movable deadline + RAII `ctx.patient(budget)`
+guard on `ToolCtx`, cancel surface stays live while suspended. kaibo's half
+waits on that release. Lands *before or with* the first production builtin;
+failing-first test: a builtin that sleeps past 30s but under its own budget
+completes, while a pure-script spin still dies at 30s.
+
+---
+
 ## P2 — Focused fixes & hardening
+
+### Remove the transitional `provider` call-param alias
+The backends/casts rename shipped 2026-06-11 with `#[serde(alias = "provider")]`
+on the `cast` tool arg (consult/explore/synthesize), so a client still sending
+`provider` selects the named cast instead of being silently dropped into the
+default (`docs/casts.md` "How a call maps"). One cycle only by design: delete
+the alias (and this entry) on the next release pass. `tests/cast_param.rs` pins
+the alias behavior — its alias tests go with it; the duplicate-field test
+becomes a plain unknown-field test (inputs are deny_unknown_fields, so a stale
+`provider` turns into a loud invalid-params error, which is the desired end
+state).
 
 ### Unquota'd `/` MemoryFs scratch: redirection writes unbounded bytes into RAM
 **Proven live, 2026-06-10**: against the running server,
@@ -75,9 +196,17 @@ memory-resident fs (`resident_bytes()`, exact net accounting under the fs's own
 lock), limiting is a shared `ByteBudget` with profile defaults riding
 `KernelConfig` the way `OutputLimitConfig::mcp()` already does. This superseded
 the earlier kaibo-local `QuotaFs` wrapper idea (a wrapper undercounts overlay
-bases, and opt-in guards drift). kaibo's part once kaish ships it: pick up the
-new kaish-kernel (currently on published 0.8.0, Cargo.toml — needs a release or
-a path-dep flip), thread `[sandbox].scratch_limit_bytes` → the kernel budget
+bases, and opt-in guards drift). **kaish landed `ByteBudget` 2026-06-10**
+(re-exported from kaish-vfs), so kaibo's half is unblocked and gains urgency from
+the media-spine plan (P1 above): media artifacts in scratch are megabytes by
+design, not just pathological loops. 2026-06-11: waiting on a kaish 0.8.1
+release (entry recorded in kaish `docs/issues.md`, including a one-line
+`ByteBudget` re-export from kaish-kernel so kaibo needs no direct kaish-vfs
+dep). Attach point confirmed: kaibo builds its own scratch `MemoryFs`
+(`sandbox.rs:170`), so the budget goes in via `MemoryFs::with_budget` at
+construction — `KernelConfig.vfs_budget_bytes` never enters the `with_backend`
+path. kaibo's part once 0.8.1 lands: bump the registry dep, thread
+`[sandbox].scratch_limit_bytes` → an owned labeled budget on the scratch mount
 (stricter-only, like the rest of `SandboxConfig`; default generous, e.g. 64 MB
 — scratch is a feature, runaway growth is the bug), and land the failing-first
 test: the probe above expecting the loud ENOSPC-style refusal; prove teeth by
@@ -118,21 +247,21 @@ one-question/many-models (the diverse-opinion panel made literal).
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they
 rot (rig 0.34's bundled `CLAUDE_*` / gemini consts are already retired — see the
 `claude-3-5-haiku-latest` 404 on 2026-06-03). Keep them in sync with the
-source-of-truth pal configs (`provider-model-ids` memory). → Model ids now live in
-profiles and are overridable per profile in `config.toml` (shipped; `docs/config.md`).
-The in-sync-with-pals discipline for the built-in defaults stays regardless.
+source-of-truth pal configs (`provider-model-ids` memory). → Model ids now live
+on cast slots and are overridable per cast in `config.toml` (shipped;
+`docs/config.md`). The in-sync-with-pals discipline for the built-in defaults
+(`config.rs::default_models`) stays regardless.
 
-### Per-model request shaping (the `Dialect` seam): remaining knobs
-The `Dialect` → `ModelShape` (`consult.rs`) resolves request params per (kind, model)
-from a profile, asked per *phase* against its own model. Thinking is model-aware across
-all providers (Anthropic adaptive vs enabled-budget, Gemini 3-line `thinkingLevel` vs
-2.5/3.5 `thinkingBudget`), reasoning depth is per-role effort, and a `thinking_style`
-config knob overrides the Anthropic classifier. Remaining knobs to land on the same seam:
-- **Static budget.** `THINKING_BUDGET` (8192) and `max_tokens` (16384) are constants,
-  not per-model/per-phase. Fine today; if a provider caps output below 16384 it'll
-  400 (DeepSeek accepted 16384 in testing) — cap that arm rather than lowering the
-  global, per the `large-token-headroom` memory. The `Dialect` is the place to make
-  these per-model when one provider forces it.
+### Per-model request shaping (`ModelShape`): remaining knobs
+`ModelShape` (`consult.rs`) resolves request params per (kind, model), fit per
+*arm* with the slot's tunables via `Arm::from_slot` (each falling back to the
+per-role `[defaults]`). Thinking is model-aware across all providers (Anthropic
+adaptive vs enabled-budget, Gemini 3-line `thinkingLevel` vs 2.5/3.5
+`thinkingBudget`), reasoning depth is per-role effort (with `thinkingLevel` as
+the 3-line's effort sink), and `thinking_style` (per slot or `[defaults]`)
+overrides the Anthropic classifier. `max_tokens`/`thinking_budget` are per-slot
+tunables — if a provider caps output low, cap that slot, not the global, per the
+`large-token-headroom` memory. Remaining knobs on the same seam:
 - **Gemini 3.5 boundary is empirical.** The classifier (`is_gemini3_level`) flips
   only the pure `gemini-3-*` line to `thinkingLevel`; `gemini-3.5-flash` stays on
   budget because the 2026-06-06 live test confirmed budget works there. If a future
@@ -140,11 +269,22 @@ config knob overrides the Anthropic classifier. Remaining knobs to land on the s
   don't guess.
 - **Anthropic adaptive boundary is empirical.** `is_anthropic_adaptive` flips Opus
   4.6+/Sonnet 4.6/Fable 5 to adaptive (the rest stay enabled-budget). Add ids as models
-  ship, or set `thinking_style` per profile to override; confirm a new id with the
+  ship, or set `thinking_style` on the slot to override; confirm a new id with the
   `#[ignore]`d Opus-4.8 probe rather than guessing.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
+
+### Tunables with no sink are accepted (and rendered) silently
+A slot whose resolved `ModelShape` has no sink for a knob still accepts it,
+load-validates it, and renders it at `kaibo://config` as if effective:
+`thinking_budget` on a Gemini 3-line slot (the level line never sends a budget,
+yet the `< max_tokens` inversion check still applies to it), and
+`effort`/`thinking_budget` on an openai-kind slot (`ThinkingStyle::None` sends
+neither). The effort half of this was fixed for the 3-line (it now maps onto
+`thinkingLevel`); the rest is invisible-no-op residue. Fix shape: at load (or in
+the render), flag per-slot tunables the slot's resolved shape will never send —
+a note in the render is enough to make the no-op visible to the operator.
 
 ### Per-model prose fitting — gemini-cli probe candidates (params-first, prose-later)
 Once the params seam lands, probe whether Gemini's *prose* underperforms Anthropic's
@@ -172,19 +312,22 @@ before forking any preamble. Candidates lifted from gemini-cli's codebase-invest
 - **Debug affordance:** a `WRITE_SYSTEM_MD`-style dump of the assembled prompt to a
   file (gemini-cli's `GEMINI_WRITE_SYSTEM_MD`) — handy once prompts compose per model.
 
-### Server doesn't report which providers are usable
+### Server doesn't report which backends are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
-error. Validating available providers at startup (and noting them in the server
-instructions) would fail faster and tell a client what it can actually use. For
-the `openai` provider this would mean a startup ping of `OPENAI_BASE_URL/models`
-rather than a key check. This can come along with adding an MCP resource for listing models.
+error. Validating available backends at startup (and noting them in the server
+instructions) would fail faster and tell a client what it can actually use — under
+casts this gets more valuable, not less: one dead backend can hole several casts,
+and "cast `chimera` is degraded: backend `sd` unreachable" is a better failure
+than a mid-consult error. For an `openai`-kind backend this means a startup ping
+of its `base_url/models` rather than a key check. This can come along with adding
+an MCP resource for listing models.
 
 ---
 
 ## P4 — Eventually
 
 ### Config-overrideable system prompts (deferred until a non-Amy user asks)
-Note: the in-tree `Dialect` seam (P3, "Per-model request shaping") is the *same*
+Note: the in-tree `ModelShape` seam (P3, "Per-model request shaping") is the *same*
 resolution point this would extend — build that first; config override rides it.
 Every model-facing string is hardcoded in Rust today: the three phase preambles
 (`consult.rs` `report_preamble`/`synthesize_preamble`/`consult_preamble`, each
@@ -197,9 +340,9 @@ on it and replace the `&consult_preamble()` literals at the `.preamble()` call i
 `run_phase`; on the config side a `[prompts]` table would slot in exactly like
 `[defaults]`. Deferred because Amy is the only user and edits the source directly —
 build it when someone else needs it. Three forks to settle *when* asked, not now:
-- **Granularity** — server-wide `[prompts]` vs per-profile (prompt framing is
+- **Granularity** — server-wide `[prompts]` vs per-cast/per-slot (prompt framing is
   model-sensitive: Gemma fixates on prohibitions where capable models don't, per the
-  positive-framing discipline, so per-profile has a real case) vs both.
+  positive-framing discipline, so per-slot has a real case) vs both.
 - **Replace scope** — override the role text only and keep injecting
   `kaish_syntax_core()` (safe: can't silently drop the grounding/exit-code contract)
   vs full-preamble raw replace vs per-field opt-in.
@@ -207,7 +350,7 @@ build it when someone else needs it. Three forks to settle *when* asked, not now
   vs inline `"""…"""` vs both, mirroring `api_key_env`/`api_key_file`.
 
 ### A secrets-manager key source (deferred)
-Custom credential paths shipped — a profile's `api_key_env` / `api_key_file`
+Custom credential paths shipped — a backend's `api_key_env` / `api_key_file`
 override the built-in `~/.anthropic-key.txt` / `~/.deepseek-key` / `~/.gemini-api-key`
 defaults (`credentials.rs`, `docs/config.md`). A secrets *manager* is still out of
 scope: by design the TOML references keys, never inlines them, so "point at
