@@ -1140,9 +1140,13 @@ impl RawSlot {
                 let (backend, id) = parse_slot_ref(&s)?;
                 Ok(ModelSlot::bare(backend, id))
             }
+            // Trim `backend`/`id` so the table form behaves like the `"backend/id"`
+            // string form (which trims in `parse_slot_ref`): identical intent must
+            // not depend on the spelling. The empty-after-trim case is still caught
+            // loudly downstream (`merge`: unknown backend / empty model id).
             Self::Table(t) => Ok(ModelSlot {
-                backend: t.backend,
-                id: t.id,
+                backend: t.backend.trim().to_string(),
+                id: t.id.trim().to_string(),
                 vision: t.vision,
                 max_tokens: t.max_tokens,
                 thinking_budget: t.thinking_budget,
@@ -1739,6 +1743,28 @@ mod tests {
         assert!(err.contains("unknown cast"), "got: {err}");
         assert!(err.contains("known casts"), "got: {err}");
         assert!(err.contains("anthropic"), "got: {err}");
+    }
+
+    /// The table slot form trims `backend`/`id` just like the `"backend/id"` string
+    /// form (`parse_slot_ref`): identical intent must not hinge on the spelling. A
+    /// padded `backend = " anthropic "` would otherwise miss the backend map and
+    /// surface as a baffling "unknown backend" — same class as a padded ref.
+    #[test]
+    fn a_table_slot_trims_backend_and_id_like_the_ref_form() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.x]
+            synth = { backend = " anthropic ", id = "  claude-opus-4-8  " }
+            "#,
+        )
+        .unwrap();
+        let slot = cfg
+            .resolve_cast("x")
+            .unwrap()
+            .require_slot(ModelRole::Synth)
+            .unwrap();
+        assert_eq!(slot.backend, "anthropic");
+        assert_eq!(slot.id, "claude-opus-4-8");
     }
 
     // --- scratch budget ---------------------------------------------------------
