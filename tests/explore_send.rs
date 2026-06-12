@@ -13,7 +13,7 @@
 use kaibo::consult::RunExplore;
 
 fn assert_send_sync<T: Send + Sync>() {}
-fn assert_is_tool<T: rig::tool::Tool>() {}
+fn assert_is_tool<T: rig_core::tool::Tool>() {}
 
 #[test]
 fn run_explore_is_a_send_sync_rig_tool() {

@@ -579,9 +579,9 @@ fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
 
 type Responder = Arc<
     dyn Fn(
-            &rig::completion::CompletionRequest,
+            &rig_core::completion::CompletionRequest,
         )
-            -> Result<rig::completion::CompletionResponse<()>, rig::completion::CompletionError>
+            -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError>
         + Send
         + Sync,
 >;
@@ -609,9 +609,9 @@ impl ScriptedClient {
     fn new<F>(expect_model: &str, responder: F) -> Self
     where
         F: Fn(
-                &rig::completion::CompletionRequest,
+                &rig_core::completion::CompletionRequest,
             )
-                -> Result<rig::completion::CompletionResponse<()>, rig::completion::CompletionError>
+                -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError>
             + Send
             + Sync
             + 'static,
@@ -639,17 +639,17 @@ struct ScriptedModel {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct NoStream;
 
-impl rig::completion::GetTokenUsage for NoStream {
-    fn token_usage(&self) -> Option<rig::completion::Usage> {
+impl rig_core::completion::GetTokenUsage for NoStream {
+    fn token_usage(&self) -> Option<rig_core::completion::Usage> {
         None
     }
 }
 
-impl rig::client::CompletionClient for ScriptedClient {
+impl rig_core::client::CompletionClient for ScriptedClient {
     type CompletionModel = ScriptedModel;
 }
 
-impl rig::completion::CompletionModel for ScriptedModel {
+impl rig_core::completion::CompletionModel for ScriptedModel {
     type Response = ();
     type StreamingResponse = NoStream;
     type Client = ScriptedClient;
@@ -663,8 +663,8 @@ impl rig::completion::CompletionModel for ScriptedModel {
 
     async fn completion(
         &self,
-        request: rig::completion::CompletionRequest,
-    ) -> Result<rig::completion::CompletionResponse<()>, rig::completion::CompletionError> {
+        request: rig_core::completion::CompletionRequest,
+    ) -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError> {
         assert_eq!(
             self.id, self.client.expect_model,
             "this client serves only {:?} — the loop routed a phase to the wrong client",
@@ -677,7 +677,7 @@ impl rig::completion::CompletionModel for ScriptedModel {
             .push(Seen {
                 preamble: request.preamble.clone().or_else(|| {
                     request.chat_history.iter().find_map(|m| match m {
-                        rig::completion::message::Message::System { content } => {
+                        rig_core::completion::message::Message::System { content } => {
                             Some(content.clone())
                         }
                         _ => None,
@@ -691,20 +691,20 @@ impl rig::completion::CompletionModel for ScriptedModel {
 
     async fn stream(
         &self,
-        _request: rig::completion::CompletionRequest,
+        _request: rig_core::completion::CompletionRequest,
     ) -> Result<
-        rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
-        rig::completion::CompletionError,
+        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig_core::completion::CompletionError,
     > {
         unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
     }
 }
 
 /// A final text answer — ends the tool loop.
-fn text_response(text: impl Into<String>) -> rig::completion::CompletionResponse<()> {
-    rig::completion::CompletionResponse {
-        choice: rig::OneOrMany::one(rig::completion::message::AssistantContent::text(text)),
-        usage: rig::completion::Usage::new(),
+fn text_response(text: impl Into<String>) -> rig_core::completion::CompletionResponse<()> {
+    rig_core::completion::CompletionResponse {
+        choice: rig_core::OneOrMany::one(rig_core::completion::message::AssistantContent::text(text)),
+        usage: rig_core::completion::Usage::new(),
         raw_response: (),
         message_id: None,
     }
@@ -715,26 +715,26 @@ fn tool_call_response(
     id: &str,
     name: &str,
     args: Value,
-) -> rig::completion::CompletionResponse<()> {
-    rig::completion::CompletionResponse {
-        choice: rig::OneOrMany::one(rig::completion::message::AssistantContent::tool_call(
+) -> rig_core::completion::CompletionResponse<()> {
+    rig_core::completion::CompletionResponse {
+        choice: rig_core::OneOrMany::one(rig_core::completion::message::AssistantContent::tool_call(
             id, name, args,
         )),
-        usage: rig::completion::Usage::new(),
+        usage: rig_core::completion::Usage::new(),
         raw_response: (),
         message_id: None,
     }
 }
 
 /// True if the request declares a tool named `name`.
-fn has_tool(req: &rig::completion::CompletionRequest, name: &str) -> bool {
+fn has_tool(req: &rig_core::completion::CompletionRequest, name: &str) -> bool {
     req.tools.iter().any(|t| t.name == name)
 }
 
 /// Everything the model was shown in user turns — `User` text *and* tool-result
 /// text — oldest→newest, so a responder can branch on a report's arrival.
-fn transcript_text(req: &rig::completion::CompletionRequest) -> String {
-    use rig::completion::message::{Message, ToolResultContent, UserContent};
+fn transcript_text(req: &rig_core::completion::CompletionRequest) -> String {
+    use rig_core::completion::message::{Message, ToolResultContent, UserContent};
     req.chat_history
         .iter()
         .filter_map(|m| match m {
@@ -892,8 +892,8 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
 /// True if any tool result in the request history carried an *image* part. The
 /// text-only `transcript_text` can't see this, and that's the point: an image part
 /// is exactly what a base64 tool envelope must become to reach model context.
-fn request_has_tool_result_image(req: &rig::completion::CompletionRequest) -> bool {
-    use rig::completion::message::{Message, ToolResultContent, UserContent};
+fn request_has_tool_result_image(req: &rig_core::completion::CompletionRequest) -> bool {
+    use rig_core::completion::message::{Message, ToolResultContent, UserContent};
     req.chat_history.iter().any(|m| match m {
         Message::User { content } => content.iter().any(|c| {
             matches!(

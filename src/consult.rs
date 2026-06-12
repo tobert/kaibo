@@ -25,11 +25,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rig::client::CompletionClient;
-use rig::completion::message::{ToolChoice, UserContent};
-use rig::completion::{Message, Prompt, PromptError, ToolDefinition};
-use rig::providers::{anthropic, deepseek, gemini, openai};
-use rig::tool::{Tool, ToolDyn};
+use rig_core::client::CompletionClient;
+use rig_core::completion::message::{ToolChoice, UserContent};
+use rig_core::completion::{Message, Prompt, PromptError, ToolDefinition};
+use rig_core::providers::{anthropic, deepseek, gemini, openai};
+use rig_core::tool::{Tool, ToolDyn};
 use serde::Deserialize;
 use serde_json::{json, Value};
 

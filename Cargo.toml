@@ -28,7 +28,7 @@ anyhow = "1"
 
 # LLM providers + agent/tool loop. Native tools (no `rmcp` feature needed — kaibo
 # wraps kaish as an in-process rig Tool, not over MCP).
-rig-core = "0.34"
+rig-core = "0.38"
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider

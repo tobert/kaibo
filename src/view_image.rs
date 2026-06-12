@@ -22,8 +22,8 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::{json, Value};
 

@@ -39,14 +39,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rig::client::CompletionClient;
-use rig::completion::message::{
+use rig_core::client::CompletionClient;
+use rig_core::completion::message::{
     AssistantContent, Message, ToolChoice, ToolResultContent, UserContent,
 };
-use rig::completion::{
+use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
-use rig::OneOrMany;
+use rig_core::OneOrMany;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -206,7 +206,7 @@ impl CompletionModel for ScriptedModel {
     async fn stream(
         &self,
         _request: CompletionRequest,
-    ) -> Result<rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
+    ) -> Result<rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
     {
         unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
     }
