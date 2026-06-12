@@ -19,6 +19,7 @@ pub mod progress;
 pub mod sandbox;
 pub mod server;
 pub mod session;
+pub mod view_image;
 
 /// A scripted, offline stand-in for a provider client, for driving the consult loop
 /// deterministically in unit tests. Test-only — never compiled into the binary.

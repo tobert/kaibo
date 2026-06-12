@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
-use kaish_kernel::vfs::{ByteBudget, LocalFs, MemoryFs, VfsRouter};
+use kaish_kernel::vfs::{ByteBudget, Filesystem, LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig};
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
@@ -177,6 +177,23 @@ pub fn build_readonly_kernel_with(
     root: impl Into<PathBuf>,
     sandbox: &SandboxConfig,
 ) -> Result<Kernel> {
+    Ok(build_readonly_kernel_and_vfs(root, sandbox)?.0)
+}
+
+/// Like [`build_readonly_kernel_with`], but also hand back the project's VFS router.
+///
+/// That router is the *only* handle that reads a file's bytes directly: under
+/// `Kernel::with_backend` the kernel's own [`Kernel::vfs`] is just its internal
+/// `/v/*` scratch — our project mounts live on the backend's router, reachable only
+/// through execution (capped, text) or this handle. [`KaishWorker::read_file`]
+/// (for `view_image`) needs the raw bytes uncapped, so the worker keeps this router
+/// and reads through it. It's the *same* router execution uses, so a read stays
+/// governed by the read-only project mount and the `/` scratch — containment and
+/// read-only stay structural, identical to `run_kaish`.
+fn build_readonly_kernel_and_vfs(
+    root: impl Into<PathBuf>,
+    sandbox: &SandboxConfig,
+) -> Result<(Kernel, Arc<VfsRouter>)> {
     let root = root.into();
     let mount_point = root.to_string_lossy().to_string();
 
@@ -194,7 +211,11 @@ pub fn build_readonly_kernel_with(
     // The project itself: real files, read-only.
     vfs.mount(&mount_point, LocalFs::read_only(&root));
 
-    let backend: Arc<dyn KernelBackend> = Arc::new(LocalBackend::new(Arc::new(vfs)));
+    // Keep a handle to the project router before it disappears into the backend, so
+    // the worker can read bytes through these mounts (the kernel's own `vfs()` won't
+    // carry them — see this fn's doc).
+    let project_vfs = Arc::new(vfs);
+    let backend: Arc<dyn KernelBackend> = Arc::new(LocalBackend::new(project_vfs.clone()));
 
     // Start from the MCP output limit (head+tail truncation) and set the configured
     // cap so a runaway `cat` can't flood the caller's context; the timeout bounds
@@ -212,13 +233,14 @@ pub fn build_readonly_kernel_with(
     // runs after the default builtins are registered, so any config-driven
     // `disable_builtins` shadows win.
     let disable = sandbox.disable_builtins.clone();
-    Kernel::with_backend(
+    let kernel = Kernel::with_backend(
         backend,
         config,
         |_| {},
         move |reg| apply_disabled_builtins(reg, &disable),
     )
-    .context("failed to build read-only kaish kernel")
+    .context("failed to build read-only kaish kernel")?;
+    Ok((kernel, project_vfs))
 }
 
 /// The schemas of every builtin kaibo's kernel registers, sorted by name.
@@ -279,13 +301,33 @@ impl KaishOutput {
 /// handle holds only a `Send` channel, so [`KaishWorker::run`]'s future is `Send`
 /// and can be awaited from inside a rig tool's `call`. The kernel persists across
 /// calls, so the explorer gets shell continuity (cwd, vars) within a session.
+///
+/// `Clone` shares one kernel thread: the handle is just a `Send` channel sender, so
+/// two tools backed by the same worker (e.g. `run_kaish` + `view_image`) drive the
+/// *same* read-only kernel rather than spinning a second one.
+#[derive(Clone)]
 pub struct KaishWorker {
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
 }
 
-struct Job {
-    script: String,
-    reply: tokio::sync::oneshot::Sender<KaishOutput>,
+/// A unit of work for the worker thread. Two shapes: run a script (the explorer's
+/// whole interface), or read a file's raw bytes straight through the VFS.
+enum Job {
+    /// Run a kaish script; reply with its captured output.
+    Run {
+        script: String,
+        reply: tokio::sync::oneshot::Sender<KaishOutput>,
+    },
+    /// Read a file's bytes through the kernel's VFS, *bypassing* the script-output
+    /// cap (an image is megabytes; `cat | base64` through `run`'s capped stdout
+    /// would truncate it). Same VFS as every read, so containment and read-only stay
+    /// structural — an out-of-mount path routes to the empty `/` scratch and 404s.
+    /// Reply carries the bytes or a rendered error string (`io::Error` is not `Send`
+    /// across the boundary cleanly, and the caller only needs the message).
+    Read {
+        path: PathBuf,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<Vec<u8>, String>>,
+    },
 }
 
 impl KaishWorker {
@@ -323,10 +365,11 @@ impl KaishWorker {
                 };
                 // `block_on` runs the `!Send` kernel future on this thread only.
                 rt.block_on(async move {
-                    let kernel = match build_readonly_kernel_with(&root, &sandbox) {
-                        Ok(k) => {
+                    let (kernel, project_vfs) = match build_readonly_kernel_and_vfs(&root, &sandbox)
+                    {
+                        Ok(kv) => {
                             let _ = init_tx.send(Ok(()));
-                            k
+                            kv
                         }
                         Err(e) => {
                             let _ = init_tx.send(Err(format!("{e:#}")));
@@ -334,20 +377,36 @@ impl KaishWorker {
                         }
                     };
                     while let Some(job) = jobs_rx.recv().await {
-                        let out = match run(&kernel, &job.script).await {
-                            Ok(r) => KaishOutput {
-                                code: r.code,
-                                stdout: r.text_out().into_owned(),
-                                stderr: r.err.clone(),
-                            },
-                            Err(e) => KaishOutput {
-                                code: -1,
-                                stdout: String::new(),
-                                stderr: format!("{e:#}"),
-                            },
-                        };
-                        // Receiver gone (caller cancelled) is fine — drop the result.
-                        let _ = job.reply.send(out);
+                        match job {
+                            Job::Run { script, reply } => {
+                                let out = match run(&kernel, &script).await {
+                                    Ok(r) => KaishOutput {
+                                        code: r.code,
+                                        stdout: r.text_out().into_owned(),
+                                        stderr: r.err.clone(),
+                                    },
+                                    Err(e) => KaishOutput {
+                                        code: -1,
+                                        stdout: String::new(),
+                                        stderr: format!("{e:#}"),
+                                    },
+                                };
+                                // Receiver gone (caller cancelled) is fine — drop it.
+                                let _ = reply.send(out);
+                            }
+                            Job::Read { path, reply } => {
+                                // Read straight through the *project* VFS router on
+                                // this thread. The read-only mount governs what
+                                // resolves: under `root` → real bytes; anywhere else →
+                                // the empty `/` scratch → NotFound. No output cap
+                                // applies — that's a script-execution guard, not a VFS
+                                // one. (The kernel's own `vfs()` carries only its
+                                // internal `/v/*` scratch under `with_backend`, not
+                                // these mounts — hence the retained handle.)
+                                let out = project_vfs.read(&path).await.map_err(|e| format!("{e}"));
+                                let _ = reply.send(out);
+                            }
+                        }
                     }
                 });
             })
@@ -364,12 +423,36 @@ impl KaishWorker {
     pub async fn run(&self, script: impl Into<String>) -> Result<KaishOutput> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.jobs
-            .send(Job {
+            .send(Job::Run {
                 script: script.into(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("kaish worker thread is gone"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("kaish worker dropped the reply"))
+    }
+
+    /// Read a file's raw bytes through the kernel's VFS. The returned future is
+    /// `Send`. This is the read path for binary content (`view_image`): it bypasses
+    /// the script-output cap (which exists to keep a wide `cat` from flooding the
+    /// model's context, not to bound a deliberate single-file read) while keeping the
+    /// *same* read-only mount as every other read — so containment and read-only stay
+    /// structural. A path that resolves outside the project mount lands in the empty
+    /// `/` scratch and comes back `NotFound`.
+    ///
+    /// `path` should be absolute and already inside the workspace; the caller
+    /// (`view_image`) canonicalizes and boundary-checks host-side first so it can
+    /// give an actionable out-of-workspace error before ever reaching here.
+    pub async fn read_file(&self, path: impl Into<PathBuf>) -> Result<Vec<u8>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(Job::Read {
+                path: path.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("kaish worker thread is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("kaish worker dropped the reply"))?
+            .map_err(|e| anyhow::anyhow!(e))
     }
 }

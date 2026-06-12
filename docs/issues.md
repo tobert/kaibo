@@ -14,7 +14,26 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-11 (kaish 0.8.1 bump + scratch ByteBudget SHIPPED — the dep
+Last pass: 2026-06-11 (vision-in SHIPPED — `view_image(path)` (`src/view_image.rs`):
+a vision-capable phase reads an image *file* from the workspace and the bytes reach
+model context as a rig image part. Path-only by decision (debug screenshots/assets/
+docs are files already in the tree); no MCP-native/inline input. Bytes are read
+through the project VFS via a new `KaishWorker::read_file` (a `Job::Read` on the
+worker thread → the *project* `VfsRouter`, retained from `build_readonly_kernel_and_vfs`
+because under `with_backend` the kernel's own `vfs()` carries only `/v/*` scratch),
+so containment + read-only stay structural and the 8 KB script-output cap is bypassed
+for the deliberate read. Toolset assembly gates `view_image` on `arm.caps.vision` in
+all three phases (`phase_tools` for explore/synthesize, `consult_tools` for the synth
+driver; the explore′ sweep inherits its own gate); a blind model never sees the tool,
+so there's no fail-loud attach path. Two correctness landmines caught by reading
+ground truth, not guessing: rig's part key is camelCase **`mimeType`** (not the
+`mime_type` an earlier note claimed), and `Tool::Output` must be a `serde_json::Value`
+object — rig `serde_json::to_string`s the output, so a `String` arrives double-encoded
+and `from_tool_output` treats it as text, never an image (the offline round-trip test
+proves the whole chain). Out-of-workspace paths get an actionable copy-it-in error
+(the caller's agent can act on it); MIME by magic-byte sniff; a loud size cap, no
+resize dep. Offline tests: tool unit tests + the full caps→toolset→VFS→envelope→rig
+round-trip + a blind-synth negative. Folded out sequencing step (1) below.) 2026-06-11 (kaish 0.8.1 bump + scratch ByteBudget SHIPPED — the dep
 moved to published `kaish-kernel = "0.8.1"` (clean, no API breakage), and the
 unbounded-`/`-scratch surprise is closed: `[sandbox].scratch_limit_bytes` (env
 `KAIBO_SCRATCH_LIMIT_BYTES`, default 64 MB, must be > 0 — no "unbounded" escape)
@@ -99,9 +118,11 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 - **Perception vs production.** A tool whose output the model must *see*
   (`view_image`) is a **rig tool** — the only channel that carries image parts into
   model context is the rig tool-result envelope (`ToolResultContent::from_tool_output`
-  parses `{"response":…, "parts":[{"type":"image","data":…,"mime_type":…}]}` —
-  rig-core 0.34 `completion/message.rs:864`; the Anthropic and Gemini arms map image
-  parts natively both directions, `providers/gemini/completion.rs:455,1135`). A tool
+  parses `{"response":…, "parts":[{"type":"image","data":…,"mimeType":…}]}` — the
+  part key is camelCase **`mimeType`**, confirmed against rig-core 0.34
+  `completion/message.rs:888` (the `mime_type` spelling in an earlier draft of this
+  note was wrong); the Anthropic and Gemini arms map image parts natively both
+  directions, `providers/gemini/completion.rs:455,1135`). A tool
   whose output is an *artifact* (`image2image <in> <out>`, `tts "…"`) is a **kaish
   builtin**: async `Tool::execute` + `register_arc` is already kaibo's own pattern
   (`Blocked`, `sandbox.rs`), paths compose with redirects/pipes/loops, and `run_kaish`
@@ -119,11 +140,11 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
   `RawContent::ResourceLink` (`model/content.rs:140`) instead of base64 blobs.
 - **Capabilities are data on the `ModelShape` seam** — SHIPPED
   2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
-  `vision` pin in the role table, resolved caps at `kaibo://config`. What
-  remains is the *consumption*: toolsets assembled from resolved caps (a vision
-  model gets `view_image`; a kernel gets the `tts` builtin only when a
-  tts-capable role is configured — absent, not erroring; images attached to a
-  blind model fail loud). That lands with vision-in.
+  `vision` pin in the role table, resolved caps at `kaibo://config`. The vision
+  half of the *consumption* shipped too (vision-in, see the Last pass): a vision
+  arm's toolset gains `view_image`. Still pending: the production-role half — a
+  kernel gets the `tts`/`image` builtin only when that role is configured (absent,
+  not erroring), which lands with the production builtins.
 - **Roles outgrow explorer/synth** — SHIPPED 2026-06-11: the role table
   (explorer, synth, image, tts; `ModelRole`/`ModelSlot` in `config.rs`),
   spelled `[casts.<name>]` since the backends/casts split shipped. Media slots
@@ -131,21 +152,23 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
   `explore`/`synthesize` remain the agent costumes over `run_phase`; new
   capabilities are injected tools or builtins, never new loops.
 
-**Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11; vision-in's
-toolset assembly and the production builtins both land on resolved cast slots,
-so it fronted the queue. (1) vision-in — `view_image` rig tool reading *through
-the kaish VFS* (one access path; containment + ro stay structural), caller
-images by path-in-scope and inline base64 both, toolset assembly reads the
-synth arm's resolved caps, `consult_result` assembles `Vec<Content>`, mock
-responders assert/emit image parts so media is offline-tested like everything
-else. (2) First production builtin (image2image or tts) + out-dir +
-ResourceLink delivery. Additive after that.
+**Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
+SHIPPED 2026-06-11, path-only (see the Last pass for the mechanics and the two
+correctness landmines). **Next: (2)** first production builtin (image2image or tts)
++ out-dir + ResourceLink delivery; the **output**-side `consult_result`
+`Vec<Content>` assembly (`Content::image` / `ResourceLink`) belongs here, *not*
+with vision-in — vision-in is input-only, the model sees images via the tool-result
+envelope, never the answer. The production builtins also need the per-builtin
+timeout (its own P1 entry below) before they can run a minutes-long model call.
+Additive after that.
 
-**Open design points:** session history records `[image: path, mime]` markers, not
-blobs; image size caps with loud errors (no resize dep). Per-builtin timeout tuning
-is its own P1 entry below — a blocker for any model-backed builtin. **Explicitly deferred:**
-search/code-exec tools, file-store/context-cache plays, batch synth (its P3 entry
-stands), any image-processing crate.
+**Open design points (for the production builtins):** session history records
+`[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const
+today (`DEFAULT_MAX_IMAGE_BYTES`, 5 MiB) — promote to a `[sandbox]`/`[defaults]` knob
+if it bites. **Explicitly deferred:** inline/attach (non-file) image *input* (YAGNI —
+add when a genuinely-never-a-file pasted image comes up), search/code-exec tools,
+file-store/context-cache plays, batch synth (its P3 entry stands), any
+image-processing crate.
 
 ### Per-builtin timeouts: the 30s script timeout cannot serve model-backed builtins
 The kernel exec timeout is one global knob: `KAISH_EXEC_TIMEOUT` (30s,

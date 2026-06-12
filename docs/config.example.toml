@@ -30,7 +30,7 @@
 # Don't paste the key to the model — set the env var or key file in your shell.
 # Then RECONNECT the kaibo MCP server so it re-reads the environment and this file
 # (keys are read once at startup; in Claude Code: run /mcp and reconnect kaibo).
-# Prefer another provider? Pass provider="<backend-or-cast>" per call, or set
+# Prefer another provider? Pass cast="<backend-or-cast>" per call, or set
 # `cast` below.
 #
 # kaibo serves two resources you can read from your MCP client, no tool turn spent:

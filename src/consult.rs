@@ -40,6 +40,7 @@ use crate::kaish_syntax::kaish_syntax_core;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, SessionStore};
+use crate::view_image::ViewImage;
 
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
@@ -963,14 +964,24 @@ pub async fn explore(
         question.to_string(),
         cfg.explorer_max_turns,
         cfg.progress.as_ref(),
-        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
-            Ok(vec![Box::new(RunKaish::with_progress(
-                KaishWorker::spawn_with(&root, cfg.sandbox.clone())?,
-                cfg.progress.clone(),
-            ))])
-        },
+        &|| phase_tools(&root, cfg, arm.caps.vision),
     )
     .await
+}
+
+/// The single-arm phase toolset (`explore`/`synthesize`): always `run_kaish`, plus
+/// `view_image` when the arm's model is vision-capable. One [`KaishWorker`] backs
+/// both tools (shared kernel) so a vision phase doesn't spin a second kaish thread.
+fn phase_tools(root: &Path, cfg: &ConsultConfig, vision: bool) -> Result<Vec<Box<dyn ToolDyn>>> {
+    let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
+    let mut tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(RunKaish::with_progress(
+        worker.clone(),
+        cfg.progress.clone(),
+    ))];
+    if vision {
+        tools.push(Box::new(ViewImage::new(worker, root.to_path_buf())));
+    }
+    Ok(tools)
 }
 
 /// Build the standalone `synthesize` user prompt. Pure and offline-testable.
@@ -1047,12 +1058,7 @@ pub async fn synthesize(
         user_prompt,
         cfg.synth_max_turns,
         cfg.progress.as_ref(),
-        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
-            Ok(vec![Box::new(RunKaish::with_progress(
-                KaishWorker::spawn_with(&root, cfg.sandbox.clone())?,
-                cfg.progress.clone(),
-            ))])
-        },
+        &|| phase_tools(&root, cfg, arm.caps.vision),
     )
     .await
 }
@@ -1119,6 +1125,7 @@ fn consult_tools(
     root: &Path,
     cfg: &ConsultConfig,
     reports: Arc<Mutex<Vec<String>>>,
+    synth_vision: bool,
 ) -> Result<Vec<Box<dyn ToolDyn>>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
@@ -1136,10 +1143,20 @@ fn consult_tools(
         reports,
         cfg.progress.clone(),
     );
-    Ok(vec![
-        Box::new(RunKaish::with_progress(worker, cfg.progress.clone())),
+    let mut tools: Vec<Box<dyn ToolDyn>> = vec![
+        Box::new(RunKaish::with_progress(
+            worker.clone(),
+            cfg.progress.clone(),
+        )),
         Box::new(explore),
-    ])
+    ];
+    // The driver loop runs on the *synth* arm, so view_image rides the synth's
+    // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
+    // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
+    if synth_vision {
+        tools.push(Box::new(ViewImage::new(worker, root.to_path_buf())));
+    }
+    Ok(tools)
 }
 
 /// Run a `consult` over two resolved arms.
@@ -1168,7 +1185,7 @@ pub(crate) async fn consult_with(
             // Rebuilt per call (main loop, and again if run_phase forces a final
             // turn); every build shares the one `reports` sink so all explore′
             // sweeps aggregate.
-            &|| consult_tools(explorer, root, cfg, reports.clone()),
+            &|| consult_tools(explorer, root, cfg, reports.clone(), synth.caps.vision),
         )
         .await
         .context("consult loop")?;
@@ -2251,6 +2268,7 @@ mod tests {
 
     /// The recomposed consult must drive BOTH tools: a direct `run_kaish` and the
     /// delegated `explore′`. Pin the wiring offline — no model, just the toolset.
+    /// A non-vision synth gets no `view_image` (it's gated on the synth's caps).
     #[test]
     fn consult_toolset_has_both_run_kaish_and_explore() {
         let dir = tempdir().unwrap();
@@ -2261,8 +2279,14 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
-        let tools = consult_tools(&arm(&client, "explorer-model"), dir.path(), &cfg, reports)
-            .expect("building the consult toolset should succeed");
+        let tools = consult_tools(
+            &arm(&client, "explorer-model"),
+            dir.path(),
+            &cfg,
+            reports,
+            false, // synth is not vision-capable
+        )
+        .expect("building the consult toolset should succeed");
 
         let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -2272,6 +2296,60 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "explore"),
             "missing explore′, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "view_image"),
+            "a blind synth must not get view_image, got {names:?}"
+        );
+    }
+
+    /// When the synth arm is vision-capable, the consult driver's toolset gains
+    /// `view_image` — the consumption of the resolved caps. The explorer arm's caps
+    /// are irrelevant here (the driver runs on the synth); the bool models that.
+    #[test]
+    fn a_vision_synth_gets_view_image_in_the_consult_toolset() {
+        let dir = tempdir().unwrap();
+        let client = ScriptedClient::builder().build();
+        let cfg = ConsultConfig::default();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+
+        let tools = consult_tools(
+            &arm(&client, "explorer-model"),
+            dir.path(),
+            &cfg,
+            reports,
+            true, // synth IS vision-capable
+        )
+        .expect("building the consult toolset should succeed");
+
+        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.iter().any(|n| n == "view_image"),
+            "a vision synth must get view_image, got {names:?}"
+        );
+    }
+
+    /// The single-arm phase toolset (`explore`/`synthesize`): `run_kaish` always,
+    /// `view_image` exactly when the arm is vision-capable. Pins the shared helper
+    /// both ways so neither phase's gate drifts.
+    #[test]
+    fn phase_tools_gates_view_image_on_the_vision_cap() {
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+
+        let blind = phase_tools(dir.path(), &cfg, false).expect("blind toolset builds");
+        let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
+        assert!(blind_names.iter().any(|n| n == "run_kaish"));
+        assert!(
+            !blind_names.iter().any(|n| n == "view_image"),
+            "no view_image without vision, got {blind_names:?}"
+        );
+
+        let seeing = phase_tools(dir.path(), &cfg, true).expect("vision toolset builds");
+        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
+        assert!(
+            seeing_names.iter().any(|n| n == "view_image"),
+            "view_image present with vision, got {seeing_names:?}"
         );
     }
 

@@ -889,6 +889,122 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
     );
 }
 
+/// True if any tool result in the request history carried an *image* part. The
+/// text-only `transcript_text` can't see this, and that's the point: an image part
+/// is exactly what a base64 tool envelope must become to reach model context.
+fn request_has_tool_result_image(req: &rig::completion::CompletionRequest) -> bool {
+    use rig::completion::message::{Message, ToolResultContent, UserContent};
+    req.chat_history.iter().any(|m| match m {
+        Message::User { content } => content.iter().any(|c| {
+            matches!(
+                c,
+                UserContent::ToolResult(tr)
+                    if tr.content.iter().any(|rc| matches!(rc, ToolResultContent::Image(_)))
+            )
+        }),
+        _ => false,
+    })
+}
+
+/// vision-in, end to end and offline. A vision-capable synth is offered `view_image`,
+/// calls it on a real file in the tree, and the bytes return as a rig *image part* in
+/// the next turn — not text. The synth can only reach its answer once it has seen the
+/// image, so a green run proves the whole chain: caps → toolset assembly → VFS read
+/// through the read-only kernel → base64 envelope → rig `from_tool_output` → image in
+/// model context. The proof of the "all three phases" decision, exercised on the
+/// `synthesize` phase through its public seam.
+#[tokio::test]
+async fn a_vision_synth_sees_an_image_through_view_image() {
+    const SYNTH_MODEL: &str = "claude-sonnet-4-6";
+
+    // A real PNG (signature + filler — we never decode it) inside the workspace.
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(b"kaibo-pixels");
+    std::fs::write(root.join("diagram.png"), &png).unwrap();
+
+    let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
+        if request_has_tool_result_image(req) {
+            // The image landed in context as an image part — only now answer.
+            Ok(text_response("I can see the diagram. DONE"))
+        } else {
+            assert!(
+                has_tool(req, "view_image"),
+                "a vision synth must be offered view_image"
+            );
+            Ok(tool_call_response(
+                "t-view",
+                "view_image",
+                json!({ "path": "diagram.png" }),
+            ))
+        }
+    });
+    let synth = Arm::new(
+        synth_client.clone(),
+        SYNTH_MODEL,
+        16384,
+        None,
+        ModelCaps { vision: true },
+    );
+
+    let answer = synthesize(
+        "What does the diagram show?",
+        None,
+        &root,
+        &synth,
+        &ConsultConfig::default(),
+    )
+    .await
+    .expect("vision synthesize should succeed");
+
+    // The only route to "DONE" runs through the image-present branch, so this single
+    // assertion proves the round-trip: the model actually received the image part.
+    assert!(
+        answer.contains("DONE"),
+        "synth answered only after seeing the image part: {answer:?}"
+    );
+}
+
+/// The negative: a blind synth (the default `ModelCaps { vision: false }`) is never
+/// offered `view_image`. Pin it on the same `synthesize` seam so the gate can't
+/// silently flip open for a text-only model.
+#[tokio::test]
+async fn a_blind_synth_is_not_offered_view_image() {
+    const SYNTH_MODEL: &str = "deepseek-v4-pro";
+
+    let dir = tempfile::tempdir().unwrap();
+    let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
+        assert!(
+            !has_tool(req, "view_image"),
+            "a blind synth must NOT see view_image"
+        );
+        assert!(has_tool(req, "run_kaish"), "but it still drives run_kaish");
+        Ok(text_response("text-only answer"))
+    });
+    let synth = Arm::new(
+        synth_client.clone(),
+        SYNTH_MODEL,
+        16384,
+        None,
+        ModelCaps { vision: false },
+    );
+
+    synthesize(
+        "anything",
+        None,
+        dir.path(),
+        &synth,
+        &ConsultConfig::default(),
+    )
+    .await
+    .expect("blind synthesize should succeed");
+    assert!(
+        !synth_client.seen().is_empty(),
+        "the synth client was driven"
+    );
+}
+
 // Validation of the user-config path: load the real user config
 // (~/.config/kaibo/config.toml), resolve a *non-built-in* cast, and run its synth
 // slot against Lemonade. Proves config → cast → backend → arm wiring for a second
