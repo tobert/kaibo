@@ -56,13 +56,17 @@ lru = "0.18"
 # OpenTelemetry traces (opt-in, off by default — see src/telemetry.rs + config.rs).
 # rig-core already emits the GenAI span tree (invoke_agent → chat → tool, with
 # gen_ai.usage.* token fields); these crates just export it over OTLP. We pick the
-# HTTP/protobuf transport on an *async* reqwest client so it reuses kaibo's existing
-# reqwest 0.13 + rustls (no tonic/gRPC, no second HTTP stack) — feature unification
-# then keeps a single reqwest. The outbound OTLP socket is allowed under stdio-only
-# (kaibo never *binds*); it stays off unless [telemetry] enables it.
+# HTTP/protobuf transport reusing kaibo's reqwest 0.13 + rustls (no tonic/gRPC, no
+# second HTTP stack) — feature unification keeps a single reqwest. We use the
+# *blocking* reqwest client deliberately: the default `with_batch_exporter` runs on a
+# dedicated thread and drives export via `futures_executor::block_on` with no tokio
+# reactor, so an *async* reqwest client fails every export ("no reactor running") and
+# silently drops spans. The blocking client owns its own thread+runtime and works
+# there. The outbound OTLP socket is allowed under stdio-only (kaibo never *binds*);
+# it stays off unless [telemetry] enables it.
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-client", "reqwest-rustls"] }
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 tracing-opentelemetry = "0.33"
 
 [dev-dependencies]

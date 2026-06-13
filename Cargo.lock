@@ -1753,8 +1753,6 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -2116,6 +2114,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
