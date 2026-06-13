@@ -256,16 +256,63 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
 #     per-role value for THIS slot only; knobs you omit fall back. Available:
-#     max_tokens, thinking_budget, temperature, effort, thinking_style — they
-#     track the model, not the server. A typo'd knob is a loud load error. ---
+#     max_tokens, thinking_budget, temperature, effort, thinking_style, and
+#     `preamble` (the per-model system prompt) — they track the model, not the
+#     server. A typo'd knob is a loud load error. See [prompts] below for how the
+#     per-model `preamble` layers over the per-phase prompt and the built-in. ---
 
 [casts.deep-dive]
 aliases  = ["deep"]                          # casts (and backends) take aliases
 explorer = "deepseek/deepseek-v4-flash"
 synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
 
+# --- A per-model prompt: a local Gemma explorer wants different framing than a
+#     hosted Claude would. `preamble` lives on the slot, beside the tunables, and
+#     wins over [prompts].explorer and the built-in for THIS model. ---
+
+[casts.tuned-local]
+explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Quote exact numbered lines; never guess a path." }
+synth    = "claude/claude-sonnet-4-6"        # no per-model prompt → [prompts] or built-in
+
 # --- Hosted GPT end to end, both roles on the keyed backend above. ---
 
 [casts.gpt]
 explorer = "gpt/gpt-5-mini"
 synth    = "gpt/gpt-5"
+
+# ---------------------------------------------------------------------------
+# [context] — "house rules" files spliced into every consultation tool's preamble
+# as standing guidance, so kaibo's models inherit the calling agent's conventions.
+# Vendor-neutral: the only default is the emerging AGENTS.md convention.
+# ---------------------------------------------------------------------------
+# Two lists, two failure modes:
+#   project_files — root-relative, read IF PRESENT (absent is normal); each must
+#     stay within the project root (a ../ escape or out-of-tree symlink is refused).
+#     Default ["AGENTS.md"]; an explicit [] opts out. Env KAIBO_PROJECT_FILES
+#     (colon-separated) / CLI --project-context-file (repeatable).
+#   user_files — absolute/tilde, read REQUIRED (a missing declared file is a loud
+#     error). Read in trusted server-side Rust; only the CONTENTS reach the model,
+#     never the path, so the read-only shell's scope is not widened. Env
+#     KAIBO_USER_FILES / CLI --user-context-file.
+#
+# [context]
+# project_files = ["AGENTS.md"]
+# user_files    = ["~/.claude/CLAUDE.md"]
+
+# ---------------------------------------------------------------------------
+# [prompts] — per-PHASE system-prompt overrides. Where [context] ADDS project
+# guidance, [prompts] REPLACES the built-in role framing (full replace — the kaish
+# shell contract rides the run_kaish tool regardless). File-only and operator-only
+# (a calling agent can't inject a prompt). An empty value is a loud load error.
+# Precedence per phase: slot `preamble` (per-model, above) > [prompts].<phase> >
+# built-in. The synth slot feeds both `synthesize` and `consult`, but each keeps
+# its own key, so they can diverge.
+# ---------------------------------------------------------------------------
+#
+# [prompts]
+# explorer   = "You are a security auditor. Hunt injection sinks and unsafe deserialization."
+# synthesize = "Answer concisely; lead with the file:line that settles it."
+# consult    = """
+# You are a staff engineer reviewing this codebase.
+# Prefer architectural answers; name the file:line that carries each claim.
+# """

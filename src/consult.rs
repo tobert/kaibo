@@ -76,6 +76,41 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
     }
 }
 
+/// Operator preamble (system-prompt) overrides per phase, from the `[prompts]`
+/// config table. `None` for a phase means "use the built-in" — so an empty table
+/// is byte-for-byte the historical preambles. **Full replace** by decision: an
+/// override *is* the role framing, verbatim; the kaish operating contract is not
+/// re-appended here because it independently rides the `run_kaish` tool
+/// description (`run_kaish_tool_description`), so the model keeps the shell
+/// contract even when an operator rewrites the prose. Empty/whitespace values are
+/// refused at config load (`config.rs::merge_prompts`) — a blank system prompt is
+/// never the intent. House rules still append on top (see [`phase_preamble`]):
+/// `[prompts]` replaces the *role* framing, `[context]` adds *project* guidance —
+/// orthogonal axes.
+#[derive(Debug, Clone, Default)]
+pub struct PromptOverrides {
+    /// Replaces [`report_preamble`] — the explorer, both standalone and the
+    /// nested `explore′` sweep.
+    pub explorer: Option<String>,
+    /// Replaces [`synthesize_preamble`] — the standalone `synthesize`.
+    pub synthesize: Option<String>,
+    /// Replaces [`consult_preamble`] — the `consult` driver.
+    pub consult: Option<String>,
+}
+
+/// Resolve one phase's full system prompt: the operator override if set, else the
+/// built-in `default`, then house rules appended. The single composition point for
+/// every model-driven phase, so override + `[context]` layering is identical
+/// everywhere (and the call sites read as one line).
+fn phase_preamble(
+    override_: Option<&str>,
+    default: fn() -> String,
+    house_rules: Option<&str>,
+) -> String {
+    let base = override_.map(str::to_string).unwrap_or_else(default);
+    with_house_rules(base, house_rules)
+}
+
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
@@ -733,6 +768,10 @@ pub struct ConsultConfig {
     /// The server fills it per call (it needs the resolved root to read the files);
     /// the `Default` is `None`, so every offline test runs the unchanged preamble.
     pub house_rules: Option<Arc<str>>,
+    /// Per-phase system-prompt overrides (`[prompts]`). `Default` is empty, so the
+    /// built-in preambles run unchanged. Server-set per call from the resolved
+    /// config. See [`PromptOverrides`].
+    pub prompts: PromptOverrides,
 }
 
 impl Default for ConsultConfig {
@@ -744,6 +783,7 @@ impl Default for ConsultConfig {
             sandbox: SandboxConfig::default(),
             progress: Arc::new(NullSink),
             house_rules: None,
+            prompts: PromptOverrides::default(),
         }
     }
 }
@@ -1196,11 +1236,11 @@ pub struct RunExplore {
     /// handed to the nested kernel's `run_kaish` so the sub-agent's own reads show
     /// through too (a delegated sweep is where a long consult spends its silence).
     progress: Arc<dyn ProgressSink>,
-    /// The operator's house rules (or `None`), spliced onto the sweep preamble so
-    /// the cheap explorer orients on the same `AGENTS.md`/user guidance the driver
-    /// and standalone `explore` get — the block helps *search*, not just the final
-    /// answer (it names where things live and what matters).
-    house_rules: Option<Arc<str>>,
+    /// The sweep's fully-resolved system prompt, computed once by `consult_tools`:
+    /// the explorer override-or-default with house rules already appended. So the
+    /// nested explorer carries the same `[prompts]`/`[context]` framing as the
+    /// standalone `explore`, built once instead of per sweep.
+    preamble: Arc<str>,
 }
 
 impl RunExplore {
@@ -1212,7 +1252,7 @@ impl RunExplore {
         sandbox: SandboxConfig,
         reports: Arc<Mutex<Vec<String>>>,
         progress: Arc<dyn ProgressSink>,
-        house_rules: Option<Arc<str>>,
+        preamble: Arc<str>,
     ) -> Self {
         Self {
             arm,
@@ -1221,7 +1261,7 @@ impl RunExplore {
             sandbox,
             reports,
             progress,
-            house_rules,
+            preamble,
         }
     }
 }
@@ -1285,7 +1325,7 @@ impl Tool for RunExplore {
         let result = self
             .arm
             .run(
-                &with_house_rules(report_preamble(), self.house_rules.as_deref()),
+                &self.preamble,
                 args.question,
                 self.max_turns,
                 self.progress.as_ref(),
@@ -1319,7 +1359,11 @@ pub async fn explore(
 ) -> Result<String> {
     let root = root.into();
     arm.run(
-        &with_house_rules(report_preamble(), cfg.house_rules.as_deref()),
+        &phase_preamble(
+            cfg.prompts.explorer.as_deref(),
+            report_preamble,
+            cfg.house_rules.as_deref(),
+        ),
         question.to_string(),
         cfg.explorer_max_turns,
         cfg.progress.as_ref(),
@@ -1413,7 +1457,11 @@ pub async fn synthesize(
     let root = root.into();
     let user_prompt = synthesize_user_prompt(question, context);
     arm.run(
-        &with_house_rules(synthesize_preamble(), cfg.house_rules.as_deref()),
+        &phase_preamble(
+            cfg.prompts.synthesize.as_deref(),
+            synthesize_preamble,
+            cfg.house_rules.as_deref(),
+        ),
         user_prompt,
         cfg.synth_max_turns,
         cfg.progress.as_ref(),
@@ -1493,7 +1541,14 @@ fn consult_tools(
     // pointed at the explorer arm — its own client, model, and request shape,
     // which may live on a different backend than the driver's. Bounded by
     // explorer_max_turns per sweep; no cap on how many times consult may delegate
-    // (Amy's call — watch real behavior).
+    // (Amy's call — watch real behavior). Its system prompt is the same explorer
+    // override-or-default + house rules the standalone `explore` resolves, built
+    // once here rather than per sweep.
+    let explorer_preamble: Arc<str> = Arc::from(phase_preamble(
+        cfg.prompts.explorer.as_deref(),
+        report_preamble,
+        cfg.house_rules.as_deref(),
+    ));
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explorer_max_turns,
@@ -1501,7 +1556,7 @@ fn consult_tools(
         cfg.sandbox.clone(),
         reports,
         cfg.progress.clone(),
-        cfg.house_rules.clone(),
+        explorer_preamble,
     );
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
         Box::new(RunKaish::with_progress(
@@ -1538,7 +1593,11 @@ pub(crate) async fn consult_with(
 
     let answer = synth
         .run(
-            &with_house_rules(consult_preamble(), cfg.house_rules.as_deref()),
+            &phase_preamble(
+                cfg.prompts.consult.as_deref(),
+                consult_preamble,
+                cfg.house_rules.as_deref(),
+            ),
             user_prompt.to_string(),
             cfg.synth_max_turns,
             cfg.progress.as_ref(),
@@ -1796,6 +1855,85 @@ mod tests {
         assert!(
             explorer_pre.contains("code explorer"),
             "still the explorer's own role framing: {explorer_pre}"
+        );
+    }
+
+    /// A `[prompts]` override **fully replaces** the built-in preamble: the
+    /// operator's prose is verbatim, and the built-in role framing is *gone* (the
+    /// kaish contract still rides the `run_kaish` tool, untested here). House rules
+    /// still append on top — `[prompts]` and `[context]` are orthogonal axes. We
+    /// drive a single `explore` phase and read back what the model was handed.
+    #[tokio::test]
+    async fn a_prompt_override_fully_replaces_the_preamble_and_house_rules_still_append() {
+        const MODEL: &str = "explorer";
+        const CUSTOM: &str = "You are a SECURITY AUDITOR. Hunt injection sinks.";
+        const HOUSE: &str = "HOUSE_RULE_MARKER: prefer tabs";
+
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .build();
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig {
+            prompts: PromptOverrides {
+                explorer: Some(CUSTOM.to_string()),
+                ..PromptOverrides::default()
+            },
+            house_rules: Some(Arc::from(HOUSE)),
+            ..ConsultConfig::default()
+        };
+        explore("q", dir.path(), &arm(&client, MODEL), &cfg)
+            .await
+            .unwrap();
+
+        let reqs = client.requests_for(MODEL);
+        let pre = reqs[0].preamble.as_deref().unwrap_or("");
+        // The override is verbatim...
+        assert!(pre.contains(CUSTOM), "override prose missing: {pre}");
+        // ...the built-in framing is fully replaced (full-replace, by decision)...
+        assert!(
+            !pre.contains("code explorer"),
+            "override must REPLACE, not augment, the built-in: {pre}"
+        );
+        // ...and house rules still layer on top.
+        assert!(pre.contains(HOUSE), "house rules must still append: {pre}");
+    }
+
+    /// Each phase reads its *own* override key — an `explorer`-only override must
+    /// not bleed into the `synthesize` phase, which keeps its built-in. Guards the
+    /// per-phase routing in [`phase_preamble`]/[`PromptOverrides`].
+    #[tokio::test]
+    async fn prompt_overrides_are_per_phase() {
+        const MODEL: &str = "synth";
+        const CUSTOM_EXPLORER: &str = "EXPLORER_ONLY_OVERRIDE";
+
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .build();
+        let dir = tempdir().unwrap();
+        // Only the explorer key is set; the synthesize phase must ignore it.
+        let cfg = ConsultConfig {
+            prompts: PromptOverrides {
+                explorer: Some(CUSTOM_EXPLORER.to_string()),
+                ..PromptOverrides::default()
+            },
+            ..ConsultConfig::default()
+        };
+        synthesize("q", None, dir.path(), &arm(&client, MODEL), &cfg)
+            .await
+            .unwrap();
+
+        let pre = client.requests_for(MODEL)[0]
+            .preamble
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            !pre.contains(CUSTOM_EXPLORER),
+            "the explorer override must not bleed into synthesize: {pre}"
+        );
+        // synthesize keeps its built-in framing.
+        assert!(
+            pre.contains("You answer a question about a codebase"),
+            "synthesize keeps its built-in preamble: {pre}"
         );
     }
 

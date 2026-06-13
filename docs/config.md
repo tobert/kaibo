@@ -106,6 +106,7 @@ image    = "sd/sdxl-turbo"                  # image gen stays local
 
 # table form: id + capability pins + per-slot tunables
 # synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
+# explorer = { backend = "openai", id = "Gemma-4-E4B-it", preamble = "..." }  # per-model prompt
 ```
 
 - **Known roles:** `explorer`, `synth`, `image`, `tts`. A typo'd role (or a typo'd
@@ -137,11 +138,13 @@ image    = "sd/sdxl-turbo"                  # image gen stays local
 The split un-straddles the knobs. **Connection knobs ride the backend** (key
 source, `base_url`, `request_timeout_secs` — they describe the wire).
 **Model-tracking knobs ride the slot** (`max_tokens`, `thinking_budget`,
-`temperature`, `effort`, `thinking_style`, the `vision` pin — they describe the
-model), each falling back to its per-role `[defaults]` value when omitted
-(`explorer` slots inherit the `explorer_*` defaults; `synth` and the media roles
-inherit the `synth_*` side). A profile-level `max_tokens` awkwardly shared by two
-models no longer exists.
+`temperature`, `effort`, `thinking_style`, the `vision` pin, and `preamble` — they
+describe the model), each falling back to its per-role `[defaults]` value when
+omitted (`explorer` slots inherit the `explorer_*` defaults; `synth` and the media
+roles inherit the `synth_*` side). A profile-level `max_tokens` awkwardly shared by
+two models no longer exists. The `preamble` knob is the per-model system prompt —
+its own fallback chain (it has no `[defaults]` entry) is documented under
+[System prompts](#system-prompts-prompts) below.
 
 The `[defaults]` knobs themselves:
 
@@ -281,6 +284,9 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | export headers | `telemetry.headers` *(map; file-only — values are secrets)* | — | — |
 | project house-rules files | `context.project_files` *(list; default `["AGENTS.md"]`)* | `KAIBO_PROJECT_FILES` *(colon-separated)* | `--project-context-file FILE` *(repeatable)* |
 | user house-rules files | `context.user_files` *(list)* | `KAIBO_USER_FILES` *(colon-separated)* | `--user-context-file FILE` *(repeatable)* |
+| explorer system prompt | `prompts.explorer` *(file-only — full replace)* | — | — |
+| synthesize system prompt | `prompts.synthesize` *(file-only — full replace)* | — | — |
+| consult system prompt | `prompts.consult` *(file-only — full replace)* | — | — |
 
 **Two deliberate exceptions to the rule:**
 
@@ -422,6 +428,76 @@ what matters). Precedence is the usual per-call > CLI > env > file > built-in: a
 CLI `--project-context-file` replaces lower layers additively (the CLI can't
 express "empty"; opt out with an empty `[context] project_files = []` or
 `KAIBO_PROJECT_FILES=`).
+
+## System prompts: `[prompts]`
+
+Where `[context]` *adds* project guidance, `[prompts]` *replaces* the built-in
+role framing — the system prompt each phase runs under. One override per phase:
+
+```toml
+[prompts]
+explorer = "You are a security auditor. Hunt injection sinks and unsafe deserialization."
+
+# Triple-quoted for multiline — the usual authoring shape.
+consult = """
+You are a staff engineer reviewing this codebase.
+Prefer architectural answers; name the file:line that carries each claim.
+"""
+```
+
+| key | replaces | runs in |
+|---|---|---|
+| `explorer` | `report_preamble` | standalone `explore` **and** the nested `explore′` sweep |
+| `synthesize` | `synthesize_preamble` | standalone `synthesize` |
+| `consult` | `consult_preamble` | the `consult` driver |
+
+**Full replace, by decision.** An override *is* the role framing, verbatim — kaibo
+does not re-wrap it. That's safe because the kaish operating contract (how to drive
+the read-only shell, the exit-code meanings, the `cat -n`/`rg -n` idioms) rides the
+`run_kaish` *tool description* independently, so the model keeps the shell contract
+even when you rewrite the prose. What an override *does* drop is the tuned role
+framing kaibo ships — the explorer's "report, don't conclude", the synth's "trust a
+grounded citation, reach for more", the positive-framing discipline weak/local
+models lean on. That's yours to own when you override.
+
+**Orthogonal to `[context]`.** House rules still append on top of an override:
+`[prompts]` sets the *role*, `[context]` adds the *project's* conventions, and both
+land in the final system prompt. Layering order is `override-or-built-in` →
+`+ house rules`.
+
+**File-only, and operator-only.** Multiline prose has no clean env/CLI form (the
+same call `telemetry.headers` makes), so overrides live only in `config.toml`. They
+are *not* a per-call tool argument — a calling agent can't inject a system prompt;
+only the operator who owns the config can. An empty or whitespace-only override is
+a **loud load error** (a blank system prompt is never intended) — remove the key to
+fall back to the built-in.
+
+### Per-model overrides (the slot `preamble`)
+
+`[prompts]` is keyed by *phase* (the job). A prompt can also be keyed by *model*,
+because the same phase may run different models — a local Gemma explorer wants
+different framing than a Claude Haiku one (kaibo's request shaping is already
+model-aware; the prose is too). The per-model knob is `preamble` on the cast's
+**slot**, beside `effort`/`thinking_style`:
+
+```toml
+[casts.local]
+explorer = { backend = "openai", id = "Gemma-4-E4B-it", preamble = "You are a careful reader; quote exact lines." }
+synth    = "anthropic/claude-sonnet-4-6"   # no per-model prompt; uses [prompts] or built-in
+```
+
+**Precedence, per phase:** `slot.preamble` → `[prompts].<phase>` → built-in. The
+slot (most specific — *this* model in *this* cast) wins, the same way `effort`
+overrides the `[defaults]` effort. Set neither and the built-in runs.
+
+**One model, two synth jobs.** The synth slot's model plays *both* the standalone
+`synthesize` and the `consult` driver, so its `preamble` feeds both — but each phase
+resolves under its own key, so they stay **independently overridable**: a copy today
+(both the synth slot's voice), free to diverge by setting `[prompts].synthesize` and
+`[prompts].consult` separately. `slot.preamble` = "this model's voice"; the phase
+keys = "this job's framing." The explorer has one job, so no ambiguity. A per-call
+model override (a bare slot) carries no `preamble` — overriding the model doesn't
+drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`.
 
 ## Path containment
 

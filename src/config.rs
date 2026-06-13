@@ -33,7 +33,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-use crate::consult::{ModelCaps, ThinkingStyleOverride};
+use crate::consult::{ModelCaps, PromptOverrides, ThinkingStyleOverride};
 use crate::context::ContextConfig;
 use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use crate::sandbox::SandboxConfig;
@@ -202,6 +202,12 @@ pub struct ModelSlot {
     pub temperature: Option<f64>,
     pub effort: Option<String>,
     pub thinking_style: Option<ThinkingStyleOverride>,
+    /// Per-model system-prompt override: the role framing this *model* runs under,
+    /// beside its other per-slot knobs. Full replace, like `[prompts]` (the kaish
+    /// contract rides the `run_kaish` tool regardless). Resolved per phase by the
+    /// server, winning over the per-phase `[prompts]` and the built-in. `None` →
+    /// fall back to those. A per-call model override (a `bare` slot) carries none.
+    pub preamble: Option<String>,
 }
 
 impl ModelSlot {
@@ -218,6 +224,7 @@ impl ModelSlot {
             temperature: None,
             effort: None,
             thinking_style: None,
+            preamble: None,
         }
     }
 
@@ -522,6 +529,9 @@ pub struct Config {
     /// House-rules files spliced into each consultation tool's preamble (the
     /// `[context]` table). Defaults to reading `AGENTS.md` when present.
     pub context: ContextConfig,
+    /// Per-phase system-prompt overrides (the `[prompts]` table). Empty by
+    /// default — the built-in preambles run unchanged.
+    pub prompts: PromptOverrides,
     /// Read-only sandbox limits (exec timeout, output cap, extra disabled builtins).
     pub sandbox: SandboxConfig,
     /// Backends (connections) by name.
@@ -912,6 +922,7 @@ impl Config {
             .collect();
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default());
+        let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
@@ -935,6 +946,7 @@ impl Config {
             defaults,
             telemetry,
             context,
+            prompts,
             sandbox,
             backends,
             casts,
@@ -1133,6 +1145,7 @@ struct RawConfig {
     defaults: Option<RawDefaults>,
     telemetry: Option<RawTelemetry>,
     context: Option<RawContext>,
+    prompts: Option<RawPrompts>,
     sandbox: Option<RawSandbox>,
     backends: Option<BTreeMap<String, RawBackend>>,
     casts: Option<BTreeMap<String, RawCast>>,
@@ -1179,6 +1192,22 @@ struct RawContext {
     /// Absolute/tilde files read unconditionally (missing = error). Env:
     /// `KAIBO_USER_FILES` (colon-separated). Default: empty.
     user_files: Option<Vec<String>>,
+}
+
+/// The `[prompts]` stanza — per-phase system-prompt (preamble) overrides. Each
+/// is the full role framing, verbatim (the kaish contract rides the `run_kaish`
+/// tool independently). All optional; an absent table runs the built-ins. File-
+/// only: multiline prose has no clean env/CLI form (same call as
+/// `telemetry.headers`). See [`PromptOverrides`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPrompts {
+    /// Replaces the explorer preamble (standalone `explore` and nested `explore′`).
+    explorer: Option<String>,
+    /// Replaces the standalone `synthesize` preamble.
+    synthesize: Option<String>,
+    /// Replaces the `consult` driver preamble.
+    consult: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1346,6 +1375,7 @@ struct RawSlotTable {
     temperature: Option<f64>,
     effort: Option<String>,
     thinking_style: Option<String>,
+    preamble: Option<String>,
 }
 
 impl RawSlot {
@@ -1373,6 +1403,16 @@ impl RawSlot {
                     .map(str::parse)
                     .transpose()
                     .context("thinking_style")?,
+                // Same loud-on-empty rule as `[prompts]`: a blank per-model prompt
+                // is never intended, and silently running it would strip the role
+                // framing with no signal. Drop the key to fall back.
+                preamble: match t.preamble {
+                    Some(p) if p.trim().is_empty() => bail!(
+                        "slot preamble is empty — a blank system prompt is never \
+                         intended; remove the key to use the built-in/`[prompts]` value"
+                    ),
+                    other => other,
+                },
             }),
         }
     }
@@ -1448,6 +1488,27 @@ fn merge_context(raw: RawContext) -> ContextConfig {
             .map(|s| expand_tilde(s))
             .collect(),
     }
+}
+
+/// Resolve `[prompts]`. Each override is taken verbatim (full replace), but an
+/// empty or whitespace-only value is refused loudly: a blank system prompt is
+/// never the intent, and silently running it would strip the role framing with no
+/// signal. Remove the key to fall back to the built-in.
+fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
+    fn non_empty(label: &str, v: Option<String>) -> Result<Option<String>> {
+        match v {
+            Some(s) if s.trim().is_empty() => bail!(
+                "[prompts] {label} is empty — a blank system prompt is never intended; \
+                 remove the key to use the built-in preamble"
+            ),
+            other => Ok(other),
+        }
+    }
+    Ok(PromptOverrides {
+        explorer: non_empty("explorer", raw.explorer)?,
+        synthesize: non_empty("synthesize", raw.synthesize)?,
+        consult: non_empty("consult", raw.consult)?,
+    })
 }
 
 fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {

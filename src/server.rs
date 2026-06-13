@@ -27,7 +27,7 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig};
+use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig, PromptOverrides};
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
 use crate::image_gen::ImageGen;
@@ -472,6 +472,28 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
+    /// Resolve this call's per-phase system prompts for `cast`: the per-model slot
+    /// `preamble` (if set) wins over the global `[prompts].<phase>`, which wins over
+    /// the built-in (resolved downstream in `consult.rs`). The synth slot's preamble
+    /// feeds *both* synth phases — standalone `synthesize` and the `consult` driver —
+    /// but through their own keys, so they stay independently overridable (a copy
+    /// today, free to diverge). `cast` is the post-override clone, so a per-call
+    /// model override (a bare slot) correctly carries no preamble.
+    fn resolved_prompts(&self, cast: &Cast) -> PromptOverrides {
+        let mut p = self.config.prompts.clone();
+        if let Some(pre) = cast
+            .slot(ModelRole::Explorer)
+            .and_then(|s| s.preamble.clone())
+        {
+            p.explorer = Some(pre);
+        }
+        if let Some(pre) = cast.slot(ModelRole::Synth).and_then(|s| s.preamble.clone()) {
+            p.synthesize = Some(pre.clone());
+            p.consult = Some(pre);
+        }
+        p
+    }
+
     /// Resolve a call's cast: the explicit name (looked up in the registry, by
     /// name or alias), else the server's default cast. An unknown name is a
     /// parameter error naming the available casts. Returns an owned clone so the
@@ -653,6 +675,7 @@ impl KaiboHandler {
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
             house_rules: self.house_rules(&root)?,
+            prompts: self.resolved_prompts(&cast),
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -719,6 +742,7 @@ impl KaiboHandler {
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
             house_rules: self.house_rules(&root)?,
+            prompts: self.resolved_prompts(&cast),
         };
 
         let span = tracing::info_span!("explore", cast = %cast.name, model = %arm.model);
@@ -769,6 +793,7 @@ impl KaiboHandler {
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
             house_rules: self.house_rules(&root)?,
+            prompts: self.resolved_prompts(&cast),
         };
 
         let span = tracing::info_span!(
@@ -1211,6 +1236,10 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         effort: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking_style: Option<String>,
+        /// The per-model system-prompt override, verbatim (not a secret — it's the
+        /// operator's own framing). Absent when unset.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preamble: Option<String>,
     }
 
     /// A cast's role table, keyed by role. Only configured roles appear.
@@ -1268,6 +1297,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
                         temperature,
                         effort,
                         thinking_style,
+                        preamble,
                     } = slot;
                     let caps = config
                         .slot_caps(slot)
@@ -1282,6 +1312,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
                             temperature: *temperature,
                             effort: effort.clone(),
                             thinking_style: thinking_style.map(|s| format!("{s:?}").to_lowercase()),
+                            preamble: preamble.clone(),
                         },
                     )
                 })
@@ -1533,6 +1564,93 @@ mod tests {
 
     fn handler() -> KaiboHandler {
         KaiboHandler::new(Config::builtin()).expect("handler builds")
+    }
+
+    fn handler_from_toml(toml: &str) -> KaiboHandler {
+        KaiboHandler::new(Config::from_toml_str(toml).expect("config parses"))
+            .expect("handler builds")
+    }
+
+    /// A per-model slot `preamble` wins over the global `[prompts].<phase>`, and the
+    /// synth slot feeds *both* synth phases (standalone `synthesize` and the consult
+    /// driver) — the "its own, even if a copy" shape: same value today, but each
+    /// arrives under its own key, free to diverge.
+    #[test]
+    fn slot_preamble_wins_over_phase_prompts_and_feeds_both_synth_phases() {
+        let h = handler_from_toml(
+            r#"
+            [prompts]
+            explorer = "EXP_PHASE"
+            synthesize = "SYN_PHASE"
+            consult = "CON_PHASE"
+
+            [casts.team]
+            explorer = { backend = "anthropic", id = "claude-haiku-4-5", preamble = "EXP_SLOT" }
+            synth = { backend = "anthropic", id = "claude-opus-4-8", preamble = "SYNTH_SLOT" }
+            "#,
+        );
+        let cast = h.resolve_cast(Some("team".into())).unwrap();
+        let p = h.resolved_prompts(&cast);
+        // Slot wins over the phase prompt for the explorer...
+        assert_eq!(p.explorer.as_deref(), Some("EXP_SLOT"));
+        // ...and the synth slot's voice reaches BOTH synth phases, each via its own
+        // key (a copy for now, independently addressable).
+        assert_eq!(p.synthesize.as_deref(), Some("SYNTH_SLOT"));
+        assert_eq!(p.consult.as_deref(), Some("SYNTH_SLOT"));
+    }
+
+    /// With no slot preambles, the global `[prompts]` is the fallback — and the two
+    /// synth phases keep *independent* keys, so standalone `synthesize` can differ
+    /// from the `consult` driver. This is the "standalone synth is its own" guarantee.
+    #[test]
+    fn phase_prompts_are_the_fallback_and_synth_phases_stay_independent() {
+        let h = handler_from_toml(
+            r#"
+            [prompts]
+            synthesize = "STANDALONE_ONLY"
+            consult = "DRIVER_ONLY"
+
+            [casts.team]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth = "anthropic/claude-opus-4-8"
+            "#,
+        );
+        let cast = h.resolve_cast(Some("team".into())).unwrap();
+        let p = h.resolved_prompts(&cast);
+        assert!(p.explorer.is_none(), "no explorer prompt set anywhere");
+        // The two synth phases diverge — proof they're not collapsed into one.
+        assert_eq!(p.synthesize.as_deref(), Some("STANDALONE_ONLY"));
+        assert_eq!(p.consult.as_deref(), Some("DRIVER_ONLY"));
+    }
+
+    /// A per-call model override (a bare slot) carries no preamble — so overriding
+    /// the model doesn't silently drag along the configured slot's framing.
+    #[test]
+    fn a_per_call_model_override_carries_no_slot_preamble() {
+        let h = handler_from_toml(
+            r#"
+            [casts.team]
+            explorer = { backend = "anthropic", id = "claude-haiku-4-5", preamble = "EXP_SLOT" }
+            synth = "anthropic/claude-opus-4-8"
+            "#,
+        );
+        let mut cast = h.resolve_cast(Some("team".into())).unwrap();
+        // Simulate a per-call explorer model override → bare slot, preamble dropped.
+        h.apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            Some("claude-haiku-4-5"),
+            None,
+            "model",
+            "backend",
+        )
+        .unwrap();
+        let p = h.resolved_prompts(&cast);
+        assert!(
+            p.explorer.is_none(),
+            "a bare (per-call-override) slot must carry no preamble, got {:?}",
+            p.explorer
+        );
     }
 
     /// Progress is opt-in: with no `progressToken` in `_meta` we send nothing, so the

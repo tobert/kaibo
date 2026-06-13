@@ -1390,3 +1390,106 @@ fn context_env_overrides_file_and_empty_opts_out() {
         c.context.user_files
     );
 }
+
+// --- [prompts] system-prompt overrides ----------------------------------------
+
+/// No `[prompts]` table → every override is `None` (the built-in preambles run).
+#[test]
+fn prompts_default_to_no_overrides() {
+    let c = Config::builtin();
+    assert!(c.prompts.explorer.is_none());
+    assert!(c.prompts.synthesize.is_none());
+    assert!(c.prompts.consult.is_none());
+}
+
+/// A `[prompts]` table is parsed verbatim, per phase — including a multiline
+/// triple-quoted prompt, the expected authoring shape.
+#[test]
+fn prompts_table_sets_per_phase_overrides() {
+    let c = Config::from_toml_str(
+        r#"
+        [prompts]
+        explorer = "You are a security auditor."
+        consult = """
+        You are a staff engineer.
+        Prefer architectural answers.
+        """
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        c.prompts.explorer.as_deref(),
+        Some("You are a security auditor.")
+    );
+    assert!(c
+        .prompts
+        .consult
+        .as_deref()
+        .unwrap()
+        .contains("staff engineer"));
+    // An unset phase stays None — the built-in runs.
+    assert!(c.prompts.synthesize.is_none());
+}
+
+/// An empty (or whitespace-only) override is a loud load error — a blank system
+/// prompt is never intended, and silently running it would strip the role framing
+/// with no signal. Remove the key to fall back to the built-in.
+#[test]
+fn an_empty_prompt_override_is_a_loud_error() {
+    for value in ["\"\"", "\"   \""] {
+        let toml = format!("[prompts]\nexplorer = {value}\n");
+        let err = Config::from_toml_str(&toml)
+            .expect_err(&format!("empty override {value} must be rejected"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[prompts] explorer"), "names the key: {msg}");
+        assert!(msg.contains("empty"), "explains why: {msg}");
+    }
+}
+
+/// An unknown phase key is a typo, not a silently-ignored no-op — `deny_unknown_fields`.
+#[test]
+fn an_unknown_prompt_key_is_a_load_error() {
+    let err = Config::from_toml_str("[prompts]\nsynth = \"oops, wrong key\"\n")
+        .expect_err("an unknown [prompts] key must be a load error");
+    assert!(format!("{err:#}").contains("synth"), "names the bad key");
+}
+
+/// A per-model `preamble` rides the cast's slot table, beside effort/thinking_style.
+#[test]
+fn a_slot_carries_a_per_model_preamble() {
+    let c = Config::from_toml_str(
+        r#"
+        [casts.team]
+        explorer = { backend = "openai", id = "Gemma-4-E4B-it", preamble = "You are a careful reader." }
+        synth = "anthropic/claude-sonnet-4-6"
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("team").unwrap();
+    assert_eq!(
+        cast.require_slot(ModelRole::Explorer)
+            .unwrap()
+            .preamble
+            .as_deref(),
+        Some("You are a careful reader.")
+    );
+    // The string-form synth slot carries none.
+    assert!(cast
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .preamble
+        .is_none());
+}
+
+/// An empty slot preamble is a loud load error — same rule as `[prompts]`.
+#[test]
+fn an_empty_slot_preamble_is_a_loud_error() {
+    let err = Config::from_toml_str(
+        r#"
+        [casts.x]
+        synth = { backend = "anthropic", id = "claude-opus-4-8", preamble = "   " }
+        "#,
+    )
+    .expect_err("a blank slot preamble must be rejected");
+    assert!(format!("{err:#}").contains("preamble"), "names it: {err:#}");
+}
