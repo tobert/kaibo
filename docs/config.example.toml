@@ -211,10 +211,10 @@ key_optional = true
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
 #
-# Roles: explorer, synth (the agent phases), image (a production role for the
-# media builtins as they land). A typo'd role is a loud load error. A cast may
-# omit roles — the tool that needs a missing role fails at call time, naming the
-# gap ("cast `notes` has no synth slot"); absent = capability absent.
+# Roles: explorer, synth (the agent phases), image (the `generate_image` capability —
+# an openai-kind slot that genuinely produces a picture). A typo'd role is a loud load
+# error. A cast may omit roles — the tool that needs a missing role fails at call time,
+# naming the gap ("cast `notes` has no image slot"); absent = capability absent.
 #
 # Slot forms:
 #   role = "backend/model-id"                                  # the common case

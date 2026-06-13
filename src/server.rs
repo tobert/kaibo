@@ -29,6 +29,8 @@ use tracing::Instrument;
 use crate::config::{Cast, Config, ModelRole, ModelSlot};
 use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig};
 use crate::explorer::format_output;
+use crate::generate_image::GenerateImageInput;
+use crate::image_gen::ImageGen;
 use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
@@ -71,6 +73,7 @@ pub struct ToolGating {
     pub explore: bool,
     pub synthesize: bool,
     pub run_kaish: bool,
+    pub generate_image: bool,
 }
 
 impl Default for ToolGating {
@@ -80,6 +83,7 @@ impl Default for ToolGating {
             explore: true,
             synthesize: true,
             run_kaish: true,
+            generate_image: true,
         }
     }
 }
@@ -87,7 +91,11 @@ impl Default for ToolGating {
 impl ToolGating {
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
-        !self.consult && !self.explore && !self.synthesize && !self.run_kaish
+        !self.consult
+            && !self.explore
+            && !self.synthesize
+            && !self.run_kaish
+            && !self.generate_image
     }
 }
 
@@ -301,6 +309,7 @@ impl KaiboHandler {
             (gating.explore, "explore"),
             (gating.synthesize, "synthesize"),
             (gating.run_kaish, "run_kaish"),
+            (gating.generate_image, "generate_image"),
         ] {
             if !enabled {
                 assert!(
@@ -556,6 +565,24 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
+    /// Resolve a cast's `image` slot into an image generator (a *capability*, not a
+    /// model loop). A missing slot is the loud call-time gap (absent = capability
+    /// absent, same as `arm`); a non-openai backend is refused inside `from_slot`
+    /// (rig 0.38 has no image path for the keyed protocols). Both surface as a
+    /// parameter error the caller can act on — pick a cast with an openai `image`
+    /// slot, or configure one.
+    fn image_gen(&self, cast: &Cast) -> Result<Arc<dyn ImageGen>, McpError> {
+        let slot = cast
+            .require_slot(ModelRole::Image)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let backend = self
+            .config
+            .resolve_backend(&slot.backend)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        crate::image_gen::rig_openai(backend, slot)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
+    }
+
     #[tool(
         description = "Investigate a question about a codebase and return a grounded, \
             cited answer. A capable model drives a read-only kaish shell \
@@ -785,6 +812,51 @@ impl KaiboHandler {
         Ok(CallToolResult::success(vec![Content::text(format_output(
             &out,
         ))]))
+    }
+
+    #[tool(
+        description = "Generate an image from a text prompt and return it inline. A \
+            capability tool: no codebase investigation, no shell — kaibo's image model \
+            (the cast's `image` slot) draws what you describe and hands back the picture \
+            as an image plus a short caption. The cast must carry an `image` slot on an \
+            OpenAI-compatible backend (hosted gpt-image/DALL·E, or a local \
+            Stable-Diffusion server speaking /v1/images/generations); see kaibo://config \
+            for the configured casts. The image rides back inline (size-capped); a \
+            picture too large to inline is a clear error, not a silent drop. Args: \
+            prompt (required), cast (optional), size (\"WxH\", default 1024x1024), \
+            image_model (override the slot's model id)."
+    )]
+    pub async fn generate_image(
+        &self,
+        Parameters(input): Parameters<GenerateImageInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut cast = self.resolve_cast(input.cast.clone())?;
+        // Optional per-call model id override on the image slot (keeps its backend).
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Image,
+            input.image_model.as_deref(),
+            None,
+            "image_model",
+            "image_backend",
+        )?;
+        let generator = self.image_gen(&cast)?;
+        let size = crate::generate_image::parse_size(input.size.as_deref())
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        // A capability call: a single provider request, no model loop. The span
+        // captures its wall-clock from the caller side.
+        let span = tracing::info_span!("generate_image", cast = %cast.name, size = ?size);
+        let image = crate::generate_image::generate(generator.as_ref(), &input.prompt, size)
+            .instrument(span)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        Ok(CallToolResult::success(crate::generate_image::to_content(
+            &image,
+            &input.prompt,
+            size,
+        )))
     }
 }
 
@@ -1026,6 +1098,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         explore: bool,
         synthesize: bool,
         run_kaish: bool,
+        generate_image: bool,
     }
 
     #[derive(Serialize)]
@@ -1194,6 +1267,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         explore,
         synthesize,
         run_kaish,
+        generate_image,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -1234,6 +1308,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
             explore,
             synthesize,
             run_kaish,
+            generate_image,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),

@@ -69,6 +69,10 @@ struct Args {
     /// Don't advertise the `run_kaish` tool.
     #[arg(long)]
     no_run_kaish: bool,
+
+    /// Don't advertise the `generate_image` tool.
+    #[arg(long)]
+    no_generate_image: bool,
 }
 
 #[tokio::main]
@@ -100,6 +104,7 @@ async fn main() -> Result<()> {
             explore: args.no_explore,
             synthesize: args.no_synthesize,
             run_kaish: args.no_run_kaish,
+            generate_image: args.no_generate_image,
         },
         args.allow_path.clone(),
     );

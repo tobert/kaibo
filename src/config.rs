@@ -975,6 +975,9 @@ impl Config {
         if disable.run_kaish {
             self.tools.run_kaish = false;
         }
+        if disable.generate_image {
+            self.tools.generate_image = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -991,6 +994,7 @@ pub struct ToolDisables {
     pub explore: bool,
     pub synthesize: bool,
     pub run_kaish: bool,
+    pub generate_image: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -1165,6 +1169,7 @@ struct RawTools {
     explore: Option<bool>,
     synthesize: Option<bool>,
     run_kaish: Option<bool>,
+    generate_image: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1412,6 +1417,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         explore: raw.explore.unwrap_or(d.explore),
         synthesize: raw.synthesize.unwrap_or(d.synthesize),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
+        generate_image: raw.generate_image.unwrap_or(d.generate_image),
     }
 }
 
@@ -1460,6 +1466,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_RUN_KAISH") {
         tools.run_kaish = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_GENERATE_IMAGE") {
+        tools.generate_image = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);

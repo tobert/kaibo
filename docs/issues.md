@@ -1,9 +1,10 @@
 # kaibo — Known Issues & Open Work
 
-解剖（かいぼう）'s punch list. kaibo dissects a codebase read-only and answers
-questions; this file is where we record what's missing, what's fragile, and what
-we'd improve. Evidence-first — name the file, the line, the *why*, and how it
-surfaced.
+解剖（かいぼう）'s punch list. kaibo is an assistant agent for other agents — a team
+of models offering *consultation* (read-only, cited codebase answers) and
+*capabilities* (image generation today, more later). This file is where we record
+what's missing, what's fragile, and what we'd improve. Evidence-first — name the
+file, the line, the *why*, and how it surfaced.
 
 Conventions:
 
@@ -13,6 +14,28 @@ Conventions:
   (`kaibo-architecture`, `kaish-readonly-bypass`, `provider-model-ids`).
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
+
+Last pass: 2026-06-13 (image-out SHIPPED, **live-verified** — kaibo's first
+*capability* (vs. consultation). `generate_image` (`generate_image.rs` + a `server.rs`
+handler) is a dedicated MCP tool, **not** a `run_phase` costume and **not** a kaish
+builtin: it resolves the cast's `image` slot into an `ImageGen` (`image_gen.rs`),
+calls rig's openai `ImageGenerationModel`, sniffs the MIME (shared `view_image::sniff_mime`),
+and returns the bytes inline as `Content::image` + a caption. Openai-kind only — rig
+0.38 has no image path for the keyed Anthropic/Gemini/DeepSeek protocols, so a
+non-openai `image` slot is refused loudly (the same honesty as parked TTS); enabled by
+rig-core's `image` feature (zero extra deps). Gated `--no-generate-image` /
+`KAIBO_NO_GENERATE_IMAGE`, all-off still refused at startup. Inline-only with a size
+cap (`DEFAULT_MAX_IMAGE_BYTES`); over-cap is a loud error, never a silent drop. Offline
+tests cover parse/sniff/cap/content + the openai-only resolver gate + tool gating; the
+**live probe** (`tests/image_gen_live.rs`, `#[ignore]`) generated a real 569 KB PNG via
+local lemonade `SD-Turbo-GGUF` over `/v1/images/generations` in ~9s — so this is
+live-works, not just offline-green. **Surface change from the plan below:** image gen
+was scoped as a *kaish builtin* (for shell composition); we shipped it as a capability
+tool instead — the basic "agent asks for an image" path wants a direct call, and the
+builtin/VFS-composition surface is re-homed under image2image/media pipelines, deferred.
+Deferred follow-ons: `--out-dir` + `ResourceLink` for large artifacts; per-builtin
+timeout (moot for a direct tool — the per-backend `request_timeout` governs); the
+builtin/VFS composition surface; non-openai image kinds pending rig coverage.)
 
 Last pass: 2026-06-12 (view_image on OpenAI-compatible VLMs SHIPPED, offline-green —
 the channel fix from `docs/oai-images.md`. An `openai` vision slot now genuinely *sees*:
@@ -146,11 +169,16 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
   part key is camelCase **`mimeType`**, confirmed against rig-core 0.34
   `completion/message.rs:888` (the `mime_type` spelling in an earlier draft of this
   note was wrong); the Anthropic and Gemini arms map image parts natively both
-  directions, `providers/gemini/completion.rs:455,1135`). A tool
-  whose output is an *artifact* (`image2image <in> <out>`, `tts "…"`) is a **kaish
-  builtin**: async `Tool::execute` + `register_arc` is already kaibo's own pattern
-  (`Blocked`, `sandbox.rs`), paths compose with redirects/pipes/loops, and `run_kaish`
-  callers get production tools with no model in the loop at all.
+  directions, `providers/gemini/completion.rs:455,1135`). A tool whose output is an
+  *artifact* is a **capability** — its own MCP tool, not a `run_phase` loop.
+  **Refined 2026-06-13 (image-out shipped):** the basic "agent asks kaibo to *make*
+  something" path is a direct capability tool (`generate_image`: resolve slot →
+  provider call → `Content::image`), simpler and the natural agent-facing surface.
+  The earlier plan to make these **kaish builtins** (async `Tool::execute` +
+  `register_arc`, like `Blocked` in `sandbox.rs`) was premised on *shell composition*
+  — `image2image <in> <out>` piped to another tool, artifacts on the scratch VFS. That
+  rationale is real but it's a *later* concern (media pipelines), re-homed to the
+  deferred follow-on below; don't reach for a builtin until composition is the point.
 - **Media moves by VFS path; base64 only at the edges** (provider wire, MCP
   content). Scratch `MemoryFs` is the working bus — bounded now that kaish landed
   `ByteBudget` (kaish-vfs, 2026-06-10; kaibo pickup tracked in the P2 entry below).
@@ -166,25 +194,27 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
   2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
   `vision` pin in the role table, resolved caps at `kaibo://config`. The vision
   half of the *consumption* shipped too (vision-in, see the Last pass): a vision
-  arm's toolset gains `view_image`. Still pending: the production-role half — a
-  kernel gets the `tts`/`image` builtin only when that role is configured (absent,
-  not erroring), which lands with the production builtins.
+  arm's toolset gains `view_image`. The `image` production role is now consumed too
+  (image-out, 2026-06-13): `generate_image` reads `slot(ModelRole::Image)` and is
+  refused honestly off an unconfigured cast — no kernel-conditional builtin needed,
+  since it's a direct tool, not a builtin.
 - **Roles outgrow explorer/synth** — SHIPPED 2026-06-11: the role table
   (explorer, synth, image, tts; `ModelRole`/`ModelSlot` in `config.rs`),
-  spelled `[casts.<name>]` since the backends/casts split shipped. Media slots
-  are stored but unconsumed until the production builtins land.
-  `explore`/`synthesize` remain the agent costumes over `run_phase`; new
-  capabilities are injected tools or builtins, never new loops.
+  spelled `[casts.<name>]` since the backends/casts split shipped. The `image` slot
+  is now consumed by `generate_image`; `tts` stays a reserved seam pending rig
+  coverage. `explore`/`synthesize` remain the agent costumes over `run_phase`;
+  capabilities are their own tool shapes, never new loops.
 
 **Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
-SHIPPED 2026-06-11, path-only (see the Last pass for the mechanics and the two
-correctness landmines). **Next: (2)** first production builtin (image2image or tts)
-+ out-dir + ResourceLink delivery; the **output**-side `consult_result`
-`Vec<Content>` assembly (`Content::image` / `ResourceLink`) belongs here, *not*
-with vision-in — vision-in is input-only, the model sees images via the tool-result
-envelope, never the answer. The production builtins also need the per-builtin
-timeout (its own P1 entry below) before they can run a minutes-long model call.
-Additive after that.
+SHIPPED 2026-06-11, path-only. (2) **image-out — SHIPPED 2026-06-13** as the
+`generate_image` capability tool (live-verified; see the top Last pass), inline
+`Content::image` only. **Next: (3)** the deferred large-artifact + composition work —
+`--out-dir` (project **ro** / scratch **rw-bounded** / `/out` **rw**, off by default;
+failing-first tests: writes outside `/out` refused, project ro even with out-dir set)
++ `ResourceLink` delivery for objects over the inline cap, and the kaish-builtin/VFS
+surface for *composition* (image2image, feeding a generated artifact to another tool in
+a `run_kaish` script). Those builtins need the per-builtin timeout (its own P1 entry)
+before a minutes-long model call. Additive after that.
 
 **Open design points (for the production builtins):** session history records
 `[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const

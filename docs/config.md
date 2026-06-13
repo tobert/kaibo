@@ -425,7 +425,8 @@ operator) the full picture:
 - `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
 - `default_root` — the `--root` value, if set
 - `default_cast` — which cast is used when a call omits `cast`
-- `tools` — which of the four tools are currently advertised
+- `tools` — which tools are currently advertised (`consult`, `explore`,
+  `synthesize`, `run_kaish`, `generate_image`)
 - `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins
 - `defaults` — the global tunables every slot falls back to (rendered so the
   per-slot values below read as deltas against it)

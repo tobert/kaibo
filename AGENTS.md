@@ -1,9 +1,14 @@
 # AGENTS.md — kaibo (解剖)
 
-Kaibo is a stdio MCP server that answers questions about a codebase with grounded,
-cited answers, read-only. **One primitive, four tools.** The primitive is `run_phase`
+Kaibo is a stdio MCP server: an assistant agent **for other agents**. It augments a
+calling agent (Claude, etc.) with a team of models, lending two kinds of help —
+*consultation* (grounded, cited, read-only answers about a codebase) and
+*capabilities* (things the team can *do* and hand back as artifacts; image generation
+today, more as `rig` grows coverage).
+
+**Consultation: one primitive, four tools.** The primitive is `run_phase`
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
-loop. Every tool is that loop wearing different clothes:
+loop. Each consultation tool is that loop wearing different clothes:
 
 - **`consult`** — a capable model with `{run_kaish, explore′}`: it reads precise
   spans directly and delegates broad sweeps to a cheap explorer sub-agent, then
@@ -13,8 +18,15 @@ loop. Every tool is that loop wearing different clothes:
   → an answer (investigates directly when context is thin).
 - **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
 
-Each tool is independently gated by a `--no-<tool>` flag (all on by default;
-all-four-off is refused at startup). Multi-provider over `rig-core`: a
+**Capabilities** are a distinct, growing tool *class* — not `run_phase` loops:
+
+- **`generate_image`** — prompt → image, returned inline as MCP `Content::image`
+  (`generate_image.rs`, `image_gen.rs`). A single provider call behind the `ImageGen`
+  seam; no shell, no model loop. Resolves the cast's `image` slot, openai-kind only
+  (rig 0.38 has no image path for the keyed protocols — refused honestly otherwise).
+
+Each tool is independently gated by a `--no-<tool>` flag (all on by default; the
+all-off server is refused at startup). Multi-provider over `rig-core`: a
 **`ProviderKind`** is the wire protocol (keyed Anthropic / DeepSeek / Gemini, plus
 **`openai`** for any OpenAI-compatible endpoint). A **`Profile`** (`config.rs`) is a
 *named instance* of a kind with its own base URL, key source, and models — so two

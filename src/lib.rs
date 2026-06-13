@@ -1,18 +1,27 @@
-//! kaibo (解剖) — a two-phase MCP consult agent.
+//! kaibo (解剖) — an assistant agent *for other agents*.
 //!
-//! An MCP client asks `kaibo` a question. Internally, a cheap *explorer* model
-//! drives a read-only [`kaish`] kernel via a single `run_kaish(script)` tool —
-//! `cat`, `grep`, `rg`, `find`, `jq`, `awk`, pipelines, the lot — and writes a
-//! curated report. A *synthesizer* model then answers from that report, with the
-//! same tools available as a fallback for precise spans.
+//! kaibo augments a calling agent (Claude, etc.) with a team of models, lending two
+//! distinct kinds of help over MCP:
 //!
-//! The load-bearing safety property lives in [`sandbox`]: the explorer can read
-//! the project but cannot mutate it, and cannot shell out to external commands.
+//! - **Consultation** — grounded, cited answers about a codebase. A capable model
+//!   reads precise spans and delegates broad sweeps to a cheap *explorer* sub-agent,
+//!   all driving a read-only [`kaish`] kernel via `run_kaish(script)` (`cat`, `grep`,
+//!   `rg`, `find`, `jq`, pipelines, the lot). The `consult`/`explore`/`synthesize`
+//!   tools are all costumes over one primitive, [`consult::run_phase`].
+//! - **Capabilities** — things the team can *do* and hand back as artifacts. The first
+//!   is image generation ([`image_gen`], the `generate_image` tool); more (TTS/STT, …)
+//!   follow as rig grows provider coverage. A capability is its own tool shape, not a
+//!   `run_phase` loop.
+//!
+//! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project
+//! but cannot mutate it, and cannot shell out to external commands.
 
 pub mod config;
 pub mod consult;
 pub mod credentials;
 pub mod explorer;
+pub mod generate_image;
+pub mod image_gen;
 pub mod kaish_syntax;
 pub mod mcp_log;
 pub mod progress;
