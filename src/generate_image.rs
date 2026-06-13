@@ -8,11 +8,10 @@
 //! by a scripted backend; the live wire is proven by an `#[ignore]`d probe.
 //!
 //! **Scratch/inline only, by design (this slice).** The bytes ride back inline,
-//! base64 on the MCP edge, capped at [`crate::view_image::DEFAULT_MAX_IMAGE_BYTES`].
-//! An image past the cap is an honest, loud error — large-artifact delivery
-//! (`--out-dir` + `ResourceLink`) and the kaish-builtin/VFS composition surface (for
-//! image2image pipelines) are tracked follow-ons in `docs/issues.md`, not silent
-//! truncation here.
+//! base64 on the MCP edge, capped at [`GENERATE_IMAGE_MAX_BYTES`]. An image past the
+//! cap is an honest, loud error — large-artifact delivery (`--out-dir` +
+//! `ResourceLink`) and the kaish-builtin/VFS composition surface (for image2image
+//! pipelines) are tracked follow-ons in `docs/issues.md`, not silent truncation here.
 
 use anyhow::{anyhow, Result};
 use rmcp::model::Content;
@@ -20,11 +19,22 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 
 use crate::image_gen::ImageGen;
-use crate::view_image::{sniff_mime, DEFAULT_MAX_IMAGE_BYTES};
+use crate::view_image::sniff_mime;
 
 /// Default square size when the caller doesn't ask for one. Generous enough to be
 /// useful; a turbo SD model or a hosted gpt-image both accept it.
 pub const DEFAULT_SIZE: (u32, u32) = (1024, 1024);
+
+/// Inline-delivery cap for a *generated* image — its own knob, deliberately looser
+/// than [`view_image`](crate::view_image)'s `DEFAULT_MAX_IMAGE_BYTES`. The two pull
+/// in opposite directions: `view_image` reads workspace files (screenshots/diagrams,
+/// rarely large) and wants a tight cap so a stray read can't flood model context; a
+/// generated 1024² PNG routinely lands several MiB, and the cap is enforced *after*
+/// the (paid) call, so it must be generous enough that a rejection is genuinely
+/// exceptional, not routine. 20 MiB clears typical SD/gpt-image output with room to
+/// spare; past it is a loud error until large-artifact delivery (`--out-dir` /
+/// `ResourceLink`) lands.
+pub const GENERATE_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 /// Arguments to `generate_image`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -44,9 +54,15 @@ pub struct GenerateImageInput {
     pub size: Option<String>,
 
     /// Override the `image` slot's model id (sent verbatim — an id with "/" is one
-    /// id). Keeps the slot's configured backend.
+    /// id). Keeps the slot's configured backend unless `image_backend` retargets it.
     #[serde(default)]
     pub image_model: Option<String>,
+
+    /// Run the `image_model` override on this backend (name or alias) instead of the
+    /// slot's configured one. Requires `image_model`; together they replace the slot
+    /// wholesale, so this also works on a cast that carries no `image` slot at all.
+    #[serde(default)]
+    pub image_backend: Option<String>,
 }
 
 /// A generated image and the MIME type sniffed from its bytes.
@@ -56,15 +72,44 @@ pub struct GeneratedImage {
     pub mime: &'static str,
 }
 
+/// Why a generation failed, split so the MCP handler can categorize honestly: the
+/// caller can *act* on `Unusable` (lower the size, pick another model) but not on
+/// `Backend` (the provider/network failed). Mapping both to one error category would
+/// tell a calling agent "the server is broken, don't retry" when the fix is in its
+/// own hands — the opposite of the loud-*and-honest* errors this project wants.
+#[derive(Debug)]
+pub enum GenerateError {
+    /// The image backend / provider call failed (network, auth, rate-limit, an empty
+    /// response). Not the caller's fault — maps to an MCP internal error.
+    Backend(anyhow::Error),
+    /// The bytes came back but can't be delivered as asked — an unrecognized format,
+    /// or over the inline cap. The caller can change the request — maps to an MCP
+    /// invalid-params error.
+    Unusable(String),
+}
+
+impl std::fmt::Display for GenerateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(e) => write!(f, "{e:#}"),
+            Self::Unusable(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for GenerateError {}
+
 /// Parse a `WxH` size, defaulting when absent. Rejects zero/garbage loudly rather
 /// than silently substituting — a malformed size is a caller mistake worth surfacing.
+/// Accepts the ASCII `x`/`X` and the Unicode `×` (U+00D7) so a size copied from a spec
+/// sheet — or echoed back from our own caption, which prints `×` — round-trips.
 pub fn parse_size(spec: Option<&str>) -> Result<(u32, u32)> {
     let Some(spec) = spec else {
         return Ok(DEFAULT_SIZE);
     };
     let spec = spec.trim();
     let (w, h) = spec
-        .split_once(['x', 'X'])
+        .split_once(['x', 'X', '×'])
         .ok_or_else(|| anyhow!("size must be WxH (e.g. \"1024x1024\"), got {spec:?}"))?;
     let parse = |s: &str, which: &str| -> Result<u32> {
         let n: u32 = s
@@ -81,31 +126,35 @@ pub fn parse_size(spec: Option<&str>) -> Result<(u32, u32)> {
 
 /// Generate one image: call the backend, sniff the MIME, enforce the inline cap.
 ///
-/// Errors loudly on (a) an empty/failed generation, (b) bytes whose format we can't
-/// recognize — a generated blob that isn't a known image type is suspicious, not
-/// something to mislabel — and (c) bytes over the inline cap (no out-dir yet to spill
-/// to). None of these is a silent fallback.
+/// Errors loudly, and *categorized* (see [`GenerateError`]): a failed/empty
+/// generation is [`GenerateError::Backend`]; bytes in an unrecognized format or over
+/// the inline cap are [`GenerateError::Unusable`] (the caller can fix those). None of
+/// these is a silent fallback — a blob we can't recognize is suspicious, not
+/// something to mislabel, and an over-cap image is refused, never quietly dropped.
 pub async fn generate(
     image_gen: &dyn ImageGen,
     prompt: &str,
     size: (u32, u32),
-) -> Result<GeneratedImage> {
-    let bytes = image_gen.generate(prompt, size).await?;
+) -> std::result::Result<GeneratedImage, GenerateError> {
+    let bytes = image_gen
+        .generate(prompt, size)
+        .await
+        .map_err(GenerateError::Backend)?;
     let mime = sniff_mime(&bytes).ok_or_else(|| {
-        anyhow!(
+        GenerateError::Unusable(format!(
             "image model returned {} bytes in an unrecognized format (not png/jpeg/gif/webp); \
              refusing to mislabel them",
             bytes.len()
-        )
+        ))
     })?;
-    if bytes.len() > DEFAULT_MAX_IMAGE_BYTES {
-        return Err(anyhow!(
+    if bytes.len() > GENERATE_IMAGE_MAX_BYTES {
+        return Err(GenerateError::Unusable(format!(
             "generated image is {} bytes, over the {} byte inline cap; large-artifact \
              delivery (--out-dir / ResourceLink) is not yet wired — lower the size or use a \
              model that emits smaller images",
             bytes.len(),
-            DEFAULT_MAX_IMAGE_BYTES
-        ));
+            GENERATE_IMAGE_MAX_BYTES
+        )));
     }
     Ok(GeneratedImage { bytes, mime })
 }
@@ -143,6 +192,8 @@ mod tests {
         assert_eq!(parse_size(None).unwrap(), DEFAULT_SIZE);
         assert_eq!(parse_size(Some("512x768")).unwrap(), (512, 768));
         assert_eq!(parse_size(Some(" 640 X 480 ")).unwrap(), (640, 480));
+        // The Unicode × is accepted — our own caption emits it, so it must round-trip.
+        assert_eq!(parse_size(Some("1024×768")).unwrap(), (1024, 768));
         assert!(parse_size(Some("1024")).is_err());
         assert!(parse_size(Some("0x10")).is_err());
         assert!(parse_size(Some("axb")).is_err());
@@ -171,36 +222,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_rejects_unrecognized_bytes_loudly() {
+    async fn generate_rejects_unrecognized_bytes_as_unusable() {
         let backend = ScriptedImageGen::returning(b"not an image".to_vec());
         let err = generate(&backend, "x", DEFAULT_SIZE)
             .await
             .expect_err("unrecognized bytes must error, not be mislabeled");
+        // Unusable, not Backend — the caller can pick a different model.
         assert!(
-            err.to_string().contains("unrecognized format"),
-            "error should name the format problem: {err}"
+            matches!(err, GenerateError::Unusable(ref m) if m.contains("unrecognized format")),
+            "expected a caller-fixable Unusable naming the format problem: {err:?}"
         );
     }
 
     #[tokio::test]
-    async fn generate_rejects_oversized_loudly() {
+    async fn generate_rejects_oversized_as_unusable() {
         // A valid png header followed by enough filler to exceed the inline cap.
-        let backend = ScriptedImageGen::returning(fake_png(DEFAULT_MAX_IMAGE_BYTES + 1));
+        let backend = ScriptedImageGen::returning(fake_png(GENERATE_IMAGE_MAX_BYTES + 1));
         let err = generate(&backend, "x", DEFAULT_SIZE)
             .await
             .expect_err("an over-cap image must error, never be silently dropped");
         assert!(
-            err.to_string().contains("inline cap"),
-            "error should name the cap: {err}"
+            matches!(err, GenerateError::Unusable(ref m) if m.contains("inline cap")),
+            "expected a caller-fixable Unusable naming the cap: {err:?}"
         );
     }
 
     #[tokio::test]
-    async fn generate_surfaces_a_backend_failure() {
+    async fn generate_surfaces_a_backend_failure_as_backend() {
         let backend = ScriptedImageGen::failing("model is down");
         let err = generate(&backend, "x", DEFAULT_SIZE)
             .await
             .expect_err("a backend failure must propagate");
-        assert!(err.to_string().contains("model is down"), "{err}");
+        // Backend, not Unusable — the server/provider failed, not the request.
+        assert!(
+            matches!(err, GenerateError::Backend(ref e) if e.to_string().contains("model is down")),
+            "expected a Backend error carrying the cause: {err:?}"
+        );
     }
 }

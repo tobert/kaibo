@@ -911,9 +911,13 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
 
         // Re-emit the (possibly rewritten) tool-results message, then each extracted
         // image as its own tool-result-free user message — the load-bearing separation.
-        if let Ok(content) = OneOrMany::many(new_parts) {
-            out.push(Message::User { content });
-        }
+        // Each input part maps to exactly one `new_parts` entry, so an input `User`
+        // turn (always non-empty) yields a non-empty `new_parts` — `many` can't fail.
+        // Assert it rather than silently skipping: if a future refactor breaks that
+        // invariant we want a crash, not a quietly dropped message.
+        let content = OneOrMany::many(new_parts)
+            .expect("a non-empty user turn maps part-for-part to a non-empty result");
+        out.push(Message::User { content });
         for img in extracted {
             out.push(Message::User {
                 content: OneOrMany::one(UserContent::Image(img)),
@@ -1039,6 +1043,10 @@ where
         }
         let agent = builder.tools(make_tools()?).build();
 
+        // A fresh hook per loop iteration is load-bearing: its `saw_view_image` flag
+        // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
+        // agent across resumes) would carry a stale flag — breaking on the first
+        // completion call of a resume that ran no view_image. Keep it built here.
         let result = agent
             .prompt(prompt.clone())
             .with_history(history.clone())
@@ -2899,6 +2907,30 @@ mod tests {
             Message::assistant("thinking"),
         ];
         assert_eq!(count_model_turns(&history), 2, "two assistant messages");
+    }
+
+    /// A *rewritten* transcript interleaves inserted user `Image` turns between the
+    /// assistant turns; those must not inflate the count (they're `Message::User`, not
+    /// assistant), or a looping `view_image` could refresh its budget after all.
+    #[test]
+    fn count_model_turns_ignores_inserted_user_image_turns() {
+        let history = vec![
+            Message::user("q"),
+            vi_call("a"),
+            Message::User {
+                content: OneOrMany::one(vi_result("a")),
+            },
+            // The rewrite's inserted image turn — a user message, not a model turn.
+            Message::User {
+                content: OneOrMany::one(UserContent::image_base64("ZmFrZQ==", None, None)),
+            },
+            Message::assistant("now answering"),
+        ];
+        assert_eq!(
+            count_model_turns(&history),
+            2,
+            "only the two assistant messages count; the inserted image turn does not"
+        );
     }
 
     /// No session history ⇒ the prompt is *exactly* the bare question. This pins the

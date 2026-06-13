@@ -824,19 +824,22 @@ impl KaiboHandler {
             for the configured casts. The image rides back inline (size-capped); a \
             picture too large to inline is a clear error, not a silent drop. Args: \
             prompt (required), cast (optional), size (\"WxH\", default 1024x1024), \
-            image_model (override the slot's model id)."
+            image_model (override the slot's model id) + image_backend (retarget it, \
+            works even on a cast with no image slot)."
     )]
     pub async fn generate_image(
         &self,
         Parameters(input): Parameters<GenerateImageInput>,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast.clone())?;
-        // Optional per-call model id override on the image slot (keeps its backend).
+        // Optional per-call override on the image slot: `image_model` keeps the slot's
+        // backend; `image_backend` retargets it (and works on a cast with no image slot
+        // at all). The "pass the backend override arg" error now names a real arg.
         self.apply_model_override(
             &mut cast,
             ModelRole::Image,
             input.image_model.as_deref(),
-            None,
+            input.image_backend.as_deref(),
             "image_model",
             "image_backend",
         )?;
@@ -847,10 +850,22 @@ impl KaiboHandler {
         // A capability call: a single provider request, no model loop. The span
         // captures its wall-clock from the caller side.
         let span = tracing::info_span!("generate_image", cast = %cast.name, size = ?size);
-        let image = crate::generate_image::generate(generator.as_ref(), &input.prompt, size)
+        // Categorize honestly: a backend/provider failure is ours (internal_error); an
+        // unusable result (unrecognized format, over the inline cap) is caller-fixable
+        // (invalid_params) — so the agent changes the request rather than giving up.
+        use crate::generate_image::GenerateError;
+        let image = match crate::generate_image::generate(generator.as_ref(), &input.prompt, size)
             .instrument(span)
             .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        {
+            Ok(image) => image,
+            Err(e @ GenerateError::Unusable(_)) => {
+                return Err(McpError::invalid_params(e.to_string(), None));
+            }
+            Err(e @ GenerateError::Backend(_)) => {
+                return Err(McpError::internal_error(e.to_string(), None));
+            }
+        };
 
         Ok(CallToolResult::success(crate::generate_image::to_content(
             &image,
