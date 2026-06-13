@@ -317,6 +317,44 @@ on cast slots and are overridable per cast in `config.toml` (shipped;
 `docs/config.md`). The in-sync-with-pals discipline for the built-in defaults
 (`config.rs::default_models`) stays regardless.
 
+### rig provider gaps we route around (tracked upstream limitations)
+`rig-core` is the wire layer for every provider; where it's thin, kaibo inherits the
+gap. We adapt rather than fork, but the cost is real — record it so we don't keep
+rediscovering it. Two live ones beyond the TTS coverage matrix (see the media-spine
+P1 entry):
+
+- **openai image gen drops `additional_params` — no SD knobs reachable.** rig 0.38's
+  `providers/openai/image_generation.rs::image_generation` hardcodes the request body
+  to `model`/`prompt`/`size` (+`response_format` for non-gpt-image) and **never
+  serializes the request's `additional_params`** — the field exists on
+  `ImageGenerationRequest` and the builder sets it, but this impl ignores it (the
+  completion path *does* merge it; the image path doesn't). So every Stable-Diffusion
+  knob — steps, cfg_scale, sampler/scheduler, seed, negative_prompt, clip-skip,
+  **LoRA weights** — is dropped before it leaves the process. Confirmed not a server
+  limit: a direct POST to lemonade's `/api/v1/images/generations` with
+  `steps`/`cfg_scale`/`seed`/`negative_prompt` returned an image (2026-06-13 probe) —
+  the wire honors extras, rig won't send them. *Exception:* sd-cpp-style LoRA via
+  `<lora:name:weight>` rides in the `prompt` string, which rig **does** send, so that
+  subset may already work (unconfirmed — needs a differential probe). **Landmine:**
+  don't add a `params`/`negative_prompt` arg to `generate_image` until the wire
+  carries it — accepting a knob rig silently drops is exactly the silent fallback we
+  refuse. Fix path: upstream a one-spot merge of `additional_params` into the images
+  body (small, obviously-correct), then expose params as a per-call arg + per-slot
+  defaults (the `ModelShape`/tunables shape); **not** a hand-rolled images POST (a
+  second non-rig wire path, the TTS lesson). Until then, `generate_image` is
+  prompt-only by design, not omission.
+- **Gemini support is thin — text in, little else.** rig 0.38's gemini provider is
+  `Completion` + `Embeddings` + `Transcription` (STT) + `ModelListing` only:
+  `client.rs` declares `type ImageGeneration = Nothing` and `type AudioGeneration =
+  Nothing` for *both* the standard and interactions-API clients. So Gemini — a richly
+  multimodal family — reaches kaibo as essentially a text/vision-in completion
+  backend; rig exposes none of its image gen (Imagen/"nano-banana"), TTS, context
+  caching, file stores, or search/code-exec grounding (all of which the `gpal` MCP
+  sibling drives directly). This is why the example casts carry commented-out
+  `gemini/...image` ids as TODOs that can't yet land, and why "voice on Gemini" parked
+  with TTS. Track rig's gemini coverage; adopt its traits when they broaden rather
+  than hand-rolling Gemini's `generateContent` media modalities over raw HTTP.
+
 ### Per-model request shaping (`ModelShape`): remaining knobs
 `ModelShape` (`consult.rs`) resolves request params per (kind, model), fit per
 *arm* with the slot's tunables via `Arm::from_slot` (each falling back to the
