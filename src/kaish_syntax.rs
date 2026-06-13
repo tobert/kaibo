@@ -58,7 +58,13 @@ pub fn kaish_operating_contract() -> &'static str {
 /// lives. Composed once.
 pub fn kaish_syntax_core() -> &'static str {
     static CORE: OnceLock<String> = OnceLock::new();
-    CORE.get_or_init(|| format!("{}\n\n{}", kaish_operating_contract(), KAISH_SANDBOX_ADDENDUM))
+    CORE.get_or_init(|| {
+        format!(
+            "{}\n\n{}",
+            kaish_operating_contract(),
+            KAISH_SANDBOX_ADDENDUM
+        )
+    })
 }
 
 /// The internal `run_kaish` (rig) tool description shown to kaibo's own models. It

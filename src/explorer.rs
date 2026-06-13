@@ -85,7 +85,9 @@ impl Tool for RunKaish {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Announce the read before running it — the beat fires even if the script
         // then errors, which is exactly the liveness a stuck call wants to show.
-        self.progress.emit(PhaseEvent::KaishRun { script: args.script.clone() });
+        self.progress.emit(PhaseEvent::KaishRun {
+            script: args.script.clone(),
+        });
         let out = self
             .worker
             .run(args.script)

@@ -98,13 +98,21 @@ mod tests {
             "consult complete"
         );
         assert_eq!(PhaseEvent::SweepFinished.message(), "sweep complete");
-        assert!(PhaseEvent::TurnCapReached.message().contains("research limit"));
+        assert!(PhaseEvent::TurnCapReached
+            .message()
+            .contains("research limit"));
         assert_eq!(
-            PhaseEvent::KaishRun { script: "rg -n TODO src".into() }.message(),
+            PhaseEvent::KaishRun {
+                script: "rg -n TODO src".into()
+            }
+            .message(),
             "running kaish: rg -n TODO src"
         );
         assert_eq!(
-            PhaseEvent::SweepStarted { question: "where is the sandbox?".into() }.message(),
+            PhaseEvent::SweepStarted {
+                question: "where is the sandbox?".into()
+            }
+            .message(),
             "exploring: where is the sandbox?"
         );
     }
@@ -118,8 +126,15 @@ mod tests {
         // Over the cap → clipped with an ellipsis, never longer than the cap.
         let long = "x".repeat(200);
         let out = brief(&long, 80);
-        assert_eq!(out.chars().count(), 80, "clip keeps max chars incl. the ellipsis");
-        assert!(out.ends_with('…'), "an over-length clip is marked with an ellipsis");
+        assert_eq!(
+            out.chars().count(),
+            80,
+            "clip keeps max chars incl. the ellipsis"
+        );
+        assert!(
+            out.ends_with('…'),
+            "an over-length clip is marked with an ellipsis"
+        );
     }
 
     #[test]

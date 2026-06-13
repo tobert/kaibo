@@ -120,20 +120,24 @@ impl Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(field.name().to_string(), Value::String(value.to_string()));
+            self.fields
+                .insert(field.name().to_string(), Value::String(value.to_string()));
         }
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
+        self.fields
+            .insert(field.name().to_string(), Value::from(value));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
+        self.fields
+            .insert(field.name().to_string(), Value::from(value));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_string(), Value::Bool(value));
+        self.fields
+            .insert(field.name().to_string(), Value::Bool(value));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
@@ -141,7 +145,8 @@ impl Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = Some(rendered);
         } else {
-            self.fields.insert(field.name().to_string(), Value::String(rendered));
+            self.fields
+                .insert(field.name().to_string(), Value::String(rendered));
         }
     }
 }
@@ -227,7 +232,12 @@ mod tests {
             LoggingLevel::Emergency,
         ];
         for pair in ascending.windows(2) {
-            assert!(rank(pair[0]) < rank(pair[1]), "{:?} must rank below {:?}", pair[0], pair[1]);
+            assert!(
+                rank(pair[0]) < rank(pair[1]),
+                "{:?} must rank below {:?}",
+                pair[0],
+                pair[1]
+            );
         }
     }
 
@@ -283,6 +293,9 @@ mod tests {
             fields,
         }
         .into_param();
-        assert_eq!(param.data.as_object().unwrap()["target"], Value::String("kaibo".into()));
+        assert_eq!(
+            param.data.as_object().unwrap()["target"],
+            Value::String("kaibo".into())
+        );
     }
 }

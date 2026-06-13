@@ -135,7 +135,10 @@ mod tests {
         // s3 pushes past the cap of 2 → s1 (LRU) is evicted.
         store.record("s3", QaTurn::new("q3", "a3"));
 
-        assert!(store.history("s1").is_empty(), "s1 should have been evicted");
+        assert!(
+            store.history("s1").is_empty(),
+            "s1 should have been evicted"
+        );
         assert_eq!(store.history("s2"), vec![QaTurn::new("q2", "a2")]);
         assert_eq!(store.history("s3"), vec![QaTurn::new("q3", "a3")]);
         assert_eq!(store.session_count(), 2);
@@ -155,7 +158,10 @@ mod tests {
             vec![QaTurn::new("q1", "a1")],
             "s1 was just touched, so it must survive — eviction must follow recency"
         );
-        assert!(store.history("s2").is_empty(), "s2 became the LRU and should be evicted");
+        assert!(
+            store.history("s2").is_empty(),
+            "s2 became the LRU and should be evicted"
+        );
     }
 
     #[test]
