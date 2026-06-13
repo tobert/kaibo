@@ -1,9 +1,14 @@
 # view_image on OpenAI-compatible VLMs (the user-turn image channel)
 
-**Status:** scoped and de-risked; ready for a fresh session to implement. Decision
-settled (openai-only rewrite first). Both spikes are done (see Spikes — S2 changed
-the design: the image must be a *separate* user message). A live probe against a
-local VLM is still mandatory before we call it done — offline-green ≠ live-works.
+**Status:** IMPLEMENTED, offline-green (2026-06-12). The break-rewrite-resume path
+ships in `src/consult.rs` (`ViewImageBreakHook`, `rewrite_view_image_history`, the
+`run_phase` resume loop) gated on `ModelCaps.tool_result_images`; anthropic/gemini
+keep the tool-result channel untouched. Offline tests cover the rewrite (separate
+message, idempotency, co-tool-call) and the driven loop (break→resume, co-tool-call).
+**The live probe below is the remaining gate** — mandatory before we call it done,
+because the scripted mock can't catch an orphaned `tool_use`: offline-green ≠
+live-works. Both spikes done (S2 made the image a *separate* user message). The design
+notes below are kept as the as-built record.
 
 ## The promise we're keeping
 

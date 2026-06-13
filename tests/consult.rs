@@ -544,6 +544,22 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     assert!(ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true)).vision);
     // The override pins in both directions.
     assert!(!ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", Some(false)).vision);
+
+    // The transport channel is the *other* half of the see-∧-transport predicate, and
+    // it's a property of the wire protocol alone — never overridden. Anthropic/Gemini
+    // carry an image inside a tool result; the openai wire forbids it, so a seeing
+    // openai VLM must get the image on a user turn (the break-rewrite-resume path).
+    assert!(
+        ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", None).tool_result_images
+    );
+    assert!(ModelCaps::resolve(ProviderKind::Gemini, "gemini-3.5-flash", None).tool_result_images);
+    assert!(
+        !ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true))
+            .tool_result_images,
+        "an openai VLM sees, but its transport can't carry a tool-result image"
+    );
+    // The vision override never flips the transport channel — it's the wire's property.
+    assert!(!ModelCaps::resolve(ProviderKind::Openai, "anything", Some(true)).tool_result_images);
 }
 
 #[test]
@@ -726,6 +742,25 @@ fn tool_call_response(
     }
 }
 
+/// Several tool calls in ONE assistant turn — the co-tool-call case (`view_image`
+/// alongside `run_kaish`). rig runs them together and folds both results into a single
+/// user turn, exactly the shape the view_image turn-boundary break must tolerate.
+fn tool_calls_response(
+    calls: &[(&str, &str, Value)],
+) -> rig_core::completion::CompletionResponse<()> {
+    use rig_core::completion::message::AssistantContent;
+    let contents: Vec<AssistantContent> = calls
+        .iter()
+        .map(|(id, name, args)| AssistantContent::tool_call(*id, *name, args.clone()))
+        .collect();
+    rig_core::completion::CompletionResponse {
+        choice: rig_core::OneOrMany::many(contents).expect("at least one tool call"),
+        usage: rig_core::completion::Usage::new(),
+        raw_response: (),
+        message_id: None,
+    }
+}
+
 /// True if the request declares a tool named `name`.
 fn has_tool(req: &rig_core::completion::CompletionRequest, name: &str) -> bool {
     req.tools.iter().any(|t| t.name == name)
@@ -810,14 +845,20 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
         EXPLORER_MODEL,
         8192,
         Some(explorer_params.clone()),
-        ModelCaps { vision: false },
+        ModelCaps {
+            vision: false,
+            tool_result_images: true,
+        },
     );
     let synth = Arm::new(
         synth_client.clone(),
         SYNTH_MODEL,
         16384,
         Some(synth_params.clone()),
-        ModelCaps { vision: true },
+        ModelCaps {
+            vision: true,
+            tool_result_images: true,
+        },
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -906,6 +947,18 @@ fn request_has_tool_result_image(req: &rig_core::completion::CompletionRequest) 
     })
 }
 
+/// True if any user message carries an *image part* (not a tool-result image). This
+/// is exactly what a base64 envelope must become on a transport that can't carry an
+/// image in a tool result — the openai user-turn channel. The recorder (`Seen`)
+/// captures only text, so the assertion has to walk `req.chat_history` here.
+fn request_has_user_image(req: &rig_core::completion::CompletionRequest) -> bool {
+    use rig_core::completion::message::{Message, UserContent};
+    req.chat_history.iter().any(|m| match m {
+        Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Image(_))),
+        _ => false,
+    })
+}
+
 /// vision-in, end to end and offline. A vision-capable synth is offered `view_image`,
 /// calls it on a real file in the tree, and the bytes return as a rig *image part* in
 /// the next turn — not text. The synth can only reach its answer once it has seen the
@@ -945,7 +998,10 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
         SYNTH_MODEL,
         16384,
         None,
-        ModelCaps { vision: true },
+        ModelCaps {
+            vision: true,
+            tool_result_images: true,
+        },
     );
 
     let answer = synthesize(
@@ -966,7 +1022,7 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
     );
 }
 
-/// The negative: a blind synth (the default `ModelCaps { vision: false }`) is never
+/// The negative: a blind synth (the default `ModelCaps { vision: false, tool_result_images: true }`) is never
 /// offered `view_image`. Pin it on the same `synthesize` seam so the gate can't
 /// silently flip open for a text-only model.
 #[tokio::test]
@@ -987,7 +1043,10 @@ async fn a_blind_synth_is_not_offered_view_image() {
         SYNTH_MODEL,
         16384,
         None,
-        ModelCaps { vision: false },
+        ModelCaps {
+            vision: false,
+            tool_result_images: true,
+        },
     );
 
     synthesize(
@@ -1002,6 +1061,139 @@ async fn a_blind_synth_is_not_offered_view_image() {
     assert!(
         !synth_client.seen().is_empty(),
         "the synth client was driven"
+    );
+}
+
+/// The openai VLM path, offline: a vision synth on a transport that can't carry an
+/// image in a tool result (`tool_result_images: false`) still *sees* the image — it
+/// arrives on the **user-turn** channel. The synth calls `view_image`; the loop breaks
+/// at the turn boundary, rewrites the result onto a separate user `Image` turn, and
+/// resumes. The responder answers only once it sees a user image, and asserts no
+/// tool-result image copy survives — the rewrite *moved* the bytes, it didn't duplicate
+/// them. This is the core regression for the whole break-rewrite-resume path.
+///
+/// Necessary but NOT sufficient: the mock returns its scripted answer regardless of
+/// wire validity, so a rewrite that orphaned a `tool_use` would still pass here. Only
+/// the live VLM probe catches that — see `docs/oai-images.md`.
+#[tokio::test]
+async fn an_openai_vlm_sees_an_image_on_the_user_turn_channel() {
+    const SYNTH_MODEL: &str = "qwen2-vl-local";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(b"kaibo-pixels");
+    std::fs::write(root.join("diagram.png"), &png).unwrap();
+
+    let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
+        if request_has_user_image(req) {
+            // The image arrived on the user channel — and the tool-result copy is gone.
+            assert!(
+                !request_has_tool_result_image(req),
+                "the rewrite must MOVE the image to a user turn, not leave a tool-result copy"
+            );
+            Ok(text_response("I can see the diagram. DONE"))
+        } else {
+            assert!(
+                has_tool(req, "view_image"),
+                "an openai vision synth must still be offered view_image"
+            );
+            Ok(tool_call_response(
+                "t-view",
+                "view_image",
+                json!({ "path": "diagram.png" }),
+            ))
+        }
+    });
+    // vision: true but tool_result_images: false — the openai transport. This flips
+    // run_phase onto the break-rewrite-resume path.
+    let synth = Arm::new(
+        synth_client.clone(),
+        SYNTH_MODEL,
+        16384,
+        None,
+        ModelCaps {
+            vision: true,
+            tool_result_images: false,
+        },
+    );
+
+    let answer = synthesize(
+        "What does the diagram show?",
+        None,
+        &root,
+        &synth,
+        &ConsultConfig::default(),
+    )
+    .await
+    .expect("openai-VLM synthesize should resume after the view_image break");
+
+    assert!(
+        answer.contains("DONE"),
+        "the synth answered only after the image arrived on the user turn: {answer:?}"
+    );
+    // The loop broke and resumed: a view_image turn, then a separate resumed turn.
+    assert!(
+        synth_client.seen().len() >= 2,
+        "the loop must have broken on view_image and resumed: {} request(s)",
+        synth_client.seen().len()
+    );
+}
+
+/// Co-tool-call on the openai path: one assistant turn calls `view_image` AND
+/// `run_kaish` together. The break must wait for the turn boundary so *both* tools run
+/// and both results land before the rewrite — breaking mid-`view_image` would orphan
+/// the `run_kaish` `tool_use`. A clean resume to an answer is the offline proof the
+/// transcript stayed well-formed across the co-tool-call turn.
+#[tokio::test]
+async fn an_openai_vlm_co_tool_call_view_image_and_run_kaish_resumes_cleanly() {
+    const SYNTH_MODEL: &str = "qwen2-vl-local";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(b"kaibo-pixels");
+    std::fs::write(root.join("diagram.png"), &png).unwrap();
+
+    let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
+        if request_has_user_image(req) {
+            assert!(
+                !request_has_tool_result_image(req),
+                "the view_image image moved to a user turn; no tool-result copy remains"
+            );
+            Ok(text_response("DONE"))
+        } else {
+            // One turn, two tools — view_image alongside run_kaish.
+            Ok(tool_calls_response(&[
+                ("t-view", "view_image", json!({ "path": "diagram.png" })),
+                ("t-ls", "run_kaish", json!({ "script": "ls" })),
+            ]))
+        }
+    });
+    let synth = Arm::new(
+        synth_client.clone(),
+        SYNTH_MODEL,
+        16384,
+        None,
+        ModelCaps {
+            vision: true,
+            tool_result_images: false,
+        },
+    );
+
+    let answer = synthesize(
+        "What does the diagram show?",
+        None,
+        &root,
+        &synth,
+        &ConsultConfig::default(),
+    )
+    .await
+    .expect("a co-tool-call view_image turn must resume without orphaning run_kaish");
+
+    assert!(
+        answer.contains("DONE"),
+        "the synth resumed and answered after the co-tool-call turn: {answer:?}"
     );
 }
 

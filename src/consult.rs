@@ -18,18 +18,24 @@
 //! Each tool gets its own fresh [`KaishWorker`] (a kernel rooted at the
 //! project), and so does every `explore′` delegation.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use rig_core::agent::{HookAction, PromptHook};
 use rig_core::client::CompletionClient;
-use rig_core::completion::message::{ToolChoice, UserContent};
-use rig_core::completion::{Message, Prompt, PromptError, ToolDefinition};
+use rig_core::completion::message::{
+    AssistantContent, Image, ToolChoice, ToolResult, ToolResultContent, UserContent,
+};
+use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition};
 use rig_core::providers::{anthropic, deepseek, gemini, openai};
 use rig_core::tool::{Tool, ToolDyn};
+use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -101,24 +107,57 @@ fn is_anthropic_adaptive(model: &str) -> bool {
         .any(|tier| model.contains(tier))
 }
 
-/// What one (provider, model) can perceive — capability data on the same seam as
-/// [`ModelShape`], resolved per model slot: an explicit config override wins, else
-/// the built-in classifier. Toolsets are assembled from resolved caps (a vision
-/// model gets `view_image` when vision-in lands; a blind model never sees the
-/// tool), so a capability mismatch is structural, not a runtime surprise.
+/// What one (provider, model) can perceive — and *how* an image reaches it. Capability
+/// data on the same seam as [`ModelShape`], resolved per model slot: an explicit config
+/// override wins, else the built-in classifier. Toolsets are assembled from resolved
+/// caps (a vision model gets `view_image` when vision-in lands; a blind model never
+/// sees the tool), so a capability mismatch is structural, not a runtime surprise.
+///
+/// The real predicate `view_image` rides on is **see ∧ transport**: a model can *see*
+/// (`vision`) AND the chosen channel can *carry* the image. Anthropic/Gemini carry an
+/// image inside a tool result (`tool_result_images`); OpenAI's wire forbids it (rig
+/// 400s before sending), so an OpenAI VLM must receive the image on the user-turn
+/// channel instead — the break-rewrite-resume path in [`run_phase`]. The two bools let
+/// the toolset gate `view_image` on `vision` while the loop gates the rewrite on
+/// `vision && !tool_result_images`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelCaps {
     /// Accepts image parts in model context (vision-in).
     pub vision: bool,
+    /// Does this model's *transport* carry an image inside a tool result? When false,
+    /// a seen image must ride the user-turn channel instead (see [`Arm::rewrites_view_image`]).
+    pub tool_result_images: bool,
 }
 
 impl ModelCaps {
     /// Resolve the caps for `model` under `kind`. `vision_override` is the per-slot
     /// config escape hatch (`vision = true/false` in the role table) — it pins the
-    /// answer in both directions; `None` asks the classifier.
+    /// vision answer in both directions; `None` asks the classifier. The transport
+    /// channel is a property of the wire protocol alone (`kind`), never overridden.
     pub fn resolve(kind: ProviderKind, model: &str, vision_override: Option<bool>) -> Self {
         let vision = vision_override.unwrap_or_else(|| is_vision_capable(kind, model));
-        Self { vision }
+        Self {
+            vision,
+            tool_result_images: transport_supports_tool_result_images(kind),
+        }
+    }
+}
+
+/// Does this wire protocol carry an image *inside a tool result*? Anthropic
+/// (`tool_result` image blocks) and Gemini (`functionResponse` inline data) do — it's
+/// documented and first-class. The OpenAI wire forbids images in a `role:tool` message
+/// and rig enforces it before sending (`ToolResultContent::Image(_) => Err(..)` in
+/// `openai/completion/mod.rs`), so a `view_image` result there must instead be
+/// delivered as an `image_url` part on a **user** turn. DeepSeek is moot — vision-blind,
+/// so `view_image` never attaches. Branch the rewrite on *this*, not on `kind == Openai`:
+/// the next no-tool-result-image provider is a table entry, not a new `if`.
+fn transport_supports_tool_result_images(kind: ProviderKind) -> bool {
+    match kind {
+        ProviderKind::Anthropic | ProviderKind::Gemini => true,
+        ProviderKind::Openai => false,
+        // Vision-blind on the wire; the value is unreached (no view_image attaches),
+        // but "no tool-result image channel" is the honest answer.
+        ProviderKind::DeepSeek => false,
     }
 }
 
@@ -406,6 +445,7 @@ trait PhaseRunner: Send + Sync {
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
+        break_on_view_image: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 }
 
@@ -429,6 +469,7 @@ where
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
+        break_on_view_image: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(run_phase(
             &self.client,
@@ -440,6 +481,7 @@ where
             params,
             progress,
             make_tools,
+            break_on_view_image,
         ))
     }
 }
@@ -603,6 +645,14 @@ impl Arm {
         }
     }
 
+    /// Does a `view_image` on this arm need the user-turn rewrite? True exactly when
+    /// the model can *see* but its transport can't carry the image in a tool result
+    /// (an OpenAI VLM) — the predicate [`run_phase`]'s break-rewrite-resume gate reads.
+    /// A blind arm never sees `view_image`, so this is false there regardless.
+    fn rewrites_view_image(&self) -> bool {
+        self.caps.vision && !self.caps.tool_result_images
+    }
+
     /// Run one bounded tool loop on this arm: its client, model, params, and
     /// `max_tokens`, with the caller's preamble/prompt/turn-cap/toolset.
     pub(crate) async fn run(
@@ -622,6 +672,7 @@ impl Arm {
                 self.params.as_ref(),
                 progress,
                 make_tools,
+                self.rewrites_view_image(),
             )
             .await
     }
@@ -708,6 +759,195 @@ fn finalize_prompt(mut chat_history: Vec<Message>) -> (Vec<Message>, Message) {
     }
 }
 
+// --- view_image on the user-turn channel (the openai VLM path) ----------------
+
+/// The cancellation reason [`ViewImageBreakHook`] terminates with, so [`run_phase`]
+/// can tell *its* deliberate break from any other `PromptCancelled` rig might raise
+/// (a lost prompt, an empty tool batch). An internal sentinel; never shown to a model.
+const VIEW_IMAGE_BREAK: &str = "kaibo:view_image_break";
+
+/// The text a rewritten `view_image` tool result carries when its own note is somehow
+/// absent — enough to satisfy the `tool_use → tool_result` pairing every provider
+/// requires. The image itself rides the separate user turn the rewrite inserts.
+const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
+
+/// Breaks the managed tool loop at the turn boundary after a `view_image` ran, so
+/// [`run_phase`] can move the image onto the **user-turn** channel for a transport
+/// that can't carry it in a tool result (an OpenAI VLM).
+///
+/// **Why flag now, terminate next — not mid-turn.** A single assistant turn can call
+/// `view_image` *and* `run_kaish` together; terminating the instant `view_image`
+/// returns would drop the other tool's result and orphan its `tool_use`. And rig's
+/// `on_tool_result` Terminate hands back a transcript snapshotted *before* the turn's
+/// results are folded into `new_messages` (`prompt_request/mod.rs` ~:928), so it
+/// wouldn't even carry the image we came for. So we only *set a flag* on
+/// `on_tool_result`, and terminate on the **next** `on_completion_call` — the point
+/// where rig has written every tool result of the triggering turn into `new_messages`
+/// and `Terminate` returns the complete transcript (`:670`). Disabled
+/// (`enabled == false`) every callback is a no-op, so installing it on a transport
+/// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
+#[derive(Clone)]
+struct ViewImageBreakHook {
+    enabled: bool,
+    /// Set once a `view_image` tool result lands this turn; read at the next
+    /// completion call. Interior mutability because `PromptHook`'s callbacks are `&self`
+    /// and rig runs a turn's tools concurrently.
+    saw_view_image: Arc<AtomicBool>,
+}
+
+impl ViewImageBreakHook {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            saw_view_image: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl<M: CompletionModel> PromptHook<M> for ViewImageBreakHook {
+    async fn on_tool_result(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        _args: &str,
+        _result: &str,
+    ) -> HookAction {
+        if self.enabled && tool_name == ViewImage::NAME {
+            self.saw_view_image.store(true, Ordering::SeqCst);
+        }
+        HookAction::cont()
+    }
+
+    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
+        if self.enabled && self.saw_view_image.load(Ordering::SeqCst) {
+            HookAction::terminate(VIEW_IMAGE_BREAK)
+        } else {
+            HookAction::cont()
+        }
+    }
+}
+
+/// Rewrite a transcript so every `view_image` image rides the **user-turn** channel
+/// instead of the tool-result channel. For each `view_image` tool result that still
+/// carries an image: keep its text as a short ack (so the `tool_use → tool_result`
+/// pairing stays valid) and emit a separate, tool-result-free `Message::User { [Image] }`
+/// right after that user message — the bytes the model now sees on a channel OpenAI
+/// accepts. Every other block (assistant text/thinking, other tools' use/result pairs)
+/// is preserved verbatim, so no `tool_use` is left unanswered.
+///
+/// **A separate message, never mixed.** rig's openai converter drops every non-tool
+/// part from a user turn that *also* carries tool results (`openai/completion/mod.rs`
+/// ~:618) — an image left in the tool-results message would vanish with no error, the
+/// exact silent drop we refuse. Hence its own message.
+///
+/// Idempotent: it triggers only on a tool result that *still holds an image*, so a
+/// result already acked to text (an earlier break) and an already-inserted image
+/// message both pass through untouched — safe to run after every break. Pure and
+/// offline-testable.
+fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
+    // The tool_use ids naming a view_image call live on the *assistant* `ToolCall`,
+    // not on the user `ToolResult` — collect them first, then match results against them.
+    let view_image_ids: HashSet<String> = history
+        .iter()
+        .filter_map(|m| match m {
+            Message::Assistant { content, .. } => Some(content),
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|c| match c {
+            AssistantContent::ToolCall(tc) if tc.function.name == ViewImage::NAME => {
+                Some(tc.id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<Message> = Vec::with_capacity(history.len());
+    for msg in history {
+        let content = match msg {
+            Message::User { content } => content,
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+
+        let mut new_parts: Vec<UserContent> = Vec::new();
+        // Images pulled out of this turn's view_image results, re-emitted as their own
+        // user messages immediately after (one per image), preserving order.
+        let mut extracted: Vec<Image> = Vec::new();
+
+        for part in content {
+            match part {
+                UserContent::ToolResult(tr) if view_image_ids.contains(&tr.id) => {
+                    let ToolResult {
+                        id,
+                        call_id,
+                        content,
+                    } = tr;
+                    // Split the result into its text (the load note → ack) and its
+                    // image (→ a user turn). A result already acked has no image, so
+                    // this is a no-op for it — the idempotency that makes re-running safe.
+                    let mut texts: Vec<ToolResultContent> = Vec::new();
+                    for rc in content {
+                        match rc {
+                            ToolResultContent::Image(img) => extracted.push(img),
+                            text => texts.push(text),
+                        }
+                    }
+                    let content = OneOrMany::many(texts).unwrap_or_else(|_| {
+                        OneOrMany::one(ToolResultContent::text(VIEW_IMAGE_ACK))
+                    });
+                    new_parts.push(UserContent::ToolResult(ToolResult {
+                        id,
+                        call_id,
+                        content,
+                    }));
+                }
+                other => new_parts.push(other),
+            }
+        }
+
+        // Re-emit the (possibly rewritten) tool-results message, then each extracted
+        // image as its own tool-result-free user message — the load-bearing separation.
+        if let Ok(content) = OneOrMany::many(new_parts) {
+            out.push(Message::User { content });
+        }
+        for img in extracted {
+            out.push(Message::User {
+                content: OneOrMany::one(UserContent::Image(img)),
+            });
+        }
+    }
+    out
+}
+
+/// Count the model turns a transcript represents — one assistant message per
+/// completion that produced output. The view_image break re-enters the loop with a
+/// fresh `max_turns`, so rig's internal turn counter resets each resume; deriving
+/// turns-spent from the transcript (rig's history carries no `turns_used`) is what
+/// stops a model that loops `view_image` from refreshing its budget every break.
+fn count_model_turns(history: &[Message]) -> usize {
+    history
+        .iter()
+        .filter(|m| matches!(m, Message::Assistant { .. }))
+        .count()
+}
+
+/// Split a rewritten transcript for re-entry into the managed loop: the trailing
+/// message becomes the resume `prompt`, the rest goes to `.with_history(...)`. Mirrors
+/// [`finalize_prompt`]'s split (so the original `user_prompt`, already in the history,
+/// is never replayed on top of it) but appends no note — this is a normal resume, not
+/// a forced finish. The rewritten transcript always carries at least the original
+/// prompt, so the empty arm is unreachable defensive code.
+fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
+    match history.pop() {
+        Some(last) => (history, last),
+        None => (Vec::new(), Message::user("")),
+    }
+}
+
 /// One model loop, parameterized by its toolset: build an agent with `preamble`,
 /// hand it the tools `make_tools` builds, and run its bounded tool loop. Generic
 /// over the provider.
@@ -726,7 +966,22 @@ fn finalize_prompt(mut chat_history: Vec<Message>) -> (Vec<Message>, Message) {
 /// run one final constrained turn via [`finalize_after_max_turns`]: the tools stay
 /// declared so the accumulated tool_use/tool_result history stays valid, but
 /// `ToolChoice::None` forbids new calls — the model must answer from what it has.
-#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+///
+/// **view_image on the user-turn channel.** When `break_on_view_image` is set (a
+/// vision model whose transport can't carry an image in a tool result — an OpenAI
+/// VLM), a [`ViewImageBreakHook`] terminates the loop at the turn boundary after a
+/// `view_image` call. rig hands back the full transcript via `PromptCancelled`; we
+/// rewrite each `view_image` result onto a separate user `Image` turn
+/// ([`rewrite_view_image_history`]) and re-enter the loop with the remaining turn
+/// budget. The model now sees the image in user content, the one channel every
+/// provider accepts. When unset the hook is inert and this is the old single call.
+#[allow(clippy::too_many_arguments)]
+// each arg is a distinct, named loop input
+// A named parent for rig's GenAI spans: rig's `invoke_agent` checks the current
+// span and nests under this one, so a phase's whole model loop (every `chat` turn,
+// every `tool` call) hangs off one `run_phase` span carrying the model. Inert
+// unless an exporter is attached (telemetry off → no subscriber records it).
+#[tracing::instrument(name = "run_phase", skip_all, fields(model = %model, max_turns = max_turns))]
 pub(crate) async fn run_phase<C, F>(
     client: &C,
     model: &str,
@@ -737,40 +992,92 @@ pub(crate) async fn run_phase<C, F>(
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
     make_tools: F,
+    break_on_view_image: bool,
 ) -> Result<String>
 where
     C: CompletionClient,
     C::CompletionModel: 'static,
     F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
 {
-    let mut builder = client
-        .agent(model)
-        .preamble(preamble)
-        .max_tokens(max_tokens);
-    // Thinking on (both phases) where the provider takes a request-time toggle.
-    if let Some(params) = thinking {
-        builder = builder.additional_params(params.clone());
-    }
-    let agent = builder.tools(make_tools()?).build();
-    match agent.prompt(user_prompt).max_turns(max_turns).await {
-        Ok(answer) => Ok(answer),
-        Err(PromptError::MaxTurnsError { chat_history, .. }) => {
-            // The loop hit its cap and is about to write a forced final answer —
-            // tell the caller, so a watching client sees "wrapping up" not silence.
+    // Loop state across view_image-break resumes. The first pass is the bare prompt
+    // with no history — byte-for-byte the old single call. Each break rewrites the
+    // transcript (image onto the user-turn channel) and re-enters here.
+    let mut prompt: Message = Message::user(user_prompt);
+    let mut history: Vec<Message> = Vec::new();
+
+    loop {
+        // Outer turn budget: rig's `max_turns` resets each resume, so subtract the
+        // turns already spent (assistant messages in the carried history) — a model
+        // that loops `view_image` can't refresh its budget every break.
+        let remaining = max_turns.saturating_sub(count_model_turns(&history));
+        if remaining == 0 {
+            // The whole budget went to view_image breaks — force the finish from what
+            // we have, the same shape the turn-cap path uses.
             progress.emit(PhaseEvent::TurnCapReached);
-            finalize_after_max_turns(
+            let mut full = history;
+            full.push(prompt);
+            return finalize_after_max_turns(
                 client,
                 model,
                 preamble,
                 max_tokens,
                 thinking,
                 make_tools()?,
-                *chat_history,
+                full,
                 max_turns,
             )
-            .await
+            .await;
         }
-        Err(e) => Err(anyhow!("model loop failed: {e}")),
+
+        let mut builder = client
+            .agent(model)
+            .preamble(preamble)
+            .max_tokens(max_tokens);
+        // Thinking on (both phases) where the provider takes a request-time toggle.
+        if let Some(params) = thinking {
+            builder = builder.additional_params(params.clone());
+        }
+        let agent = builder.tools(make_tools()?).build();
+
+        let result = agent
+            .prompt(prompt.clone())
+            .with_history(history.clone())
+            .with_hook(ViewImageBreakHook::new(break_on_view_image))
+            .max_turns(remaining)
+            .await;
+
+        match result {
+            Ok(answer) => return Ok(answer),
+            Err(PromptError::MaxTurnsError { chat_history, .. }) => {
+                // The loop hit its cap and is about to write a forced final answer —
+                // tell the caller, so a watching client sees "wrapping up" not silence.
+                progress.emit(PhaseEvent::TurnCapReached);
+                return finalize_after_max_turns(
+                    client,
+                    model,
+                    preamble,
+                    max_tokens,
+                    thinking,
+                    make_tools()?,
+                    *chat_history,
+                    max_turns,
+                )
+                .await;
+            }
+            // Our deliberate view_image break. We terminated at the *next* completion
+            // call, so every `tool_use` in the triggering turn is already answered in
+            // this transcript — co-tool-call orphaning is structurally impossible.
+            // Move each view_image image onto its own user turn and resume.
+            Err(PromptError::PromptCancelled {
+                chat_history,
+                reason,
+            }) if reason == VIEW_IMAGE_BREAK => {
+                let (rest, next) = split_for_resume(rewrite_view_image_history(chat_history));
+                history = rest;
+                prompt = next;
+            }
+            Err(e) => return Err(anyhow!("model loop failed: {e}")),
+        }
     }
 }
 
@@ -1284,7 +1591,10 @@ mod tests {
             model,
             16384,
             params,
-            ModelCaps { vision: false },
+            ModelCaps {
+                vision: false,
+                tool_result_images: true,
+            },
         )
     }
 
@@ -1919,14 +2229,20 @@ mod tests {
             EXPLORER,
             4096,
             None,
-            ModelCaps { vision: false },
+            ModelCaps {
+                vision: false,
+                tool_result_images: true,
+            },
         );
         let synth_arm = Arm::new(
             synth_client.clone(),
             SYNTH,
             32768,
             None,
-            ModelCaps { vision: true },
+            ModelCaps {
+                vision: true,
+                tool_result_images: true,
+            },
         );
 
         let out = consult_with("q", dir.path(), &explorer_arm, &synth_arm, &cfg)
@@ -2409,6 +2725,180 @@ mod tests {
             matches!(rest.last(), Some(Message::Assistant { .. })),
             "assistant turn preserved at the tail"
         );
+    }
+
+    // --- view_image user-turn rewrite (the openai VLM path) ------------------
+
+    /// An assistant turn calling `view_image` by `id`.
+    fn vi_call(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                id,
+                ViewImage::NAME,
+                json!({ "path": "shot.png" }),
+            )),
+        }
+    }
+
+    /// A `view_image` tool result: the load note (text) *and* the image part — the
+    /// hybrid shape rig's `from_tool_output` produces.
+    fn vi_result(id: &str) -> UserContent {
+        UserContent::ToolResult(ToolResult {
+            id: id.to_string(),
+            call_id: None,
+            content: OneOrMany::many([
+                ToolResultContent::text("Loaded image shot.png (image/png, 1.0 KiB)."),
+                ToolResultContent::image_base64("ZmFrZQ==", None, None),
+            ])
+            .unwrap(),
+        })
+    }
+
+    /// True if any tool result anywhere still carries an image part.
+    fn any_tool_result_image(h: &[Message]) -> bool {
+        h.iter().any(|m| {
+            matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                    if tr.content.iter().any(|rc| matches!(rc, ToolResultContent::Image(_))))))
+        })
+    }
+
+    /// Count user messages carrying an `Image` part (the rewrite's inserted turns).
+    fn user_image_messages(h: &[Message]) -> usize {
+        h.iter()
+            .filter(|m| {
+                matches!(m, Message::User { content }
+                    if content.iter().any(|c| matches!(c, UserContent::Image(_))))
+            })
+            .count()
+    }
+
+    /// The core rewrite: a `view_image` image leaves the tool-result channel and
+    /// reappears as its *own* tool-result-free user message, while the `tool_use`
+    /// stays answered (now by text). The separate message is load-bearing — rig's
+    /// openai converter drops non-tool parts from a mixed user turn.
+    #[test]
+    fn rewrite_moves_view_image_onto_a_separate_user_image_turn() {
+        let history = vec![
+            Message::user("look at shot.png"),
+            vi_call("call-1"),
+            Message::User {
+                content: OneOrMany::one(vi_result("call-1")),
+            },
+        ];
+        let out = rewrite_view_image_history(history);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "no image may survive on the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            1,
+            "the image reappears as exactly one user Image message: {out:?}"
+        );
+        // The view_image tool_use is still answered (by a text-only result), so no
+        // provider sees an orphaned tool_use.
+        assert!(
+            out.iter().any(|m| matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                    if tr.id == "call-1"
+                    && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+            "the view_image tool_use stays answered by a text result: {out:?}"
+        );
+        // The image turn lands *after* its (rewritten) tool-results message.
+        let result_pos = out
+            .iter()
+            .position(|m| {
+                matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(_))))
+            })
+            .expect("the tool-results message is present");
+        let image_pos = out
+            .iter()
+            .position(|m| {
+                matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::Image(_))))
+            })
+            .expect("the image message is present");
+        assert!(
+            result_pos < image_pos,
+            "the image rides immediately after the tool result: {out:?}"
+        );
+    }
+
+    /// Idempotent: a second pass (a later break re-walks the whole transcript) must
+    /// not duplicate the image or otherwise change anything — it triggers only on a
+    /// result that *still* holds an image, and the first pass already moved it.
+    #[test]
+    fn rewrite_is_idempotent() {
+        let history = vec![
+            Message::user("q"),
+            vi_call("c1"),
+            Message::User {
+                content: OneOrMany::one(vi_result("c1")),
+            },
+        ];
+        let once = rewrite_view_image_history(history);
+        let twice = rewrite_view_image_history(once.clone());
+        assert_eq!(once, twice, "a second rewrite pass is a no-op");
+        assert_eq!(user_image_messages(&twice), 1, "no duplicate image turn");
+    }
+
+    /// Co-tool-call: one assistant turn called `view_image` *and* `run_kaish`, and one
+    /// user turn answered both. The rewrite must move only the image and leave the
+    /// `run_kaish` result verbatim — proof the rewrite never orphans the co-tool's
+    /// `tool_use`. (The turn-boundary break that makes this transcript reachable is
+    /// proven separately in the driven loop test.)
+    #[test]
+    fn rewrite_leaves_a_co_tool_call_result_intact() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::many([
+                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+                AssistantContent::tool_call("rk", "run_kaish", json!({ "script": "ls" })),
+            ])
+            .unwrap(),
+        };
+        let results = Message::User {
+            content: OneOrMany::many([
+                vi_result("vi"),
+                UserContent::tool_result(
+                    "rk",
+                    OneOrMany::one(ToolResultContent::text("exit:0\nshot.png")),
+                ),
+            ])
+            .unwrap(),
+        };
+        let out = rewrite_view_image_history(vec![Message::user("q"), assistant, results]);
+
+        assert!(!any_tool_result_image(&out), "view_image image moved out");
+        assert_eq!(user_image_messages(&out), 1, "exactly the one image turn");
+        assert!(
+            out.iter().any(|m| matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                    if tr.id == "rk"
+                    && tr.content.iter().any(|rc| matches!(rc,
+                        ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
+            "the run_kaish tool_result is preserved verbatim: {out:?}"
+        );
+    }
+
+    /// The outer turn budget is derived from the transcript (rig carries no
+    /// `turns_used`): one model turn per assistant message, so a looping `view_image`
+    /// can't refresh its budget every break.
+    #[test]
+    fn count_model_turns_counts_assistant_messages() {
+        let history = vec![
+            Message::user("q"),
+            vi_call("a"),
+            Message::User {
+                content: OneOrMany::one(vi_result("a")),
+            },
+            Message::assistant("thinking"),
+        ];
+        assert_eq!(count_model_turns(&history), 2, "two assistant messages");
     }
 
     /// No session history ⇒ the prompt is *exactly* the bare question. This pins the

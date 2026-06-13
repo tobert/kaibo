@@ -52,8 +52,9 @@ use serde_json::Value;
 
 /// How the mock answers one request for one model: branch on the request's content
 /// and return a response, or an error to exercise the failure paths.
-pub type Responder =
-    Arc<dyn Fn(&CompletionRequest) -> Result<CompletionResponse<()>, CompletionError> + Send + Sync>;
+pub type Responder = Arc<
+    dyn Fn(&CompletionRequest) -> Result<CompletionResponse<()>, CompletionError> + Send + Sync,
+>;
 
 /// A snapshot of one inbound completion request, captured for post-hoc assertions.
 /// Decoupled from the responder so a test can assert *what was asked* separately
@@ -107,7 +108,9 @@ pub struct ScriptedClient {
 
 impl ScriptedClient {
     pub fn builder() -> ScriptedBuilder {
-        ScriptedBuilder { responders: HashMap::new() }
+        ScriptedBuilder {
+            responders: HashMap::new(),
+        }
     }
 
     /// Snapshot of every request seen so far, in call order.
@@ -117,7 +120,10 @@ impl ScriptedClient {
 
     /// Requests addressed to `model`, in call order.
     pub fn requests_for(&self, model: &str) -> Vec<RecordedRequest> {
-        self.requests().into_iter().filter(|r| r.model == model).collect()
+        self.requests()
+            .into_iter()
+            .filter(|r| r.model == model)
+            .collect()
     }
 }
 
@@ -206,8 +212,10 @@ impl CompletionModel for ScriptedModel {
     async fn stream(
         &self,
         _request: CompletionRequest,
-    ) -> Result<rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
-    {
+    ) -> Result<
+        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
         unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
     }
 }
@@ -228,8 +236,25 @@ pub fn tool_call_response(
     response(OneOrMany::one(AssistantContent::tool_call(id, name, args)))
 }
 
+/// Several tool calls in *one* assistant turn — the co-tool-call case (e.g. a turn
+/// that calls `view_image` alongside `run_kaish`). rig runs them together and folds
+/// all their results into a single user turn, which is exactly the shape the
+/// view_image turn-boundary break must tolerate without orphaning a `tool_use`.
+pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse<()> {
+    let contents: Vec<AssistantContent> = calls
+        .into_iter()
+        .map(|(id, name, args)| AssistantContent::tool_call(id, name, args))
+        .collect();
+    response(OneOrMany::many(contents).expect("at least one tool call"))
+}
+
 fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<()> {
-    CompletionResponse { choice, usage: Usage::new(), raw_response: (), message_id: None }
+    CompletionResponse {
+        choice,
+        usage: Usage::new(),
+        raw_response: (),
+        message_id: None,
+    }
 }
 
 /// A provider-side error — drives `run_phase`'s failure arm (the model loop fails
@@ -338,6 +363,9 @@ impl RecordingSink {
 
 impl crate::progress::ProgressSink for RecordingSink {
     fn emit(&self, event: crate::progress::PhaseEvent) {
-        self.events.lock().expect("recording sink poisoned").push(event);
+        self.events
+            .lock()
+            .expect("recording sink poisoned")
+            .push(event);
     }
 }

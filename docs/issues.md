@@ -14,7 +14,30 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-11 (vision-in SHIPPED — `view_image(path)` (`src/view_image.rs`):
+Last pass: 2026-06-12 (view_image on OpenAI-compatible VLMs SHIPPED, offline-green —
+the channel fix from `docs/oai-images.md`. An `openai` vision slot now genuinely *sees*:
+`view_image` still produces the tool-result image envelope, but on a transport that
+can't carry it (the OpenAI wire forbids an image in a `role:tool` message; rig 400s
+first), `run_phase` (`consult.rs`) installs a `ViewImageBreakHook` that flags on
+`on_tool_result` and terminates on the **next** `on_completion_call` — the turn
+boundary where rig's transcript already holds every tool result of the triggering
+turn, so co-tool-call orphaning is structurally impossible (verified against rig 0.38.2
+`prompt_request/mod.rs:665-672,1081`). The `PromptCancelled` transcript is rewritten
+(`rewrite_view_image_history`): each `view_image` result becomes a text ack and a
+*separate*, tool-result-free `Message::User { [Image] }` lands after it (mixed in one
+turn, rig's openai converter silently drops the image — the load-bearing S2 result),
+then the loop resumes via the `finalize_prompt`-style split with a transcript-derived
+outer turn budget so a looping `view_image` can't refresh `max_turns`. Gated on a new
+see-∧-transport predicate: `ModelCaps.tool_result_images` (= `transport_supports_tool_
+result_images(kind)`); anthropic/gemini keep the tool-result channel untouched. Offline
+tests: pure rewrite (separate-message, idempotency, co-tool-call selectivity) + two
+driven loop tests (single break→resume asserts a user image and *no* tool-result image
+copy; a co-tool-call view_image+run_kaish turn resumes cleanly). **OPEN — the live
+probe is load-bearing, not optional:** the scripted mock returns its answer regardless
+of wire validity, so a rewrite that left an orphaned `tool_use` passes offline; only a
+real openai-compatible VLM (local Qwen-VL via llama.cpp/vLLM) reporting a detail it
+could only see confirms it. Run before calling this done — see `docs/oai-images.md`
+"Tests/Live probe".) 2026-06-11 (vision-in SHIPPED — `view_image(path)` (`src/view_image.rs`):
 a vision-capable phase reads an image *file* from the workspace and the bytes reach
 model context as a rig image part. Path-only by decision (debug screenshots/assets/
 docs are files already in the tree); no MCP-native/inline input. Bytes are read

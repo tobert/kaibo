@@ -16,6 +16,17 @@
 //! resolved caps say the model is vision-capable (`consult.rs`), so a blind model
 //! never sees it — there is no "image handed to a model that can't read it" path.
 //!
+//! **The envelope is the same; the channel is not.** This tool always produces the
+//! tool-result image envelope. On a transport that carries an image inside a tool
+//! result (Anthropic `tool_result` blocks, Gemini `functionResponse` inline data)
+//! that's the whole story. On one that can't — the OpenAI wire forbids an image in a
+//! `role:tool` message — the loop ([`run_phase`](crate::consult)) breaks at the turn
+//! boundary after a `view_image`, rewrites the result onto a separate **user** `Image`
+//! turn (the channel every provider accepts), and resumes. So a seeing model receives
+//! the image regardless of transport; only the channel differs, decided by
+//! `ModelCaps.tool_result_images`. The invariant: a vision model on a no-tool-result-
+//! image transport still gets the image — via a user turn, never silently dropped.
+//!
 //! [`ToolResultContent::from_tool_output`]: rig_core::completion::message
 //! [`Arm`]: crate::consult::Arm
 

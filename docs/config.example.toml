@@ -244,7 +244,11 @@ image    = "sd/sdxl-turbo"
 # --- The table form, part 1: capability pins. `vision = true` overrides the
 #     built-in classifier (Anthropic/Gemini multimodal-in, DeepSeek text-only,
 #     generic openai endpoints vision-off until you say otherwise — kaibo can't
-#     know what's behind an arbitrary id, so opt in, don't guess). ---
+#     know what's behind an arbitrary id, so opt in, don't guess). A vision slot on
+#     an openai-compatible backend really sees: `view_image` reads the file and kaibo
+#     delivers it on the user-turn channel (the openai wire forbids images in a tool
+#     result), so a local Qwen-VL/llava views workspace images the same as a hosted
+#     Claude or Gemini does. ---
 
 [casts.vlm]
 explorer = "llama/qwen2.5-coder-7b"                              # bare ref: just the id
