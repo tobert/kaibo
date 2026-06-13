@@ -37,6 +37,11 @@ Three concepts, each owning exactly one idea:
   (img2txt, audio-in) is a capability (`ModelCaps`) of an agent slot, because
   the only channel into model context is the rig tool-result envelope. See the
   media-spine entry in `docs/issues.md` for the perception/production split.
+  **Status:** the production roles are reserved seams — nothing consumes
+  `image`/`tts` yet. `tts` (and `stt`) are parked pending rig provider coverage
+  (rig 0.38 has TTS for openai-kind only, no Gemini/Anthropic), to be adopted
+  when rig expands rather than hand-rolled. The Gemini-tts slot above is the
+  *motivating* example for why casts exist, not working config today.
 - **cast** — a named assignment of models to roles, freely spanning backends.
   This is what the `cast` call param selects.
 
@@ -67,7 +72,7 @@ key_optional = true
 explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers
 image    = "sd/sdxl-turbo"                  # image gen stays local
-tts      = "gemini/gemini-2.5-flash-tts"
+# tts    = "gemini/gemini-2.5-flash-tts"    # the motivating role — RESERVED, see below
 
 [casts.local-only]                          # privacy posture: nothing leaves the box
 explorer = "gemma/Gemma-4-E4B-it-GGUF"

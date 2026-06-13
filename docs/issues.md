@@ -171,6 +171,30 @@ add when a genuinely-never-a-file pasted image comes up), search/code-exec tools
 file-store/context-cache plays, batch synth (its P3 entry stands), any
 image-processing crate.
 
+**TTS/STT — PARKED pending rig provider coverage (decided 2026-06-13).** No sound
+devices in scope: file-in/file-out only (TTS writes an audio file, STT reads one and
+returns text — `stt` is the natural fit for a kaish builtin emitting text, no new
+delivery channel; TTS is the artifact path needing out-dir + per-builtin timeout).
+The blocker is rig, not kaibo's design. rig 0.38 *has* the traits
+(`AudioGenerationModel` = TTS, `TranscriptionModel` = STT) but coverage is uneven:
+- **TTS** — openai-kind only (also xai/azure/openrouter); **no Gemini, no Anthropic,
+  no DeepSeek**. So the obvious chimera "voice on Gemini" can't be driven through rig.
+- **STT** — openai-kind **and Gemini** (also hf/mistral/groq/azure); no Anthropic/DeepSeek.
+- Feasibility note for the adopter: rig's openai audio/transcription methods hang off
+  `openai::Client`, but kaibo builds `openai::CompletionsClient` (`consult.rs:637`) —
+  a second small client on the same base_url/key, not a blocker.
+
+Decision: **wait for rig to broaden coverage and adopt its traits wholesale**, rather
+than hand-roll Gemini's AUDIO-modality `generateContent` over raw HTTP now (a second
+non-rig wire path to maintain, against the one-primitive grain). Kept as ready seams:
+`ModelRole::Tts` still parses/resolves into a cast slot (annotated reserved in
+`config.rs`); `stt` isn't a role yet (add with the consumer). The shipped
+`config.example.toml` was scrubbed of the `tts` slot — the embedded template must not
+advertise a capability kaibo lacks; `docs/config.md`/`docs/casts.md` document the
+reserved roles honestly. **When this un-parks** (rig adds Gemini/Anthropic TTS, or
+openai-only TTS is judged enough): wire the `tts` builtin (needs the per-builtin
+timeout + out-dir below), add the `stt` role + builtin, restore the example slots.
+
 ### Per-builtin timeouts: the 30s script timeout cannot serve model-backed builtins
 The kernel exec timeout is one global knob: `KAISH_EXEC_TIMEOUT` (30s,
 `sandbox.rs:103`) threaded via `with_request_timeout` (`sandbox.rs:184`),

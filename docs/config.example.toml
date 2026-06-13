@@ -211,10 +211,10 @@ key_optional = true
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
 #
-# Roles: explorer, synth (the agent phases), image, tts (production roles for the
+# Roles: explorer, synth (the agent phases), image (a production role for the
 # media builtins as they land). A typo'd role is a loud load error. A cast may
 # omit roles — the tool that needs a missing role fails at call time, naming the
-# gap ("cast `tts-box` has no synth slot"); absent = capability absent.
+# gap ("cast `notes` has no synth slot"); absent = capability absent.
 #
 # Slot forms:
 #   role = "backend/model-id"                                  # the common case
@@ -232,7 +232,6 @@ key_optional = true
 explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers
 image    = "sd/sdxl-turbo"                  # image gen stays local
-tts      = "gemini/gemini-3.1-flash-tts-preview"
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
 #     the local-default `openai` backend. ---

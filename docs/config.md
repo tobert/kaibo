@@ -102,7 +102,7 @@ or a table when the slot needs pins or tunables:
 explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers
 image    = "sd/sdxl-turbo"                  # image gen stays local
-tts      = "gemini/gemini-2.5-flash-tts"
+# tts    = "gemini/gemini-2.5-flash-tts"    # RESERVED — parses but unconsumed (see below)
 
 # table form: id + capability pins + per-slot tunables
 # synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
@@ -113,7 +113,11 @@ tts      = "gemini/gemini-2.5-flash-tts"
   built-ins always carry explorer+synth; a user cast that omits one is valid
   config, and the tool that needs the missing role fails loudly *at call time*,
   naming the gap ("cast `tts-box` has no synth slot"). Absent = capability absent.
-  (Nothing consumes `image`/`tts` yet; they land with the production builtins.)
+  (Nothing consumes `image`/`tts` yet; they land with the production builtins.
+  `tts` — and a future `stt` — is parked pending rig provider coverage: rig 0.38
+  drives TTS only for openai-kind backends, not Gemini/Anthropic. Kept as the
+  adoption seam; the shipped `config.example.toml` deliberately omits it rather
+  than advertise a capability that doesn't exist. See `docs/issues.md`.)
 - **An unknown backend in a slot is a load error** naming the known backends; an
   empty model id is rejected at load (it would surface as a baffling provider 404
   mid-call otherwise).

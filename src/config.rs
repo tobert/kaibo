@@ -126,11 +126,23 @@ impl Default for Defaults {
 /// phases; the media roles (the pal-merge production models — see `docs/issues.md`
 /// "Media spine") are present only when configured: an absent slot means the
 /// capability is absent, not an error (built-in casts always carry explorer+synth).
+///
+/// **`Tts` is a reserved, unwired seam.** It parses and resolves into a cast slot,
+/// but nothing consumes it — and won't until rig's provider coverage fills in: as
+/// of rig 0.38 `AudioGenerationModel` (TTS) exists only for openai-kind backends,
+/// not Gemini/Anthropic, so the natural chimera "voice on Gemini" can't be driven
+/// through rig today. `stt` (transcription) isn't even a role yet for the same
+/// reason — kept parked rather than hand-rolled, to be adopted wholesale when rig
+/// expands. (`Image` is in the same unconsumed state, tracked under the media
+/// spine.) See the "Media spine" entry in `docs/issues.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelRole {
     Explorer,
     Synth,
     Image,
+    /// Reserved/unwired — no consumer until rig ships a usable TTS driver for the
+    /// backends a chimera wants (see the enum doc). Kept so a `tts = …` slot stays
+    /// valid config and the adoption seam is already in place.
     Tts,
 }
 
