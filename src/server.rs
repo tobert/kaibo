@@ -108,9 +108,8 @@ pub struct ConsultInput {
     pub path: Option<String>,
 
     /// Cast: a built-in name ("anthropic" (default), "deepseek", "gemini",
-    /// "openai") or a cast from config.toml. `provider` is accepted as a
-    /// transitional alias for this field; sending both is a loud error.
-    #[serde(default, alias = "provider")]
+    /// "openai") or a cast from config.toml.
+    #[serde(default)]
     pub cast: Option<String>,
 
     /// Override the explorer (investigation) model id. Sent verbatim — an id
@@ -178,8 +177,8 @@ pub struct ExploreInput {
     pub path: Option<String>,
 
     /// Cast: "anthropic" (default), "deepseek", "gemini", "openai", or a cast
-    /// from config.toml. `provider` is accepted as a transitional alias.
-    #[serde(default, alias = "provider")]
+    /// from config.toml.
+    #[serde(default)]
     pub cast: Option<String>,
 
     /// Override the explorer model id. Sent verbatim — an id containing "/" is
@@ -218,8 +217,8 @@ pub struct SynthesizeInput {
     pub path: Option<String>,
 
     /// Cast: "anthropic" (default), "deepseek", "gemini", "openai", or a cast
-    /// from config.toml. `provider` is accepted as a transitional alias.
-    #[serde(default, alias = "provider")]
+    /// from config.toml.
+    #[serde(default)]
     pub cast: Option<String>,
 
     /// Override the synthesizer (capable) model id. Sent verbatim — an id
@@ -2012,39 +2011,24 @@ mod tests {
         );
     }
 
-    // --- The cast param and its transitional `provider` alias ------------------
+    // --- The cast param --------------------------------------------------------
 
-    /// `cast` is the param's name; a client still sending `provider` must land on
-    /// the same field (the serde alias), not be silently dropped into the default.
+    /// `cast` is the param's name and a stale `provider` is now a tombstone: with
+    /// the transitional alias removed it falls under `deny_unknown_fields`, so an
+    /// old client sending it gets a loud invalid-params error, never a silent drop
+    /// into the default cast. (The rmcp-seam coverage lives in tests/cast_param.rs.)
     #[test]
-    fn provider_alias_still_selects_the_cast() {
-        let input: ConsultInput =
-            serde_json::from_value(json!({ "question": "q", "provider": "gemini" }))
-                .expect("provider alias must deserialize");
-        assert_eq!(input.cast.as_deref(), Some("gemini"));
+    fn cast_is_the_param_and_a_stale_provider_is_rejected() {
         let input: ConsultInput =
             serde_json::from_value(json!({ "question": "q", "cast": "deepseek" })).unwrap();
         assert_eq!(input.cast.as_deref(), Some("deepseek"));
-        // The other two inputs carry the same alias.
-        let input: ExploreInput =
-            serde_json::from_value(json!({ "question": "q", "provider": "openai" })).unwrap();
-        assert_eq!(input.cast.as_deref(), Some("openai"));
-        let input: SynthesizeInput =
-            serde_json::from_value(json!({ "question": "q", "provider": "claude" })).unwrap();
-        assert_eq!(input.cast.as_deref(), Some("claude"));
-    }
-
-    /// Sending BOTH spellings is a loud duplicate-field error — two selectors
-    /// disagreeing must never silently pick a winner.
-    #[test]
-    fn sending_both_cast_and_provider_is_a_duplicate_field_error() {
         let err = serde_json::from_value::<ConsultInput>(
-            json!({ "question": "q", "cast": "anthropic", "provider": "gemini" }),
+            json!({ "question": "q", "provider": "gemini" }),
         )
-        .expect_err("both spellings must be rejected");
+        .expect_err("a stale `provider` arg must be a loud unknown-field error");
         assert!(
-            err.to_string().contains("duplicate field"),
-            "want a duplicate-field error, got: {err}"
+            err.to_string().contains("provider"),
+            "the error must name the unknown field, got: {err}"
         );
     }
 

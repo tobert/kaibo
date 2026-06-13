@@ -164,11 +164,12 @@ built-in single-backend cast, both arms on one backend, no media builtins.
   the new id classifies fresh. With a backend arg (aliases resolve) the slot is
   replaced wholesale, so it also works on a role the cast doesn't carry — a
   bare id there is a loud error naming the backend arg.
-- **The `cast` param** carries `#[serde(alias = "provider")]` for one cycle:
-  a client still sending `provider` must not be *silently ignored* into the
-  default cast (serde drops unknown fields — a textbook silent fallback).
-  With the alias both spellings work and sending both is a loud
-  duplicate-field error. Removal note lives in `docs/issues.md`.
+- **The `cast` param** carried `#[serde(alias = "provider")]` for one cycle
+  after the rename so a client still sending `provider` selected the named cast
+  instead of being *silently ignored* into the default (serde drops unknown
+  fields — a textbook silent fallback). That alias is now removed: the inputs
+  are `deny_unknown_fields`, so a stale `provider` is a loud invalid-params
+  error — the intended end state.
 - **Rename map:** `server.provider`→`server.cast`, `KAIBO_PROVIDER`→
   `KAIBO_CAST`, `--provider`→`--cast`, `resolve_profile`→`resolve_cast`;
   `kaibo://config` renders `backends` + `casts` (slots as `"backend/id"` with
@@ -204,6 +205,6 @@ the sandbox, and path containment. The rewrite is the layer above them — the
 2. **Arms through consult.** Per-phase clients behind the `Arm` seam; the
    offline mock proves a mixed cast drives each phase on its own client and
    that the explore′ delegation crosses backends correctly.
-3. **Server surface.** `cast` param + `provider` alias (both-set is an
-   error), `run_kaish` cast arg, resource render, `docs/config.md` rewrite,
-   tool descriptions.
+3. **Server surface.** `cast` param (a stale `provider` is a loud unknown-field
+   error — the alias was retired one cycle after the rename), `run_kaish` cast
+   arg, resource render, `docs/config.md` rewrite, tool descriptions.

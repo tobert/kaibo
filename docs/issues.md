@@ -58,7 +58,8 @@ an explicit backend arg (no `"backend/id"` call-arg parsing — a bare HF org
 prefix must never silently retarget through a backend alias), tool inputs are
 deny_unknown_fields, `kaibo://config` renders the alias registries, and a new
 openai-kind backend must declare base_url. Folded out the P1 entry; the
-`provider`-alias removal note moved to its own P2 entry below). 2026-06-11
+transitional `provider` call-arg alias rode one cycle and has since been removed
+— a stale `provider` is now a loud unknown-field error). 2026-06-11
 (media-spine foundations shipped — the role table
 (`[profiles.<name>.models]`, `ModelRole`/`ModelSlot` in `config.rs`; flat
 `explorer_model`/`synth_model` keys stay valid, both-spellings is a loud error)
@@ -201,19 +202,6 @@ completes, while a pure-script spin still dies at 30s.
 ---
 
 ## P2 — Focused fixes & hardening
-
-### Remove the transitional `provider` call-param alias
-The backends/casts rename shipped 2026-06-11 with `#[serde(alias = "provider")]`
-on the `cast` tool arg (consult/explore/synthesize), so a client still sending
-`provider` selects the named cast instead of being silently dropped into the
-default (`docs/casts.md` "How a call maps"). One cycle only by design: delete
-the alias (and this entry) on the next release pass. `tests/cast_param.rs` pins
-the alias behavior — its alias tests go with it; the duplicate-field test
-becomes a plain unknown-field test (inputs are deny_unknown_fields, so a stale
-`provider` turns into a loud invalid-params error, which is the desired end
-state).
-
----
 
 ## P3 — Infra, perf, polish
 

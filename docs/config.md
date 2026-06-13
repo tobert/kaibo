@@ -298,13 +298,13 @@ The rename map ships as loud errors, never silent reinterpretation:
 | `server.provider` | unknown-field load error (`deny_unknown_fields`) |
 | `KAIBO_PROVIDER` | load error naming `KAIBO_CAST` and `docs/casts.md` |
 | `--provider` | rejected by clap (unknown flag) |
-| call arg `provider` | **still accepted** as an alias of `cast`, for one cycle |
+| call arg `provider` | unknown-field error (`deny_unknown_fields`) — the alias is gone |
 
-The call-arg alias is the one survivor, on purpose: serde drops unknown fields, so
-without the alias a client still sending `provider` would be *silently ignored*
-into the default cast — a textbook silent fallback. With the alias both spellings
-work and sending both is a loud duplicate-field error. The removal note lives in
-`docs/issues.md`.
+The call-arg `provider` alias was the one survivor for a single cycle after the
+rename: serde drops unknown fields, so without it a client still sending
+`provider` would have been *silently ignored* into the default cast — a textbook
+silent fallback. That cycle is over; the alias is removed and a stale `provider`
+is now a loud invalid-params error like every other tombstone above.
 
 ## File location & loading
 
