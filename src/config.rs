@@ -30,11 +30,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::consult::{ModelCaps, ThinkingStyleOverride};
-use crate::credentials::{self, PLACEHOLDER_OPENAI_KEY, ProviderKind};
+use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
 
@@ -448,6 +448,42 @@ pub enum CastUsability {
     Unconfigured,
 }
 
+// --- Telemetry -------------------------------------------------------------
+
+/// Resolved OpenTelemetry export config. **Off by default**: kaibo reads private
+/// source, and rig's GenAI spans carry prompts, completions, and source snippets,
+/// so a default run must ship nothing off-box. Enabling opens an *outbound* OTLP/
+/// HTTP connection to `endpoint` — allowed under the stdio-only invariant (kaibo
+/// never *binds*), but a real boundary, hence opt-in. See `src/telemetry.rs`.
+#[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    /// Whether to stand up the OTLP exporter at all. `false` → zero overhead.
+    pub enabled: bool,
+    /// OTLP/HTTP (protobuf) traces endpoint, e.g. `http://localhost:4318/v1/traces`.
+    pub endpoint: String,
+    /// Extra headers on each export request (auth for a remote collector, etc.).
+    /// File-only — a header map has no clean single-env-var form.
+    pub headers: BTreeMap<String, String>,
+    /// Per-export deadline. The exporter must never wedge a shutdown flush.
+    pub timeout: Duration,
+    /// `service.name` on the OTLP Resource — how this process shows up in traces.
+    pub service_name: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // The session's `otlp-mcp` collector and most local collectors listen
+            // here; flipping `enabled` alone targets localhost, never a remote.
+            endpoint: "http://localhost:4318/v1/traces".to_string(),
+            headers: BTreeMap::new(),
+            timeout: Duration::from_secs(10),
+            service_name: "kaibo".to_string(),
+        }
+    }
+}
+
 // --- The whole config ------------------------------------------------------
 
 /// kaibo's resolved configuration.
@@ -468,6 +504,8 @@ pub struct Config {
     /// Which tools to advertise.
     pub tools: ToolGating,
     pub defaults: Defaults,
+    /// OpenTelemetry export — off by default (see [`TelemetryConfig`]).
+    pub telemetry: TelemetryConfig,
     /// Read-only sandbox limits (exec timeout, output cap, extra disabled builtins).
     pub sandbox: SandboxConfig,
     /// Backends (connections) by name.
@@ -856,6 +894,7 @@ impl Config {
             .into_iter()
             .map(PathBuf::from)
             .collect();
+        let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
@@ -877,6 +916,7 @@ impl Config {
             log,
             tools,
             defaults,
+            telemetry,
             sandbox,
             backends,
             casts,
@@ -1057,6 +1097,7 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
 struct RawConfig {
     server: Option<RawServer>,
     defaults: Option<RawDefaults>,
+    telemetry: Option<RawTelemetry>,
     sandbox: Option<RawSandbox>,
     backends: Option<BTreeMap<String, RawBackend>>,
     casts: Option<BTreeMap<String, RawCast>>,
@@ -1065,6 +1106,18 @@ struct RawConfig {
     /// Declared so the message points at the migration instead of serde's
     /// generic unknown-field complaint.
     profiles: Option<toml::Value>,
+}
+
+/// The `[telemetry]` stanza — mirrors `[server]` in spirit: all optional, overrides
+/// the off-by-default built-in. `headers` is a sub-table; the rest take `KAIBO_*`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTelemetry {
+    enabled: Option<bool>,
+    endpoint: Option<String>,
+    headers: Option<BTreeMap<String, String>>,
+    timeout_secs: Option<u64>,
+    service_name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1306,6 +1359,27 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
     })
 }
 
+fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
+    let d = TelemetryConfig::default();
+    // A zero timeout means "time out instantly" — never a real intent, and it would
+    // brick every export (and the shutdown flush). Catch it at load, same spirit as
+    // the backend request_timeout check.
+    let timeout = match raw.timeout_secs {
+        Some(0) => {
+            bail!("[telemetry] timeout_secs must be > 0 — a zero deadline fails every export")
+        }
+        Some(n) => Duration::from_secs(n),
+        None => d.timeout,
+    };
+    Ok(TelemetryConfig {
+        enabled: raw.enabled.unwrap_or(d.enabled),
+        endpoint: raw.endpoint.unwrap_or(d.endpoint),
+        headers: raw.headers.unwrap_or(d.headers),
+        timeout,
+        service_name: raw.service_name.unwrap_or(d.service_name),
+    })
+}
+
 fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
     let d = SandboxConfig::default();
     SandboxConfig {
@@ -1427,6 +1501,27 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
         sandbox.scratch_limit_bytes = Some(parse_env_int("KAIBO_SCRATCH_LIMIT_BYTES", &v)?);
     }
     // disable_builtins is a list — file-only, no env form.
+
+    let telemetry = raw.telemetry.get_or_insert_with(Default::default);
+    if let Some(v) = get("KAIBO_TELEMETRY_ENABLED") {
+        // Same on/off grammar as the KAIBO_NO_* flags, but here it can flip a
+        // file-enabled exporter *off* too — so set the parsed bool either way.
+        let on = {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        };
+        telemetry.enabled = Some(on);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_ENDPOINT") {
+        telemetry.endpoint = Some(v);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_TIMEOUT_SECS") {
+        telemetry.timeout_secs = Some(parse_env_int("KAIBO_TELEMETRY_TIMEOUT_SECS", &v)?);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_SERVICE_NAME") {
+        telemetry.service_name = Some(v);
+    }
+    // headers is a map — file-only, no env form (same call as disable_builtins).
     Ok(())
 }
 
@@ -2025,14 +2120,12 @@ mod tests {
     /// A typo'd role key in a cast stanza is a loud load error (deny_unknown_fields).
     #[test]
     fn an_unknown_role_key_in_a_cast_is_a_load_error() {
-        assert!(
-            Config::from_toml_str(
-                r#"
+        assert!(Config::from_toml_str(
+            r#"
             [casts.x]
             explorrer = "anthropic/claude-haiku-4-5"
             "#,
-            )
-            .is_err()
-        );
+        )
+        .is_err());
     }
 }

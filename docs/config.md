@@ -270,6 +270,11 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |
 | disable extra builtins | `sandbox.disable_builtins` *(list; file-only)* | — | — |
+| telemetry on/off | `telemetry.enabled` *(default false)* | `KAIBO_TELEMETRY_ENABLED` | — |
+| OTLP traces endpoint | `telemetry.endpoint` | `KAIBO_TELEMETRY_ENDPOINT` | — |
+| export timeout (s) | `telemetry.timeout_secs` *(must be > 0)* | `KAIBO_TELEMETRY_TIMEOUT_SECS` | — |
+| trace service name | `telemetry.service_name` | `KAIBO_TELEMETRY_SERVICE_NAME` | — |
+| export headers | `telemetry.headers` *(map; file-only — values are secrets)* | — | — |
 
 **Two deliberate exceptions to the rule:**
 
@@ -330,6 +335,38 @@ Loading rules, in the spirit of "crashing beats silent corruption":
 
 Project-local layering (a repo-root `.kaibo.toml` merged over the user config) is a
 plausible later layer — noted, not in this cut.
+
+## Telemetry (OpenTelemetry traces)
+
+**Off by default, and that default is load-bearing.** kaibo reads a private
+codebase, and the spans `rig-core` emits carry prompts, completions, and source
+snippets. A default run must ship *nothing* off-box, so `[telemetry]` is opt-in:
+
+```toml
+[telemetry]
+enabled      = true                                # default false
+endpoint     = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
+timeout_secs = 10                                  # per-export deadline; must be > 0
+service_name = "kaibo"                             # service.name on the trace Resource
+headers = { authorization = "Bearer <token>" }     # file-only; values are secrets
+```
+
+What you get is the GenAI trace tree rig already produces — a tool call →
+`run_phase` per phase → `invoke_agent` → a `chat` span per model turn (with
+`gen_ai.request.model` and every `gen_ai.usage.*` token count) → a `tool` span per
+`run_kaish` / delegated `explore′` sweep. kaibo only adds the named parent spans
+(`consult` / `explore` / `synthesize` / `run_kaish`) that root each trace; the
+exporter ships the rest. Transport is OTLP/HTTP + protobuf (the `/v1/traces` path),
+reusing kaibo's `reqwest` — no gRPC, no second HTTP stack.
+
+**The boundary this draws.** Enabling opens an **outbound** OTLP connection to
+`endpoint`. That's allowed under kaibo's stdio-only invariant — kaibo can read a
+filesystem, so it must never *bind* a socket, but reaching *out* to a collector is
+not binding. Keep `endpoint` local (the default `localhost:4318`) unless you mean
+to send traces — with full content — to a remote. Header **values** are secrets and
+never appear in the `kaibo://config` render (only the header *names* do, like an
+API-key env-var name). Logs continue to ride the `tracing` → stderr + MCP
+`notifications/message` path regardless; telemetry adds the *traces* signal only.
 
 ## Path containment
 

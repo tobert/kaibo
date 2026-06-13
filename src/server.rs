@@ -5,12 +5,11 @@
 
 use std::path::PathBuf;
 
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
-use rmcp::ErrorData as McpError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -21,19 +20,21 @@ use rmcp::model::{
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
-use rmcp::{RoleServer, tool, tool_handler, tool_router};
+use rmcp::ErrorData as McpError;
+use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
 use serde_json::json;
+use tracing::Instrument;
 
 use crate::config::{Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{Arm, ConsultConfig, consult, explore, synthesize};
+use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig};
 use crate::explorer::format_output;
 use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
 use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink};
-use crate::sandbox::{KaishWorker, builtin_schemas};
+use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::SessionStore;
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -620,8 +621,20 @@ impl KaiboHandler {
         // only ever touched there, never held across the consult await.
         let session = input.session_id.as_deref().map(|id| (&self.sessions, id));
 
+        // The root span for this tool call's trace: it parents both phases'
+        // `run_phase` spans (and through them rig's GenAI tree), so the explore and
+        // synth model loops land in ONE trace instead of two orphan roots. Inert
+        // unless an exporter is attached.
+        let span = tracing::info_span!(
+            "consult",
+            cast = %cast.name,
+            explorer_model = %explorer.model,
+            synth_model = %synth.model,
+            session = session.is_some(),
+        );
         progress.emit(PhaseEvent::PhaseStarted { phase: "consult" });
         let out = consult(&input.question, root, &explorer, &synth, &cfg, session)
+            .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
@@ -667,8 +680,10 @@ impl KaiboHandler {
             progress: progress.clone(),
         };
 
+        let span = tracing::info_span!("explore", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
         let report = explore(&input.question, root, &arm, &cfg)
+            .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
@@ -714,10 +729,17 @@ impl KaiboHandler {
             progress: progress.clone(),
         };
 
+        let span = tracing::info_span!(
+            "synthesize",
+            cast = %cast.name,
+            model = %arm.model,
+            with_context = input.context.is_some(),
+        );
         progress.emit(PhaseEvent::PhaseStarted {
             phase: "synthesize",
         });
         let answer = synthesize(&input.question, input.context.as_deref(), root, &arm, &cfg)
+            .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         progress.emit(PhaseEvent::PhaseFinished {
@@ -750,8 +772,14 @@ impl KaiboHandler {
         // configured sandbox limits (timeout, output cap, disabled builtins).
         let worker = KaishWorker::spawn_with(&root, self.config.sandbox.clone())
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        // The direct-shell tool gets its own trace (no model loop under it). The kaish
+        // worker is `!Send` on its own thread, but this span wraps the async `.await`
+        // here, so the script's wall-clock is captured from the caller side — no span
+        // crosses the thread boundary.
+        let span = tracing::info_span!("run_kaish");
         let out = worker
             .run(input.script)
+            .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
@@ -791,7 +819,8 @@ impl rmcp::ServerHandler for KaiboHandler {
                 &self.tool_schemas,
                 &self.config,
                 &self.allowed_set,
-                self.config.default_cast_usability(|k| std::env::var(k).ok()),
+                self.config
+                    .default_cast_usability(|k| std::env::var(k).ok()),
             )),
         }
     }
@@ -977,6 +1006,9 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         sandbox: SandboxDoc,
         /// The [defaults] tunables every slot falls back to.
         defaults: DefaultsDoc,
+        /// OpenTelemetry export state (off by default). Header *names* only — a
+        /// value could be a bearer token, so it's withheld like an API key.
+        telemetry: TelemetryDoc,
         /// alias → canonical backend name. Aliases are valid slot-ref prefixes
         /// and per-call backend overrides, so callers must be able to discover
         /// them here — built-in and file-declared both.
@@ -1021,6 +1053,20 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         thinking_style: String,
         request_timeout_secs: u64,
         session_capacity: usize,
+    }
+
+    /// Telemetry as resolved. SECRET-SAFETY: `header_names` lists the keys of any
+    /// configured export headers but never their values — an Authorization value is
+    /// a secret, same as an API key. The operator set the names; surfacing those is
+    /// the discoverability the resource promises.
+    #[derive(Serialize)]
+    struct TelemetryDoc {
+        enabled: bool,
+        endpoint: String,
+        timeout_secs: u64,
+        service_name: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        header_names: Vec<String>,
     }
 
     #[derive(Serialize)]
@@ -1170,6 +1216,13 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         request_timeout,
         session_capacity,
     } = &config.defaults;
+    let crate::config::TelemetryConfig {
+        enabled: telemetry_enabled,
+        endpoint: telemetry_endpoint,
+        headers: telemetry_headers,
+        timeout: telemetry_timeout,
+        service_name: telemetry_service_name,
+    } = &config.telemetry;
     let doc = ConfigDoc {
         allowed_paths: allowed_set
             .iter()
@@ -1202,6 +1255,13 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
             thinking_style: format!("{thinking_style:?}").to_lowercase(),
             request_timeout_secs: request_timeout.as_secs(),
             session_capacity: session_capacity.get(),
+        },
+        telemetry: TelemetryDoc {
+            enabled: *telemetry_enabled,
+            endpoint: telemetry_endpoint.clone(),
+            timeout_secs: telemetry_timeout.as_secs(),
+            service_name: telemetry_service_name.clone(),
+            header_names: telemetry_headers.keys().cloned().collect(),
         },
         backend_aliases: config.backend_aliases().clone(),
         backends,
@@ -1355,8 +1415,8 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::ServerHandler;
     use rmcp::model::NumberOrString;
+    use rmcp::ServerHandler;
 
     /// A small stand-in builtin set so resource rendering is offline-testable.
     fn sample_schemas() -> Vec<ToolSchema> {
@@ -1722,6 +1782,38 @@ mod tests {
         assert!(
             body.contains("ANTHROPIC_API_KEY"),
             "config resource must show key source env var names:\n{body}"
+        );
+        // Telemetry state is part of the resolved runtime: an operator must be able
+        // to see whether kaibo is shipping spans off-box and to where.
+        assert!(
+            body.contains("[telemetry]") && body.contains("enabled = false"),
+            "config resource must show telemetry state (off by default):\n{body}"
+        );
+    }
+
+    /// SECRET-SAFETY teeth: an export header *value* (e.g. a bearer token) must
+    /// never reach the rendered resource — only the header *name*, the pointer the
+    /// operator set, exactly as key sources render their env var name not the key.
+    #[test]
+    fn config_resource_withholds_telemetry_header_values() {
+        let config = Config::from_toml_str(
+            r#"
+            [telemetry]
+            enabled = true
+            headers = { authorization = "Bearer super-secret-token" }
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[]);
+        // The header NAME is discoverable…
+        assert!(
+            body.contains("authorization"),
+            "header name must be visible for diagnostics:\n{body}"
+        );
+        // …but its VALUE is a secret and must not leak.
+        assert!(
+            !body.contains("super-secret-token") && !body.contains("Bearer"),
+            "a header value must never render — it can be a bearer token:\n{body}"
         );
     }
 

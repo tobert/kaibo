@@ -120,6 +120,27 @@ scratch_limit_bytes = 67108864
 # disable_builtins = ["rg", "find"]
 
 # ---------------------------------------------------------------------------
+# [telemetry] — OpenTelemetry trace export. OFF BY DEFAULT, and that default is
+# load-bearing: kaibo reads private source, and the spans rig emits carry prompts,
+# completions, and source snippets. A default run ships NOTHING. Enabling opens an
+# OUTBOUND OTLP/HTTP connection to `endpoint` — allowed under stdio-only (kaibo
+# never *binds* a socket), but a real boundary, so it's opt-in. rig already emits
+# the GenAI span tree (a tool call → each phase → each model turn, with token
+# usage); this just exports it. Transport is OTLP/HTTP + protobuf (the `/v1/traces`
+# path), reusing kaibo's reqwest — no gRPC. Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,
+# TIMEOUT_SECS,SERVICE_NAME}. `headers` is file-only (a value can be a secret).
+# ---------------------------------------------------------------------------
+
+# [telemetry]
+# enabled      = true                                # default false — opt in here
+# endpoint     = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
+# timeout_secs = 10                                  # per-export deadline; must be > 0
+# service_name = "kaibo"                             # service.name on the trace Resource
+# Extra export headers (auth for a remote collector). The VALUES are secrets — they
+# never appear in the kaibo://config render (only the header names do).
+# headers = { authorization = "Bearer <token>" }
+
+# ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire protocol/rig client
 # (anthropic | deepseek | gemini | openai); the rest describes the wire (endpoint,
 # key source, per-request deadline). Models live on cast slots, never here.

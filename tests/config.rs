@@ -1197,3 +1197,106 @@ fn a_bare_slot_carries_no_pins_or_tunables() {
     assert_eq!(slot.effort, None);
     assert_eq!(slot.thinking_style, None);
 }
+
+// --- Telemetry (OTLP traces) -------------------------------------------------
+// kaibo reads private source, so a default run must stay fully local: telemetry
+// is opt-in, off by default. These are the teeth on that invariant plus the
+// file/env precedence for the new [telemetry] table (mirrors [server]).
+
+#[test]
+fn telemetry_is_off_by_default_so_a_default_run_stays_local() {
+    // The boundary that matters: a fresh install never ships a span off-box. If
+    // someone flips the default to `true`, this fails — by design.
+    let c = Config::builtin();
+    assert!(
+        !c.telemetry.enabled,
+        "telemetry must default OFF — a default run ships nothing to a collector"
+    );
+    // The endpoint default points at a local OTLP/HTTP collector, so flipping
+    // `enabled = true` alone targets localhost, not some remote.
+    assert_eq!(c.telemetry.endpoint, "http://localhost:4318/v1/traces");
+    assert_eq!(c.telemetry.service_name, "kaibo");
+    assert!(c.telemetry.headers.is_empty());
+}
+
+#[test]
+fn telemetry_table_parses_from_file() {
+    let c = Config::from_toml_str(
+        r#"
+        [telemetry]
+        enabled = true
+        endpoint = "http://collector.internal:4318/v1/traces"
+        timeout_secs = 5
+        service_name = "kaibo-dev"
+        headers = { authorization = "Bearer t0ken", "x-tenant" = "kaibo" }
+        "#,
+    )
+    .unwrap();
+    assert!(c.telemetry.enabled);
+    assert_eq!(
+        c.telemetry.endpoint,
+        "http://collector.internal:4318/v1/traces"
+    );
+    assert_eq!(c.telemetry.timeout, Duration::from_secs(5));
+    assert_eq!(c.telemetry.service_name, "kaibo-dev");
+    assert_eq!(
+        c.telemetry.headers.get("authorization").map(String::as_str),
+        Some("Bearer t0ken")
+    );
+    assert_eq!(
+        c.telemetry.headers.get("x-tenant").map(String::as_str),
+        Some("kaibo")
+    );
+}
+
+#[test]
+fn env_overrides_telemetry_over_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // File turns it on and points somewhere; env retargets and retunes it.
+    std::fs::write(
+        &path,
+        "[telemetry]\nenabled = true\nendpoint = \"http://file:4318/v1/traces\"\n",
+    )
+    .unwrap();
+    let env: HashMap<&str, &str> = [
+        ("KAIBO_TELEMETRY_ENDPOINT", "http://env:4318/v1/traces"),
+        ("KAIBO_TELEMETRY_TIMEOUT_SECS", "30"),
+        ("KAIBO_TELEMETRY_SERVICE_NAME", "kaibo-env"),
+    ]
+    .into_iter()
+    .collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert!(
+        c.telemetry.enabled,
+        "file's enabled survives where env is silent"
+    );
+    assert_eq!(c.telemetry.endpoint, "http://env:4318/v1/traces");
+    assert_eq!(c.telemetry.timeout, Duration::from_secs(30));
+    assert_eq!(c.telemetry.service_name, "kaibo-env");
+}
+
+#[test]
+fn env_can_disable_telemetry_that_the_file_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[telemetry]\nenabled = true\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_TELEMETRY_ENABLED", "0")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert!(
+        !c.telemetry.enabled,
+        "KAIBO_TELEMETRY_ENABLED=0 must turn off a file-enabled exporter"
+    );
+}
+
+#[test]
+fn a_non_numeric_telemetry_timeout_is_a_loud_error() {
+    let env: HashMap<&str, &str> = [("KAIBO_TELEMETRY_TIMEOUT_SECS", "soon")]
+        .into_iter()
+        .collect();
+    let err = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("KAIBO_TELEMETRY_TIMEOUT_SECS"),
+        "got: {err:#}"
+    );
+}

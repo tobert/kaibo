@@ -111,13 +111,30 @@ async fn main() -> Result<()> {
     // before then — startup — buffer here and flush when draining begins, so the
     // client sees them too.
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Per-layer filters, not one global EnvFilter. The OTLP layer must see rig's
+    // `rig::*` spans — the GenAI trace tree is the whole point — while stderr and
+    // the MCP bridge stay scoped to the `kaibo` target. A single global filter would
+    // gate all three to one directive, so each carries its own. RUST_LOG still wins
+    // over config.log (unchanged), rebuilt fresh per layer.
+    let kaibo_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.log.clone()));
+    // Stand up the OTLP exporter first, so the boxed layer's subscriber type is the
+    // bare `Registry`. `None` (zero overhead) unless [telemetry] opted in; the guard
+    // flushes the batch on exit. A build error here is fatal — a misconfigured
+    // exporter is an operator mistake, surfaced loudly, not silently swallowed.
+    let (otel_layer, otel_guard) =
+        match kaibo::telemetry::init::<tracing_subscriber::Registry>(&config.telemetry)? {
+            Some((layer, guard)) => (Some(layer), Some(guard)),
+            None => (None, None),
+        };
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(otel_layer)
         .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(config.log.clone())),
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(kaibo_filter()),
         )
-        .with(McpBridgeLayer::new(log_tx))
+        .with(McpBridgeLayer::new(log_tx).with_filter(kaibo_filter()))
         .init();
 
     // A zero-tool server is a misconfiguration, not a mode: refuse it loudly here,
@@ -179,6 +196,13 @@ async fn main() -> Result<()> {
     tokio::spawn(mcp_log::drain(log_rx, log_level, service.peer().clone()));
     service.waiting().await?;
 
+    // Flush and stop the OTLP exporter before exit (no-op when telemetry was off):
+    // the batch processor buffers spans off-thread, so without this the last spans
+    // are lost. The guard's shutdown caps its own time, so a wedged collector can't
+    // hang us here past the server loop.
+    if let Some(guard) = otel_guard {
+        guard.shutdown();
+    }
     tracing::info!("kaibo shutting down");
     Ok(())
 }

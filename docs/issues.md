@@ -356,25 +356,20 @@ defaults (`credentials.rs`, `docs/config.md`). A secrets *manager* is still out 
 scope: by design the TOML references keys, never inlines them, so "point at
 `$SECRET_TOOL` output" would be a future key-source variant alongside env/file.
 
-### OTLP / OpenTelemetry export (P4, deferred)
-MCP notifications shipped first: progress (`notifications/progress`, gated on a
-caller `progressToken`) and a logging bridge (`notifications/message`, `setLevel`-
-tuned). Both ride seams that OTEL can reuse rather than replace:
-- **Spans** — the natural trace tree is already there: a tool call → `run_phase` →
-  each delegated `explore′` sweep → each `run_kaish`. The `progress::PhaseEvent`
-  points (`PhaseStarted`/`SweepStarted`/`KaishRun`/…, `consult.rs`) are exactly the
-  span boundaries; a `ProgressSink` impl that opens/closes spans instead of (or
-  alongside) emitting MCP progress is the cleanest entry. The sink is already
-  threaded everywhere via `ConsultConfig.progress`.
-- **Logs** — `mcp_log::McpBridgeLayer` is one `tracing` layer feeding one channel;
-  an OTLP layer is a *second* `tracing` layer in the same `main.rs` registry stack,
-  no new plumbing.
-- **Metrics** — turn counts, token usage (rig surfaces `Usage`), per-phase latency,
-  sweep fan-out.
-Deferred because it needs an exporter dep + endpoint config (a `[telemetry]` table
-mirroring `[server]`) and there's no consumer wired yet. Note the **stdio-only**
-invariant: an OTLP/gRPC or HTTP exporter opens an *outbound* socket — that's allowed
-(kaibo must never *bind/listen*), but it's a real boundary to call out in review, and
-it should be opt-in/off-by-default so a default run stays fully local. The session
-context already runs an `otlp-mcp` collector, a ready sink for a first probe.
+### OTLP logs + metrics signals (deferred — traces shipped)
+The **traces** signal is in: `[telemetry]` (off by default) stands up an OTLP/HTTP
+exporter and a `tracing-opentelemetry` layer in `main.rs`, exporting the GenAI span
+tree rig already emits (`src/telemetry.rs`, `docs/config.md`). Two signals remain:
+- **Logs** — kaibo's `tracing` events (the `kaibo`-target log lines) as an OTLP
+  *logs* signal via `opentelemetry-appender-tracing`, a third layer in the same
+  registry stack. Today they still ride stderr + the MCP `notifications/message`
+  bridge only; nothing exports them.
+- **Metrics** — rig records token usage as span *fields*, not as metric
+  instruments. Real counters/histograms (tokens, per-phase latency, sweep fan-out)
+  are hand-rolled, or derived from spans at the collector. Decide which before
+  adding an `opentelemetry` metrics provider.
+Both reuse the same off-by-default `[telemetry]` gate and endpoint; the open
+question is whether the content/cost of a logs signal is worth it given traces
+already carry the prompts/completions. The session's `otlp-mcp` collector is the
+sink for a probe.
 
