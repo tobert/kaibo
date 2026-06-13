@@ -73,6 +73,20 @@ struct Args {
     /// Don't advertise the `generate_image` tool.
     #[arg(long)]
     no_generate_image: bool,
+
+    /// Project house-rules file spliced into each consultation tool's preamble,
+    /// resolved relative to the project root and read only if present. Repeatable.
+    /// Defaults to AGENTS.md; passing any replaces that default. Also settable via
+    /// KAIBO_PROJECT_FILES (colon-separated) or [context] project_files.
+    #[arg(long = "project-context-file", value_name = "FILE", action = clap::ArgAction::Append)]
+    project_context_file: Vec<String>,
+
+    /// User house-rules file (e.g. ~/.claude/CLAUDE.md) spliced into each
+    /// consultation tool's preamble; read unconditionally (missing is an error).
+    /// Repeatable. Also settable via KAIBO_USER_FILES (colon-separated) or
+    /// [context] user_files.
+    #[arg(long = "user-context-file", value_name = "FILE", action = clap::ArgAction::Append)]
+    user_context_file: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -107,6 +121,8 @@ async fn main() -> Result<()> {
             generate_image: args.no_generate_image,
         },
         args.allow_path.clone(),
+        args.project_context_file.clone(),
+        args.user_context_file.clone(),
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else

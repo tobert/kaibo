@@ -870,6 +870,8 @@ fn cli_cast_wins_over_env_and_file() {
             ..Default::default()
         },
         vec![], // no --allow-path flags
+        vec![], // no --project-context-file flags
+        vec![], // no --user-context-file flags
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -889,7 +891,7 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
     // Pre-seed allow_paths as if they came from env or a config file.
     c.allow_paths = vec![std::path::PathBuf::from("/tmp/from-env")];
     // Apply CLI with no --allow-path flags (empty list).
-    c.apply_cli(None, None, ToolDisables::default(), vec![]);
+    c.apply_cli(None, None, ToolDisables::default(), vec![], vec![], vec![]);
     // The env/file-layer value must survive.
     assert!(
         c.allow_paths
@@ -1298,5 +1300,93 @@ fn a_non_numeric_telemetry_timeout_is_a_loud_error() {
     assert!(
         format!("{err:#}").contains("KAIBO_TELEMETRY_TIMEOUT_SECS"),
         "got: {err:#}"
+    );
+}
+
+// --- [context] house-rules files ----------------------------------------------
+
+/// With no `[context]` table, kaibo reads `AGENTS.md` by default (vendor-neutral,
+/// opt-out) and no user files — the behavior an operator gets for free.
+#[test]
+fn context_defaults_to_agents_md_only() {
+    let c = Config::builtin();
+    assert_eq!(c.context.project_files, vec!["AGENTS.md".to_string()]);
+    assert!(c.context.user_files.is_empty());
+}
+
+/// An explicit `[context]` table replaces both lists — including the canonical
+/// "share my CLAUDE.md" shape the feature was built for.
+#[test]
+fn context_table_sets_project_and_user_files() {
+    let c = Config::from_toml_str(
+        r#"
+        [context]
+        project_files = ["AGENTS.md", "docs/CONVENTIONS.md"]
+        user_files = ["~/.claude/CLAUDE.md"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        c.context.project_files,
+        vec!["AGENTS.md".to_string(), "docs/CONVENTIONS.md".to_string()]
+    );
+    // user_files are tilde-expanded at merge so assemble does pure filesystem work.
+    let user = &c.context.user_files;
+    assert_eq!(user.len(), 1);
+    assert!(
+        !user[0].to_string_lossy().starts_with('~'),
+        "~ must be expanded at merge, got: {}",
+        user[0].display()
+    );
+    assert!(user[0].to_string_lossy().ends_with(".claude/CLAUDE.md"));
+}
+
+/// An explicit empty `project_files = []` is the opt-out: it turns off even the
+/// AGENTS.md default, rather than being ignored as "unset".
+#[test]
+fn context_explicit_empty_project_files_opts_out_of_the_default() {
+    let c = Config::from_toml_str(
+        r#"
+        [context]
+        project_files = []
+        "#,
+    )
+    .unwrap();
+    assert!(
+        c.context.project_files.is_empty(),
+        "an explicit [] opts out of the AGENTS.md default, got: {:?}",
+        c.context.project_files
+    );
+}
+
+/// `KAIBO_PROJECT_FILES` / `KAIBO_USER_FILES` override the file layer, colon-
+/// separated like PATH; and an empty value is the env-level opt-out.
+#[test]
+fn context_env_overrides_file_and_empty_opts_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[context]\nproject_files = [\"AGENTS.md\"]\nuser_files = [\"/from/file.md\"]\n",
+    )
+    .unwrap();
+
+    // Env replaces both: a two-entry project list, an empty user list (opt-out).
+    let env: HashMap<&str, &str> = [
+        ("KAIBO_PROJECT_FILES", "A.md:sub/B.md"),
+        ("KAIBO_USER_FILES", ""),
+    ]
+    .into_iter()
+    .collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(
+        c.context.project_files,
+        vec!["A.md".to_string(), "sub/B.md".to_string()],
+        "KAIBO_PROJECT_FILES (colon-separated) replaces the file layer"
+    );
+    assert!(
+        c.context.user_files.is_empty(),
+        "an empty KAIBO_USER_FILES opts out of the file's user_files, got: {:?}",
+        c.context.user_files
     );
 }

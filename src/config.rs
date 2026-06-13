@@ -34,6 +34,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::consult::{ModelCaps, ThinkingStyleOverride};
+use crate::context::ContextConfig;
 use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
@@ -518,6 +519,9 @@ pub struct Config {
     pub defaults: Defaults,
     /// OpenTelemetry export — off by default (see [`TelemetryConfig`]).
     pub telemetry: TelemetryConfig,
+    /// House-rules files spliced into each consultation tool's preamble (the
+    /// `[context]` table). Defaults to reading `AGENTS.md` when present.
+    pub context: ContextConfig,
     /// Read-only sandbox limits (exec timeout, output cap, extra disabled builtins).
     pub sandbox: SandboxConfig,
     /// Backends (connections) by name.
@@ -907,6 +911,7 @@ impl Config {
             .map(PathBuf::from)
             .collect();
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
+        let context = merge_context(raw.context.unwrap_or_default());
         let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
@@ -929,6 +934,7 @@ impl Config {
             tools,
             defaults,
             telemetry,
+            context,
             sandbox,
             backends,
             casts,
@@ -956,6 +962,8 @@ impl Config {
         cast: Option<String>,
         disable: ToolDisables,
         allow_paths: Vec<PathBuf>,
+        project_context_files: Vec<String>,
+        user_context_files: Vec<PathBuf>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
@@ -981,6 +989,16 @@ impl Config {
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
+        }
+        // Each context list replaces its lower layers when the operator passed any
+        // on the CLI — matching the allow_paths discipline. The CLI has no way to
+        // express "empty", so passing a flag is always an additive override, never
+        // the opt-out (that's KAIBO_PROJECT_FILES= or an explicit [] in the file).
+        if !project_context_files.is_empty() {
+            self.context.project_files = project_context_files;
+        }
+        if !user_context_files.is_empty() {
+            self.context.user_files = user_context_files;
         }
     }
 }
@@ -1114,6 +1132,7 @@ struct RawConfig {
     server: Option<RawServer>,
     defaults: Option<RawDefaults>,
     telemetry: Option<RawTelemetry>,
+    context: Option<RawContext>,
     sandbox: Option<RawSandbox>,
     backends: Option<BTreeMap<String, RawBackend>>,
     casts: Option<BTreeMap<String, RawCast>>,
@@ -1145,6 +1164,21 @@ struct RawSandbox {
     scratch_limit_bytes: Option<u64>,
     /// Builtins to disable on top of the read-only denylist (file-only; no env).
     disable_builtins: Option<Vec<String>>,
+}
+
+/// The `[context]` stanza — files whose contents are spliced into each
+/// consultation tool's preamble as standing guidance. Both lists optional;
+/// omitting `project_files` keeps the built-in `["AGENTS.md"]` default, while an
+/// explicit empty list opts out of even that. See [`ContextConfig`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContext {
+    /// Root-relative files read if present. Env: `KAIBO_PROJECT_FILES`
+    /// (colon-separated). Default (when the key is absent): `["AGENTS.md"]`.
+    project_files: Option<Vec<String>>,
+    /// Absolute/tilde files read unconditionally (missing = error). Env:
+    /// `KAIBO_USER_FILES` (colon-separated). Default: empty.
+    user_files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1397,6 +1431,25 @@ fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
     })
 }
 
+/// Resolve `[context]`. A *missing* `project_files` keeps the built-in
+/// `["AGENTS.md"]` default (vendor-neutral, opt-out by an explicit empty list);
+/// `user_files` default to empty and are tilde-expanded here so `assemble` is
+/// pure filesystem work. The files themselves are read lazily, per call, against
+/// the resolved root — not here — so a config load never touches a project.
+fn merge_context(raw: RawContext) -> ContextConfig {
+    ContextConfig {
+        project_files: raw
+            .project_files
+            .unwrap_or_else(|| vec!["AGENTS.md".to_string()]),
+        user_files: raw
+            .user_files
+            .unwrap_or_default()
+            .iter()
+            .map(|s| expand_tilde(s))
+            .collect(),
+    }
+}
+
 fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
     let d = SandboxConfig::default();
     SandboxConfig {
@@ -1425,6 +1478,16 @@ fn merge_tools(raw: RawTools) -> ToolGating {
 
 /// Fold `KAIBO_*` env vars into the raw config (env over file). Numeric parse
 /// failures are loud — a `KAIBO_MAX_TOKENS=abc` is a mistake, not a fallback.
+/// Split a colon-separated path list (PATH grammar) into entries, dropping empty
+/// components. Shared by the context-file env vars; an empty input yields an empty
+/// list (the opt-out signal for `project_files`).
+fn split_path_list(v: &str) -> Vec<String> {
+    std::env::split_paths(v)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
 fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
     // Tombstone: the old selector env var must not be silently ignored into the
     // default cast — name its replacement and stop.
@@ -1509,6 +1572,18 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_SESSION_CAPACITY") {
         defaults.session_capacity = Some(parse_env_int("KAIBO_SESSION_CAPACITY", &v)?);
+    }
+
+    // Context files: colon-separated like PATH (and like KAIBO_ALLOW_PATHS), so a
+    // single path with no colon is one entry. An empty value sets an empty list —
+    // that's the opt-out for project_files (turn off the AGENTS.md default), so we
+    // set Some(empty) rather than skipping.
+    let context = raw.context.get_or_insert_with(Default::default);
+    if let Some(v) = get("KAIBO_PROJECT_FILES") {
+        context.project_files = Some(split_path_list(&v));
+    }
+    if let Some(v) = get("KAIBO_USER_FILES") {
+        context.user_files = Some(split_path_list(&v));
     }
 
     let sandbox = raw.sandbox.get_or_insert_with(Default::default);

@@ -279,6 +279,8 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | export timeout (s) | `telemetry.timeout_secs` *(must be > 0)* | `KAIBO_TELEMETRY_TIMEOUT_SECS` | — |
 | trace service name | `telemetry.service_name` | `KAIBO_TELEMETRY_SERVICE_NAME` | — |
 | export headers | `telemetry.headers` *(map; file-only — values are secrets)* | — | — |
+| project house-rules files | `context.project_files` *(list; default `["AGENTS.md"]`)* | `KAIBO_PROJECT_FILES` *(colon-separated)* | `--project-context-file FILE` *(repeatable)* |
+| user house-rules files | `context.user_files` *(list)* | `KAIBO_USER_FILES` *(colon-separated)* | `--user-context-file FILE` *(repeatable)* |
 
 **Two deliberate exceptions to the rule:**
 
@@ -371,6 +373,55 @@ to send traces — with full content — to a remote. Header **values** are secr
 never appear in the `kaibo://config` render (only the header *names* do, like an
 API-key env-var name). Logs continue to ride the `tracing` → stderr + MCP
 `notifications/message` path regardless; telemetry adds the *traces* signal only.
+
+## House rules: `[context]`
+
+kaibo's models are *for other agents*, so it helps when they inherit the calling
+agent's conventions. `[context]` names files whose contents are spliced into each
+consultation tool's preamble (the system prompt) as standing guidance — an
+`AGENTS.md`, a shared `~/.claude/CLAUDE.md`, whatever you call yours. **Vendor-
+neutral:** no filename is hardcoded in the product; the only default is the
+emerging cross-tool `AGENTS.md` convention, and that's just a config default you
+can change or turn off.
+
+```toml
+[context]
+# Root-relative, read IF PRESENT (absent is normal). Default: ["AGENTS.md"].
+# An explicit [] opts out of even that.
+project_files = ["AGENTS.md", "docs/CONVENTIONS.md"]
+
+# Absolute/tilde paths, read UNCONDITIONALLY (a missing one is a startup-visible
+# error — you declared it, so kaibo won't silently drop it). Default: none.
+user_files = ["~/.claude/CLAUDE.md"]
+```
+
+Two lists, two deliberately different failure semantics:
+
+- **`project_files`** are root-relative and **read-if-present**: a repo with no
+  `AGENTS.md` is the normal case, not an error. Each is joined to the resolved
+  project root and canonicalize-checked to stay *within* it — a configured `../`
+  or an out-of-tree symlink is refused, so the same containment that bounds the
+  read-only shell bounds what gets injected.
+- **`user_files`** are **read-required**: you named the file on purpose, so a
+  missing one is a loud error rather than a silent skip that ships an answer
+  missing the guidance you were counting on.
+
+**The trust boundary** (why `user_files` may sit outside the allowed set): these
+files are read in trusted server-side Rust at the tool handler — the same trust
+level as `config.toml` itself — and only their *contents* reach the model, never
+the path. The read-only kaish shell still cannot reach `~/.claude`; the model's
+read scope is *not* widened. That's the distinction from `[server] allow_paths`
+below: `allow_paths` widens what the *model* can explore, `[context]` injects
+fixed operator text the model never navigates to.
+
+Injected into every phase that drives a model — the `consult` driver, the
+standalone `explore` and `synthesize`, *and* the nested `explore′` sweep inside
+`consult` — so the cheap explorer orients on the same `AGENTS.md`/user guidance
+while it searches, not just at answer time (the block names where things live and
+what matters). Precedence is the usual per-call > CLI > env > file > built-in: a
+CLI `--project-context-file` replaces lower layers additively (the CLI can't
+express "empty"; opt out with an empty `[context] project_files = []` or
+`KAIBO_PROJECT_FILES=`).
 
 ## Path containment
 

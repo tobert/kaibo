@@ -421,7 +421,7 @@ fn allow_paths_cli_replaces_env_and_file() {
     c.apply_cli(None, None, kaibo::config::ToolDisables::default(), vec![
         std::path::PathBuf::from("/tmp/cli-a"),
         std::path::PathBuf::from("/tmp/cli-b"),
-    ]);
+    ], vec![], vec![]);
     assert_eq!(c.allow_paths.len(), 2);
     assert!(c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/cli-a")));
     assert!(c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/cli-b")));

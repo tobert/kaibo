@@ -459,6 +459,19 @@ impl KaiboHandler {
         ))
     }
 
+    /// Assemble the operator's house rules for this call against the resolved
+    /// `root`: the `[context]` files read here, in trusted server-side Rust, and
+    /// folded into the phase preamble. A missing *declared* user file is a loud
+    /// `internal_error`, never a silent skip — the operator was counting on that
+    /// guidance reaching the model. `None` when nothing's configured/present.
+    fn house_rules(&self, root: &std::path::Path) -> Result<Option<Arc<str>>, McpError> {
+        self.config
+            .context
+            .assemble(root)
+            .map(|opt| opt.map(Arc::from))
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+    }
+
     /// Resolve a call's cast: the explicit name (looked up in the registry, by
     /// name or alias), else the server's default cast. An unknown name is a
     /// parameter error naming the available casts. Returns an owned clone so the
@@ -639,6 +652,7 @@ impl KaiboHandler {
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
+            house_rules: self.house_rules(&root)?,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -704,6 +718,7 @@ impl KaiboHandler {
             synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
+            house_rules: self.house_rules(&root)?,
         };
 
         let span = tracing::info_span!("explore", cast = %cast.name, model = %arm.model);
@@ -753,6 +768,7 @@ impl KaiboHandler {
             synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
+            house_rules: self.house_rules(&root)?,
         };
 
         let span = tracing::info_span!(

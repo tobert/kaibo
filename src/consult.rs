@@ -48,6 +48,34 @@ use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, SessionStore};
 use crate::view_image::ViewImage;
 
+/// Splice the operator's house rules (if any) onto a phase preamble. The base
+/// preamble functions stay pure (and their tests byte-for-byte stable); this is
+/// the one seam that folds in the assembled `[context]` block. Every phase that
+/// drives a model uses it — the `consult` driver, the standalone `explore` and
+/// `synthesize`, *and* the nested `explore′` sweep — so the explorer orients on
+/// the same guidance the driver does (it helps *search*, not just the answer).
+/// `None` returns the base unchanged: a server with no `[context]` files runs
+/// exactly the historical preamble.
+///
+/// Framed as standing background, not the question, and positively (per the
+/// `positive-prompt-framing` discipline): tell the model what the block *is* and
+/// how to use it — conventions to honor while investigating — rather than fencing
+/// it off. It sits *after* the base so the tool's own role framing leads.
+fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
+    match house_rules {
+        None => base,
+        Some(rules) => format!(
+            "{base}\n\n\
+             --- Operator house rules for this codebase ---\n\
+             The agent you're helping configured the guidance below — project \
+             conventions and working preferences for this repository. Treat it as \
+             trusted standing context: honor it as you investigate and when you write \
+             your answer. It's background about how this codebase works, not the \
+             question you're answering.\n\n{rules}"
+        ),
+    }
+}
+
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
@@ -698,6 +726,13 @@ pub struct ConsultConfig {
     /// It rides on `ConsultConfig` because that's the one bundle already threaded into
     /// every phase fn and the toolset builders.
     pub progress: Arc<dyn ProgressSink>,
+    /// Operator house rules (assembled `AGENTS.md` / user files) to splice into
+    /// each top-level tool's preamble, or `None` for the historical bare preamble.
+    /// `Arc<str>` so cloning `ConsultConfig` per phase is cheap. Rides here for the
+    /// same reason as `progress`: it's the one bundle already threaded everywhere.
+    /// The server fills it per call (it needs the resolved root to read the files);
+    /// the `Default` is `None`, so every offline test runs the unchanged preamble.
+    pub house_rules: Option<Arc<str>>,
 }
 
 impl Default for ConsultConfig {
@@ -708,6 +743,7 @@ impl Default for ConsultConfig {
             synth_max_turns: d.synth_max_turns,
             sandbox: SandboxConfig::default(),
             progress: Arc::new(NullSink),
+            house_rules: None,
         }
     }
 }
@@ -1160,9 +1196,15 @@ pub struct RunExplore {
     /// handed to the nested kernel's `run_kaish` so the sub-agent's own reads show
     /// through too (a delegated sweep is where a long consult spends its silence).
     progress: Arc<dyn ProgressSink>,
+    /// The operator's house rules (or `None`), spliced onto the sweep preamble so
+    /// the cheap explorer orients on the same `AGENTS.md`/user guidance the driver
+    /// and standalone `explore` get — the block helps *search*, not just the final
+    /// answer (it names where things live and what matters).
+    house_rules: Option<Arc<str>>,
 }
 
 impl RunExplore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         arm: Arm,
         max_turns: usize,
@@ -1170,6 +1212,7 @@ impl RunExplore {
         sandbox: SandboxConfig,
         reports: Arc<Mutex<Vec<String>>>,
         progress: Arc<dyn ProgressSink>,
+        house_rules: Option<Arc<str>>,
     ) -> Self {
         Self {
             arm,
@@ -1178,6 +1221,7 @@ impl RunExplore {
             sandbox,
             reports,
             progress,
+            house_rules,
         }
     }
 }
@@ -1241,7 +1285,7 @@ impl Tool for RunExplore {
         let result = self
             .arm
             .run(
-                &report_preamble(),
+                &with_house_rules(report_preamble(), self.house_rules.as_deref()),
                 args.question,
                 self.max_turns,
                 self.progress.as_ref(),
@@ -1275,7 +1319,7 @@ pub async fn explore(
 ) -> Result<String> {
     let root = root.into();
     arm.run(
-        &report_preamble(),
+        &with_house_rules(report_preamble(), cfg.house_rules.as_deref()),
         question.to_string(),
         cfg.explorer_max_turns,
         cfg.progress.as_ref(),
@@ -1369,7 +1413,7 @@ pub async fn synthesize(
     let root = root.into();
     let user_prompt = synthesize_user_prompt(question, context);
     arm.run(
-        &synthesize_preamble(),
+        &with_house_rules(synthesize_preamble(), cfg.house_rules.as_deref()),
         user_prompt,
         cfg.synth_max_turns,
         cfg.progress.as_ref(),
@@ -1457,6 +1501,7 @@ fn consult_tools(
         cfg.sandbox.clone(),
         reports,
         cfg.progress.clone(),
+        cfg.house_rules.clone(),
     );
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
         Box::new(RunKaish::with_progress(
@@ -1493,7 +1538,7 @@ pub(crate) async fn consult_with(
 
     let answer = synth
         .run(
-            &consult_preamble(),
+            &with_house_rules(consult_preamble(), cfg.house_rules.as_deref()),
             user_prompt.to_string(),
             cfg.synth_max_turns,
             cfg.progress.as_ref(),
@@ -1632,6 +1677,126 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/foo.rs"), "fn target_marker() {}\n").unwrap();
         dir
+    }
+
+    /// The load-bearing wiring test for the house-rules feature: operator context
+    /// configured on `ConsultConfig` must reach the *model's preamble*, and only
+    /// when configured. A scripted phase answers immediately; we read back the
+    /// role framing rig forwarded. The `None` arm proves the splice is gated, not
+    /// unconditional — a server with no `[context]` runs the unchanged preamble.
+    #[tokio::test]
+    async fn house_rules_splice_into_the_phase_preamble_only_when_configured() {
+        const MODEL: &str = "explorer";
+        const MARKER: &str = "HOUSE_RULE_MARKER: prefer tabs over spaces";
+
+        let dir = tempdir().unwrap();
+
+        // Configured → the marker and its framing ride in the preamble.
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .build();
+        let cfg = ConsultConfig {
+            house_rules: Some(Arc::from(MARKER)),
+            ..ConsultConfig::default()
+        };
+        explore("q", dir.path(), &arm(&client, MODEL), &cfg)
+            .await
+            .unwrap();
+        let reqs = client.requests_for(MODEL);
+        let pre = reqs[0].preamble.as_deref().unwrap_or("");
+        assert!(
+            pre.contains(MARKER),
+            "house rules must reach the preamble: {pre}"
+        );
+        assert!(
+            pre.contains("Operator house rules"),
+            "the framing header must introduce them: {pre}"
+        );
+        // Still the explorer's own role framing — house rules append, not replace.
+        assert!(
+            pre.contains("code explorer"),
+            "base preamble must remain: {pre}"
+        );
+
+        // Unconfigured → the same call carries the base preamble and no marker.
+        let bare = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .build();
+        let cfg2 = ConsultConfig::default(); // house_rules: None
+        explore("q", dir.path(), &arm(&bare, MODEL), &cfg2)
+            .await
+            .unwrap();
+        let reqs2 = bare.requests_for(MODEL);
+        let pre2 = reqs2[0].preamble.as_deref().unwrap_or("");
+        assert!(!pre2.contains(MARKER), "no [context] → no marker: {pre2}");
+        assert!(
+            pre2.contains("code explorer"),
+            "base preamble intact: {pre2}"
+        );
+    }
+
+    /// House rules reach the *nested* `explore′` sweep too, not just the driver —
+    /// the consistency that lets the cheap explorer orient on `AGENTS.md` while it
+    /// searches. Drives the real consult loop: the driver delegates one sweep, the
+    /// explorer reports, the driver answers. We then assert BOTH models saw the
+    /// marker in their preamble — the explorer via the `RunExplore`-threaded block.
+    #[tokio::test]
+    async fn house_rules_reach_the_nested_explorer_sweep() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+        const MARKER: &str = "HOUSE_RULE_MARKER: the cast lives in config.rs";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let seen = transcript_text(req);
+                if !seen.contains("SWEEP_DONE") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "where does the cast live?" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: config.rs"))
+                }
+            })
+            // The explorer answers its sweep immediately (no kaish needed for this
+            // test — we only care what preamble it was handed).
+            .on_model(EXPLORER, |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig {
+            house_rules: Some(Arc::from(MARKER)),
+            ..ConsultConfig::default()
+        };
+        consult_with(
+            "where does the cast live?",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        // The driver saw it (as the standalone test also proves)...
+        let synth_pre = client.requests_for(SYNTH)[0]
+            .preamble
+            .clone()
+            .unwrap_or_default();
+        assert!(synth_pre.contains(MARKER), "driver preamble: {synth_pre}");
+        // ...and so did the nested explorer — the teeth for this change.
+        let explorer_reqs = client.requests_for(EXPLORER);
+        assert!(!explorer_reqs.is_empty(), "the sweep must have run");
+        let explorer_pre = explorer_reqs[0].preamble.clone().unwrap_or_default();
+        assert!(
+            explorer_pre.contains(MARKER),
+            "the nested explore′ sweep must carry the house rules too: {explorer_pre}"
+        );
+        assert!(
+            explorer_pre.contains("code explorer"),
+            "still the explorer's own role framing: {explorer_pre}"
+        );
     }
 
     /// The load-bearing e2e: a scripted consult that delegates a sweep to `explore′`,

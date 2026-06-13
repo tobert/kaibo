@@ -282,6 +282,19 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P3 — Infra, perf, polish
 
+### `[context]` house rules have no size cap (and ride every turn, every phase)
+The `[context]` files are spliced into the preamble whole (`context.rs::assemble`
+→ `consult.rs::with_house_rules`), the preamble is re-sent on *every* model turn,
+and the block now rides *every* phase — the driver, standalone `explore`/
+`synthesize`, and each nested `explore′` sweep. A large `AGENTS.md` +
+`~/.claude/CLAUDE.md` is real token cost multiplied across turns *and* sweeps. No
+truncation by design — silent truncation of operator guidance is the wrong failure
+— but a generous cap with a *loud* error (or a startup warning naming the byte
+count) would catch a runaway file before it quietly bloats every call. Measure a
+real config before adding the knob. Project-local `.kaibo.toml` layering (already
+noted under "File location") would let a repo ship its own `[context]` without a
+global edit.
+
 ### Multi-turn session history is unbounded per session
 `SessionStore` (`session.rs`) caps the number of *sessions* (LRU, `session_capacity`)
 but keeps every `(question, answer)` pair in a session forever — matching dpal, which

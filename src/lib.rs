@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod consult;
+pub mod context;
 pub mod credentials;
 pub mod explorer;
 pub mod generate_image;
