@@ -211,7 +211,7 @@ key_optional = true
 explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers
 image    = "sd/sdxl-turbo"                  # image gen stays local
-tts      = "gemini/gemini-2.5-flash-tts"
+tts      = "gemini/gemini-3.1-flash-tts-preview"
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
 #     the local-default `openai` backend. ---
