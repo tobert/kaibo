@@ -18,7 +18,11 @@ loop. Each consultation tool is that loop wearing different clothes:
   → an answer (investigates directly when context is thin).
 - **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
 
-**Capabilities** are a distinct, growing tool *class* — not `run_phase` loops:
+**Capabilities** are a distinct, growing tool *class* — not `run_phase` loops. The
+direction is the tell: consultation and perception (`view_image`) run images and
+context *into* kaibo's own models so they can reason; a capability runs a model and
+hands the **artifact back to the calling agent** — kaibo is the producer, the caller
+is the consumer.
 
 - **`generate_image`** — prompt → image, returned inline as MCP `Content::image`
   (`generate_image.rs`, `image_gen.rs`). A single provider call behind the `ImageGen`

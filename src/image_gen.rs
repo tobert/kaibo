@@ -5,6 +5,11 @@
 //! — things the team can *do* and hand back as artifacts. This module is the first
 //! capability: turn a prompt into image bytes.
 //!
+//! The direction is the opposite of [`view_image`](crate::view_image): that tool runs
+//! an image *into* a kaibo model's context so it can *see* while answering; this one
+//! produces an artifact that flows *out* to the calling agent (the `generate_image`
+//! tool returns it inline as MCP `Content::image`). Producer here, consumer there.
+//!
 //! The seam is deliberately narrow. [`ImageGen`] is "prompt + size → bytes"; the
 //! `generate_image` tool ([`crate::generate_image`]) owns everything around it
 //! (cast/slot resolution, MIME, MCP delivery), and the offline tests drive a scripted
