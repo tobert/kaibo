@@ -418,6 +418,18 @@ built-in reproduces it with no per-cast config. Still open, lower value:
   to a file, à la gemini-cli's `GEMINI_WRITE_SYSTEM_MD` — useful now that prompts
   compose per model from `[prompts]`, slot `preamble`, and `[context]`.
 
+### `generate_image` doesn't advertise its cast `enum` yet
+The consultation tools (`consult`/`explore`/`synthesize`) now stamp the live
+usable-cast roster onto their `cast` param as a JSON-Schema `enum` at startup
+(`inject_cast_enum`, `server.rs`), so an agent picking a team reads the menu off
+the schema instead of the truncatable handshake prose — the fix for the "had to
+spelunk `kaibo://config` to find `deepseek`" failure. `generate_image` was left
+out on purpose: its `cast` selects the **`image`** slot (openai-kind only), so the
+right menu is "casts with a usable image slot", not the explorer/synth `usable_casts`
+list — a different filter (`Config::image_capable_casts`, to write). Add it so image
+gen is as discoverable as consultation. Low-risk: the enum is advisory (`call_tool`
+deserializes via serde, which ignores it), so it never rejects a config-only cast.
+
 ### Server doesn't report which backends are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
 error. Validating available backends at startup (and noting them in the server

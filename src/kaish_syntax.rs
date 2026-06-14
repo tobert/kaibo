@@ -106,16 +106,31 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 /// learn more. The canonical block carries the "how kaish works" spine; we add only
 /// what's kaibo's.
 pub fn kaibo_instructions(schemas: &[ToolSchema]) -> String {
+    format!("{}\n\n{}", kaibo_lead(), kaish_reference(schemas))
+}
+
+/// The opening paragraph: what kaibo is and the tool menu. Split out from the kaish
+/// reference so the scope-aware handshake can slot the `## Casts` roster *between*
+/// them — the menu of teams reads before the kaish syntax wall, where a host that
+/// truncates won't drop it.
+fn kaibo_lead() -> &'static str {
+    "kaibo (解剖) — ask a question about a codebase and get a grounded, cited \
+     answer. kaibo reads the project READ-ONLY through a kaish shell and never \
+     modifies files or runs external commands. Tools: `consult` (capable model, \
+     reads spans and delegates broad sweeps), `explore` (fast curated report), \
+     `synthesize` (capable model over optional context), and `run_kaish` (drive \
+     the shell directly). Each is gated independently, so a given server may \
+     advertise only some."
+}
+
+/// The kaish onboarding spine — the mental model, operating contract, live builtin
+/// index, and where to read more. Reference material: it follows the cast menu in
+/// the handshake because "what can I run" is reusable detail, not the first choice
+/// a caller makes.
+fn kaish_reference(schemas: &[ToolSchema]) -> String {
     let onboarding = compose(&Recipe::agent_onboarding(), &SchemaContent::new(schemas));
     format!(
-        "kaibo (解剖) — ask a question about a codebase and get a grounded, cited \
-         answer. kaibo reads the project READ-ONLY through a kaish shell and never \
-         modifies files or runs external commands. Tools: `consult` (capable model, \
-         reads spans and delegates broad sweeps), `explore` (fast curated report), \
-         `synthesize` (capable model over optional context), and `run_kaish` (drive \
-         the shell directly). Each is gated independently, so a given server may \
-         advertise only some.\n\n\
-         The shell is kaish. Here is how it works:\n\n\
+        "The shell is kaish. Here is how it works:\n\n\
          {onboarding}\n\n\
          ## Learn more kaish\n\
          Read the `kaibo://kaish/*` resources to go deeper without spending a tool \
@@ -254,8 +269,12 @@ pub fn kaibo_instructions_with_scope(
         CastUsability::Unconfigured => format!("{}\n\n", setup_section(config)),
         CastUsability::Ready | CastUsability::LocalUnverified => String::new(),
     };
-    let base = kaibo_instructions(schemas);
+    // Menu before reference: the lead (what kaibo is + tools), then the live cast
+    // roster, then the kaish onboarding spine. A caller's first decision is "which
+    // team", so it precedes the syntax detail — and survives a host that truncates.
+    let lead = kaibo_lead();
     let casts = casts_section(&config.default_cast, usable_casts);
+    let reference = kaish_reference(schemas);
 
     // Scope section: always accurate, never ambiguous.
     let root_line = match &config.root {
@@ -269,8 +288,9 @@ pub fn kaibo_instructions_with_scope(
         .join("\n");
 
     format!(
-        "{setup}{base}\n\n\
+        "{setup}{lead}\n\n\
          {casts}\
+         {reference}\n\n\
          ## Scope\n\
          This server's path containment is always on. A per-call `path` must \
          canonicalize to at-or-under one of the allowed trees below.\n\n\
@@ -508,6 +528,38 @@ mod tests {
             text.contains("canonical") && text.contains("kaibo://config"),
             "Casts section must point at kaibo://config as canonical:\n{text}"
         );
+    }
+
+    /// Menu before reference: the cast roster precedes the kaish onboarding spine, so
+    /// a caller reads "which team" before the syntax wall — and a host that truncates
+    /// the instructions keeps the menu. The lead still opens. Fails if the order is
+    /// reverted to onboarding-then-casts.
+    #[test]
+    fn casts_section_precedes_the_kaish_reference() {
+        let config = Config::builtin();
+        let usable = vec![("anthropic".to_string(), CastUsability::Ready)];
+        let text = kaibo_instructions_with_scope(
+            &sample_schemas_for_ordering(),
+            &config,
+            &[PathBuf::from("/tmp")],
+            CastUsability::Ready,
+            &usable,
+        );
+        let casts_at = text.find("## Casts").expect("has a Casts section");
+        let kaish_at = text
+            .find("The shell is kaish")
+            .expect("has the kaish reference");
+        let lead_at = text.find("kaibo (解剖)").expect("opens with the lead");
+        assert!(
+            lead_at < casts_at && casts_at < kaish_at,
+            "order must be lead → casts → kaish reference (got lead={lead_at}, \
+             casts={casts_at}, kaish={kaish_at}):\n{text}"
+        );
+    }
+
+    /// A couple of builtins so the onboarding spine renders in ordering tests.
+    fn sample_schemas_for_ordering() -> Vec<ToolSchema> {
+        vec![ToolSchema::new("cat", "Read a file")]
     }
 
     #[test]

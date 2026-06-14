@@ -116,7 +116,8 @@ pub struct ConsultInput {
     pub path: Option<String>,
 
     /// Which cast (model team) runs this call; omit for the server's default.
-    /// The usable casts are named in the handshake and `kaibo://config`.
+    /// Pick from this param's `enum` — the casts live right now; `kaibo://config`
+    /// lists every configured cast and backend, with their aliases.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -185,7 +186,8 @@ pub struct ExploreInput {
     pub path: Option<String>,
 
     /// Which cast (model team) runs this call; omit for the server's default.
-    /// The usable casts are named in the handshake and `kaibo://config`.
+    /// Pick from this param's `enum` — the casts live right now; `kaibo://config`
+    /// lists every configured cast and backend, with their aliases.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -225,7 +227,8 @@ pub struct SynthesizeInput {
     pub path: Option<String>,
 
     /// Which cast (model team) runs this call; omit for the server's default.
-    /// The usable casts are named in the handshake and `kaibo://config`.
+    /// Pick from this param's `enum` — the casts live right now; `kaibo://config`
+    /// lists every configured cast and backend, with their aliases.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -282,6 +285,43 @@ pub struct KaiboHandler {
     /// config.allow_paths; falls back to the canonicalized cwd when both are empty.
     /// `Arc` because rmcp clones the handler per request.
     allowed_set: Arc<Vec<PathBuf>>,
+}
+
+/// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
+/// consultation tool still in `router` (consult/explore/synthesize — the tools
+/// whose `cast` selects the explorer/synth team). This surfaces the live roster
+/// where an agent actually picks an argument value, instead of deferring it to
+/// prose the host may drop.
+///
+/// Advisory, not enforcing: `call_tool` deserializes the args with serde, which
+/// ignores `enum`, so a config-only cast passed by name still resolves — this
+/// only advertises the common set. Skipped when `casts` is empty (no cast can
+/// reach a model), because an empty `enum` reads as "no valid value" to a strict
+/// client and would wrongly forbid the field, which is optional. A gated-off tool
+/// is already absent from `router`, so the lookups simply skip it.
+fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, casts: &[String]) {
+    if casts.is_empty() {
+        return;
+    }
+    let values: Vec<serde_json::Value> = casts
+        .iter()
+        .map(|c| serde_json::Value::String(c.clone()))
+        .collect();
+    for name in ["consult", "explore", "synthesize"] {
+        let Some(route) = router.map.get_mut(name) else {
+            continue;
+        };
+        let mut schema = (*route.attr.input_schema).clone();
+        if let Some(cast) = schema
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+            .and_then(|props| props.get_mut("cast"))
+            .and_then(|c| c.as_object_mut())
+        {
+            cast.insert("enum".to_string(), serde_json::Value::Array(values.clone()));
+            route.attr.input_schema = Arc::new(schema);
+        }
+    }
 }
 
 #[tool_router]
@@ -350,6 +390,18 @@ impl KaiboHandler {
                 .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
             allowed.push(canon);
         }
+
+        // Stamp the live cast roster onto the consultation tools' `cast` param as a
+        // JSON-Schema `enum`, so an agent choosing a team reads the menu off the tool
+        // schema it already fills arguments from — not only the handshake prose, which
+        // a host may truncate (the failure that motivated this). Env is read once here,
+        // the same startup moment the handshake resolves its list; reconnect re-reads.
+        let usable: Vec<String> = config
+            .usable_casts(|k| std::env::var(k).ok())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        inject_cast_enum(&mut tool_router, &usable);
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
         Ok(Self {
@@ -642,8 +694,8 @@ impl KaiboHandler {
             session_id: kaibo replays that session's prior question/answer pairs as \
             context (the exploration still runs fresh each turn). Args: question \
             (required), path (project dir; optional if the server has a default root), \
-            cast (optional; the usable casts are named in the handshake and \
-            `kaibo://config`), session_id (optional; opaque conversation key), \
+            cast (optional; pick from the `cast` enum of teams live right now, or \
+            see `kaibo://config`), session_id (optional; opaque conversation key), \
             include_report (optional; attach the explorer's report as \
             structured_content for debugging the hand-off), and optional \
             explorer_model / synth_model overrides (a model id, sent verbatim; \
@@ -1588,6 +1640,57 @@ mod tests {
     fn handler_from_toml(toml: &str) -> KaiboHandler {
         KaiboHandler::new(Config::from_toml_str(toml).expect("config parses"))
             .expect("handler builds")
+    }
+
+    /// The live cast roster is stamped onto each consultation tool's `cast` param as
+    /// a JSON-Schema `enum`, so an agent reads the menu off the schema it fills
+    /// arguments from — the fix for casts being discoverable only in handshake prose
+    /// a host may truncate. The keyless local `openai` cast is always usable, so it
+    /// anchors the assertion regardless of which API keys the test env carries.
+    #[test]
+    fn consultation_tools_advertise_the_live_cast_enum() {
+        let h = handler();
+        for tool in ["consult", "explore", "synthesize"] {
+            let schema = h
+                .tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .clone();
+            let variants = schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .unwrap_or_else(|| panic!("{tool}: cast param should carry an enum:\n{schema:#?}"));
+            assert!(
+                variants.iter().any(|v| v == "openai"),
+                "{tool}: cast enum should list the always-usable local cast, got {variants:?}"
+            );
+        }
+    }
+
+    /// An empty roster (no cast can reach a model) leaves `cast` enum-free: an empty
+    /// `enum` would read as "no valid value" and wrongly forbid the optional field.
+    /// `inject_cast_enum` is the seam — driving it with `[]` keeps the test honest
+    /// without fabricating a keyless-everything config.
+    #[test]
+    fn empty_cast_roster_leaves_the_param_unconstrained() {
+        let mut router = KaiboHandler::tool_router();
+        inject_cast_enum(&mut router, &[]);
+        let schema = router
+            .get("consult")
+            .expect("tool present")
+            .input_schema
+            .clone();
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .is_none(),
+            "an empty roster must not stamp an enum:\n{schema:#?}"
+        );
     }
 
     /// A per-model slot `preamble` wins over the global `[prompts].<phase>`, and the
