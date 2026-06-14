@@ -200,3 +200,29 @@ teeth.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ```
+
+## Pull requests & the changelog
+
+From **0.2.0** on, kaibo maintains a changelog and lands changes through pull
+requests — `main` is protected by convention, not a scratchpad.
+
+- **Branch → PR → review → merge.** Non-trivial work lands on a branch and goes up
+  as a PR, not direct-to-`main`. Dogfood the review: run a **cross-family** pass over
+  the diff — a different model lineage than wrote it (`/code-review`, or kaibo's own
+  `consult`/`synthesize` aimed at the change) — before merge. A typo or a one-line doc
+  fix can still go straight to `main`; this is judgment, not ceremony.
+- **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
+  section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
+  Same "why not what" ethos as commits: write what a *user* notices, not the file
+  diff. Internal-only refactors need no entry — the git log is their record (mirrors
+  the `docs/issues.md` "delete when shipped" discipline).
+- **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
+  section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
+  then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
+  `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
+  re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
+  `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
+- **Release gate — kaish bump pending.** A bug surfaced upstream right after kaish
+  `0.8.3` (the current `Cargo.toml` pin); 0.2.0 waits on the fixed release. Bump the
+  pin, adapt to any API change rather than pinning around it (per **Working here**),
+  and re-green the offline suite before cutting. Tracked in `docs/issues.md`.

@@ -288,7 +288,9 @@ are set up so they can cache well on most providers.
 
 ## Contributing
 
-Agent contributions welcome. See [`AGENTS.md`](AGENTS.md) for the architecture and
+Agent contributions welcome. From 0.2.0 on, changes land through pull requests and
+every user-facing change gets a [`CHANGELOG.md`](CHANGELOG.md) entry. See
+[`AGENTS.md`](AGENTS.md) for the architecture, the PR-and-changelog workflow, and
 working conventions, and [`docs/issues.md`](docs/issues.md) for the live tracker.
 
 ## License
