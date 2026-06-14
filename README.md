@@ -228,20 +228,26 @@ growing capability class as the provider library grows coverage.
 
 ```
 your agent ──stdio MCP──▶ kaibo
-                            │  consult(question)
+                            │  consult(question or request)
                             ▼
-                    ┌────────────────────────────────┐
-                    │ synth model (capable)          │
-                    │   • reads spans via kaish      │──▶ explorer sub-agent
-                    │   • delegates broad sweeps  ◀──│    (fast/cheap model,
-                    │   • cites file:line            │     read-only kaish)
-                    └────────────────────────────────┘
+                    ┌───────────────────────────┐   ┌───────────────────────────┐
+                    │ synth model (capable)     │   │ explorer (lite)           │
+                    │   • reads files via kaish │   │   • reads files via kaish │
+                    │   • delegates to explorer │─▶ │                           │
+                    │   • writes a summary      │ ◀─│   • summarizes results    │
+                    └───────────────────────────┘   └───────────────────────────┘
                             │  synthesized answer (not the transcript)
                             ▼
                        back to your agent
 ```
 
-kaibo is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
+kaibo is an agent for your agent. kaibo's consult(), explore(), and synthesize() agents have their
+own tool, `run_kaish` for working with the filesystem and transforming inputs. When using the
+consult() tool, it starts with a big model, which can delegate to the explore agent. The
+explorer/synthesis combination is meant to speed up execution and save token spend by having
+smaller and faster models do the bulk of tool calling operations before synthesis begins.
+
+It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)
 comes as a rust crate and is embedded directly in kaibo, no exec() or repl shells involved.
 
