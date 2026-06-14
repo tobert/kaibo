@@ -1,56 +1,88 @@
 //! One span per tool call. Wrap any phase tool so every invocation emits a `tool`
-//! span carrying `gen_ai.tool.name` and an ok/err `outcome` (the span's own
-//! duration is the call's latency). This is what lets telemetry answer *which* tool
-//! the model actually called — the question the `read`-tool spike could only infer
-//! from trace content (docs/issues.md "No per-tool-call span").
+//! span carrying `gen_ai.tool.name`, a short `gen_ai.tool.arguments` summary, and an
+//! ok/err `outcome` (the span's own duration is the call's latency). This is what
+//! lets telemetry answer *which* tool the model called *and with what* — the
+//! granularity the read-tool and orientation A/Bs both needed (the tool name alone
+//! couldn't separate a discovery `glob` from a `cat -n` read inside `run_kaish`).
 //!
 //! It's *our* span on *our* tools, independent of what rig or a given provider
-//! instruments, so it lands the same on every backend. The wrapper is otherwise
-//! transparent: name, definition, args, output, and errors pass straight through.
+//! instruments, so it lands the same on every backend. The wrapper sits at the
+//! `ToolDyn` seam (where `call` carries the raw JSON args) so it can summarize the
+//! call; it is otherwise transparent — name, definition, output, and errors pass
+//! straight through.
 
 use rig_core::completion::ToolDefinition;
-use rig_core::tool::{Tool, ToolDyn};
+use rig_core::tool::{Tool, ToolDyn, ToolError};
+use rig_core::wasm_compat::WasmBoxedFuture;
 use tracing::{field, info_span, Instrument, Span};
 
-/// Wraps a [`Tool`], emitting a `tool` span per `call`. Delegates everything else.
-pub struct Traced<T> {
-    inner: T,
+/// Wraps a boxed [`ToolDyn`], emitting a `tool` span per `call`. Delegates the rest.
+pub struct Traced {
+    inner: Box<dyn ToolDyn>,
 }
 
-impl<T: Tool> Traced<T> {
-    pub fn new(inner: T) -> Self {
-        Self { inner }
-    }
-}
-
-impl<T: Tool> Tool for Traced<T> {
-    const NAME: &'static str = T::NAME;
-    type Error = T::Error;
-    type Args = T::Args;
-    type Output = T::Output;
-
-    async fn definition(&self, prompt: String) -> ToolDefinition {
-        self.inner.definition(prompt).await
+impl ToolDyn for Traced {
+    fn name(&self) -> String {
+        self.inner.name()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // `outcome` is left empty and filled after the call so one span carries both
-        // "which tool" and "did it succeed"; the span's start/end bracket the latency.
-        let span = info_span!("tool", "gen_ai.tool.name" = T::NAME, outcome = field::Empty);
-        async {
-            let result = self.inner.call(args).await;
-            Span::current().record("outcome", if result.is_ok() { "ok" } else { "error" });
-            result
-        }
-        .instrument(span)
-        .await
+    fn definition<'a>(&'a self, prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
+        self.inner.definition(prompt)
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        let name = self.inner.name();
+        // Summarize before the args are moved into the call. `outcome` is filled
+        // after, so one span carries which tool, with what, and whether it worked;
+        // the span's start/end bracket the latency.
+        let summary = arg_summary(&args);
+        Box::pin(async move {
+            let span = info_span!(
+                "tool",
+                "gen_ai.tool.name" = %name,
+                "gen_ai.tool.arguments" = %summary,
+                outcome = field::Empty,
+            );
+            async {
+                let result = self.inner.call(args).await;
+                Span::current().record("outcome", if result.is_ok() { "ok" } else { "error" });
+                result
+            }
+            .instrument(span)
+            .await
+        })
     }
 }
 
 /// Box a tool as a span-wrapped [`ToolDyn`] — the toolset-assembly drop-in for
 /// `Box::new(tool)`, so every tool in a phase's toolset is traced uniformly.
 pub fn traced<T: Tool + 'static>(tool: T) -> Box<dyn ToolDyn> {
-    Box::new(Traced::new(tool))
+    Box::new(Traced {
+        inner: Box::new(tool),
+    })
+}
+
+/// A short, span-friendly summary of a tool call's JSON args: the most informative
+/// field — the `run_kaish` `script`, a `path`, an `explore` `question` — else the
+/// raw JSON, truncated. Read-only project args carry no secrets; the cap just keeps
+/// a long script from bloating the span. This is the field that turns "16 run_kaish
+/// calls" into "1 was `glob`, 15 were `cat -n`/`rg`".
+fn arg_summary(args: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let preview = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| {
+            ["script", "path", "question", "prompt"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(str::to_string))
+        })
+        .unwrap_or_else(|| args.to_string());
+    if preview.chars().count() <= MAX_CHARS {
+        preview
+    } else {
+        let cut: String = preview.chars().take(MAX_CHARS).collect();
+        format!("{cut}…")
+    }
 }
 
 #[cfg(test)]
@@ -98,54 +130,77 @@ mod tests {
         }
     }
 
-    /// Captures (span name, gen_ai.tool.name, outcome) for each span opened/closed.
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<(String, String, String)>>>);
+    /// The summary pulls the informative field (so a `run_kaish` span shows the
+    /// *script*), falls back to raw JSON, and truncates a long value.
+    #[test]
+    fn arg_summary_picks_the_informative_field() {
+        assert_eq!(
+            arg_summary(r#"{"script":"glob -a '**/*'"}"#),
+            "glob -a '**/*'"
+        );
+        assert_eq!(arg_summary(r#"{"path":"src/lib.rs"}"#), "src/lib.rs");
+        // No known field → the raw JSON (still useful, just not distilled).
+        assert_eq!(arg_summary(r#"{"msg":"hi"}"#), r#"{"msg":"hi"}"#);
+        // Long script is truncated with an ellipsis.
+        let long = format!(r#"{{"script":"{}"}}"#, "x".repeat(500));
+        let s = arg_summary(&long);
+        assert!(
+            s.chars().count() <= 201,
+            "truncated: {} chars",
+            s.chars().count()
+        );
+        assert!(s.ends_with('…'), "marked truncated: {s}");
+    }
 
-    struct FieldGrab {
+    /// Captures (span name, tool name, arguments, outcome) for each span closed.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<(String, String, String, String)>>>);
+
+    #[derive(Default)]
+    struct Grab {
         tool: Option<String>,
+        args: Option<String>,
         outcome: Option<String>,
     }
-    impl tracing::field::Visit for FieldGrab {
+    impl tracing::field::Visit for Grab {
         fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
             match f.name() {
                 "gen_ai.tool.name" => self.tool = Some(v.to_string()),
+                "gen_ai.tool.arguments" => self.args = Some(v.to_string()),
                 "outcome" => self.outcome = Some(v.to_string()),
                 _ => {}
             }
         }
-        fn record_debug(&mut self, _f: &tracing::field::Field, _v: &dyn std::fmt::Debug) {}
+        // `%summary`/`%name` record via Display, which arrives as a debug value.
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            let s = format!("{v:?}");
+            let s = s.trim_matches('"').to_string();
+            match f.name() {
+                "gen_ai.tool.name" => self.tool = Some(s),
+                "gen_ai.tool.arguments" => self.args = Some(s),
+                "outcome" => self.outcome = Some(s),
+                _ => {}
+            }
+        }
+    }
+    struct Stored {
+        tool: String,
+        args: String,
+        outcome: String,
     }
 
     impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
-        // Record on close so the `outcome` (set after the inner call) is present.
-        fn on_close(&self, id: tracing::Id, ctx: Context<'_, S>) {
-            let span = ctx.span(&id).unwrap();
-            let name = span.name().to_string();
-            // The tool name is an at-creation field; pull it from the span extensions
-            // the registry stores. Simpler: re-record from a stored visitor.
-            let ext = span.extensions();
-            if let Some(g) = ext.get::<Grabbed>() {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((name, g.tool.clone(), g.outcome.clone()));
-            }
-        }
         fn on_new_span(
             &self,
             attrs: &tracing::span::Attributes<'_>,
             id: &tracing::Id,
             ctx: Context<'_, S>,
         ) {
-            let mut g = FieldGrab {
-                tool: None,
-                outcome: None,
-            };
+            let mut g = Grab::default();
             attrs.record(&mut g);
-            let span = ctx.span(id).unwrap();
-            span.extensions_mut().insert(Grabbed {
+            ctx.span(id).unwrap().extensions_mut().insert(Stored {
                 tool: g.tool.unwrap_or_default(),
+                args: g.args.unwrap_or_default(),
                 outcome: g.outcome.unwrap_or_default(),
             });
         }
@@ -155,67 +210,67 @@ mod tests {
             values: &tracing::span::Record<'_>,
             ctx: Context<'_, S>,
         ) {
-            let mut g = FieldGrab {
-                tool: None,
-                outcome: None,
-            };
+            let mut g = Grab::default();
             values.record(&mut g);
-            if let Some(span) = ctx.span(id) {
-                if let Some(stored) = span.extensions_mut().get_mut::<Grabbed>() {
-                    if let Some(o) = g.outcome {
-                        stored.outcome = o;
-                    }
+            if let (Some(span), Some(o)) = (ctx.span(id), g.outcome) {
+                if let Some(st) = span.extensions_mut().get_mut::<Stored>() {
+                    st.outcome = o;
                 }
             }
         }
-    }
-    struct Grabbed {
-        tool: String,
-        outcome: String,
+        fn on_close(&self, id: tracing::Id, ctx: Context<'_, S>) {
+            let span = ctx.span(&id).unwrap();
+            let name = span.name().to_string();
+            // Pull owned values out before the extensions borrow ends, then push.
+            let row = span
+                .extensions()
+                .get::<Stored>()
+                .map(|st| (name, st.tool.clone(), st.args.clone(), st.outcome.clone()));
+            if let Some(row) = row {
+                self.0.lock().unwrap().push(row);
+            }
+        }
     }
 
-    /// A success emits a `tool` span tagged with the tool's name and outcome=ok; the
-    /// output passes through unchanged.
+    /// A success emits a `tool` span tagged with the tool's name, an args summary,
+    /// and outcome=ok; the output passes through.
     #[tokio::test]
-    async fn emits_a_named_tool_span_on_success() {
+    async fn emits_a_tool_span_with_name_args_and_outcome() {
         let cap = Capture::default();
         let sub = tracing_subscriber::registry().with(cap.clone());
         let _g = tracing::subscriber::set_default(sub);
 
-        // Disambiguate: `Traced<T>` carries both `Tool::call` and the blanket
-        // `ToolDyn::call`. We exercise the typed `Tool::call` the wrapper defines.
-        let out = Tool::call(&Traced::new(Echo), EchoArgs { msg: "hi".into() })
-            .await
-            .unwrap();
-        assert_eq!(out, "hi", "output passes through the wrapper");
+        let tool = traced(Echo);
+        let out = tool.call(r#"{"msg":"hi"}"#.to_string()).await.unwrap();
+        assert!(out.contains("hi"), "output passes through: {out}");
 
-        drop(_g); // close the subscriber's view; spans already closed at await end
+        drop(_g);
         let spans = cap.0.lock().unwrap().clone();
         assert!(
-            spans
-                .iter()
-                .any(|(n, tool, oc)| n == "tool" && tool == "echo" && oc == "ok"),
-            "a `tool` span tagged gen_ai.tool.name=echo outcome=ok: {spans:?}"
+            spans.iter().any(|(n, tool, args, oc)| n == "tool"
+                && tool == "echo"
+                && args.contains("hi")
+                && oc == "ok"),
+            "a `tool` span with name/args/outcome: {spans:?}"
         );
     }
 
-    /// An error still emits the span, tagged outcome=error — so a failing tool is
-    /// visible, not silent.
+    /// An error still emits the span, tagged outcome=error.
     #[tokio::test]
     async fn emits_an_error_outcome_when_the_tool_fails() {
         let cap = Capture::default();
         let sub = tracing_subscriber::registry().with(cap.clone());
         let _g = tracing::subscriber::set_default(sub);
 
-        let err = Tool::call(&Traced::new(Echo), EchoArgs { msg: "boom".into() }).await;
-        assert!(err.is_err(), "error passes through");
+        let tool = traced(Echo);
+        assert!(tool.call(r#"{"msg":"boom"}"#.to_string()).await.is_err());
 
         drop(_g);
         let spans = cap.0.lock().unwrap().clone();
         assert!(
             spans
                 .iter()
-                .any(|(n, tool, oc)| n == "tool" && tool == "echo" && oc == "error"),
+                .any(|(n, tool, _args, oc)| n == "tool" && tool == "echo" && oc == "error"),
             "a `tool` span tagged outcome=error: {spans:?}"
         );
     }
