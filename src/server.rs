@@ -115,8 +115,8 @@ pub struct ConsultInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Cast: a built-in name ("anthropic" (default), "deepseek", "gemini",
-    /// "openai") or a cast from config.toml.
+    /// Which cast (model team) runs this call; omit for the server's default.
+    /// The usable casts are named in the handshake and `kaibo://config`.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -184,8 +184,8 @@ pub struct ExploreInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Cast: "anthropic" (default), "deepseek", "gemini", "openai", or a cast
-    /// from config.toml.
+    /// Which cast (model team) runs this call; omit for the server's default.
+    /// The usable casts are named in the handshake and `kaibo://config`.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -224,8 +224,8 @@ pub struct SynthesizeInput {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Cast: "anthropic" (default), "deepseek", "gemini", "openai", or a cast
-    /// from config.toml.
+    /// Which cast (model team) runs this call; omit for the server's default.
+    /// The usable casts are named in the handshake and `kaibo://config`.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -628,8 +628,8 @@ impl KaiboHandler {
             session_id: kaibo replays that session's prior question/answer pairs as \
             context (the exploration still runs fresh each turn). Args: question \
             (required), path (project dir; optional if the server has a default root), \
-            cast (a built-in name — anthropic|deepseek|gemini|openai — or a cast \
-            from config.toml), session_id (optional; opaque conversation key), \
+            cast (optional; the usable casts are named in the handshake and \
+            `kaibo://config`), session_id (optional; opaque conversation key), \
             include_report (optional; attach the explorer's report as \
             structured_content for debugging the hand-off), and optional \
             explorer_model / synth_model overrides (a model id, sent verbatim; \
@@ -713,8 +713,8 @@ impl KaiboHandler {
             This is the explorer seam on its own: it gathers evidence, it does not \
             write a polished final answer (use `consult` for that). Read-only: it \
             never modifies the project. Args: question (required), path (project dir; \
-            optional if the server has a default root), cast \
-            (anthropic|deepseek|gemini|openai or a cast from config.toml), and \
+            optional if the server has a default root), cast (optional; the \
+            usable casts are named in the handshake and `kaibo://config`), and \
             optional model (with optional backend) / max_turns overrides."
     )]
     async fn explore(
@@ -764,8 +764,8 @@ impl KaiboHandler {
             context, it investigates directly. This is the synthesizer seam on its \
             own — a real outside opinion you can seed with material `explore` or you \
             gathered. Read-only. Args: question (required), context (optional), path \
-            (project dir; optional with a default root), cast \
-            (anthropic|deepseek|gemini|openai or a cast from config.toml), and an \
+            (project dir; optional with a default root), cast (optional; the \
+            usable casts are named in the handshake and `kaibo://config`), and an \
             optional model (with optional backend) override."
     )]
     async fn synthesize(
