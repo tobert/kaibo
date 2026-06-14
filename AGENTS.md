@@ -1,8 +1,8 @@
 # AGENTS.md — kaibo (解剖)
 
-Kaibo is a stdio MCP server: an assistant agent **for other agents**. It augments a
-calling agent (Claude, etc.) with a team of models, lending two kinds of help —
-*consultation* (grounded, cited, read-only answers about a codebase) and
+Kaibo is a stdio MCP server that provides assistant agent **for other agents**.
+It augments a calling agent (Claude, etc.) with a team of models, lending two
+kinds of help — *consultation* (grounded, cited, read-only answers about a codebase) and
 *capabilities* (things the team can *do* and hand back as artifacts; image generation
 today, more as `rig` grows coverage).
 
