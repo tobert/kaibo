@@ -74,6 +74,9 @@ impl RigOpenaiImageGen {
         // per-request deadline, an OpenAI-compatible client on its base URL + key.
         let base_url = backend.resolved_base_url();
         let key = backend.resolve_key()?;
+        // reqwest is built `rustls-no-provider`: install the ring provider before
+        // `.build()`, which otherwise panics with no process default. Idempotent.
+        crate::tls::ensure_crypto_provider();
         let http = reqwest::Client::builder()
             .timeout(backend.request_timeout)
             .connect_timeout(

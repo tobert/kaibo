@@ -30,6 +30,7 @@ pub mod sandbox;
 pub mod server;
 pub mod session;
 pub mod telemetry;
+pub mod tls;
 pub mod view_image;
 
 /// A scripted, offline stand-in for a provider client, for driving the consult loop

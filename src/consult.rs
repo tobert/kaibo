@@ -657,6 +657,10 @@ impl Arm {
         // bounds a single completion; `connect_timeout` fails a dead endpoint
         // fast (capped at the deadline so a sub-10s backend timeout still
         // dominates). Injected via rig's `.http_client(..)`.
+        //
+        // reqwest is built `rustls-no-provider`, so `.build()` below panics unless a
+        // process-default crypto provider is installed; do it now (idempotent).
+        crate::tls::ensure_crypto_provider();
         let http = reqwest::Client::builder()
             .timeout(backend.request_timeout)
             .connect_timeout(backend.request_timeout.min(Duration::from_secs(10)))

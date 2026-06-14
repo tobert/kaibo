@@ -1,0 +1,6 @@
+# Statically link the MSVC C runtime on Windows so a release build is a single
+# self-contained kaibo.exe — no VCRedist / vcruntime DLL needed on the target box.
+# (TLS is rustls + ring, so there's no OpenSSL DLL to ship either; the .exe stands
+# alone.) Other targets are unaffected. See .github/workflows/release.yml.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

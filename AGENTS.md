@@ -54,6 +54,14 @@ commands.
 - **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.
+- **TLS is rustls + ring, no aws-lc / no OpenSSL.** The whole tree must stay free of
+  `aws-lc-sys` and `openssl-sys` (both are C/cmake) so we ship fully static single-
+  file binaries — musl links with nothing but a Rust toolchain. reqwest is built
+  `rustls-no-provider` and we install ring at every client build site (`src/tls.rs`);
+  `tests/tls.rs` proves a real client builds, and `cargo tree -i aws-lc-rs` must come
+  back empty. The trap: enabling reqwest's `rustls` feature (directly, or via
+  rig-core's default features, or otlp's `reqwest-rustls`) silently re-pulls aws-lc —
+  the Cargo.toml comments mark each of those three off. See **Build & release**.
 
 ## Working here
 
@@ -74,12 +82,36 @@ commands.
   `consult`/`explore`/`synthesize` build the real client behind `with_provider_client!`.
 - **`docs/issues.md` is the live tracker.** Skim it before new work. Delete
   entries when they ship — don't mark them done; git history is the record.
-- **`kaish-kernel` is a path dep** (`../kaish/crates/kaish-kernel`), under active
-  development. It will break kaibo's build transiently — adapt to its new API,
-  don't pin around it. `kaish-mcp` is a useful reference sibling, not a dependency.
+- **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
+  under active development upstream. A version bump can change its API — when you
+  bump, adapt kaibo to the new shape, don't pin around it. (If you're co-developing
+  kaish locally, a `[patch.crates-io]` to `../kaish/crates/kaish-kernel` is the way
+  — keep it out of committed `Cargo.toml`.) `kaish-mcp` is a useful reference
+  sibling, not a dependency.
 - **Provider model ids drift.** Built-in defaults seed the profile registry in
   `config.rs::default_models`; rig's bundled model consts are often retired.
   Cross-check the pal configs. Per-profile overrides live in the XDG `config.toml`.
+
+## Build & release
+
+kaibo ships as a single static-ish binary per platform, built by
+`.github/workflows/release.yml` on a `v*` tag (also `workflow_dispatch` to smoke the
+matrix). This is feasible *because* the TLS invariant above keeps the tree C-free:
+no aws-lc, no OpenSSL.
+
+- **Linux → fully static** via `x86_64`/`aarch64-unknown-linux-musl`, built with
+  `cargo zigbuild` (zig is the cross C compiler/linker for ring's small C/asm). The
+  result is `statically linked` / `not a dynamic executable` — runs on any distro.
+- **macOS** isn't truly static (Apple forbids static libSystem) but is self-contained
+  — a plain `cargo build --release` per arch, depending only on always-present system
+  libs.
+- **Windows** statically links the CRT via `+crt-static` in `.cargo/config.toml`, so
+  it's one self-contained `.exe` (no VCRedist; rustls/ring means no OpenSSL DLL).
+
+Local musl repro (no system zig needed): `pip install ziglang` in a venv,
+`cargo install cargo-zigbuild`, then `cargo zigbuild --release --target
+x86_64-unknown-linux-musl`. Verify the boundary with `cargo tree -i aws-lc-rs`
+(empty) and `ldd target/.../kaibo` (`not a dynamic executable`).
 
 ## Driving the models
 

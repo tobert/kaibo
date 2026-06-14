@@ -30,14 +30,31 @@ anyhow = "1"
 # wraps kaish as an in-process rig Tool, not over MCP). The `image` feature
 # (zero extra deps) unlocks the openai-kind `ImageGenerationModel` behind the
 # `generate_image` capability tool; rig 0.38 has image gen for openai-kind only.
-rig-core = { version = "0.38", features = ["image"] }
+# `default-features = false` drops rig's default `rustls` feature, which would
+# pull `reqwest/rustls` → the aws-lc-rs crypto provider (C + cmake, the one thing
+# that makes a static musl build painful). We re-add the other defaults rig needs
+# (`reqwest`, `derive`) and let TLS come from our own `rustls`+ring wiring below.
+rig-core = { version = "0.38", default-features = false, features = ["image", "reqwest", "derive"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
 # would otherwise hang a tool call forever (see consult.rs / docs/issues.md).
-# Match rig's own reqwest: version 0.13, rustls TLS, no default-tls — feature
-# unification then keeps a single reqwest with one TLS backend.
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Match rig's own reqwest: version 0.13, rustls TLS, no default-tls.
+#
+# `rustls-no-provider` (not `rustls`): reqwest's plain `rustls` feature hard-wires
+# the aws-lc-rs crypto provider (C/cmake — the static-musl footgun). `-no-provider`
+# compiles rustls but bakes no default provider, so reqwest reads the *process*
+# default `CryptoProvider` at client-build time and panics loudly if none is
+# installed (never a silent no-TLS fallback). We install ring once at startup —
+# see `src/tls.rs`. This keeps the whole tree aws-lc-free for static builds; verify
+# with `cargo tree -i aws-lc-rs` (must be empty).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# The crypto provider behind rustls, chosen explicitly: ring, not aws-lc-rs. ring
+# builds with no C toolchain or cmake, so `x86_64-unknown-linux-musl` (and friends)
+# link fully static out of the box. reqwest pins rustls `default-features = false`,
+# so naming ring here is what actually compiles a provider in; `src/tls.rs` installs
+# it as the process default. Keep the version aligned with reqwest's rustls (0.23).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Base64 for `view_image`: the rig tool-result image envelope carries bytes as a
@@ -68,7 +85,12 @@ lru = "0.18"
 # it stays off unless [telemetry] enables it.
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+# No `reqwest-rustls` here: that feature pulls `reqwest/default-tls` → `reqwest/rustls`
+# → aws-lc-rs, re-introducing the C provider we just dropped. The blocking exporter
+# builds a plain reqwest client and uses whatever TLS the (feature-unified) reqwest
+# was compiled with — i.e. our rustls-no-provider + ring. So we keep only the
+# transport features and let TLS come from the shared reqwest above.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
