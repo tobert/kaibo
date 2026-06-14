@@ -100,15 +100,21 @@ pub struct PromptOverrides {
 }
 
 /// Resolve one phase's full system prompt: the operator override if set, else the
-/// built-in `default`, then house rules appended. The single composition point for
-/// every model-driven phase, so override + `[context]` layering is identical
-/// everywhere (and the call sites read as one line).
+/// built-in `default`, then the static repo `orientation` map, then house rules.
+/// The single composition point for every model-driven phase, so override +
+/// `[orientation]` + `[context]` layering is identical everywhere. Order: role
+/// framing → the file map (immediately useful context) → operator house rules.
 fn phase_preamble(
     override_: Option<&str>,
     default: fn() -> String,
+    orientation: Option<&str>,
     house_rules: Option<&str>,
 ) -> String {
-    let base = override_.map(str::to_string).unwrap_or_else(default);
+    let mut base = override_.map(str::to_string).unwrap_or_else(default);
+    if let Some(map) = orientation {
+        base.push_str("\n\n");
+        base.push_str(map); // carries its own `PROJECT FILES.` header
+    }
     with_house_rules(base, house_rules)
 }
 
@@ -796,6 +802,11 @@ pub struct ConsultConfig {
     /// built-in preambles run unchanged. Server-set per call from the resolved
     /// config. See [`PromptOverrides`].
     pub prompts: PromptOverrides,
+    /// The static repo-orientation block (assembled `[orientation]` map), or `None`.
+    /// `Arc<str>` so cloning per phase is cheap. Server-set per call from the
+    /// resolved root (only for the exploring tools — `explore`/`consult`); `Default`
+    /// is `None`, so offline tests run the unchanged preamble.
+    pub orientation: Option<Arc<str>>,
 }
 
 impl Default for ConsultConfig {
@@ -808,6 +819,7 @@ impl Default for ConsultConfig {
             progress: Arc::new(NullSink),
             house_rules: None,
             prompts: PromptOverrides::default(),
+            orientation: None,
         }
     }
 }
@@ -1386,6 +1398,7 @@ pub async fn explore(
         &phase_preamble(
             cfg.prompts.explorer.as_deref(),
             report_preamble,
+            cfg.orientation.as_deref(),
             cfg.house_rules.as_deref(),
         ),
         question.to_string(),
@@ -1486,6 +1499,7 @@ pub async fn synthesize(
         &phase_preamble(
             cfg.prompts.synthesize.as_deref(),
             synthesize_preamble,
+            cfg.orientation.as_deref(),
             cfg.house_rules.as_deref(),
         ),
         user_prompt,
@@ -1574,6 +1588,7 @@ fn consult_tools(
     let explorer_preamble: Arc<str> = Arc::from(phase_preamble(
         cfg.prompts.explorer.as_deref(),
         report_preamble,
+        cfg.orientation.as_deref(),
         cfg.house_rules.as_deref(),
     ));
     let explore = RunExplore::new(
@@ -1623,6 +1638,7 @@ pub(crate) async fn consult_with(
             &phase_preamble(
                 cfg.prompts.consult.as_deref(),
                 consult_preamble,
+                cfg.orientation.as_deref(),
                 cfg.house_rules.as_deref(),
             ),
             user_prompt.to_string(),

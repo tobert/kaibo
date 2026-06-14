@@ -25,6 +25,7 @@ pub mod generate_image;
 pub mod image_gen;
 pub mod kaish_syntax;
 pub mod mcp_log;
+pub mod orientation;
 pub mod progress;
 pub mod sandbox;
 pub mod server;

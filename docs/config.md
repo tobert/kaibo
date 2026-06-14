@@ -503,6 +503,39 @@ keys = "this job's framing." The explorer has one job, so no ambiguity. A per-ca
 model override (a bare slot) carries no `preamble` — overriding the model doesn't
 drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`.
 
+## Repo orientation: `[orientation]`
+
+A static, computed-once **file map** injected into the exploring preamble, so a
+model starts *knowing* the project's files instead of spending its first turns on
+`glob`/`ls`/`rg --files` to discover the layout (the structure-first lesson from
+Agentless/Aider, made free — no model in the loop).
+
+```toml
+[orientation]
+enabled = true               # default; set false to turn the map off
+full_list_max_files = 256    # ≤ this → inject the full list; above → refuse the call
+```
+
+How it works: the server runs the kernel's **own** `glob -a --json '**/*'` server-side
+per `explore`/`consult` call — the *same* ignore-aware enumeration the model's shell
+would get (same VFS, same ignore rules), so the map can't disagree with what the
+explorer's own `glob`/`rg` sees. `-a` includes hidden config (`.github/`, `.cargo/`);
+the ignore filter still drops `.git`/`target`.
+
+Size-gated, by file count:
+- **≤ `full_list_max_files`** → the complete file list is spliced in.
+- **above it** → the call is **refused loudly** (`internal_error` naming the knob).
+  The directory-tree map for larger repos is the next increment; for now a big repo
+  is an explicit error, not a silent dump — raise the limit, set `enabled = false`,
+  or point a cast that explores via `rg` at it. (`full_list_max_files = 0` is a load
+  error: it would refuse every repo; disable instead.)
+
+It rides the **exploring** phases only — standalone `explore`, the `consult` driver,
+and the nested `explore′` sweep. Standalone `synthesize` works from supplied context,
+so it gets no map. Like `[context]`, the block re-sends each turn, which the size gate
+keeps bounded. Whether it actually erases the discovery turns is measurable via the
+per-tool `tool` spans (see Telemetry).
+
 ## Path containment
 
 **Always on.** Every tool call's `path` argument (or the server `--root` when `path`

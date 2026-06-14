@@ -1493,3 +1493,35 @@ fn an_empty_slot_preamble_is_a_loud_error() {
     .expect_err("a blank slot preamble must be rejected");
     assert!(format!("{err:#}").contains("preamble"), "names it: {err:#}");
 }
+
+// --- [orientation] static repo map --------------------------------------------
+
+/// No `[orientation]` table → on by default, 256-file ceiling.
+#[test]
+fn orientation_defaults_on_with_256_ceiling() {
+    let c = Config::builtin();
+    assert!(c.orientation.enabled);
+    assert_eq!(c.orientation.full_list_max_files, 256);
+}
+
+/// The table tunes both knobs.
+#[test]
+fn orientation_table_tunes_enabled_and_ceiling() {
+    let c = Config::from_toml_str("[orientation]\nenabled = false\nfull_list_max_files = 1000\n")
+        .unwrap();
+    assert!(!c.orientation.enabled);
+    assert_eq!(c.orientation.full_list_max_files, 1000);
+}
+
+/// A zero ceiling is a loud load error — it would refuse every repo; disable
+/// instead. (Same "a knob that silently does nothing is the failure we refuse"
+/// discipline as the other limits.)
+#[test]
+fn a_zero_orientation_ceiling_is_a_loud_error() {
+    let err = Config::from_toml_str("[orientation]\nfull_list_max_files = 0\n")
+        .expect_err("a zero ceiling must be rejected");
+    assert!(
+        format!("{err:#}").contains("full_list_max_files"),
+        "names the knob: {err:#}"
+    );
+}

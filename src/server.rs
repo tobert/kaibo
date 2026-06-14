@@ -472,6 +472,20 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
+    /// Assemble the static repo-orientation map for this call against the resolved
+    /// `root` — the `[orientation]` block injected into the exploring preamble. Runs
+    /// the kernel's own `glob` server-side (no model turn). A repo over the file
+    /// ceiling is a loud `internal_error` (the operator chose that limit), per
+    /// `OrientationConfig::assemble`. Only the *exploring* tools call this.
+    async fn orientation(&self, root: &std::path::Path) -> Result<Option<Arc<str>>, McpError> {
+        self.config
+            .orientation
+            .assemble(root, self.config.sandbox.clone())
+            .await
+            .map(|opt| opt.map(Arc::from))
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+    }
+
     /// Resolve this call's per-phase system prompts for `cast`: the per-model slot
     /// `preamble` (if set) wins over the global `[prompts].<phase>`, which wins over
     /// the built-in (resolved downstream in `consult.rs`). The synth slot's preamble
@@ -676,6 +690,7 @@ impl KaiboHandler {
             progress: progress.clone(),
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
+            orientation: self.orientation(&root).await?,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -743,6 +758,7 @@ impl KaiboHandler {
             progress: progress.clone(),
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
+            orientation: self.orientation(&root).await?,
         };
 
         let span = tracing::info_span!("explore", cast = %cast.name, model = %arm.model);
@@ -794,6 +810,8 @@ impl KaiboHandler {
             progress: progress.clone(),
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
+            // synthesize works from supplied context, not exploration → no repo map.
+            orientation: None,
         };
 
         let span = tracing::info_span!(

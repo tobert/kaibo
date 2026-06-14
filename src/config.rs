@@ -36,6 +36,7 @@ use serde::Deserialize;
 use crate::consult::{ModelCaps, PromptOverrides, ThinkingStyleOverride};
 use crate::context::ContextConfig;
 use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
+use crate::orientation::OrientationConfig;
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
 
@@ -532,6 +533,9 @@ pub struct Config {
     /// Per-phase system-prompt overrides (the `[prompts]` table). Empty by
     /// default — the built-in preambles run unchanged.
     pub prompts: PromptOverrides,
+    /// Static repo-orientation injected into the exploring preamble (the
+    /// `[orientation]` table). On by default for small repos.
+    pub orientation: OrientationConfig,
     /// Read-only sandbox limits (exec timeout, output cap, extra disabled builtins).
     pub sandbox: SandboxConfig,
     /// Backends (connections) by name.
@@ -944,6 +948,7 @@ impl Config {
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default());
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
+        let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
         let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
@@ -968,6 +973,7 @@ impl Config {
             telemetry,
             context,
             prompts,
+            orientation,
             sandbox,
             backends,
             casts,
@@ -1167,6 +1173,7 @@ struct RawConfig {
     telemetry: Option<RawTelemetry>,
     context: Option<RawContext>,
     prompts: Option<RawPrompts>,
+    orientation: Option<RawOrientation>,
     sandbox: Option<RawSandbox>,
     backends: Option<BTreeMap<String, RawBackend>>,
     casts: Option<BTreeMap<String, RawCast>>,
@@ -1229,6 +1236,19 @@ struct RawPrompts {
     synthesize: Option<String>,
     /// Replaces the `consult` driver preamble.
     consult: Option<String>,
+}
+
+/// The `[orientation]` stanza — the static repo-map injected into the exploring
+/// preamble. Both fields optional; defaults are on with a 256-file ceiling. See
+/// [`OrientationConfig`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOrientation {
+    /// Inject the map at all. Default `true`.
+    enabled: Option<bool>,
+    /// File-count ceiling for the full-list form; over it, a call is refused.
+    /// Default `256`.
+    full_list_max_files: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1529,6 +1549,24 @@ fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
         explorer: non_empty("explorer", raw.explorer)?,
         synthesize: non_empty("synthesize", raw.synthesize)?,
         consult: non_empty("consult", raw.consult)?,
+    })
+}
+
+/// Resolve `[orientation]`. A zero `full_list_max_files` would refuse *every* repo
+/// (no project has zero files), which is never the intent — disable it via
+/// `enabled = false` instead. Loud at load rather than a baffling per-call error.
+fn merge_orientation(raw: RawOrientation) -> Result<OrientationConfig> {
+    let d = OrientationConfig::default();
+    let full_list_max_files = raw.full_list_max_files.unwrap_or(d.full_list_max_files);
+    if full_list_max_files == 0 {
+        bail!(
+            "[orientation] full_list_max_files must be > 0 — a zero ceiling refuses \
+             every repo; set `enabled = false` to turn the map off instead"
+        );
+    }
+    Ok(OrientationConfig {
+        enabled: raw.enabled.unwrap_or(d.enabled),
+        full_list_max_files,
     })
 }
 
