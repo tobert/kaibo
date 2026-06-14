@@ -58,12 +58,13 @@ cast = "anthropic"
 log = "kaibo=info"
 
 # Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
-# A config with all four false is refused at startup, same as today.
+# A config with all five false is refused at startup, same as today.
 [server.tools]
-consult    = true
-explore    = true
-synthesize = true
-run_kaish  = true
+consult        = true
+explore        = true
+synthesize     = true
+run_kaish      = true
+generate_image = true
 
 # ---------------------------------------------------------------------------
 # [defaults] — tunables every cast slot falls back to. The model-tracking knobs
