@@ -73,6 +73,12 @@ commands.
 - **TDD.** Tests that can and will fail. The sandbox boundary gets failing-first
   tests — and we prove they have teeth (mount the project writable with
   `LocalFs::new` instead of `read_only`, watch the write-denial tests fail).
+- **`docs/sandbox-probes.md` is the read-only/containment audit runbook.** The
+  `cargo test` suites are the continuous guard; that doc is how we *live-test* the
+  shipped boundary now and then (write/external/read-escape/env/path batteries via
+  `run_kaish`, plus an optional model-driven pass). It's framed as **defensive** work
+  — auditing our own claims — and routes adversarial framing to a **local** cast so a
+  remote classifier never sees it. Re-run it before a release; stamp the "Last run" line.
 - **Model loops are tested offline.** A scripted `CompletionClient` in
   `src/test_support.rs` (`#[cfg(test)]`) drives the *real* consult loop with no
   network — delegation→report aggregation, session replay, turn-cap recovery. It's
