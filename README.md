@@ -13,33 +13,39 @@
 
 ---
 
-## What it is
+## Introduction
 
-Your agent can't reliably catch all the bugs it writes — it reviews its own work with
-the same blind spots that produced it. kaibo gets you a second opinion from a
-*different* model family, one whose mistakes don't line up with your agent's, so the
-things your model can't see have a chance of being caught.
+Sometimes editing and code review are valuable because other people see things right away that
+have slipped by us. Maybe it's because we were too close to the writing, or didn't sleep well
+last night, or any number of reasons. This happens with agents too. A new model revision rolls
+out, your model writes some bad code. It can't see the bug right in front of it.
+The solution for both humans and agents is the same: get a second opinion.
 
-Those blind spots run strong through a model lineage: the Claudes share them, the GPTs
-share them, and spawning more subagents from the same family can repeat them. It's a
-monoculture, and a monoculture falls to a single blight.
+kaibo is a suite of agents wrapped in an MCP server, and the agents run on a
+different model family than yours. Biases tend to be shared across
+a model lineage: the Claudes share them, the GPTs share them, and spawning more
+subagents from the same family repeats them. It's a bit like monoculture, leaving you
+vulnerable to blight. A reviewer whose mistakes don't line up with
+yours has a chance of catching what your model can't see. So you can bring that
+outside perspective into a code review, design session, or research: your agent calls
+`consult`, and the subagent does its own exploration and synthesis, reporting a
+summary back.
 
-kaibo is a stdio [MCP](https://modelcontextprotocol.io) server that gives your agent
-a `consult` tool that brings in a different model as a subagent. kaibo supports
-Anthropic, Gemini, DeepSeek and any OpenAI-compatible endpoint, including local
-services like llama.cpp. The agent is set up to mix small models for exploration with
-larger models for synthesis to help keep your API spend down.
+kaibo integrates as a stdio [MCP](https://modelcontextprotocol.io) server and supports
+Anthropic, Gemini, DeepSeek, and any OpenAI-compatible endpoint, including local
+services like llama.cpp. Each agent is set up to mix small models for exploration with
+larger models for synthesis, to help keep your API spend down.
 
-kaibo agents access your files using an embedded read-only shell, [kaish](https://github.com/tobert/kaish).
-The kaish shells are set up to have only builtin commands, with a virtual filesystem
-layer configured without any write capability at all, sandboxing the shell without
-needing fancy virtual machines or elaborate tricks to make a Unix shell behave.
+The agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
+shell. kaish has all of its commands built in and mounts your project through a
+virtual filesystem layer that is read-only, so the agents can read files in your
+workspace and write nowhere.
 
-## Install
+## Installation
 
 kaibo ships as a single self-contained binary (Linux builds are fully static musl —
 they run on any distro). Requires a Rust toolchain ≥ 1.85. A simple setup will get
-most folks rolling. Kaibo provides resources to your agent so that it can configure
+most folks rolling. kaibo provides resources to your agent so that it can configure
 kaibo for your system and credentials.
 
 ```sh
@@ -88,7 +94,7 @@ config):
 }
 ```
 
-### Let your agent configure it
+## Configuration
 
 The fastest way to set up is to let your agent do it. kaibo ships a **`configure`
 prompt** for exactly this — in Claude Code it shows up as `/kaibo:configure` (pass an
@@ -110,7 +116,7 @@ The prompt leans on two MCP resources kaibo serves, which you can also read dire
 
 ---
 
-## Configure your models
+## Backends, Roles, and Casts
 
 Model diversity *is* the product, so configuration is first-class. kaibo works out of
 the box with environment variables and built-in defaults, so a missing config file is
@@ -165,9 +171,9 @@ always readable at the `kaibo://config` MCP resource.
 
 ---
 
-## The tools
+## Tools
 
-Each tool is gated independently (`--no-<tool>`, all on by default); a server with
+Each tool is gated independently via `--no-<tool>`. All are on by default. A server with
 every tool off is refused at startup.
 
 ### `consult` — hybrid agent that explores and synthesizes
@@ -292,6 +298,14 @@ Agent contributions welcome. From 0.2.0 on, changes land through pull requests a
 every user-facing change gets a [`CHANGELOG.md`](CHANGELOG.md) entry. See
 [`AGENTS.md`](AGENTS.md) for the architecture, the PR-and-changelog workflow, and
 working conventions, and [`docs/issues.md`](docs/issues.md) for the live tracker.
+
+## Name
+
+Originally @tobert was combining 'kai' (会) with different words to find a name for this
+tool. kai + [aibo](https://jisho.org/word/%E7%9B%B8%E6%A3%92) sounded nice to align with
+[gpal](https://github.com/tobert/gpal)/[dpal](https://github.com/tobert/dpal)/[cpal](https://github.com/tobert/cpal).
+It turns out kaibo ([解剖](https://jisho.org/word/%E8%A7%A3%E5%89%96)) means
+dissection, autopsy, or postmortem examination and that was that.
 
 ## License
 
