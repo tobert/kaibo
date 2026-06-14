@@ -233,8 +233,8 @@ your agent ──stdio MCP──▶ kaibo
                     ┌───────────────────────────┐   ┌───────────────────────────┐
                     │ synth model (capable)     │   │ explorer (lite)           │
                     │   • reads files via kaish │   │   • reads files via kaish │
-                    │   • delegates to explorer │─▶ │                           │
-                    │   • writes a summary      │ ◀─│   • summarizes results    │
+                    │   • delegates to explorer │-> │                           │
+                    │   • writes a summary      │ <-│   • summarizes results    │
                     └───────────────────────────┘   └───────────────────────────┘
                             │  synthesized answer (not the transcript)
                             ▼
