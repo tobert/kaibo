@@ -663,6 +663,27 @@ impl Config {
         }
     }
 
+    /// The casts that can reach a model *right now* — [`CastUsability::Ready`] or
+    /// [`CastUsability::LocalUnverified`], with the state so the handshake can tag a
+    /// local/unverified one. Sorted by name (the `casts` `BTreeMap`'s order). This is
+    /// the truthful, startup-resolved answer to "what can I pass as `cast`?" — and it
+    /// includes config.toml casts the static per-tool `cast` enum can't name. An
+    /// [`CastUsability::Unconfigured`] cast (a backend missing its key) is filtered
+    /// out: we advertise only what will actually work. Env lookup is injected for
+    /// testability, mirroring [`cast_usability`](Self::cast_usability).
+    pub fn usable_casts(
+        &self,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Vec<(String, CastUsability)> {
+        self.casts
+            .iter()
+            .filter_map(|(name, cast)| match self.cast_usability(cast, &get_env) {
+                CastUsability::Unconfigured => None,
+                usable => Some((name.clone(), usable)),
+            })
+            .collect()
+    }
+
     /// [`cast_usability`](Self::cast_usability) for the default cast — what `get_info`
     /// reads to decide whether to surface setup guidance. If the default cast somehow
     /// doesn't resolve (it's validated to at startup), treat it as `Unconfigured` so we
@@ -1889,6 +1910,33 @@ mod tests {
         assert_eq!(
             cfg.default_cast_usability(|_| None),
             CastUsability::Unconfigured
+        );
+    }
+
+    /// `usable_casts` keeps only the casts that can reach a model — filtering out the
+    /// `Unconfigured` ones — and reports each survivor's state so the handshake can tag
+    /// a local one. With only an Anthropic key in the env, the keyed built-ins that lack
+    /// keys (deepseek, gemini) drop out; anthropic is Ready and the keyless `openai` is
+    /// LocalUnverified. This is the source of the truthful "## Casts" handshake list.
+    #[test]
+    fn usable_casts_filters_unconfigured_and_reports_state() {
+        let cfg = Config::from_toml_str(NO_KEY_FILES).unwrap();
+        let env = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
+        let usable = cfg.usable_casts(env);
+        assert_eq!(
+            usable,
+            vec![
+                ("anthropic".to_string(), CastUsability::Ready),
+                ("openai".to_string(), CastUsability::LocalUnverified),
+            ],
+            "only keyed-and-present + keyless casts survive, with their state"
+        );
+        // With no key at all, the only survivor is the keyless local cast.
+        let none = cfg.usable_casts(|_| None);
+        assert_eq!(
+            none,
+            vec![("openai".to_string(), CastUsability::LocalUnverified)],
+            "no env key ⇒ only the keyless local cast is usable"
         );
     }
 

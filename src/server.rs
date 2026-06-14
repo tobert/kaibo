@@ -948,6 +948,7 @@ impl rmcp::ServerHandler for KaiboHandler {
                 &self.allowed_set,
                 self.config
                     .default_cast_usability(|k| std::env::var(k).ok()),
+                &self.config.usable_casts(|k| std::env::var(k).ok()),
             )),
         }
     }
@@ -2178,6 +2179,7 @@ mod tests {
             &config,
             &allowed,
             crate::config::CastUsability::Ready,
+            &[],
         );
         // The scope section must name each allowed path.
         assert!(
@@ -2208,6 +2210,7 @@ mod tests {
             &config,
             &allowed,
             crate::config::CastUsability::Ready,
+            &[],
         );
         assert!(
             text.contains("/projects/myapp"),
@@ -2227,6 +2230,7 @@ mod tests {
             &config,
             &allowed,
             crate::config::CastUsability::Ready,
+            &[],
         );
         // Must explain that every call must pass a path.
         assert!(

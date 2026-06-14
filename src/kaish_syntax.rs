@@ -181,6 +181,51 @@ fn setup_section(config: &Config) -> String {
     )
 }
 
+/// The `## Casts` block: the casts that can reach a model *right now* (from
+/// [`Config::usable_casts`]), the default marked and a local/unverified one tagged.
+/// This is the handshake answering "what can I pass as `cast`?" truthfully — it
+/// names config.toml casts the static per-tool `cast` enum can't, and lists only
+/// what will actually work (an unconfigured cast is filtered upstream). It closes by
+/// pointing at `kaibo://config` as canonical for the full configured state, since
+/// this list is deliberately partial (usable-only) and read once at startup.
+///
+/// Empty `usable` (no cast can reach a model) renders nothing — the `Unconfigured`
+/// setup banner already owns that case and would otherwise say it twice. Returns a
+/// trailing `\n\n` so the caller can splice it in unconditionally.
+fn casts_section(default_cast: &str, usable: &[(String, CastUsability)]) -> String {
+    if usable.is_empty() {
+        return String::new();
+    }
+    let lines: String = usable
+        .iter()
+        .map(|(name, state)| {
+            let mut tags = Vec::new();
+            if name == default_cast {
+                tags.push("default");
+            }
+            if matches!(state, CastUsability::LocalUnverified) {
+                tags.push("local, unverified");
+            }
+            if tags.is_empty() {
+                format!("- `{name}`")
+            } else {
+                format!("- `{name}` ({})", tags.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "## Casts\n\
+         A cast is the model team that staffs a consultation; pass `cast=<name>` on a \
+         call to pick one. Usable right now (resolved at startup — reconnect after a \
+         config or key change):\n\
+         {lines}\n\n\
+         `kaibo://config` is canonical for what's configured — every cast and backend \
+         (with aliases), the gated tools, and sandbox limits.\n\n"
+    )
+}
+
 /// Like [`kaibo_instructions`] but with a **scope section** appended so the calling
 /// model always knows:
 /// - the default root (or that every call must pass one),
@@ -199,6 +244,7 @@ pub fn kaibo_instructions_with_scope(
     config: &Config,
     allowed_set: &[PathBuf],
     usability: CastUsability,
+    usable_casts: &[(String, CastUsability)],
 ) -> String {
     // The unconfigured-install banner leads, so a fresh user sees it first.
     let setup = match usability {
@@ -206,6 +252,7 @@ pub fn kaibo_instructions_with_scope(
         CastUsability::Ready | CastUsability::LocalUnverified => String::new(),
     };
     let base = kaibo_instructions(schemas);
+    let casts = casts_section(&config.default_cast, usable_casts);
 
     // Scope section: always accurate, never ambiguous.
     let root_line = match &config.root {
@@ -220,6 +267,7 @@ pub fn kaibo_instructions_with_scope(
 
     format!(
         "{setup}{base}\n\n\
+         {casts}\
          ## Scope\n\
          This server's path containment is always on. A per-call `path` must \
          canonicalize to at-or-under one of the allowed trees below.\n\n\
@@ -359,6 +407,7 @@ mod tests {
             &config,
             &[PathBuf::from("/tmp")],
             CastUsability::Unconfigured,
+            &[],
         );
         assert!(
             text.contains("Setup needed"),
@@ -395,13 +444,67 @@ mod tests {
     fn instructions_omit_setup_when_usable() {
         let config = Config::builtin();
         for usability in [CastUsability::Ready, CastUsability::LocalUnverified] {
-            let text =
-                kaibo_instructions_with_scope(&[], &config, &[PathBuf::from("/tmp")], usability);
+            let text = kaibo_instructions_with_scope(
+                &[],
+                &config,
+                &[PathBuf::from("/tmp")],
+                usability,
+                &[],
+            );
             assert!(
                 !text.contains("Setup needed"),
                 "{usability:?} must not get the setup banner:\n{text}"
             );
         }
+    }
+
+    /// The handshake lists the casts that can reach a model *right now* — the
+    /// truthful, startup-resolved answer to "what can I pass as `cast`?", including
+    /// config.toml casts the static tool-schema enum can't name. The default is
+    /// marked; a local/unverified one is tagged; an unconfigured cast is *not*
+    /// advertised as usable; and the section points at `kaibo://config` as canonical
+    /// for the full configured state.
+    #[test]
+    fn instructions_list_usable_casts_and_point_at_config() {
+        let config = Config::builtin(); // default cast "anthropic"
+        let usable = vec![
+            ("anthropic".to_string(), CastUsability::Ready),
+            ("mylocal".to_string(), CastUsability::LocalUnverified),
+        ];
+        let text = kaibo_instructions_with_scope(
+            &[],
+            &config,
+            &[PathBuf::from("/tmp")],
+            CastUsability::Ready,
+            &usable,
+        );
+        assert!(
+            text.contains("## Casts"),
+            "must have a Casts section:\n{text}"
+        );
+        // Both usable casts are named, including the config.toml one.
+        for needle in ["anthropic", "mylocal"] {
+            assert!(
+                text.contains(needle),
+                "Casts section must name usable cast {needle:?}:\n{text}"
+            );
+        }
+        // The default is marked.
+        assert!(
+            text.contains("(default)"),
+            "Casts section must mark the default cast:\n{text}"
+        );
+        // A built-in cast absent from the usable list (no key) is NOT advertised —
+        // gemini only appears if something names it, and nothing here does.
+        assert!(
+            !text.contains("gemini"),
+            "an unconfigured cast must not be advertised as usable:\n{text}"
+        );
+        // Points at the config resource as canonical for what's configured.
+        assert!(
+            text.contains("canonical") && text.contains("kaibo://config"),
+            "Casts section must point at kaibo://config as canonical:\n{text}"
+        );
     }
 
     #[test]
