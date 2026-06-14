@@ -98,11 +98,10 @@ async fn list_files(worker: &KaishWorker) -> Result<Vec<String>> {
 fn render(files: &[String]) -> String {
     let mut s = String::with_capacity(64 + files.iter().map(|f| f.len() + 1).sum::<usize>());
     s.push_str(
-        "PROJECT FILES. This is the project's complete file list (read-only, hidden \
-         config included; build/VCS dirs excluded). You already know every file here \
-         — you do not need to `ls`, `glob`, or `rg --files` to discover the layout. \
-         Go straight to reading the files the question touches (`cat -n FILE`), and \
-         use `rg -n` to find *where* something lives inside them.\n",
+        "PROJECT FILES. The project's complete file list (read-only; hidden config \
+         included, build/VCS dirs excluded). You already have the whole layout here, \
+         so go straight to reading the files the question touches with `cat -n FILE`, \
+         and use `rg -n` to find where something lives inside them.\n",
     );
     for f in files {
         s.push_str("  ");
