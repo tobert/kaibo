@@ -282,6 +282,24 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
+### Review the provider retry + failure policy (and document it)
+We don't have a stated, audited answer for what a `consult`/`explore`/`synthesize`
+call does when a provider misbehaves mid-flight: a 429/529 overload, a connection
+reset, a partial stream, or a wedged-but-connected backend. Today the only explicit
+guard is the per-backend `request_timeout_secs` (default 900, `config.md`) that bounds
+a *single* completion — but whether rig retries with backoff, how many times, and
+whether a terminal provider error surfaces to the caller as a clean tool error (so the
+host agent can proceed *without* the consultation) versus failing the whole call is
+unverified. Surfaced in README review (an SRE reviewer asked "what happens on a
+DeepSeek 529?" and we couldn't answer from the docs).
+
+Do: trace the actual path through `consult.rs` → the rig client (`tls.rs`/client
+construction) → reqwest; confirm or add retry/backoff with a cap; make a terminal
+failure a clean, named tool error rather than an opaque internal_error; then document
+the policy in the README FAQ (it currently only promises "a down provider surfaces a
+clean error" loosely) and `docs/config.md`. A failing-first test that injects a 529 via
+the scripted `CompletionClient` (`test_support.rs`) is the natural guard.
+
 ## P3 — Infra, perf, polish
 
 ### `[context]` house rules have no size cap (and ride every turn, every phase)
