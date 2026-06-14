@@ -1,6 +1,7 @@
-<!-- TODO(repo): logo eventually — not a launch blocker. Title + tagline is enough for day one. -->
-
-<h1 align="center">kaibo（解剖）</h1>
+<p align="center">
+  <!-- Kaile, the kaibo mascot. Brand assets + generator live in docs/brand/. -->
+  <img src="docs/brand/banner-teal.png" alt="kaibo（解剖）" width="820">
+</p>
 
 <p align="center">
   <strong>A tool for getting second opinions.</strong>
@@ -9,12 +10,6 @@
 <p align="center">
   <em>Diverse models that investigate your code — not just vote on it.</em>
 </p>
-
-<!-- NOTE: tagline. Title line A ("a second opinion…") + subline C ("investigate, not
-     vote") chosen because C beats the "another LLM-ensemble wrapper" reflex fastest on
-     HN/lobste.rs. Alternative subline for an SRE/infra crowd:
-     "Don't run a model monoculture against your hardest bugs." Swap if the launch venue
-     skews that way. -->
 
 <p align="center">
   <!-- TODO(repo): badges once published — crates.io version, license, CI. -->
@@ -44,26 +39,6 @@ kaibo agents access your files using an embedded read-only shell, [kaish](https:
 The kaish shells are set up to have only builtin commands, with a virtual filesystem
 layer configured without any write capability at all, sandboxing the shell without
 needing fancy virtual machines or elaborate tricks to make a Unix shell behave.
-
----
-
-## See it work
-
-<!-- TODO(repo): THE asciinema. The launch asset — more important than logo or site.
-     Pull a real example from the Claude Code logs:
-       1. A REAL bug, from a real commit, that the primary agent waved through clean.
-       2. consult() dispatched; a different model investigates the actual code and
-          returns "here's the bug + where" with a file:line.
-       3. The wrongness is legible to a non-expert in <10s — off-by-one, missed error
-          path, race, unhandled None — not something needing domain context.
-       4. Under ~60s, dead air trimmed, no sped-up sections (this crowd distrusts them).
-       5. Show the synthesized answer that crosses back, not the raw transcript.
-     Record with asciinema, host the .cast, embed here.
-     Caption: name the actual bug + the actual model that caught it. Specificity sells. -->
-
-<!-- asciinema embed goes here -->
-
----
 
 ## Install
 
