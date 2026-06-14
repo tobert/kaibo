@@ -13,10 +13,12 @@ use kaish_kernel::tools::ToolSchema;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, CallToolResult, Content, Implementation, ListResourceTemplatesResult,
-    ListResourcesResult, LoggingLevel, Meta, PaginatedRequestParams, ProgressNotificationParam,
-    ProgressToken, ProtocolVersion, RawResource, RawResourceTemplate, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SetLevelRequestParams,
+    AnnotateAble, CallToolResult, Content, GetPromptRequestParams, GetPromptResult, Implementation,
+    JsonObject, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, LoggingLevel,
+    Meta, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
+    PromptMessage, PromptMessageRole, ProtocolVersion, RawResource, RawResourceTemplate,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -994,6 +996,10 @@ impl rmcp::ServerHandler for KaiboHandler {
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                // One prompt: `configure`, the guided "set up my models" flow (see
+                // `kaibo_prompts`). Advertising `prompts` is what surfaces it in a
+                // client's prompt picker / slash menu.
+                .enable_prompts()
                 // kaibo mirrors its `tracing` logs onto the MCP `notifications/message`
                 // channel (see `mcp_log`); advertising `logging` is what lets a client
                 // tune the floor with `logging/setLevel`.
@@ -1070,6 +1076,25 @@ impl rmcp::ServerHandler for KaiboHandler {
             &self.allowed_set,
         )
     }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult {
+            prompts: kaibo_prompts(),
+            ..Default::default()
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        kaibo_prompt_messages(&request.name, request.arguments.as_ref())
+    }
 }
 
 /// A `text/markdown` resource at `uri` with `name`/`description`. Small helper so
@@ -1132,6 +1157,104 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
         ));
     }
     resources
+}
+
+/// The one prompt kaibo advertises: a guided "set up my models" flow.
+const CONFIGURE_PROMPT_NAME: &str = "configure";
+
+/// The `configure` prompt body. It hands the calling agent kaibo's *own* config
+/// resources and the real config.toml shape (env/file key sources, family-mixing
+/// casts) instead of restating the manual, so "configure kaibo" is a grounded flow
+/// rather than freehand. Positive framing throughout — name the good idiom, not the
+/// prohibition (the house prompt discipline, see AGENTS.md).
+const CONFIGURE_PROMPT_BODY: &str = "\
+You're configuring **kaibo**, the MCP server you're connected to right now — it lends \
+your work a second opinion from models outside your own family. This sets up which \
+models it uses.
+
+Work through these steps:
+
+1. Read kaibo's two config resources first (they're MCP resources — no tool turn spent):
+   • `kaibo://config/example` — the annotated config.toml template, every knob explained.
+   • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
+and where each key is sourced from.
+2. Ask me which providers I can actually reach before writing anything: which of \
+Anthropic / DeepSeek / Gemini I hold API keys for, and whether I run any \
+OpenAI-compatible local servers (llama.cpp, Ollama, an image server) and at what base \
+URLs. Let me tell you my providers rather than guessing them.
+3. Propose a roster, then write it to `$XDG_CONFIG_HOME/kaibo/config.toml` (default \
+`~/.config/kaibo/config.toml`). Favor a cast that mixes model families across roles — \
+a cheap, fast explorer on one lineage and a stronger synth on another. That's both \
+cheaper and the whole point of an outside opinion; two flavors of one base model give \
+one voice twice.
+4. Keep secrets in the environment or a key file. A backend names an env var \
+(`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
+the secret stays outside it. Tell me which env vars to set or files to write, and let \
+me put the keys in myself.
+5. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
+the config and keys — both load once at startup.";
+
+/// The prompts kaibo advertises (`list_prompts`). Currently just `configure`.
+fn kaibo_prompts() -> Vec<Prompt> {
+    vec![Prompt::new(
+        CONFIGURE_PROMPT_NAME,
+        Some(
+            "Guide your agent through writing a kaibo config.toml: it reads kaibo's own \
+             config resources, asks which providers and models you have, and writes the \
+             file. Pass an optional `goal` to steer the roster.",
+        ),
+        Some(vec![PromptArgument {
+            name: "goal".to_string(),
+            title: Some("Setup goal".to_string()),
+            description: Some(
+                "What you want from the setup, e.g. \"a local-only privacy cast\" or \
+                 \"a cheap DeepSeek explorer with a Claude synth\". Optional — omit for a \
+                 general walk-through."
+                    .to_string(),
+            ),
+            required: Some(false),
+        }]),
+    )]
+}
+
+/// Resolve a prompt name + arguments into its messages (`get_prompt`). Pure — no peer
+/// or IO — so the prompt content is unit-testable; the trait method is a thin wrapper.
+/// An unknown name is a loud `invalid_params`, never a silent empty prompt.
+fn kaibo_prompt_messages(
+    name: &str,
+    arguments: Option<&JsonObject>,
+) -> Result<GetPromptResult, McpError> {
+    match name {
+        CONFIGURE_PROMPT_NAME => {
+            // A blank/whitespace goal reads as "no goal" — don't append an empty line.
+            let goal = arguments
+                .and_then(|a| a.get("goal"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            Ok(GetPromptResult {
+                description: Some("Configure kaibo's models for this codebase".to_string()),
+                messages: vec![PromptMessage::new_text(
+                    PromptMessageRole::User,
+                    configure_prompt_text(goal),
+                )],
+            })
+        }
+        other => Err(McpError::invalid_params(
+            format!("unknown prompt {other:?}; kaibo offers: {CONFIGURE_PROMPT_NAME}"),
+            None,
+        )),
+    }
+}
+
+/// The `configure` body, with an optional caller `goal` appended verbatim.
+fn configure_prompt_text(goal: Option<&str>) -> String {
+    let mut body = String::from(CONFIGURE_PROMPT_BODY);
+    if let Some(goal) = goal {
+        body.push_str("\n\nMy goal for this setup: ");
+        body.push_str(goal);
+    }
+    body
 }
 
 /// The URI templates kaibo advertises: per-builtin help, addressed by name.
@@ -1658,7 +1781,7 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::NumberOrString;
+    use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
 
     /// A small stand-in builtin set so resource rendering is offline-testable.
@@ -1899,6 +2022,102 @@ mod tests {
                 .iter()
                 .any(|t| t.raw.uri_template == BUILTIN_URI_TEMPLATE),
             "must advertise the per-builtin URI template"
+        );
+    }
+
+    /// The handshake must advertise the `prompts` capability, else a client never
+    /// asks for the `configure` prompt — the menu entry would be invisible.
+    #[test]
+    fn handshake_advertises_prompts_capability() {
+        let info = handler().get_info();
+        assert!(
+            info.capabilities.prompts.is_some(),
+            "prompts capability must be enabled so clients surface the configure prompt"
+        );
+    }
+
+    /// `list_prompts` offers exactly the `configure` prompt, with its optional `goal`
+    /// argument declared not-required (a required arg would make the bare prompt fail).
+    #[test]
+    fn lists_the_configure_prompt() {
+        let prompts = kaibo_prompts();
+        let configure = prompts
+            .iter()
+            .find(|p| p.name == CONFIGURE_PROMPT_NAME)
+            .expect("configure prompt must be advertised");
+        let goal = configure
+            .arguments
+            .as_ref()
+            .and_then(|args| args.iter().find(|a| a.name == "goal"))
+            .expect("configure must declare a `goal` argument");
+        assert_eq!(
+            goal.required,
+            Some(false),
+            "`goal` must be optional so the bare prompt works"
+        );
+    }
+
+    /// The prompt body is the whole point: it must route the agent to kaibo's own
+    /// config resources and the real config.toml shape, not restate the manual. If a
+    /// resource URI or the secret-handling contract drifts, this fails.
+    #[test]
+    fn configure_prompt_grounds_in_the_config_resources() {
+        let result =
+            kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, None).expect("configure must resolve");
+        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+            panic!("configure prompt must be a text message");
+        };
+        for needle in [
+            CONFIG_EXAMPLE_URI,            // read the annotated template
+            CONFIG_URI,                    // and the resolved live state
+            "config.toml",                 // write target
+            "api_key_env",                 // keys-by-reference, not inline
+            "reconnect",                   // re-read at startup
+        ] {
+            assert!(
+                text.contains(needle),
+                "configure prompt should mention {needle:?}; body:\n{text}"
+            );
+        }
+    }
+
+    /// A supplied `goal` is woven into the message so the agent tailors the roster;
+    /// a blank one is treated as absent (no dangling "goal:" line).
+    #[test]
+    fn configure_prompt_weaves_in_a_goal() {
+        let args = json!({ "goal": "a local-only privacy cast" });
+        let with_goal = kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, args.as_object())
+            .expect("configure must resolve");
+        let PromptMessageContent::Text { text } = &with_goal.messages[0].content else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("a local-only privacy cast"),
+            "a supplied goal must appear in the prompt; body:\n{text}"
+        );
+
+        let blank = json!({ "goal": "   " });
+        let without = kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, blank.as_object())
+            .expect("configure must resolve");
+        let PromptMessageContent::Text { text } = &without.messages[0].content else {
+            panic!("expected text");
+        };
+        assert!(
+            !text.contains("My goal for this setup:"),
+            "a blank goal must not append an empty goal line; body:\n{text}"
+        );
+    }
+
+    /// An unknown prompt name is a loud `invalid_params`, never a silent empty prompt
+    /// the agent would run blind.
+    #[test]
+    fn unknown_prompt_is_a_loud_error() {
+        let err = kaibo_prompt_messages("does-not-exist", None)
+            .expect_err("an unknown prompt name must error");
+        assert!(
+            err.message.contains("does-not-exist") && err.message.contains(CONFIGURE_PROMPT_NAME),
+            "error should name the bad prompt and the real one, got: {}",
+            err.message
         );
     }
 
