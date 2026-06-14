@@ -34,8 +34,11 @@ use crate::config::{CastUsability, Config};
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so just read. Browse with line \
-numbers so every citation is exact — `cat -n FILE`, `rg -n PATTERN`, and numbered \
-spans like `cat -n FILE | sed -n '40,80p'`. Each call starts at the project root; \
+numbers so every citation is exact — `cat -n FILE` to read a whole file, \
+`rg -n -B3 -A6 PATTERN` to find a match with the lines around it, and numbered \
+spans like `cat -n FILE | sed -n '40,80p'` for one slice of a large file. \
+`wc -l FILE` tells you a file's length — most are short enough to read whole. \
+Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \

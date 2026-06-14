@@ -402,31 +402,21 @@ neither). The effort half of this was fixed for the 3-line (it now maps onto
 the render), flag per-slot tunables the slot's resolved shape will never send —
 a note in the render is enough to make the no-op visible to the operator.
 
-### Per-model prose fitting — gemini-cli probe candidates (params-first, prose-later)
-Once the params seam lands, probe whether Gemini's *prose* underperforms Anthropic's
-before forking any preamble. Candidates lifted from gemini-cli's codebase-investigator
-(`packages/core/src/agents/codebase-investigator.ts`), the direct twin of kaibo's
-`explore`, ranked by expected lift:
-- **Structured report + a worked few-shot example** (`:166-189`). Its final report is
-  a JSON schema (`RelevantLocations:[{FilePath,Reasoning,KeySymbols}]`) with a full
-  filled-in example *in the prompt*. kaibo's explorer returns free-text "a curated
-  report"; weaker models follow a *shown* shape far better than a described one. This
-  touches the explorer→synth hand-off seam (`report_preamble`), so it's the highest-
-  value and highest-blast-radius probe.
-- **"Treat confusion as a signal to dig deeper"** (`:146`) — imperative curiosity;
-  kaibo's "get more when context isn't enough", made directive. Positive framing.
-- **Completeness pressure** (`:140,147`) — "don't stop at the first relevant file…
-  complete and minimal set." For the cheap explorer (coverage is its job) this may be
-  the right lean for Gemini.
-- **Tension to test, not adopt:** gemini-cli uses `DO / DO NOT` bullets freely *with
-  Gemini* and it works — against our positive-framing discipline. Hypothesis: that
-  caution is **Gemma-specific, not Gemini-wide**. If Gemini tolerates prohibitions,
-  its prose can be more directive than the local-Gemma profile's. Measure.
-- **`<scratchpad>` mandate** (`:151-160`) — high variance: a strong scaffold for a
-  less self-directed model, but pulls toward long chats, against "few high-value
-  turns" and the turn cap. Probe last.
-- **Debug affordance:** a `WRITE_SYSTEM_MD`-style dump of the assembled prompt to a
-  file (gemini-cli's `GEMINI_WRITE_SYSTEM_MD`) — handy once prompts compose per model.
+### Explorer prose — residual probes (the report shape + reading strategy shipped)
+The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
+`ExplorationTrace`), the curiosity + completeness behaviors, and the assertive
+whole-file / `rg -B/-A` reading strategy now live in `report_preamble` (and the
+`rg`/`wc -l` idioms in the shared cheatsheet). Measured against a real review task,
+a lite Gemini explorer dropped from 48 turns to ~21 with *better* citations — the
+built-in reproduces it with no per-cast config. Still open, lower value:
+- **A worked, filled-in example in the prompt.** We ship the section *template*, not a
+  filled `RelevantLocations` example. A *shown* example may lift the weakest local
+  models further — probe if a Gemma explorer underperforms a Gemini one on the shape.
+- **`<scratchpad>` scaffold** — deliberately *not* adopted (it pulls toward long chats,
+  against the turn cap). Reconsider only for a notably less self-directed local model.
+- **Debug affordance:** dump the *assembled* preamble (built-in/override + house rules)
+  to a file, à la gemini-cli's `GEMINI_WRITE_SYSTEM_MD` — useful now that prompts
+  compose per model from `[prompts]`, slot `preamble`, and `[context]`.
 
 ### Server doesn't report which backends are usable
 Keys are resolved lazily at call time, so a missing key surfaces as a mid-call

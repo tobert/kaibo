@@ -117,13 +117,32 @@ fn phase_preamble(
 pub fn report_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You are a code explorer. {core}\n\n\
-         Your job is NOT to write a polished answer. Investigate the question, then \
-         produce a CURATED REPORT for a synthesizer who will write the final answer: \
-         list the relevant files with `file:line` locations, quote the short key \
-         snippets verbatim, and note what each means for the question. Be precise and \
-         evidence-first; omit filler. The synthesizer trusts your citations, so make \
-         them exact."
+        "You are a code explorer. You build a complete, accurate picture of the code \
+         a question touches and hand it to a synthesizer who writes the final \
+         answer — so your work is to gather grounded evidence and cite it exactly. \
+         {core}\n\n\
+         HOW TO READ. Read for the whole picture in as few looks as possible. Locate \
+         with ripgrep and take the surrounding context in the same call — \
+         `rg -n -B4 -A8 PATTERN` returns each match with the lines around it, ready \
+         to understand. When a file is central, read it WHOLE with `cat -n FILE`: \
+         most files are short, and one full read hands you its imports, its context, \
+         and exact line numbers together. Save narrow spans for a genuinely large \
+         file — over a thousand lines, which `wc -l FILE` confirms: \
+         `cat -n FILE | sed -n 'A,Bp'`.\n\n\
+         HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
+         each key symbol to where it is defined and where it is used; chase anything \
+         that puzzles you until it is clear — a confusing spot usually hides the \
+         thing you need. One thorough pass beats many shallow ones.\n\n\
+         WHAT TO PRODUCE. A curated report for the synthesizer, in these sections:\n\
+         - SummaryOfFindings: what you concluded, in a few sentences.\n\
+         - RelevantLocations: for each location that matters — the concrete \
+         `file:line`, the key symbols there (functions, types, fields), a short \
+         verbatim snippet, and what it means for the question.\n\
+         - ExplorationTrace: the path you took, when it helps the synthesizer trust \
+         the result.\n\
+         Keep it tight and evidence-first. The synthesizer trusts your citations and \
+         builds on them, so ground every claim in an exact `file:line` — that \
+         exactness is the whole value of your report."
     )
 }
 
@@ -1433,7 +1452,9 @@ pub fn synthesize_preamble() -> String {
     format!(
         "You answer a question about a codebase, grounded in evidence and citing \
          concrete `file:line`. {core}\n\n\
-         You may be given CONTEXT — a curated explorer report or pasted material. \
+         You may be given CONTEXT — typically a curated explorer report (a \
+         SummaryOfFindings plus RelevantLocations, each with a `file:line`, key \
+         symbols, and a short snippet), or pasted material. \
          Treat it as your starting evidence: when it cites a concrete `file:line`, \
          trust it — a grounded citation rarely needs re-deriving. The `run_kaish` \
          tool is yours to drive directly whenever the context isn't enough: fetch a \
@@ -1518,8 +1539,9 @@ pub fn consult_preamble() -> String {
         "You answer a question about a codebase, grounded in evidence and citing \
          concrete `file:line`. {core}\n\n\
          You also have a second tool, `explore`: it delegates a broad sweep to a \
-         fast investigator that rips through the repo and reports back with \
-         `file:line` citations. Reach for `explore` to cover breadth — find where a \
+         fast investigator that rips through the repo and reports back with a \
+         curated report — RelevantLocations carrying `file:line`, key symbols, and \
+         snippets. Reach for `explore` to cover breadth — find where a \
          thing lives, gather the relevant files — and use `run_kaish` to read a \
          precise span yourself and confirm a detail. Build your answer from what \
          they return: quote the key snippet, name its `file:line`, and let the \
@@ -2932,6 +2954,28 @@ mod tests {
             !names.iter().any(|n| n == "view_image"),
             "a blind synth must not get view_image, got {names:?}"
         );
+    }
+
+    /// The explorer preamble carries the behaviors we measured into it — the
+    /// whole-file reading directive (the lite-explorer win, 48→23 turns), the
+    /// context-buffer `rg` idiom, and the three report sections the synth side now
+    /// expects. Pure and offline; pins the prose so a future edit can't silently
+    /// drop any of it (the synth preambles are written against this shape).
+    #[test]
+    fn report_preamble_keeps_the_reading_directive_and_report_shape() {
+        let p = report_preamble();
+        // Reading strategy: read whole files, locate with an rg context buffer.
+        assert!(p.contains("cat -n FILE"), "whole-file read idiom: {p}");
+        assert!(
+            p.to_lowercase().contains("whole"),
+            "the whole-file directive must survive: {p}"
+        );
+        assert!(p.contains("rg -n -B4 -A8"), "rg context-buffer idiom: {p}");
+        // The report template the synth (synthesize/consult preambles) is written
+        // against — keep the three section names in lockstep with those.
+        for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
+            assert!(p.contains(section), "missing report section {section}: {p}");
+        }
     }
 
     /// When the synth arm is vision-capable, the consult driver's toolset gains
