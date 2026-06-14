@@ -71,6 +71,14 @@ where
         return Ok(None);
     }
 
+    // opentelemetry-otlp builds its own reqwest (blocking) client when we build the
+    // exporter below, and — because reqwest is compiled `rustls-no-provider` (see
+    // Cargo.toml / src/tls.rs) — that build panics unless a process-default crypto
+    // provider is already installed. This is a real client build site like the ones in
+    // consult.rs / image_gen.rs, so it installs ring the same way: anything else
+    // would abort the live binary on its first span export.
+    crate::tls::ensure_crypto_provider();
+
     // HTTP/protobuf on the async reqwest client — reuses kaibo's reqwest 0.13 +
     // rustls (no tonic/gRPC). HttpBinary is the protobuf wire (the `/v1/traces`
     // endpoint in config points at it).
