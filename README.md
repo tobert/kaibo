@@ -8,12 +8,7 @@
 </p>
 
 <p align="center">
-  <em>Diverse models that investigate your code — not just vote on it.</em>
-</p>
-
-<p align="center">
   <!-- TODO(repo): badges once published — crates.io version, license, CI. -->
-  <!-- TODO(repo): name-collision check before publishing — crates.io / npm / notable projects. -->
 </p>
 
 ---
