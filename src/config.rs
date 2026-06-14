@@ -39,6 +39,7 @@ use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use crate::orientation::OrientationConfig;
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
+use kaish_kernel::{IgnoreConfig, IgnoreScope};
 
 // --- Tunable defaults (the [defaults] table) -------------------------------
 
@@ -949,7 +950,10 @@ impl Config {
         let context = merge_context(raw.context.unwrap_or_default());
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
-        let sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
+        let mut sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
+        // The ignore policy lives in its own `[kaish.ignore]` stanza (behavior, not
+        // safety), but resolves onto the same struct the kernel builder consumes.
+        sandbox.ignore = merge_kaish(raw.kaish.unwrap_or_default())?;
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
         // real intent (there's no "unbounded" escape hatch by design: an unbounded
@@ -1175,6 +1179,7 @@ struct RawConfig {
     prompts: Option<RawPrompts>,
     orientation: Option<RawOrientation>,
     sandbox: Option<RawSandbox>,
+    kaish: Option<RawKaish>,
     backends: Option<BTreeMap<String, RawBackend>>,
     casts: Option<BTreeMap<String, RawCast>>,
     /// Tombstone. `[profiles]` was split into `[backends]` + `[casts]`
@@ -1205,6 +1210,41 @@ struct RawSandbox {
     scratch_limit_bytes: Option<u64>,
     /// Builtins to disable on top of the read-only denylist (file-only; no env).
     disable_builtins: Option<Vec<String>>,
+}
+
+/// The `[kaish]` stanza — tuning for the kaish kernel's *behavior* (as opposed to
+/// `[sandbox]`, which is its safety boundary and resource limits). Today it carries
+/// only the ignore policy; it's a stanza, not a bare key, so future kaish knobs have
+/// a home. File-only (no `KAIBO_*` env), like its `[sandbox]` list siblings.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKaish {
+    ignore: Option<RawIgnore>,
+}
+
+/// The `[kaish.ignore]` sub-table — which gitignore-format files the file-walking
+/// builtins honor, and how broadly. Every key is optional and defaults to
+/// [`IgnoreConfig::mcp`]'s value, so an absent stanza (or a partial one) preserves
+/// today's `.gitignore`-aware, enforced-scope behavior. `files` *replaces* the
+/// default `[".gitignore"]` when given — list it explicitly alongside extras to keep
+/// it (though `auto_gitignore`, on by default, still walks nested `.gitignore`s
+/// regardless).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIgnore {
+    /// Ignore filenames loaded at the root and walked up through ancestors, in
+    /// precedence order (later wins, rg-style). Default: `[".gitignore"]`.
+    files: Option<Vec<String>>,
+    /// Apply built-in defaults (`target/`, `node_modules/`, `.git`). Default: true.
+    defaults: Option<bool>,
+    /// Auto-load nested `.gitignore` files during the walk. Default: true.
+    auto_gitignore: Option<bool>,
+    /// Also honor the user's global gitignore (`core.excludesFile`). Default: false.
+    global_gitignore: Option<bool>,
+    /// `"enforced"` (all walkers, incl. `find` — protects the agent's context) or
+    /// `"advisory"` (polite tools only; `find` stays POSIX-unrestricted). Default:
+    /// `"enforced"`.
+    scope: Option<String>,
 }
 
 /// The `[context]` stanza — files whose contents are spliced into each
@@ -1580,7 +1620,35 @@ fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
         output_limit_bytes: raw.output_limit_bytes.unwrap_or(d.output_limit_bytes),
         scratch_limit_bytes: raw.scratch_limit_bytes.unwrap_or(d.scratch_limit_bytes),
         disable_builtins: raw.disable_builtins.unwrap_or(d.disable_builtins),
+        // Resolved separately from `[kaish.ignore]` and stitched in by `merge`.
+        ignore: d.ignore,
     }
+}
+
+/// Resolve `[kaish.ignore]` into the kernel's [`IgnoreConfig`]. Each key falls back
+/// to the [`IgnoreConfig::mcp`] default, so an absent stanza reproduces it exactly
+/// (`.gitignore` + built-in defaults, enforced scope) and a partial stanza overrides
+/// only the keys it names. An unrecognized `scope` is a load error, not a silent
+/// fallback to the default.
+fn merge_kaish(raw: RawKaish) -> Result<IgnoreConfig> {
+    let ri = raw.ignore.unwrap_or_default();
+    let scope = match ri.scope.as_deref() {
+        None | Some("enforced") => IgnoreScope::Enforced,
+        Some("advisory") => IgnoreScope::Advisory,
+        Some(other) => {
+            bail!("[kaish.ignore] scope = {other:?} must be \"enforced\" or \"advisory\"")
+        }
+    };
+
+    let mut ignore = IgnoreConfig::none();
+    ignore.set_scope(scope);
+    ignore.set_defaults(ri.defaults.unwrap_or(true));
+    ignore.set_auto_gitignore(ri.auto_gitignore.unwrap_or(true));
+    ignore.set_use_global_gitignore(ri.global_gitignore.unwrap_or(false));
+    for name in ri.files.unwrap_or_else(|| vec![".gitignore".to_string()]) {
+        ignore.add_file(&name);
+    }
+    Ok(ignore)
 }
 
 fn merge_tools(raw: RawTools) -> ToolGating {
@@ -2358,6 +2426,70 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cfg.sandbox.scratch_limit_bytes, 2048);
+    }
+
+    // --- ignore policy ([kaish.ignore]) -----------------------------------------
+
+    /// An absent `[kaish]` stanza reproduces the kernel's MCP ignore default exactly:
+    /// `.gitignore` loaded, built-in defaults on, auto-gitignore on, enforced scope.
+    /// So omitting it keeps today's behavior.
+    #[test]
+    fn ignore_default_matches_mcp() {
+        let cfg = Config::builtin();
+        let ig = &cfg.sandbox.ignore;
+        assert_eq!(ig.files(), &[".gitignore"]);
+        assert!(ig.use_defaults());
+        assert!(ig.auto_gitignore());
+        assert!(!ig.use_global_gitignore());
+        assert_eq!(ig.scope(), IgnoreScope::Enforced);
+    }
+
+    /// `[kaish.ignore].files` is the explicit list — extra ignore files reach the
+    /// kernel, and the order is preserved (precedence is later-wins).
+    #[test]
+    fn ignore_files_are_configurable() {
+        let cfg =
+            Config::from_toml_str("[kaish.ignore]\nfiles = [\".gitignore\", \".claudeignore\"]\n")
+                .unwrap();
+        assert_eq!(
+            cfg.sandbox.ignore.files(),
+            &[".gitignore".to_string(), ".claudeignore".to_string()]
+        );
+    }
+
+    /// A partial stanza overrides only the keys it names; the rest keep the MCP
+    /// default. Here `scope = "advisory"` flips scope while `files`/`defaults` stay.
+    #[test]
+    fn ignore_partial_stanza_overrides_only_named_keys() {
+        let cfg = Config::from_toml_str(
+            "[kaish.ignore]\nscope = \"advisory\"\nglobal_gitignore = true\n",
+        )
+        .unwrap();
+        let ig = &cfg.sandbox.ignore;
+        assert_eq!(ig.scope(), IgnoreScope::Advisory);
+        assert!(ig.use_global_gitignore());
+        // Untouched keys keep their mcp defaults.
+        assert_eq!(ig.files(), &[".gitignore"]);
+        assert!(ig.use_defaults());
+        assert!(ig.auto_gitignore());
+    }
+
+    /// An unrecognized `scope` is a loud load error, not a silent fall-back to the
+    /// default — a typo here would otherwise quietly leave `find` unrestricted.
+    #[test]
+    fn an_unknown_ignore_scope_is_a_load_error() {
+        let err = Config::from_toml_str("[kaish.ignore]\nscope = \"strict\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scope"), "got: {err}");
+        assert!(err.contains("enforced"), "got: {err}");
+    }
+
+    /// A typo'd key under `[kaish.ignore]` is a loud load error (deny_unknown_fields),
+    /// not a silently-ignored no-op.
+    #[test]
+    fn an_unknown_ignore_key_is_a_load_error() {
+        assert!(Config::from_toml_str("[kaish.ignore]\nfles = [\".x\"]\n").is_err());
     }
 
     /// A typo'd role key in a cast stanza is a loud load error (deny_unknown_fields).

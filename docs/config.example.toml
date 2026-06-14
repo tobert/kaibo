@@ -120,6 +120,31 @@ scratch_limit_bytes = 67108864
 # disable_builtins = ["rg", "find"]
 
 # ---------------------------------------------------------------------------
+# [kaish.ignore] — which gitignore-format files the file-walking builtins
+# (glob/rg/ls/find — and the orientation repo-map, which rides the same kernel)
+# honor. This is DISCOVERY/NOISE policy, NOT a safety boundary: it changes what the
+# explorer SEES, never what it's allowed to read. Omit the whole stanza to keep the
+# default below (`.gitignore` + built-in defaults, enforced scope) — that's exactly
+# what kaibo does today. Every key is optional; a partial stanza overrides only the
+# keys it names. File-only (no KAIBO_* env).
+# ---------------------------------------------------------------------------
+
+# [kaish.ignore]
+# `files` REPLACES the default [".gitignore"] — to add (say) .claudeignore while
+# keeping .gitignore, list both. Loaded at the root and walked up through ancestors,
+# in precedence order (later wins, rg-style). auto_gitignore (below) still walks
+# root + nested .gitignore files regardless of this list — so dropping ".gitignore"
+# here does NOT disable .gitignore (only stops honoring ANCESTOR .gitignores above
+# the root). To honor .gitignore nowhere, set auto_gitignore = false AND omit it here.
+# files = [".gitignore", ".claudeignore"]
+# defaults         = true       # built-in target/, node_modules/, .git
+# auto_gitignore   = true       # auto-load nested .gitignore files during the walk
+# global_gitignore = false      # also honor the user's global gitignore (excludesFile)
+# scope = "enforced"            # "enforced" = every walker incl. find (guards agent
+                                # context); "advisory" = polite tools only, find stays
+                                # POSIX-unrestricted. A typo here is a load error.
+
+# ---------------------------------------------------------------------------
 # [telemetry] — OpenTelemetry trace export. OFF BY DEFAULT, and that default is
 # load-bearing: kaibo reads private source, and the spans rig emits carry prompts,
 # completions, and source snippets. A default run ships NOTHING. Enabling opens an
@@ -225,13 +250,16 @@ key_optional = true
 # backend in a slot is a load error naming the known backends.
 # ---------------------------------------------------------------------------
 
-# --- The reason casts exist: a chimera — each role on the backend that serves
-#     it best, selected as one name (`cast = "chimera"`). ---
+# --- The reason casts exist: a chimera — mix model FAMILIES across roles, a
+#     different lineage per job, named as one team (`cast = "chimera"`). That's the
+#     whole point: two flavors of one base model give you one opinion in two voices;
+#     a cheap DeepSeek explorer + a strong Claude synth give you mistakes that don't
+#     line up. Cheaper AND more diverse at once. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
-synth    = "claude/claude-sonnet-4-6"       # the voice that answers
-image    = "sd/sdxl-turbo"                  # image gen stays local
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — DeepSeek family
+synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude family
+image    = "sd/sdxl-turbo"                  # image gen stays local — Stable Diffusion
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
 #     the local-default `openai` backend. ---

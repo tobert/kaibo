@@ -6,6 +6,7 @@
 use std::fs;
 
 use kaibo::sandbox::{build_readonly_kernel, build_readonly_kernel_with, run, SandboxConfig};
+use kaish_kernel::IgnoreConfig;
 use tempfile::tempdir;
 
 /// Reads through the sandbox work and see the live project tree.
@@ -324,6 +325,53 @@ async fn scratch_writes_past_the_budget_are_refused() {
     assert!(
         r.ok(),
         "the same write must succeed under the default budget, got {r:?}"
+    );
+}
+
+/// A configured extra ignore file (e.g. `.claudeignore`) hides its matches from the
+/// file-walking builtins the explorer drives — the `[kaish.ignore]` policy reaching
+/// the kernel. Teeth: the *same* tree under the default config (which loads only
+/// `.gitignore`) still lists the file, so it's the configured filter doing the
+/// hiding, not the file being absent or some other guard.
+#[tokio::test(flavor = "current_thread")]
+async fn configured_ignore_file_hides_its_matches() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("keep.txt"), "keep\n").unwrap();
+    fs::write(dir.path().join("secret.txt"), "secret\n").unwrap();
+    // `.claudeignore` isn't honored by git or kaish's defaults — only by config.
+    fs::write(dir.path().join(".claudeignore"), "secret.txt\n").unwrap();
+
+    // Default config: `.claudeignore` is not in the ignore-file list, so the explorer
+    // sees secret.txt.
+    let kernel = build_readonly_kernel(dir.path()).unwrap();
+    let r = run(&kernel, "glob '**/*'").await.unwrap();
+    assert!(r.ok(), "glob should succeed, got {r:?}");
+    assert!(
+        r.text_out().contains("secret.txt"),
+        "default config must list secret.txt (no .claudeignore loaded), got: {:?}",
+        r.text_out()
+    );
+
+    // Configure `.claudeignore` on top of the defaults: secret.txt vanishes, keep.txt
+    // stays.
+    let mut ignore = IgnoreConfig::mcp();
+    ignore.add_file(".claudeignore");
+    let sandbox = SandboxConfig {
+        ignore,
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
+    let r = run(&kernel, "glob '**/*'").await.unwrap();
+    assert!(r.ok(), "glob should succeed, got {r:?}");
+    assert!(
+        !r.text_out().contains("secret.txt"),
+        "configured .claudeignore must hide secret.txt, got: {:?}",
+        r.text_out()
+    );
+    assert!(
+        r.text_out().contains("keep.txt"),
+        "a non-ignored file must still be listed, got: {:?}",
+        r.text_out()
     );
 }
 

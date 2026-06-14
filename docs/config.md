@@ -277,6 +277,11 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |
 | disable extra builtins | `sandbox.disable_builtins` *(list; file-only)* | — | — |
+| ignore files | `kaish.ignore.files` *(list; replaces `[".gitignore"]`; file-only)* | — | — |
+| ignore defaults | `kaish.ignore.defaults` *(default true)* | — | — |
+| auto-load nested .gitignore | `kaish.ignore.auto_gitignore` *(default true)* | — | — |
+| global gitignore | `kaish.ignore.global_gitignore` *(default false)* | — | — |
+| ignore scope | `kaish.ignore.scope` *(`"enforced"` \| `"advisory"`; default `"enforced"`)* | — | — |
 | telemetry on/off | `telemetry.enabled` *(default false)* | `KAIBO_TELEMETRY_ENABLED` | — |
 | OTLP traces endpoint | `telemetry.endpoint` | `KAIBO_TELEMETRY_ENDPOINT` | — |
 | export timeout (s) | `telemetry.timeout_secs` *(must be > 0)* | `KAIBO_TELEMETRY_TIMEOUT_SECS` | — |
@@ -592,6 +597,8 @@ operator) the full picture:
 - `tools` — which tools are currently advertised (`consult`, `explore`,
   `synthesize`, `run_kaish`, `generate_image`)
 - `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins
+- `kaish.ignore` — the resolved ignore policy the file-walking builtins honor:
+  `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope`
 - `defaults` — the global tunables every slot falls back to (rendered so the
   per-slot values below read as deltas against it)
 - `backends` — each connection: its kind, the *resolved* `base_url` (openai kind),

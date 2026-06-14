@@ -42,7 +42,9 @@ use async_trait::async_trait;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{ByteBudget, Filesystem, LocalFs, MemoryFs, VfsRouter};
-use kaish_kernel::{Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig};
+use kaish_kernel::{
+    IgnoreConfig, Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig,
+};
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
 struct Blocked {
@@ -115,12 +117,20 @@ pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
 /// override via `[sandbox].scratch_limit_bytes` (stricter is the usual move).
 pub const DEFAULT_SCRATCH_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Tunable read-only-sandbox limits, set via `[sandbox]` in config.toml.
+/// The resolved kaish-kernel runtime config kaibo hands the kernel builder.
 ///
-/// These can only make the box *stricter* — `disable_builtins` shadow-blocks
-/// additional builtins, and the dangerous axes aren't even compiled in. The
-/// read-only invariant is structural (the mount, MemoryFs, compiled-out axes) and
-/// is not a config knob.
+/// Two distinct concerns travel together because both are consumed at one place
+/// (the kernel build), but they map to *separate* TOML stanzas:
+///
+/// - The **safety/limit** fields come from `[sandbox]`. These can only make the box
+///   *stricter* — `disable_builtins` shadow-blocks additional builtins, and the
+///   dangerous axes aren't even compiled in. The read-only invariant is structural
+///   (the mount, MemoryFs, compiled-out axes) and is *not* a config knob.
+/// - [`SandboxConfig::ignore`] is **discovery/noise** policy from `[kaish.ignore]` —
+///   which gitignore-format files the file-walking builtins (`glob`/`rg`/`ls`/`find`,
+///   and the orientation repo-map that rides the same kernel) honor. It changes what
+///   the explorer *sees*, never what it's *allowed* to read; containment and
+///   read-only are unaffected.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     /// Per-kaish-script wall-clock budget; exceeding it exits 124.
@@ -132,6 +142,10 @@ pub struct SandboxConfig {
     pub scratch_limit_bytes: u64,
     /// Builtins to shadow-block on top of the structural read-only guards.
     pub disable_builtins: Vec<String>,
+    /// Ignore-file policy for the file-walking builtins, sourced from
+    /// `[kaish.ignore]`. Defaults to [`IgnoreConfig::mcp`] (`.gitignore` + built-in
+    /// defaults, enforced scope) so omitting the stanza preserves today's behavior.
+    pub ignore: IgnoreConfig,
 }
 
 impl Default for SandboxConfig {
@@ -141,6 +155,7 @@ impl Default for SandboxConfig {
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             scratch_limit_bytes: DEFAULT_SCRATCH_LIMIT_BYTES,
             disable_builtins: Vec::new(),
+            ignore: IgnoreConfig::mcp(),
         }
     }
 }
@@ -222,11 +237,16 @@ fn build_readonly_kernel_and_vfs(
     // wall clock. Both guards matter for a caller-facing `run_kaish` with no turn cap.
     let mut output_limit = OutputLimitConfig::mcp();
     output_limit.set_limit(Some(sandbox.output_limit_bytes));
+    // `mcp()` already seeds an `.gitignore`-aware filter; override with the resolved
+    // `[kaish.ignore]` policy so configured extra ignore files (`.claudeignore`, …)
+    // and scope/default toggles reach every file-walking builtin — and the
+    // orientation repo-map, which enumerates through this same kernel.
     let config = KernelConfig::mcp()
         .with_cwd(root)
         .with_allow_external_commands(false)
         .with_request_timeout(sandbox.exec_timeout)
-        .with_output_limit(output_limit);
+        .with_output_limit(output_limit)
+        .with_ignore_config(sandbox.ignore.clone());
 
     // `with_backend` ignores config.vfs_mode and routes all non-`/v/*` paths
     // through our read-only backend (the read-only invariant). `configure_tools`

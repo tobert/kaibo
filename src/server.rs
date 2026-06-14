@@ -1202,6 +1202,9 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         tools: ToolsDoc,
         /// Read-only sandbox limits.
         sandbox: SandboxDoc,
+        /// kaish kernel behavior tuning (the `[kaish]` stanza) — currently the
+        /// resolved ignore policy the file-walking builtins honor.
+        kaish: KaishDoc,
         /// The [defaults] tunables every slot falls back to.
         defaults: DefaultsDoc,
         /// OpenTelemetry export state (off by default). Header *names* only — a
@@ -1236,6 +1239,26 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         scratch_limit_bytes: u64,
         /// Builtins shadow-blocked beyond the structural read-only guards.
         disable_builtins: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    struct KaishDoc {
+        ignore: IgnoreDoc,
+    }
+
+    /// The resolved `[kaish.ignore]` policy the file-walking builtins honor.
+    #[derive(Serialize)]
+    struct IgnoreDoc {
+        /// Ignore filenames loaded (root + ancestors), in precedence order.
+        files: Vec<String>,
+        /// Built-in defaults (`target/`, `node_modules/`, `.git`) applied.
+        defaults: bool,
+        /// Nested `.gitignore` files auto-loaded during the walk.
+        auto_gitignore: bool,
+        /// User's global gitignore (`core.excludesFile`) honored.
+        global_gitignore: bool,
+        /// `"enforced"` (all walkers incl. `find`) or `"advisory"` (polite tools only).
+        scope: &'static str,
     }
 
     #[derive(Serialize)]
@@ -1407,6 +1430,7 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
         output_limit_bytes,
         scratch_limit_bytes,
         disable_builtins,
+        ignore,
     } = &config.sandbox;
     let crate::config::Defaults {
         explorer_max_turns,
@@ -1448,6 +1472,18 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
             output_limit_bytes: *output_limit_bytes,
             scratch_limit_bytes: *scratch_limit_bytes,
             disable_builtins: disable_builtins.clone(),
+        },
+        kaish: KaishDoc {
+            ignore: IgnoreDoc {
+                files: ignore.files().to_vec(),
+                defaults: ignore.use_defaults(),
+                auto_gitignore: ignore.auto_gitignore(),
+                global_gitignore: ignore.use_global_gitignore(),
+                scope: match ignore.scope() {
+                    kaish_kernel::IgnoreScope::Enforced => "enforced",
+                    kaish_kernel::IgnoreScope::Advisory => "advisory",
+                },
+            },
         },
         defaults: DefaultsDoc {
             explorer_max_turns: *explorer_max_turns,
