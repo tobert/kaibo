@@ -418,27 +418,24 @@ built-in reproduces it with no per-cast config. Still open, lower value:
   to a file, à la gemini-cli's `GEMINI_WRITE_SYSTEM_MD` — useful now that prompts
   compose per model from `[prompts]`, slot `preamble`, and `[context]`.
 
-### `generate_image` doesn't advertise its cast `enum` yet
-The consultation tools (`consult`/`explore`/`synthesize`) now stamp the live
-usable-cast roster onto their `cast` param as a JSON-Schema `enum` at startup
-(`inject_cast_enum`, `server.rs`), so an agent picking a team reads the menu off
-the schema instead of the truncatable handshake prose — the fix for the "had to
-spelunk `kaibo://config` to find `deepseek`" failure. `generate_image` was left
-out on purpose: its `cast` selects the **`image`** slot (openai-kind only), so the
-right menu is "casts with a usable image slot", not the explorer/synth `usable_casts`
-list — a different filter (`Config::image_capable_casts`, to write). Add it so image
-gen is as discoverable as consultation. Low-risk: the enum is advisory (`call_tool`
-deserializes via serde, which ignores it), so it never rejects a config-only cast.
+### `generate_image` doesn't advertise its cast `enum`
+The consultation tools stamp the usable-cast roster onto their `cast` param as a
+JSON-Schema enum (`inject_cast_enum`, `server.rs`); `generate_image` doesn't. Its
+`cast` selects the **`image`** slot (openai-kind only), so the right menu is a
+different filter — "casts with a usable image slot", not the explorer/synth
+`usable_casts` — i.e. a `Config::image_capable_casts` to write. Add it so image gen
+is as discoverable as consultation. Advisory like the others (serde ignores the enum
+in `call_tool`), so it never rejects a config-only cast.
 
-### Server doesn't report which backends are usable
-Keys are resolved lazily at call time, so a missing key surfaces as a mid-call
-error. Validating available backends at startup (and noting them in the server
-instructions) would fail faster and tell a client what it can actually use — under
-casts this gets more valuable, not less: one dead backend can hole several casts,
-and "cast `chimera` is degraded: backend `sd` unreachable" is a better failure
-than a mid-consult error. For an `openai`-kind backend this means a startup ping
-of its `base_url/models` rather than a key check. This can come along with adding
-an MCP resource for listing models.
+### Server doesn't validate backend health at startup
+Usable *casts* are now advertised — the handshake `## Casts` list and the `cast`
+schema enum (`inject_cast_enum`, `server.rs`) tell a client what teams it can pass.
+The remaining gap is backend *health*: keys resolve lazily at call time and an
+`openai`-kind `base_url` is never pinged, so a present-but-wrong key or a down local
+endpoint still surfaces as a mid-call error. A startup check (key presence + an
+`openai` `base_url/models` ping) would fail faster and, under casts, report degraded
+teams up front — "cast `chimera` is degraded: backend `sd` unreachable" beats a
+mid-consult error. An MCP resource enumerating models could ride along.
 
 ---
 
