@@ -365,9 +365,13 @@ headers = { authorization = "Bearer <token>" }     # file-only; values are secre
 
 What you get is the GenAI trace tree rig already produces — a tool call →
 `run_phase` per phase → `invoke_agent` → a `chat` span per model turn (with
-`gen_ai.request.model` and every `gen_ai.usage.*` token count) → a `tool` span per
-`run_kaish` / delegated `explore′` sweep. kaibo only adds the named parent spans
-(`consult` / `explore` / `synthesize` / `run_kaish`) that root each trace; the
+`gen_ai.request.model` and every `gen_ai.usage.*` token count). On top of that,
+kaibo adds the named parent spans (`consult` / `explore` / `synthesize` /
+`run_kaish`) that root each trace, **and a `tool` span per tool invocation**
+(`tool_span.rs`) carrying `gen_ai.tool.name` and an ok/err `outcome` — so you can
+query *which* tool the model actually called (`run_kaish`, `view_image`, the nested
+`explore′`), not just that a turn happened. rig's own per-tool instrumentation
+isn't reliably queryable across backends, so this is kaibo's, on kaibo's tools. The
 exporter ships the rest. Transport is OTLP/HTTP + protobuf (the `/v1/traces` path),
 reusing kaibo's `reqwest` — no gRPC, no second HTTP stack.
 

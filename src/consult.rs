@@ -46,6 +46,7 @@ use crate::kaish_syntax::kaish_syntax_core;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, SessionStore};
+use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
 /// Splice the operator's house rules (if any) onto a phase preamble. The base
@@ -1353,7 +1354,7 @@ impl Tool for RunExplore {
                 self.max_turns,
                 self.progress.as_ref(),
                 &|| -> Result<Vec<Box<dyn ToolDyn>>> {
-                    Ok(vec![Box::new(RunKaish::with_progress(
+                    Ok(vec![traced(RunKaish::with_progress(
                         KaishWorker::spawn_with(&self.root, self.sandbox.clone())?,
                         self.progress.clone(),
                     ))])
@@ -1400,12 +1401,12 @@ pub async fn explore(
 /// both tools (shared kernel) so a vision phase doesn't spin a second kaish thread.
 fn phase_tools(root: &Path, cfg: &ConsultConfig, vision: bool) -> Result<Vec<Box<dyn ToolDyn>>> {
     let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
-    let mut tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(RunKaish::with_progress(
+    let mut tools: Vec<Box<dyn ToolDyn>> = vec![traced(RunKaish::with_progress(
         worker.clone(),
         cfg.progress.clone(),
     ))];
     if vision {
-        tools.push(Box::new(ViewImage::new(worker, root.to_path_buf())));
+        tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     Ok(tools)
 }
@@ -1585,17 +1586,17 @@ fn consult_tools(
         explorer_preamble,
     );
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
-        Box::new(RunKaish::with_progress(
+        traced(RunKaish::with_progress(
             worker.clone(),
             cfg.progress.clone(),
         )),
-        Box::new(explore),
+        traced(explore),
     ];
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
     if synth_vision {
-        tools.push(Box::new(ViewImage::new(worker, root.to_path_buf())));
+        tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     Ok(tools)
 }
