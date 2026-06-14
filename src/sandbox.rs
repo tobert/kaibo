@@ -293,6 +293,43 @@ impl KaishOutput {
     pub fn ok(&self) -> bool {
         self.code == 0
     }
+
+    /// Flatten one [`ExecResult`] into the `Send` snapshot the worker ships back.
+    ///
+    /// A text result passes through verbatim. A **binary** result — kaish 0.8.3's
+    /// binary-aware builtins (`cat` of a non-UTF-8 file, `dd` without `of=`) now
+    /// carry a `Bytes` payload — is the trap: [`ExecResult::text_out`] would
+    /// lossy-decode those bytes to mojibake (U+FFFD replacement chars) and hand the
+    /// model silent garbage with exit 0. We refuse that corruption: stdout stays
+    /// empty and stderr carries an actionable note (byte count + the two real outs —
+    /// `view_image` for an image, base64/xxd/redirect for anything else). A pipeline
+    /// that *ends* in text (`cat blob | base64`) is a text result and never lands here.
+    pub fn from_result(r: &ExecResult) -> Self {
+        if let Some(bytes) = r.out_bytes() {
+            let mut stderr = format!(
+                "output is binary ({} bytes), not text — kaibo won't lossy-decode it. \
+                 For an image, call view_image with the path; otherwise pipe through \
+                 base64 (or xxd), or redirect to a file.",
+                bytes.len()
+            );
+            // Preserve any real stderr the script also emitted (rare alongside a
+            // binary success, but never drop it).
+            if !r.err.is_empty() {
+                stderr.push('\n');
+                stderr.push_str(&r.err);
+            }
+            return Self {
+                code: r.code,
+                stdout: String::new(),
+                stderr,
+            };
+        }
+        Self {
+            code: r.code,
+            stdout: r.text_out().into_owned(),
+            stderr: r.err.clone(),
+        }
+    }
 }
 
 /// A long-lived, read-only kaish kernel pinned to its own thread.
@@ -380,11 +417,7 @@ impl KaishWorker {
                         match job {
                             Job::Run { script, reply } => {
                                 let out = match run(&kernel, &script).await {
-                                    Ok(r) => KaishOutput {
-                                        code: r.code,
-                                        stdout: r.text_out().into_owned(),
-                                        stderr: r.err.clone(),
-                                    },
+                                    Ok(r) => KaishOutput::from_result(&r),
                                     Err(e) => KaishOutput {
                                         code: -1,
                                         stdout: String::new(),
