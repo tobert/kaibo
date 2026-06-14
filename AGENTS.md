@@ -43,11 +43,16 @@ commands.
 
 ## Invariants — do not weaken without a failing-first test
 
-- **Read-only is the product.** Enforced in `src/sandbox.rs` by four levers: a
-  read-only mount, `MemoryFs` at `/`, external commands disabled, and a `DENYLIST`
-  of builtins that reach real state *directly* and bypass the mount (git, touch,
-  spawn, exec, kill, mktemp — see the module doc-comment). Any change here keeps
-  `tests/sandbox.rs` green and adds a test that can fail. Read-*scope* is also
+- **Read-only is the product.** Enforced in `src/sandbox.rs` by four *structural*
+  levers — there is no hardcoded denylist: (0) a minimal feature surface (only the
+  `localfs` axis; `subprocess`/`git`/`host`/`os-integration` are OFF, so
+  `exec`/`spawn`/`kill`/`git`/`ps` are never compiled in), (1) a read-only mount
+  (every write/delete/`mkdir`/`touch`/`dd of=` is refused at the VFS layer), (2)
+  `MemoryFs` at `/` (paths outside the project land in ephemeral scratch, never on
+  disk), and (3) external commands disabled. The `Blocked` wrapper survives only for
+  the config-driven `[sandbox].disable_builtins`, which can make the box *stricter* —
+  see the module doc-comment. Any change here keeps `tests/sandbox.rs` green and adds
+  a test that can fail. Read-*scope* is also
   bounded: every call's path must canonicalize (symlinks, `..` resolved) into the
   allowed set (`--root` / `--allow-path`, launch cwd when unset), enforced in
   `server.rs::resolve_root` with tests in `tests/containment.rs`.
@@ -66,7 +71,8 @@ commands.
 ## Working here
 
 - **TDD.** Tests that can and will fail. The sandbox boundary gets failing-first
-  tests — and we prove they have teeth (empty the `DENYLIST`, watch them fail).
+  tests — and we prove they have teeth (mount the project writable with
+  `LocalFs::new` instead of `read_only`, watch the write-denial tests fail).
 - **Model loops are tested offline.** A scripted `CompletionClient` in
   `src/test_support.rs` (`#[cfg(test)]`) drives the *real* consult loop with no
   network — delegation→report aggregation, session replay, turn-cap recovery. It's

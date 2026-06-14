@@ -5,7 +5,7 @@
 
 use std::fs;
 
-use kaibo::sandbox::{SandboxConfig, build_readonly_kernel, build_readonly_kernel_with, run};
+use kaibo::sandbox::{build_readonly_kernel, build_readonly_kernel_with, run, SandboxConfig};
 use tempfile::tempdir;
 
 /// Reads through the sandbox work and see the live project tree.
@@ -81,6 +81,45 @@ async fn writes_into_project_do_not_touch_disk() {
     assert!(
         !target.exists(),
         "a redirect into the read-only project must not create a real file"
+    );
+}
+
+/// `dd` arrived in kaish 0.8.2/0.8.3 as a new write-capable builtin (`of=` copies
+/// bytes into a target). It writes through the VFS `WriteMode`, so the read-only
+/// project mount must refuse `of=` into the tree exactly like a redirect — the
+/// write path is structural, not builtin-specific. Read the input from a real
+/// project file (the read-only mount allows reads) and try to copy it next to
+/// itself. Teeth: mount the project writable and `of=` lands a real file, so this
+/// assertion is the only thing the read-only mount is buying.
+#[tokio::test(flavor = "current_thread")]
+async fn dd_cannot_write_into_the_project() {
+    let dir = tempfile::Builder::new()
+        .prefix("kaibo-dd")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("src.bin");
+    fs::write(&src, b"sixteen-byte-pad").unwrap();
+
+    let kernel = build_readonly_kernel(dir.path()).unwrap();
+    let target = dir.path().join("copy.bin");
+    let script = format!(
+        "dd if={} of={} bs=16 count=1",
+        src.display(),
+        target.display()
+    );
+    let r = run(&kernel, &script).await.unwrap();
+
+    assert!(
+        !r.ok(),
+        "dd of= into the read-only project must be refused, got {r:?}"
+    );
+    assert!(
+        r.err.contains("read-only"),
+        "the refusal should cite the read-only mount, got {r:?}"
+    );
+    assert!(
+        !target.exists(),
+        "dd must not create a real file in the read-only project"
     );
 }
 

@@ -269,10 +269,12 @@ call; plain script execution keeps the tight 30s. Mechanism question answered
 timer task sleeps the whole duration and fires the cancel token (kaish
 `kernel.rs:1511,1618-1625`); `ExecuteOptions.timeout` resizes per-script but
 nothing can suspend it mid-script, so this *does* need a kaish-kernel seam.
-Design recorded in kaish `docs/issues.md` ("Watchdog seam: a per-builtin
-'patient' budget", targets 0.8.2): movable deadline + RAII `ctx.patient(budget)`
-guard on `ToolCtx`, cancel surface stays live while suspended. kaibo's half
-waits on that release. Lands *before or with* the first production builtin;
+The upstream seam **shipped** (kaish 0.8.2/0.8.3): `ctx.patient(budget) ->
+PatientGuard` on `ToolCtx` (kaish `watchdog.rs`, a `timeout` builtin), a movable
+deadline whose cancel surface stays live while suspended. So the blocker is
+cleared — but kaibo has no in-kernel model-backed builtin to wire it onto yet
+(production capabilities ship as MCP tools, not kaish builtins). kaibo's half
+lands *before or with* the first production builtin;
 failing-first test: a builtin that sleeps past 30s but under its own budget
 completes, while a pure-script spin still dies at 30s.
 
