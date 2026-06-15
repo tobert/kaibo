@@ -1277,9 +1277,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85388674cd5438f7af7105613e776f3cd454f9d35925c15f836eb35728898b76"
+checksum = "5d7789b337d2dca16dbd62f5c6b52b5c59d35037200156cf78d0a3ee29d81fcc"
 dependencies = [
  "async-trait",
  "ignore",
@@ -1288,18 +1288,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "861618aad1a9a08a7ee50ad1120f09c8102467eb3eaa159019d6afd230b707ff"
+checksum = "3b3e7a2f81430be4ab7046f7b24654fa38e9fc19ad33d6de7552b90936e8fcb1"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dd794dd8d6b362aee38407092e736b9f78b422a67d5d3d2f096ddb0261c40c2"
+checksum = "478d843786658d8d8e6c51956b04eb5530a40434de613f863b222ef092f269e2"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1343,9 +1343,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "644559df8d50d73ae6325f0835c4aab07d82b8ad45be9ae7d2564ebecd0a44ca"
+checksum = "fc465058212ca30a396eb07b4eb7d82720ccaa1a82dc92c029766bf7dda8c8af"
 dependencies = [
  "async-trait",
  "clap",
@@ -1354,9 +1354,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf1d62730da2995fdd0fed59aace0e8a2f127473afdc15fa6c0c8cb110db2952"
+checksum = "3e8a3f6c4f583ceaa89c8b0486db6d7982f388f34da12c5715b73fd141e8c870"
 dependencies = [
  "base64",
  "serde",
@@ -1367,9 +1367,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb406969e8974e34c2f325b378c2a79d70b3cd43ffcca1e210827636323e4611"
+checksum = "a16e1f4189ba8719f8ac37dc21a21c502ce3e9c1c48aaee0a17b47e42b46939b"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
