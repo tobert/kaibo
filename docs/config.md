@@ -572,19 +572,27 @@ would then reject, so an omitted `path` there stays an error.
 ```toml
 # config.toml
 [server]
-allow_paths = ["/home/atobey/shared-libs", "/data/fixtures"]
+allow_paths = ["~/src", "/data/fixtures"]
 ```
 
 ```sh
 # env — colon-separated like PATH
-KAIBO_ALLOW_PATHS=/home/atobey/shared-libs:/data/fixtures kaibo
+KAIBO_ALLOW_PATHS=~/src:/data/fixtures kaibo
 
 # CLI — repeatable
-kaibo --allow-path /home/atobey/shared-libs --allow-path /data/fixtures
+kaibo --allow-path ~/src --allow-path /data/fixtures
 ```
 
 A non-empty CLI `--allow-path` set replaces the env/file layer entirely (same
 precedence rule as `--root`). To lift all limits: `--allow-path /`.
+
+**Set it once.** Putting your whole workspace tree in `allow_paths`
+(`["~/src"]`) means every project under it is in-bounds, and because the client's
+cwd/workspace lands inside that tree, kaibo infers it as the [default root](#path-containment)
+automatically — so you configure access once and never pass `path` per call. A
+leading `~` in `root` / `allow_paths` expands to `$HOME` (file and env layers), the
+same as key files and `[context]` paths; the CLI relies on your shell's own
+expansion. Other paths are taken as written.
 
 **When defaulting does *not* happen.** If `--allow-path` is set to a tree that does
 not contain the launch cwd and no `--root` is given, there is no default root: the

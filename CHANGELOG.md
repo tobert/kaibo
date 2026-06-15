@@ -49,6 +49,11 @@ the git log. Each later release appends a new section at the top.
   and still land on the project. The scope handshake and `kaibo://config` tag the
   root as inferred. An `--allow-path` that excludes the cwd leaves no default root —
   kaibo never defaults to a path its own containment check would reject.
+- **`~` expands in `[server] root` and `allow_paths`** (config-file and `KAIBO_*`
+  env layers), matching the tilde handling key files and `[context]` paths already
+  get. Set `allow_paths = ["~/src"]` once and every project under it is in-bounds —
+  with cwd inferred as the default root, you stop thinking about `path` entirely.
+  (Previously a literal `~` was taken verbatim and failed canonicalization at startup.)
 - **Per-tool gating.** Each tool has a `--no-<tool>` flag (all on by default); an
   all-off server is refused at startup.
 - **Operator ignore files** via a `[kaish.ignore]` config stanza.

@@ -939,12 +939,16 @@ impl Config {
         let tools = merge_tools(server.tools.unwrap_or_default());
         let default_cast = server.cast.unwrap_or_else(|| "anthropic".to_string());
         let log = server.log.unwrap_or_else(|| "kaibo=info".to_string());
-        let root = server.root.map(PathBuf::from);
+        // Tilde-expand `root` and `allow_paths` (file *and* env layers both land here
+        // as strings), so a hand-edited `~/src` resolves to `$HOME/src` like key files
+        // and `[context]` paths already do — rather than a literal `~` that fails
+        // canonicalization at startup. Absolute/relative paths pass through unchanged.
+        let root = server.root.as_deref().map(expand_tilde);
         let allow_paths = server
             .allow_paths
             .unwrap_or_default()
-            .into_iter()
-            .map(PathBuf::from)
+            .iter()
+            .map(|s| expand_tilde(s))
             .collect();
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default());
