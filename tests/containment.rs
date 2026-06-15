@@ -146,6 +146,13 @@ async fn omitted_path_with_root_set_uses_root() {
     config.allow_paths = vec![];
     let handler = KaiboHandler::new(config).expect("handler builds");
 
+    // An explicit --root is the default root, and is NOT tagged inferred — guards
+    // against the `(Some(root), false)` arm accidentally flipping to `true`.
+    assert!(
+        !handler.default_root_inferred(),
+        "an explicit --root must not be marked inferred"
+    );
+
     let out = handler
         .run_kaish(Parameters(RunKaishInput {
             script: "cat hello.txt".to_string(),
@@ -279,6 +286,35 @@ async fn omitted_path_with_allow_path_excluding_cwd_still_errors() {
         err_str.contains("path") || err_str.contains("root") || err_str.contains("parameter"),
         "omitted path must produce a parameter-flavored error, got: {err_str}"
     );
+}
+
+// --- (f3) cwd is an *ancestor* of the only allow-path: no default root --------
+
+/// When the only `--allow-path` is a *descendant* of the launch cwd (so cwd is an
+/// ancestor of the boundary, not inside it), the cwd must NOT be adopted as the
+/// default root: `cwd.starts_with(allow_path)` is false, so cwd is above the boundary
+/// and resolving to it would escape the allowed set. This pins the ancestor-vs-
+/// descendant semantic distinctly from the sibling case in (f2).
+#[tokio::test]
+async fn omitted_path_with_cwd_ancestor_of_allow_path_has_no_default_root() {
+    // Create the allow-path *inside* the crate cwd so cwd is its ancestor. (tempdir's
+    // usual /tmp location would be a sibling, exercising a different branch.)
+    let sub = tempfile::tempdir_in(".").expect("tempdir under cwd");
+    let handler = handler_with_allowed(None, &[sub.path()]);
+
+    assert!(
+        handler.default_root().is_none(),
+        "cwd as an ancestor of the allow-path is outside the boundary; no default root"
+    );
+    assert!(!handler.default_root_inferred());
+
+    handler
+        .run_kaish(Parameters(RunKaishInput {
+            script: "ls".to_string(),
+            path: None,
+        }))
+        .await
+        .expect_err("omitted path with no default root must be a parameter error");
 }
 
 // --- (h) empty-string path is rejected as invalid_params --------------------

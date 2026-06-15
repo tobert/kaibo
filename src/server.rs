@@ -418,9 +418,14 @@ impl KaiboHandler {
                 let cwd_canon = std::fs::canonicalize(&cwd)
                     .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
                 if allowed.is_empty() {
-                    // Zero config: the workspace is the whole boundary.
+                    // Zero config: the workspace is the whole boundary. Push it here,
+                    // *before* the guard below, so the `starts_with` check sees it and
+                    // adopts cwd as the default root in the zero-config case.
                     allowed.push(cwd_canon.clone());
                 }
+                // Mirror `resolve_root`'s containment check (step 3): only adopt cwd
+                // when it falls inside the allowed set, so we never default to a path
+                // the call-time check would reject.
                 if allowed.iter().any(|tree| cwd_canon.starts_with(tree)) {
                     (Some(cwd_canon), true)
                 } else {
