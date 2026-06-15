@@ -116,11 +116,16 @@ pub fn kaibo_instructions(schemas: &[ToolSchema]) -> String {
 fn kaibo_lead() -> &'static str {
     "kaibo (解剖) — ask a question about a codebase and get a grounded, cited \
      answer. kaibo reads the project READ-ONLY through a kaish shell and never \
-     modifies files or runs external commands. Tools: `consult` (capable model, \
-     reads spans and delegates broad sweeps), `explore` (fast curated report), \
-     `synthesize` (capable model over optional context), and `run_kaish` (drive \
-     the shell directly). Each is gated independently, so a given server may \
-     advertise only some."
+     modifies files or runs external commands. It finds and reads the relevant, \
+     current code itself — point it at a project and say what you did or want to \
+     know (what you changed and why, the behavior in question); it locates the \
+     spans. You don't need to paste files or a diff: prose about your intent is \
+     worth more than a dump kaibo would just re-read from disk. Reach for \
+     `consult` first — a capable model investigates and hands back the answer, \
+     not the transcript. kaibo also exposes more focused tools (a fast \
+     `explore`, a `synthesize` seam, and `run_kaish` to drive the shell \
+     yourself), each gated independently and described in its own schema, so a \
+     given server may advertise only some."
 }
 
 /// The kaish onboarding spine — the mental model, operating contract, live builtin
@@ -389,6 +394,31 @@ mod tests {
     #[test]
     fn the_tool_description_is_the_core() {
         assert_eq!(run_kaish_tool_description(), kaish_syntax_core());
+    }
+
+    #[test]
+    fn lead_steers_callers_to_describe_intent_not_paste_a_diff() {
+        // The handshake must teach the client agent that kaibo reads the real code
+        // itself, so it should say what it did rather than dump a diff. If this
+        // framing is ever dropped, callers fall back to pasting source kaibo would
+        // only re-read from disk — catch that here.
+        let lead = kaibo_lead().to_lowercase();
+        assert!(
+            lead.contains("diff"),
+            "lead must steer callers away from pasting a diff:\n{}",
+            kaibo_lead()
+        );
+        assert!(
+            lead.contains("reads the relevant"),
+            "lead must say kaibo finds and reads the code itself:\n{}",
+            kaibo_lead()
+        );
+        // consult is the tool to reach for first; the others surface via schema.
+        assert!(
+            lead.contains("reach for `consult` first"),
+            "lead must foreground `consult` as the first reach:\n{}",
+            kaibo_lead()
+        );
     }
 
     #[test]

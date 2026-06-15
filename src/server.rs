@@ -108,7 +108,10 @@ impl ToolGating {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConsultInput {
-    /// The question to investigate about the project.
+    /// The question to investigate about the project. Say what you did or want to
+    /// know in prose — what you changed and why, the behavior you're asking about.
+    /// kaibo locates and reads the real, current code itself, so describing your
+    /// intent beats pasting a diff or a file dump it would only re-read from disk.
     pub question: String,
 
     /// Absolute path to the project to explore. Optional when the server has a
@@ -754,10 +757,15 @@ impl KaiboHandler {
             cited answer. A capable model drives a read-only kaish shell \
             (cat/grep/rg/find/jq/pipelines): it reads precise spans directly and \
             delegates broad repo sweeps to a fast explorer sub-agent, then answers \
-            from what they find with concrete `file:line` citations. Read-only: it \
-            never modifies the project. For a multi-turn conversation, pass a stable \
-            session_id: kaibo replays that session's prior question/answer pairs as \
-            context (the exploration still runs fresh each turn). Args: question \
+            from what they find with concrete `file:line` citations. It finds and \
+            reads the relevant code itself — describe what you did or want to know \
+            (what you changed and why, the behavior in question) in prose; don't \
+            paste a diff or dump files, kaibo reads the real, current source from \
+            disk and your intent is the part it can't recover on its own. \
+            Read-only: it never modifies the project. For a multi-turn \
+            conversation, pass a stable session_id: kaibo replays that session's \
+            prior question/answer pairs as context (the exploration still runs \
+            fresh each turn). Args: question \
             (required), path (project dir; optional if the server has a default root), \
             cast (optional; pick from the `cast` enum of teams live right now, or \
             see `kaibo://config`), session_id (optional; opaque conversation key), \
