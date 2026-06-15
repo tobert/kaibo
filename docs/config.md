@@ -543,7 +543,7 @@ per-tool `tool` spans (see Telemetry).
 
 ## Path containment
 
-**Always on.** Every tool call's `path` argument (or the server `--root` when `path`
+**Always on.** Every tool call's `path` argument (or the default root when `path`
 is omitted) is resolved — `std::fs::canonicalize` expands symlinks and collapses `..`
 — and then checked against the **allowed set**. A path that doesn't fall at-or-under
 one of the allowed trees is `invalid_params`, naming the allowed trees and the three
@@ -557,29 +557,49 @@ action. The default isn't silent: the resolved allowed set is reported in a star
 log line and in the `## Scope` section of the server's MCP `instructions` (visible in
 every `initialize` response), and at `kaibo://config`.
 
+**The default root** is what a call resolves to when it omits `path`: an explicit
+`--root`, or — when none is set — the launch cwd, *inferred* whenever it falls inside
+the allowed set (it always does in the zero-config case, since the cwd is the whole
+allowed set). So the common single-workspace case needs no `--root`: kaibo already
+knows the workspace from its cwd and uses it for both bounding and defaulting. The
+inferred case is labelled as such in the `## Scope` handshake and at `kaibo://config`
+(`default_root_inferred`). The one gap: an `--allow-path` that *excludes* the cwd
+leaves no default root — kaibo never defaults to a path its own containment check
+would then reject, so an omitted `path` there stays an error.
+
 **Widening the boundary:**
 
 ```toml
 # config.toml
 [server]
-allow_paths = ["/home/atobey/shared-libs", "/data/fixtures"]
+allow_paths = ["~/src", "/data/fixtures"]
 ```
 
 ```sh
 # env — colon-separated like PATH
-KAIBO_ALLOW_PATHS=/home/atobey/shared-libs:/data/fixtures kaibo
+KAIBO_ALLOW_PATHS=~/src:/data/fixtures kaibo
 
 # CLI — repeatable
-kaibo --allow-path /home/atobey/shared-libs --allow-path /data/fixtures
+kaibo --allow-path ~/src --allow-path /data/fixtures
 ```
 
 A non-empty CLI `--allow-path` set replaces the env/file layer entirely (same
 precedence rule as `--root`). To lift all limits: `--allow-path /`.
 
-**Containment ≠ defaulting.** With no `--root`, an omitted `path` still errors
-("no `path` provided and the server has no default `--root`") — the launch cwd
-bounds what you *may ask about*, it never becomes what you *asked about*. The error
-is `invalid_params`, surfaced where the caller can read it.
+**Set it once.** Putting your whole workspace tree in `allow_paths`
+(`["~/src"]`) means every project under it is in-bounds, and because the client's
+cwd/workspace lands inside that tree, kaibo infers it as the [default root](#path-containment)
+automatically — so you configure access once and never pass `path` per call. A
+leading `~` in `root` / `allow_paths` expands to `$HOME` (file and env layers), the
+same as key files and `[context]` paths; the CLI relies on your shell's own
+expansion. Other paths are taken as written.
+
+**When defaulting does *not* happen.** If `--allow-path` is set to a tree that does
+not contain the launch cwd and no `--root` is given, there is no default root: the
+cwd is outside the boundary, so adopting it would point the default at a path
+containment rejects. An omitted `path` then errors ("no `path` provided and the
+server has no default root …") — `invalid_params`, surfaced where the caller can read
+it. Pass an explicit `--root` (inside an allowed tree) to restore a default.
 
 **Resolution.** `resolve_root` (`src/server.rs`) returns the *canonicalized* path,
 so the kaish VFS mount target is always resolved. A nonexistent or non-directory

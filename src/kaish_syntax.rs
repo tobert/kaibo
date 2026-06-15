@@ -15,7 +15,7 @@
 //! progressively learn more kaish — syntax, scatter, the builtin index, a single
 //! builtin's parameters — without spending a tool turn.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use kaish_kernel::help::{
@@ -261,6 +261,8 @@ pub fn kaibo_instructions_with_scope(
     schemas: &[ToolSchema],
     config: &Config,
     allowed_set: &[PathBuf],
+    default_root: Option<&Path>,
+    default_root_inferred: bool,
     usability: CastUsability,
     usable_casts: &[(String, CastUsability)],
 ) -> String {
@@ -276,8 +278,14 @@ pub fn kaibo_instructions_with_scope(
     let casts = casts_section(&config.default_cast, usable_casts);
     let reference = kaish_reference(schemas);
 
-    // Scope section: always accurate, never ambiguous.
-    let root_line = match &config.root {
+    // Scope section: always accurate, never ambiguous. Report the *effective* default
+    // root (an explicit `--root`, or the launch cwd kaibo inferred), and tag the
+    // inferred case so the caller can tell it wasn't configured by hand.
+    let root_line = match default_root {
+        Some(r) if default_root_inferred => format!(
+            "- **Default root:** `{}` (inferred from launch cwd — a call may omit `path`)",
+            r.display()
+        ),
         Some(r) => format!("- **Default root:** `{}`", r.display()),
         None => "- **Default root:** none — every call must pass a `path` argument.".to_string(),
     };
@@ -429,6 +437,8 @@ mod tests {
             &[],
             &config,
             &[PathBuf::from("/tmp")],
+            None,
+            false,
             CastUsability::Unconfigured,
             &[],
         );
@@ -471,6 +481,8 @@ mod tests {
                 &[],
                 &config,
                 &[PathBuf::from("/tmp")],
+                None,
+                false,
                 usability,
                 &[],
             );
@@ -498,6 +510,8 @@ mod tests {
             &[],
             &config,
             &[PathBuf::from("/tmp")],
+            None,
+            false,
             CastUsability::Ready,
             &usable,
         );
@@ -542,6 +556,8 @@ mod tests {
             &sample_schemas_for_ordering(),
             &config,
             &[PathBuf::from("/tmp")],
+            None,
+            false,
             CastUsability::Ready,
             &usable,
         );
