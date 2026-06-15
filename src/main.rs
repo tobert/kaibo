@@ -35,7 +35,10 @@ struct Args {
     /// Default project root to explore when a call omits `path`. Also joins the
     /// containment allowed set: a call's `path` must resolve to at-or-under --root
     /// or one of the --allow-path trees. With neither flag the allowed set defaults
-    /// to the launch cwd (MCP clients start stdio servers with cwd = workspace).
+    /// to the launch cwd (MCP clients start stdio servers with cwd = workspace), and
+    /// that cwd is also adopted as the inferred default root — so a call may omit
+    /// `path` without configuring anything. (An --allow-path that excludes the cwd
+    /// leaves no default root, since we never default to a path containment rejects.)
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 

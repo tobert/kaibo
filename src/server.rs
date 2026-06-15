@@ -3,7 +3,7 @@
 //! stdio only — like kaish-mcp, kaibo must never bind a socket: it can read a
 //! user's filesystem, so the transport pipe is the security boundary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -111,8 +111,9 @@ pub struct ConsultInput {
     /// The question to investigate about the project.
     pub question: String,
 
-    /// Absolute path to the project to explore. Optional only if the server was
-    /// launched with a default `--root`. Must be at-or-under an allowed tree; see
+    /// Absolute path to the project to explore. Optional when the server has a
+    /// default root — an explicit `--root`, or the launch cwd inferred when it's
+    /// inside the allowed set. Must be at-or-under an allowed tree; see
     /// `kaibo://config` for the server's current allowed set and how to widen it.
     #[serde(default)]
     pub path: Option<String>,
@@ -181,8 +182,9 @@ pub struct ExploreInput {
     /// The question to investigate about the project.
     pub question: String,
 
-    /// Absolute path to the project. Optional only if the server was launched
-    /// with a default `--root`. Must be at-or-under an allowed tree; see
+    /// Absolute path to the project. Optional when the server has a default root
+    /// — an explicit `--root`, or the launch cwd inferred when it's inside the
+    /// allowed set. Must be at-or-under an allowed tree; see
     /// `kaibo://config` for the server's current allowed set and how to widen it.
     #[serde(default)]
     pub path: Option<String>,
@@ -222,8 +224,9 @@ pub struct SynthesizeInput {
     #[serde(default)]
     pub context: Option<String>,
 
-    /// Absolute path to the project. Optional only if the server was launched
-    /// with a default `--root`. Must be at-or-under an allowed tree; see
+    /// Absolute path to the project. Optional when the server has a default root
+    /// — an explicit `--root`, or the launch cwd inferred when it's inside the
+    /// allowed set. Must be at-or-under an allowed tree; see
     /// `kaibo://config` for the server's current allowed set and how to widen it.
     #[serde(default)]
     pub path: Option<String>,
@@ -254,8 +257,9 @@ pub struct RunKaishInput {
     /// The kaish (sh-like) script to run against the read-only project.
     pub script: String,
 
-    /// Absolute path to the project. Optional only if the server was launched
-    /// with a default `--root`. Must be at-or-under an allowed tree; see
+    /// Absolute path to the project. Optional when the server has a default root
+    /// — an explicit `--root`, or the launch cwd inferred when it's inside the
+    /// allowed set. Must be at-or-under an allowed tree; see
     /// `kaibo://config` for the server's current allowed set and how to widen it.
     /// Each call starts at this root — there is no persistent cwd across calls.
     #[serde(default)]
@@ -287,6 +291,16 @@ pub struct KaiboHandler {
     /// config.allow_paths; falls back to the canonicalized cwd when both are empty.
     /// `Arc` because rmcp clones the handler per request.
     allowed_set: Arc<Vec<PathBuf>>,
+    /// The effective default root a call uses when it omits `path` — the explicit
+    /// `--root`/config value, or the launch cwd inferred when it falls inside the
+    /// allowed set. Canonicalized. `None` only when no root was configured *and* the
+    /// cwd is outside the allowed set (an `--allow-path` that excludes the cwd), in
+    /// which case an omitted `path` stays a parameter error. `Arc` for cheap clone.
+    default_root: Arc<Option<PathBuf>>,
+    /// True when [`Self::default_root`] was inferred from the launch cwd rather than
+    /// configured explicitly. Surfaced as "(inferred from launch cwd)" in the scope
+    /// section and `kaibo://config` so the boundary stays legible.
+    default_root_inferred: bool,
 }
 
 /// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
@@ -366,13 +380,17 @@ impl KaiboHandler {
         // so `resolve_root`'s Path::starts_with check is sound (symlinks resolved,
         // `..` collapsed). A nonexistent path can't bound anything — loud error.
         let mut allowed: Vec<PathBuf> = Vec::new();
+        // The explicit default root, if `--root` was configured — canonicalized so it
+        // doubles as both an allowed tree and the call's default root.
+        let mut explicit_root: Option<PathBuf> = None;
         if let Some(root) = &config.root {
             let canon = std::fs::canonicalize(root)
                 .with_context(|| format!("canonicalizing --root {}", root.display()))?;
             if !canon.is_dir() {
                 anyhow::bail!("--root {} is not a directory", canon.display());
             }
-            allowed.push(canon);
+            allowed.push(canon.clone());
+            explicit_root = Some(canon);
         }
         for p in &config.allow_paths {
             let canon = std::fs::canonicalize(p)
@@ -382,16 +400,34 @@ impl KaiboHandler {
             }
             allowed.push(canon);
         }
-        // When no root and no allow_paths are given, fall back to the launch cwd.
-        // MCP clients start stdio servers with cwd = workspace, so the zero-config
-        // case scopes itself to the project naturally.
-        if allowed.is_empty() {
-            let cwd = std::env::current_dir()
-                .context("could not determine current directory for default allowed set")?;
-            let canon = std::fs::canonicalize(&cwd)
-                .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
-            allowed.push(canon);
-        }
+
+        // Resolve the default root and the allowed-set cwd fallback together. With an
+        // explicit `--root`, that is the default root and no cwd is consulted. Without
+        // one, the launch cwd does double duty: MCP clients start stdio servers with
+        // cwd = workspace, so it is both the zero-config allowed tree *and* the natural
+        // default root — adopt it as the inferred default root whenever it falls inside
+        // the allowed set, so a call may omit `path` in the common single-workspace
+        // case. We never adopt a cwd the containment check would then reject (an
+        // `--allow-path` that excludes the cwd leaves the default root unset, and an
+        // omitted `path` stays a parameter error).
+        let (default_root, default_root_inferred): (Option<PathBuf>, bool) = match explicit_root {
+            Some(root) => (Some(root), false),
+            None => {
+                let cwd = std::env::current_dir()
+                    .context("could not determine current directory for the default root")?;
+                let cwd_canon = std::fs::canonicalize(&cwd)
+                    .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
+                if allowed.is_empty() {
+                    // Zero config: the workspace is the whole boundary.
+                    allowed.push(cwd_canon.clone());
+                }
+                if allowed.iter().any(|tree| cwd_canon.starts_with(tree)) {
+                    (Some(cwd_canon), true)
+                } else {
+                    (None, false)
+                }
+            }
+        };
 
         // Stamp the live cast roster onto the consultation tools' `cast` param as a
         // JSON-Schema `enum`, so an agent choosing a team reads the menu off the tool
@@ -413,6 +449,8 @@ impl KaiboHandler {
             sessions,
             mcp_log_level: Arc::new(AtomicU8::new(mcp_log::rank(mcp_log::DEFAULT_LEVEL))),
             allowed_set: Arc::new(allowed),
+            default_root: Arc::new(default_root),
+            default_root_inferred,
         })
     }
 
@@ -448,11 +486,26 @@ impl KaiboHandler {
         (*self.allowed_set).clone()
     }
 
+    /// The effective default root — what a call resolves to when it omits `path`.
+    /// The explicit `--root`/config value, or the launch cwd when it was inferred
+    /// (see [`Self::default_root_inferred`]); `None` when neither applies. Exposed
+    /// for tests and the `kaibo://config` resource.
+    pub fn default_root(&self) -> Option<PathBuf> {
+        (*self.default_root).clone()
+    }
+
+    /// Whether [`Self::default_root`] was inferred from the launch cwd rather than
+    /// configured explicitly.
+    pub fn default_root_inferred(&self) -> bool {
+        self.default_root_inferred
+    }
+
     /// Resolve a call's project root with containment enforcement:
     ///
-    /// 1. Select the raw path: the explicit `path` arg, else the server's `--root`.
-    ///    An omitted `path` with no `--root` is a parameter error — not a silent
-    ///    default (containment does not change this existing behavior).
+    /// 1. Select the raw path: the explicit `path` arg, else the effective default
+    ///    root (an explicit `--root`, or the launch cwd inferred when it falls inside
+    ///    the allowed set). An omitted `path` with no default root is a parameter
+    ///    error — not a silent default.
     /// 2. Canonicalize the selected path (resolves symlinks and `..`). A path that
     ///    doesn't exist is `invalid_params` with the canonicalize error.
     /// 3. Require the canonicalized path to be at-or-under one of the allowed trees.
@@ -461,12 +514,17 @@ impl KaiboHandler {
     ///
     /// Returns the CANONICALIZED path so the kaish mount target is always resolved.
     fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
-        // Step 1: select the raw path.
+        // Step 1: select the raw path. The default root is the explicit `--root` or
+        // the inferred launch cwd (already canonicalized and dir-checked at startup,
+        // and guaranteed inside the allowed set); the steps below re-validate it
+        // uniformly with an explicit `path`, so there is no special-casing here.
         let raw = match path {
             Some(p) => PathBuf::from(p),
-            None => self.config.root.clone().ok_or_else(|| {
+            None => (*self.default_root).clone().ok_or_else(|| {
                 McpError::invalid_params(
-                    "no `path` provided and the server has no default --root",
+                    "no `path` provided and the server has no default root \
+                     (configure one with --root, or launch kaibo with its cwd \
+                     inside the allowed set so the workspace is inferred)",
                     None,
                 )
             })?,
@@ -1022,6 +1080,8 @@ impl rmcp::ServerHandler for KaiboHandler {
                 &self.tool_schemas,
                 &self.config,
                 &self.allowed_set,
+                self.default_root.as_deref(),
+                self.default_root_inferred,
                 self.config
                     .default_cast_usability(|k| std::env::var(k).ok()),
                 &self.config.usable_casts(|k| std::env::var(k).ok()),
@@ -1074,6 +1134,8 @@ impl rmcp::ServerHandler for KaiboHandler {
             &self.tool_schemas,
             &self.config,
             &self.allowed_set,
+            self.default_root.as_deref(),
+            self.default_root_inferred,
         )
     }
 
@@ -1305,7 +1367,12 @@ fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
 /// values. The backend struct stores sources, not secrets; this renderer reads only
 /// those source fields. If Config ever gains a resolved-key cache, do not read it here.
 /// Tests in this file assert the contract holds.
-fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
+fn render_config_resource(
+    config: &Config,
+    allowed_set: &[PathBuf],
+    default_root: Option<&Path>,
+    default_root_inferred: bool,
+) -> String {
     use serde::Serialize;
     use std::collections::BTreeMap;
 
@@ -1316,9 +1383,14 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
     struct ConfigDoc {
         /// Allowed path trees: a per-call path must be at-or-under one of these.
         allowed_paths: Vec<String>,
-        /// Default root (the --root value), if set.
+        /// The effective default root a call uses when it omits `path` — an explicit
+        /// `--root`, or the launch cwd kaibo inferred. Absent when neither applies.
         #[serde(skip_serializing_if = "Option::is_none")]
         default_root: Option<String>,
+        /// True when `default_root` was inferred from the launch cwd rather than
+        /// configured explicitly. Only meaningful when `default_root` is present.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        default_root_inferred: bool,
         /// Default cast name (what a call omitting `cast` gets).
         default_cast: String,
         /// Which tools are currently advertised.
@@ -1581,7 +1653,8 @@ fn render_config_resource(config: &Config, allowed_set: &[PathBuf]) -> String {
             .iter()
             .map(|p| p.display().to_string())
             .collect(),
-        default_root: config.root.as_ref().map(|p| p.display().to_string()),
+        default_root: default_root.map(|p| p.display().to_string()),
+        default_root_inferred,
         default_cast: config.default_cast.clone(),
         tools: ToolsDoc {
             consult,
@@ -1665,9 +1738,12 @@ fn read_kaibo_resource_with_config(
     schemas: &[ToolSchema],
     config: &Config,
     allowed_set: &[PathBuf],
+    default_root: Option<&Path>,
+    default_root_inferred: bool,
 ) -> Result<ReadResourceResult, McpError> {
     if uri == CONFIG_URI {
-        let body = render_config_resource(config, allowed_set);
+        let body =
+            render_config_resource(config, allowed_set, default_root, default_root_inferred);
         return Ok(ReadResourceResult {
             contents: vec![ResourceContents::text(body, uri)],
         });
@@ -2125,7 +2201,7 @@ mod tests {
         // Use the config-aware dispatch for all URIs — same path the handler takes.
         let config = Config::builtin();
         let allowed: Vec<PathBuf> = Vec::new();
-        let result = read_kaibo_resource_with_config(uri, schemas, &config, &allowed)
+        let result = read_kaibo_resource_with_config(uri, schemas, &config, &allowed, None, false)
             .expect("known uri must read");
         match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
@@ -2165,7 +2241,9 @@ mod tests {
                 &format!("{BUILTIN_PREFIX}nope"),
                 &schemas,
                 &config,
-                &allowed
+                &allowed,
+                None,
+                false
             )
             .is_err(),
             "an unregistered builtin must be a not-found error"
@@ -2177,7 +2255,8 @@ mod tests {
         let config = Config::builtin();
         let allowed: Vec<PathBuf> = Vec::new();
         assert!(
-            read_kaibo_resource_with_config("kaibo://nope", &[], &config, &allowed).is_err(),
+            read_kaibo_resource_with_config("kaibo://nope", &[], &config, &allowed, None, false)
+                .is_err(),
             "an unknown URI must be a not-found error, not an empty success"
         );
     }
@@ -2276,7 +2355,8 @@ mod tests {
 
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp")];
-        let result = read_kaibo_resource_with_config(CONFIG_EXAMPLE_URI, &[], &config, &allowed)
+        let result =
+            read_kaibo_resource_with_config(CONFIG_EXAMPLE_URI, &[], &config, &allowed, None, false)
             .expect("example resource must be readable");
         let body = match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
@@ -2323,7 +2403,7 @@ mod tests {
     fn config_resource_renders_expected_fields() {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
-        let body = render_config_resource(&config, &allowed);
+        let body = render_config_resource(&config, &allowed, None, false);
         // Structural presence checks — the resource is TOML or a document, not prose.
         for needle in [
             "allowed_paths",
@@ -2404,7 +2484,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[]);
+        let body = render_config_resource(&config, &[], None, false);
         // The header NAME is discoverable…
         assert!(
             body.contains("authorization"),
@@ -2435,7 +2515,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[]);
+        let body = render_config_resource(&config, &[], None, false);
         for needle in ["[backend_aliases]", "[cast_aliases]"] {
             assert!(body.contains(needle), "must render {needle}:\n{body}");
         }
@@ -2482,7 +2562,7 @@ mod tests {
             unsafe {
                 std::env::set_var(var_name, SENTINEL);
             }
-            let b = render_config_resource(&config, &allowed);
+            let b = render_config_resource(&config, &allowed, None, false);
             #[allow(deprecated)]
             unsafe {
                 std::env::remove_var(var_name);
@@ -2508,7 +2588,7 @@ mod tests {
         let file_path = tmp.path().to_string_lossy().to_string();
         let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
         let config2 = Config::from_toml_str(&toml2).expect("valid config");
-        let body2 = render_config_resource(&config2, &allowed);
+        let body2 = render_config_resource(&config2, &allowed, None, false);
         // The file path (source pointer) may appear, but not the file contents.
         assert!(
             !body2.contains(SENTINEL),
@@ -2523,14 +2603,14 @@ mod tests {
     fn read_kaibo_config_resource_is_readable() {
         let config = Config::builtin();
         let allowed = handler().allowed_set();
-        let body_str = render_config_resource(&config, &allowed);
+        let body_str = render_config_resource(&config, &allowed, None, false);
         // Sanity: the rendered document has something in it.
         assert!(
             !body_str.is_empty(),
             "config resource body must not be empty"
         );
         // The dispatch must not return not-found for this URI.
-        let result = read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed);
+        let result = read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed, None, false);
         assert!(
             result.is_ok(),
             "kaibo://config must be readable, got {result:?}"
@@ -2554,6 +2634,8 @@ mod tests {
             &schemas,
             &config,
             &allowed,
+            None,
+            false,
             crate::config::CastUsability::Ready,
             &[],
         );
@@ -2573,18 +2655,20 @@ mod tests {
         );
     }
 
-    /// When there is a default root, the scope section must say so rather than
-    /// saying "no default root".
+    /// When there is an explicit default root, the scope section must name it and
+    /// must NOT tag it as inferred.
     #[test]
     fn instructions_scope_section_names_default_root() {
         let schemas = sample_schemas();
-        let mut config = Config::builtin();
-        config.root = Some(std::path::PathBuf::from("/projects/myapp"));
-        let allowed = vec![std::path::PathBuf::from("/projects/myapp")];
+        let config = Config::builtin();
+        let root = std::path::PathBuf::from("/projects/myapp");
+        let allowed = vec![root.clone()];
         let text = kaibo_instructions_with_scope(
             &schemas,
             &config,
             &allowed,
+            Some(&root),
+            false,
             crate::config::CastUsability::Ready,
             &[],
         );
@@ -2592,19 +2676,51 @@ mod tests {
             text.contains("/projects/myapp"),
             "scope section must name the configured root:\n{text}"
         );
+        assert!(
+            !text.contains("inferred"),
+            "an explicit root must not be tagged inferred:\n{text}"
+        );
     }
 
-    /// When no default root is set the scope section must be honest about it.
+    /// An inferred default root (from the launch cwd) must be named *and* tagged so
+    /// the caller can tell it wasn't configured by hand.
+    #[test]
+    fn instructions_scope_section_tags_inferred_default_root() {
+        let schemas = sample_schemas();
+        let config = Config::builtin();
+        let root = std::path::PathBuf::from("/work/space");
+        let allowed = vec![root.clone()];
+        let text = kaibo_instructions_with_scope(
+            &schemas,
+            &config,
+            &allowed,
+            Some(&root),
+            true,
+            crate::config::CastUsability::Ready,
+            &[],
+        );
+        assert!(
+            text.contains("/work/space"),
+            "scope section must name the inferred root:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("inferred"),
+            "an inferred root must be tagged so the boundary stays legible:\n{text}"
+        );
+    }
+
+    /// When no default root applies the scope section must be honest about it.
     #[test]
     fn instructions_scope_section_states_no_default_root_when_absent() {
         let schemas = sample_schemas();
-        let mut config = Config::builtin();
-        config.root = None;
+        let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp")];
         let text = kaibo_instructions_with_scope(
             &schemas,
             &config,
             &allowed,
+            None,
+            false,
             crate::config::CastUsability::Ready,
             &[],
         );

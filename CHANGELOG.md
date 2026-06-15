@@ -43,6 +43,12 @@ the git log. Each later release appends a new section at the top.
   writing `config.toml`, alongside `kaibo://config` (resolved runtime state) and
   `kaibo://config/example` (annotated template) resources. Secrets are referenced by
   env-var name or key-file path, never inlined.
+- **Zero-config workspace root.** When no `--root` is set, kaibo adopts its launch
+  cwd as the inferred default root (it already scoped containment to that cwd, and
+  MCP clients start stdio servers with cwd = workspace), so a call may omit `path`
+  and still land on the project. The scope handshake and `kaibo://config` tag the
+  root as inferred. An `--allow-path` that excludes the cwd leaves no default root —
+  kaibo never defaults to a path its own containment check would reject.
 - **Per-tool gating.** Each tool has a `--no-<tool>` flag (all on by default); an
   all-off server is refused at startup.
 - **Operator ignore files** via a `[kaish.ignore]` config stanza.

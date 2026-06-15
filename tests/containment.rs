@@ -205,14 +205,66 @@ async fn no_root_no_allow_paths_defaults_to_cwd() {
     );
 }
 
-// --- (f) omitted path with no root still errors as a parameter error ---------
+// --- (f) omitted path with no root infers the launch cwd as the default root --
 
-/// With no --root set, an omitted `path` is a parameter error ("not a silent
-/// default") — containment does not change this existing behavior.
+/// With no --root and no --allow-path, an omitted `path` resolves to the launch
+/// cwd: the zero-config allowed set is the cwd, so the cwd is adopted as the
+/// inferred default root and a call may omit `path` in the common single-workspace
+/// case. (MCP clients start stdio servers with cwd = workspace.)
 #[tokio::test]
-async fn omitted_path_no_root_still_errors_as_parameter_error() {
-    let config = Config::builtin(); // no root
+async fn omitted_path_zero_config_infers_cwd_as_default_root() {
+    let config = Config::builtin(); // no root, no allow_paths -> cwd inferred
     let handler = KaiboHandler::new(config).expect("handler builds");
+
+    let out = handler
+        .run_kaish(Parameters(RunKaishInput {
+            script: "ls".to_string(),
+            path: None,
+        }))
+        .await
+        .expect("omitted path with zero-config must resolve to the inferred cwd")
+        .content
+        .into_iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `ls` at the crate root (the test process cwd) lists real files.
+    assert!(
+        out.contains("Cargo.toml"),
+        "inferred-cwd call should list the crate root, got: {out}"
+    );
+
+    // The handler must expose the inferred default root, and mark it inferred.
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        handler.default_root().as_deref(),
+        Some(cwd.as_path()),
+        "zero-config default root must be the canonicalized cwd"
+    );
+    assert!(
+        handler.default_root_inferred(),
+        "a cwd-derived default root must be marked inferred"
+    );
+}
+
+// --- (f2) an allow-path that excludes the cwd leaves no default root ----------
+
+/// When `--allow-path` is set to a tree that does NOT contain the launch cwd and
+/// no `--root` is given, the cwd is outside the boundary, so it must NOT be adopted
+/// as the default root. An omitted `path` then remains a parameter error — we never
+/// default to a root the containment check would reject.
+#[tokio::test]
+async fn omitted_path_with_allow_path_excluding_cwd_still_errors() {
+    let allowed = tempdir().unwrap(); // a tempdir, never an ancestor of the crate cwd
+    let handler = handler_with_allowed(None, &[allowed.path()]);
+
+    // No default root was inferred (cwd is outside the allow-path).
+    assert!(
+        handler.default_root().is_none(),
+        "cwd outside the allowed set must not be adopted as a default root"
+    );
+    assert!(!handler.default_root_inferred());
 
     let err = handler
         .run_kaish(Parameters(RunKaishInput {
@@ -220,10 +272,8 @@ async fn omitted_path_no_root_still_errors_as_parameter_error() {
             path: None,
         }))
         .await
-        .expect_err("omitted path with no root must be a parameter error");
+        .expect_err("omitted path with no default root must be a parameter error");
 
-    // The error must be invalid_params territory — not a containment rejection,
-    // but the existing "no path provided and no --root" error.
     let err_str = format!("{err:?}");
     assert!(
         err_str.contains("path") || err_str.contains("root") || err_str.contains("parameter"),
