@@ -1257,11 +1257,14 @@ and where each key is sourced from.
 Anthropic / DeepSeek / Gemini I hold API keys for, and whether I run any \
 OpenAI-compatible local servers (llama.cpp, Ollama, an image server) and at what base \
 URLs. Let me tell you my providers rather than guessing them.
-3. Propose a roster, then write it to `$XDG_CONFIG_HOME/kaibo/config.toml` (default \
-`~/.config/kaibo/config.toml`). Favor a cast that mixes model families across roles — \
-a cheap, fast explorer on one lineage and a stronger synth on another. That's both \
-cheaper and the whole point of an outside opinion; two flavors of one base model give \
-one voice twice.
+3. Propose a roster that fits the providers I actually named in step 2 — don't assume \
+a chimera before you know what I can reach. If I hold keys across two or more families, \
+a chimera is the sweet spot: a cheap, fast explorer on one lineage and a stronger synth \
+on another — cheaper, and a real outside opinion where two voices' mistakes don't line \
+up. If I have just one provider, a clean single-family cast is the right answer, not a \
+fallback — get me running on what I have rather than holding out for a second key. Then \
+write the roster to `$XDG_CONFIG_HOME/kaibo/config.toml` (default \
+`~/.config/kaibo/config.toml`).
 4. Keep secrets in the environment or a key file. A backend names an env var \
 (`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
 the secret stays outside it. Tell me which env vars to set or files to write, and let \
@@ -2168,6 +2171,32 @@ mod tests {
                 "configure prompt should mention {needle:?}; body:\n{text}"
             );
         }
+    }
+
+    /// The chimera must be gated on actually holding multiple families, and a
+    /// single-provider setup must read as a correct outcome — not a fallback. Without
+    /// this, an eager agent jumps straight to a mixed-family roster and writes a dead
+    /// cast when the user holds one key. Pins both halves so the steer can't regress to
+    /// the old unconditional "favor a chimera".
+    #[test]
+    fn configure_prompt_gates_the_chimera_on_having_multiple_families() {
+        let result =
+            kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, None).expect("configure must resolve");
+        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+            panic!("configure prompt must be a text message");
+        };
+        assert!(
+            text.contains("two or more families"),
+            "the chimera must be conditioned on holding multiple families; body:\n{text}"
+        );
+        assert!(
+            text.contains("single-family"),
+            "a one-provider setup must be offered as a real answer; body:\n{text}"
+        );
+        assert!(
+            text.contains("don't assume a chimera"),
+            "the prompt must tell the agent not to pre-commit to a chimera; body:\n{text}"
+        );
     }
 
     /// A supplied `goal` is woven into the message so the agent tailors the roster;
