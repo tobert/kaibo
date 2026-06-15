@@ -282,13 +282,6 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
-### Bump kaish-kernel past 0.8.3 before cutting 0.2.0 (release gate)
-A bug surfaced upstream right after the `0.8.3` cut — the current `Cargo.toml` pin
-(`kaish-kernel = "0.8.3"`) — and the fix is in an imminent release. Bump the pin,
-adapt kaibo to any API change rather than pinning around it (AGENTS.md "Working
-here"), and re-green the offline suite. This gates the 0.2.0 release tag; the
-release process is documented in AGENTS.md "Pull requests & the changelog".
-
 ### Review the provider retry + failure policy (and document it)
 We don't have a stated, audited answer for what a `consult`/`explore`/`synthesize`
 call does when a provider misbehaves mid-flight: a 429/529 overload, a connection

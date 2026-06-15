@@ -222,7 +222,6 @@ requests — `main` is protected by convention, not a scratchpad.
   `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
   re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
   `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
-- **Release gate — kaish bump pending.** A bug surfaced upstream right after kaish
-  `0.8.3` (the current `Cargo.toml` pin); 0.2.0 waits on the fixed release. Bump the
-  pin, adapt to any API change rather than pinning around it (per **Working here**),
-  and re-green the offline suite before cutting. Tracked in `docs/issues.md`.
+- **kaish pin.** Currently `kaish-kernel = "0.8.4"` — the release that fixed the bug
+  which surfaced just after `0.8.3`. The bump was clean (no API change); offline suite
+  green. Keep this current per the **Working here** kaish-bump discipline before cutting.
