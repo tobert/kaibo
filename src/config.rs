@@ -1863,7 +1863,12 @@ pub fn default_config_path() -> Option<PathBuf> {
     })
 }
 
-/// Expand a leading `~` to `$HOME`. Leaves other paths untouched.
+/// Expand a leading `~` or `~/...` to `$HOME`. Leaves every other path untouched —
+/// in particular `~user` (no slash) is **not** expanded: kaibo never does a `getpwnam`
+/// lookup from config-parsing code, and a literal `~user` simply fails canonicalization
+/// loudly. Keep it this narrow; widening it to `~user` would pull a mutable system
+/// database into a path that feeds the containment boundary. With `$HOME` unset the
+/// input passes through verbatim (and then fails canonicalization), never silently.
 fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -1881,6 +1886,30 @@ fn expand_tilde(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- expand_tilde ---------------------------------------------------------
+
+    /// `expand_tilde` must expand only a leading `~` / `~/...` to `$HOME`, and leave
+    /// everything else — `~user`, a mid-path `~`, absolute and relative paths —
+    /// verbatim. The non-expansion of `~user` is a security property (no getpwnam from
+    /// a path that feeds containment), so it gets its own teeth here.
+    #[test]
+    fn expand_tilde_only_touches_a_leading_home_tilde() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let home = home.trim_end_matches('/');
+
+        assert_eq!(expand_tilde("~/src"), PathBuf::from(format!("{home}/src")));
+        assert_eq!(expand_tilde("~"), PathBuf::from(home));
+
+        // Passthrough cases — left exactly as written.
+        for verbatim in ["~user", "~user/x", "/abs/~/x", "rel/path", "/data/fixtures"] {
+            assert_eq!(
+                expand_tilde(verbatim),
+                PathBuf::from(verbatim),
+                "{verbatim:?} must pass through unchanged"
+            );
+        }
+    }
 
     // --- built-in equivalence -------------------------------------------------
 

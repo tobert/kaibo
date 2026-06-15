@@ -910,7 +910,10 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
 /// covers `KAIBO_ROOT` / `KAIBO_ALLOW_PATHS` too.)
 #[test]
 fn tilde_expands_in_root_and_allow_paths() {
+    // Trim a trailing slash so `{home}/src` matches `PathBuf::from(HOME).join("src")`,
+    // which normalizes `/home/user/` + `src` to `/home/user/src` (no empty component).
     let home = std::env::var("HOME").expect("HOME set in test env");
+    let home = home.trim_end_matches('/');
     let toml = "[server]\n\
                 root = \"~/src/proj\"\n\
                 allow_paths = [\"~/src\", \"/data/fixtures\"]\n";
@@ -940,6 +943,44 @@ fn tilde_expands_in_root_and_allow_paths() {
             .iter()
             .any(|p| p.to_string_lossy().starts_with('~')),
         "no allow_paths entry may keep a literal leading ~, got {:?}",
+        c.allow_paths
+    );
+}
+
+/// The env layer funnels through the same expansion: `KAIBO_ROOT` and the
+/// colon-separated `KAIBO_ALLOW_PATHS` must expand a leading `~` to `$HOME`. Pins the
+/// commit's "covers env too" claim — distinct from the file-layer test — so a future
+/// refactor that expanded only the file path would be caught.
+#[test]
+fn tilde_expands_in_env_layer_root_and_allow_paths() {
+    let home = std::env::var("HOME").expect("HOME set in test env");
+    let home = home.trim_end_matches('/');
+    let env: HashMap<&str, &str> = [
+        ("KAIBO_ROOT", "~/envroot"),
+        ("KAIBO_ALLOW_PATHS", "~/a:~/b:/data/fixtures"),
+    ]
+    .into_iter()
+    .collect();
+    // No config file (built-in defaults) + the injected env layer.
+    let c = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap();
+
+    assert_eq!(
+        c.root.as_deref(),
+        Some(std::path::Path::new(&format!("{home}/envroot"))),
+        "~ in KAIBO_ROOT must expand to $HOME"
+    );
+    for expected in [format!("{home}/a"), format!("{home}/b")] {
+        assert!(
+            c.allow_paths
+                .contains(&std::path::PathBuf::from(&expected)),
+            "~ in KAIBO_ALLOW_PATHS must expand to {expected}, got {:?}",
+            c.allow_paths
+        );
+    }
+    assert!(
+        c.allow_paths
+            .contains(&std::path::PathBuf::from("/data/fixtures")),
+        "non-tilde KAIBO_ALLOW_PATHS entry must pass through, got {:?}",
         c.allow_paths
     );
 }

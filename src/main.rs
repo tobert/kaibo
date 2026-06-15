@@ -39,14 +39,17 @@ struct Args {
     /// that cwd is also adopted as the inferred default root — so a call may omit
     /// `path` without configuring anything. (An --allow-path that excludes the cwd
     /// leaves no default root, since we never default to a path containment rejects.)
+    /// A leading `~` is expanded by your shell, not by kaibo; in config.toml / KAIBO_*
+    /// kaibo expands it for you.
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 
     /// Additional allowed path tree. Repeatable. A per-call `path` must resolve
     /// to at-or-under --root or one of these; use --allow-path / to lift all
     /// limits. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
-    /// [server] allow_paths in config.toml. A non-empty set of --allow-path flags
-    /// replaces the env/file layer.
+    /// [server] allow_paths in config.toml — those expand a leading `~`; on the CLI
+    /// your shell does (a quoted '~/src' arrives literal and fails canonicalization).
+    /// A non-empty set of --allow-path flags replaces the env/file layer.
     #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append)]
     allow_path: Vec<PathBuf>,
 
