@@ -1403,16 +1403,17 @@ pub fn oneshot_preamble() -> String {
 /// shell, no exploration. The thin counterpart to `consult` (prompt in, answer out)
 /// for when the caller already owns the context and just wants the model's take.
 /// Built on the one loop primitive with an empty toolset and a single turn, so it is
-/// exactly one upstream request. Orientation is never spliced (it reads no project);
-/// operator house rules still apply, like every top-level tool.
+/// exactly one upstream request. Neither orientation nor operator house rules are
+/// spliced — both are project guidance, and oneshot reads no project.
+///
+/// Safe-by-accident note: a vision synth arm carries `break_on_view_image = true`
+/// (via `Arm::rewrites_view_image`), but the empty toolset has no `view_image` tool,
+/// so the break hook can never fire and the single turn always completes cleanly. If
+/// you ever give oneshot a tool, revisit this — a live break would consume the turn
+/// and land in the turn-cap finalize path.
 pub async fn oneshot(prompt: &str, arm: &Arm, cfg: &ConsultConfig) -> Result<String> {
     arm.run(
-        &phase_preamble(
-            cfg.prompts.oneshot.as_deref(),
-            oneshot_preamble,
-            None,
-            cfg.house_rules.as_deref(),
-        ),
+        &phase_preamble(cfg.prompts.oneshot.as_deref(), oneshot_preamble, None, None),
         prompt.to_string(),
         1,
         cfg.progress.as_ref(),
@@ -1856,34 +1857,45 @@ mod tests {
     /// A `[prompts]` override **fully replaces** the built-in preamble: the
     /// operator's prose is verbatim, and the built-in role framing is *gone* (the
     /// kaish contract still rides the `run_kaish` tool, untested here). House rules
-    /// still append on top — `[prompts]` and `[context]` are orthogonal axes. We
-    /// drive a single `oneshot` phase and read back what the model was handed.
+    /// still append on top — `[prompts]` and `[context]` are orthogonal axes. Driven
+    /// on the `consult` driver, the phase that carries both an override and house
+    /// rules (oneshot reads no project, so it carries neither house rules nor a map).
     #[tokio::test]
     async fn a_prompt_override_fully_replaces_the_preamble_and_house_rules_still_append() {
-        const MODEL: &str = "synth";
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
         const CUSTOM: &str = "You are a SECURITY AUDITOR. Hunt injection sinks.";
         const HOUSE: &str = "HOUSE_RULE_MARKER: prefer tabs";
 
         let client = ScriptedClient::builder()
-            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
+        let dir = tempdir().unwrap();
         let cfg = ConsultConfig {
             prompts: PromptOverrides {
-                oneshot: Some(CUSTOM.to_string()),
+                consult: Some(CUSTOM.to_string()),
                 ..PromptOverrides::default()
             },
             house_rules: Some(Arc::from(HOUSE)),
             ..ConsultConfig::default()
         };
-        oneshot("q", &arm(&client, MODEL), &cfg).await.unwrap();
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
-        let reqs = client.requests_for(MODEL);
+        let reqs = client.requests_for(SYNTH);
         let pre = reqs[0].preamble.as_deref().unwrap_or("");
         // The override is verbatim...
         assert!(pre.contains(CUSTOM), "override prose missing: {pre}");
         // ...the built-in framing is fully replaced (full-replace, by decision)...
         assert!(
-            !pre.contains("second opinion"),
+            !pre.contains("You answer a question about a codebase"),
             "override must REPLACE, not augment, the built-in: {pre}"
         );
         // ...and house rules still layer on top.
