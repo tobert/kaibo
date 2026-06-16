@@ -319,6 +319,22 @@ the scripted `CompletionClient` (`test_support.rs`) is the natural guard.
 
 ## P3 — Infra, perf, polish
 
+### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
+The config resource grew a `[runtime]` table for state that's *computed at read
+time* rather than configured — currently `follow_worktrees` (the knob) and
+`followed_worktrees` (the live extra set the worktree-follow grants beyond
+`allowed_paths`, recomputed each read so a mid-session worktree shows up). The slot
+is the right home for other runtime-derived facts a caller/operator would want to
+see at a glance — candidates: which casts actually resolved a key right now (vs.
+merely configured), the resolved default root's *source* (explicit vs. inferred
+cwd) surfaced inside `[runtime]` instead of as a sibling flag, live session-store
+occupancy, or a "git repo detected at root" hint. Add these as the need shows up;
+keep the rule that `[runtime]` is *observed*, not *set* (the static knobs stay
+above it), so a reader can always tell "what kaibo discovered" from "what the
+operator chose". `RuntimeDoc` in `server.rs::render_config_resource` is the seam;
+the value is threaded in from the handler (it needs `allowed_set` / live state),
+so new fields follow that same path.
+
 ### `[context]` house rules have no size cap (and ride every turn, every phase)
 The `[context]` files are spliced into the preamble whole (`context.rs::assemble`
 → `consult.rs::with_house_rules`), the preamble is re-sent on *every* model turn,

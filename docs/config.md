@@ -604,6 +604,39 @@ it. Pass an explicit `--root` (inside an allowed tree) to restore a default.
 so the kaish VFS mount target is always resolved. A nonexistent or non-directory
 entry in `--root` / `--allow-path` is a loud construction error at startup.
 
+**Following git worktrees (on by default).** When a call's `path` misses the allowed
+set, kaibo doesn't reject it outright if it's a *linked git worktree of a repo
+already in the set* — it admits it. So a feature branch you check out in a sibling
+directory (`git worktree add ../proj-feature …`), even one created mid-session, is
+reachable without touching `allow_paths`. This is *narrower* than widening to the
+parent (`--allow-path ~/src` would grant read of everything under it); follow admits
+exactly the worktrees of an already-allowed repo and nothing else.
+
+kaibo resolves this by **reading git's own link files** — a worktree's `.git` file,
+the repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git` (the
+binary isn't in the build; see [Read-only is structural](#)). Trust flows only
+outward from the allowed repo: kaibo enumerates the worktrees the *allowed* repo's
+common git dir vouches for and admits a candidate only if it falls inside one. It
+never consults the candidate's own `.git`, so a foreign directory with a forged
+`gitdir:` pointer can't admit itself. The check runs only on the (rare)
+containment-miss path — the normal in-bounds call is untouched.
+
+Turn it off to keep the boundary strictly static:
+
+```toml
+[server]
+follow_worktrees = false
+```
+
+```sh
+KAIBO_NO_FOLLOW_WORKTREES=1 kaibo      # env
+kaibo --no-follow-worktrees            # CLI (can only disable, like --no-<tool>)
+```
+
+The worktrees currently followed are listed at `kaibo://config` under `[runtime]`
+(see below), recomputed on each read so a mid-session worktree shows up without a
+reconnect.
+
 ## kaibo://config
 
 An MCP resource at the URI `kaibo://config` (`application/toml`) exposes the server's
@@ -613,6 +646,12 @@ operator) the full picture:
 - `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
 - `default_root` — the `--root` value, if set
 - `default_cast` — which cast is used when a call omits `cast`
+- `runtime` — state *computed at read time*, kept distinct from the configured
+  knobs above so a reader can tell "what kaibo discovered" from "what the operator
+  set". Currently `follow_worktrees` (the knob's effective value) and
+  `followed_worktrees` (the git worktrees admitted beyond `allowed_paths` right
+  now; recomputed each read, so a worktree added mid-session appears without a
+  reconnect)
 - `tools` — which tools are currently advertised (`consult`, `oneshot`,
   `run_kaish`, `generate_image`)
 - `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins

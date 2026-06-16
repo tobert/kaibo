@@ -53,6 +53,15 @@ struct Args {
     #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append)]
     allow_path: Vec<PathBuf>,
 
+    /// Don't follow git worktrees: a per-call `path` in a linked worktree of an
+    /// already-allowed repo is rejected like any other outside path. By default
+    /// kaibo admits such worktrees (resolved by reading git's link files, never by
+    /// running git), so a sibling worktree you spin up mid-session is reachable
+    /// without an --allow-path. Also settable via KAIBO_NO_FOLLOW_WORKTREES or
+    /// [server] follow_worktrees = false.
+    #[arg(long)]
+    no_follow_worktrees: bool,
+
     /// Default cast when a call omits it (a built-in name or a cast defined in
     /// config.toml). Built-ins: anthropic | deepseek | gemini | openai (plus
     /// aliases: claude, google, local, …). Replaces the old --provider flag
@@ -122,6 +131,7 @@ async fn main() -> Result<()> {
             generate_image: args.no_generate_image,
         },
         args.allow_path.clone(),
+        args.no_follow_worktrees,
         args.project_context_file.clone(),
         args.user_context_file.clone(),
     );
