@@ -6,17 +6,23 @@ kinds of help — *consultation* (grounded, cited, read-only answers about a cod
 *capabilities* (things the team can *do* and hand back as artifacts; image generation
 today, more as `rig` grows coverage).
 
-**Consultation: one primitive, four tools.** The primitive is `run_phase`
+**Consultation: one primitive, three tools.** The primitive is `run_phase`
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
 loop. Each consultation tool is that loop wearing different clothes:
 
-- **`consult`** — a capable model with `{run_kaish, explore′}`: it reads precise
-  spans directly and delegates broad sweeps to a cheap explorer sub-agent, then
-  answers. No rigid explorer→synth hand-off; the model chooses.
-- **`explore`** — a cheap model with `{run_kaish}` → a curated report (the seam).
-- **`synthesize`** — a capable model with `{run_kaish}` + optional caller `context`
-  → an answer (investigates directly when context is thin).
+- **`consult`** — a capable model with `{run_kaish, explore′}` + optional caller
+  `context`: it reads precise spans directly and delegates broad sweeps to a cheap
+  explorer sub-agent, then answers. No rigid explorer→synth hand-off; the model
+  chooses. Supplied context is trusted starting evidence — it investigates for
+  *more*, not to re-verify. The `explore′` sweep (`report_preamble`) lives *inside*
+  this loop now; it is not a standalone tool.
+- **`oneshot`** — a capable model with **no tools**: the caller owns the context, so
+  it's one upstream request, prompt in / answer out, no codebase access. The thin
+  counterpart to `consult` — and the door to a model outside the caller's family.
 - **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
+
+Both model-driven tools name their cast + answering model(s) in a provenance footer
+(`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
 
 **Capabilities** are a distinct, growing tool *class* — not `run_phase` loops. The
 direction is the tell: consultation and perception (`view_image`) run images and
@@ -91,7 +97,7 @@ commands.
   Two primitives — response strategy + a request log — so new cases (multi-sweep,
   model routing, error injection) are new responders, not harness changes. Inject via
   the generic seams (`run_phase`, `consult_with`, `consult_session_turn`); the public
-  `consult`/`explore`/`synthesize` build the real client behind `with_provider_client!`.
+  `consult`/`oneshot` build the real client behind `with_provider_client!`.
 - **`docs/issues.md` is the live tracker.** Skim it before new work. Delete
   entries when they ship — don't mark them done; git history is the record.
 - **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
@@ -169,8 +175,9 @@ How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherit
   better anti-bias posture: bias lives in a report's gaps and framing, not its cited
   facts, so the cure is investigation that *extends* the context, not re-checking it.
   Keep a "the code is the only ground truth" tiebreaker for genuine conflicts (it
-  fires only when one is noticed; it doesn't send the model hunting). See the synth
-  prompts in `consult.rs` (`synthesize_preamble`, `synthesize_user_prompt`).
+  fires only when one is noticed; it doesn't send the model hunting). See the context
+  framing in `consult.rs` (`consult_preamble`, `consult_user_prompt`) — the seam that
+  absorbed the old standalone `synthesize`.
 
 ## Commit style
 
@@ -209,7 +216,7 @@ requests — `main` is protected by convention, not a scratchpad.
 - **Branch → PR → review → merge.** Non-trivial work lands on a branch and goes up
   as a PR, not direct-to-`main`. Dogfood the review: run a **cross-family** pass over
   the diff — a different model lineage than wrote it (`/code-review`, or kaibo's own
-  `consult`/`synthesize` aimed at the change) — before merge. A typo or a one-line doc
+  `consult`/`oneshot` aimed at the change) — before merge. A typo or a one-line doc
   fix can still go straight to `main`; this is judgment, not ceremony.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).

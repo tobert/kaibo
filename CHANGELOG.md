@@ -13,17 +13,20 @@ the git log. Each later release appends a new section at the top.
 
 ### Added
 
-- **`consult`** — the headline tool: ask a question about a codebase, get a
-  grounded, cited answer. A capable model reads precise spans directly and delegates
-  broad sweeps to a cheap explorer sub-agent, then synthesizes — so your context
-  receives the answer, not the investigation transcript. Args: `question`, `path`,
-  `cast`, `session_id`, `include_report`, and per-call `explorer_model` /
-  `synth_model` (+ `_backend`) overrides.
-- **`explore`** — a fast, cheap model sweeps the project read-only and returns a
-  curated report (relevant files, line numbers, key snippets) for a stronger model
-  to reason over.
-- **`synthesize`** — a capable model answers grounded in optional caller `context`
-  (an explore report or pasted source), investigating directly when context is thin.
+- **`consult`** — the headline tool: ask a model *outside your own family* about a
+  codebase and get a grounded, cited answer. A capable model reads precise spans
+  directly and delegates broad sweeps to a cheap explorer sub-agent, then synthesizes
+  — so your context receives the answer, not the investigation transcript. Pick which
+  family answers with `cast`. Optionally seed it with `context` (a change summary or
+  pasted source), trusted as starting evidence while it investigates for more. The
+  answer carries a provenance footer naming the cast and the models that produced it.
+  Args: `question`, `context`, `path`, `cast`, `session_id`, `include_report`, and
+  per-call `explorer_model` / `synth_model` (+ `_backend`) overrides.
+- **`oneshot`** — a thin, direct second opinion from a model outside your family:
+  prompt in, answer out, no codebase access and no tools, exactly one upstream
+  request. The counterpart to `consult` for when you already own the context (you've
+  pasted what's needed, or the question is general). Pick the model with `cast`; the
+  answer carries the same provenance footer.
 - **`run_kaish`** — drive the read-only kaish shell yourself, no model in the loop:
   exit code + stdout + stderr.
 - **`generate_image`** — kaibo's first *capability* (an artifact handed back to the

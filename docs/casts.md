@@ -151,7 +151,7 @@ consult(question, root, arms, cfg, session)
 `cast = "claude"` walks the identical pipeline with boring resolution: the
 built-in single-backend cast, both arms on one backend, no media builtins.
 
-- **`explore` / `synthesize`**: one arm each, trivially.
+- **`oneshot`**: one arm (the synth slot), no tools — trivially.
 - **`run_kaish`**: shipped *without* a `cast` arg (decided at implementation
   time, overriding the draft here). It has no agent in the loop and no media
   builtins exist yet for a cast's production slots to gate; the arg lands

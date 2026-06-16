@@ -15,7 +15,23 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-Last pass: 2026-06-13 (image-out SHIPPED, **live-verified** — kaibo's first
+Last pass: 2026-06-16 (consultation surface collapsed to **`consult` + `oneshot`**,
+offline-green — the cross-model-study finding that agents reach for the per-model pals
+over kaibo. The pals win on naming the model in the tool and offering two shapes
+(agentic + a thin oneshot); kaibo led with "a codebase" and four tools, two of which
+(`explore`, `synthesize`) were internal seams leaking onto the public surface. Fix:
+`consult` gains an optional `context` seed (absorbing `synthesize`'s trusted-evidence
+behavior; the `explore′` sweep stays internal to its loop), a new toolless `oneshot`
+(prompt in / answer out, no codebase access — the pal-shaped thin path), and `explore`/
+`synthesize` removed as public tools (with their `--no-*` flags, `[prompts]` keys, and
+config rows). Both model tools now describe themselves as the door to a model *outside
+the caller's family*, name the casts up front, and append a provenance footer (cast +
+answering models) so a study sees which model answered without opening `kaibo://config`;
+`consult` also steers "say what you did, don't paste a diff". Tests ported to the new
+seams (view_image now exercises the `consult` driver where it rides; the synthesize
+prompt tests became consult-with-context tests) + new tests pinning oneshot's empty
+toolset and the provenance footer. Lands via the `client-instructions-say-what-you-did`
+PR; cross-family review pending before merge.) 2026-06-13 (image-out SHIPPED, **live-verified** — kaibo's first
 *capability* (vs. consultation). `generate_image` (`generate_image.rs` + a `server.rs`
 handler) is a dedicated MCP tool, **not** a `run_phase` costume and **not** a kaish
 builtin: it resolves the cast's `image` slot into an `ImageGen` (`image_gen.rs`),
@@ -202,7 +218,8 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
   (explorer, synth, image, tts; `ModelRole`/`ModelSlot` in `config.rs`),
   spelled `[casts.<name>]` since the backends/casts split shipped. The `image` slot
   is now consumed by `generate_image`; `tts` stays a reserved seam pending rig
-  coverage. `explore`/`synthesize` remain the agent costumes over `run_phase`;
+  coverage. `consult`/`oneshot` are the agent costumes over `run_phase` (the old
+  `explore`/`synthesize` tools folded into them — see the surface-collapse below);
   capabilities are their own tool shapes, never new loops.
 
 **Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
@@ -283,7 +300,7 @@ completes, while a pure-script spin still dies at 30s.
 ## P2 — Focused fixes & hardening
 
 ### Review the provider retry + failure policy (and document it)
-We don't have a stated, audited answer for what a `consult`/`explore`/`synthesize`
+We don't have a stated, audited answer for what a `consult`/`oneshot`
 call does when a provider misbehaves mid-flight: a 429/529 overload, a connection
 reset, a partial stream, or a wedged-but-connected backend. Today the only explicit
 guard is the per-backend `request_timeout_secs` (default 900, `config.md`) that bounds
@@ -305,8 +322,9 @@ the scripted `CompletionClient` (`test_support.rs`) is the natural guard.
 ### `[context]` house rules have no size cap (and ride every turn, every phase)
 The `[context]` files are spliced into the preamble whole (`context.rs::assemble`
 → `consult.rs::with_house_rules`), the preamble is re-sent on *every* model turn,
-and the block now rides *every* phase — the driver, standalone `explore`/
-`synthesize`, and each nested `explore′` sweep. A large `AGENTS.md` +
+and the block rides every codebase-reading phase — the `consult` driver and each
+nested `explore′` sweep (the toolless `oneshot` reads no project, so it gets none).
+A large `AGENTS.md` +
 `~/.claude/CLAUDE.md` is real token cost multiplied across turns *and* sweeps. No
 truncation by design — silent truncation of operator guidance is the wrong failure
 — but a generous cap with a *loud* error (or a startup warning naming the byte
@@ -331,15 +349,16 @@ for now, but a busy server rebuilds kernels constantly. Consider a small worker
 pool, or resetting one kernel's cwd between phases instead of rebuilding. Measure
 before optimizing.
 
-### `synthesize_batch` — a tool-less, batchable synth variant (deferred from the tool-surface work)
-The standalone `synthesize` we shipped is *interactive* (`{run_kaish}`) so it can
-self-correct a bad cite — the panel was unanimous a tool-less synth is too weak.
-The strictly tool-less, non-interactive variant is still worth having for batch
-fan-out: submit → poll → read, modelled on gpal/cpal's job system. Uses the parked
-`SYNTH_ONESHOT_PREAMBLE` wording in the (now-deleted) plan. It's a **per-provider
-capability** like `thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, `openai` ✗ —
-`None` where unsupported. Open fork when built: many-questions/one-model vs
-one-question/many-models (the diverse-opinion panel made literal).
+### `oneshot` batch — batchable fan-out of the tool-less answer (deferred)
+The tool-less, non-interactive answer shipped as the `oneshot` tool (prompt in,
+answer out, no tools — `consult.rs::oneshot`). What's still deferred is the *batch*
+shape for fan-out: submit → poll → read, modelled on gpal/cpal's job system, so a
+caller can fire many oneshots (or one question across many casts) without holding a
+synchronous call open per answer. It's a **per-provider capability** like
+`thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, `openai` ✗ — `None` where
+unsupported. Open fork when built: many-questions/one-model vs one-question/many-models
+(the diverse-opinion panel made literal). The provenance footer oneshot already
+appends makes a batch result self-labelling.
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they
@@ -461,28 +480,18 @@ mid-consult error. An MCP resource enumerating models could ride along.
 
 ## P4 — Eventually
 
-### Config-overrideable system prompts (deferred until a non-Amy user asks)
-Note: the in-tree `ModelShape` seam (P3, "Per-model request shaping") is the *same*
-resolution point this would extend — build that first; config override rides it.
-Every model-facing string is hardcoded in Rust today: the three phase preambles
-(`consult.rs` `report_preamble`/`synthesize_preamble`/`consult_preamble`, each
-interpolating `kaish_syntax_core()`), the per-call framers (`synthesize_user_prompt`,
-`consult_user_prompt`), `FINALIZE_NOTE`, and the shared cheatsheet in
-`kaish_syntax.rs` (`KAISH_SANDBOX_ADDENDUM` + the `kaish-help`-sourced contract). No
-config path reaches any of them. The seam is already there: `ConsultConfig`
-(`consult.rs`) is threaded into every phase fn, so a resolved `prompts` set could ride
-on it and replace the `&consult_preamble()` literals at the `.preamble()` call in
-`run_phase`; on the config side a `[prompts]` table would slot in exactly like
-`[defaults]`. Deferred because Amy is the only user and edits the source directly —
-build it when someone else needs it. Three forks to settle *when* asked, not now:
-- **Granularity** — server-wide `[prompts]` vs per-cast/per-slot (prompt framing is
-  model-sensitive: Gemma fixates on prohibitions where capable models don't, per the
-  positive-framing discipline, so per-slot has a real case) vs both.
-- **Replace scope** — override the role text only and keep injecting
-  `kaish_syntax_core()` (safe: can't silently drop the grounding/exit-code contract)
-  vs full-preamble raw replace vs per-field opt-in.
-- **Source** — `*_file` path (keeps `config.toml` readable, prompts as real files)
-  vs inline `"""…"""` vs both, mirroring `api_key_env`/`api_key_file`.
+### Config-overrideable system prompts — residual (the phase-preamble override shipped)
+The phase **preambles** are now config-overridable: `[prompts].<phase>` (`explorer` /
+`consult` / `oneshot`) and the per-slot `preamble` full-replace the built-in, resolved
+through `ConsultConfig.prompts` and threaded into every phase fn (`config.rs`,
+`docs/config.md`). Granularity (server-wide *and* per-slot), replace scope (full
+replace; the kaish contract still rides the `run_kaish` tool description), and source
+(inline `"""…"""`) all landed. What's *not* reachable, by design: the per-call framers
+(`consult_user_prompt`), `FINALIZE_NOTE`, and the shared cheatsheet in `kaish_syntax.rs`
+(`KAISH_SANDBOX_ADDENDUM` + the `kaish-help`-sourced contract) — the cheatsheet is the
+grounding/exit-code contract and must not be silently droppable. Only build a config
+path to the framers if a real user wants it; the remaining fork is whether a `*_file`
+source (prompts as real files) is worth it alongside the inline form.
 
 ### A secrets-manager key source (deferred)
 Custom credential paths shipped — a backend's `api_key_env` / `api_key_file`

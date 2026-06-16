@@ -864,9 +864,9 @@ fn cli_cast_wins_over_env_and_file() {
     c.apply_cli(
         Some("/tmp/proj".into()),
         Some("deepseek".to_string()),
-        // Only --no-explore was passed.
+        // Only --no-oneshot was passed.
         ToolDisables {
-            explore: true,
+            oneshot: true,
             ..Default::default()
         },
         vec![], // no --allow-path flags
@@ -875,9 +875,9 @@ fn cli_cast_wins_over_env_and_file() {
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
-    // Only explore is dropped; the rest stay enabled.
+    // Only oneshot is dropped; the rest stay enabled.
     assert!(c.tools.consult);
-    assert!(!c.tools.explore);
+    assert!(!c.tools.oneshot);
     assert!(c.tools.run_kaish);
 }
 
@@ -971,8 +971,7 @@ fn tilde_expands_in_env_layer_root_and_allow_paths() {
     );
     for expected in [format!("{home}/a"), format!("{home}/b")] {
         assert!(
-            c.allow_paths
-                .contains(&std::path::PathBuf::from(&expected)),
+            c.allow_paths.contains(&std::path::PathBuf::from(&expected)),
             "~ in KAIBO_ALLOW_PATHS must expand to {expected}, got {:?}",
             c.allow_paths
         );
@@ -1481,7 +1480,7 @@ fn context_env_overrides_file_and_empty_opts_out() {
 fn prompts_default_to_no_overrides() {
     let c = Config::builtin();
     assert!(c.prompts.explorer.is_none());
-    assert!(c.prompts.synthesize.is_none());
+    assert!(c.prompts.oneshot.is_none());
     assert!(c.prompts.consult.is_none());
 }
 
@@ -1511,7 +1510,7 @@ fn prompts_table_sets_per_phase_overrides() {
         .unwrap()
         .contains("staff engineer"));
     // An unset phase stays None — the built-in runs.
-    assert!(c.prompts.synthesize.is_none());
+    assert!(c.prompts.oneshot.is_none());
 }
 
 /// An empty (or whitespace-only) override is a loud load error — a blank system

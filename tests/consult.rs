@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
 use kaibo::consult::{
-    consult, explore, request_params, synthesize, synthesize_user_prompt, thinking_params, Arm,
-    ConsultConfig, ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
+    consult, consult_user_prompt, oneshot, request_params, thinking_params, Arm, ConsultConfig,
+    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
 use serde_json::{json, Value};
@@ -32,11 +32,32 @@ fn builtin_arm(cast: &str, role: ModelRole) -> Arm {
     arm_from(&Config::builtin(), cast, role)
 }
 
+/// A throwaway explorer arm for the driver-only `view_image` tests. `consult` needs
+/// an explorer arm to assemble its toolset, but these tests never make the driver
+/// delegate a sweep, so it is never invoked — it just has to exist. Shares the
+/// synth's scripted client under a model id the test never scripts.
+fn unused_explorer(client: &ScriptedClient) -> Arm {
+    Arm::new(
+        client.clone(),
+        "unused-explorer",
+        16384,
+        None,
+        ModelCaps {
+            vision: false,
+            tool_result_images: true,
+        },
+    )
+}
+
 #[test]
-fn synthesize_prompt_grounds_in_supplied_context() {
-    let p = synthesize_user_prompt(
+fn consult_seed_context_is_framed_as_trusted_evidence() {
+    // The seam that absorbed standalone `synthesize`: caller `context` rides the
+    // consult driver's prompt as *trusted starting evidence*, with the steer to
+    // investigate for more — not to re-verify what's likely right.
+    let p = consult_user_prompt(
         "What blocks writes?",
         Some("src/sandbox.rs:95 read-only mount"),
+        &[],
     );
 
     assert!(p.contains("What blocks writes?"), "question present");
@@ -45,25 +66,16 @@ fn synthesize_prompt_grounds_in_supplied_context() {
         "context present"
     );
     assert!(p.to_lowercase().contains("context"), "context labelled");
-    // Question framed before the supplied context.
-    let q = p.find("What blocks writes?").unwrap();
-    let c = p.find("src/sandbox.rs:95 read-only mount").unwrap();
-    assert!(q < c, "question should precede the context");
-    // Framing: a grounded citation is trusted; `run_kaish` is for *getting more*
-    // when the context isn't enough — not for re-verifying what's likely right.
-    // Pin both halves so a revert toward "verify the cited span" framing, or a
-    // revert that drops the get-more license, fails here.
-    assert!(
-        p.contains("run_kaish"),
-        "investigation tool offered even with context"
-    );
+    // Framing: a grounded citation is trusted; tools are for *getting more* when the
+    // context isn't enough — not for re-verifying. Pin both halves so a revert toward
+    // "verify the cited span", or one that drops the get-more license, fails here.
     let lower = p.to_lowercase();
     assert!(
         lower.contains("trust"),
         "a grounded citation should be trusted, got: {p}"
     );
     assert!(
-        lower.contains("more than the context")
+        lower.contains("more than it gives")
             || lower.contains("didn't cover")
             || lower.contains("left open"),
         "supplied context must steer toward fetching more, not re-verifying, got: {p}"
@@ -71,24 +83,18 @@ fn synthesize_prompt_grounds_in_supplied_context() {
 }
 
 #[test]
-fn synthesize_prompt_without_context_still_points_at_investigation() {
-    // The panel's "vacuous with empty context" worry: with no context the prompt
-    // must still drive a real investigation via run_kaish, not invite a guess.
-    let p = synthesize_user_prompt("What blocks writes?", None);
-    assert!(p.contains("What blocks writes?"));
-    assert!(
-        p.contains("run_kaish"),
-        "empty context must still steer to run_kaish, got: {p}"
+fn consult_prompt_without_context_or_history_is_the_bare_question() {
+    // No seed, no thread ⇒ the prompt is exactly the question; the investigation
+    // steer lives in the consult preamble, not this prompt. Whitespace-only context
+    // is no context — don't pretend there's evidence.
+    assert_eq!(
+        consult_user_prompt("What blocks writes?", None, &[]),
+        "What blocks writes?"
     );
-}
-
-#[test]
-fn synthesize_prompt_treats_blank_context_as_absent() {
-    // Whitespace-only context is no context — don't pretend there's evidence.
-    let p = synthesize_user_prompt("Q?", Some("  \n  "));
-    assert!(
-        p.contains("run_kaish"),
-        "blank context should behave like None, got: {p}"
+    assert_eq!(
+        consult_user_prompt("Q?", Some("  \n  "), &[]),
+        "Q?",
+        "blank context should behave like None"
     );
 }
 
@@ -596,9 +602,10 @@ fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
 type Responder = Arc<
     dyn Fn(
             &rig_core::completion::CompletionRequest,
-        )
-            -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError>
-        + Send
+        ) -> Result<
+            rig_core::completion::CompletionResponse<()>,
+            rig_core::completion::CompletionError,
+        > + Send
         + Sync,
 >;
 
@@ -626,9 +633,10 @@ impl ScriptedClient {
     where
         F: Fn(
                 &rig_core::completion::CompletionRequest,
-            )
-                -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError>
-            + Send
+            ) -> Result<
+                rig_core::completion::CompletionResponse<()>,
+                rig_core::completion::CompletionError,
+            > + Send
             + Sync
             + 'static,
     {
@@ -680,7 +688,8 @@ impl rig_core::completion::CompletionModel for ScriptedModel {
     async fn completion(
         &self,
         request: rig_core::completion::CompletionRequest,
-    ) -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError> {
+    ) -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError>
+    {
         assert_eq!(
             self.id, self.client.expect_model,
             "this client serves only {:?} — the loop routed a phase to the wrong client",
@@ -719,7 +728,9 @@ impl rig_core::completion::CompletionModel for ScriptedModel {
 /// A final text answer — ends the tool loop.
 fn text_response(text: impl Into<String>) -> rig_core::completion::CompletionResponse<()> {
     rig_core::completion::CompletionResponse {
-        choice: rig_core::OneOrMany::one(rig_core::completion::message::AssistantContent::text(text)),
+        choice: rig_core::OneOrMany::one(rig_core::completion::message::AssistantContent::text(
+            text,
+        )),
         usage: rig_core::completion::Usage::new(),
         raw_response: (),
         message_id: None,
@@ -733,9 +744,9 @@ fn tool_call_response(
     args: Value,
 ) -> rig_core::completion::CompletionResponse<()> {
     rig_core::completion::CompletionResponse {
-        choice: rig_core::OneOrMany::one(rig_core::completion::message::AssistantContent::tool_call(
-            id, name, args,
-        )),
+        choice: rig_core::OneOrMany::one(
+            rig_core::completion::message::AssistantContent::tool_call(id, name, args),
+        ),
         usage: rig_core::completion::Usage::new(),
         raw_response: (),
         message_id: None,
@@ -867,6 +878,7 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
 
     let out = consult(
         "Where is target_marker defined?",
+        None,
         dir.path(),
         &explorer,
         &synth,
@@ -964,8 +976,8 @@ fn request_has_user_image(req: &rig_core::completion::CompletionRequest) -> bool
 /// the next turn — not text. The synth can only reach its answer once it has seen the
 /// image, so a green run proves the whole chain: caps → toolset assembly → VFS read
 /// through the read-only kernel → base64 envelope → rig `from_tool_output` → image in
-/// model context. The proof of the "all three phases" decision, exercised on the
-/// `synthesize` phase through its public seam.
+/// model context. The proof of the "all phases" decision, exercised on the `consult`
+/// driver (the synth arm) — where `view_image` rides now.
 #[tokio::test]
 async fn a_vision_synth_sees_an_image_through_view_image() {
     const SYNTH_MODEL: &str = "claude-sonnet-4-6";
@@ -1004,15 +1016,18 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
         },
     );
 
-    let answer = synthesize(
+    let answer = consult(
         "What does the diagram show?",
         None,
         &root,
+        &unused_explorer(&synth_client),
         &synth,
         &ConsultConfig::default(),
+        None,
     )
     .await
-    .expect("vision synthesize should succeed");
+    .expect("vision consult should succeed")
+    .answer;
 
     // The only route to "DONE" runs through the image-present branch, so this single
     // assertion proves the round-trip: the model actually received the image part.
@@ -1023,7 +1038,7 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
 }
 
 /// The negative: a blind synth (the default `ModelCaps { vision: false, tool_result_images: true }`) is never
-/// offered `view_image`. Pin it on the same `synthesize` seam so the gate can't
+/// offered `view_image`. Pin it on the same `consult` driver so the gate can't
 /// silently flip open for a text-only model.
 #[tokio::test]
 async fn a_blind_synth_is_not_offered_view_image() {
@@ -1049,15 +1064,17 @@ async fn a_blind_synth_is_not_offered_view_image() {
         },
     );
 
-    synthesize(
+    consult(
         "anything",
         None,
         dir.path(),
+        &unused_explorer(&synth_client),
         &synth,
         &ConsultConfig::default(),
+        None,
     )
     .await
-    .expect("blind synthesize should succeed");
+    .expect("blind consult should succeed");
     assert!(
         !synth_client.seen().is_empty(),
         "the synth client was driven"
@@ -1118,15 +1135,18 @@ async fn an_openai_vlm_sees_an_image_on_the_user_turn_channel() {
         },
     );
 
-    let answer = synthesize(
+    let answer = consult(
         "What does the diagram show?",
         None,
         &root,
+        &unused_explorer(&synth_client),
         &synth,
         &ConsultConfig::default(),
+        None,
     )
     .await
-    .expect("openai-VLM synthesize should resume after the view_image break");
+    .expect("openai-VLM consult should resume after the view_image break")
+    .answer;
 
     assert!(
         answer.contains("DONE"),
@@ -1181,15 +1201,18 @@ async fn an_openai_vlm_co_tool_call_view_image_and_run_kaish_resumes_cleanly() {
         },
     );
 
-    let answer = synthesize(
+    let answer = consult(
         "What does the diagram show?",
         None,
         &root,
+        &unused_explorer(&synth_client),
         &synth,
         &ConsultConfig::default(),
+        None,
     )
     .await
-    .expect("a co-tool-call view_image turn must resume without orphaning run_kaish");
+    .expect("a co-tool-call view_image turn must resume without orphaning run_kaish")
+    .answer;
 
     assert!(
         answer.contains("DONE"),
@@ -1232,15 +1255,15 @@ async fn secondary_local_cast_from_user_config_runs() {
     let secondary = ModelSlot::bare(glm_synth.backend.clone(), "Gemma-4-E4B-it-GGUF");
     let arm = Arm::from_slot(backend, &secondary, ModelRole::Synth, &cfg.defaults)
         .expect("secondary arm builds");
-    let answer = synthesize(
-        "In one sentence, what does kaibo's read-only sandbox prevent?",
-        Some("src/sandbox.rs builds a read-only kernel; writes and external commands are refused."),
-        env!("CARGO_MANIFEST_DIR"),
+    let answer = oneshot(
+        "Context: src/sandbox.rs builds a read-only kernel; writes and external \
+         commands are refused.\n\nIn one sentence, what does kaibo's read-only sandbox \
+         prevent?",
         &arm,
         &ConsultConfig::default(),
     )
     .await
-    .expect("secondary-cast synthesize against Lemonade should succeed");
+    .expect("secondary-cast oneshot against Lemonade should succeed");
     eprintln!("=== SECONDARY CAST ANSWER ===\n{answer}\n");
     assert!(!answer.trim().is_empty(), "expected a non-empty answer");
 }
@@ -1258,6 +1281,7 @@ async fn recomposed_consult_runs_against_local_gemma() {
 
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
         root,
         &builtin_arm("openai", ModelRole::Explorer),
         &builtin_arm("openai", ModelRole::Synth),
@@ -1282,68 +1306,28 @@ async fn recomposed_consult_runs_against_local_gemma() {
     );
 }
 
-// The `explore` unit on its own (the seam behind the MCP `explore` tool): a cheap
-// model drives {run_kaish} and returns a curated report citing real file:line.
+// The `oneshot` seam live: a thin, toolless answer grounded only in the context the
+// caller pasted into the prompt (no codebase access, no run_kaish). The counterpart
+// to consult — consult-without-context's "investigate the real tree" path is covered
+// by `recomposed_consult_runs_against_local_gemma` above.
 #[tokio::test]
-#[ignore = "hits the local OpenAI-compatible (Gemma) server (explore only); run with --ignored while it's up"]
-async fn explore_unit_reports_from_the_real_tree() {
-    let report = explore(
-        "Which source file enforces the read-only sandbox, and name one builtin it blocks?",
-        env!("CARGO_MANIFEST_DIR"),
-        &builtin_arm("openai", ModelRole::Explorer),
+#[ignore = "hits the local OpenAI-compatible (Gemma) server (oneshot); run with --ignored while it's up"]
+async fn oneshot_answers_from_pasted_context() {
+    let arm = builtin_arm("openai", ModelRole::Synth);
+
+    let answer = oneshot(
+        "Context: src/sandbox.rs builds a read-only kernel; the LocalFs read-only \
+         mount refuses every write.\n\nIn one sentence, which file enforces kaibo's \
+         read-only sandbox?",
+        &arm,
         &ConsultConfig::default(),
     )
     .await
-    .expect("explore against local gemma should succeed");
-
-    eprintln!("=== EXPLORE REPORT ===\n{report}\n");
-    let lower = report.to_lowercase();
+    .expect("oneshot against local gemma should succeed");
+    eprintln!("=== ONESHOT ===\n{answer}\n");
     assert!(
-        lower.contains("sandbox.rs") || lower.contains("sandbox"),
-        "the report should cite the sandbox source, got: {report}"
-    );
-}
-
-// Standalone `synthesize` (the seam behind the MCP `synthesize` tool): grounded
-// from supplied context, and — the panel's worry — still useful with no context
-// because run_kaish lets it investigate rather than guess.
-#[tokio::test]
-#[ignore = "hits the local OpenAI-compatible (Gemma) server (synthesize); run with --ignored while it's up"]
-async fn synthesize_grounds_in_context_and_investigates_without_it() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let cfg = ConsultConfig::default();
-    let arm = builtin_arm("openai", ModelRole::Synth);
-
-    // With a thin context: it should answer grounded, optionally confirming via run_kaish.
-    let with_ctx = synthesize(
-        "Which file enforces the read-only sandbox?",
-        Some("src/sandbox.rs builds a read-only kernel; the LocalFs read-only mount refuses every write."),
-        root,
-        &arm,
-        &cfg,
-    )
-    .await
-    .expect("synthesize with context should succeed");
-    eprintln!("=== SYNTH (with context) ===\n{with_ctx}\n");
-    assert!(
-        with_ctx.to_lowercase().contains("sandbox"),
-        "should answer about the sandbox file, got: {with_ctx}"
-    );
-
-    // With NO context: it must still investigate via run_kaish and answer grounded.
-    let no_ctx = synthesize(
-        "Which file enforces the read-only sandbox?",
-        None,
-        root,
-        &arm,
-        &cfg,
-    )
-    .await
-    .expect("synthesize without context should still investigate and succeed");
-    eprintln!("=== SYNTH (no context) ===\n{no_ctx}\n");
-    assert!(
-        no_ctx.to_lowercase().contains("sandbox"),
-        "empty-context synth must investigate and still answer, got: {no_ctx}"
+        answer.to_lowercase().contains("sandbox"),
+        "should answer about the sandbox file from the pasted context, got: {answer}"
     );
 }
 
@@ -1358,6 +1342,7 @@ async fn two_phase_consult_via_deepseek() {
     }
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
         env!("CARGO_MANIFEST_DIR"),
         &builtin_arm("deepseek", ModelRole::Explorer),
         &builtin_arm("deepseek", ModelRole::Synth),
@@ -1383,6 +1368,7 @@ async fn two_phase_consult_via_gemini() {
     }
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
         env!("CARGO_MANIFEST_DIR"),
         &builtin_arm("gemini", ModelRole::Explorer),
         &builtin_arm("gemini", ModelRole::Synth),
@@ -1413,6 +1399,7 @@ async fn two_phase_consult_answers_from_the_real_tree() {
 
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
         root,
         &builtin_arm("anthropic", ModelRole::Explorer),
         &builtin_arm("anthropic", ModelRole::Synth),
@@ -1456,6 +1443,7 @@ async fn adaptive_only_anthropic_model_round_trips() {
 
     let out = consult(
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
         env!("CARGO_MANIFEST_DIR"),
         &explorer,
         &synth,

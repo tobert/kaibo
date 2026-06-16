@@ -6,8 +6,8 @@
 //! - **Consultation** — grounded, cited answers about a codebase. A capable model
 //!   reads precise spans and delegates broad sweeps to a cheap *explorer* sub-agent,
 //!   all driving a read-only [`kaish`] kernel via `run_kaish(script)` (`cat`, `grep`,
-//!   `rg`, `find`, `jq`, pipelines, the lot). The `consult`/`explore`/`synthesize`
-//!   tools are all costumes over one primitive, [`consult::run_phase`].
+//!   `rg`, `find`, `jq`, pipelines, the lot). The `consult` and toolless `oneshot`
+//!   tools are both costumes over one primitive, [`consult::run_phase`].
 //! - **Capabilities** — things the team can *do* and hand back as artifacts. The first
 //!   is image generation ([`image_gen`], the `generate_image` tool); more (TTS/STT, …)
 //!   follow as rig grows provider coverage. A capability is its own tool shape, not a

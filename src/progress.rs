@@ -21,7 +21,7 @@ use std::fmt;
 /// sweeps, read zero spans, or hit its turn cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhaseEvent {
-    /// A top-level tool began (`consult` / `explore` / `synthesize`).
+    /// A top-level tool began (`consult` / `oneshot`).
     PhaseStarted { phase: &'static str },
     /// The model ran a kaish script directly — a precise read.
     KaishRun { script: String },
