@@ -22,7 +22,7 @@
 # Getting started — a fresh install has no key yet
 # ---------------------------------------------------------------------------
 # With nothing configured, kaibo starts fine and `run_kaish` works immediately —
-# the read-only shell needs no model. `consult` / `explore` / `synthesize` need a
+# the read-only shell needs no model. `consult` / `oneshot` need a
 # provider key on the default cast (`anthropic` out of the box). Give it one the
 # private way — kaibo reads the key at startup, so it never enters your chat:
 #   env:   export ANTHROPIC_API_KEY=sk-...     (or DEEPSEEK_/GEMINI_/OPENAI_…)
@@ -58,11 +58,10 @@ cast = "anthropic"
 log = "kaibo=info"
 
 # Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
-# A config with all five false is refused at startup, same as today.
+# A config with all four false is refused at startup, same as today.
 [server.tools]
 consult        = true
-explore        = true
-synthesize     = true
+oneshot        = true
 run_kaish      = true
 generate_image = true
 
@@ -335,14 +334,15 @@ synth    = "gpt/gpt-5"
 # shell contract rides the run_kaish tool regardless). File-only and operator-only
 # (a calling agent can't inject a prompt). An empty value is a loud load error.
 # Precedence per phase: slot `preamble` (per-model, above) > [prompts].<phase> >
-# built-in. The synth slot feeds both `synthesize` and `consult`, but each keeps
-# its own key, so they can diverge.
+# built-in. The synth slot feeds both `consult` and `oneshot`, but each keeps
+# its own key, so they can diverge. Phases: `explorer` (the nested explore′ sweep),
+# `consult` (the driver), `oneshot` (the thin toolless answer).
 # ---------------------------------------------------------------------------
 #
 # [prompts]
-# explorer   = "You are a security auditor. Hunt injection sinks and unsafe deserialization."
-# synthesize = "Answer concisely; lead with the file:line that settles it."
-# consult    = """
+# explorer = "You are a security auditor. Hunt injection sinks and unsafe deserialization."
+# oneshot  = "Answer concisely; you have no codebase access, so reason from what you're given."
+# consult  = """
 # You are a staff engineer reviewing this codebase.
 # Prefer architectural answers; name the file:line that carries each claim.
 # """

@@ -8,13 +8,7 @@ use std::process::Command;
 use kaibo::config::Config;
 use kaibo::server::{KaiboHandler, ToolGating};
 
-const ALL_TOOLS: [&str; 5] = [
-    "consult",
-    "explore",
-    "generate_image",
-    "run_kaish",
-    "synthesize",
-];
+const ALL_TOOLS: [&str; 4] = ["consult", "generate_image", "oneshot", "run_kaish"];
 
 fn advertised(gating: ToolGating) -> Vec<String> {
     let mut config = Config::builtin();
@@ -40,16 +34,9 @@ fn each_flag_removes_exactly_its_own_tool() {
             },
         ),
         (
-            "explore",
+            "oneshot",
             ToolGating {
-                explore: false,
-                ..Default::default()
-            },
-        ),
-        (
-            "synthesize",
-            ToolGating {
-                synthesize: false,
+                oneshot: false,
                 ..Default::default()
             },
         ),
@@ -88,8 +75,7 @@ fn each_flag_removes_exactly_its_own_tool() {
 fn all_disabled_is_detected() {
     let none_on = ToolGating {
         consult: false,
-        explore: false,
-        synthesize: false,
+        oneshot: false,
         run_kaish: false,
         generate_image: false,
     };
@@ -115,8 +101,7 @@ fn all_tools_disabled_refuses_to_start() {
         .env("XDG_CONFIG_HOME", empty_config.path())
         .args([
             "--no-consult",
-            "--no-explore",
-            "--no-synthesize",
+            "--no-oneshot",
             "--no-run-kaish",
             "--no-generate-image",
         ])

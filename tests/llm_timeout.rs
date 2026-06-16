@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use kaibo::config::{Config, ModelRole};
-use kaibo::consult::{synthesize, Arm, ConsultConfig};
+use kaibo::consult::{oneshot, Arm, ConsultConfig};
 use tokio::net::TcpListener;
 
 /// Bind an ephemeral port and accept connections forever without ever replying —
@@ -36,7 +36,7 @@ async fn black_hole() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn synthesize_aborts_when_the_provider_never_responds() {
+async fn oneshot_aborts_when_the_provider_never_responds() {
     let (base_url, _server) = black_hole().await;
 
     // The built-in openai backend aimed at the black hole, keyless, with a short
@@ -62,10 +62,8 @@ async fn synthesize_aborts_when_the_provider_never_responds() {
     let started = Instant::now();
     let res = tokio::time::timeout(
         Duration::from_secs(20),
-        synthesize(
+        oneshot(
             "What does the sandbox prevent?",
-            Some("src/sandbox.rs builds a read-only kernel."),
-            env!("CARGO_MANIFEST_DIR"),
             &arm,
             &ConsultConfig::default(),
         ),

@@ -178,34 +178,32 @@ every tool off is refused at startup.
 
 ### `consult` — hybrid agent that explores and synthesizes
 
-Ask a question about a codebase; get a grounded, cited answer. A capable model drives
-a fast explorer sub-agent and can fill in any gaps using its own `run_kaish` tool.
-The models have instructions to return a synthesized report at the end, leaving the
-noise from the consultation out of your context.
+Ask a model *outside your own family* about a codebase; get a grounded, cited answer.
+A capable model drives a fast explorer sub-agent and can fill in any gaps using its own
+`run_kaish` tool. The models have instructions to return a synthesized report at the
+end, leaving the noise from the consultation out of your context. Describe what you did
+or want to know in prose — kaibo reads the real, current source itself, so you don't
+need to paste a diff; optionally seed it with `context` (a change summary or pasted
+source), which it trusts as starting evidence while investigating for more. The answer
+carries a provenance footer naming the cast and models that produced it.
 
 When an answer surprises you, pass `include_report: true` to get the explorer's raw
 findings back alongside it — the audit trail for how the consultation reached its
 conclusion. (For deeper tracing, kaibo emits per-tool OpenTelemetry spans; see
 [`docs/config.md`](docs/config.md).)
 
-*Args:* `question` (required), `path` (project dir; optional with a default `--root`),
-`cast`, `session_id`, `include_report`, and per-call `explorer_model` / `synth_model`
-(+ `_backend`) overrides.
+*Args:* `question` (required), `context` (optional seed), `path` (project dir; optional
+with a default `--root`), `cast`, `session_id`, `include_report`, and per-call
+`explorer_model` / `synth_model` (+ `_backend`) overrides.
 
-### `explore` — the fast evidence-gatherer
+### `oneshot` — a thin second opinion
 
-The explorer agent on its own: a fast, cheap model reads the project and returns a
-curated report. Its instructions ask it to include relevant files, line numbers,
-and key snippets without trying to analyze them. This saves work for the more
-expensive models.
+The counterpart to `consult` for when you already own the context: prompt in, answer
+out, no codebase access and no tools — exactly one upstream request. Use it to ask a
+model outside your family a direct question (you've pasted what's needed, or it's
+general). Pick the model with `cast`; the answer carries the same provenance footer.
 
-### `synthesize` — a second opinion
-
-A capable model answers a question, grounded in optional `context` you pass in
-(typically an `explore` report or pasted source). With context it treats it as
-primary evidence and uses the shell only to verify or fill precise gaps; without
-context it investigates directly. This is the synthesizer half of `consult`, callable
-on its own without the explorer phase.
+*Args:* `prompt` (required), `cast`, and a per-call `model` (+ `backend`) override.
 
 ### `run_kaish` — direct read-only shell
 
@@ -241,11 +239,13 @@ your agent ──stdio MCP──▶ kaibo
                        back to your agent
 ```
 
-kaibo is an agent for your agent. kaibo's consult(), explore(), and synthesize() agents have their
-own tool, `run_kaish` for working with the filesystem and transforming inputs. When using the
-consult() tool, it starts with a big model, which can delegate to the explore agent. The
-explorer/synthesis combination is meant to speed up execution and save token spend by having
-smaller and faster models do the bulk of tool calling operations before synthesis begins.
+kaibo is an agent for your agent. kaibo's consult() agent drives the read-only
+`run_kaish` shell for working with the filesystem and transforming inputs. When using the
+consult() tool, it starts with a big model, which can delegate to a fast explorer
+sub-agent. The explorer/synthesis combination is meant to speed up execution and save token
+spend by having smaller and faster models do the bulk of tool calling operations before
+synthesis begins. (oneshot() skips all of that — a single direct call when you already
+have the context.)
 
 It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)

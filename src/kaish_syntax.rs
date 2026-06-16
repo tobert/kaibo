@@ -122,10 +122,10 @@ fn kaibo_lead() -> &'static str {
      spans. You don't need to paste files or a diff: prose about your intent is \
      worth more than a dump kaibo would just re-read from disk. Reach for \
      `consult` first — a capable model investigates and hands back the answer, \
-     not the transcript. kaibo also exposes more focused tools (a fast \
-     `explore`, a `synthesize` seam, and `run_kaish` to drive the shell \
-     yourself), each gated independently and described in its own schema, so a \
-     given server may advertise only some."
+     not the transcript. kaibo also exposes `oneshot` (a thin, toolless second \
+     opinion when you already own the context) and `run_kaish` (drive the \
+     read-only shell yourself), each gated independently and described in its \
+     own schema, so a given server may advertise only some."
 }
 
 /// The kaish onboarding spine — the mental model, operating contract, live builtin
@@ -183,8 +183,8 @@ fn setup_section(config: &Config) -> String {
 
     format!(
         "## Setup needed — no model provider configured\n\
-         kaibo's default cast `{cast}` has no usable API key, so `consult`, `explore`, \
-         and `synthesize` can't reach a model yet. `run_kaish` works right now — it drives \
+         kaibo's default cast `{cast}` has no usable API key, so `consult` and \
+         `oneshot` can't reach a model yet. `run_kaish` works right now — it drives \
          the read-only shell with no model in the loop — so you can browse the code while \
          you set a key.\n\n\
          Give the default cast a key. Prefer an **environment variable** or a **key file** \

@@ -4,11 +4,12 @@
 //! a bounded tool loop. Every tool on the surface is that loop wearing different
 //! clothes:
 //!
-//! - [`explore`] — a cheap model · `{run_kaish}` → a curated report.
-//! - [`synthesize`] — a capable model · `{run_kaish}` · optional context → an answer.
-//! - [`consult`] — a capable model · `{run_kaish, explore′}` → a cited answer. No
-//!   rigid explorer→synth hand-off: the capable model decides when to delegate a
-//!   broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span directly.
+//! - [`consult`] — a capable model · `{run_kaish, explore′}` · optional context → a
+//!   cited answer. No rigid explorer→synth hand-off: the capable model decides when
+//!   to delegate a broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span
+//!   directly. The `explore′` sweep ([`report_preamble`]) is internal to this loop.
+//! - [`oneshot`] — a capable model · no tools · the caller's context → a direct
+//!   answer. The thin counterpart: one upstream request, no codebase access.
 //!
 //! Each phase arrives as a resolved [`Arm`]: its own client (type-erased — the
 //! decided plumbing fork, `docs/casts.md`), model, request params, and caps. The
@@ -52,9 +53,9 @@ use crate::view_image::ViewImage;
 /// Splice the operator's house rules (if any) onto a phase preamble. The base
 /// preamble functions stay pure (and their tests byte-for-byte stable); this is
 /// the one seam that folds in the assembled `[context]` block. Every phase that
-/// drives a model uses it — the `consult` driver, the standalone `explore` and
-/// `synthesize`, *and* the nested `explore′` sweep — so the explorer orients on
-/// the same guidance the driver does (it helps *search*, not just the answer).
+/// drives a model uses it — the `consult` driver, the toolless `oneshot`, *and* the
+/// nested `explore′` sweep — so the explorer orients on the same guidance the driver
+/// does (it helps *search*, not just the answer).
 /// `None` returns the base unchanged: a server with no `[context]` files runs
 /// exactly the historical preamble.
 ///
@@ -90,13 +91,12 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
 /// orthogonal axes.
 #[derive(Debug, Clone, Default)]
 pub struct PromptOverrides {
-    /// Replaces [`report_preamble`] — the explorer, both standalone and the
-    /// nested `explore′` sweep.
+    /// Replaces [`report_preamble`] — the nested `explore′` sweep inside `consult`.
     pub explorer: Option<String>,
-    /// Replaces [`synthesize_preamble`] — the standalone `synthesize`.
-    pub synthesize: Option<String>,
     /// Replaces [`consult_preamble`] — the `consult` driver.
     pub consult: Option<String>,
+    /// Replaces [`oneshot_preamble`] — the thin, toolless `oneshot`.
+    pub oneshot: Option<String>,
 }
 
 /// Resolve one phase's full system prompt: the operator override if set, else the
@@ -576,8 +576,8 @@ where
 }
 
 /// One resolved phase arm: its own client + model + request params + caps. The
-/// unit `consult`/`explore`/`synthesize` receive — they never learn about
-/// backends or casts. The server resolves a cast's slots into arms
+/// unit `consult`/`oneshot` (and the nested `explore′`) receive — they never learn
+/// about backends or casts. The server resolves a cast's slots into arms
 /// ([`Arm::from_slot`]); tests inject any [`CompletionClient`] (the scripted
 /// offline one included) via [`Arm::new`], which is what keeps the mock harness
 /// driving the *real* loop with no network.
@@ -1070,8 +1070,8 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 ///
 /// The toolset is injected via a *factory* (not a prebuilt `Vec`, and not hardcoded
 /// to `run_kaish`) so the same loop is the primitive behind every tool on the
-/// surface — `explore` ({run_kaish}), `synthesize` ({run_kaish}), and the
-/// recomposed `consult` ({run_kaish, explore′}). The factory matters because of the
+/// surface — `oneshot` ({} — no tools), the recomposed `consult`
+/// ({run_kaish, explore′}), and its nested `explore′` ({run_kaish}). The factory matters because of the
 /// turn-cap recovery below: a fresh toolset is built for the forced final turn, and
 /// `Box<dyn ToolDyn>` can't be cloned, so we rebuild rather than share. Each call
 /// spawns its own `KaishWorker`(s); the caller owns their lifetime.
@@ -1274,8 +1274,8 @@ pub struct RunExplore {
     progress: Arc<dyn ProgressSink>,
     /// The sweep's fully-resolved system prompt, computed once by `consult_tools`:
     /// the explorer override-or-default with house rules already appended. So the
-    /// nested explorer carries the same `[prompts]`/`[context]` framing as the
-    /// standalone `explore`, built once instead of per sweep.
+    /// nested explorer carries the explorer's `[prompts]`/`[context]` framing,
+    /// built once instead of per sweep.
     preamble: Arc<str>,
 }
 
@@ -1384,163 +1384,94 @@ impl Tool for RunExplore {
     }
 }
 
-/// The `explore` unit: a cheap model drives `{run_kaish}` over `root` and returns
-/// a curated report. The standalone seam behind the MCP `explore` tool — built on
-/// the one loop primitive via the resolved explorer [`Arm`].
-pub async fn explore(
-    question: &str,
-    root: impl Into<PathBuf>,
-    arm: &Arm,
-    cfg: &ConsultConfig,
-) -> Result<String> {
-    let root = root.into();
+/// The `oneshot` preamble: a thin, direct second opinion with no tools and no
+/// codebase access. The caller owns the context, so this never investigates — frame
+/// the model as a capable outside voice answering from what it was handed plus its
+/// own knowledge. Deliberately minimal: no kaish cheatsheet (there are no tools to
+/// drive) and no repo map (oneshot never reads the project).
+pub fn oneshot_preamble() -> String {
+    "You are a capable model giving a direct second opinion to another agent. Answer \
+     the question it sends from the material it provides and your own knowledge — \
+     this call has no codebase access and no tools, so the caller owns the context. \
+     Be precise and useful: reason over exactly what you were handed, and name \
+     explicitly anything you'd need that wasn't given rather than guessing it. Keep \
+     your claims grounded in the material and say where its edge is."
+        .to_string()
+}
+
+/// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
+/// shell, no exploration. The thin counterpart to `consult` (prompt in, answer out)
+/// for when the caller already owns the context and just wants the model's take.
+/// Built on the one loop primitive with an empty toolset and a single turn, so it is
+/// exactly one upstream request. Orientation is never spliced (it reads no project);
+/// operator house rules still apply, like every top-level tool.
+pub async fn oneshot(prompt: &str, arm: &Arm, cfg: &ConsultConfig) -> Result<String> {
     arm.run(
         &phase_preamble(
-            cfg.prompts.explorer.as_deref(),
-            report_preamble,
-            cfg.orientation.as_deref(),
+            cfg.prompts.oneshot.as_deref(),
+            oneshot_preamble,
+            None,
             cfg.house_rules.as_deref(),
         ),
-        question.to_string(),
-        cfg.explorer_max_turns,
+        prompt.to_string(),
+        1,
         cfg.progress.as_ref(),
-        &|| phase_tools(&root, cfg, arm.caps.vision),
+        &|| Ok(Vec::new()),
     )
     .await
 }
 
-/// The single-arm phase toolset (`explore`/`synthesize`): always `run_kaish`, plus
-/// `view_image` when the arm's model is vision-capable. One [`KaishWorker`] backs
-/// both tools (shared kernel) so a vision phase doesn't spin a second kaish thread.
-fn phase_tools(root: &Path, cfg: &ConsultConfig, vision: bool) -> Result<Vec<Box<dyn ToolDyn>>> {
-    let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
-    let mut tools: Vec<Box<dyn ToolDyn>> = vec![traced(RunKaish::with_progress(
-        worker.clone(),
-        cfg.progress.clone(),
-    ))];
-    if vision {
-        tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
-    }
-    Ok(tools)
-}
-
-/// Build the standalone `synthesize` user prompt. Pure and offline-testable.
+/// Build the consult driver's user prompt from the question, any caller-supplied
+/// `context`, and any prior session turns. Pure and offline-testable: this framing
+/// is the whole of the context-seed and multi-turn hand-off, so it's worth pinning.
 ///
-/// With `context`, frame it as trusted starting evidence — a grounded `file:line`
-/// rarely needs re-deriving — and steer the model to reach for `run_kaish` when it
-/// needs *more* than the context gives (a span, a whole file, a detail left open),
-/// not to re-verify what's likely right (question first, then context). With no
-/// context — or whitespace-only — steer the model to investigate directly via
-/// `run_kaish` rather than guess, so the answer stays grounded either way.
-pub fn synthesize_user_prompt(question: &str, context: Option<&str>) -> String {
-    match context.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(context) => format!(
-            "Question:\n{question}\n\n\
-             Context (supplied material — typically a curated explorer report or \
-             pasted source):\n{context}\n\n\
-             Answer the question, grounded in concrete `file:line` evidence. The \
-             context is your starting evidence — when it cites a `file:line`, trust \
-             it; a grounded citation rarely needs re-deriving. Reach for the \
-             `run_kaish` tool when you need more than the context gives you: a span \
-             it references but doesn't quote, a whole file or a large span when you \
-             need the full picture, a detail it left open, or anything the question \
-             asks that it didn't cover. If the code you read and the context \
-             genuinely disagree, the code wins — the code is the only ground truth. \
-             Cite concrete `file:line` for every claim."
-        ),
-        None => format!(
-            "Question:\n{question}\n\n\
-             No context was supplied. Investigate the project yourself with the \
-             `run_kaish` tool (a read-only kaish shell) and answer from what you find, \
-             citing concrete `file:line`."
-        ),
-    }
-}
-
-/// Standalone synth preamble: interactive, framing supplied context as trusted
-/// starting evidence and `run_kaish` as the way to *get more* when the context
-/// isn't enough — including whole files and large spans. Composes the shared
-/// [`kaish_syntax_core`] so the shell idioms and exit-code contract don't drift.
-pub fn synthesize_preamble() -> String {
-    let core = kaish_syntax_core();
-    format!(
-        "You answer a question about a codebase, grounded in evidence and citing \
-         concrete `file:line`. {core}\n\n\
-         You may be given CONTEXT — typically a curated explorer report (a \
-         SummaryOfFindings plus RelevantLocations, each with a `file:line`, key \
-         symbols, and a short snippet), or pasted material. \
-         Treat it as your starting evidence: when it cites a concrete `file:line`, \
-         trust it — a grounded citation rarely needs re-deriving. The `run_kaish` \
-         tool is yours to drive directly whenever the context isn't enough: fetch a \
-         span it references but doesn't quote, read a whole file or a large span when \
-         you need the full picture, chase a detail it left open, or investigate \
-         anything the question reaches that the context didn't cover. Getting more \
-         evidence when you need it is the normal move; you're never limited to what \
-         you were handed. Where the code you read and the context genuinely disagree, \
-         the code wins — the code is the only ground truth that matters. Ground every \
-         claim in a concrete `file:line`."
-    )
-}
-
-/// The standalone `synthesize` seam: a capable model answers `question`, grounded
-/// in an optional caller-supplied `context` (typically an `explore` report or
-/// pasted material), with `run_kaish` to verify or fill a precise gap. Takes the
-/// resolved synth [`Arm`] — a real outside opinion, not the cheap explorer.
-pub async fn synthesize(
-    question: &str,
-    context: Option<&str>,
-    root: impl Into<PathBuf>,
-    arm: &Arm,
-    cfg: &ConsultConfig,
-) -> Result<String> {
-    let root = root.into();
-    let user_prompt = synthesize_user_prompt(question, context);
-    arm.run(
-        &phase_preamble(
-            cfg.prompts.synthesize.as_deref(),
-            synthesize_preamble,
-            cfg.orientation.as_deref(),
-            cfg.house_rules.as_deref(),
-        ),
-        user_prompt,
-        cfg.synth_max_turns,
-        cfg.progress.as_ref(),
-        &|| phase_tools(&root, cfg, arm.caps.vision),
-    )
-    .await
-}
-
-/// Build the consult driver's user prompt from the question and any prior session
-/// turns. Pure and offline-testable: this framing is the whole of the multi-turn
-/// hand-off, so it's worth pinning in a test.
-///
-/// With **no** history this is exactly the bare question — a stateless consult is
-/// byte-for-byte unchanged. With history, prepend the prior `(question, answer)`
-/// pairs as conversation context and steer the model to re-confirm any span a prior
-/// answer cited: the exploration runs fresh every turn (we never replay the stored
-/// report — it'd be stale), so the code is the ground truth, not the old answer.
-pub fn consult_user_prompt(question: &str, history: &[QaTurn]) -> String {
-    if history.is_empty() {
+/// With **no** context and **no** history this is exactly the bare question — a
+/// stateless, unseeded consult is byte-for-byte unchanged. Supplied `context`
+/// (a diff summary, a prior report, pasted source) is framed as *trusted starting
+/// evidence*: a grounded `file:line` rarely needs re-deriving, and the steer is to
+/// investigate for *more* when the context isn't enough — the CLAUDE.md acquisition,
+/// not verification, posture. History prepends the prior `(question, answer)` pairs
+/// and steers the model to re-confirm any span a prior answer cited: the exploration
+/// runs fresh every turn (we never replay the stored report — it'd be stale), so the
+/// code is the ground truth, not the old answer.
+pub fn consult_user_prompt(question: &str, context: Option<&str>, history: &[QaTurn]) -> String {
+    let context = context.map(str::trim).filter(|c| !c.is_empty());
+    if history.is_empty() && context.is_none() {
         return question.to_string();
     }
-    let mut prompt = String::from(
-        "This is a continuing conversation about the same codebase. Earlier turns, \
-         oldest first:\n\n",
-    );
-    for (i, turn) in history.iter().enumerate() {
+    let mut prompt = String::new();
+    if !history.is_empty() {
+        prompt.push_str(
+            "This is a continuing conversation about the same codebase. Earlier turns, \
+             oldest first:\n\n",
+        );
+        for (i, turn) in history.iter().enumerate() {
+            prompt.push_str(&format!(
+                "[Turn {}]\nQ: {}\nA: {}\n\n",
+                i + 1,
+                turn.question,
+                turn.answer
+            ));
+        }
+        prompt.push_str(
+            "Use the earlier turns for context and continuity. Investigate fresh and \
+             re-confirm any `file:line` an earlier answer cited before you rely on it — \
+             the code is the ground truth, not the prior answer.\n\n",
+        );
+    }
+    if let Some(context) = context {
         prompt.push_str(&format!(
-            "[Turn {}]\nQ: {}\nA: {}\n\n",
-            i + 1,
-            turn.question,
-            turn.answer
+            "Context the caller supplied (a diff or change summary, a prior report, or \
+             pasted source):\n{context}\n\n\
+             Treat it as trusted starting evidence: when it cites a concrete \
+             `file:line`, trust it rather than re-deriving it. Reach for your tools \
+             when you need more than it gives — a span it references but doesn't quote, \
+             a whole file for the full picture, a detail it left open, or anything the \
+             question reaches that it didn't cover. Where the code you read and the \
+             context genuinely disagree, the code wins.\n\n",
         ));
     }
-    prompt.push_str(&format!(
-        "Use the earlier turns for context and continuity. Investigate fresh and \
-         re-confirm any `file:line` an earlier answer cited before you rely on it — \
-         the code is the ground truth, not the prior answer. Now answer the current \
-         question:\n\n{question}"
-    ));
+    prompt.push_str(&format!("Now answer the current question:\n\n{question}"));
     prompt
 }
 
@@ -1561,7 +1492,13 @@ pub fn consult_preamble() -> String {
          precise span yourself and confirm a detail. Build your answer from what \
          they return: quote the key snippet, name its `file:line`, and let the \
          evidence carry the claim. Where the evidence settles the question, answer \
-         it fully; where it reaches its edge, say so and name what would close the gap."
+         it fully; where it reaches its edge, say so and name what would close the gap.\n\n\
+         The caller may hand you CONTEXT — a diff or change summary, a prior report, \
+         or pasted source. Treat it as trusted starting evidence: when it cites a \
+         concrete `file:line`, trust it rather than re-deriving it, and spend your \
+         turns getting *more* than it gave — reading a span it left unquoted, a whole \
+         file for the full picture, anything the question reaches past it. Where the \
+         code you read and the context genuinely disagree, the code wins."
     )
 }
 
@@ -1582,9 +1519,8 @@ fn consult_tools(
     // pointed at the explorer arm — its own client, model, and request shape,
     // which may live on a different backend than the driver's. Bounded by
     // explorer_max_turns per sweep; no cap on how many times consult may delegate
-    // (Amy's call — watch real behavior). Its system prompt is the same explorer
-    // override-or-default + house rules the standalone `explore` resolves, built
-    // once here rather than per sweep.
+    // (Amy's call — watch real behavior). Its system prompt is the explorer
+    // override-or-default + house rules, built once here rather than per sweep.
     let explorer_preamble: Arc<str> = Arc::from(phase_preamble(
         cfg.prompts.explorer.as_deref(),
         report_preamble,
@@ -1676,6 +1612,7 @@ pub type Session<'a> = (&'a SessionStore, &'a str);
 pub(crate) async fn consult_session_turn(
     session: Option<Session<'_>>,
     question: &str,
+    context: Option<&str>,
     root: &Path,
     explorer: &Arm,
     synth: &Arm,
@@ -1685,7 +1622,7 @@ pub(crate) async fn consult_session_turn(
         Some((store, id)) => store.history(id),
         None => Vec::new(),
     };
-    let user_prompt = consult_user_prompt(question, &history);
+    let user_prompt = consult_user_prompt(question, context, &history);
 
     let out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
 
@@ -1704,6 +1641,7 @@ pub(crate) async fn consult_session_turn(
 /// the exploration, which always runs fresh. See [`consult_session_turn`].
 pub async fn consult(
     question: &str,
+    context: Option<&str>,
     root: impl Into<PathBuf>,
     explorer: &Arm,
     synth: &Arm,
@@ -1711,7 +1649,7 @@ pub async fn consult(
     session: Option<Session<'_>>,
 ) -> Result<ConsultOutput> {
     let root = root.into();
-    consult_session_turn(session, question, &root, explorer, synth, cfg).await
+    consult_session_turn(session, question, context, &root, explorer, synth, cfg).await
 }
 
 #[cfg(test)]
@@ -1788,23 +1726,31 @@ mod tests {
     /// unconditional — a server with no `[context]` runs the unchanged preamble.
     #[tokio::test]
     async fn house_rules_splice_into_the_phase_preamble_only_when_configured() {
-        const MODEL: &str = "explorer";
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
         const MARKER: &str = "HOUSE_RULE_MARKER: prefer tabs over spaces";
 
         let dir = tempdir().unwrap();
 
-        // Configured → the marker and its framing ride in the preamble.
+        // Configured → the marker and its framing ride in the consult driver's
+        // preamble. The synth answers immediately (no sweep needed for this check).
         let client = ScriptedClient::builder()
-            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
         let cfg = ConsultConfig {
             house_rules: Some(Arc::from(MARKER)),
             ..ConsultConfig::default()
         };
-        explore("q", dir.path(), &arm(&client, MODEL), &cfg)
-            .await
-            .unwrap();
-        let reqs = client.requests_for(MODEL);
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .unwrap();
+        let reqs = client.requests_for(SYNTH);
         let pre = reqs[0].preamble.as_deref().unwrap_or("");
         assert!(
             pre.contains(MARKER),
@@ -1814,25 +1760,31 @@ mod tests {
             pre.contains("Operator house rules"),
             "the framing header must introduce them: {pre}"
         );
-        // Still the explorer's own role framing — house rules append, not replace.
+        // Still the consult driver's own role framing — house rules append, not replace.
         assert!(
-            pre.contains("code explorer"),
+            pre.contains("You answer a question about a codebase"),
             "base preamble must remain: {pre}"
         );
 
         // Unconfigured → the same call carries the base preamble and no marker.
         let bare = ScriptedClient::builder()
-            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
         let cfg2 = ConsultConfig::default(); // house_rules: None
-        explore("q", dir.path(), &arm(&bare, MODEL), &cfg2)
-            .await
-            .unwrap();
-        let reqs2 = bare.requests_for(MODEL);
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&bare, EXPLORER),
+            &arm(&bare, SYNTH),
+            &cfg2,
+        )
+        .await
+        .unwrap();
+        let reqs2 = bare.requests_for(SYNTH);
         let pre2 = reqs2[0].preamble.as_deref().unwrap_or("");
         assert!(!pre2.contains(MARKER), "no [context] → no marker: {pre2}");
         assert!(
-            pre2.contains("code explorer"),
+            pre2.contains("You answer a question about a codebase"),
             "base preamble intact: {pre2}"
         );
     }
@@ -1905,28 +1857,25 @@ mod tests {
     /// operator's prose is verbatim, and the built-in role framing is *gone* (the
     /// kaish contract still rides the `run_kaish` tool, untested here). House rules
     /// still append on top — `[prompts]` and `[context]` are orthogonal axes. We
-    /// drive a single `explore` phase and read back what the model was handed.
+    /// drive a single `oneshot` phase and read back what the model was handed.
     #[tokio::test]
     async fn a_prompt_override_fully_replaces_the_preamble_and_house_rules_still_append() {
-        const MODEL: &str = "explorer";
+        const MODEL: &str = "synth";
         const CUSTOM: &str = "You are a SECURITY AUDITOR. Hunt injection sinks.";
         const HOUSE: &str = "HOUSE_RULE_MARKER: prefer tabs";
 
         let client = ScriptedClient::builder()
             .on_model(MODEL, |_req| Ok(text_response("done")))
             .build();
-        let dir = tempdir().unwrap();
         let cfg = ConsultConfig {
             prompts: PromptOverrides {
-                explorer: Some(CUSTOM.to_string()),
+                oneshot: Some(CUSTOM.to_string()),
                 ..PromptOverrides::default()
             },
             house_rules: Some(Arc::from(HOUSE)),
             ..ConsultConfig::default()
         };
-        explore("q", dir.path(), &arm(&client, MODEL), &cfg)
-            .await
-            .unwrap();
+        oneshot("q", &arm(&client, MODEL), &cfg).await.unwrap();
 
         let reqs = client.requests_for(MODEL);
         let pre = reqs[0].preamble.as_deref().unwrap_or("");
@@ -1934,7 +1883,7 @@ mod tests {
         assert!(pre.contains(CUSTOM), "override prose missing: {pre}");
         // ...the built-in framing is fully replaced (full-replace, by decision)...
         assert!(
-            !pre.contains("code explorer"),
+            !pre.contains("second opinion"),
             "override must REPLACE, not augment, the built-in: {pre}"
         );
         // ...and house rules still layer on top.
@@ -1942,7 +1891,7 @@ mod tests {
     }
 
     /// Each phase reads its *own* override key — an `explorer`-only override must
-    /// not bleed into the `synthesize` phase, which keeps its built-in. Guards the
+    /// not bleed into the `oneshot` phase, which keeps its built-in. Guards the
     /// per-phase routing in [`phase_preamble`]/[`PromptOverrides`].
     #[tokio::test]
     async fn prompt_overrides_are_per_phase() {
@@ -1952,8 +1901,7 @@ mod tests {
         let client = ScriptedClient::builder()
             .on_model(MODEL, |_req| Ok(text_response("done")))
             .build();
-        let dir = tempdir().unwrap();
-        // Only the explorer key is set; the synthesize phase must ignore it.
+        // Only the explorer key is set; the oneshot phase must ignore it.
         let cfg = ConsultConfig {
             prompts: PromptOverrides {
                 explorer: Some(CUSTOM_EXPLORER.to_string()),
@@ -1961,9 +1909,7 @@ mod tests {
             },
             ..ConsultConfig::default()
         };
-        synthesize("q", None, dir.path(), &arm(&client, MODEL), &cfg)
-            .await
-            .unwrap();
+        oneshot("q", &arm(&client, MODEL), &cfg).await.unwrap();
 
         let pre = client.requests_for(MODEL)[0]
             .preamble
@@ -1971,12 +1917,38 @@ mod tests {
             .unwrap_or_default();
         assert!(
             !pre.contains(CUSTOM_EXPLORER),
-            "the explorer override must not bleed into synthesize: {pre}"
+            "the explorer override must not bleed into oneshot: {pre}"
         );
-        // synthesize keeps its built-in framing.
+        // oneshot keeps its built-in framing.
         assert!(
-            pre.contains("You answer a question about a codebase"),
-            "synthesize keeps its built-in preamble: {pre}"
+            pre.contains("second opinion"),
+            "oneshot keeps its built-in preamble: {pre}"
+        );
+    }
+
+    /// `oneshot` is the *thin* path: it must hand the model NO tools — no `run_kaish`,
+    /// no `explore`, no `view_image`. The caller owns the context; there is no
+    /// codebase access. Pin the empty toolset so a regression that wires a shell back
+    /// in (re-collapsing oneshot into consult) fails here.
+    #[tokio::test]
+    async fn oneshot_offers_the_model_no_tools() {
+        const MODEL: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Ok(text_response("done")))
+            .build();
+        oneshot(
+            "just answer this",
+            &arm(&client, MODEL),
+            &ConsultConfig::default(),
+        )
+        .await
+        .unwrap();
+        let reqs = client.requests_for(MODEL);
+        assert_eq!(reqs.len(), 1, "oneshot is exactly one upstream request");
+        assert!(
+            reqs[0].tool_names.is_empty(),
+            "oneshot must offer no tools, got {:?}",
+            reqs[0].tool_names
         );
     }
 
@@ -2826,6 +2798,7 @@ mod tests {
         let out1 = consult_session_turn(
             Some((&sessions, sid)),
             "Q1 what is kaish",
+            None,
             dir.path(),
             &arm(&client, "explorer"),
             &arm(&client, SYNTH),
@@ -2844,6 +2817,7 @@ mod tests {
         let out2 = consult_session_turn(
             Some((&sessions, sid)),
             "Q2 who calls it",
+            None,
             dir.path(),
             &arm(&client, "explorer"),
             &arm(&client, SYNTH),
@@ -2889,6 +2863,7 @@ mod tests {
         let result = consult_session_turn(
             Some((&sessions, sid)),
             "Q that fails",
+            None,
             dir.path(),
             &arm(&client, "explorer"),
             &arm(&client, SYNTH),
@@ -2920,6 +2895,7 @@ mod tests {
         let out = consult_session_turn(
             None,
             "lone question",
+            None,
             dir.path(),
             &arm(&client, "explorer"),
             &arm(&client, SYNTH),
@@ -2988,7 +2964,7 @@ mod tests {
             "the whole-file directive must survive: {p}"
         );
         assert!(p.contains("rg -n -B4 -A8"), "rg context-buffer idiom: {p}");
-        // The report template the synth (synthesize/consult preambles) is written
+        // The report template the consult driver preamble is written
         // against — keep the three section names in lockstep with those.
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
             assert!(p.contains(section), "missing report section {section}: {p}");
@@ -3021,23 +2997,31 @@ mod tests {
         );
     }
 
-    /// The single-arm phase toolset (`explore`/`synthesize`): `run_kaish` always,
-    /// `view_image` exactly when the arm is vision-capable. Pins the shared helper
-    /// both ways so neither phase's gate drifts.
+    /// The `consult` driver's toolset: `run_kaish` and the nested `explore′` always,
+    /// `view_image` exactly when the *synth* arm is vision-capable. Pins the gate both
+    /// ways so the driver's perception cap doesn't drift.
     #[test]
-    fn phase_tools_gates_view_image_on_the_vision_cap() {
+    fn consult_tools_gate_view_image_on_the_synth_vision_cap() {
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig::default();
+        let client = ScriptedClient::builder()
+            .on_model("m", |_r| Ok(text_response("x")))
+            .build();
+        let explorer = arm(&client, "m");
+        let reports = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        let blind = phase_tools(dir.path(), &cfg, false).expect("blind toolset builds");
+        let blind = consult_tools(&explorer, dir.path(), &cfg, reports.clone(), false)
+            .expect("blind toolset builds");
         let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
         assert!(blind_names.iter().any(|n| n == "run_kaish"));
+        assert!(blind_names.iter().any(|n| n == "explore"));
         assert!(
             !blind_names.iter().any(|n| n == "view_image"),
             "no view_image without vision, got {blind_names:?}"
         );
 
-        let seeing = phase_tools(dir.path(), &cfg, true).expect("vision toolset builds");
+        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, true)
+            .expect("vision toolset builds");
         let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
         assert!(
             seeing_names.iter().any(|n| n == "view_image"),
@@ -3306,7 +3290,7 @@ mod tests {
     #[test]
     fn empty_history_yields_the_bare_question() {
         assert_eq!(
-            consult_user_prompt("Where is the sandbox enforced?", &[]),
+            consult_user_prompt("Where is the sandbox enforced?", None, &[]),
             "Where is the sandbox enforced?"
         );
     }
@@ -3319,7 +3303,7 @@ mod tests {
             QaTurn::new("What is kaish?", "A read-only shell (src/sandbox.rs)."),
             QaTurn::new("Who calls it?", "consult drives it (src/consult.rs)."),
         ];
-        let prompt = consult_user_prompt("And explore?", &history);
+        let prompt = consult_user_prompt("And explore?", None, &history);
 
         for needle in [
             "What is kaish?",

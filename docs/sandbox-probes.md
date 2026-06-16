@@ -34,9 +34,10 @@ the *empirical* check on top of the *structural* guarantee.
 ## 0. The cheapest, safest probe: `run_kaish` (no model in the loop)
 
 `run_kaish` drives the read-only kaish kernel **directly** — no model, so **zero
-classifier exposure** — and it is the *exact* `KaishWorker`/VFS that `explore`,
-`consult`, and `synthesize` inject. Hammering it directly therefore covers the
+classifier exposure** — and it is the *exact* `KaishWorker`/VFS that `consult` (its
+driver and nested `explore′` sweep) injects. Hammering it directly therefore covers the
 model-driven tools too: a model can only emit kaish, which hits the same walls.
+(`oneshot` reads no project — it has no shell at all.)
 
 Run each battery below by handing the script to the `run_kaish` MCP tool (default
 `path` is the server's `--root`). Read the **stderr and the exit code together** —

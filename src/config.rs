@@ -1021,11 +1021,8 @@ impl Config {
         if disable.consult {
             self.tools.consult = false;
         }
-        if disable.explore {
-            self.tools.explore = false;
-        }
-        if disable.synthesize {
-            self.tools.synthesize = false;
+        if disable.oneshot {
+            self.tools.oneshot = false;
         }
         if disable.run_kaish {
             self.tools.run_kaish = false;
@@ -1056,8 +1053,7 @@ impl Config {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolDisables {
     pub consult: bool,
-    pub explore: bool,
-    pub synthesize: bool,
+    pub oneshot: bool,
     pub run_kaish: bool,
     pub generate_image: bool,
 }
@@ -1274,12 +1270,12 @@ struct RawContext {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPrompts {
-    /// Replaces the explorer preamble (standalone `explore` and nested `explore′`).
+    /// Replaces the explorer preamble (the nested `explore′` sweep inside `consult`).
     explorer: Option<String>,
-    /// Replaces the standalone `synthesize` preamble.
-    synthesize: Option<String>,
     /// Replaces the `consult` driver preamble.
     consult: Option<String>,
+    /// Replaces the toolless `oneshot` preamble.
+    oneshot: Option<String>,
 }
 
 /// The `[orientation]` stanza — the static repo-map injected into the exploring
@@ -1314,8 +1310,7 @@ struct RawServer {
 #[serde(deny_unknown_fields)]
 struct RawTools {
     consult: Option<bool>,
-    explore: Option<bool>,
-    synthesize: Option<bool>,
+    oneshot: Option<bool>,
     run_kaish: Option<bool>,
     generate_image: Option<bool>,
 }
@@ -1591,8 +1586,8 @@ fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
     }
     Ok(PromptOverrides {
         explorer: non_empty("explorer", raw.explorer)?,
-        synthesize: non_empty("synthesize", raw.synthesize)?,
         consult: non_empty("consult", raw.consult)?,
+        oneshot: non_empty("oneshot", raw.oneshot)?,
     })
 }
 
@@ -1659,8 +1654,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
     let d = ToolGating::default();
     ToolGating {
         consult: raw.consult.unwrap_or(d.consult),
-        explore: raw.explore.unwrap_or(d.explore),
-        synthesize: raw.synthesize.unwrap_or(d.synthesize),
+        oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         generate_image: raw.generate_image.unwrap_or(d.generate_image),
     }
@@ -1713,11 +1707,8 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if env_flag(get, "KAIBO_NO_CONSULT") {
         tools.consult = Some(false);
     }
-    if env_flag(get, "KAIBO_NO_EXPLORE") {
-        tools.explore = Some(false);
-    }
-    if env_flag(get, "KAIBO_NO_SYNTHESIZE") {
-        tools.synthesize = Some(false);
+    if env_flag(get, "KAIBO_NO_ONESHOT") {
+        tools.oneshot = Some(false);
     }
     if env_flag(get, "KAIBO_NO_RUN_KAISH") {
         tools.run_kaish = Some(false);

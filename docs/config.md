@@ -247,7 +247,7 @@ id — it is never parsed for a backend, so an org prefix matching a backend ali
 can't silently retarget the call); it swaps the id within the configured slot,
 dropping its pins and per-slot tunables — they described the configured model;
 the new id classifies fresh. The matching backend arg (`explorer_backend` /
-`synth_backend` on consult, `backend` on explore/synthesize) retargets the slot
+`synth_backend` on consult, `backend` on oneshot) retargets the slot
 to another backend (a call-time chimera: aliases resolve, and it works even on a
 role the cast doesn't carry). The naming rule for everything else is mechanical:
 
@@ -290,8 +290,8 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | project house-rules files | `context.project_files` *(list; default `["AGENTS.md"]`)* | `KAIBO_PROJECT_FILES` *(colon-separated)* | `--project-context-file FILE` *(repeatable)* |
 | user house-rules files | `context.user_files` *(list)* | `KAIBO_USER_FILES` *(colon-separated)* | `--user-context-file FILE` *(repeatable)* |
 | explorer system prompt | `prompts.explorer` *(file-only — full replace)* | — | — |
-| synthesize system prompt | `prompts.synthesize` *(file-only — full replace)* | — | — |
 | consult system prompt | `prompts.consult` *(file-only — full replace)* | — | — |
+| oneshot system prompt | `prompts.oneshot` *(file-only — full replace)* | — | — |
 
 **Two deliberate exceptions to the rule:**
 
@@ -371,7 +371,7 @@ headers = { authorization = "Bearer <token>" }     # file-only; values are secre
 What you get is the GenAI trace tree rig already produces — a tool call →
 `run_phase` per phase → `invoke_agent` → a `chat` span per model turn (with
 `gen_ai.request.model` and every `gen_ai.usage.*` token count). On top of that,
-kaibo adds the named parent spans (`consult` / `explore` / `synthesize` /
+kaibo adds the named parent spans (`consult` / `oneshot` /
 `run_kaish`) that root each trace, **and a `tool` span per tool invocation**
 (`tool_span.rs`) carrying `gen_ai.tool.name` and an ok/err `outcome` — so you can
 query *which* tool the model actually called (`run_kaish`, `view_image`, the nested
@@ -429,9 +429,8 @@ read scope is *not* widened. That's the distinction from `[server] allow_paths`
 below: `allow_paths` widens what the *model* can explore, `[context]` injects
 fixed operator text the model never navigates to.
 
-Injected into every phase that drives a model — the `consult` driver, the
-standalone `explore` and `synthesize`, *and* the nested `explore′` sweep inside
-`consult` — so the cheap explorer orients on the same `AGENTS.md`/user guidance
+Injected into the codebase-reading phases — the `consult` driver *and* its nested
+`explore′` sweep — so the cheap explorer orients on the same `AGENTS.md`/user guidance
 while it searches, not just at answer time (the block names where things live and
 what matters). Precedence is the usual per-call > CLI > env > file > built-in: a
 CLI `--project-context-file` replaces lower layers additively (the CLI can't
@@ -456,9 +455,9 @@ Prefer architectural answers; name the file:line that carries each claim.
 
 | key | replaces | runs in |
 |---|---|---|
-| `explorer` | `report_preamble` | standalone `explore` **and** the nested `explore′` sweep |
-| `synthesize` | `synthesize_preamble` | standalone `synthesize` |
+| `explorer` | `report_preamble` | the nested `explore′` sweep inside `consult` |
 | `consult` | `consult_preamble` | the `consult` driver |
+| `oneshot` | `oneshot_preamble` | the thin, toolless `oneshot` |
 
 **Full replace, by decision.** An override *is* the role framing, verbatim — kaibo
 does not re-wrap it. That's safe because the kaish operating contract (how to drive
@@ -499,11 +498,11 @@ synth    = "anthropic/claude-sonnet-4-6"   # no per-model prompt; uses [prompts]
 slot (most specific — *this* model in *this* cast) wins, the same way `effort`
 overrides the `[defaults]` effort. Set neither and the built-in runs.
 
-**One model, two synth jobs.** The synth slot's model plays *both* the standalone
-`synthesize` and the `consult` driver, so its `preamble` feeds both — but each phase
+**One model, two synth jobs.** The synth slot's model plays *both* the `consult`
+driver and the toolless `oneshot`, so its `preamble` feeds both — but each phase
 resolves under its own key, so they stay **independently overridable**: a copy today
-(both the synth slot's voice), free to diverge by setting `[prompts].synthesize` and
-`[prompts].consult` separately. `slot.preamble` = "this model's voice"; the phase
+(both the synth slot's voice), free to diverge by setting `[prompts].consult` and
+`[prompts].oneshot` separately. `slot.preamble` = "this model's voice"; the phase
 keys = "this job's framing." The explorer has one job, so no ambiguity. A per-call
 model override (a bare slot) carries no `preamble` — overriding the model doesn't
 drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`.
@@ -535,9 +534,9 @@ Size-gated, by file count:
   or point a cast that explores via `rg` at it. (`full_list_max_files = 0` is a load
   error: it would refuse every repo; disable instead.)
 
-It rides the **exploring** phases only — standalone `explore`, the `consult` driver,
-and the nested `explore′` sweep. Standalone `synthesize` works from supplied context,
-so it gets no map. Like `[context]`, the block re-sends each turn, which the size gate
+It rides the **exploring** phases only — the `consult` driver and its nested
+`explore′` sweep. The toolless `oneshot` reads no project, so it gets no map. Like
+`[context]`, the block re-sends each turn, which the size gate
 keeps bounded. Whether it actually erases the discovery turns is measurable via the
 per-tool `tool` spans (see Telemetry).
 
@@ -614,8 +613,8 @@ operator) the full picture:
 - `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
 - `default_root` — the `--root` value, if set
 - `default_cast` — which cast is used when a call omits `cast`
-- `tools` — which tools are currently advertised (`consult`, `explore`,
-  `synthesize`, `run_kaish`, `generate_image`)
+- `tools` — which tools are currently advertised (`consult`, `oneshot`,
+  `run_kaish`, `generate_image`)
 - `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins
 - `kaish.ignore` — the resolved ignore policy the file-walking builtins honor:
   `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope`

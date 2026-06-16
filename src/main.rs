@@ -64,13 +64,9 @@ struct Args {
     #[arg(long)]
     no_consult: bool,
 
-    /// Don't advertise the `explore` tool.
+    /// Don't advertise the `oneshot` tool.
     #[arg(long)]
-    no_explore: bool,
-
-    /// Don't advertise the `synthesize` tool.
-    #[arg(long)]
-    no_synthesize: bool,
+    no_oneshot: bool,
 
     /// Don't advertise the `run_kaish` tool.
     #[arg(long)]
@@ -121,8 +117,7 @@ async fn main() -> Result<()> {
         args.cast.clone(),
         ToolDisables {
             consult: args.no_consult,
-            explore: args.no_explore,
-            synthesize: args.no_synthesize,
+            oneshot: args.no_oneshot,
             run_kaish: args.no_run_kaish,
             generate_image: args.no_generate_image,
         },
@@ -202,7 +197,7 @@ async fn main() -> Result<()> {
     ) {
         tracing::warn!(
             cast = %config.default_cast,
-            "no API key for the default cast — consult/explore/synthesize will fail until \
+            "no API key for the default cast — consult/oneshot will fail until \
              you set a provider key (env var or key file) and reconnect; run_kaish works now. \
              See the kaibo://config/example resource."
         );

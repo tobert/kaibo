@@ -17,8 +17,8 @@ use rmcp::model::{
     JsonObject, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, LoggingLevel,
     Meta, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
     PromptMessage, PromptMessageRole, ProtocolVersion, RawResource, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
-    SetLevelRequestParams,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+    ServerInfo, SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -29,7 +29,7 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, explore, synthesize, Arm, ConsultConfig, PromptOverrides};
+use crate::consult::{consult, oneshot, Arm, ConsultConfig, PromptOverrides};
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
 use crate::image_gen::ImageGen;
@@ -65,15 +65,14 @@ const CONFIG_EXAMPLE_TOML: &str = include_str!("../docs/config.example.toml");
 
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
-/// Composes to any posture: `{explore:false, synthesize:false}` ≈ the original
-/// consult-only surface; only `run_kaish` on ≈ "no code leaves the box, kaibo as a
-/// pure read-only shell". A server with *all* off is a misconfiguration — refused
-/// at startup (see `main`), not represented as a valid state here.
+/// Composes to any posture: `{oneshot:false}` ≈ the codebase-only surface; only
+/// `run_kaish` on ≈ "no code leaves the box, kaibo as a pure read-only shell". A
+/// server with *all* off is a misconfiguration — refused at startup (see `main`),
+/// not represented as a valid state here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolGating {
     pub consult: bool,
-    pub explore: bool,
-    pub synthesize: bool,
+    pub oneshot: bool,
     pub run_kaish: bool,
     pub generate_image: bool,
 }
@@ -82,8 +81,7 @@ impl Default for ToolGating {
     fn default() -> Self {
         Self {
             consult: true,
-            explore: true,
-            synthesize: true,
+            oneshot: true,
             run_kaish: true,
             generate_image: true,
         }
@@ -93,11 +91,7 @@ impl Default for ToolGating {
 impl ToolGating {
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
-        !self.consult
-            && !self.explore
-            && !self.synthesize
-            && !self.run_kaish
-            && !self.generate_image
+        !self.consult && !self.oneshot && !self.run_kaish && !self.generate_image
     }
 }
 
@@ -113,6 +107,14 @@ pub struct ConsultInput {
     /// kaibo locates and reads the real, current code itself, so describing your
     /// intent beats pasting a diff or a file dump it would only re-read from disk.
     pub question: String,
+
+    /// Optional context to seed the investigation — a change/diff *summary*, a prior
+    /// report, or pasted source kaibo can't reach. It's treated as trusted starting
+    /// evidence: kaibo trusts a cited `file:line` rather than re-deriving it, and
+    /// spends its turns getting more where the context runs out. Prefer a prose
+    /// summary of intent over a raw diff — kaibo reads the current code itself.
+    #[serde(default)]
+    pub context: Option<String>,
 
     /// Absolute path to the project to explore. Optional when the server has a
     /// default root — an explicit `--root`, or the launch cwd inferred when it's
@@ -177,72 +179,26 @@ pub struct ConsultInput {
     pub include_report: bool,
 }
 
-/// Arguments to the `explore` tool. See [`ConsultInput`] for the
-/// `deny_unknown_fields` rationale.
+/// Arguments to the `oneshot` tool. See [`ConsultInput`] for the
+/// `deny_unknown_fields` rationale. No `path`: oneshot reads no project — it's a
+/// thin, toolless completion, so the caller owns any context the model needs.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ExploreInput {
-    /// The question to investigate about the project.
-    pub question: String,
+pub struct OneshotInput {
+    /// The prompt to send the model. There's no codebase access on this call, so
+    /// include whatever context the answer needs (pasted source, a spec, the data) —
+    /// the model answers from this and its own knowledge, nothing else.
+    pub prompt: String,
 
-    /// Absolute path to the project. Optional when the server has a default root
-    /// — an explicit `--root`, or the launch cwd inferred when it's inside the
-    /// allowed set. Must be at-or-under an allowed tree; see
-    /// `kaibo://config` for the server's current allowed set and how to widen it.
-    #[serde(default)]
-    pub path: Option<String>,
-
-    /// Which cast (model team) runs this call; omit for the server's default.
-    /// Pick from this param's `enum` — the casts live right now; `kaibo://config`
-    /// lists every configured cast and backend, with their aliases.
+    /// Which cast (model team) runs this call; omit for the server's default. Pick
+    /// from this param's `enum` — the casts live right now; `kaibo://config` lists
+    /// every configured cast and backend, with their aliases. kaibo runs the cast's
+    /// capable (synth) model.
     #[serde(default)]
     pub cast: Option<String>,
 
-    /// Override the explorer model id. Sent verbatim — an id containing "/" is
-    /// still one id. Keeps the slot's configured backend unless `backend`
-    /// retargets it.
-    #[serde(default)]
-    pub model: Option<String>,
-
-    /// Run the model override on this backend (name or alias) instead of the
-    /// slot's configured one. Requires `model`.
-    #[serde(default)]
-    pub backend: Option<String>,
-
-    /// Max tool-loop turns for the explorer (default 50 — it's cheap, let it rip).
-    #[serde(default)]
-    pub max_turns: Option<usize>,
-}
-
-/// Arguments to the `synthesize` tool. See [`ConsultInput`] for the
-/// `deny_unknown_fields` rationale.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SynthesizeInput {
-    /// The question to answer.
-    pub question: String,
-
-    /// Optional context to ground the answer in — typically an `explore` report or
-    /// pasted source. When absent, the model investigates via `run_kaish`.
-    #[serde(default)]
-    pub context: Option<String>,
-
-    /// Absolute path to the project. Optional when the server has a default root
-    /// — an explicit `--root`, or the launch cwd inferred when it's inside the
-    /// allowed set. Must be at-or-under an allowed tree; see
-    /// `kaibo://config` for the server's current allowed set and how to widen it.
-    #[serde(default)]
-    pub path: Option<String>,
-
-    /// Which cast (model team) runs this call; omit for the server's default.
-    /// Pick from this param's `enum` — the casts live right now; `kaibo://config`
-    /// lists every configured cast and backend, with their aliases.
-    #[serde(default)]
-    pub cast: Option<String>,
-
-    /// Override the synthesizer (capable) model id. Sent verbatim — an id
-    /// containing "/" is still one id. Keeps the slot's configured backend
-    /// unless `backend` retargets it.
+    /// Override the model id. Sent verbatim — an id containing "/" is still one id.
+    /// Keeps the slot's configured backend unless `backend` retargets it.
     #[serde(default)]
     pub model: Option<String>,
 
@@ -307,8 +263,8 @@ pub struct KaiboHandler {
 }
 
 /// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
-/// consultation tool still in `router` (consult/explore/synthesize — the tools
-/// whose `cast` selects the explorer/synth team). This surfaces the live roster
+/// consultation tool still in `router` (consult/oneshot — the tools whose `cast`
+/// selects the answering team). This surfaces the live roster
 /// where an agent actually picks an argument value, instead of deferring it to
 /// prose the host may drop.
 ///
@@ -326,7 +282,7 @@ fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, casts: &[String]) {
         .iter()
         .map(|c| serde_json::Value::String(c.clone()))
         .collect();
-    for name in ["consult", "explore", "synthesize"] {
+    for name in ["consult", "oneshot"] {
         let Some(route) = router.map.get_mut(name) else {
             continue;
         };
@@ -365,8 +321,7 @@ impl KaiboHandler {
         // exists before dropping it — a stale name is a build-time bug we want loud.
         for (enabled, name) in [
             (gating.consult, "consult"),
-            (gating.explore, "explore"),
-            (gating.synthesize, "synthesize"),
+            (gating.oneshot, "oneshot"),
             (gating.run_kaish, "run_kaish"),
             (gating.generate_image, "generate_image"),
         ] {
@@ -609,10 +564,10 @@ impl KaiboHandler {
     /// Resolve this call's per-phase system prompts for `cast`: the per-model slot
     /// `preamble` (if set) wins over the global `[prompts].<phase>`, which wins over
     /// the built-in (resolved downstream in `consult.rs`). The synth slot's preamble
-    /// feeds *both* synth phases — standalone `synthesize` and the `consult` driver —
-    /// but through their own keys, so they stay independently overridable (a copy
-    /// today, free to diverge). `cast` is the post-override clone, so a per-call
-    /// model override (a bare slot) correctly carries no preamble.
+    /// feeds *both* capable-model tools — the `consult` driver and the toolless
+    /// `oneshot` — but through their own keys, so they stay independently overridable
+    /// (a copy today, free to diverge). `cast` is the post-override clone, so a
+    /// per-call model override (a bare slot) correctly carries no preamble.
     fn resolved_prompts(&self, cast: &Cast) -> PromptOverrides {
         let mut p = self.config.prompts.clone();
         if let Some(pre) = cast
@@ -622,8 +577,8 @@ impl KaiboHandler {
             p.explorer = Some(pre);
         }
         if let Some(pre) = cast.slot(ModelRole::Synth).and_then(|s| s.preamble.clone()) {
-            p.synthesize = Some(pre.clone());
-            p.consult = Some(pre);
+            p.consult = Some(pre.clone());
+            p.oneshot = Some(pre);
         }
         p
     }
@@ -753,26 +708,29 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Investigate a question about a codebase and return a grounded, \
-            cited answer. A capable model drives a read-only kaish shell \
-            (cat/grep/rg/find/jq/pipelines): it reads precise spans directly and \
-            delegates broad repo sweeps to a fast explorer sub-agent, then answers \
-            from what they find with concrete `file:line` citations. It finds and \
+        description = "Ask a model *outside your own family* about a codebase and get \
+            a grounded, cited answer — kaibo is the door to a second opinion from \
+            DeepSeek, Gemini, Anthropic, or a local model. Pick which one answers with \
+            `cast` (e.g. `deepseek`, `gemini`, `anthropic`; the `cast` enum lists the \
+            teams live right now, `kaibo://config` has the full set). A capable model \
+            drives a read-only kaish shell (cat/grep/rg/find/jq/pipelines): it reads \
+            precise spans directly and delegates broad repo sweeps to a fast explorer \
+            sub-agent, then answers with concrete `file:line` citations. It finds and \
             reads the relevant code itself — describe what you did or want to know \
-            (what you changed and why, the behavior in question) in prose; don't \
-            paste a diff or dump files, kaibo reads the real, current source from \
-            disk and your intent is the part it can't recover on its own. \
-            Read-only: it never modifies the project. For a multi-turn \
-            conversation, pass a stable session_id: kaibo replays that session's \
-            prior question/answer pairs as context (the exploration still runs \
-            fresh each turn). Args: question \
-            (required), path (project dir; optional if the server has a default root), \
-            cast (optional; pick from the `cast` enum of teams live right now, or \
-            see `kaibo://config`), session_id (optional; opaque conversation key), \
-            include_report (optional; attach the explorer's report as \
-            structured_content for debugging the hand-off), and optional \
-            explorer_model / synth_model overrides (a model id, sent verbatim; \
-            add explorer_backend / synth_backend to retarget the slot's backend)."
+            (what you changed and why, the behavior in question) in prose; don't paste \
+            a diff or dump files, kaibo reads the real, current source from disk and \
+            your intent is the part it can't recover on its own. Read-only: it never \
+            modifies the project. For a multi-turn conversation, pass a stable \
+            session_id: kaibo replays that session's prior question/answer pairs (the \
+            exploration still runs fresh each turn). Args: question (required), context \
+            (optional; a change summary or pasted source to seed the investigation — \
+            trusted as starting evidence), path (project dir; optional if the server \
+            has a default root), cast (optional), session_id (optional; opaque \
+            conversation key), include_report (optional; attach the explorer's report \
+            as structured_content for debugging the hand-off), and optional \
+            explorer_model / synth_model overrides (a model id, sent verbatim; add \
+            explorer_backend / synth_backend to retarget the slot's backend). For a \
+            thin answer with no codebase access, use `oneshot` instead."
     )]
     async fn consult(
         &self,
@@ -836,86 +794,50 @@ impl KaiboHandler {
             session = session.is_some(),
         );
         progress.emit(PhaseEvent::PhaseStarted { phase: "consult" });
-        let out = consult(&input.question, root, &explorer, &synth, &cfg, session)
-            .instrument(span)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let out = consult(
+            &input.question,
+            input.context.as_deref(),
+            root,
+            &explorer,
+            &synth,
+            &cfg,
+            session,
+        )
+        .instrument(span)
+        .await
+        .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
-        Ok(consult_result(out.answer, out.report, input.include_report))
+        // Provenance: name the cast and the models that answered, so a caller (a
+        // cross-model study especially) sees which model produced this without
+        // digging into `kaibo://config`. consult runs two arms — both are named.
+        let answer = with_provenance(
+            out.answer,
+            &cast.name,
+            &[("explorer", &explorer.model), ("synth", &synth.model)],
+        );
+        Ok(consult_result(answer, out.report, input.include_report))
     }
 
     #[tool(
-        description = "Investigate a question about a codebase and return a curated \
-            report citing concrete `file:line` locations. A fast, cheap model reads \
-            the project through a read-only kaish shell (cat/grep/rg/find/pipelines) \
-            and reports what it found — relevant files, line numbers, key snippets. \
-            This is the explorer seam on its own: it gathers evidence, it does not \
-            write a polished final answer (use `consult` for that). Read-only: it \
-            never modifies the project. Args: question (required), path (project dir; \
-            optional if the server has a default root), cast (optional; the \
-            usable casts are named in the handshake and `kaibo://config`), and \
-            optional model (with optional backend) / max_turns overrides."
+        description = "Ask a model *outside your own family* a thin, direct question \
+            — prompt in, answer out, no codebase access and no tools. The counterpart \
+            to `consult`: use `oneshot` when you already own the context (you've pasted \
+            what's needed, or the question is general) and just want another model's \
+            take; use `consult` when kaibo should investigate a codebase for you. Pick \
+            which model answers with `cast` (e.g. `deepseek`, `gemini`, `anthropic`; \
+            the `cast` enum lists the teams live now, `kaibo://config` has the full \
+            set) — kaibo runs the cast's capable (synth) model. Exactly one upstream \
+            request; you are responsible for any context the model needs. Args: prompt \
+            (required), cast (optional), and an optional model (with optional backend) \
+            override."
     )]
-    async fn explore(
+    async fn oneshot(
         &self,
-        Parameters(input): Parameters<ExploreInput>,
+        Parameters(input): Parameters<OneshotInput>,
         peer: Peer<RoleServer>,
         meta: Meta,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(input.path)?;
-        let mut cast = self.resolve_cast(input.cast)?;
-        self.apply_model_override(
-            &mut cast,
-            ModelRole::Explorer,
-            input.model.as_deref(),
-            input.backend.as_deref(),
-            "model",
-            "backend",
-        )?;
-        let arm = self.arm(&cast, ModelRole::Explorer)?;
-        let progress = progress_sink(peer, &meta);
-        let defaults = &self.config.defaults;
-        let cfg = ConsultConfig {
-            explorer_max_turns: input.max_turns.unwrap_or(defaults.explorer_max_turns),
-            synth_max_turns: defaults.synth_max_turns,
-            sandbox: self.config.sandbox.clone(),
-            progress: progress.clone(),
-            house_rules: self.house_rules(&root)?,
-            prompts: self.resolved_prompts(&cast),
-            orientation: self.orientation(&root).await?,
-        };
-
-        let span = tracing::info_span!("explore", cast = %cast.name, model = %arm.model);
-        progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
-        let report = explore(&input.question, root, &arm, &cfg)
-            .instrument(span)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
-
-        Ok(CallToolResult::success(vec![Content::text(report)]))
-    }
-
-    #[tool(
-        description = "Answer a question about a codebase with a capable model, \
-            grounded in optional supplied context (typically an `explore` report or \
-            pasted source). With context, the model treats it as primary evidence and \
-            uses a read-only kaish shell to verify or fill precise gaps; without \
-            context, it investigates directly. This is the synthesizer seam on its \
-            own — a real outside opinion you can seed with material `explore` or you \
-            gathered. Read-only. Args: question (required), context (optional), path \
-            (project dir; optional with a default root), cast (optional; the \
-            usable casts are named in the handshake and `kaibo://config`), and an \
-            optional model (with optional backend) override."
-    )]
-    async fn synthesize(
-        &self,
-        Parameters(input): Parameters<SynthesizeInput>,
-        peer: Peer<RoleServer>,
-        meta: Meta,
-    ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(input.path)?;
         let mut cast = self.resolve_cast(input.cast)?;
         self.apply_model_override(
             &mut cast,
@@ -933,29 +855,21 @@ impl KaiboHandler {
             synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
-            house_rules: self.house_rules(&root)?,
+            // oneshot reads no project: no house rules, no repo map, no shell.
+            house_rules: None,
             prompts: self.resolved_prompts(&cast),
-            // synthesize works from supplied context, not exploration → no repo map.
             orientation: None,
         };
 
-        let span = tracing::info_span!(
-            "synthesize",
-            cast = %cast.name,
-            model = %arm.model,
-            with_context = input.context.is_some(),
-        );
-        progress.emit(PhaseEvent::PhaseStarted {
-            phase: "synthesize",
-        });
-        let answer = synthesize(&input.question, input.context.as_deref(), root, &arm, &cfg)
+        let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
+        progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
+        let answer = oneshot(&input.prompt, &arm, &cfg)
             .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        progress.emit(PhaseEvent::PhaseFinished {
-            phase: "synthesize",
-        });
+        progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
+        let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)]);
         Ok(CallToolResult::success(vec![Content::text(answer)]))
     }
 
@@ -1438,8 +1352,7 @@ fn render_config_resource(
     #[derive(Serialize)]
     struct ToolsDoc {
         consult: bool,
-        explore: bool,
-        synthesize: bool,
+        oneshot: bool,
         run_kaish: bool,
         generate_image: bool,
     }
@@ -1633,8 +1546,7 @@ fn render_config_resource(
     // render-or-skip decision instead of silently vanishing from the resource.
     let &ToolGating {
         consult,
-        explore,
-        synthesize,
+        oneshot,
         run_kaish,
         generate_image,
     } = &config.tools;
@@ -1676,8 +1588,7 @@ fn render_config_resource(
         default_cast: config.default_cast.clone(),
         tools: ToolsDoc {
             consult,
-            explore,
-            synthesize,
+            oneshot,
             run_kaish,
             generate_image,
         },
@@ -1760,8 +1671,7 @@ fn read_kaibo_resource_with_config(
     default_root_inferred: bool,
 ) -> Result<ReadResourceResult, McpError> {
     if uri == CONFIG_URI {
-        let body =
-            render_config_resource(config, allowed_set, default_root, default_root_inferred);
+        let body = render_config_resource(config, allowed_set, default_root, default_root_inferred);
         return Ok(ReadResourceResult {
             contents: vec![ResourceContents::text(body, uri)],
         });
@@ -1792,6 +1702,21 @@ fn consult_result(answer: String, report: String, include_report: bool) -> CallT
         result.structured_content = Some(json!({ "report": report }));
     }
     result
+}
+
+/// Append a one-line provenance footer naming the cast and the model(s) that
+/// produced `answer`. The point is legibility: a caller — a cross-model study most
+/// of all — should see *which* model answered without cross-referencing
+/// `kaibo://config`, since the answering model is the whole variable. `roles` is the
+/// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
+/// Pure and offline-testable.
+fn with_provenance(answer: String, cast: &str, roles: &[(&str, &str)]) -> String {
+    let models = roles
+        .iter()
+        .map(|(label, model)| format!("{label} `{model}`"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("{answer}\n\n———\nkaibo · cast `{cast}` · {models}")
 }
 
 /// The MCP token the client attached for progress, if any. Per the spec, progress
@@ -1903,7 +1828,7 @@ mod tests {
     #[test]
     fn consultation_tools_advertise_the_live_cast_enum() {
         let h = handler();
-        for tool in ["consult", "explore", "synthesize"] {
+        for tool in ["consult", "oneshot"] {
             let schema = h
                 .tool_router
                 .get(tool)
@@ -1947,16 +1872,16 @@ mod tests {
     }
 
     /// A per-model slot `preamble` wins over the global `[prompts].<phase>`, and the
-    /// synth slot feeds *both* synth phases (standalone `synthesize` and the consult
-    /// driver) — the "its own, even if a copy" shape: same value today, but each
-    /// arrives under its own key, free to diverge.
+    /// synth slot feeds *both* capable-model phases (the `consult` driver and the
+    /// toolless `oneshot`) — the "its own, even if a copy" shape: same value today,
+    /// but each arrives under its own key, free to diverge.
     #[test]
     fn slot_preamble_wins_over_phase_prompts_and_feeds_both_synth_phases() {
         let h = handler_from_toml(
             r#"
             [prompts]
             explorer = "EXP_PHASE"
-            synthesize = "SYN_PHASE"
+            oneshot = "ONE_PHASE"
             consult = "CON_PHASE"
 
             [casts.team]
@@ -1968,21 +1893,21 @@ mod tests {
         let p = h.resolved_prompts(&cast);
         // Slot wins over the phase prompt for the explorer...
         assert_eq!(p.explorer.as_deref(), Some("EXP_SLOT"));
-        // ...and the synth slot's voice reaches BOTH synth phases, each via its own
-        // key (a copy for now, independently addressable).
-        assert_eq!(p.synthesize.as_deref(), Some("SYNTH_SLOT"));
+        // ...and the synth slot's voice reaches BOTH capable-model phases, each via
+        // its own key (a copy for now, independently addressable).
         assert_eq!(p.consult.as_deref(), Some("SYNTH_SLOT"));
+        assert_eq!(p.oneshot.as_deref(), Some("SYNTH_SLOT"));
     }
 
     /// With no slot preambles, the global `[prompts]` is the fallback — and the two
-    /// synth phases keep *independent* keys, so standalone `synthesize` can differ
-    /// from the `consult` driver. This is the "standalone synth is its own" guarantee.
+    /// capable-model phases keep *independent* keys, so the toolless `oneshot` can
+    /// differ from the `consult` driver.
     #[test]
     fn phase_prompts_are_the_fallback_and_synth_phases_stay_independent() {
         let h = handler_from_toml(
             r#"
             [prompts]
-            synthesize = "STANDALONE_ONLY"
+            oneshot = "ONESHOT_ONLY"
             consult = "DRIVER_ONLY"
 
             [casts.team]
@@ -1993,8 +1918,8 @@ mod tests {
         let cast = h.resolve_cast(Some("team".into())).unwrap();
         let p = h.resolved_prompts(&cast);
         assert!(p.explorer.is_none(), "no explorer prompt set anywhere");
-        // The two synth phases diverge — proof they're not collapsed into one.
-        assert_eq!(p.synthesize.as_deref(), Some("STANDALONE_ONLY"));
+        // The two capable-model phases diverge — proof they're not collapsed into one.
+        assert_eq!(p.oneshot.as_deref(), Some("ONESHOT_ONLY"));
         assert_eq!(p.consult.as_deref(), Some("DRIVER_ONLY"));
     }
 
@@ -2162,11 +2087,11 @@ mod tests {
             panic!("configure prompt must be a text message");
         };
         for needle in [
-            CONFIG_EXAMPLE_URI,            // read the annotated template
-            CONFIG_URI,                    // and the resolved live state
-            "config.toml",                 // write target
-            "api_key_env",                 // keys-by-reference, not inline
-            "reconnect",                   // re-read at startup
+            CONFIG_EXAMPLE_URI, // read the annotated template
+            CONFIG_URI,         // and the resolved live state
+            "config.toml",      // write target
+            "api_key_env",      // keys-by-reference, not inline
+            "reconnect",        // re-read at startup
         ] {
             assert!(
                 text.contains(needle),
@@ -2319,6 +2244,41 @@ mod tests {
             .clone()
     }
 
+    /// Provenance footer: the answer keeps its text, and the cast plus every labelled
+    /// model is appended so a caller (a cross-model study most of all) sees which model
+    /// produced the answer without cross-referencing `kaibo://config`.
+    #[test]
+    fn provenance_footer_names_the_cast_and_every_model() {
+        let out = with_provenance(
+            "the answer".into(),
+            "gemini",
+            &[
+                ("explorer", "gemini-flash-lite-latest"),
+                ("synth", "gemini-3.5-flash"),
+            ],
+        );
+        assert!(
+            out.starts_with("the answer"),
+            "the answer is preserved: {out}"
+        );
+        assert!(out.contains("cast `gemini`"), "names the cast: {out}");
+        assert!(
+            out.contains("explorer `gemini-flash-lite-latest`"),
+            "names the explorer model: {out}"
+        );
+        assert!(
+            out.contains("synth `gemini-3.5-flash`"),
+            "names the synth model: {out}"
+        );
+
+        // The oneshot shape: a single labelled model.
+        let one = with_provenance("x".into(), "deepseek", &[("model", "deepseek-v4-pro")]);
+        assert!(
+            one.contains("cast `deepseek` · model `deepseek-v4-pro`"),
+            "{one}"
+        );
+    }
+
     /// Default path: no report requested ⇒ the answer is the whole result and no
     /// structured content rides along (a lean call, byte-for-byte its pre-flag shape).
     #[test]
@@ -2398,9 +2358,15 @@ mod tests {
 
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp")];
-        let result =
-            read_kaibo_resource_with_config(CONFIG_EXAMPLE_URI, &[], &config, &allowed, None, false)
-            .expect("example resource must be readable");
+        let result = read_kaibo_resource_with_config(
+            CONFIG_EXAMPLE_URI,
+            &[],
+            &config,
+            &allowed,
+            None,
+            false,
+        )
+        .expect("example resource must be readable");
         let body = match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
@@ -2653,7 +2619,8 @@ mod tests {
             "config resource body must not be empty"
         );
         // The dispatch must not return not-found for this URI.
-        let result = read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed, None, false);
+        let result =
+            read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed, None, false);
         assert!(
             result.is_ok(),
             "kaibo://config must be readable, got {result:?}"
