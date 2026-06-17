@@ -50,6 +50,15 @@
 # (colon-separated env var); a non-empty CLI list replaces the env/file layer.
 # allow_paths = ["/home/atobey/shared-libs", "/data/shared"]
 
+# Follow git worktrees of an already-allowed repo (default true). When a call's
+# `path` misses the allowed set, kaibo admits it if it is a linked worktree of a
+# repo already in the set — so a sibling branch checkout (even one created
+# mid-session) is reachable without an --allow-path. Resolved by reading git's
+# link files, never by running git. The kaibo://config [runtime] section lists the
+# worktrees currently followed. Set false to keep the boundary strictly static
+# (also: --no-follow-worktrees, KAIBO_NO_FOLLOW_WORKTREES).
+# follow_worktrees = true
+
 # Default cast (by name or alias) when a call omits `cast`. The old `provider`
 # key is a load error (unknown field) — see docs/casts.md for the rename map.
 cast = "anthropic"

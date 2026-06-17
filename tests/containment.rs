@@ -507,8 +507,246 @@ fn allow_paths_cli_replaces_env_and_file() {
     c.apply_cli(None, None, kaibo::config::ToolDisables::default(), vec![
         std::path::PathBuf::from("/tmp/cli-a"),
         std::path::PathBuf::from("/tmp/cli-b"),
-    ], vec![], vec![]);
+    ], false, vec![], vec![]);
     assert_eq!(c.allow_paths.len(), 2);
     assert!(c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/cli-a")));
     assert!(c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/cli-b")));
+}
+
+// --- worktree follow ----------------------------------------------------------
+//
+// A path in a linked git worktree of an *already-allowed* repo is admitted even
+// though it sits outside the static allowed set — resolved by reading git's link
+// files, never by running git inside kaibo. We build authentic layouts with the
+// real `git` binary (the test harness isn't sandboxed) so we read git's actual
+// on-disk format, not our assumption of it.
+
+use std::process::Command;
+
+/// Whether a usable `git` is on PATH. The worktree-follow tests build authentic
+/// layouts with the real binary; on the rare host without git we skip them rather
+/// than panic with a confusing "git runs in the test harness" — a missing git is an
+/// environment gap, not a kaibo bug. `Command::new` returns an `Err` (not a panic)
+/// when the program isn't found, so this is safe to probe.
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Skip the calling test (with a visible note) when git is unavailable. Used at the
+/// top of every worktree-follow test so the suite stays green on a git-less host.
+macro_rules! require_git {
+    ($name:literal) => {
+        if !git_available() {
+            eprintln!("skipping {}: git not on PATH", $name);
+            return;
+        }
+    };
+}
+
+/// Run a git subcommand in `cwd`, asserting success. Pins identity and disables the
+/// operator's global/system config so the layout is hermetic across machines.
+fn git(cwd: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("git runs in the test harness");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A repo with one commit (so `worktree add` has a HEAD to base on) at `base/repo`,
+/// returning that path. The repo is created *inside* `base` so a linked worktree
+/// added as a sibling lands outside the repo root — the boundary we're testing.
+fn init_repo_with_commit(base: &Path) -> std::path::PathBuf {
+    let repo = base.join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("README.md"), "main worktree\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "seed"]);
+    repo
+}
+
+/// A linked worktree of an allowed repo is reachable: the path resolves and a read
+/// of a file unique to that worktree succeeds. This is the headline behavior — a
+/// sibling branch checkout is usable without an --allow-path.
+#[tokio::test]
+async fn linked_worktree_of_allowed_repo_is_admitted() {
+    require_git!("linked_worktree_of_allowed_repo_is_admitted");
+    let base = tempdir().unwrap();
+    let repo = init_repo_with_commit(base.path());
+    let wt = base.path().join("feature-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    fs::write(wt.join("only-here.txt"), "in the worktree\n").unwrap();
+
+    // Allowed set is just the main repo; the worktree is a sibling outside it.
+    let handler = handler_with_allowed(Some(&repo), &[]);
+
+    let out = try_run(&handler, &wt.to_string_lossy(), "cat only-here.txt")
+        .await
+        .expect("a worktree of an allowed repo must be admitted");
+    assert!(
+        out.contains("in the worktree"),
+        "should read the worktree's own file, got: {out}"
+    );
+}
+
+/// Following a worktree must not relax the boundary for unrelated paths: a non-git
+/// directory outside the allowed set is still rejected. Pins that follow admits
+/// *only* genuine worktrees, not "anything outside".
+#[tokio::test]
+async fn follow_does_not_admit_unrelated_outside_path() {
+    require_git!("follow_does_not_admit_unrelated_outside_path");
+    let base = tempdir().unwrap();
+    let repo = init_repo_with_commit(base.path());
+    let stranger = base.path().join("not-a-worktree");
+    fs::create_dir(&stranger).unwrap();
+    fs::write(stranger.join("secret.txt"), "sensitive\n").unwrap();
+
+    let handler = handler_with_allowed(Some(&repo), &[]);
+
+    let err = try_run(&handler, &stranger.to_string_lossy(), "cat secret.txt")
+        .await
+        .expect_err("an unrelated outside path must still be rejected");
+    assert!(
+        err.to_lowercase().contains("allowed"),
+        "rejection must name the boundary, got: {err}"
+    );
+}
+
+/// A forged `.git` file on the candidate side cannot smuggle a foreign dir in. The
+/// stranger's `.git` points at a *real* registered worktree's git dir, so a naive
+/// "candidate points into us" check would admit it — but trust flows only outward
+/// from the allowed repo (which never vouches for this path), so it's rejected.
+#[tokio::test]
+async fn spoofed_dotgit_pointing_into_allowed_repo_is_rejected() {
+    require_git!("spoofed_dotgit_pointing_into_allowed_repo_is_rejected");
+    let base = tempdir().unwrap();
+    let repo = init_repo_with_commit(base.path());
+    let real_wt = base.path().join("real-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "real",
+            real_wt.to_str().unwrap(),
+        ],
+    );
+
+    // Foreign dir with a hand-crafted `.git` file aimed at the real worktree's git
+    // dir inside the allowed repo. The back-link (repo/.git/worktrees/real/gitdir)
+    // points to real_wt, not here — so the trusted side never names this path.
+    let spoof = base.path().join("spoof");
+    fs::create_dir(&spoof).unwrap();
+    fs::write(spoof.join("loot.txt"), "should stay unreachable\n").unwrap();
+    let canon_repo = fs::canonicalize(&repo).unwrap();
+    fs::write(
+        spoof.join(".git"),
+        format!("gitdir: {}/.git/worktrees/real\n", canon_repo.display()),
+    )
+    .unwrap();
+
+    let handler = handler_with_allowed(Some(&repo), &[]);
+
+    let err = try_run(&handler, &spoof.to_string_lossy(), "cat loot.txt")
+        .await
+        .expect_err("a forged .git must not admit a foreign path");
+    assert!(
+        err.to_lowercase().contains("allowed"),
+        "rejection must name the boundary, got: {err}"
+    );
+}
+
+/// `follow_worktrees = false` keeps the boundary strictly static: a genuine linked
+/// worktree of an allowed repo is rejected like any other outside path.
+#[tokio::test]
+async fn follow_disabled_rejects_a_real_worktree() {
+    require_git!("follow_disabled_rejects_a_real_worktree");
+    let base = tempdir().unwrap();
+    let repo = init_repo_with_commit(base.path());
+    let wt = base.path().join("feature-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+
+    let mut config = Config::builtin();
+    config.root = Some(repo.clone());
+    config.follow_worktrees = false;
+    let handler = KaiboHandler::new(config).expect("handler builds");
+
+    let err = try_run(&handler, &wt.to_string_lossy(), "cat README.md")
+        .await
+        .expect_err("with follow off, a worktree is just an outside path");
+    assert!(
+        err.to_lowercase().contains("allowed"),
+        "rejection must name the boundary, got: {err}"
+    );
+}
+
+/// Symmetry: when kaibo is rooted *at* a linked worktree, the repo's other
+/// worktrees (here, the main worktree) are reachable too — the common git dir is
+/// resolved via the worktree's `commondir`, not assumed to be the root's `.git`.
+#[tokio::test]
+async fn sibling_reachable_when_rooted_at_linked_worktree() {
+    require_git!("sibling_reachable_when_rooted_at_linked_worktree");
+    let base = tempdir().unwrap();
+    let repo = init_repo_with_commit(base.path());
+    let wt = base.path().join("feature-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+
+    // Root at the linked worktree; the main worktree (`repo`) is the sibling.
+    let handler = handler_with_allowed(Some(&wt), &[]);
+
+    let out = try_run(&handler, &repo.to_string_lossy(), "cat README.md")
+        .await
+        .expect("the main worktree must be reachable from a linked-worktree root");
+    assert!(
+        out.contains("main worktree"),
+        "should read the main worktree's file, got: {out}"
+    );
 }

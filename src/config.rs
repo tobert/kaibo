@@ -519,6 +519,13 @@ pub struct Config {
     /// `KAIBO_ALLOW_PATHS` (colon-separated), or `[server] allow_paths` in
     /// config.toml. Non-empty CLI list replaces lower layers.
     pub allow_paths: Vec<PathBuf>,
+    /// Follow git worktrees of an already-allowed repo (default `true`). When a
+    /// per-call `path` misses the static allowed set, admit it if it is a linked
+    /// worktree of a repo already in the set — resolved by reading git's link files,
+    /// never by running git (see `crate::worktree`). Set `false` (via
+    /// `--no-follow-worktrees`, `KAIBO_NO_FOLLOW_WORKTREES`, or
+    /// `[server] follow_worktrees = false`) to keep the boundary strictly static.
+    pub follow_worktrees: bool,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -950,6 +957,7 @@ impl Config {
             .iter()
             .map(|s| expand_tilde(s))
             .collect();
+        let follow_worktrees = server.follow_worktrees.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default());
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
@@ -974,6 +982,7 @@ impl Config {
         let cfg = Self {
             root,
             allow_paths,
+            follow_worktrees,
             default_cast,
             log,
             tools,
@@ -1003,17 +1012,27 @@ impl Config {
     /// Apply CLI overrides (highest precedence). Called from `main` after load.
     /// CLI can only *disable* a tool (the `--no-<tool>` flags); enabling is the job
     /// of the file/env/built-in layers. A non-empty `allow_paths` replaces lower layers.
+    // A thin positional overlay of the parsed CLI flags onto the loaded config — the
+    // knobs are inherently many and bundling them into a struct would just relocate
+    // the positionality into a literal, so we accept the arg count here.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_cli(
         &mut self,
         root: Option<PathBuf>,
         cast: Option<String>,
         disable: ToolDisables,
         allow_paths: Vec<PathBuf>,
+        disable_follow_worktrees: bool,
         project_context_files: Vec<String>,
         user_context_files: Vec<PathBuf>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
+        }
+        // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
+        // never force it on over a `[server] follow_worktrees = false` in the file.
+        if disable_follow_worktrees {
+            self.follow_worktrees = false;
         }
         if let Some(cast) = cast {
             self.default_cast = cast;
@@ -1299,6 +1318,9 @@ struct RawServer {
     /// at-or-under `root` OR one of these. Env override: `KAIBO_ALLOW_PATHS`
     /// (colon-separated). CLI override: repeatable `--allow-path DIR`.
     allow_paths: Option<Vec<String>>,
+    /// Follow git worktrees of an already-allowed repo. Default `true`. Env:
+    /// `KAIBO_NO_FOLLOW_WORKTREES`. CLI: `--no-follow-worktrees`.
+    follow_worktrees: Option<bool>,
     /// The default cast (was `provider` before the backends/casts split; the old
     /// key is now an unknown-field load error via `deny_unknown_fields`).
     cast: Option<String>,
@@ -1696,6 +1718,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
         if !paths.is_empty() {
             server.allow_paths = Some(paths);
         }
+    }
+    if env_flag(get, "KAIBO_NO_FOLLOW_WORKTREES") {
+        server.follow_worktrees = Some(false);
     }
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);

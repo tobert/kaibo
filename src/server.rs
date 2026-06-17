@@ -518,6 +518,19 @@ impl KaiboHandler {
             return Ok(canon);
         }
 
+        // Step 3b: worktree follow. A path that misses the static set is still
+        // admitted when it lives in a linked git worktree of an *already-allowed*
+        // repo — so a sibling worktree (a branch you check out next to the project,
+        // possibly mid-session) is reachable without an --allow-path. Resolved by
+        // reading git's link files, never by running git (subprocess/git are
+        // compiled out — see sandbox.rs). Trust flows only outward from the allowed
+        // repo: we enumerate the worktrees the allowed tree's own common git dir
+        // vouches for and never consult the candidate's `.git`, so a foreign dir
+        // can't forge its way in. Off when `follow_worktrees` is false.
+        if self.config.follow_worktrees && self.is_followed_worktree(&canon) {
+            return Ok(canon);
+        }
+
         // Violation: name the allowed set and the three widening knobs.
         let trees: Vec<String> = allowed.iter().map(|p| p.display().to_string()).collect();
         Err(McpError::invalid_params(
@@ -532,6 +545,50 @@ impl KaiboHandler {
             ),
             None,
         ))
+    }
+
+    /// True when `canon` falls inside a git worktree that an already-allowed repo
+    /// vouches for. The trusted side does the vouching: for each allowed tree we
+    /// resolve *its* common git dir and enumerate the worktrees that common dir
+    /// names; `canon` is admitted only if it sits inside one. We never read
+    /// `canon`'s own `.git`, so a forged pointer there can't smuggle a foreign path
+    /// in. Pure file reads on the (rare) containment-miss path — see
+    /// [`crate::worktree`].
+    fn is_followed_worktree(&self, canon: &std::path::Path) -> bool {
+        self.allowed_set.iter().any(|tree| {
+            crate::worktree::common_git_dir(tree)
+                .map(|common| {
+                    crate::worktree::vouched_worktrees(&common)
+                        .iter()
+                        .any(|wt| canon.starts_with(wt))
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// The worktrees the follow feature currently admits *beyond* the static allowed
+    /// set — for the `kaibo://config` runtime section, so the live boundary stays
+    /// legible. Recomputed on each read (it reflects worktrees that exist now, which
+    /// can change between calls). Empty when the feature is off or nothing extra is
+    /// reachable. Deduplicated and sorted for a stable resource.
+    fn followed_worktrees(&self) -> Vec<PathBuf> {
+        if !self.config.follow_worktrees {
+            return Vec::new();
+        }
+        let mut found: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for tree in self.allowed_set.iter() {
+            let Some(common) = crate::worktree::common_git_dir(tree) else {
+                continue;
+            };
+            for wt in crate::worktree::vouched_worktrees(&common) {
+                // Skip worktrees already covered by the static set — those aren't
+                // "extra"; the runtime section reports only what follow adds.
+                if !self.allowed_set.iter().any(|t| wt.starts_with(t)) {
+                    found.insert(wt);
+                }
+            }
+        }
+        found.into_iter().collect()
     }
 
     /// Assemble the operator's house rules for this call against the resolved
@@ -1056,6 +1113,9 @@ impl rmcp::ServerHandler for KaiboHandler {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        // Compute the runtime-derived worktree set here (it needs the handler's
+        // allowed_set and reflects worktrees that exist *now*); the renderer is a
+        // pure function of its inputs, so it can't reach back for this itself.
         read_kaibo_resource_with_config(
             &request.uri,
             &self.tool_schemas,
@@ -1063,6 +1123,7 @@ impl rmcp::ServerHandler for KaiboHandler {
             &self.allowed_set,
             self.default_root.as_deref(),
             self.default_root_inferred,
+            self.followed_worktrees(),
         )
     }
 
@@ -1304,6 +1365,7 @@ fn render_config_resource(
     allowed_set: &[PathBuf],
     default_root: Option<&Path>,
     default_root_inferred: bool,
+    followed_worktrees: Vec<PathBuf>,
 ) -> String {
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -1325,6 +1387,10 @@ fn render_config_resource(
         default_root_inferred: bool,
         /// Default cast name (what a call omitting `cast` gets).
         default_cast: String,
+        /// Runtime-derived state — computed at read time, not configured. Distinct
+        /// from the static knobs above so a reader can tell "what kaibo discovered"
+        /// from "what the operator set".
+        runtime: RuntimeDoc,
         /// Which tools are currently advertised.
         tools: ToolsDoc,
         /// Read-only sandbox limits.
@@ -1355,6 +1421,17 @@ fn render_config_resource(
         oneshot: bool,
         run_kaish: bool,
         generate_image: bool,
+    }
+
+    /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
+    /// `followed_worktrees` is the live extra set the follow feature grants beyond
+    /// `allowed_paths` right now — git worktrees of an already-allowed repo,
+    /// resolved by reading git's link files. Recomputed on each read, so a worktree
+    /// added mid-session shows up here without a reconnect.
+    #[derive(Serialize)]
+    struct RuntimeDoc {
+        follow_worktrees: bool,
+        followed_worktrees: Vec<String>,
     }
 
     #[derive(Serialize)]
@@ -1586,6 +1663,13 @@ fn render_config_resource(
         default_root: default_root.map(|p| p.display().to_string()),
         default_root_inferred,
         default_cast: config.default_cast.clone(),
+        runtime: RuntimeDoc {
+            follow_worktrees: config.follow_worktrees,
+            followed_worktrees: followed_worktrees
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+        },
         tools: ToolsDoc {
             consult,
             oneshot,
@@ -1669,9 +1753,16 @@ fn read_kaibo_resource_with_config(
     allowed_set: &[PathBuf],
     default_root: Option<&Path>,
     default_root_inferred: bool,
+    followed_worktrees: Vec<PathBuf>,
 ) -> Result<ReadResourceResult, McpError> {
     if uri == CONFIG_URI {
-        let body = render_config_resource(config, allowed_set, default_root, default_root_inferred);
+        let body = render_config_resource(
+            config,
+            allowed_set,
+            default_root,
+            default_root_inferred,
+            followed_worktrees,
+        );
         return Ok(ReadResourceResult {
             contents: vec![ResourceContents::text(body, uri)],
         });
@@ -2169,8 +2260,9 @@ mod tests {
         // Use the config-aware dispatch for all URIs — same path the handler takes.
         let config = Config::builtin();
         let allowed: Vec<PathBuf> = Vec::new();
-        let result = read_kaibo_resource_with_config(uri, schemas, &config, &allowed, None, false)
-            .expect("known uri must read");
+        let result =
+            read_kaibo_resource_with_config(uri, schemas, &config, &allowed, None, false, vec![])
+                .expect("known uri must read");
         match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
@@ -2211,7 +2303,8 @@ mod tests {
                 &config,
                 &allowed,
                 None,
-                false
+                false,
+                vec![],
             )
             .is_err(),
             "an unregistered builtin must be a not-found error"
@@ -2223,8 +2316,16 @@ mod tests {
         let config = Config::builtin();
         let allowed: Vec<PathBuf> = Vec::new();
         assert!(
-            read_kaibo_resource_with_config("kaibo://nope", &[], &config, &allowed, None, false)
-                .is_err(),
+            read_kaibo_resource_with_config(
+                "kaibo://nope",
+                &[],
+                &config,
+                &allowed,
+                None,
+                false,
+                vec![]
+            )
+            .is_err(),
             "an unknown URI must be a not-found error, not an empty success"
         );
     }
@@ -2365,6 +2466,7 @@ mod tests {
             &allowed,
             None,
             false,
+            vec![],
         )
         .expect("example resource must be readable");
         let body = match &result.contents[0] {
@@ -2404,6 +2506,27 @@ mod tests {
         );
     }
 
+    /// The `[runtime]` section surfaces the live follow state: the knob, plus the
+    /// worktrees admitted *beyond* the static allowed set right now (passed in by
+    /// the handler, which computes them at read time). This keeps `kaibo://config`
+    /// honest about the real boundary — an auto-followed sibling isn't in
+    /// `allowed_paths` but is reachable, and a reader must be able to see that.
+    #[test]
+    fn config_resource_runtime_section_reports_followed_worktrees() {
+        let config = Config::builtin();
+        let allowed = vec![std::path::PathBuf::from("/tmp/the-repo")];
+        let followed = vec![std::path::PathBuf::from("/tmp/the-repo-feature")];
+        let body = render_config_resource(&config, &allowed, None, false, followed);
+        assert!(
+            body.contains("[runtime]") && body.contains("follow_worktrees = true"),
+            "runtime section must echo the follow knob:\n{body}"
+        );
+        assert!(
+            body.contains("/tmp/the-repo-feature"),
+            "runtime section must list the followed worktree:\n{body}"
+        );
+    }
+
     /// The config resource body must contain the key structural fields a calling
     /// model or operator expects: allowed paths, default_cast, gated tools,
     /// sandbox limits, backends with kind and key sources, and casts with their
@@ -2412,11 +2535,13 @@ mod tests {
     fn config_resource_renders_expected_fields() {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
-        let body = render_config_resource(&config, &allowed, None, false);
+        let body = render_config_resource(&config, &allowed, None, false, vec![]);
         // Structural presence checks — the resource is TOML or a document, not prose.
         for needle in [
             "allowed_paths",
             "default_cast",
+            "[runtime]",
+            "follow_worktrees",
             "tools",
             "sandbox",
             "defaults",
@@ -2493,7 +2618,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false);
+        let body = render_config_resource(&config, &[], None, false, vec![]);
         // The header NAME is discoverable…
         assert!(
             body.contains("authorization"),
@@ -2524,7 +2649,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false);
+        let body = render_config_resource(&config, &[], None, false, vec![]);
         for needle in ["[backend_aliases]", "[cast_aliases]"] {
             assert!(body.contains(needle), "must render {needle}:\n{body}");
         }
@@ -2571,7 +2696,7 @@ mod tests {
             unsafe {
                 std::env::set_var(var_name, SENTINEL);
             }
-            let b = render_config_resource(&config, &allowed, None, false);
+            let b = render_config_resource(&config, &allowed, None, false, vec![]);
             #[allow(deprecated)]
             unsafe {
                 std::env::remove_var(var_name);
@@ -2597,7 +2722,7 @@ mod tests {
         let file_path = tmp.path().to_string_lossy().to_string();
         let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
         let config2 = Config::from_toml_str(&toml2).expect("valid config");
-        let body2 = render_config_resource(&config2, &allowed, None, false);
+        let body2 = render_config_resource(&config2, &allowed, None, false, vec![]);
         // The file path (source pointer) may appear, but not the file contents.
         assert!(
             !body2.contains(SENTINEL),
@@ -2612,15 +2737,22 @@ mod tests {
     fn read_kaibo_config_resource_is_readable() {
         let config = Config::builtin();
         let allowed = handler().allowed_set();
-        let body_str = render_config_resource(&config, &allowed, None, false);
+        let body_str = render_config_resource(&config, &allowed, None, false, vec![]);
         // Sanity: the rendered document has something in it.
         assert!(
             !body_str.is_empty(),
             "config resource body must not be empty"
         );
         // The dispatch must not return not-found for this URI.
-        let result =
-            read_kaibo_resource_with_config(CONFIG_URI, &[], &config, &allowed, None, false);
+        let result = read_kaibo_resource_with_config(
+            CONFIG_URI,
+            &[],
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+        );
         assert!(
             result.is_ok(),
             "kaibo://config must be readable, got {result:?}"

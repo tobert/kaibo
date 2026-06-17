@@ -870,6 +870,7 @@ fn cli_cast_wins_over_env_and_file() {
             ..Default::default()
         },
         vec![], // no --allow-path flags
+        false,  // --no-follow-worktrees not passed
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
     );
@@ -891,7 +892,15 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
     // Pre-seed allow_paths as if they came from env or a config file.
     c.allow_paths = vec![std::path::PathBuf::from("/tmp/from-env")];
     // Apply CLI with no --allow-path flags (empty list).
-    c.apply_cli(None, None, ToolDisables::default(), vec![], vec![], vec![]);
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        vec![],
+        vec![],
+    );
     // The env/file-layer value must survive.
     assert!(
         c.allow_paths

@@ -57,6 +57,15 @@ the git log. Each later release appends a new section at the top.
   get. Set `allow_paths = ["~/src"]` once and every project under it is in-bounds —
   with cwd inferred as the default root, you stop thinking about `path` entirely.
   (Previously a literal `~` was taken verbatim and failed canonicalization at startup.)
+- **Follow git worktrees automatically.** A `path` in a linked git worktree of an
+  already-allowed repo is now reachable without an `--allow-path` — so a sibling
+  branch you check out next to the project (even one you spin up mid-session) just
+  works. kaibo resolves this by reading git's own link files, never by running git
+  (the binary still isn't in the build). Trust flows only outward from the allowed
+  repo: a forged `.git` in a foreign directory can't admit itself. The
+  `kaibo://config` `[runtime]` section shows which worktrees are currently followed.
+  Turn it off with `--no-follow-worktrees`, `KAIBO_NO_FOLLOW_WORKTREES`, or
+  `[server] follow_worktrees = false` to keep the boundary strictly static.
 - **Per-tool gating.** Each tool has a `--no-<tool>` flag (all on by default); an
   all-off server is refused at startup.
 - **Operator ignore files** via a `[kaish.ignore]` config stanza.
