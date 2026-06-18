@@ -212,14 +212,19 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 
 ## Pull requests & the changelog
 
-From **0.2.0** on, kaibo maintains a changelog and lands changes through pull
-requests — `main` is protected by convention, not a scratchpad.
+Every change lands through a pull request — `main` is never committed to directly.
+This is for **transparency**: kaibo is used by other people's agents, and the PR
+trail is how a user can see what we're up to — what changed, why, and what review it
+got — without reading the diff. So the discipline isn't about code risk; it holds
+even for a one-line doc fix.
 
-- **Branch → PR → review → merge.** Non-trivial work lands on a branch and goes up
-  as a PR, not direct-to-`main`. Dogfood the review: run a **cross-family** pass over
-  the diff — a different model lineage than wrote it (`/code-review`, or kaibo's own
-  `consult`/`oneshot` aimed at the change) — before merge. A typo or a one-line doc
-  fix can still go straight to `main`; this is judgment, not ceremony.
+- **Branch → PR → review → merge, always.** Every change starts on a branch and goes
+  up as a PR. There is no "small enough to push to `main`" carve-out — the point is
+  the visible trail, and a trivial change is trivial to review and merge. Dogfood the
+  review: run a **cross-family** pass over the diff — a different model lineage than
+  wrote it (`/code-review`, or kaibo's own `consult`/`oneshot` aimed at the change) —
+  before merge. Scale the review to the change (a doc fix is a glance; a sandbox or
+  TLS change is a hard look), but don't skip the PR.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
   Same "why not what" ethos as commits: write what a *user* notices, not the file
