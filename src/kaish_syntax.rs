@@ -39,8 +39,9 @@ yours to fill, so favor one wide look over many narrow ones; reading a whole fil
 often surfaces what a surgical slice would hide. `cat -n FILE` reads a file whole \
 with its line numbers — reach for it first; most files are short (`wc -l FILE` \
 confirms). To locate something across files, `grep -rn -B3 -A6 PATTERN .` returns \
-each match with the lines around it. Save a narrow span — `cat -n FILE | sed -n \
-'40,80p'` — for a genuinely large file. Each call starts at the project root; \
+each match with the lines around it. A whole-file read that comes back truncated \
+(exit 3, a head+tail sample) was simply too big — re-read just the part you need \
+with a narrow span, `cat -n FILE | sed -n '40,80p'`. Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \

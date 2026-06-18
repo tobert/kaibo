@@ -135,9 +135,9 @@ pub fn report_preamble() -> String {
          context, and exact line numbers together, and it surfaces what a surgical \
          slice would miss. To locate something across files, take the surrounding \
          context in the same call — `grep -rn -B4 -A8 PATTERN .` returns each match \
-         with the lines around it, ready to understand. Save narrow spans for a \
-         genuinely large file — over a thousand lines, which `wc -l FILE` confirms: \
-         `cat -n FILE | sed -n 'A,Bp'`.\n\n\
+         with the lines around it, ready to understand. If a whole-file read comes \
+         back truncated (exit 3, a head+tail sample), the file was too big for one \
+         look — narrow to the part you need with `cat -n FILE | sed -n 'A,Bp'`.\n\n\
          HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
          each key symbol to where it is defined and where it is used; chase anything \
          that puzzles you until it is clear — a confusing spot usually hides the \
