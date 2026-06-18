@@ -1224,7 +1224,7 @@ struct RawKaish {
 
 /// The `[kaish.ignore]` sub-table — which gitignore-format files the file-walking
 /// builtins honor, and how broadly. Every key is optional and defaults to
-/// [`IgnoreConfig::mcp`]'s value, so an absent stanza (or a partial one) preserves
+/// [`IgnoreConfig::agent`]'s value, so an absent stanza (or a partial one) preserves
 /// today's `.gitignore`-aware, enforced-scope behavior. `files` *replaces* the
 /// default `[".gitignore"]` when given — list it explicitly alongside extras to keep
 /// it (though `auto_gitignore`, on by default, still walks nested `.gitignore`s
@@ -1625,7 +1625,7 @@ fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
 }
 
 /// Resolve `[kaish.ignore]` into the kernel's [`IgnoreConfig`]. Each key falls back
-/// to the [`IgnoreConfig::mcp`] default, so an absent stanza reproduces it exactly
+/// to the [`IgnoreConfig::agent`] default, so an absent stanza reproduces it exactly
 /// (`.gitignore` + built-in defaults, enforced scope) and a partial stanza overrides
 /// only the keys it names. An unrecognized `scope` is a load error, not a silent
 /// fallback to the default.
@@ -2454,11 +2454,11 @@ mod tests {
 
     // --- ignore policy ([kaish.ignore]) -----------------------------------------
 
-    /// An absent `[kaish]` stanza reproduces the kernel's MCP ignore default exactly:
+    /// An absent `[kaish]` stanza reproduces the kernel's agent ignore default exactly:
     /// `.gitignore` loaded, built-in defaults on, auto-gitignore on, enforced scope.
     /// So omitting it keeps today's behavior.
     #[test]
-    fn ignore_default_matches_mcp() {
+    fn ignore_default_matches_agent() {
         let cfg = Config::builtin();
         let ig = &cfg.sandbox.ignore;
         assert_eq!(ig.files(), &[".gitignore"]);
@@ -2481,7 +2481,7 @@ mod tests {
         );
     }
 
-    /// A partial stanza overrides only the keys it names; the rest keep the MCP
+    /// A partial stanza overrides only the keys it names; the rest keep the agent
     /// default. Here `scope = "advisory"` flips scope while `files`/`defaults` stay.
     #[test]
     fn ignore_partial_stanza_overrides_only_named_keys() {
@@ -2492,7 +2492,7 @@ mod tests {
         let ig = &cfg.sandbox.ignore;
         assert_eq!(ig.scope(), IgnoreScope::Advisory);
         assert!(ig.use_global_gitignore());
-        // Untouched keys keep their mcp defaults.
+        // Untouched keys keep their agent defaults.
         assert_eq!(ig.files(), &[".gitignore"]);
         assert!(ig.use_defaults());
         assert!(ig.auto_gitignore());
