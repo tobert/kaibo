@@ -74,7 +74,7 @@ impl Tool for RunKaish {
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "kaish script to execute, e.g. `rg -n TODO src | head`"
+                        "description": "kaish script to execute, e.g. `grep -rn TODO src | head`"
                     }
                 },
                 "required": ["script"]

@@ -770,7 +770,7 @@ impl KaiboHandler {
             DeepSeek, Gemini, Anthropic, or a local model. Pick which one answers with \
             `cast` (e.g. `deepseek`, `gemini`, `anthropic`; the `cast` enum lists the \
             teams live right now, `kaibo://config` has the full set). A capable model \
-            drives a read-only kaish shell (cat/grep/rg/find/jq/pipelines): it reads \
+            drives a read-only kaish shell (cat/grep/find/jq/pipelines): it reads \
             precise spans directly and delegates broad repo sweeps to a fast explorer \
             sub-agent, then answers with concrete `file:line` citations. It finds and \
             reads the relevant code itself — describe what you did or want to know \
@@ -932,8 +932,10 @@ impl KaiboHandler {
 
     #[tool(
         description = "Run a kaish (sh-like) script against the read-only project; \
-            returns exit code + stdout + stderr. Browse code with line numbers: \
-            `cat -n FILE`, `rg -n PATTERN`, `cat -n FILE | sed -n '40,80p'`; compose \
+            returns exit code + stdout + stderr. Browse code with line numbers, and \
+            read generously — `cat -n FILE` for a whole file (reach for it first), \
+            `grep -rn PATTERN .` to locate across files, `cat -n FILE | sed -n \
+            '40,80p'` for a slice of a large one; compose \
             builtins with pipes (grep/jq/awk/find/...). Read-only: writes and external \
             commands are refused (exit 126 = blocked by the sandbox; a script killed \
             for running too long exits 124). Each call starts at the project root — \
@@ -1320,7 +1322,7 @@ fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
         title: None,
         description: Some(
             "Help for a single kaish builtin — parameters and examples. \
-             e.g. kaibo://kaish/builtin/rg"
+             e.g. kaibo://kaish/builtin/grep"
                 .to_string(),
         ),
         mime_type: Some("text/markdown".to_string()),
@@ -1898,7 +1900,7 @@ mod tests {
     fn sample_schemas() -> Vec<ToolSchema> {
         vec![
             ToolSchema::new("cat", "Read a file"),
-            ToolSchema::new("rg", "Recursive grep"),
+            ToolSchema::new("grep", "Search files for a pattern"),
         ]
     }
 
@@ -2272,7 +2274,7 @@ mod tests {
     #[test]
     fn reads_the_sandbox_doc_with_the_idioms_and_codes() {
         let text = read_text(SANDBOX_URI, &[]);
-        for needle in ["cat -n", "rg", "read-only", "126", "124"] {
+        for needle in ["cat -n", "grep", "read-only", "126", "124"] {
             assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
         }
     }
@@ -2289,9 +2291,9 @@ mod tests {
     #[test]
     fn reads_a_builtin_resource_and_rejects_an_unknown_builtin() {
         let schemas = sample_schemas();
-        let text = read_text(&format!("{BUILTIN_PREFIX}rg"), &schemas);
+        let text = read_text(&format!("{BUILTIN_PREFIX}grep"), &schemas);
         assert!(
-            text.contains("rg"),
+            text.contains("grep"),
             "builtin help should name the tool:\n{text}"
         );
         let config = Config::builtin();

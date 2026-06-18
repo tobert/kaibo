@@ -1193,7 +1193,7 @@ fn sandbox_section_parses() {
         [sandbox]
         exec_timeout_secs = 5
         output_limit_bytes = 4096
-        disable_builtins = ["rg", "find"]
+        disable_builtins = ["grep", "find"]
         "#,
     )
     .unwrap();
@@ -1201,7 +1201,7 @@ fn sandbox_section_parses() {
     assert_eq!(c.sandbox.output_limit_bytes, 4096);
     assert_eq!(
         c.sandbox.disable_builtins,
-        vec!["rg".to_string(), "find".to_string()]
+        vec!["grep".to_string(), "find".to_string()]
     );
 }
 
@@ -1220,11 +1220,11 @@ fn validate_against_builtins_rejects_an_unknown_name() {
     let c = Config::from_toml_str(
         r#"
         [sandbox]
-        disable_builtins = ["rg", "definitely-not-a-builtin"]
+        disable_builtins = ["grep", "definitely-not-a-builtin"]
         "#,
     )
     .unwrap();
-    let known = vec!["rg".to_string(), "cat".to_string(), "find".to_string()];
+    let known = vec!["grep".to_string(), "cat".to_string(), "find".to_string()];
     let err = c.validate_against_builtins(&known).unwrap_err();
     assert!(
         format!("{err:#}").contains("definitely-not-a-builtin"),
@@ -1237,11 +1237,11 @@ fn validate_against_builtins_accepts_a_known_subset() {
     let c = Config::from_toml_str(
         r#"
         [sandbox]
-        disable_builtins = ["rg"]
+        disable_builtins = ["grep"]
         "#,
     )
     .unwrap();
-    let known = vec!["rg".to_string(), "cat".to_string()];
+    let known = vec!["grep".to_string(), "cat".to_string()];
     assert!(c.validate_against_builtins(&known).is_ok());
 }
 

@@ -1,13 +1,13 @@
 //! Static repo orientation: a size-gated, computed-once file map spliced into the
 //! exploring phases' preamble so a model starts *knowing* the project's files
-//! instead of spending its first turns on `glob`/`ls`/`rg --files` to discover the
+//! instead of spending its first turns on `glob`/`ls`/`find` to discover the
 //! layout. This is the structure-first lesson (Agentless/Aider) made free — no
 //! model in the loop, computed server-side.
 //!
 //! It leans on kaish's own tools rather than reimplementing them: `glob -a --json
 //! '**/*'` run through the kernel is the *same* ignore-aware enumeration the model's
 //! shell would get (same VFS, same ignore config), so the map can never disagree
-//! with what the explorer's own `glob`/`rg` sees — one source of truth. (`-a`
+//! with what the explorer's own `glob`/`grep` sees — one source of truth. (`-a`
 //! includes hidden config like `.github/`/`.cargo/`; the ignore filter still drops
 //! `.git`/`target`.)
 //!
@@ -60,7 +60,7 @@ impl OrientationConfig {
                 "this project has {n} files, over [orientation] full_list_max_files \
                  ({}). The directory-tree map for larger repos isn't built yet — raise \
                  the limit, set [orientation] enabled = false, or point a cast that \
-                 explores via `rg` at it.",
+                 explores via `grep` at it.",
                 self.full_list_max_files
             );
         }
@@ -101,7 +101,7 @@ fn render(files: &[String]) -> String {
         "PROJECT FILES. The project's complete file list (read-only; hidden config \
          included, build/VCS dirs excluded). You already have the whole layout here, \
          so go straight to reading the files the question touches with `cat -n FILE`, \
-         and use `rg -n` to find where something lives inside them.\n",
+         and use `grep -rn` to find where something lives inside them.\n",
     );
     for f in files {
         s.push_str("  ");

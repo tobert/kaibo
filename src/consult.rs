@@ -128,13 +128,15 @@ pub fn report_preamble() -> String {
          a question touches and hand it to a synthesizer who writes the final \
          answer — so your work is to gather grounded evidence and cite it exactly. \
          {core}\n\n\
-         HOW TO READ. Read for the whole picture in as few looks as possible. Locate \
-         with ripgrep and take the surrounding context in the same call — \
-         `rg -n -B4 -A8 PATTERN` returns each match with the lines around it, ready \
-         to understand. When a file is central, read it WHOLE with `cat -n FILE`: \
-         most files are short, and one full read hands you its imports, its context, \
-         and exact line numbers together. Save narrow spans for a genuinely large \
-         file — over a thousand lines, which `wc -l FILE` confirms: \
+         HOW TO READ. Read for the whole picture in as few looks as possible — the \
+         context window is yours to fill, so favor one wide look over many narrow \
+         ones. When a file is central, read it WHOLE with `cat -n FILE`: reach for \
+         this first; most files are short, one full read hands you its imports, its \
+         context, and exact line numbers together, and it surfaces what a surgical \
+         slice would miss. To locate something across files, take the surrounding \
+         context in the same call — `grep -rn -B4 -A8 PATTERN .` returns each match \
+         with the lines around it, ready to understand. Save narrow spans for a \
+         genuinely large file — over a thousand lines, which `wc -l FILE` confirms: \
          `cat -n FILE | sed -n 'A,Bp'`.\n\n\
          HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
          each key symbol to where it is defined and where it is used; chase anything \
@@ -1332,7 +1334,7 @@ impl Tool for RunExplore {
             description: "Delegate a broad sweep to a fast investigator that rips \
                 through the repo on a read-only kaish shell and reports back with \
                 concrete `file:line` citations. Give it a focused question; use it \
-                to cover breadth, and read precise spans yourself with `run_kaish`."
+                to cover breadth, and read the code yourself with `run_kaish`."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1489,8 +1491,11 @@ pub fn consult_preamble() -> String {
          fast investigator that rips through the repo and reports back with a \
          curated report — RelevantLocations carrying `file:line`, key symbols, and \
          snippets. Reach for `explore` to cover breadth — find where a \
-         thing lives, gather the relevant files — and use `run_kaish` to read a \
-         precise span yourself and confirm a detail. Build your answer from what \
+         thing lives, gather the relevant files — and use `run_kaish` to read the \
+         code yourself. When you read directly, read generously: pull a whole file \
+         with `cat -n FILE` rather than a narrow slice — the window is yours to \
+         fill, and one wide look often surfaces what a surgical read would miss. \
+         Build your answer from what \
          they return: quote the key snippet, name its `file:line`, and let the \
          evidence carry the claim. Where the evidence settles the question, answer \
          it fully; where it reaches its edge, say so and name what would close the gap.\n\n\
@@ -2013,9 +2018,9 @@ mod tests {
                 let seen = transcript_text(req);
                 if !seen.contains("target_marker") {
                     Ok(tool_call_response(
-                        "t-rg",
+                        "t-grep",
                         "run_kaish",
-                        json!({ "script": "rg -n target_marker src" }),
+                        json!({ "script": "grep -rn target_marker src" }),
                     ))
                 } else {
                     Ok(text_response(REPORT))
@@ -2116,9 +2121,9 @@ mod tests {
                 // a content check on that would skip the read we're here to observe.
                 if !transcript_text(req).contains("exit:") {
                     Ok(tool_call_response(
-                        "t-rg",
+                        "t-grep",
                         "run_kaish",
-                        json!({ "script": "rg -n target_marker src" }),
+                        json!({ "script": "grep -rn target_marker src" }),
                     ))
                 } else {
                     Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
@@ -2155,7 +2160,7 @@ mod tests {
             "the delegation must announce its finish: {events:?}"
         );
         assert!(
-            events.contains(&PhaseEvent::KaishRun { script: "rg -n target_marker src".into() }),
+            events.contains(&PhaseEvent::KaishRun { script: "grep -rn target_marker src".into() }),
             "the nested explorer's read must surface (sink threaded into the sub-agent): {events:?}"
         );
         assert!(
@@ -2171,7 +2176,7 @@ mod tests {
             question: "where is target_marker defined?".into(),
         });
         let nested = pos(&PhaseEvent::KaishRun {
-            script: "rg -n target_marker src".into(),
+            script: "grep -rn target_marker src".into(),
         });
         let finish = pos(&PhaseEvent::SweepFinished);
         assert!(
@@ -2963,19 +2968,19 @@ mod tests {
 
     /// The explorer preamble carries the behaviors we measured into it — the
     /// whole-file reading directive (the lite-explorer win, 48→23 turns), the
-    /// context-buffer `rg` idiom, and the three report sections the synth side now
+    /// context-buffer `grep` idiom, and the three report sections the synth side now
     /// expects. Pure and offline; pins the prose so a future edit can't silently
     /// drop any of it (the synth preambles are written against this shape).
     #[test]
     fn report_preamble_keeps_the_reading_directive_and_report_shape() {
         let p = report_preamble();
-        // Reading strategy: read whole files, locate with an rg context buffer.
+        // Reading strategy: read whole files, locate with a grep context buffer.
         assert!(p.contains("cat -n FILE"), "whole-file read idiom: {p}");
         assert!(
             p.to_lowercase().contains("whole"),
             "the whole-file directive must survive: {p}"
         );
-        assert!(p.contains("rg -n -B4 -A8"), "rg context-buffer idiom: {p}");
+        assert!(p.contains("grep -rn -B4 -A8"), "grep context-buffer idiom: {p}");
         // The report template the consult driver preamble is written
         // against — keep the three section names in lockstep with those.
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {

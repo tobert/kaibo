@@ -126,11 +126,11 @@ scratch_limit_bytes = 67108864
 # This only makes the box STRICTER — it can't re-enable the read-only denylist
 # (git/touch/spawn/exec/kill/mktemp), and the dangerous axes aren't compiled in.
 # A name that isn't a real builtin is a loud startup error, not a silent no-op.
-# disable_builtins = ["rg", "find"]
+# disable_builtins = ["grep", "find"]
 
 # ---------------------------------------------------------------------------
 # [kaish.ignore] — which gitignore-format files the file-walking builtins
-# (glob/rg/ls/find — and the orientation repo-map, which rides the same kernel)
+# (glob/grep/ls/find — and the orientation repo-map, which rides the same kernel)
 # honor. This is DISCOVERY/NOISE policy, NOT a safety boundary: it changes what the
 # explorer SEES, never what it's allowed to read. Omit the whole stanza to keep the
 # default below (`.gitignore` + built-in defaults, enforced scope) — that's exactly
@@ -141,7 +141,7 @@ scratch_limit_bytes = 67108864
 # [kaish.ignore]
 # `files` REPLACES the default [".gitignore"] — to add (say) .claudeignore while
 # keeping .gitignore, list both. Loaded at the root and walked up through ancestors,
-# in precedence order (later wins, rg-style). auto_gitignore (below) still walks
+# in precedence order (later wins, ripgrep-style). auto_gitignore (below) still walks
 # root + nested .gitignore files regardless of this list — so dropping ".gitignore"
 # here does NOT disable .gitignore (only stops honoring ANCESTOR .gitignores above
 # the root). To honor .gitignore nowhere, set auto_gitignore = false AND omit it here.
