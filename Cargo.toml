@@ -21,7 +21,7 @@ path = "src/main.rs"
 # `os-integration` (trash) OFF — so those builtins are never compiled in. kaibo's
 # read-only safety is thus structural (the dangerous surface doesn't exist),
 # backed by the runtime read-only mount; see src/sandbox.rs.
-kaish-kernel = { version = "0.8.4", default-features = false, features = ["localfs"] }
+kaish-kernel = { version = "0.9.0", default-features = false, features = ["localfs"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 async-trait = "0.1"
 anyhow = "1"

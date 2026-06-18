@@ -354,7 +354,7 @@ async fn configured_ignore_file_hides_its_matches() {
 
     // Configure `.claudeignore` on top of the defaults: secret.txt vanishes, keep.txt
     // stays.
-    let mut ignore = IgnoreConfig::mcp();
+    let mut ignore = IgnoreConfig::agent();
     ignore.add_file(".claudeignore");
     let sandbox = SandboxConfig {
         ignore,
