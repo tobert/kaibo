@@ -1252,7 +1252,7 @@ struct RawKaish {
 #[serde(deny_unknown_fields)]
 struct RawIgnore {
     /// Ignore filenames loaded at the root and walked up through ancestors, in
-    /// precedence order (later wins, rg-style). Default: `[".gitignore"]`.
+    /// precedence order (later wins, ripgrep-style). Default: `[".gitignore"]`.
     files: Option<Vec<String>>,
     /// Apply built-in defaults (`target/`, `node_modules/`, `.git`). Default: true.
     defaults: Option<bool>,

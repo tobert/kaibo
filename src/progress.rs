@@ -103,10 +103,10 @@ mod tests {
             .contains("research limit"));
         assert_eq!(
             PhaseEvent::KaishRun {
-                script: "rg -n TODO src".into()
+                script: "grep -rn TODO src".into()
             }
             .message(),
-            "running kaish: rg -n TODO src"
+            "running kaish: grep -rn TODO src"
         );
         assert_eq!(
             PhaseEvent::SweepStarted {
@@ -120,9 +120,9 @@ mod tests {
     #[test]
     fn brief_clips_to_one_line_and_caps_length() {
         // Multi-line script collapses to its first line.
-        assert_eq!(brief("cat -n a\nrg b\nfind c", 80), "cat -n a");
+        assert_eq!(brief("cat -n a\ngrep b\nfind c", 80), "cat -n a");
         // Leading whitespace/newlines are trimmed before the first line is taken.
-        assert_eq!(brief("\n  rg -n x  \n", 80), "rg -n x");
+        assert_eq!(brief("\n  grep -n x  \n", 80), "grep -n x");
         // Over the cap → clipped with an ellipsis, never longer than the cap.
         let long = "x".repeat(200);
         let out = brief(&long, 80);
