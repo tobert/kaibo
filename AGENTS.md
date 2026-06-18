@@ -98,8 +98,10 @@ commands.
   model routing, error injection) are new responders, not harness changes. Inject via
   the generic seams (`run_phase`, `consult_with`, `consult_session_turn`); the public
   `consult`/`oneshot` build the real client behind `with_provider_client!`.
-- **`docs/issues.md` is the live tracker.** Skim it before new work. Delete
-  entries when they ship — don't mark them done; git history is the record.
+- **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
+  before new work. Delete entries when they ship; don't mark them done. The *why*
+  behind a ship moves to **`docs/devlog.md`** (dated, newest-first, why-not-what —
+  the curated narrative git can't carry), not the commit log alone.
 - **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
   under active development upstream. A version bump can change its API — when you
   bump, adapt kaibo to the new shape, don't pin around it. (If you're co-developing
