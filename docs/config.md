@@ -613,7 +613,7 @@ exactly the worktrees of an already-allowed repo and nothing else.
 
 kaibo resolves this by **reading git's own link files** — a worktree's `.git` file,
 the repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git` (the
-binary isn't in the build; see [Read-only is structural](#)). Trust flows only
+binary isn't in the build; see [the sandbox probe runbook](sandbox-probes.md)). Trust flows only
 outward from the allowed repo: kaibo enumerates the worktrees the *allowed* repo's
 common git dir vouches for and admits a candidate only if it falls inside one. It
 never consults the candidate's own `.git`, so a foreign directory with a forged
