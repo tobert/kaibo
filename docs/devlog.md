@@ -83,7 +83,7 @@ image kinds pending rig coverage.
 
 ## 2026-06-12 — `view_image` on OpenAI-compatible VLMs
 
-Offline-green — the channel fix from `docs/oai-images.md`. An `openai` vision slot now
+Offline-green — the OpenAI vision-channel fix. An `openai` vision slot now
 genuinely *sees*. `view_image` still produces the tool-result image envelope, but on a
 transport that can't carry it (the OpenAI wire forbids an image in a `role:tool` message;
 rig 400s first), `run_phase` (`consult.rs`) installs a `ViewImageBreakHook` that flags on
@@ -105,8 +105,8 @@ Offline tests: pure rewrite (separate-message, idempotency, co-tool-call selecti
 two driven loop tests. **Caveat that was open at ship:** the scripted mock returns its
 answer regardless of wire validity, so a rewrite that left an orphaned `tool_use` passes
 offline; only a real openai-compatible VLM (local Qwen-VL) reporting a detail it could
-only *see* confirms it. The live probe was load-bearing, not optional — see
-`docs/oai-images.md` "Tests/Live probe."
+only *see* confirms it — the live probe against a real VLM was load-bearing, not
+optional.
 
 ## 2026-06-11 — vision-in (`view_image`)
 

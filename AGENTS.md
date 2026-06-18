@@ -38,14 +38,17 @@ is the consumer.
 Each tool is independently gated by a `--no-<tool>` flag (all on by default; the
 all-off server is refused at startup). Multi-provider over `rig-core`: a
 **`ProviderKind`** is the wire protocol (keyed Anthropic / DeepSeek / Gemini, plus
-**`openai`** for any OpenAI-compatible endpoint). A **`Profile`** (`config.rs`) is a
-*named instance* of a kind with its own base URL, key source, and models — so two
-`openai` profiles (hosted GPT and a local Gemma/llama.cpp server, say) can be live
-at once, each selected by the `provider` arg. Profiles come from a built-in registry
-merged under an XDG `config.toml`, `KAIBO_*` env, then CLI flags (precedence:
-per-call > CLI > env > file > built-in); a missing config file is a non-error.
-See `docs/config.md`. kaibo never modifies the project and cannot run external
-commands.
+**`openai`** for any OpenAI-compatible endpoint). A **`[backends.<name>]`**
+(`config.rs`) is a *named connection* of a kind with its own base URL and key source —
+so two `openai` backends (hosted GPT and a local Gemma/llama.cpp server, say) can be
+live at once. A **`[casts.<name>]`** is a model team mapping each role (explorer /
+synth / image / …) to a `"backend/model-id"`, freely cross-backend, so one cast can
+pair a cheap local explorer with a hosted synth; a call picks its team with the `cast`
+arg. Backends and casts come from a built-in registry merged under an XDG
+`config.toml`, `KAIBO_*` env, then CLI flags (precedence: per-call > CLI > env > file >
+built-in); a missing config file is a non-error. See `docs/config.md`, and
+`docs/casts.md` for the backends/casts design rationale. kaibo never modifies the
+project and cannot run external commands.
 
 ## Invariants — do not weaken without a failing-first test
 

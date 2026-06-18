@@ -166,7 +166,8 @@ Per-call overrides, env vars, and CLI flags all layer over the file
 (`per-call > CLI > env > file > built-in`). The full surface — per-slot thinking
 budgets, effort, sampling, system-prompt overrides, house-rules injection — is in
 [`docs/config.md`](docs/config.md), with a commented template in
-[`docs/config.example.toml`](docs/config.example.toml). The live, resolved state is
+[`docs/config.example.toml`](docs/config.example.toml); the design rationale behind the
+backends/casts split is [`docs/casts.md`](docs/casts.md). The live, resolved state is
 always readable at the `kaibo://config` MCP resource.
 
 ---
@@ -266,7 +267,9 @@ might not trust a read-write subagent to behave.
 **Is read-only actually guaranteed, or best-effort?** It's structural, not best-effort.
 kaibo compiles in only kaish's `localfs` axis — the `subprocess`, `git`, `host`, and
 `os-integration` features are off, so `exec`/`spawn`/`git`/`ps` *don't exist in the
-binary* — and mounts the project read-only on top.
+binary* — and mounts the project read-only on top. The
+[`docs/sandbox-probes.md`](docs/sandbox-probes.md) runbook is how we live-test that
+boundary — write/external-command/read-escape batteries run against the shipped binary.
 
 **How long does a consult take?** It's a multi-step investigation, not a single API
 call — a deep one can run a few minutes, more with thinking on and a large repo to
@@ -300,10 +303,12 @@ are set up so they can cache well on most providers.
 
 ## Contributing
 
-Agent contributions welcome. From 0.2.0 on, changes land through pull requests and
-every user-facing change gets a [`CHANGELOG.md`](CHANGELOG.md) entry. See
+Agent contributions welcome. Every change lands through a pull request — for
+transparency, so anyone using kaibo can see what changed and why — and every
+user-facing change gets a [`CHANGELOG.md`](CHANGELOG.md) entry. See
 [`AGENTS.md`](AGENTS.md) for the architecture, the PR-and-changelog workflow, and
-working conventions, and [`docs/issues.md`](docs/issues.md) for the live tracker.
+working conventions, [`docs/issues.md`](docs/issues.md) for the live tracker of open
+work, and [`docs/devlog.md`](docs/devlog.md) for the shipped-work record.
 
 ## Name
 
