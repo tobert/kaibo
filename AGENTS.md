@@ -170,7 +170,7 @@ How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherit
   over "never invent citations", and treat naming the edge of the evidence as a
   normal grounded move. Blanket "never X" can light up the very pathway it names and
   make weaker/local models (Gemma especially) fixate or loop. Lead the kaish
-  cheatsheet with the good idioms (`cat -n`, `rg -n`, numbered spans — they produce
+  cheatsheet with the good idioms (`cat -n`, `grep -rn`, numbered spans — they produce
   the accurate `file:line`s we reward), not a flat builtin list.
 - **Trust grounded evidence; steer toward acquisition, not verification.** When a
   phase is handed context (an explorer report, a prior turn, pasted source), frame

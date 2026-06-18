@@ -218,6 +218,16 @@ for now, but a busy server rebuilds kernels constantly. Consider a small worker
 pool, or resetting one kernel's cwd between phases instead of rebuilding. Measure
 before optimizing.
 
+### Flaky tracing-capture tests in `tool_span.rs`
+`emits_an_error_outcome_when_the_tool_fails` (and its `ok` sibling) fail ~25% of
+the time in the *parallel* full `cargo test` run, never in isolation. Both register
+a `tracing_subscriber::registry().with(cap)` via `set_default` and assert on captured
+spans; run concurrently on cargo's test threads they race on tracing's process-global
+span store, so one test's `tool` span can go missing from the other's capture. A test
+that fails when we *didn't* make a mistake is the opposite of the teeth we want. Fix:
+serialize the two (a shared `Mutex`/`serial_test`), or capture per-span without leaning
+on global dispatch. Out of scope when found (the read-idioms/output-cap PR).
+
 ### `oneshot` batch — batchable fan-out of the tool-less answer (deferred)
 The tool-less, non-interactive answer shipped as the `oneshot` tool (prompt in,
 answer out, no tools — `consult.rs::oneshot`). What's still deferred is the *batch*
@@ -313,8 +323,8 @@ a note in the render is enough to make the no-op visible to the operator.
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
 `ExplorationTrace`), the curiosity + completeness behaviors, and the assertive
-whole-file / `rg -B/-A` reading strategy now live in `report_preamble` (and the
-`rg`/`wc -l` idioms in the shared cheatsheet). Measured against a real review task,
+whole-file / `grep -B/-A` reading strategy now live in `report_preamble` (and the
+`grep`/`wc -l` idioms in the shared cheatsheet). Measured against a real review task,
 a lite Gemini explorer dropped from 48 turns to ~21 with *better* citations — the
 built-in reproduces it with no per-cast config. Still open, lower value:
 - **A worked, filled-in example in the prompt.** We ship the section *template*, not a

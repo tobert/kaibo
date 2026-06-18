@@ -34,11 +34,14 @@ use crate::config::{CastUsability, Config};
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so just read. Browse with line \
-numbers so every citation is exact — `cat -n FILE` to read a whole file, \
-`rg -n -B3 -A6 PATTERN` to find a match with the lines around it, and numbered \
-spans like `cat -n FILE | sed -n '40,80p'` for one slice of a large file. \
-`wc -l FILE` tells you a file's length — most are short enough to read whole. \
-Each call starts at the project root; \
+numbers so every citation is exact, and read generously — the context window is \
+yours to fill, so favor one wide look over many narrow ones; reading a whole file \
+often surfaces what a surgical slice would hide. `cat -n FILE` reads a file whole \
+with its line numbers — reach for it first; most files are short (`wc -l FILE` \
+confirms). To locate something across files, `grep -rn -B3 -A6 PATTERN .` returns \
+each match with the lines around it. A whole-file read that comes back truncated \
+(exit 3, a head+tail sample) was simply too big — re-read just the part you need \
+with a narrow span, `cat -n FILE | sed -n '40,80p'`. Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
@@ -325,11 +328,13 @@ pub fn kaibo_sandbox_doc() -> String {
         "# kaibo — the read-only kaish sandbox\n\n\
          {KAISH_SANDBOX_ADDENDUM}\n\n\
          ## Browsing for exact citations\n\
-         Lead with line numbers so every claim cites `file:line`:\n\
-         - `cat -n FILE` — file with line numbers\n\
-         - `rg -n PATTERN [PATH]` — matches with line numbers\n\
-         - `cat -n FILE | sed -n '40,80p'` — a numbered span\n\
-         - `rg -l PATTERN src` — just the file names that match\n\n\
+         Lead with line numbers so every claim cites `file:line`, and read \
+         generously — favor a whole file over a narrow slice:\n\
+         - `cat -n FILE` — a whole file with line numbers; reach for it first\n\
+         - `grep -rn PATTERN [PATH]` — matches with line numbers, across files\n\
+         - `grep -rn -B3 -A6 PATTERN .` — matches with the lines around them\n\
+         - `grep -rl PATTERN src` — just the file names that match\n\
+         - `cat -n FILE | sed -n '40,80p'` — a numbered span of a large file\n\n\
          ## Read-only boundary\n\
          The project is mounted read-only and external commands are off, by \
          construction. Writes, `git`, `touch`, `spawn`/`exec`, and any external \
@@ -349,7 +354,7 @@ pub fn kaibo_sandbox_doc() -> String {
          deeper without spending a tool turn: `kaibo://kaish/syntax`, \
          `kaibo://kaish/builtins`, `kaibo://kaish/vfs`, `kaibo://kaish/scatter`, and \
          the rest. For one builtin, read `kaibo://kaish/builtin/<name>` (e.g. \
-         `kaibo://kaish/builtin/rg`). All of it is also available inside a script: \
+         `kaibo://kaish/builtin/grep`). All of it is also available inside a script: \
          `help`, `help syntax`, `help <builtin>`.\n"
     )
 }
@@ -426,7 +431,7 @@ mod tests {
         // The two things the synth preamble rewards (exact file:line) and the two
         // codes an automated caller will misread without help. These are kaibo's,
         // so they live in the addendum (kaish-help can't know our 126/124).
-        for needle in ["cat -n", "rg -n", "126", "124"] {
+        for needle in ["cat -n", "grep -rn", "126", "124"] {
             assert!(
                 KAISH_SANDBOX_ADDENDUM.contains(needle),
                 "addendum must mention {needle:?}"

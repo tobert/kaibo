@@ -117,7 +117,7 @@ screenshots/assets/docs are files already in the tree); no MCP-native/inline inp
 Bytes are read through the project VFS via a new `KaishWorker::read_file` (a `Job::Read`
 on the worker thread → the *project* `VfsRouter`, retained from
 `build_readonly_kernel_and_vfs` because under `with_backend` the kernel's own `vfs()`
-carries only `/v/*` scratch), so containment + read-only stay structural and the 8 KB
+carries only `/v/*` scratch), so containment + read-only stay structural and the
 script-output cap is bypassed for the deliberate read. Toolset assembly gates
 `view_image` on `arm.caps.vision` in all phases; a blind model never sees the tool, so
 there's no fail-loud attach path.

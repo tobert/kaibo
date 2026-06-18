@@ -278,7 +278,7 @@ client that surfaces them shows live progress; whether you actually see those be
 up to your agent's UI, which kaibo can't control.
 
 **Can a runaway consultation melt my machine or my budget?** There are hard ceilings
-on both. Every kaish script is capped at 30s wall-clock, 8 KB of output, and 64 MB of
+on both. Every kaish script is capped at 30s wall-clock, 64 KiB of output, and 64 MB of
 in-memory scratch (a write past the cap fails loudly rather than growing without
 bound), so a `while true; grep -r /` can't run away. The model loops are bounded too:
 the explorer sweep and the consult driver stop at a turn limit (100 and 200 by

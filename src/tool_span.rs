@@ -66,7 +66,7 @@ pub fn traced<T: Tool + 'static>(tool: T) -> Box<dyn ToolDyn> {
 /// field — the `run_kaish` `script`, a `path`, an `explore` `question` — else the
 /// raw JSON, truncated. Read-only project args carry no secrets; the cap just keeps
 /// a long script from bloating the span. This is the field that turns "16 run_kaish
-/// calls" into "1 was `glob`, 15 were `cat -n`/`rg`".
+/// calls" into "1 was `glob`, 15 were `cat -n`/`grep`".
 fn arg_summary(args: &str) -> String {
     const MAX_CHARS: usize = 200;
     let preview = serde_json::from_str::<serde_json::Value>(args)

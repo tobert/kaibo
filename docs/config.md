@@ -461,7 +461,7 @@ Prefer architectural answers; name the file:line that carries each claim.
 
 **Full replace, by decision.** An override *is* the role framing, verbatim — kaibo
 does not re-wrap it. That's safe because the kaish operating contract (how to drive
-the read-only shell, the exit-code meanings, the `cat -n`/`rg -n` idioms) rides the
+the read-only shell, the exit-code meanings, the `cat -n`/`grep -rn` idioms) rides the
 `run_kaish` *tool description* independently, so the model keeps the shell contract
 even when you rewrite the prose. What an override *does* drop is the tuned role
 framing kaibo ships — the explorer's "report, don't conclude", the synth's "trust a
@@ -511,7 +511,7 @@ drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`
 
 A static, computed-once **file map** injected into the exploring preamble, so a
 model starts *knowing* the project's files instead of spending its first turns on
-`glob`/`ls`/`rg --files` to discover the layout (the structure-first lesson from
+`glob`/`ls`/`find` to discover the layout (the structure-first lesson from
 Agentless/Aider, made free — no model in the loop).
 
 ```toml
@@ -523,14 +523,14 @@ full_list_max_files = 256    # ≤ this → inject the full list; above → refu
 How it works: the server runs the kernel's **own** `glob -a --json '**/*'` server-side
 per `explore`/`consult` call — the *same* ignore-aware enumeration the model's shell
 would get (same VFS, same ignore rules), so the map can't disagree with what the
-explorer's own `glob`/`rg` sees. `-a` includes hidden config (`.github/`, `.cargo/`);
+explorer's own `glob`/`grep` sees. `-a` includes hidden config (`.github/`, `.cargo/`);
 the ignore filter still drops `.git`/`target`.
 
 Size-gated, by file count:
 - **≤ `full_list_max_files`** → the complete file list is spliced in.
 - **above it** → the call is **refused loudly** (`internal_error` naming the knob).
   A big repo is an explicit error, not a silent partial dump — raise the limit, set `enabled = false`,
-  or point a cast that explores via `rg` at it. (`full_list_max_files = 0` is a load
+  or point a cast that explores via `grep` at it. (`full_list_max_files = 0` is a load
   error: it would refuse every repo; disable instead.)
 
 It rides the **exploring** phases only — the `consult` driver and its nested
