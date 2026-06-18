@@ -83,7 +83,7 @@ docs are files already in the tree); no MCP-native/inline input. Bytes are read
 through the project VFS via a new `KaishWorker::read_file` (a `Job::Read` on the
 worker thread → the *project* `VfsRouter`, retained from `build_readonly_kernel_and_vfs`
 because under `with_backend` the kernel's own `vfs()` carries only `/v/*` scratch),
-so containment + read-only stay structural and the 8 KB script-output cap is bypassed
+so containment + read-only stay structural and the script-output cap is bypassed
 for the deliberate read. Toolset assembly gates `view_image` on `arm.caps.vision` in
 all three phases (`phase_tools` for explore/synthesize, `consult_tools` for the synth
 driver; the explore′ sweep inherits its own gate); a blind model never sees the tool,
@@ -364,6 +364,16 @@ read-only kernel builds) so the synth starts clean at the root (`consult.rs`). F
 for now, but a busy server rebuilds kernels constantly. Consider a small worker
 pool, or resetting one kernel's cwd between phases instead of rebuilding. Measure
 before optimizing.
+
+### Flaky tracing-capture tests in `tool_span.rs`
+`emits_an_error_outcome_when_the_tool_fails` (and its `ok` sibling) fail ~25% of
+the time in the *parallel* full `cargo test` run, never in isolation. Both register
+a `tracing_subscriber::registry().with(cap)` via `set_default` and assert on captured
+spans; run concurrently on cargo's test threads they race on tracing's process-global
+span store, so one test's `tool` span can go missing from the other's capture. A test
+that fails when we *didn't* make a mistake is the opposite of the teeth we want. Fix:
+serialize the two (a shared `Mutex`/`serial_test`), or capture per-span without leaning
+on global dispatch. Out of scope when found (the read-idioms/output-cap PR).
 
 ### `oneshot` batch — batchable fan-out of the tool-less answer (deferred)
 The tool-less, non-interactive answer shipped as the `oneshot` tool (prompt in,

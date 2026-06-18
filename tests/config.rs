@@ -1182,7 +1182,7 @@ fn required_key_with_no_source_is_an_error() {
 fn sandbox_defaults_when_unconfigured() {
     let c = Config::builtin();
     assert_eq!(c.sandbox.exec_timeout, Duration::from_secs(30));
-    assert_eq!(c.sandbox.output_limit_bytes, 8 * 1024);
+    assert_eq!(c.sandbox.output_limit_bytes, 1 << 16); // 64 KiB default
     assert!(c.sandbox.disable_builtins.is_empty());
 }
 

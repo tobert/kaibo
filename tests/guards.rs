@@ -48,15 +48,16 @@ async fn a_slow_script_is_killed_at_the_budget() {
     );
 }
 
-/// A read that exceeds the 8 KB MCP output cap must not hand the caller the whole
+/// A read that exceeds the MCP output cap must not hand the caller the whole
 /// file: the result is bounded (truncated) — or, if kaish's spill path can't write
 /// in the read-only sandbox, it surfaces a marker instead of the raw flood. Either
 /// way the caller's context is protected. Teeth: the source is 8x the cap.
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_output_is_capped_or_marked() {
     let dir = tempdir().unwrap();
-    // 64 KB of content — well past the 8 KB cap KernelConfig::agent() installs.
-    let big = "x".repeat(64 * 1024);
+    // 512 KiB of content — 8x the 64 KiB default cap, so a whole-file read can't slip
+    // through (the default lets typical source load whole; this is well past it).
+    let big = "x".repeat(1 << 19);
     fs::write(dir.path().join("big.txt"), &big).unwrap();
 
     let kernel = build_readonly_kernel(dir.path()).unwrap();
@@ -107,12 +108,12 @@ async fn disable_builtins_blocks_an_otherwise_working_builtin() {
 }
 
 /// A custom `output_limit_bytes` is honored: a read past a tiny cap is truncated.
-/// Teeth: the source is many times the configured cap, so an unconfigured (8 KB)
+/// Teeth: the source is many times the configured cap, so an unconfigured (64 KiB)
 /// path would let it through — only a threaded-in small cap catches it.
 #[tokio::test(flavor = "current_thread")]
 async fn custom_output_limit_is_honored() {
     let dir = tempdir().unwrap();
-    let body = "y".repeat(4096); // 4 KB, well under the 8 KB default but past our 512 B cap
+    let body = "y".repeat(1 << 12); // 4 KiB, well under the 64 KiB default but past our 512 B cap
     fs::write(dir.path().join("mid.txt"), &body).unwrap();
 
     let sandbox = SandboxConfig { output_limit_bytes: 512, ..SandboxConfig::default() };

@@ -104,10 +104,18 @@ fn apply_disabled_builtins(registry: &mut ToolRegistry, disable: &[String]) {
 /// matches a patient MCP caller while still bounding a runaway.
 pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default per-script output cap (matches `OutputLimitConfig::agent()`'s 8 KB): a
-/// single wide `cat`/`grep` can't flood the caller's context. Override via
-/// `[sandbox].output_limit_bytes`.
-pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
+/// Default per-script output cap: a single wide `cat`/`grep` can't flood the
+/// caller's context, but a *whole-file* read of typical source fits. We push
+/// models to read whole files (see the read idioms in `consult.rs`/`kaish_syntax.rs`),
+/// so the kernel's own `OutputLimitConfig::agent()` default of 8 KB is too tight —
+/// it truncates a ~300-line file, undercutting the very behavior we ask for. 64 KB
+/// (~18K tokens) lets every kaibo source file but the three giants load whole, and
+/// the exit-3 head+tail sample still backstops a genuinely huge read. Override via
+/// `[sandbox].output_limit_bytes`. Bytes, not tokens, on purpose: the cap is a
+/// flood backstop, not a context budget — a byte proxy is fine, and a token cap
+/// would mean embedding tiktoken (OpenAI's tokenizer, a proxy for our casts anyway)
+/// in a single-static binary. See the PR/commit for that reasoning.
+pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 1 << 16; // 64 KiB
 
 /// Default cap on the `/` scratch `MemoryFs` (64 MB). Scratch is a feature — a
 /// redirect or `mktemp` lands here, never on the read-only project — but unbounded
