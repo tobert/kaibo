@@ -217,8 +217,8 @@ nothing to review: there's no diff, because nothing it runs can change your tree
 The odd one out: where the tools above run code and context *into* kaibo's models to
 reason, this runs a model and hands an **artifact back** to your agent. Prompt → image,
 returned inline. The cast must carry an `image` slot on an OpenAI-compatible backend
-(hosted `gpt-image`/DALL·E, or a local Stable-Diffusion server). It's the first of a
-growing capability class as the provider library grows coverage.
+(hosted `gpt-image`/DALL·E, or a local Stable-Diffusion server). It's the first of
+kaibo's *capability* tools; the class grows as `rig` adds provider coverage.
 
 ---
 
@@ -284,7 +284,7 @@ configurable in `config.toml`.
 
 **What providers are supported?** Anthropic, DeepSeek, and Gemini natively, plus a
 generic `openai` kind for any OpenAI-compatible endpoint (hosted GPT, a local
-llama.cpp / Ollama / Gemma server, …). See [Configure your models](#configure-your-models).
+llama.cpp / Ollama / Gemma server, …). See [Backends, Roles, and Casts](#backends-roles-and-casts).
 
 **Does it need network or credentials?** The consulted models do — their provider
 APIs, with keys you supply. kaish itself reaches nothing: no network, no credentials.

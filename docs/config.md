@@ -529,8 +529,7 @@ the ignore filter still drops `.git`/`target`.
 Size-gated, by file count:
 - **≤ `full_list_max_files`** → the complete file list is spliced in.
 - **above it** → the call is **refused loudly** (`internal_error` naming the knob).
-  The directory-tree map for larger repos is the next increment; for now a big repo
-  is an explicit error, not a silent dump — raise the limit, set `enabled = false`,
+  A big repo is an explicit error, not a silent partial dump — raise the limit, set `enabled = false`,
   or point a cast that explores via `rg` at it. (`full_list_max_files = 0` is a load
   error: it would refuse every repo; disable instead.)
 
