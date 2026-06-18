@@ -98,9 +98,11 @@ project and cannot run external commands.
   step") would race the day a turn emits two tool calls or someone bumps concurrency,
   and the finalize replay (`tool_choice::None` ⇒ answer-now) falls out for free.
   Two primitives — response strategy + a request log — so new cases (multi-sweep,
-  model routing, error injection) are new responders, not harness changes. Inject via
-  the generic seams (`run_phase`, `consult_with`, `consult_session_turn`); the public
-  `consult`/`oneshot` build the real client behind `with_provider_client!`.
+  model routing, error injection) are new responders, not harness changes. The seams
+  take their client on the `Arm`: tests pass a `ScriptedClient` through `Arm::new`
+  into the generic entry points (`run_phase`, `consult_with`, `consult_session_turn`),
+  while the public `consult`/`oneshot` run on arms the server resolves with
+  `Arm::from_slot` — the single live construction point that wraps the real rig client.
 - **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
   before new work. Delete entries when they ship; don't mark them done. The *why*
   behind a ship moves to **`docs/devlog.md`** (dated, newest-first, why-not-what —
@@ -111,9 +113,10 @@ project and cannot run external commands.
   kaish locally, a `[patch.crates-io]` to `../kaish/crates/kaish-kernel` is the way
   — keep it out of committed `Cargo.toml`.) `kaish-mcp` is a useful reference
   sibling, not a dependency.
-- **Provider model ids drift.** Built-in defaults seed the profile registry in
-  `config.rs::default_models`; rig's bundled model consts are often retired.
-  Cross-check the pal configs. Per-profile overrides live in the XDG `config.toml`.
+- **Provider model ids drift.** Built-in defaults (`config.rs::default_models`, keyed
+  by `ProviderKind`) seed the built-in casts; rig's bundled model consts are often
+  retired. Cross-check the pal configs. Per-cast model overrides live in the XDG
+  `config.toml`.
 
 ## Build & release
 

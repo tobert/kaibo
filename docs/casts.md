@@ -185,14 +185,16 @@ built-in single-backend cast, both arms on one backend, no media builtins.
 
 ## The one plumbing fork (decided)
 
-Rig clients are distinct concrete types; today one `with_provider_client!`
-monomorphizes a whole consult per kind. Two independent arms would make that
-a 4×4 macro product. Decision: **erase the client behind a small internal
-`Arm` seam** instead. The calls are network-bound (dispatch is free), the
-scripted test client already drives the real loop behind a generic seam, and
-16 monomorphizations of a 2k-line module is compile time we'd feel. The
-offline mock keys responders by model id, so a mixed cast routing each phase
-to its own client is provable with no network.
+Rig clients are distinct concrete types. The rejected alternative was a
+`with_provider_client!`-style macro monomorphizing a whole consult per kind —
+which two independent arms would blow up into a 4×4 product. Decision, now shipped:
+**erase the client behind a small internal `Arm` seam** instead (`Arm::from_slot`
+is the single live construction point; the offline tests inject a scripted client
+through `Arm::new`). The calls are network-bound (dispatch is free), the scripted
+test client already drives the real loop behind a generic seam, and 16
+monomorphizations of a 2k-line module is compile time we'd feel. The offline mock
+keys responders by model id, so a mixed cast routing each phase to its own client
+is provable with no network.
 
 ## What survives untouched
 
