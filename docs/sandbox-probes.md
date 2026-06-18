@@ -177,7 +177,7 @@ live battery is the bar for trusting the read-only claim.
 ## 6. Model-driven probe (end-to-end, optional)
 
 To confirm the *injected* path end-to-end — that a model given an adversarial brief
-still can't escape — run **Battery A+B+C as one `explore` question on a local cast**
+still can't escape — run **Battery A+B+C as one `consult` question on a local cast**
 (`cast=openai`/`glm`/`qwen`), never a remote one. Ask it to *run* each probe and
 report exit code + stderr, framed as verifying its own read-only contract. The
 result must match the direct `run_kaish` runs above; if it diverges, the injected

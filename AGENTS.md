@@ -38,14 +38,17 @@ is the consumer.
 Each tool is independently gated by a `--no-<tool>` flag (all on by default; the
 all-off server is refused at startup). Multi-provider over `rig-core`: a
 **`ProviderKind`** is the wire protocol (keyed Anthropic / DeepSeek / Gemini, plus
-**`openai`** for any OpenAI-compatible endpoint). A **`Profile`** (`config.rs`) is a
-*named instance* of a kind with its own base URL, key source, and models — so two
-`openai` profiles (hosted GPT and a local Gemma/llama.cpp server, say) can be live
-at once, each selected by the `provider` arg. Profiles come from a built-in registry
-merged under an XDG `config.toml`, `KAIBO_*` env, then CLI flags (precedence:
-per-call > CLI > env > file > built-in); a missing config file is a non-error.
-See `docs/config.md`. kaibo never modifies the project and cannot run external
-commands.
+**`openai`** for any OpenAI-compatible endpoint). A **`[backends.<name>]`**
+(`config.rs`) is a *named connection* of a kind with its own base URL and key source —
+so two `openai` backends (hosted GPT and a local Gemma/llama.cpp server, say) can be
+live at once. A **`[casts.<name>]`** is a model team mapping each role (explorer /
+synth / image / …) to a `"backend/model-id"`, freely cross-backend, so one cast can
+pair a cheap local explorer with a hosted synth; a call picks its team with the `cast`
+arg. Backends and casts come from a built-in registry merged under an XDG
+`config.toml`, `KAIBO_*` env, then CLI flags (precedence: per-call > CLI > env > file >
+built-in); a missing config file is a non-error. See `docs/config.md`, and
+`docs/casts.md` for the backends/casts design rationale. kaibo never modifies the
+project and cannot run external commands.
 
 ## Invariants — do not weaken without a failing-first test
 
@@ -95,20 +98,25 @@ commands.
   step") would race the day a turn emits two tool calls or someone bumps concurrency,
   and the finalize replay (`tool_choice::None` ⇒ answer-now) falls out for free.
   Two primitives — response strategy + a request log — so new cases (multi-sweep,
-  model routing, error injection) are new responders, not harness changes. Inject via
-  the generic seams (`run_phase`, `consult_with`, `consult_session_turn`); the public
-  `consult`/`oneshot` build the real client behind `with_provider_client!`.
-- **`docs/issues.md` is the live tracker.** Skim it before new work. Delete
-  entries when they ship — don't mark them done; git history is the record.
+  model routing, error injection) are new responders, not harness changes. The seams
+  take their client on the `Arm`: tests pass a `ScriptedClient` through `Arm::new`
+  into the generic entry points (`run_phase`, `consult_with`, `consult_session_turn`),
+  while the public `consult`/`oneshot` run on arms the server resolves with
+  `Arm::from_slot` — the single live construction point that wraps the real rig client.
+- **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
+  before new work. Delete entries when they ship; don't mark them done. The *why*
+  behind a ship moves to **`docs/devlog.md`** (dated, newest-first, why-not-what —
+  the curated narrative git can't carry), not the commit log alone.
 - **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
   under active development upstream. A version bump can change its API — when you
   bump, adapt kaibo to the new shape, don't pin around it. (If you're co-developing
   kaish locally, a `[patch.crates-io]` to `../kaish/crates/kaish-kernel` is the way
   — keep it out of committed `Cargo.toml`.) `kaish-mcp` is a useful reference
   sibling, not a dependency.
-- **Provider model ids drift.** Built-in defaults seed the profile registry in
-  `config.rs::default_models`; rig's bundled model consts are often retired.
-  Cross-check the pal configs. Per-profile overrides live in the XDG `config.toml`.
+- **Provider model ids drift.** Built-in defaults (`config.rs::default_models`, keyed
+  by `ProviderKind`) seed the built-in casts; rig's bundled model consts are often
+  retired. Cross-check the pal configs. Per-cast model overrides live in the XDG
+  `config.toml`.
 
 ## Build & release
 
@@ -162,7 +170,7 @@ How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherit
   over "never invent citations", and treat naming the edge of the evidence as a
   normal grounded move. Blanket "never X" can light up the very pathway it names and
   make weaker/local models (Gemma especially) fixate or loop. Lead the kaish
-  cheatsheet with the good idioms (`cat -n`, `rg -n`, numbered spans — they produce
+  cheatsheet with the good idioms (`cat -n`, `grep -rn`, numbered spans — they produce
   the accurate `file:line`s we reward), not a flat builtin list.
 - **Trust grounded evidence; steer toward acquisition, not verification.** When a
   phase is handed context (an explorer report, a prior turn, pasted source), frame
@@ -210,14 +218,19 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 
 ## Pull requests & the changelog
 
-From **0.2.0** on, kaibo maintains a changelog and lands changes through pull
-requests — `main` is protected by convention, not a scratchpad.
+Every change lands through a pull request — `main` is never committed to directly.
+This is for **transparency**: kaibo is used by other people's agents, and the PR
+trail is how a user can see what we're up to — what changed, why, and what review it
+got — without reading the diff. So the discipline isn't about code risk; it holds
+even for a one-line doc fix.
 
-- **Branch → PR → review → merge.** Non-trivial work lands on a branch and goes up
-  as a PR, not direct-to-`main`. Dogfood the review: run a **cross-family** pass over
-  the diff — a different model lineage than wrote it (`/code-review`, or kaibo's own
-  `consult`/`oneshot` aimed at the change) — before merge. A typo or a one-line doc
-  fix can still go straight to `main`; this is judgment, not ceremony.
+- **Branch → PR → review → merge, always.** Every change starts on a branch and goes
+  up as a PR. There is no "small enough to push to `main`" carve-out — the point is
+  the visible trail, and a trivial change is trivial to review and merge. Dogfood the
+  review: run a **cross-family** pass over the diff — a different model lineage than
+  wrote it (`/code-review`, or kaibo's own `consult`/`oneshot` aimed at the change) —
+  before merge. Scale the review to the change (a doc fix is a glance; a sandbox or
+  TLS change is a hard look), but don't skip the PR.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
   Same "why not what" ethos as commits: write what a *user* notices, not the file

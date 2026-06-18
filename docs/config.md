@@ -529,8 +529,7 @@ the ignore filter still drops `.git`/`target`.
 Size-gated, by file count:
 - **≤ `full_list_max_files`** → the complete file list is spliced in.
 - **above it** → the call is **refused loudly** (`internal_error` naming the knob).
-  The directory-tree map for larger repos is the next increment; for now a big repo
-  is an explicit error, not a silent dump — raise the limit, set `enabled = false`,
+  A big repo is an explicit error, not a silent partial dump — raise the limit, set `enabled = false`,
   or point a cast that explores via `grep` at it. (`full_list_max_files = 0` is a load
   error: it would refuse every repo; disable instead.)
 
@@ -614,7 +613,7 @@ exactly the worktrees of an already-allowed repo and nothing else.
 
 kaibo resolves this by **reading git's own link files** — a worktree's `.git` file,
 the repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git` (the
-binary isn't in the build; see [Read-only is structural](#)). Trust flows only
+binary isn't in the build; see [the sandbox probe runbook](sandbox-probes.md)). Trust flows only
 outward from the allowed repo: kaibo enumerates the worktrees the *allowed* repo's
 common git dir vouches for and admits a candidate only if it falls inside one. It
 never consults the candidate's own `.git`, so a foreign directory with a forged
