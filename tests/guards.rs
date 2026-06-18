@@ -55,7 +55,7 @@ async fn a_slow_script_is_killed_at_the_budget() {
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_output_is_capped_or_marked() {
     let dir = tempdir().unwrap();
-    // 64 KB of content — well past the 8 KB cap KernelConfig::mcp() installs.
+    // 64 KB of content — well past the 8 KB cap KernelConfig::agent() installs.
     let big = "x".repeat(64 * 1024);
     fs::write(dir.path().join("big.txt"), &big).unwrap();
 

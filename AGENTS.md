@@ -229,6 +229,9 @@ requests — `main` is protected by convention, not a scratchpad.
   `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
   re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
   `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
-- **kaish pin.** Currently `kaish-kernel = "0.8.4"` — the release that fixed the bug
-  which surfaced just after `0.8.3`. The bump was clean (no API change); offline suite
-  green. Keep this current per the **Working here** kaish-bump discipline before cutting.
+- **kaish pin.** Currently `kaish-kernel = "0.9.0"`. The bump from `0.8.4` carried one
+  API break: the `mcp()` config constructors (`IgnoreConfig`/`OutputLimitConfig`/
+  `KernelConfig`) were renamed to `agent()` — same presets, just the embedder-facing
+  name. Adapted the three call sites in `sandbox.rs`; offline suite green, boundary
+  tests still have teeth. Keep this current per the **Working here** kaish-bump
+  discipline before cutting.

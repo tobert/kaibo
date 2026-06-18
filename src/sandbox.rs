@@ -104,7 +104,7 @@ fn apply_disabled_builtins(registry: &mut ToolRegistry, disable: &[String]) {
 /// matches a patient MCP caller while still bounding a runaway.
 pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default per-script output cap (matches `OutputLimitConfig::mcp()`'s 8 KB): a
+/// Default per-script output cap (matches `OutputLimitConfig::agent()`'s 8 KB): a
 /// single wide `cat`/`rg` can't flood the caller's context. Override via
 /// `[sandbox].output_limit_bytes`.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024;
@@ -143,7 +143,7 @@ pub struct SandboxConfig {
     /// Builtins to shadow-block on top of the structural read-only guards.
     pub disable_builtins: Vec<String>,
     /// Ignore-file policy for the file-walking builtins, sourced from
-    /// `[kaish.ignore]`. Defaults to [`IgnoreConfig::mcp`] (`.gitignore` + built-in
+    /// `[kaish.ignore]`. Defaults to [`IgnoreConfig::agent`] (`.gitignore` + built-in
     /// defaults, enforced scope) so omitting the stanza preserves today's behavior.
     pub ignore: IgnoreConfig,
 }
@@ -155,7 +155,7 @@ impl Default for SandboxConfig {
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             scratch_limit_bytes: DEFAULT_SCRATCH_LIMIT_BYTES,
             disable_builtins: Vec::new(),
-            ignore: IgnoreConfig::mcp(),
+            ignore: IgnoreConfig::agent(),
         }
     }
 }
@@ -232,16 +232,16 @@ fn build_readonly_kernel_and_vfs(
     let project_vfs = Arc::new(vfs);
     let backend: Arc<dyn KernelBackend> = Arc::new(LocalBackend::new(project_vfs.clone()));
 
-    // Start from the MCP output limit (head+tail truncation) and set the configured
+    // Start from the agent output limit (head+tail truncation) and set the configured
     // cap so a runaway `cat` can't flood the caller's context; the timeout bounds
     // wall clock. Both guards matter for a caller-facing `run_kaish` with no turn cap.
-    let mut output_limit = OutputLimitConfig::mcp();
+    let mut output_limit = OutputLimitConfig::agent();
     output_limit.set_limit(Some(sandbox.output_limit_bytes));
-    // `mcp()` already seeds an `.gitignore`-aware filter; override with the resolved
+    // `agent()` already seeds an `.gitignore`-aware filter; override with the resolved
     // `[kaish.ignore]` policy so configured extra ignore files (`.claudeignore`, …)
     // and scope/default toggles reach every file-walking builtin — and the
     // orientation repo-map, which enumerates through this same kernel.
-    let config = KernelConfig::mcp()
+    let config = KernelConfig::agent()
         .with_cwd(root)
         .with_allow_external_commands(false)
         .with_request_timeout(sandbox.exec_timeout)
