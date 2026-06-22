@@ -197,3 +197,55 @@ async fn image_attachment_to_blind_synth_is_refused() {
         "refusal must name the image/vision mismatch, got: {msg}"
     );
 }
+
+// --- the shared vision gate (batch + oneshot use it identically) -------------
+
+/// `gate_image_attachments` — the one gate both `batch` and `oneshot` call — refuses an
+/// image to a vision-blind model, passes text-only and the no-attachment case, and lets
+/// an image through to a vision-capable model. This pins the shared rule directly (the
+/// `oneshot` handler needs a `Peer` to drive end-to-end, so the gate is tested here).
+#[test]
+fn shared_vision_gate_refuses_image_to_blind_model_only() {
+    let handler = handler_rooted_at(tempdir().unwrap().path());
+    let text = Attachment::Text {
+        path: "a.txt".into(),
+        body: "x".into(),
+    };
+    let image = Attachment::Image {
+        path: "a.png".into(),
+        mime: "image/png",
+        data_b64: "QUJD".into(),
+    };
+
+    // Blind model + image → refused, naming the model, the cast, and the mismatch.
+    let err = handler
+        .gate_image_attachments(
+            false,
+            std::slice::from_ref(&image),
+            "some-model",
+            "blindcast",
+        )
+        .expect_err("an image to a blind model must be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("some-model") && msg.contains("blindcast"),
+        "names model + cast: {msg}"
+    );
+    assert!(
+        msg.contains("image") && msg.to_lowercase().contains("vision"),
+        "names the mismatch: {msg}"
+    );
+
+    // Blind model + text-only → allowed (text needs no vision).
+    handler
+        .gate_image_attachments(false, std::slice::from_ref(&text), "some-model", "c")
+        .expect("text-only attachments need no vision");
+    // Blind model + nothing → allowed.
+    handler
+        .gate_image_attachments(false, &[], "some-model", "c")
+        .expect("no attachments, no gate");
+    // Vision model + image → allowed.
+    handler
+        .gate_image_attachments(true, &[image], "vlm", "c")
+        .expect("a vision model accepts an image");
+}

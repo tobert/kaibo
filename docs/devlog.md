@@ -14,6 +14,42 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — `oneshot` grows `attach` (the interactive twin of batch attach)
+
+Amy's framing: `oneshot` should be as close to `batch` as the API split allows — "call
+Claude Opus in a single shot with some files, no tools, no wait." So `oneshot` now takes
+the same `attach: [paths]`, reusing the whole containment + classify seam batch built
+(`resolve_attachments`, `classify`, the shared `contained`/`containment_error`). The only
+thing that differs is the wire, and that's the decision this entry records.
+
+**Chose "grow oneshot against rig" over "a batch-shaped seam with an interactive impl."**
+oneshot already runs through rig's completion path, so the cheap, honest factoring is to
+map each `Attachment` onto rig's own message parts rather than invent a second submit
+abstraction. Text folds into the prompt string via `attach::with_text_context` (the same
+`<file>` wrapper batch emits — `Attachment::wrapped_text` is the one source of truth, so
+batch and oneshot wrap identically). Images become `UserContent::image_base64` parts on
+the single user turn. The rejected alternative — making the `BatchProvider` seam carry an
+"interactive" variant that calls rig — is heavier and only pays off if a third lane shows
+up; noted in issues.md, not built.
+
+**The one structural change: `run_phase` takes an `extra_parts: Vec<UserContent>`.** The
+shared loop built its initial message as `Message::user(string)` — text only. oneshot's
+images need to ride on that *initial* turn beside the text, so the parameter threads
+through `Arm::run` → `PhaseRunner` → `run_phase`, which now builds a multi-part user
+message when parts are present. Every other phase (consult, explore) passes `Vec::new()`
+and gets byte-for-byte the old `Message::user(prompt)` — pinned by a test
+(`oneshot_without_attachments_is_the_bare_prompt`) so the no-attachment path can't drift.
+This is the "image is the new plumbing" cost the batch entry predicted; it lives in the
+shared loop, not a oneshot fork, so it's one initial-message builder for everyone.
+
+**DRY'd the vision gate.** batch and oneshot refuse an image to a vision-blind model
+identically, so the check moved to one `KaiboHandler::gate_image_attachments` both call —
+and being a plain method (no `Peer`), it's unit-testable directly, which the oneshot
+handler (needs a `Peer` to drive end-to-end) otherwise isn't. rig gives us
+`ImageMediaType::from_mime_type` to turn our sniffed mime into rig's media type, so the
+image round-trips cleanly. Offline test drives the real loop and asserts the inbound
+request carries both the `<file>`-wrapped text and a structured image part.
+
 ## 2026-06-22 — two honesty/discoverability fixes: image cast enum + inert-tunable flag
 
 Both came off the P3 list; both are about not lying to the caller by omission.

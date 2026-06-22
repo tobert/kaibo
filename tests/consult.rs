@@ -1259,6 +1259,7 @@ async fn secondary_local_cast_from_user_config_runs() {
         "Context: src/sandbox.rs builds a read-only kernel; writes and external \
          commands are refused.\n\nIn one sentence, what does kaibo's read-only sandbox \
          prevent?",
+        &[],
         &arm,
         &ConsultConfig::default(),
     )
@@ -1319,6 +1320,7 @@ async fn oneshot_answers_from_pasted_context() {
         "Context: src/sandbox.rs builds a read-only kernel; the LocalFs read-only \
          mount refuses every write.\n\nIn one sentence, which file enforces kaibo's \
          read-only sandbox?",
+        &[],
         &arm,
         &ConsultConfig::default(),
     )

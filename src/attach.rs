@@ -1,7 +1,7 @@
 //! Attachments — inline a workspace file into a tool-less prompt as context.
 //!
-//! The tool-less tools (batch today, `oneshot` a tracked follow-on in
-//! `docs/issues.md`) answer from what the caller hands them. An attachment lets the
+//! The tool-less tools (`batch` and `oneshot`) answer from what the caller hands
+//! them. An attachment lets the
 //! caller name a *file* in the workspace instead of pasting its bytes through the
 //! calling agent's own context: kaibo reads it, containment-checks it against the
 //! same allowed set every other path obeys
@@ -72,6 +72,32 @@ impl Attachment {
             }
             Attachment::Image { .. } => None,
         }
+    }
+}
+
+/// The shared **text** context block for a set of attachments — every text attachment's
+/// `<file>` wrapper, joined, blank-line separated. Empty when there are no text
+/// attachments (images carry no text). This is the form a *toolless* caller (oneshot)
+/// prepends to its prompt: the text rides inline as context, the same wrapper the batch
+/// body builders emit, while images ride beside it as native parts. One source of truth
+/// for "text attachments → a context string."
+pub fn text_context(attachments: &[Attachment]) -> String {
+    attachments
+        .iter()
+        .filter_map(Attachment::wrapped_text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Prepend the attachments' text context to `prompt` (context first, then the ask —
+/// matching the batch builders' ordering). Returns `prompt` unchanged when no text
+/// attachment is present, so the no-attachment path is byte-for-byte the bare prompt.
+pub fn with_text_context(attachments: &[Attachment], prompt: &str) -> String {
+    let ctx = text_context(attachments);
+    if ctx.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{ctx}\n\n{prompt}")
     }
 }
 
@@ -215,6 +241,51 @@ mod tests {
             err.to_string().contains("image cap"),
             "names the cap: {err}"
         );
+    }
+
+    /// The text-context helper joins only text attachments (images contribute none) and
+    /// prepends them as context ahead of the prompt; with no text attachment the prompt
+    /// is returned byte-for-byte (the no-attachment path stays the bare prompt).
+    #[test]
+    fn text_context_joins_text_and_leaves_prompt_bare_when_empty() {
+        let atts = vec![
+            Attachment::Text {
+                path: "a.txt".into(),
+                body: "alpha".into(),
+            },
+            Attachment::Image {
+                path: "i.png".into(),
+                mime: "image/png",
+                data_b64: "QUJD".into(),
+            },
+            Attachment::Text {
+                path: "b.txt".into(),
+                body: "beta".into(),
+            },
+        ];
+        let ctx = text_context(&atts);
+        assert!(ctx.contains("path=\"a.txt\"") && ctx.contains("alpha"));
+        assert!(ctx.contains("path=\"b.txt\"") && ctx.contains("beta"));
+        assert!(
+            !ctx.contains("QUJD"),
+            "the image contributes no text: {ctx}"
+        );
+
+        let with = with_text_context(&atts, "the question");
+        assert!(
+            with.starts_with("<file path=\"a.txt\">"),
+            "context leads: {with}"
+        );
+        assert!(with.ends_with("the question"), "prompt trails: {with}");
+
+        // No text attachment → the prompt is returned unchanged (bare-prompt path).
+        let only_image = vec![Attachment::Image {
+            path: "i.png".into(),
+            mime: "image/png",
+            data_b64: "QUJD".into(),
+        }];
+        assert_eq!(with_text_context(&only_image, "just ask"), "just ask");
+        assert_eq!(with_text_context(&[], "just ask"), "just ask");
     }
 
     /// Binary that is neither valid UTF-8 nor a recognized image is refused rather than

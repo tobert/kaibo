@@ -31,7 +31,8 @@ use anyhow::{anyhow, Context, Result};
 use rig_core::agent::{HookAction, PromptHook};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    AssistantContent, Image, ToolChoice, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
+    ToolResultContent, UserContent,
 };
 use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition};
 use rig_core::providers::{anthropic, deepseek, gemini, openai};
@@ -40,6 +41,7 @@ use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::attach::Attachment;
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
@@ -569,7 +571,7 @@ trait PhaseRunner: Send + Sync {
         &'a self,
         preamble: &'a str,
         max_tokens: u64,
-        user_prompt: String,
+        initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
@@ -593,7 +595,7 @@ where
         &'a self,
         preamble: &'a str,
         max_tokens: u64,
-        user_prompt: String,
+        initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
@@ -605,7 +607,7 @@ where
             &self.model,
             preamble,
             max_tokens,
-            user_prompt,
+            initial_prompt,
             max_turns,
             params,
             progress,
@@ -791,7 +793,7 @@ impl Arm {
     pub(crate) async fn run(
         &self,
         preamble: &str,
-        user_prompt: String,
+        initial_prompt: Message,
         max_turns: usize,
         progress: &dyn ProgressSink,
         make_tools: ToolFactory<'_>,
@@ -800,7 +802,7 @@ impl Arm {
             .run_phase(
                 preamble,
                 self.max_tokens,
-                user_prompt,
+                initial_prompt,
                 max_turns,
                 self.params.as_ref(),
                 progress,
@@ -1143,7 +1145,7 @@ pub(crate) async fn run_phase<C, F>(
     model: &str,
     preamble: &str,
     max_tokens: u64,
-    user_prompt: String,
+    initial_prompt: Message,
     max_turns: usize,
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
@@ -1155,10 +1157,13 @@ where
     C::CompletionModel: 'static,
     F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
 {
-    // Loop state across view_image-break resumes. The first pass is the bare prompt
-    // with no history — byte-for-byte the old single call. Each break rewrites the
-    // transcript (image onto the user-turn channel) and re-enters here.
-    let mut prompt: Message = Message::user(user_prompt);
+    // Loop state across view_image-break resumes. The caller hands us the *assembled*
+    // first user turn — a bare `Message::user(prompt)` for every tool-driven phase, or a
+    // multi-part turn (oneshot's inlined attachment images beside the text) built in
+    // `oneshot`. Keeping the assembly in the caller keeps this engine free of multimodal
+    // concerns: it just runs whatever turn it's given, then each view_image break rewrites
+    // the transcript and re-enters here (holistic review, Gemini Pro 2026-06-22).
+    let mut prompt: Message = initial_prompt;
     let mut history: Vec<Message> = Vec::new();
 
     loop {
@@ -1402,7 +1407,7 @@ impl Tool for RunExplore {
             .arm
             .run(
                 &self.preamble,
-                args.question,
+                Message::user(args.question),
                 self.max_turns,
                 self.progress.as_ref(),
                 &|| -> Result<Vec<Box<dyn ToolDyn>>> {
@@ -1495,10 +1500,51 @@ pub fn batch_system_prompt(override_: Option<&str>) -> String {
 /// so the break hook can never fire and the single turn always completes cleanly. If
 /// you ever give oneshot a tool, revisit this — a live break would consume the turn
 /// and land in the turn-cap finalize path.
-pub async fn oneshot(prompt: &str, arm: &Arm, cfg: &ConsultConfig) -> Result<String> {
+///
+/// `attachments` are caller-named workspace files inlined as context (the `attach` arg),
+/// resolved server-side so their bytes never transit the calling agent's context — the
+/// same seam batch uses. Text files prepend to the prompt as `<file>`-wrapped context
+/// (`attach::with_text_context`); images ride beside the prompt as native rig image parts
+/// on the single user turn. The image caller must already have gated on the model's
+/// vision cap (the server does, before this runs). With no attachments this is exactly
+/// the bare prompt and an empty part list — byte-for-byte the old single call.
+pub async fn oneshot(
+    prompt: &str,
+    attachments: &[Attachment],
+    arm: &Arm,
+    cfg: &ConsultConfig,
+) -> Result<String> {
+    let user_prompt = crate::attach::with_text_context(attachments, prompt);
+    let image_parts: Vec<UserContent> = attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
+                data_b64.clone(),
+                ImageMediaType::from_mime_type(mime),
+                None,
+            )),
+            Attachment::Text { .. } => None,
+        })
+        .collect();
+    // Assemble the single user turn here — multimodal awareness lives in oneshot, not the
+    // shared loop. No images → a bare `Message::user` (byte-for-byte the old call). With
+    // images, the text rides as the first part (skipped when empty — image-only with an
+    // empty prompt shouldn't emit a pointless `{type:text,text:""}` block), then the images.
+    let initial_prompt = if image_parts.is_empty() {
+        Message::user(user_prompt)
+    } else {
+        let mut parts = Vec::with_capacity(image_parts.len() + 1);
+        if !user_prompt.is_empty() {
+            parts.push(UserContent::text(user_prompt));
+        }
+        parts.extend(image_parts);
+        Message::User {
+            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
+        }
+    };
     arm.run(
         &phase_preamble(cfg.prompts.oneshot.as_deref(), oneshot_preamble, None, None),
-        prompt.to_string(),
+        initial_prompt,
         1,
         cfg.progress.as_ref(),
         &|| Ok(Vec::new()),
@@ -1665,7 +1711,7 @@ pub(crate) async fn consult_with(
                 cfg.orientation.as_deref(),
                 cfg.house_rules.as_deref(),
             ),
-            user_prompt.to_string(),
+            Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
             cfg.progress.as_ref(),
             // Rebuilt per call (main loop, and again if run_phase forces a final
@@ -2008,7 +2054,7 @@ mod tests {
             },
             ..ConsultConfig::default()
         };
-        oneshot("q", &arm(&client, MODEL), &cfg).await.unwrap();
+        oneshot("q", &[], &arm(&client, MODEL), &cfg).await.unwrap();
 
         let pre = client.requests_for(MODEL)[0]
             .preamble
@@ -2037,6 +2083,7 @@ mod tests {
             .build();
         oneshot(
             "just answer this",
+            &[],
             &arm(&client, MODEL),
             &ConsultConfig::default(),
         )
@@ -2048,6 +2095,144 @@ mod tests {
             reqs[0].tool_names.is_empty(),
             "oneshot must offer no tools, got {:?}",
             reqs[0].tool_names
+        );
+    }
+
+    /// `oneshot` inlines its attachments onto the single user turn: a text file prepends
+    /// as `<file>`-wrapped context ahead of the prompt, and an image rides as a native
+    /// rig image part on the same message — the toolless analogue of batch's attach,
+    /// driven through the real loop offline.
+    #[tokio::test]
+    async fn oneshot_inlines_text_and_image_attachments() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        const MODEL: &str = "synth";
+
+        // The mock inspects the inbound request for an image part — the only way to
+        // assert the image rode as a structured part (the text capture flattens parts).
+        let saw_image = Arc::new(AtomicBool::new(false));
+        let flag = saw_image.clone();
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |req| {
+                let has_image = req.chat_history.iter().any(|m| match m {
+                    Message::User { content } => {
+                        content.iter().any(|c| matches!(c, UserContent::Image(_)))
+                    }
+                    _ => false,
+                });
+                if has_image {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Ok(text_response("done"))
+            })
+            .build();
+
+        let attachments = vec![
+            Attachment::Text {
+                path: "README.md".into(),
+                body: "hello world".into(),
+            },
+            Attachment::Image {
+                path: "shot.png".into(),
+                mime: "image/png",
+                data_b64: "QUJD".into(),
+            },
+        ];
+        oneshot(
+            "review these",
+            &attachments,
+            &arm(&client, MODEL),
+            &ConsultConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = client.requests_for(MODEL);
+        assert_eq!(reqs.len(), 1, "oneshot is exactly one upstream request");
+        // The text file rode inline as `<file>`-wrapped context, ahead of the prompt.
+        let ut = &reqs[0].user_text;
+        assert!(ut.contains("<file path=\"README.md\">"), "text file inlined as context: {ut}");
+        assert!(ut.contains("hello world"), "the file body rode inline: {ut}");
+        assert!(ut.contains("review these"), "the prompt is still present: {ut}");
+        // The image rode as a native image part, not flattened into text.
+        assert!(
+            saw_image.load(Ordering::SeqCst),
+            "the image attachment must ride as a structured image part"
+        );
+    }
+
+    /// With no attachments, `oneshot`'s user turn is exactly the bare prompt and carries
+    /// no image part — the no-attachment path stays byte-for-byte the old single call.
+    #[tokio::test]
+    async fn oneshot_without_attachments_is_the_bare_prompt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        const MODEL: &str = "synth";
+        let saw_image = Arc::new(AtomicBool::new(false));
+        let flag = saw_image.clone();
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |req| {
+                let has_image = req.chat_history.iter().any(|m| match m {
+                    Message::User { content } => {
+                        content.iter().any(|c| matches!(c, UserContent::Image(_)))
+                    }
+                    _ => false,
+                });
+                if has_image {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Ok(text_response("done"))
+            })
+            .build();
+        oneshot("just ask", &[], &arm(&client, MODEL), &ConsultConfig::default())
+            .await
+            .unwrap();
+        let reqs = client.requests_for(MODEL);
+        assert_eq!(reqs[0].user_text.trim(), "just ask", "bare prompt, no wrapper");
+        assert!(!saw_image.load(Ordering::SeqCst), "no attachment, no image part");
+    }
+
+    /// An image-only attach with an empty prompt sends *just* the image part — no empty
+    /// `{type:text, text:""}` chunk. Without the guard the user turn would carry a useless
+    /// empty text part, so this counts text parts and pins it at zero.
+    #[tokio::test]
+    async fn oneshot_empty_prompt_image_only_omits_empty_text_part() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        const MODEL: &str = "synth";
+        let text_parts = Arc::new(AtomicUsize::new(usize::MAX));
+        let counter = text_parts.clone();
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |req| {
+                let n = req
+                    .chat_history
+                    .iter()
+                    .find_map(|m| match m {
+                        Message::User { content } => Some(
+                            content
+                                .iter()
+                                .filter(|c| matches!(c, UserContent::Text(_)))
+                                .count(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                counter.store(n, Ordering::SeqCst);
+                Ok(text_response("done"))
+            })
+            .build();
+        let img = Attachment::Image {
+            path: "x.png".into(),
+            mime: "image/png",
+            data_b64: "QUJD".into(),
+        };
+        oneshot("", &[img], &arm(&client, MODEL), &ConsultConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            text_parts.load(Ordering::SeqCst),
+            0,
+            "an empty prompt must not add an empty text part beside the image"
         );
     }
 

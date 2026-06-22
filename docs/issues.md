@@ -162,11 +162,38 @@ boundary otherwise sound. The attacker model keeps it narrow: kaibo cannot write
 workspace, so the race needs a concurrent writer to the very tree the calling agent owns
 (a self-attack), inside a sub-millisecond window. `resolve_root` is the less-exposed of
 the two — it hands the canonical path to the kaish kernel, which opens a directory fd and
-works through it — while the attachment path reads a file one-shot and discards the fd.
-Structural fix when justified: open `O_NOFOLLOW`, `fstat` the fd, re-check containment via
-`/proc/self/fd/N`, then read from the already-open fd. Deferred until the attacker model
-(a workspace writable by someone other than the caller) is real; documented in
-`resolve_attachments`' doc-comment so it isn't rediscovered.
+works through it — while the attachment path reads a file one-shot with `std::fs::read`
+and discards the fd.
+
+**Likely structural fix: read attachments *through the kaish VFS*, not `std::fs::read`** —
+the project's own "read-only is structural" mechanism, and `view_image` already does
+exactly this (`view_image.rs`: `worker.read_file(&canon)` on a `KaishWorker`, the same
+read-only mount `run_kaish` uses). The VFS resolves within its mount and **refuses to
+follow a symlink out of the allowed tree** (proved by `tests/containment.rs`'s
+`mount_layer_symlink_in_allowed_pointing_outside`), so a swapped escaping symlink is
+rejected regardless of timing — the window closes structurally, and it's portable (no
+`/proc`, no `O_NOFOLLOW` per-platform dance). `resolve_attachments` keeps its
+`std`-level canonicalize + `contained` check for the friendly early error; the *read*
+moves to the worker. Open wrinkle to settle when we build it: `resolve_attachments` spans
+multiple allowed trees + followed worktrees, while a `KaishWorker` is rooted at one tree —
+so either root a worker per containing tree, or reuse the worker `batch_submit` would
+already have. A flaky racy "prove the TOCTOU" test isn't worth it (the project hates flaky
+tests); the deterministic proof is that the VFS refuses the escaping read — extend the
+mount-layer test to the attachment path. Deferred until the attacker model (a workspace
+writable by someone other than the caller) is real, but it's *more correct* regardless, so
+likely worth doing on its own merits. Documented in `resolve_attachments`' doc-comment.
+
+### The `<file>` attachment wrapper doesn't escape its body
+`Attachment::wrapped_text` (`attach.rs`) wraps a text attachment as
+`<file path="…">{body}</file>` without escaping `body`, so a file that itself contains a
+literal `</file>` produces a malformed wrapper — the model *may* still read it as intended
+(LLMs are robust to it), but the delimiter is ambiguous. Shared by both attach surfaces
+(batch body builders + oneshot), and self-inflicted (the caller owns the workspace file),
+so low-stakes — flagged by both cross-family reviews (DeepSeek + Gemini, 2026-06-22) as a
+defense-in-depth nit, not a bug. Fix when it bites: escape the body (CDATA, or replace the
+close tag) in the one wrapper so batch and oneshot inherit it together; the `path`
+attribute is server-controlled (the caller's path string), not a second injection point of
+concern. Lower priority than a real delimiter the model is told to trust.
 
 ### Review the provider retry + failure policy (and document it)
 We don't have a stated, audited answer for what a `consult`/`oneshot`
@@ -252,19 +279,23 @@ in the module doc and `docs/devlog.md`. What's left:
   proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
   is ever confirmed by probe for a batch backend, lift it there — the constant is the
   one knob to change.
-- **Attachments on `oneshot` (deferred — batch shipped).** `batch_submit` now takes
-  `attach: [paths]` — workspace files (text spliced inline, images as native base64
-  parts) read + containment-checked server-side so the bytes never transit the calling
-  agent's context (`src/attach.rs`, `server.rs::resolve_attachments`, the shared
-  `contained`/`containment_error` the session-root check also uses; both batch body
-  builders emit structured parts now). `oneshot` is the natural sibling — the same
-  "name a file instead of pasting it" win for the synchronous tool-less call — but it
-  runs through **rig**, not the hand-rolled batch HTTP, so *text* attachment is a cheap
-  prompt-string splice while *image* attachment needs rig multimodal-message building
-  (different plumbing). Consider it later; the `Attachment`/`classify` seam is reusable
-  as-is. A typed `FileRef` variant is reserved for the Gemini File API path (oversized/
-  reused media, Gemini-only) — only worth it once a genuinely-too-big-to-inline case
-  shows up.
+- **`FileRef` / Gemini File API for *batch* is bigger than "a variant beside `Image`"
+  — and may be the wrong shape.** Re-scoped after checking gpal + Google's docs (2026-06-22):
+  - **gpal's batch is inline-only** (`create_batch` → `InlinedRequest(contents=prompt)`,
+    `/home/atobey/src/gpal/src/gpal/server.py:2394`). Its File-API uploads (`file_uris`,
+    `Part.from_uri`) and **context caching** (`cached_content`) — the things that make
+    gpal's `consult` fast on big/reused context — all live on the *interactive*
+    `consult_gemini` path, **never** its batch. So gpal (which inspired kaibo) does *not*
+    validate File-API-with-batch; don't cite it as precedent.
+  - **Gemini *inlined* batch caps at ~20 MB total** (file-based JSONL batch goes to 2 GB).
+    kaibo submits inlined, so 20 MB is the real ceiling (see the duplication entry below).
+  - **File refs in an *inlined* batch request are unconfirmed** — Google's
+    [batch-api docs](https://ai.google.dev/gemini-api/docs/batch-api) only document
+    referencing uploaded files from a *file-based* JSONL batch, not inline. So a
+    `FileRef` variant that just rides beside inline `Image` may not even be accepted; the
+    real "files in batch" path is **adopting file-based JSONL submission** (write a JSONL,
+    upload it, reference uploaded files, poll a file output) — a whole second submission
+    mode, not a body-builder tweak. Park `FileRef` until that mode is on the table.
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
 (shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
@@ -299,19 +330,30 @@ failures and a truncated page are surfaced, not hidden). Still open:
   Consider making effort a default-on floor the cast/caller can lower, the way
   `max_tokens` already is. (Distinct from the "lift the tier" bullet above — that's the
   ceiling, this is the override.)
-- **Shared `attach` duplicates per item — a payload/memory ceiling as batches grow.**
+- **Shared `attach` duplicates per item — bounded by the inlined-batch payload cap.**
   Attachments are shared across the batch but inlined *per item*: `anthropic_content`/
   `gemini_parts` (`batch.rs`) re-encode every attachment into every item's request, so a
-  1 MiB attachment on a 1000-prompt batch is ~1 GiB in the JSON AST and again in the
-  serialized body. Inherent — provider batch APIs carry bytes inline per request, and
-  prompt caching doesn't shrink the JSONL — so the real fix is a guard, not dedup: bound
-  total submitted payload (sum of prompts + attachments×items) with a loud refusal before
-  it OOMs or trips the provider's body-size limit, the way single-file size is already
-  capped. Surfaced by the holistic review (Gemini Pro, 2026-06-22). Low priority until a
-  big-attachment × many-prompt batch is real — measure first; today's single-digit-prompt
-  reviews are nowhere near it. Note this interacts with the `FileRef`/File-API path
-  (`attach.rs` module doc): a `fileUri` reference is tiny and *reused* across items, so
-  remote-referenced media is the eventual escape from this duplication for large files.
+  1 MiB attachment on a 20-prompt batch is ~20 MiB of body. The binding limit is the
+  provider's: **Gemini inlined batch caps at ~20 MB total**
+  ([batch-api docs](https://ai.google.dev/gemini-api/docs/batch-api); file-based JSONL
+  batch is the 2 GB tier, which kaibo doesn't use), and Anthropic has its own per-request
+  ceiling — so the wire rejects an over-cap batch before kaibo OOMs. We will **not**
+  dedupe in memory (a shared `Arc<str>` would still serialize N times on the wire — the
+  providers require the bytes inline per inlined request). Two real directions, in order:
+  - **Near-term, cheap: a loud pre-flight guard.** Refuse before submit when the estimated
+    total inlined payload (Σ prompts + attachments×items) would exceed the backend's inline
+    cap, naming the cap — beats an opaque provider 400. The per-file size cap already exists;
+    this is the per-batch total.
+  - **Structural, later: stop holding the content in RAM / off the inline wire.** Two levers,
+    both better than dedup. (a) **Context caching** (`cached_content`) — Gemini supports it
+    *per request in batch*, and kaibo's attachments are *shared*, so cache the shared context
+    once and have every item reference it: one upload, cache-hit pricing, no N× inline bytes.
+    Near-perfect fit for our model. (b) **File-based JSONL batch** (the 2 GB tier) — spill the
+    JSONL (and any uploaded file refs) to an **XDG cache dir on disk**, upload it, let kaibo
+    release the in-RAM content, poll a file output. This is the "write to disk so we can let go
+    of the content" direction, and it's the same machinery the `FileRef`/File-API item above
+    needs — so they land together if they land. Surfaced by the holistic review (Gemini Pro,
+    2026-06-22) and the docs follow-up; low priority until a big × many batch is real.
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they

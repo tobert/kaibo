@@ -64,6 +64,7 @@ async fn oneshot_aborts_when_the_provider_never_responds() {
         Duration::from_secs(20),
         oneshot(
             "What does the sandbox prevent?",
+            &[],
             &arm,
             &ConsultConfig::default(),
         ),
