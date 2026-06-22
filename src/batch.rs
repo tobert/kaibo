@@ -42,6 +42,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
+use crate::attach::Attachment;
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot, SlotTunables};
 use crate::credentials::ProviderKind;
 
@@ -126,8 +127,15 @@ pub struct BatchListItem {
 #[async_trait]
 pub trait BatchProvider: Send + Sync {
     /// Submit `items` (each answered under the shared `system` preamble) as one batch;
-    /// returns the provider's batch id.
-    async fn submit(&self, system: &str, items: &[BatchItem]) -> Result<String>;
+    /// returns the provider's batch id. `attachments` are shared workspace files inlined
+    /// as context ahead of *every* item's prompt — text spliced inline, images carried as
+    /// native base64 parts (see [`crate::attach`]).
+    async fn submit(
+        &self,
+        system: &str,
+        attachments: &[Attachment],
+        items: &[BatchItem],
+    ) -> Result<String>;
     /// Poll a batch by its provider id.
     async fn poll(&self, batch_id: &str) -> Result<BatchPoll>;
     /// Ask the provider to cancel a batch by its id.
@@ -171,6 +179,31 @@ pub fn batch_shaping(
     (max_tokens, params)
 }
 
+/// Build one Anthropic message `content` for a prompt plus the shared attachments.
+/// With no attachments it stays a plain string (the unchanged wire shape — a bare
+/// prompt). With attachments it becomes a content-block array: the attachments first
+/// (as *context* — a text file as a `<file>`-wrapped text block, an image as a base64
+/// `image` block, Anthropic recommending image-before-text), then the prompt last.
+fn anthropic_content(attachments: &[Attachment], prompt: &str) -> Value {
+    if attachments.is_empty() {
+        return json!(prompt);
+    }
+    let mut blocks: Vec<Value> = attachments
+        .iter()
+        .map(|att| match att {
+            Attachment::Text { .. } => {
+                json!({ "type": "text", "text": att.wrapped_text().expect("text attachment wraps") })
+            }
+            Attachment::Image { mime, data_b64, .. } => json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime, "data": data_b64 }
+            }),
+        })
+        .collect();
+    blocks.push(json!({ "type": "text", "text": prompt }));
+    Value::Array(blocks)
+}
+
 /// Build the Anthropic Message Batches request body. Each item becomes one request
 /// whose `params` is a Messages API body: `model`/`max_tokens`/`system`/`messages` plus
 /// the flattened thinking block (`thinking`, and the adaptive tier's `output_config`).
@@ -181,6 +214,7 @@ pub fn anthropic_batch_body(
     max_tokens: u64,
     system: &str,
     params: &Option<Value>,
+    attachments: &[Attachment],
     items: &[BatchItem],
 ) -> Value {
     let requests: Vec<Value> = items
@@ -192,7 +226,7 @@ pub fn anthropic_batch_body(
             p.insert("system".into(), json!(system));
             p.insert(
                 "messages".into(),
-                json!([{ "role": "user", "content": it.prompt }]),
+                json!([{ "role": "user", "content": anthropic_content(attachments, &it.prompt) }]),
             );
             // Flatten the thinking/effort block in, the way rig flattens
             // additional_params into a Messages body (consult.rs).
@@ -542,7 +576,12 @@ impl AnthropicBatch {
 
 #[async_trait]
 impl BatchProvider for AnthropicBatch {
-    async fn submit(&self, system: &str, items: &[BatchItem]) -> Result<String> {
+    async fn submit(
+        &self,
+        system: &str,
+        attachments: &[Attachment],
+        items: &[BatchItem],
+    ) -> Result<String> {
         if self.model.is_empty() {
             return Err(anyhow!(
                 "this batch client was built for poll/cancel only (no model) — submit \
@@ -552,7 +591,14 @@ impl BatchProvider for AnthropicBatch {
         if items.is_empty() {
             return Err(anyhow!("a batch needs at least one prompt"));
         }
-        let body = anthropic_batch_body(&self.model, self.max_tokens, system, &self.params, items);
+        let body = anthropic_batch_body(
+            &self.model,
+            self.max_tokens,
+            system,
+            &self.params,
+            attachments,
+            items,
+        );
         let url = format!("{ANTHROPIC_API_BASE}/v1/messages/batches");
         let resp = self
             .auth(self.http.post(&url))
@@ -862,6 +908,7 @@ pub fn gemini_batch_body(
     max_tokens: u64,
     system: &str,
     params: &Option<Value>,
+    attachments: &[Attachment],
     items: &[BatchItem],
 ) -> Value {
     let requests: Vec<Value> = items
@@ -885,7 +932,7 @@ pub fn gemini_batch_body(
             }
             req.insert(
                 "contents".into(),
-                json!([{ "role": "user", "parts": [{ "text": it.prompt }] }]),
+                json!([{ "role": "user", "parts": gemini_parts(attachments, &it.prompt) }]),
             );
             req.insert("generationConfig".into(), Value::Object(gen));
             json!({ "request": Value::Object(req), "metadata": { "key": it.custom_id } })
@@ -897,6 +944,27 @@ pub fn gemini_batch_body(
             "input_config": { "requests": { "requests": requests } }
         }
     })
+}
+
+/// Build one Gemini user-turn `parts` array for a prompt plus the shared attachments:
+/// the attachments first as context (a text file as a `<file>`-wrapped text part, an
+/// image as an `inlineData` part), then the prompt last. Always an array (Gemini's
+/// native part shape), so the no-attachment case is just `[{ text: prompt }]` — the
+/// unchanged wire shape.
+fn gemini_parts(attachments: &[Attachment], prompt: &str) -> Value {
+    let mut parts: Vec<Value> = attachments
+        .iter()
+        .map(|att| match att {
+            Attachment::Text { .. } => {
+                json!({ "text": att.wrapped_text().expect("text attachment wraps") })
+            }
+            Attachment::Image { mime, data_b64, .. } => {
+                json!({ "inlineData": { "mimeType": mime, "data": data_b64 } })
+            }
+        })
+        .collect();
+    parts.push(json!({ "text": prompt }));
+    Value::Array(parts)
 }
 
 /// Gemini batch over HTTP. Mirrors [`AnthropicBatch`]: holds the connection (client, key,
@@ -986,7 +1054,12 @@ impl GeminiBatch {
 
 #[async_trait]
 impl BatchProvider for GeminiBatch {
-    async fn submit(&self, system: &str, items: &[BatchItem]) -> Result<String> {
+    async fn submit(
+        &self,
+        system: &str,
+        attachments: &[Attachment],
+        items: &[BatchItem],
+    ) -> Result<String> {
         if self.model.is_empty() {
             return Err(anyhow!(
                 "this batch client was built for poll/cancel only (no model) — submit \
@@ -996,7 +1069,7 @@ impl BatchProvider for GeminiBatch {
         if items.is_empty() {
             return Err(anyhow!("a batch needs at least one prompt"));
         }
-        let body = gemini_batch_body(self.max_tokens, system, &self.params, items);
+        let body = gemini_batch_body(self.max_tokens, system, &self.params, attachments, items);
         let url = format!(
             "{}/models/{}:batchGenerateContent",
             self.base_url, self.model
@@ -1101,6 +1174,9 @@ mod test_double {
     use super::*;
     use std::sync::Mutex;
 
+    /// One recorded submit: the shared `(system, attachments, items)` a test asserts on.
+    type SubmitRecord = (String, Vec<Attachment>, Vec<BatchItem>);
+
     /// A scripted [`BatchProvider`] for offline tests: records submits and replays a
     /// fixed sequence of poll outcomes (so a test can drive submit → pending → done
     /// with no network) — the batch analogue of
@@ -1108,7 +1184,7 @@ mod test_double {
     pub struct ScriptedBatch {
         submit_id: String,
         polls: Mutex<std::collections::VecDeque<BatchPoll>>,
-        submits: Mutex<Vec<(String, Vec<BatchItem>)>>,
+        submits: Mutex<Vec<SubmitRecord>>,
         canceled: Mutex<Vec<String>>,
         listing: (Vec<BatchListItem>, bool),
     }
@@ -1132,8 +1208,8 @@ mod test_double {
             self
         }
 
-        /// The `(system, items)` of each submit, in order.
-        pub fn submits(&self) -> Vec<(String, Vec<BatchItem>)> {
+        /// The `(system, attachments, items)` of each submit, in order.
+        pub fn submits(&self) -> Vec<SubmitRecord> {
             self.submits.lock().expect("submits lock").clone()
         }
 
@@ -1145,11 +1221,17 @@ mod test_double {
 
     #[async_trait]
     impl BatchProvider for ScriptedBatch {
-        async fn submit(&self, system: &str, items: &[BatchItem]) -> Result<String> {
-            self.submits
-                .lock()
-                .expect("submits lock")
-                .push((system.to_string(), items.to_vec()));
+        async fn submit(
+            &self,
+            system: &str,
+            attachments: &[Attachment],
+            items: &[BatchItem],
+        ) -> Result<String> {
+            self.submits.lock().expect("submits lock").push((
+                system.to_string(),
+                attachments.to_vec(),
+                items.to_vec(),
+            ));
             Ok(self.submit_id.clone())
         }
 
@@ -1293,7 +1375,7 @@ mod tests {
             },
         ];
         let body =
-            anthropic_batch_body("claude-sonnet-4-6", max_tokens, "be terse", &params, &items);
+            anthropic_batch_body("claude-sonnet-4-6", max_tokens, "be terse", &params, &[], &items);
         let reqs = body["requests"].as_array().expect("requests array");
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0]["custom_id"], "0");
@@ -1303,6 +1385,58 @@ mod tests {
         // The maxed thinking knob is flattened into each request's params.
         assert_eq!(reqs[0]["params"]["output_config"]["effort"], "high");
         assert_eq!(reqs[1]["params"]["messages"][0]["content"], "second");
+    }
+
+    /// With shared attachments, each Anthropic item's `content` becomes a block array:
+    /// the attachments first (a `<file>`-wrapped text block, then a base64 `image`
+    /// block), then the prompt last — the same shared attachments on every item.
+    #[test]
+    fn anthropic_content_carries_text_and_image_attachments() {
+        let attachments = vec![
+            Attachment::Text {
+                path: "README.md".into(),
+                body: "hello".into(),
+            },
+            Attachment::Image {
+                path: "logo.png".into(),
+                mime: "image/png",
+                data_b64: "QUJD".into(),
+            },
+        ];
+        let items = vec![
+            BatchItem {
+                custom_id: "0".into(),
+                prompt: "review this".into(),
+            },
+            BatchItem {
+                custom_id: "1".into(),
+                prompt: "and this".into(),
+            },
+        ];
+        let body = anthropic_batch_body("claude-sonnet-4-6", 1024, "sys", &None, &attachments, &items);
+        let content = &body["requests"][0]["params"]["messages"][0]["content"];
+        let blocks = content.as_array().expect("attachments make content a block array");
+        // [text-attachment, image-attachment, prompt]
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(
+            blocks[0]["text"].as_str().unwrap().contains("path=\"README.md\""),
+            "the text block wraps the file: {}",
+            blocks[0]["text"]
+        );
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJD");
+        // The prompt rides last, after the context.
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "review this");
+        // The same shared attachments ride on the second item, ahead of its own prompt.
+        let c1 = body["requests"][1]["params"]["messages"][0]["content"]
+            .as_array()
+            .expect("second item also a block array");
+        assert_eq!(c1[2]["text"], "and this");
+        assert_eq!(c1[1]["source"]["data"], "QUJD");
     }
 
     #[test]
@@ -1574,7 +1708,7 @@ mod tests {
                 prompt: "second".into(),
             },
         ];
-        let body = gemini_batch_body(max_tokens, "be terse", &params, &items);
+        let body = gemini_batch_body(max_tokens, "be terse", &params, &[], &items);
         let reqs = body["batch"]["input_config"]["requests"]["requests"]
             .as_array()
             .expect("requests array");
@@ -1607,7 +1741,7 @@ mod tests {
             custom_id: "0".into(),
             prompt: "q".into(),
         }];
-        let body = gemini_batch_body(1024, "", &None, &items);
+        let body = gemini_batch_body(1024, "", &None, &[], &items);
         let req = &body["batch"]["input_config"]["requests"]["requests"][0]["request"];
         assert!(
             req.get("systemInstruction").is_none(),
@@ -1618,6 +1752,42 @@ mod tests {
             req["generationConfig"]["maxOutputTokens"].as_u64().unwrap(),
             1024
         );
+    }
+
+    /// With shared attachments, each Gemini item's `parts` array leads with the
+    /// attachments as context (a `<file>`-wrapped text part, then an `inlineData` image
+    /// part), then the prompt last.
+    #[test]
+    fn gemini_parts_carry_text_and_image_attachments() {
+        let attachments = vec![
+            Attachment::Text {
+                path: "diff.patch".into(),
+                body: "@@ -1 +1 @@".into(),
+            },
+            Attachment::Image {
+                path: "shot.png".into(),
+                mime: "image/png",
+                data_b64: "QUJD".into(),
+            },
+        ];
+        let items = vec![BatchItem {
+            custom_id: "0".into(),
+            prompt: "review".into(),
+        }];
+        let body = gemini_batch_body(1024, "sys", &None, &attachments, &items);
+        let parts = body["batch"]["input_config"]["requests"]["requests"][0]["request"]["contents"]
+            [0]["parts"]
+            .as_array()
+            .expect("parts array");
+        assert_eq!(parts.len(), 3);
+        assert!(
+            parts[0]["text"].as_str().unwrap().contains("path=\"diff.patch\""),
+            "the text part wraps the file: {}",
+            parts[0]["text"]
+        );
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "QUJD");
+        assert_eq!(parts[2]["text"], "review");
     }
 
     #[test]
@@ -1843,9 +2013,10 @@ mod tests {
             custom_id: "0".into(),
             prompt: "q".into(),
         }];
-        let id = provider.submit("sys", &items).await.unwrap();
+        let id = provider.submit("sys", &[], &items).await.unwrap();
         assert_eq!(id, "msgbatch_test");
         assert_eq!(provider.submits()[0].0, "sys");
+        assert!(provider.submits()[0].1.is_empty(), "no attachments in this flow");
         assert!(matches!(
             provider.poll(&id).await.unwrap(),
             BatchPoll::Pending { .. }

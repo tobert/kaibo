@@ -16,6 +16,7 @@
 //! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project
 //! but cannot mutate it, and cannot shell out to external commands.
 
+pub mod attach;
 pub mod batch;
 pub mod config;
 pub mod consult;

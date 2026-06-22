@@ -236,6 +236,19 @@ in the module doc and `docs/devlog.md`. What's left:
   proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
   is ever confirmed by probe for a batch backend, lift it there — the constant is the
   one knob to change.
+- **Attachments on `oneshot` (deferred — batch shipped).** `batch_submit` now takes
+  `attach: [paths]` — workspace files (text spliced inline, images as native base64
+  parts) read + containment-checked server-side so the bytes never transit the calling
+  agent's context (`src/attach.rs`, `server.rs::resolve_attachments`, the shared
+  `contained`/`containment_error` the session-root check also uses; both batch body
+  builders emit structured parts now). `oneshot` is the natural sibling — the same
+  "name a file instead of pasting it" win for the synchronous tool-less call — but it
+  runs through **rig**, not the hand-rolled batch HTTP, so *text* attachment is a cheap
+  prompt-string splice while *image* attachment needs rig multimodal-message building
+  (different plumbing). Consider it later; the `Attachment`/`classify` seam is reusable
+  as-is. A typed `FileRef` variant is reserved for the Gemini File API path (oversized/
+  reused media, Gemini-only) — only worth it once a genuinely-too-big-to-inline case
+  shows up.
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
 (shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),

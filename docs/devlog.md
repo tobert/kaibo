@@ -76,6 +76,55 @@ thread whose `set_default` is in scope. Proven: 0 failures in 150 full-suite run
 the outcome field. Rejected the symptom-level "just serialize" because it left the
 ~1% consult-thread poisoning window open — measured, didn't assume.
 
+## 2026-06-22 — batch: `attach` — inline workspace files as context
+
+Amy wanted "let's get gemini pro batch to give us feedback on README.md" to mean *attach
+the file*, not paste it: kaibo reads README (or a `git diff > x.diff`) and inlines it, so
+the bytes never round-trip through the calling agent's context. That framing — "if the
+provider has attachments cool, but I don't care, just inline it for us" — settled the whole
+design. **Caller-side inlining, not provider attachment APIs.**
+
+The decisions, and what we rejected:
+
+- **Same surface, two encodings.** One `attach: [paths]` param, *shared* across every
+  prompt in the batch (the way `system` is shared) — because the stated cases are one
+  prompt + one file, and "N questions about the same README" is the natural multi-prompt
+  shape. Per-prompt attachments (prompts-as-objects) were rejected as YAGNI. Text splices
+  in as `<file path="…">…</file>`; an **image** can't splice into a string, so it becomes a
+  structured base64 part the provider carries natively (Anthropic `image` block / Gemini
+  `inlineData`). That's the real cost: the two body builders had to stop emitting a bare
+  string and emit **structured parts** — built now (even though text is the common case) so
+  image wasn't a later re-architecture. Anthropic content stays a plain string when there
+  are no attachments, preserving the existing wire shape.
+
+- **Reusing the boundary, not a parallel one.** "Restricted to workspace and worktrees like
+  everything else" became *literally* the same code: factored `resolve_root`'s containment
+  into `contained` + `containment_error`, and `resolve_attachments` calls them — so an
+  attachment can't read outside the workspace any more than `run_kaish` can. This is a
+  *second* fs-read path outside the kaish VFS, but it doesn't weaken read-only (we only
+  read), and it's the same pattern `[context]`/house-rules already use (server-side Rust
+  reads a file into a preamble). Proved the teeth: defeating `contained` makes the
+  outside-path and symlink-escape tests read outside bytes and fail.
+
+- **Images gated on real vision capability.** An image to a vision-blind synth would be
+  silently ignored or error upstream, so we refuse honestly up front via the existing
+  `ModelCaps` classifier — and we moved that gate (and attachment resolution) *before*
+  building the network client, so a vision misconfig is reported with **no key and no
+  network**. That also made the gate offline-testable (pin a slot `vision = false`, attach
+  an image, assert the refusal).
+
+- **Loud failures, no silent truncation.** A path outside the set, a directory, an
+  oversized file, or a binary that's neither UTF-8 nor a known image is a clear refusal —
+  the UTF-8/image sniff (shared with `view_image`) is the branch point, not just a guard.
+
+**Gemini File API: designed for, deliberately not built.** It's real (upload → `file_uri`
+→ `fileData` part) and could ride in batch, but it's *Gemini-only* and the use cases are
+text/inline-image, which both providers carry natively with no upload lifecycle. So it's a
+reserved typed `FileRef` variant (see `issues.md`), earning its keep only for
+genuinely-too-big-to-inline media. **`oneshot` deferred** the same way: same win, but it
+runs through rig (not the hand-rolled batch HTTP), so its image path needs rig multimodal
+messages — a later, separate piece.
+
 ## 2026-06-22 — batch: Gemini provider (second backend behind the seam)
 
 Added the second `BatchProvider` impl — Gemini inline batch — so the offline lane reaches
