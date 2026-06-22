@@ -14,6 +14,51 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — `$VAR` expansion in `root` / `allow_paths`, for portable scratch reads
+
+Amy asked the real question behind "can a user easily allow kaibo to read `/tmp`?": the
+mechanism existed (`--allow-path` / `KAIBO_ALLOW_PATHS` / `[server] allow_paths`), but the
+*path* you had to write was host-specific — a literal `/tmp` is wrong on macOS (per-user
+`/var/folders/...`) and on sandboxed Linux (`$XDG_RUNTIME_DIR`). kaibo already followed
+XDG for the config file but had no XDG/POSIX awareness in the read boundary. The fix is to
+let `root` / `allow_paths` expand `$VAR` / `${VAR}` (and the leading `~` they already did),
+so `allow_paths = ["$TMPDIR"]` resolves per machine.
+
+**Chose general `$VAR` expansion over a curated temp-var set or an `--allow-tmp` knob.**
+Amy's call: the general form is least-surprising to anyone who's used a shell, and it
+costs no more than the narrow one — `$TMPDIR`/`$XDG_RUNTIME_DIR`/`$HOME` all just fall out,
+plus whatever else a user names. A one-off `--allow-tmp` switch would have been more magic
+for less reach.
+
+**Expansion order is env-first, then tilde.** Two reasons it's not the other way: the
+tilde step keeps operating on an `OsString` `$HOME` (a non-UTF-8 home survives, as it did
+before), and a variable whose *value* carries a leading `~` (`MYDIR=~/data`) still expands.
+A single pass only — a variable's value is never re-scanned for `$`, so there's no
+expansion-injection surprise from environment contents.
+
+**Undefined / empty / non-UTF-8 variable is a loud load error, not a passthrough.** A
+silent gap (`$TMPDR` typo → empty segment → a path that canonicalizes *somewhere*) is
+exactly the data-corruption failure mode the house rule rejects; refuse at startup. Two
+cross-family reviews (DeepSeek V4 Pro via `consult`, Gemini 3.1 Pro via the batch lane)
+hardened this: Gemini caught that `undefined → error` does *not* cover a **set-but-empty**
+variable — `$EMPTY/scratch` collapses to `/scratch`, `$EMPTY/` to `/` (the whole
+filesystem) — a real silent boundary-widening, now refused in `resolve_var` (extracted as a
+pure seam so the rejection is unit-tested without mutating process env). Both flagged the
+`$HOME`-non-UTF-8 error conflating "set but not UTF-8" with "not set"; now distinguished.
+And on the bare-`$` question the two reviewers split — DeepSeek called shell-style
+passthrough fine, Gemini argued a stray `$` in a boundary path masks a typo and there's no
+way to write a literal `$`. Took Gemini's stricter line as the better fit for "silent
+fallbacks are a mistake": `$$` now escapes a literal `$`, and any other stray `$` is an
+error.
+
+**Scoped to the boundary knobs (`root` / `allow_paths`), not every path field.** `[context]`
+`user_files` and the key-file paths still tilde-only; extending them is consistency work,
+not the temp-read goal, and it widens the fallible surface — logged as a follow-up rather
+than smuggled in. The rest of the surface Amy asked for shipped together: the `configure`
+prompt gained an opt-in read-scope step, the containment-error message names the portable
+`$TMPDIR` form, and `docs/config.md` documents it — so a user meets the idiom wherever they
+hit the boundary.
+
 ## 2026-06-22 — `oneshot` grows `attach` (the interactive twin of batch attach)
 
 Amy's framing: `oneshot` should be as close to `batch` as the API split allows — "call

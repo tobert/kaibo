@@ -88,11 +88,18 @@ the git log. Each later release appends a new section at the top.
   and still land on the project. The scope handshake and `kaibo://config` tag the
   root as inferred. An `--allow-path` that excludes the cwd leaves no default root —
   kaibo never defaults to a path its own containment check would reject.
-- **`~` expands in `[server] root` and `allow_paths`** (config-file and `KAIBO_*`
-  env layers), matching the tilde handling key files and `[context]` paths already
-  get. Set `allow_paths = ["~/src"]` once and every project under it is in-bounds —
-  with cwd inferred as the default root, you stop thinking about `path` entirely.
-  (Previously a literal `~` was taken verbatim and failed canonicalization at startup.)
+- **`~` *and* `$VAR` / `${VAR}` expand in `[server] root` and `allow_paths`**
+  (config-file and `KAIBO_*` env layers), matching the tilde handling key files and
+  `[context]` paths already get. Set `allow_paths = ["~/src"]` once and every project
+  under it is in-bounds — with cwd inferred as the default root, you stop thinking about
+  `path` entirely. (Previously a literal `~` was taken verbatim and failed
+  canonicalization at startup.) Environment variables make a scratch space portable:
+  `allow_paths = ["$TMPDIR"]` or `["$XDG_RUNTIME_DIR/kaibo"]` lets kaibo read artifacts
+  a workflow drops in a temp dir without hardcoding a host-specific `/tmp`. A variable
+  that is unset, **set but empty**, or non-UTF-8 is a loud load error, never a silent gap
+  that would misplace the read boundary (an empty `$EMPTY/` would otherwise collapse to
+  `/`); write `$$` for a literal `$`. The `configure` prompt now walks you through this
+  opt-in.
 - **Follow git worktrees automatically.** A `path` in a linked git worktree of an
   already-allowed repo is now reachable without an `--allow-path` — so a sibling
   branch you check out next to the project (even one you spin up mid-session) just
