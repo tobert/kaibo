@@ -20,9 +20,17 @@
 //! Size caps are loud too (a file past its cap is refused, never silently truncated).
 //!
 //! A typed `FileRef` variant is reserved here in spirit for the later Gemini File API
-//! path (oversized/reused media, Gemini-only) — see `docs/issues.md`. We design the
-//! seam typed so that path slots in beside `Image` rather than re-architecting the
-//! body builders.
+//! path (oversized/reused media, Gemini-only) — see `docs/issues.md`. The *enum* is
+//! additive — a new variant beside `Text`/`Image` — but be honest about the cost: `Text`
+//! and `Image` carry their bytes **inline**, which is exactly what lets the body builders
+//! stay pure synchronous functions. The File API is a stateful two-step (async-upload the
+//! bytes → get a `fileUri` → reference it), and `resolve_attachments` is deliberately
+//! key-free, so it can't do that upload. Landing `FileRef` therefore means a
+//! provider-specific **upload pre-pass inside `submit`** that resolves local bytes to a
+//! URI *before* the pure builder runs — the builders stay pure, fed an already-resolved
+//! reference. So `Attachment` as written is an *inline-data* handle, not a universal
+//! media handle; don't assume `FileRef` is free of pipeline work. (Holistic review,
+//! Gemini Pro, 2026-06-22.)
 
 use anyhow::{bail, Result};
 use base64::Engine;

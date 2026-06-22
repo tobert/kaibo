@@ -299,6 +299,19 @@ failures and a truncated page are surfaced, not hidden). Still open:
   Consider making effort a default-on floor the cast/caller can lower, the way
   `max_tokens` already is. (Distinct from the "lift the tier" bullet above — that's the
   ceiling, this is the override.)
+- **Shared `attach` duplicates per item — a payload/memory ceiling as batches grow.**
+  Attachments are shared across the batch but inlined *per item*: `anthropic_content`/
+  `gemini_parts` (`batch.rs`) re-encode every attachment into every item's request, so a
+  1 MiB attachment on a 1000-prompt batch is ~1 GiB in the JSON AST and again in the
+  serialized body. Inherent — provider batch APIs carry bytes inline per request, and
+  prompt caching doesn't shrink the JSONL — so the real fix is a guard, not dedup: bound
+  total submitted payload (sum of prompts + attachments×items) with a loud refusal before
+  it OOMs or trips the provider's body-size limit, the way single-file size is already
+  capped. Surfaced by the holistic review (Gemini Pro, 2026-06-22). Low priority until a
+  big-attachment × many-prompt batch is real — measure first; today's single-digit-prompt
+  reviews are nowhere near it. Note this interacts with the `FileRef`/File-API path
+  (`attach.rs` module doc): a `fileUri` reference is tiny and *reused* across items, so
+  remote-referenced media is the eventual escape from this duplication for large files.
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they

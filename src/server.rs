@@ -29,7 +29,7 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, oneshot, Arm, ConsultConfig, ModelShape, PromptOverrides};
+use crate::consult::{consult, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides};
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
 use crate::image_gen::ImageGen;
@@ -1199,17 +1199,18 @@ impl KaiboHandler {
         )))
     }
 
-    /// Resolve a cast's synth slot for batch: its slot + backend, plus whether the model
-    /// accepts image input (`vision`). Cheap and key-free — it does *not* build a network
-    /// client, so the caller can resolve attachments and gate vision (both request-shaping,
+    /// Resolve a cast's synth slot for batch: its slot + backend, plus the model's
+    /// resolved [`ModelCaps`]. Cheap and key-free — it does *not* build a network client,
+    /// so the caller can resolve attachments and gate on capability (both request-shaping,
     /// not connection) before paying for a provider. A missing synth slot is the loud
     /// call-time gap; the batch-lane check rides the later `batch::submitter` build. The
-    /// vision answer comes from the same slot the provider will use, so the gate and the
-    /// wire agree on which model runs.
+    /// caps come from the same slot the provider will use, so the gate and the wire agree
+    /// on which model runs. Returns the whole `ModelCaps` (not just `vision`) so a future
+    /// audio/video attachment gate has its answer without growing this signature.
     fn batch_synth<'a>(
         &'a self,
         cast: &'a Cast,
-    ) -> Result<(&'a ModelSlot, &'a Backend, bool), McpError> {
+    ) -> Result<(&'a ModelSlot, &'a Backend, ModelCaps), McpError> {
         let slot = cast
             .require_slot(ModelRole::Synth)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -1217,12 +1218,8 @@ impl KaiboHandler {
             .config
             .resolve_backend(&slot.backend)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let vision = self
-            .config
-            .slot_caps(slot)
-            .map(|c| c.vision)
-            .unwrap_or(false);
-        Ok((slot, backend, vision))
+        let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
+        Ok((slot, backend, caps))
     }
 
     /// A poll/cancel-only provider for a handle's backend. Poll and cancel need only the
@@ -1321,7 +1318,7 @@ impl KaiboHandler {
             "model",
             "backend",
         )?;
-        let (slot, backend, vision) = self.batch_synth(&cast)?;
+        let (slot, backend, caps) = self.batch_synth(&cast)?;
         let backend_name = backend.name.clone();
         let model = slot.id.clone();
         // Read + containment-check the attachments before anything hits the network: a
@@ -1332,7 +1329,7 @@ impl KaiboHandler {
         // would silently ignore (or error on) an image part, so refuse honestly up front
         // (the project posture), naming the cast so the caller can pick a vision one. This
         // runs before the provider is built, so a vision misconfig needs no key to report.
-        if !vision
+        if !caps.vision
             && attachments
                 .iter()
                 .any(|a| matches!(a, crate::attach::Attachment::Image { .. }))
