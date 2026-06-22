@@ -121,6 +121,16 @@ mod tests {
     /// it. It is never a thread's default, so it receives no events; it exists only to
     /// keep the registration path honest. Leaked deliberately: it must outlive every
     /// test in the process.
+    ///
+    /// A subtlety worth stating, because it looks like a residual race and isn't: a
+    /// no-subscriber test *can* poison the `tool` callsite to `never` before the first
+    /// capture test runs. But registering a dispatcher (`Dispatch::new` →
+    /// `callsite::register_dispatch`) *rebuilds the interest cache for every already-
+    /// registered callsite* against the live set — so this very call un-poisons `tool`,
+    /// and the test's own `set_default` rebuilds it again. The only window that ever
+    /// mattered was poisoning *after* those rebuilds but before the span fires, by a
+    /// concurrent first-touch under `has_just_one` — which is exactly the window forcing
+    /// `has_just_one` false closes. Hence 0/150 full-suite runs (was ~5%).
     fn force_multi_dispatcher() {
         use std::sync::OnceLock;
         static KEEPALIVE: OnceLock<()> = OnceLock::new();
