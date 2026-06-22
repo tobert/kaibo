@@ -32,7 +32,9 @@ the git log. Each later release appends a new section at the top.
 - **`generate_image`** — kaibo's first *capability* (an artifact handed back to the
   caller, not reasoning run into kaibo's own models): prompt → image, returned inline
   as MCP image content. OpenAI-compatible image backends only (hosted
-  `gpt-image` / DALL·E, or a local Stable-Diffusion server).
+  `gpt-image` / DALL·E, or a local Stable-Diffusion server). Its `cast` parameter
+  advertises the casts that actually carry a usable image slot as a schema enum, so a
+  host agent picks one off the schema — as discoverable as the consultation tools.
 - **Batch (`batch_submit` / `batch_get` / `batch_cancel` / `batch_list`)** — the
   *offline, async sibling* of `oneshot`: submit a list of tool-less prompts, get a
   handle, poll it, read every answer when the provider's batch lane finishes — no call
@@ -66,7 +68,10 @@ the git log. Each later release appends a new section at the top.
 - **Guided setup.** A built-in `configure` MCP prompt walks your host agent through
   writing `config.toml`, alongside `kaibo://config` (resolved runtime state) and
   `kaibo://config/example` (annotated template) resources. Secrets are referenced by
-  env-var name or key-file path, never inlined.
+  env-var name or key-file path, never inlined. `kaibo://config` flags any per-slot
+  tunable the slot's resolved model shape will never send (an `inert_tunables` list —
+  e.g. a `thinking_budget` on an effort-only model, an `effort` on a budget-only one),
+  so a no-op knob is visible to the operator instead of rendering as if effective.
 - **Zero-config workspace root.** When no `--root` is set, kaibo adopts its launch
   cwd as the inferred default root (it already scoped containment to that cwd, and
   MCP clients start stdio servers with cwd = workspace), so a call may omit `path`

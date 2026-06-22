@@ -696,6 +696,35 @@ impl Config {
             .collect()
     }
 
+    /// The casts that can actually serve `generate_image` *right now*: those carrying
+    /// an `image` slot on an OpenAI-compatible backend (the only kind rig 0.38 drives
+    /// for image generation) whose key resolves. This is the image-tool analogue of
+    /// [`usable_casts`](Self::usable_casts) — a deliberately *different* filter, because
+    /// `generate_image` selects the `image` slot, not explorer/synth: a cast with a
+    /// stranded explorer key but a working image slot belongs here (and a fully-keyed
+    /// cast with no image slot does not). Sorted by name (the `casts` `BTreeMap` order);
+    /// includes config.toml casts the static `cast` enum can't name. Env lookup injected
+    /// for testability, mirroring [`usable_casts`](Self::usable_casts).
+    pub fn image_capable_casts(&self, get_env: impl Fn(&str) -> Option<String>) -> Vec<String> {
+        self.casts
+            .iter()
+            .filter(|(_, cast)| {
+                let Some(slot) = cast.slot(ModelRole::Image) else {
+                    return false;
+                };
+                // Slot backend refs resolve at merge time; skip defensively rather than
+                // panic if that ever changes. Only openai-kind has a rig image path, and
+                // a Missing key means the slot can't reach a model — neither is usable.
+                let Ok(backend) = self.resolve_backend(&slot.backend) else {
+                    return false;
+                };
+                backend.kind == ProviderKind::Openai
+                    && !matches!(backend.key_status(&get_env), KeyStatus::Missing)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// [`cast_usability`](Self::cast_usability) for the default cast — what `get_info`
     /// reads to decide whether to surface setup guidance. If the default cast somehow
     /// doesn't resolve (it's validated to at startup), treat it as `Unconfigured` so we
@@ -2144,6 +2173,36 @@ mod tests {
             vec![("openai".to_string(), CastUsability::LocalUnverified)],
             "no env key ⇒ only the keyless local cast is usable"
         );
+    }
+
+    /// `image_capable_casts` is a *different* filter than `usable_casts`: it keeps only
+    /// casts whose `image` slot rides an openai backend with a resolvable key. A cast
+    /// with an openai image slot survives even with no env key (the local backend is
+    /// keyless); a cast whose image slot is on a non-openai backend is dropped (rig has
+    /// no image path there); a cast with no image slot at all never appears.
+    #[test]
+    fn image_capable_casts_keeps_only_openai_image_slots() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.art]
+            image = { backend = "openai", id = "sd-xl" }
+
+            [casts.wrongkind]
+            image = { backend = "anthropic", id = "imagen-ish" }
+            "#,
+        )
+        .unwrap();
+        // No env key at all: the openai image cast still qualifies (keyless local),
+        // the anthropic-backed one is excluded by kind, and the built-in agent-only
+        // casts (no image slot) never appear.
+        assert_eq!(
+            cfg.image_capable_casts(|_| None),
+            vec!["art".to_string()],
+            "only the openai-backed image cast is image-capable"
+        );
+        // An anthropic key in the env changes nothing — wrong kind stays excluded.
+        let with_key = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
+        assert_eq!(cfg.image_capable_casts(with_key), vec!["art".to_string()]);
     }
 
     /// The built-in aliases register at BOTH levels: `claude` resolves as a cast

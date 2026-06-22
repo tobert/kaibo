@@ -341,17 +341,6 @@ tunables — if a provider caps output low, cap that slot, not the global, per t
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
 
-### Tunables with no sink are accepted (and rendered) silently
-A slot whose resolved `ModelShape` has no sink for a knob still accepts it,
-load-validates it, and renders it at `kaibo://config` as if effective:
-`thinking_budget` on a Gemini 3-line slot (the level line never sends a budget,
-yet the `< max_tokens` inversion check still applies to it), and
-`effort`/`thinking_budget` on an openai-kind slot (`ThinkingStyle::None` sends
-neither). The effort half of this was fixed for the 3-line (it now maps onto
-`thinkingLevel`); the rest is invisible-no-op residue. Fix shape: at load (or in
-the render), flag per-slot tunables the slot's resolved shape will never send —
-a note in the render is enough to make the no-op visible to the operator.
-
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
 `ExplorationTrace`), the curiosity + completeness behaviors, and the assertive
@@ -367,15 +356,6 @@ built-in reproduces it with no per-cast config. Still open, lower value:
 - **Debug affordance:** dump the *assembled* preamble (built-in/override + house rules)
   to a file, à la gemini-cli's `GEMINI_WRITE_SYSTEM_MD` — useful now that prompts
   compose per model from `[prompts]`, slot `preamble`, and `[context]`.
-
-### `generate_image` doesn't advertise its cast `enum`
-The consultation tools stamp the usable-cast roster onto their `cast` param as a
-JSON-Schema enum (`inject_cast_enum`, `server.rs`); `generate_image` doesn't. Its
-`cast` selects the **`image`** slot (openai-kind only), so the right menu is a
-different filter — "casts with a usable image slot", not the explorer/synth
-`usable_casts` — i.e. a `Config::image_capable_casts` to write. Add it so image gen
-is as discoverable as consultation. Advisory like the others (serde ignores the enum
-in `call_tool`), so it never rejects a config-only cast.
 
 ### Server doesn't validate backend health at startup
 Usable *casts* are now advertised — the handshake `## Casts` list and the `cast`
