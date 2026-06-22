@@ -33,6 +33,27 @@ the git log. Each later release appends a new section at the top.
   caller, not reasoning run into kaibo's own models): prompt → image, returned inline
   as MCP image content. OpenAI-compatible image backends only (hosted
   `gpt-image` / DALL·E, or a local Stable-Diffusion server).
+- **Batch (`batch_submit` / `batch_get` / `batch_cancel` / `batch_list`)** — the
+  *offline, async sibling* of `oneshot`: submit a list of tool-less prompts, get a
+  handle, poll it, read every answer when the provider's batch lane finishes — no call
+  held open per answer. Built for fanning many prompts (or one hard question you'll wait on) at a
+  top-tier model: it maxes the knobs (forces high thinking effort + a generous token
+  budget) regardless of how the cast was tuned for interactive use, and a per-call
+  `model`/`backend` override lets you batch a Pro/Opus tier a cast otherwise synths
+  cheaper. Each prompt is self-contained — no codebase access, no tools. kaibo keeps
+  no state: the handle is the whole address, so poll/cancel survive a restart, and a
+  failed item is surfaced per-item rather than dropped. Runs on **Anthropic and Gemini**
+  backends (OpenAI batch is a tracked follow-on); a cast whose synth has no batch lane is
+  refused with a clear message naming the ones that do. For Gemini there's a ready-made
+  `gemini-batch` cast that synths Gemini **Pro** — the tier you reach for offline, where
+  its latency is free. Gated by `--no-batch` (one flag over every verb). Batch carries its
+  own system preamble fit to the offline lane — one complete, self-contained response with
+  no follow-up, told to spend on depth — overridable via `[prompts].batch` like the other
+  phases. While a batch runs, `batch_get` reminds you to go do other work and check back
+  rather than wait on it. Lost a handle? `batch_list` re-discovers the batches a backend
+  still holds (newest first, each with its handle, status, and progress), so a batch is
+  never orphaned — defaulting across every batch-capable backend, or scoped to one with
+  `backend`.
 - **`view_image`** — vision-capable consultation phases can read an image *file* from
   the workspace into model context (screenshots, diagrams, assets already in the tree).
 - **Multi-provider model teams.** Anthropic, DeepSeek, and Gemini natively, plus a

@@ -14,6 +14,131 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — batch: Gemini provider (second backend behind the seam)
+
+Added the second `BatchProvider` impl — Gemini inline batch — so the offline lane reaches
+the model Amy actually wants there: Gemini **Pro**. Pro is near-unusable interactively
+(slow), but batch is exactly where that latency is free, so it's the natural home for it.
+Shipped a ready-made `gemini-batch` **cast** (synth → `gemini-pro-latest`) rather than
+adding a `batch` role slot to the schema — today's cast machinery already expresses "a
+team whose synth is Pro," and the per-call `model`/`backend` override covers the rest. The
+deferred `batch`-role-slot alternative stays parked; it earns its keep only if one cast
+needing *both* a cheap interactive synth and a Pro batch synth becomes common.
+
+The seam paid off: the trait, the stateless `backend/provider-id` handle, the
+ScriptedBatch offline harness, and the four verbs were all reused unchanged. What's
+genuinely Gemini-shaped lives in pure, offline-tested functions, and dispatch moved into
+`batch.rs` (`submitter`/`poller`/`batch_supported`) so `server.rs` no longer hardcodes a
+provider — it asks the module, and an unsupported kind is refused in one place.
+
+**Probed the wire shape, didn't guess** (the CLAUDE.md rule, and the `issues.md` entry
+demanded it). The live probe earned its keep — Gemini's batch differs from Anthropic's in
+ways no amount of reading would have settled:
+
+- **Body shape can't be shared.** Gemini nests *both* the completion budget
+  (`maxOutputTokens`) and the thinking block under one `generationConfig`, where Anthropic
+  carries `max_tokens` top-level. So `gemini_batch_body` folds the floored budget into the
+  `generationConfig` that `ModelShape::to_params` already produced, beside `thinkingConfig`
+  — and the maxed-knobs shaping (`batch_shaping`) was reused verbatim across both.
+- **Results come back inline in the long-running-operation object**, not behind a separate
+  results URL (Anthropic's `results_url` + JSONL). No second fetch.
+- **`batchStats` counts arrive as JSON strings** (`"7"`), not numbers — `as_u64` alone
+  would have silently read them as 0, exactly the quiet miscount the project forbids. The
+  count reader handles both.
+- **Cancel is instant-terminal**, not Anthropic's interim "canceling" you poll through. A
+  cancelled/failed/expired Gemini batch is `done:true` immediately with a top-level
+  operation error and (usually) no per-item output. `Done(vec![])` would render as
+  "0 results" and read like success — wrong — so added a `BatchPoll::Failed { state,
+  message }` variant that names the terminal state honestly. Partial results that *did*
+  land before the terminal event are still handed back as `Done`.
+- **List lives under `operations`** (not `data`) and paginates via `nextPageToken` (not
+  `has_more`); an empty list omits the key entirely, so that's an empty page, not an error.
+- **The slashed provider id just worked.** A Gemini handle is `gemini/batches/<id>` — the
+  id itself contains a slash — but `parse_batch_handle`'s split-on-*first*-slash plus the
+  no-slash-in-backend-name invariant (enforced at config load) already made that
+  unambiguous. The Anthropic-era design absorbed it for free.
+
+`includeThoughts` is on (inherited from the shaping), so a Gemini answer carries the
+reasoning as separate `"thought": true` parts; confirmed against a live thinking batch
+that the answer text is the *non*-thought parts (a final answer part may still carry a
+`thoughtSignature` — that's not a thought part, so it stays). The whole seam is
+offline-tested (pure shaping/parsing fns + ScriptedBatch), and the live wire was proven
+end-to-end through the actual MCP server: submit → list → poll → `## [0] Pong.`, plus a
+cancel that lands in `Failed`, plus a non-batch cast refused with the supported set named.
+
+**The dogfood earned its keep twice.** Running a real `gemini-batch` job through the
+reconnected server surfaced that the cast's pinned synth `gemini-3-pro-preview` was
+*retired* — and exposed a sharp edge of Gemini's batch lane: submit **accepted** the dead
+model (`BATCH_STATE_PENDING`), and the failure only landed as a *per-item* error when the
+request actually ran ("This model … is no longer available"). The per-item failure
+surfacing did exactly its job — the answer came back as `## [0] — failed: provider error:
+…` rather than a silent empty — but it's a reminder that Gemini batch does no model
+validation at submit time. The fix is the drift-resistant default: the cast synths
+`gemini-pro-latest` (the alias, today resolving to `gemini-3.1-pro-preview`) rather than a
+pinned preview that gets retired out from under us — `provider-model-ids` drift, made
+concrete. Confirmed live: `gemini-pro-latest`, `gemini-3.1-pro-preview`, and `gemini-2.5-pro`
+all 200 on a synchronous `generateContent`; `gemini-3-pro-preview` 404s.
+
+## 2026-06-22 — batch: offline max-effort fan-out (Anthropic first)
+
+Shipped the batch tool class — `batch_submit`/`batch_get`/`batch_cancel`/`batch_list`,
+the **offline, async sibling of `oneshot`**. The shape was the whole debate. Started
+from "batch mode as a param on `oneshot`" and rejected it: batch is a *different class*,
+not a flag. It's toolless **by construction** — provider batch APIs are offline and
+can't drive a tool loop — so it's built on the `oneshot` *shape* (a capable model
+answering from what it was handed), never `run_phase`. Separate verbs rather than one
+tool with modes, because submit→poll→cancel→list are genuinely distinct and "kill a fat
+top-tier batch" is a real button to want.
+
+Designed fresh for kaibo, not ported from gpal/cpal — those were a reference for what's
+*possible*, not a template. Decisions worth recording:
+
+- **Max the knobs by default.** Batch floors `max_tokens` and forces thinking at
+  `BATCH_EFFORT` regardless of how the cast's synth slot was tuned for interactive use.
+  The motivating case (Amy's): Gemini Pro is near-unusable interactively, so casts synth
+  on Flash — but batch is exactly where you reach for Pro, and the latency that makes
+  max-thinking painful synchronously is *free* once you've accepted "come back later."
+  `BATCH_EFFORT` is threaded *explicitly* through `ModelShape::to_params` rather than
+  via the `consult::thinking_params` helper — a first cut reused that helper, but it
+  would have silently baked in `consult`'s interactive `DEFAULT_EFFORT`; a cross-family
+  review caught the dead-constant trap, so batch now owns its effort independently
+  (`max_tokens` is a *floor*, never undercutting a richer slot).
+- **No state, by design.** kaibo holds nothing on disk, and we kept it that way: the
+  returned handle is `backend/provider-id`, the *whole* address. Poll/cancel/list
+  rebuild a fresh client from the backend and re-address the provider's own batch id, so
+  they survive a server restart. The split trusts a backend name to carry no `/` — so we
+  *enforced* that at config load (`config.rs`) rather than leaving it a convention the
+  slot-ref and batch-handle parsers silently bank on.
+- **A preamble of its own.** Batch shares `oneshot`'s toolless shape but not its words.
+  A cross-family review (Opus, run *through* `batch_submit` itself — dogfooding the
+  tool to critique its own design) flagged that `oneshot`'s "name what you'd need rather
+  than guessing" is right *synchronously* (a gap invites a next turn) but wrong offline
+  (there is no next turn — stopping at "I'd need X" burns the caller's one shot). So
+  `batch_preamble` (overridable via `[prompts].batch`) tells the model it gets one
+  complete, self-contained response, to spend the forced budget on depth, and to
+  *state an assumption and answer under it* rather than stall — and drops the negative
+  "guessing" framing for the positive form the CLAUDE.md rule wants.
+- **`batch_list` closes the orphan gap.** No state means a *lost* handle is a batch that
+  keeps billing with no way back to it — the review's sharpest finding. `batch_list`
+  reads the provider's own batch list (the source of truth kaibo doesn't keep): newest
+  first, each entry a ready-to-use handle with status and progress, defaulting across
+  every Anthropic backend (you may not recall which ran it) or scoped to one.
+  Per-backend failures and a truncated page are surfaced, never hidden. Live-verified
+  against 14 real historical batches — recovered every one by handle.
+
+**Anthropic first, deliberately.** Message Batches is inline (requests in one POST) and
+the wire shape is one we're confident about; Gemini (Amy's real want) and OpenAI
+(file-based) follow as their own PRs once a live probe confirms each shape — the
+"confirm, don't guess" discipline. A non-Anthropic cast is refused with a clear message
+rather than silently no-oping, the same honest-absence posture as the `ImageGen` seam.
+`batch_submit` is many-prompts/one-cast for now; the one-question/many-casts panel is N
+provider batches under a composite handle, deferred (`docs/issues.md`).
+
+The whole seam is offline-tested: pure request-shaping/response-parsing/render fns plus
+a `ScriptedBatch` driving submit→pending→done and a seeded list with no network,
+mirroring `ScriptedImageGen`. The live wire is proven by trying it (the dogfooded review
+and the `batch_list` recovery run), not by a unit test that can't reach the provider.
+
 ## 2026-06-18 — kaish-kernel 0.9.0
 
 Bumped the published dep `0.8.4 → 0.9.0`. One API break carried through: the `mcp()`

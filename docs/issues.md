@@ -228,16 +228,55 @@ that fails when we *didn't* make a mistake is the opposite of the teeth we want.
 serialize the two (a shared `Mutex`/`serial_test`), or capture per-span without leaning
 on global dispatch. Out of scope when found (the read-idioms/output-cap PR).
 
-### `oneshot` batch — batchable fan-out of the tool-less answer (deferred)
-The tool-less, non-interactive answer shipped as the `oneshot` tool (prompt in,
-answer out, no tools — `consult.rs::oneshot`). What's still deferred is the *batch*
-shape for fan-out: submit → poll → read, modelled on gpal/cpal's job system, so a
-caller can fire many oneshots (or one question across many casts) without holding a
-synchronous call open per answer. It's a **per-provider capability** like
-`thinking_params`: Gemini ✓, Anthropic ✓, DeepSeek?, `openai` ✗ — `None` where
-unsupported. Open fork when built: many-questions/one-model vs one-question/many-models
-(the diverse-opinion panel made literal). The provenance footer oneshot already
-appends makes a batch result self-labelling.
+### Batch — remaining providers and the many-casts fork
+The batch tool class shipped Anthropic- and Gemini-first (`src/batch.rs`,
+`batch_submit`/`batch_get`/`batch_cancel`/`batch_list`, one `--no-batch` gate): offline,
+toolless, max-effort fan-out behind the `BatchProvider` seam, with the design rationale
+in the module doc and `docs/devlog.md`. What's left:
+
+- **OpenAI batch** — file-based (upload JSONL, reference a file id, poll, download an
+  output file), unlike Anthropic's inline POST. The output file is left in place by
+  default; add a `config.toml` flag to opt into cleanup for callers who'd rather not
+  accrete files. The generic local `openai` kind stays ✗ (no batch endpoint).
+- **The many-casts fork.** `batch_submit` today is many-prompts/**one**-cast (one
+  provider batch). The diverse-opinion panel — one question across **many** casts — is N
+  provider batches under a composite handle; deferred. The provenance footer already
+  makes each result self-labelling, so the rendering is mostly there.
+- **Effort tier.** Batch forces `BATCH_EFFORT = "high"` (== `DEFAULT_EFFORT`, the
+  proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
+  is ever confirmed by probe for a batch backend, lift it there — the constant is the
+  one knob to change.
+
+Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
+(shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
+DeepSeek ?, local `openai` ✗.
+
+### Batch design hardening (cross-model Opus review, 2026-06-22)
+A cross-family review of the batch slice (Opus 4.8, run *through* `batch_submit` itself
+dogfooding the tool) confirmed the bones — the verb surface, stateless
+`backend/provider-id` handle, per-item failure surfacing — and flagged four follow-ons.
+Shipped in the same pass: the batch preamble (no longer a verbatim `oneshot` reuse —
+`consult.rs::batch_preamble`, overridable via `[prompts].batch`), the `/`-in-backend-name
+guard the handle split relies on (`config.rs`), the don't-busy-wait note on the tool
+descriptions, and **`batch_list`** (`server.rs`/`batch.rs::list`) — the way back to a
+batch whose handle was lost, closing the orphaned/billing-batch footgun (per-backend
+failures and a truncated page are surfaced, not hidden). Still open:
+
+- **Index-as-`custom_id` + statelessness = context-loss risk.** Result labels are bare
+  `0..N`, meaningful only to a caller still holding the ordered prompt list. Echo the
+  prompt (or a digest) back beside each answer in `batch_get` so a result is
+  self-describing — the natural complement to holding no state. (`batch.rs::render_poll`
+  / `BatchAnswer` is the seam; would need the submitted prompts carried or re-fetched.)
+- **`batch_get` returns prose for both pending and done.** An agent must parse the
+  progress string to know whether it's looking at a status or its answers. A structured
+  status token (or distinct content shape) would let the caller branch without reading
+  prose.
+- **Forced effort vs. a floor.** `max_tokens` is already a floor (never undercuts a
+  richer slot), but effort is *force-clobbered* to `BATCH_EFFORT` — lossy for legitimate
+  bulk-classification / short-extraction batches where high effort is wasted spend.
+  Consider making effort a default-on floor the cast/caller can lower, the way
+  `max_tokens` already is. (Distinct from the "lift the tier" bullet above — that's the
+  ceiling, this is the override.)
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they

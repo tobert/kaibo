@@ -75,6 +75,10 @@ pub struct ToolGating {
     pub oneshot: bool,
     pub run_kaish: bool,
     pub generate_image: bool,
+    /// The batch capability (submit/get/cancel/list) — one gate over all the verbs:
+    /// they're one capability (you can't get or list without submit), so `--no-batch`
+    /// drops them together rather than a flag apiece.
+    pub batch: bool,
 }
 
 impl Default for ToolGating {
@@ -84,6 +88,7 @@ impl Default for ToolGating {
             oneshot: true,
             run_kaish: true,
             generate_image: true,
+            batch: true,
         }
     }
 }
@@ -91,7 +96,7 @@ impl Default for ToolGating {
 impl ToolGating {
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
-        !self.consult && !self.oneshot && !self.run_kaish && !self.generate_image
+        !self.consult && !self.oneshot && !self.run_kaish && !self.generate_image && !self.batch
     }
 }
 
@@ -206,6 +211,56 @@ pub struct OneshotInput {
     /// slot's configured one. Requires `model`.
     #[serde(default)]
     pub backend: Option<String>,
+}
+
+/// Arguments to `batch_submit`. Many prompts, one cast/model — they all ride one
+/// provider batch. See [`ConsultInput`] for the `deny_unknown_fields` rationale.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSubmitInput {
+    /// The prompts to fan out, one batch item each. Like `oneshot`, there's no
+    /// codebase access — each prompt carries its own context; the model answers from
+    /// it and its own knowledge. Batch runs them at max thinking, so it's the lane for
+    /// hard questions you're willing to wait on.
+    pub prompts: Vec<String>,
+
+    /// Which cast (model team) runs the batch; omit for the server's default. Batch
+    /// uses the cast's capable (synth) model on a batch-capable backend; `kaibo://config`
+    /// lists the casts.
+    #[serde(default)]
+    pub cast: Option<String>,
+
+    /// Override the synth model id. Sent verbatim — an id containing "/" is still one
+    /// id. Keeps the cast's backend unless `backend` retargets it. Reach for this to
+    /// batch a top-tier model the cast synths something cheaper for interactive use.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Run the `model` override on this backend (name or alias) instead of the cast's.
+    /// Requires `model`. Must be a batch-capable backend.
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
+/// Arguments to `batch_list`: an optional backend to scope the listing to.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BatchListInput {
+    /// Which backend (name or alias) to list batches from. Omit to list across every
+    /// configured batch-capable backend — the orphan-recovery default when you've lost a
+    /// handle and don't recall which backend ran it.
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
+/// Arguments to `batch_get` / `batch_cancel`: the opaque handle `batch_submit`
+/// returned (`"backend/provider-id"`).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BatchHandleInput {
+    /// The batch handle kaibo returned from `batch_submit` (e.g.
+    /// `anthropic/msgbatch_…`). kaibo holds no state — the handle is the whole address.
+    pub batch_id: String,
 }
 
 /// Arguments to the `run_kaish` tool. See [`ConsultInput`] for the
@@ -324,6 +379,11 @@ impl KaiboHandler {
             (gating.oneshot, "oneshot"),
             (gating.run_kaish, "run_kaish"),
             (gating.generate_image, "generate_image"),
+            // One `--no-batch` flag drops all batch routes together.
+            (gating.batch, "batch_submit"),
+            (gating.batch, "batch_get"),
+            (gating.batch, "batch_cancel"),
+            (gating.batch, "batch_list"),
         ] {
             if !enabled {
                 assert!(
@@ -1030,6 +1090,263 @@ impl KaiboHandler {
             size,
         )))
     }
+
+    /// Resolve a cast's synth slot into a submit-capable batch provider, plus its
+    /// backend name (for the returned handle) and model id (for the caller message). A
+    /// missing synth slot is the loud call-time gap; a backend whose kind has no batch
+    /// lane is refused inside the provider build (`batch::submitter`). Both surface as a
+    /// parameter error the caller can act on — pick a cast whose synth is a batch-capable
+    /// backend.
+    fn batch_submitter(
+        &self,
+        cast: &Cast,
+    ) -> Result<(Arc<dyn crate::batch::BatchProvider>, String, String), McpError> {
+        let slot = cast
+            .require_slot(ModelRole::Synth)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let backend = self
+            .config
+            .resolve_backend(&slot.backend)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+        Ok((provider, backend.name.clone(), slot.id.clone()))
+    }
+
+    /// A poll/cancel-only provider for a handle's backend. Poll and cancel need only the
+    /// connection (key + endpoint), so this re-addresses a batch by id after a restart —
+    /// kaibo holds no state.
+    fn batch_poller(
+        &self,
+        backend_name: &str,
+    ) -> Result<Arc<dyn crate::batch::BatchProvider>, McpError> {
+        let backend = self
+            .config
+            .resolve_backend(backend_name)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        crate::batch::poller(backend).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
+    }
+
+    /// The set of backend names `batch_list` should query. An explicit `backend` scopes
+    /// to that one (resolved by name/alias, and refused loudly if its kind has no batch
+    /// lane). Omitted, it's every configured batch-capable backend, sorted — the orphan-
+    /// recovery default. No batch-capable backend at all is a clear parameter error, not an
+    /// empty list pretending nothing's there.
+    fn batch_backends(&self, backend: Option<&str>) -> Result<Vec<String>, McpError> {
+        if let Some(name) = backend {
+            let b = self
+                .config
+                .resolve_backend(name)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            if !crate::batch::batch_supported(b.kind) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "backend {:?} ({:?}) has no batch lane, so it can't be listed \
+                         (batch-capable: {}). Omit `backend` to list every batch-capable \
+                         backend.",
+                        b.name,
+                        b.kind,
+                        crate::batch::supported_kinds_list()
+                    ),
+                    None,
+                ));
+            }
+            return Ok(vec![b.name.clone()]);
+        }
+        let names: Vec<String> = self
+            .config
+            .backends
+            .values()
+            .filter(|b| crate::batch::batch_supported(b.kind))
+            .map(|b| b.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Err(McpError::invalid_params(
+                "no batch-capable backend is configured".to_string(),
+                None,
+            ));
+        }
+        Ok(names)
+    }
+
+    #[tool(
+        description = "Submit a batch of tool-less questions to run *offline* at max \
+            thinking, and get back a handle to poll — the async sibling of `oneshot`. \
+            Use it to fan many prompts (or one hard question you'll wait on) at a \
+            top-tier model without holding a call open per answer: the provider runs \
+            them on its cheaper batch lane and kaibo hands back the id. Each prompt is \
+            self-contained — no codebase access, no tools (batch can't drive a tool \
+            loop) — so include the context each answer needs, the same as `oneshot`. \
+            Batch maxes the knobs (forces high effort + a generous token budget) \
+            regardless of how the cast was tuned for interactive use. Runs the cast's \
+            synth model on a backend that supports batch; point `cast`/`model` at one (or \
+            get a clear refusal naming the batch-capable backends). `kaibo://config` lists \
+            the casts. Args: prompts (required, a list), cast \
+            (optional), model + backend (optional synth override — handy to batch a \
+            Pro/Opus tier a cast synths cheaper interactively). Returns a handle; poll \
+            it with `batch_get`, stop it with `batch_cancel`. This is a fire-and-forget \
+            lane: submit, then go do other work — don't sit in a wait/sleep loop holding \
+            your turn open. A batch can take minutes to hours (the provider's offline \
+            SLA is up to 24h), and the handle is durable — it survives a server restart \
+            — so come back and `batch_get` later rather than blocking on it now."
+    )]
+    async fn batch_submit(
+        &self,
+        Parameters(input): Parameters<BatchSubmitInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if input.prompts.is_empty() {
+            return Err(McpError::invalid_params(
+                "batch needs at least one prompt".to_string(),
+                None,
+            ));
+        }
+        let mut cast = self.resolve_cast(input.cast)?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            input.model.as_deref(),
+            input.backend.as_deref(),
+            "model",
+            "backend",
+        )?;
+        let (provider, backend_name, model) = self.batch_submitter(&cast)?;
+        let items: Vec<crate::batch::BatchItem> = input
+            .prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| crate::batch::BatchItem {
+                custom_id: i.to_string(),
+                prompt: p.clone(),
+            })
+            .collect();
+        // Batch is the oneshot *shape* (a capable model answering from what it was
+        // handed, no tools) but its own behavioral contract — one offline response, no
+        // follow-up, spend on depth — so it carries a distinct preamble, overridable via
+        // `[prompts].batch`. Reads no project (no map / house rules), like oneshot.
+        let system = crate::consult::batch_system_prompt(self.config.prompts.batch.as_deref());
+        let span =
+            tracing::info_span!("batch_submit", cast = %cast.name, model = %model, n = items.len());
+        let provider_id = provider
+            .submit(&system, &items)
+            .instrument(span)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        // The handle namespaces the provider id by backend, so poll/cancel re-address it
+        // without re-specifying the cast. The split is unambiguous because a *backend
+        // name* carries no '/' (enforced at config load) — so the first '/' is always the
+        // backend/id boundary, even when the provider id itself contains slashes (a Gemini
+        // id is `batches/<id>`).
+        let handle = format!("{backend_name}/{provider_id}");
+        let msg = format!(
+            "Submitted batch `{handle}` — {} prompt(s) on cast `{}` (model `{}`). \
+             Poll it with `batch_get` (it'll show progress, then per-item answers when \
+             done); stop it with `batch_cancel`.",
+            items.len(),
+            cast.name,
+            model
+        );
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "Poll a batch by the handle `batch_submit` returned. While it runs \
+            you get a progress line; once it's done you get every item's answer (each \
+            labelled by its index), with per-item failures surfaced rather than dropped. \
+            kaibo holds no state — the handle is the whole address, so this works across \
+            a server restart. Poll occasionally, not in a tight loop: if it's still \
+            pending, go do other work and check back later rather than sleeping on it — \
+            the handle keeps, so there's no rush and nothing to lose. Args: batch_id \
+            (the handle from `batch_submit`)."
+    )]
+    async fn batch_get(
+        &self,
+        Parameters(input): Parameters<BatchHandleInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let (backend_name, provider_id) = parse_batch_handle(&input.batch_id)?;
+        let provider = self.batch_poller(backend_name)?;
+        let span = tracing::info_span!("batch_get", handle = %input.batch_id);
+        let poll = provider
+            .poll(provider_id)
+            .instrument(span)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let label = format!("{backend_name} · {provider_id}");
+        Ok(CallToolResult::success(vec![Content::text(
+            crate::batch::render_poll(&poll, &label),
+        )]))
+    }
+
+    #[tool(
+        description = "Cancel a running batch by its handle. The provider stops scheduling \
+            new requests; any already in flight finish. Poll with `batch_get` afterward \
+            for the final per-item results. Args: batch_id (the handle from \
+            `batch_submit`)."
+    )]
+    async fn batch_cancel(
+        &self,
+        Parameters(input): Parameters<BatchHandleInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let (backend_name, provider_id) = parse_batch_handle(&input.batch_id)?;
+        let provider = self.batch_poller(backend_name)?;
+        let span = tracing::info_span!("batch_cancel", handle = %input.batch_id);
+        provider
+            .cancel(provider_id)
+            .instrument(span)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Requested cancellation of batch `{}`. Poll it with `batch_get` for the \
+             final per-item results.",
+            input.batch_id
+        ))]))
+    }
+
+    #[tool(
+        description = "List the batches a backend still knows about, newest first — the \
+            way back to a batch whose handle you've lost (kaibo holds no state, so the \
+            provider's own list is the source of truth). Each entry comes with its \
+            ready-to-use handle, status, and progress; feed one to `batch_get` or \
+            `batch_cancel`. Omit `backend` to list across every batch-capable backend; \
+            pass one (name or alias) to scope it. A backend that \
+            can't be reached (no key, endpoint down) is reported rather than hiding the \
+            rest, and a truncated page says so. Args: backend (optional)."
+    )]
+    async fn batch_list(
+        &self,
+        Parameters(input): Parameters<BatchListInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let backends = self.batch_backends(input.backend.as_deref())?;
+        let mut entries: Vec<(String, crate::batch::BatchListItem)> = Vec::new();
+        let mut errors: Vec<(String, String)> = Vec::new();
+        let mut truncated: Vec<String> = Vec::new();
+        for name in backends {
+            // Build the poller and list per backend, turning any failure into a
+            // per-backend note — one keyless or unreachable backend never sinks the
+            // whole listing (the per-item-failure ethos, at the backend grain).
+            let listed = match self.batch_poller(&name) {
+                Ok(provider) => {
+                    let span = tracing::info_span!("batch_list", backend = %name);
+                    provider.list().instrument(span).await
+                }
+                Err(e) => Err(anyhow::anyhow!("{}", e.message)),
+            };
+            match listed {
+                Ok((items, has_more)) => {
+                    if has_more {
+                        truncated.push(name.clone());
+                    }
+                    for it in items {
+                        let handle = format!("{}/{}", name, it.provider_id);
+                        entries.push((handle, it));
+                    }
+                }
+                Err(e) => errors.push((name, format!("{e:#}"))),
+            }
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            crate::batch::render_list(&entries, &errors, &truncated),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1423,6 +1740,7 @@ fn render_config_resource(
         oneshot: bool,
         run_kaish: bool,
         generate_image: bool,
+        batch: bool,
     }
 
     /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
@@ -1628,6 +1946,7 @@ fn render_config_resource(
         oneshot,
         run_kaish,
         generate_image,
+        batch,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -1677,6 +1996,7 @@ fn render_config_resource(
             oneshot,
             run_kaish,
             generate_image,
+            batch,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),
@@ -1803,6 +2123,26 @@ fn consult_result(answer: String, report: String, include_report: bool) -> CallT
 /// `kaibo://config`, since the answering model is the whole variable. `roles` is the
 /// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
 /// Pure and offline-testable.
+/// Split a batch handle (`"backend/provider-id"`) the way `batch_submit` minted it.
+/// Splitting on the *first* `/` is unambiguous because a backend name carries no `/`
+/// (enforced at config load) — so the provider id keeps any slashes of its own (an
+/// Anthropic id is `msgbatch_…`; a Gemini id is `batches/<id>`). A malformed handle is a
+/// loud parameter error — the caller pasted something that wasn't a kaibo batch id.
+fn parse_batch_handle(handle: &str) -> Result<(&str, &str), McpError> {
+    handle
+        .split_once('/')
+        .filter(|(b, id)| !b.is_empty() && !id.is_empty())
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "batch id {handle:?} must be \"backend/provider-id\" — pass the handle \
+                     kaibo returned from batch_submit"
+                ),
+                None,
+            )
+        })
+}
+
 fn with_provenance(answer: String, cast: &str, roles: &[(&str, &str)]) -> String {
     let models = roles
         .iter()

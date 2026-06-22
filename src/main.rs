@@ -85,6 +85,10 @@ struct Args {
     #[arg(long)]
     no_generate_image: bool,
 
+    /// Don't advertise the batch tools (`batch_submit`/`batch_get`/`batch_cancel`).
+    #[arg(long)]
+    no_batch: bool,
+
     /// Project house-rules file spliced into each consultation tool's preamble,
     /// resolved relative to the project root and read only if present. Repeatable.
     /// Defaults to AGENTS.md; passing any replaces that default. Also settable via
@@ -129,6 +133,7 @@ async fn main() -> Result<()> {
             oneshot: args.no_oneshot,
             run_kaish: args.no_run_kaish,
             generate_image: args.no_generate_image,
+            batch: args.no_batch,
         },
         args.allow_path.clone(),
         args.no_follow_worktrees,
@@ -174,7 +179,7 @@ async fn main() -> Result<()> {
     // crashing over a silently useless server.
     anyhow::ensure!(
         !config.tools.all_disabled(),
-        "all four tools are disabled — a zero-tool server does nothing. \
+        "every tool is disabled — a zero-tool server does nothing. \
          Enable at least one (drop a --no-<tool> flag or a KAIBO_NO_<TOOL> env / \
          [server.tools] entry)."
     );

@@ -184,7 +184,8 @@ The `[defaults]` knobs themselves:
 
 Four backends and four same-named single-backend casts ship **in code** and
 reproduce kaibo's historical behavior exactly, so a **missing config file is not
-an error**. The TOML *merges over* this registry by name: set one field on a
+an error**. One extra built-in cast ships too — `gemini-batch`, a Gemini cast whose
+synth is Pro, for the offline batch lane (see `batch_submit`). The TOML *merges over* this registry by name: set one field on a
 built-in to retarget it, or add brand-new backends and casts. The built-in alias
 names register at **both** levels — as cast aliases (so `cast = "claude"`
 resolves) and backend aliases (so a slot ref `claude/<id>` resolves) — and are
@@ -202,6 +203,7 @@ reserved: naming a new backend or cast after one is a loud collision error.
 | `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` |
 | `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` |
+| `gemini-batch` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-pro-latest` |
 | `openai` | `openai/Gemma-4-E4B-it-GGUF` | `openai/Gemma-4-26B-A4B-it-GGUF` |
 
 ### The chimera payoff
@@ -458,6 +460,7 @@ Prefer architectural answers; name the file:line that carries each claim.
 | `explorer` | `report_preamble` | the nested `explore′` sweep inside `consult` |
 | `consult` | `consult_preamble` | the `consult` driver |
 | `oneshot` | `oneshot_preamble` | the thin, toolless `oneshot` |
+| `batch` | `batch_preamble` | the offline, max-thinking `batch_submit` |
 
 **Full replace, by decision.** An override *is* the role framing, verbatim — kaibo
 does not re-wrap it. That's safe because the kaish operating contract (how to drive
@@ -506,6 +509,12 @@ resolves under its own key, so they stay **independently overridable**: a copy t
 keys = "this job's framing." The explorer has one job, so no ambiguity. A per-call
 model override (a bare slot) carries no `preamble` — overriding the model doesn't
 drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`.
+
+`batch_submit` runs the synth model too, but deliberately does **not** inherit the
+synth slot's `preamble`: its lane has a distinct behavioral contract (one offline
+response, no follow-up, spend on depth) that a slot preamble written for interactive
+synth would silently replace. Tune batch through `[prompts].batch` (or accept the
+built-in `batch_preamble`); the slot preamble stays scoped to the interactive phases.
 
 ## Repo orientation: `[orientation]`
 
