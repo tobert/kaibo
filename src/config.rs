@@ -1987,7 +1987,9 @@ fn expand_tilde(s: &str) -> PathBuf {
 /// surprising (crashing beats data corruption): a typo'd `$TMPDR` fails at load, not by
 /// quietly granting `/`. Env expansion runs *first* so a leading `~` in a variable's
 /// *value* is still expanded (`MYDIR=~/data; allow_paths=["$MYDIR"]` works), and so the
-/// tilde step keeps operating on an `OsString` `$HOME` (non-UTF-8 homes survive). This is
+/// tilde step still resolves `~` through an `OsString` `$HOME` — a non-UTF-8 home survives
+/// *via the `~` form* (`expand_tilde` uses `var_os`); `$HOME` spelled out goes through
+/// UTF-8 `std::env::var`, so on the rare non-UTF-8 home, write `~`. This is
 /// what lets a user write the environment-portable `allow_paths = ["$TMPDIR"]` /
 /// `["$XDG_RUNTIME_DIR/scratch"]` instead of hardcoding a host-specific `/tmp`. A bare
 /// `$` not forming a reference (followed by a non-name char) is left literal, shell-style;
@@ -2036,6 +2038,18 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
                     if nc == '}' {
                         closed = true;
                         break;
+                    }
+                    // Validate as we collect, so `${/tmp}` is a clear "invalid name"
+                    // error rather than the misleading "not set" the env lookup would
+                    // give — and so both reference forms agree on what a name is. (The
+                    // braced form *is* an explicit expansion request, so a bad name is an
+                    // error here, unlike a bare `$1` which is simply not a reference.)
+                    let ok = if name.is_empty() { is_start(nc) } else { is_continue(nc) };
+                    if !ok {
+                        bail!(
+                            "path {s:?} has an invalid character {nc:?} in a ${{...}} \
+                             reference — names are [A-Za-z_][A-Za-z0-9_]*"
+                        );
                     }
                     name.push(nc);
                 }
@@ -2107,6 +2121,10 @@ mod tests {
         assert_eq!(expand_env_vars("${HOME}/src").unwrap(), format!("{home}/src"));
         // A reference mid-path, and back-to-back text.
         assert_eq!(expand_env_vars("/x/${HOME}y").unwrap(), format!("/x/{home}y"));
+        // Adjacent references concatenate; the second `$` ends the first name and starts
+        // a new reference (`is_continue` ⊇ `is_start`, so the name loop is well-behaved).
+        assert_eq!(expand_env_vars("$HOME$HOME").unwrap(), format!("{home}{home}"));
+        assert_eq!(expand_env_vars("${HOME}${HOME}").unwrap(), format!("{home}{home}"));
     }
 
     /// An undefined variable is a loud error, not a silent empty segment — the property
@@ -2119,10 +2137,14 @@ mod tests {
         assert!(std::env::var(unset).is_err(), "test precondition: {unset} unset");
 
         for bad in [
-            format!("${unset}"),
-            format!("${{{unset}}}"),
+            format!("${unset}"),       // bare form, undefined
+            format!("${{{unset}}}"),   // braced form, undefined
             "${UNTERMINATED".to_string(),
             "${}".to_string(),
+            // The braced form is an explicit expansion request, so an invalid name is a
+            // loud parse error (not the misleading "not set" the env lookup would give).
+            "${1bad}".to_string(),     // can't start with a digit
+            "${A/B}".to_string(),      // `/` is not a name char
         ] {
             assert!(
                 expand_env_vars(&bad).is_err(),
@@ -2132,11 +2154,18 @@ mod tests {
     }
 
     /// A `$` that doesn't begin a valid reference is left literal (shell-style), and a
-    /// path with no `$` at all is untouched.
+    /// path with no `$` at all is untouched. A bare `$1` / `$$` is *not* a reference (the
+    /// next char isn't a name-start), so it passes through — only the braced `${...}` form
+    /// treats a bad name as an error.
     #[test]
     fn expand_env_vars_leaves_bare_dollar_and_plain_paths_alone() {
         assert_eq!(expand_env_vars("/a/$ b").unwrap(), "/a/$ b");
         assert_eq!(expand_env_vars("/cost/$100").unwrap(), "/cost/$100");
+        // `$$` where neither `$` is followed by a name-start char stays literal. (A `$`
+        // *is* a name-start nowhere, so `$$x` would instead try to expand `$x` — the
+        // second `$` is literal, the `x` names a var; that's deliberate, not tested here.)
+        assert_eq!(expand_env_vars("$$ ").unwrap(), "$$ ");
+        assert_eq!(expand_env_vars("trailing$").unwrap(), "trailing$");
         assert_eq!(expand_env_vars("/data/fixtures").unwrap(), "/data/fixtures");
     }
 
