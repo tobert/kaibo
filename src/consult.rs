@@ -1175,10 +1175,15 @@ where
         Message::user(user_prompt)
     } else {
         let mut parts = Vec::with_capacity(extra_parts.len() + 1);
-        parts.push(UserContent::text(user_prompt));
+        // Skip an empty text part (image-only attach with an empty prompt) — an empty
+        // `{type:text, text:""}` block is a benign but pointless chunk; the image parts
+        // are enough. `extra_parts` is non-empty here, so the message is never empty.
+        if !user_prompt.is_empty() {
+            parts.push(UserContent::text(user_prompt));
+        }
         parts.extend(extra_parts);
         Message::User {
-            content: OneOrMany::many(parts).expect("a oneshot prompt part is always present"),
+            content: OneOrMany::many(parts).expect("extra_parts is non-empty on this branch"),
         }
     };
     let mut history: Vec<Message> = Vec::new();
@@ -2194,6 +2199,50 @@ mod tests {
         let reqs = client.requests_for(MODEL);
         assert_eq!(reqs[0].user_text.trim(), "just ask", "bare prompt, no wrapper");
         assert!(!saw_image.load(Ordering::SeqCst), "no attachment, no image part");
+    }
+
+    /// An image-only attach with an empty prompt sends *just* the image part — no empty
+    /// `{type:text, text:""}` chunk. Without the guard the user turn would carry a useless
+    /// empty text part, so this counts text parts and pins it at zero.
+    #[tokio::test]
+    async fn oneshot_empty_prompt_image_only_omits_empty_text_part() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        const MODEL: &str = "synth";
+        let text_parts = Arc::new(AtomicUsize::new(usize::MAX));
+        let counter = text_parts.clone();
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |req| {
+                let n = req
+                    .chat_history
+                    .iter()
+                    .find_map(|m| match m {
+                        Message::User { content } => Some(
+                            content
+                                .iter()
+                                .filter(|c| matches!(c, UserContent::Text(_)))
+                                .count(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                counter.store(n, Ordering::SeqCst);
+                Ok(text_response("done"))
+            })
+            .build();
+        let img = Attachment::Image {
+            path: "x.png".into(),
+            mime: "image/png",
+            data_b64: "QUJD".into(),
+        };
+        oneshot("", &[img], &arm(&client, MODEL), &ConsultConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            text_parts.load(Ordering::SeqCst),
+            0,
+            "an empty prompt must not add an empty text part beside the image"
+        );
     }
 
     /// The load-bearing e2e: a scripted consult that delegates a sweep to `explore′`,

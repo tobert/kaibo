@@ -197,13 +197,15 @@ pub struct OneshotInput {
 
     /// Workspace files to inline as context for the prompt — absolute or relative paths
     /// under the allowed set (same boundary as `path` elsewhere; worktrees included).
-    /// kaibo reads each file and inlines it so its bytes never pass through your context:
-    /// say "review README.md" and attach `["README.md"]`, or `git diff > x.diff` and
-    /// attach `["x.diff"]`. The same surface as `batch_submit`'s `attach`, on the
-    /// interactive (synchronous) call. Text files splice in as text; images
-    /// (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable model). A
-    /// path outside the workspace, a directory, an oversized file, or a binary that isn't
-    /// a known image is refused with a clear error. Omit for none.
+    /// kaibo reads each file and inlines it so its bytes never pass through your context.
+    /// Prefer **whole files**: a tool-less model has no way to go read the repo itself, so
+    /// give it the full file(s) it needs — `["README.md", "src/server.rs"]` — not a snippet.
+    /// (A `git diff > changes.diff` then `["changes.diff"]` works for reviewing *uncommitted*
+    /// changes, but a diff is leaner context than the files themselves.) The same surface as
+    /// `batch_submit`'s `attach`, on the interactive (synchronous) call. Text files splice in
+    /// as text; images (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
+    /// model). A path outside the workspace, a directory, an oversized file, or a binary that
+    /// isn't a known image is refused with a clear error. Omit for none.
     #[serde(default)]
     pub attach: Vec<String>,
 
@@ -239,9 +241,12 @@ pub struct BatchSubmitInput {
     /// Workspace files to inline as shared context for *every* prompt in the batch —
     /// absolute or relative paths under the allowed set (same boundary as `path`
     /// elsewhere; worktrees included). kaibo reads each file and inlines it so its bytes
-    /// never pass through your context: say "review README.md" and attach `["README.md"]`,
-    /// or `git diff > x.diff` and attach `["x.diff"]`. Text files splice in as text;
-    /// images (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
+    /// never pass through your context. Prefer **whole files**: a tool-less model has no way
+    /// to go read the repo itself, so give it the full file(s) it needs —
+    /// `["README.md", "src/server.rs"]` — not a snippet. (A `git diff > changes.diff` then
+    /// `["changes.diff"]` works for reviewing *uncommitted* changes, but a diff is leaner
+    /// context than the files themselves.) Text files splice in as text; images
+    /// (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
     /// synth model). A path outside the workspace, a directory, an oversized file, or a
     /// binary that isn't a known image is refused with a clear error. Omit for none.
     #[serde(default)]

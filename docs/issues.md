@@ -183,6 +183,18 @@ mount-layer test to the attachment path. Deferred until the attacker model (a wo
 writable by someone other than the caller) is real, but it's *more correct* regardless, so
 likely worth doing on its own merits. Documented in `resolve_attachments`' doc-comment.
 
+### The `<file>` attachment wrapper doesn't escape its body
+`Attachment::wrapped_text` (`attach.rs`) wraps a text attachment as
+`<file path="…">{body}</file>` without escaping `body`, so a file that itself contains a
+literal `</file>` produces a malformed wrapper — the model *may* still read it as intended
+(LLMs are robust to it), but the delimiter is ambiguous. Shared by both attach surfaces
+(batch body builders + oneshot), and self-inflicted (the caller owns the workspace file),
+so low-stakes — flagged by both cross-family reviews (DeepSeek + Gemini, 2026-06-22) as a
+defense-in-depth nit, not a bug. Fix when it bites: escape the body (CDATA, or replace the
+close tag) in the one wrapper so batch and oneshot inherit it together; the `path`
+attribute is server-controlled (the caller's path string), not a second injection point of
+concern. Lower priority than a real delimiter the model is told to trust.
+
 ### Review the provider retry + failure policy (and document it)
 We don't have a stated, audited answer for what a `consult`/`oneshot`
 call does when a provider misbehaves mid-flight: a 429/529 overload, a connection
