@@ -267,27 +267,6 @@ in the module doc and `docs/devlog.md`. What's left:
   proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
   is ever confirmed by probe for a batch backend, lift it there — the constant is the
   one knob to change.
-- **Attachments on `oneshot` — bring it as close to `batch` as the API split allows
-  (in progress).** `batch_submit` takes `attach: [paths]` — workspace files (text spliced
-  inline, images as native base64 parts) read + containment-checked server-side so the
-  bytes never transit the calling agent's context (`src/attach.rs`,
-  `server.rs::resolve_attachments`, the shared `contained`/`containment_error` the
-  session-root check also uses). `oneshot` is the same shape — a tool-less prompt to a
-  capable model, caller owns the context — minus the offline/async lane, so it *should*
-  share the cast resolution and the `Attachment`/`classify` seam wholesale; the only real
-  difference is the wire (interactive vs. provider batch). Two ways to factor that, decide
-  when we build it:
-  - **`oneshot` grows `attach` against rig.** It already runs through rig, so reuse
-    `resolve_attachments` + `classify`, then map each `Attachment` onto a rig
-    `Message`/`UserContent` (text part + image part) instead of a provider-JSON part.
-    `Attachment::wrapped_text` keeps the `<file>` wrapper identical to batch; the
-    image branch is the new plumbing (rig multimodal message, not the hand-rolled JSON
-    `anthropic_content`/`gemini_parts`). The win Amy named: "call Claude Opus in a single
-    shot with some files, no tools, no wait."
-  - **A `batch`-shaped seam with an *interactive* impl back to rig.** Make the
-    `BatchProvider`-style abstraction carry an "interactive" variant that calls rig's
-    sync completion instead of a provider batch endpoint, so one submit path serves both
-    lanes. Heavier; only worth it if a third lane appears. Default to the first.
 - **`FileRef` / Gemini File API for *batch* is bigger than "a variant beside `Image`"
   — and may be the wrong shape.** Re-scoped after checking gpal + Google's docs (2026-06-22):
   - **gpal's batch is inline-only** (`create_batch` → `InlinedRequest(contents=prompt)`,

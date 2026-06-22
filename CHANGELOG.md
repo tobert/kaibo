@@ -26,7 +26,11 @@ the git log. Each later release appends a new section at the top.
   prompt in, answer out, no codebase access and no tools, exactly one upstream
   request. The counterpart to `consult` for when you already own the context (you've
   pasted what's needed, or the question is general). Pick the model with `cast`; the
-  answer carries the same provenance footer.
+  answer carries the same provenance footer. Takes the same **`attach`** as
+  `batch_submit` — name workspace files ("review README.md", or `git diff > x.diff`
+  then `attach: ["x.diff"]`) and kaibo inlines them (text as text, images as native
+  image parts on a vision-capable model) so their bytes never pass through your context.
+  So "call Opus once with these files, no tools, no waiting" is a single call.
 - **`run_kaish`** — drive the read-only kaish shell yourself, no model in the loop:
   exit code + stdout + stderr.
 - **`generate_image`** — kaibo's first *capability* (an artifact handed back to the

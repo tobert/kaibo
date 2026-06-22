@@ -195,6 +195,18 @@ pub struct OneshotInput {
     /// the model answers from this and its own knowledge, nothing else.
     pub prompt: String,
 
+    /// Workspace files to inline as context for the prompt — absolute or relative paths
+    /// under the allowed set (same boundary as `path` elsewhere; worktrees included).
+    /// kaibo reads each file and inlines it so its bytes never pass through your context:
+    /// say "review README.md" and attach `["README.md"]`, or `git diff > x.diff` and
+    /// attach `["x.diff"]`. The same surface as `batch_submit`'s `attach`, on the
+    /// interactive (synchronous) call. Text files splice in as text; images
+    /// (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable model). A
+    /// path outside the workspace, a directory, an oversized file, or a binary that isn't
+    /// a known image is refused with a clear error. Omit for none.
+    #[serde(default)]
+    pub attach: Vec<String>,
+
     /// Which cast (model team) runs this call; omit for the server's default. Pick
     /// from this param's `enum` — the casts live right now; `kaibo://config` lists
     /// every configured cast and backend, with their aliases. kaibo runs the cast's
@@ -631,6 +643,36 @@ impl KaiboHandler {
             ),
             None,
         )
+    }
+
+    /// Refuse image attachments to a vision-blind model, naming the cast so the caller
+    /// can pick a vision-capable one. Shared by the tool-less attach surfaces (`batch` and
+    /// `oneshot`) so the refusal reads identically and lives in one place; a blind model
+    /// would silently ignore or error on an image part, so we refuse honestly up front
+    /// (the project posture) rather than ship a no-op image. Text-only attachments (and
+    /// the no-attachment case) always pass.
+    pub fn gate_image_attachments(
+        &self,
+        vision: bool,
+        attachments: &[crate::attach::Attachment],
+        model: &str,
+        cast: &str,
+    ) -> Result<(), McpError> {
+        if !vision
+            && attachments
+                .iter()
+                .any(|a| matches!(a, crate::attach::Attachment::Image { .. }))
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "an image attachment was given, but the model `{model}` on cast `{cast}` \
+                     doesn't accept image input. Use a vision-capable cast/model, or attach \
+                     only text files. `kaibo://config` lists each slot's `vision`."
+                ),
+                None,
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve caller-named attachment paths into [`Attachment`](crate::attach::Attachment)s,
@@ -1073,6 +1115,11 @@ impl KaiboHandler {
             "backend",
         )?;
         let arm = self.arm(&cast, ModelRole::Synth)?;
+        // Read + containment-check the attachments (same boundary as a session root); the
+        // bytes are inlined server-side so they never transit the calling agent's context.
+        let attachments = self.resolve_attachments(&input.attach)?;
+        // Gate image attachments on the model's vision capability (shared with batch).
+        self.gate_image_attachments(arm.caps.vision, &attachments, &arm.model, &cast.name)?;
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         let cfg = ConsultConfig {
@@ -1088,7 +1135,7 @@ impl KaiboHandler {
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
-        let answer = oneshot(&input.prompt, &arm, &cfg)
+        let answer = oneshot(&input.prompt, &attachments, &arm, &cfg)
             .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
@@ -1325,25 +1372,9 @@ impl KaiboHandler {
         // bad path is a clean refusal, not a half-submitted batch. The bytes are inlined
         // server-side so they never transit the calling agent's context.
         let attachments = self.resolve_attachments(&input.attach)?;
-        // Gate image attachments on the synth model's vision capability — a blind model
-        // would silently ignore (or error on) an image part, so refuse honestly up front
-        // (the project posture), naming the cast so the caller can pick a vision one. This
-        // runs before the provider is built, so a vision misconfig needs no key to report.
-        if !caps.vision
-            && attachments
-                .iter()
-                .any(|a| matches!(a, crate::attach::Attachment::Image { .. }))
-        {
-            return Err(McpError::invalid_params(
-                format!(
-                    "an image attachment was given, but the synth model `{model}` on cast \
-                     `{}` doesn't accept image input. Use a vision-capable cast/model, or \
-                     attach only text files. `kaibo://config` lists each slot's `vision`.",
-                    cast.name
-                ),
-                None,
-            ));
-        }
+        // Gate image attachments on the synth model's vision capability before the
+        // provider is built — so a vision misconfig needs no key to report.
+        self.gate_image_attachments(caps.vision, &attachments, &model, &cast.name)?;
         // Now build the network client (resolves the key); a batch-incapable backend is
         // refused honestly here.
         let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
