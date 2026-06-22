@@ -200,9 +200,12 @@ pub struct OneshotInput {
     /// kaibo reads each file and inlines it so its bytes never pass through your context.
     /// Prefer **whole files**: a tool-less model has no way to go read the repo itself, so
     /// give it the full file(s) it needs — `["README.md", "src/server.rs"]` — not a snippet.
-    /// (A `git diff > changes.diff` then `["changes.diff"]` works for reviewing *uncommitted*
-    /// changes, but a diff is leaner context than the files themselves.) The same surface as
-    /// `batch_submit`'s `attach`, on the interactive (synchronous) call. Text files splice in
+    /// Top-tier models carry very large context windows (1M+ tokens), so don't be stingy —
+    /// attach whole files, even several, rather than trimming; it has plenty of room to work
+    /// with the full source. (A `git diff > changes.diff` then `["changes.diff"]` works for
+    /// reviewing *uncommitted* changes, but a diff is leaner context than the files
+    /// themselves.) The same surface as `batch_submit`'s `attach`, on the interactive
+    /// (synchronous) call. Text files splice in
     /// as text; images (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
     /// model). A path outside the workspace, a directory, an oversized file, or a binary that
     /// isn't a known image is refused with a clear error. Omit for none.
@@ -243,9 +246,11 @@ pub struct BatchSubmitInput {
     /// elsewhere; worktrees included). kaibo reads each file and inlines it so its bytes
     /// never pass through your context. Prefer **whole files**: a tool-less model has no way
     /// to go read the repo itself, so give it the full file(s) it needs —
-    /// `["README.md", "src/server.rs"]` — not a snippet. (A `git diff > changes.diff` then
-    /// `["changes.diff"]` works for reviewing *uncommitted* changes, but a diff is leaner
-    /// context than the files themselves.) Text files splice in as text; images
+    /// `["README.md", "src/server.rs"]` — not a snippet. Top-tier models carry very large
+    /// context windows (1M+ tokens), so don't be stingy — attach whole files, even several,
+    /// rather than trimming. (A `git diff > changes.diff` then `["changes.diff"]` works for
+    /// reviewing *uncommitted* changes, but a diff is leaner context than the files
+    /// themselves.) Text files splice in as text; images
     /// (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
     /// synth model). A path outside the workspace, a directory, an oversized file, or a
     /// binary that isn't a known image is refused with a clear error. Omit for none.
