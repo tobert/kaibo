@@ -571,8 +571,7 @@ trait PhaseRunner: Send + Sync {
         &'a self,
         preamble: &'a str,
         max_tokens: u64,
-        user_prompt: String,
-        extra_parts: Vec<UserContent>,
+        initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
@@ -596,8 +595,7 @@ where
         &'a self,
         preamble: &'a str,
         max_tokens: u64,
-        user_prompt: String,
-        extra_parts: Vec<UserContent>,
+        initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
@@ -609,8 +607,7 @@ where
             &self.model,
             preamble,
             max_tokens,
-            user_prompt,
-            extra_parts,
+            initial_prompt,
             max_turns,
             params,
             progress,
@@ -796,8 +793,7 @@ impl Arm {
     pub(crate) async fn run(
         &self,
         preamble: &str,
-        user_prompt: String,
-        extra_parts: Vec<UserContent>,
+        initial_prompt: Message,
         max_turns: usize,
         progress: &dyn ProgressSink,
         make_tools: ToolFactory<'_>,
@@ -806,8 +802,7 @@ impl Arm {
             .run_phase(
                 preamble,
                 self.max_tokens,
-                user_prompt,
-                extra_parts,
+                initial_prompt,
                 max_turns,
                 self.params.as_ref(),
                 progress,
@@ -1150,8 +1145,7 @@ pub(crate) async fn run_phase<C, F>(
     model: &str,
     preamble: &str,
     max_tokens: u64,
-    user_prompt: String,
-    extra_parts: Vec<UserContent>,
+    initial_prompt: Message,
     max_turns: usize,
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
@@ -1163,29 +1157,13 @@ where
     C::CompletionModel: 'static,
     F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
 {
-    // Loop state across view_image-break resumes. The first pass is the bare prompt
-    // with no history — byte-for-byte the old single call. Each break rewrites the
-    // transcript (image onto the user-turn channel) and re-enters here.
-    //
-    // `extra_parts` are caller-supplied attachment parts (oneshot's inlined images) that
-    // ride on the *initial* user turn beside the text prompt — context first, prompt
-    // text last. Empty for every other phase, so their initial message stays exactly
-    // `Message::user(prompt)`, byte-for-byte unchanged.
-    let mut prompt: Message = if extra_parts.is_empty() {
-        Message::user(user_prompt)
-    } else {
-        let mut parts = Vec::with_capacity(extra_parts.len() + 1);
-        // Skip an empty text part (image-only attach with an empty prompt) — an empty
-        // `{type:text, text:""}` block is a benign but pointless chunk; the image parts
-        // are enough. `extra_parts` is non-empty here, so the message is never empty.
-        if !user_prompt.is_empty() {
-            parts.push(UserContent::text(user_prompt));
-        }
-        parts.extend(extra_parts);
-        Message::User {
-            content: OneOrMany::many(parts).expect("extra_parts is non-empty on this branch"),
-        }
-    };
+    // Loop state across view_image-break resumes. The caller hands us the *assembled*
+    // first user turn — a bare `Message::user(prompt)` for every tool-driven phase, or a
+    // multi-part turn (oneshot's inlined attachment images beside the text) built in
+    // `oneshot`. Keeping the assembly in the caller keeps this engine free of multimodal
+    // concerns: it just runs whatever turn it's given, then each view_image break rewrites
+    // the transcript and re-enters here (holistic review, Gemini Pro 2026-06-22).
+    let mut prompt: Message = initial_prompt;
     let mut history: Vec<Message> = Vec::new();
 
     loop {
@@ -1429,8 +1407,7 @@ impl Tool for RunExplore {
             .arm
             .run(
                 &self.preamble,
-                args.question,
-                Vec::new(),
+                Message::user(args.question),
                 self.max_turns,
                 self.progress.as_ref(),
                 &|| -> Result<Vec<Box<dyn ToolDyn>>> {
@@ -1549,10 +1526,25 @@ pub async fn oneshot(
             Attachment::Text { .. } => None,
         })
         .collect();
+    // Assemble the single user turn here — multimodal awareness lives in oneshot, not the
+    // shared loop. No images → a bare `Message::user` (byte-for-byte the old call). With
+    // images, the text rides as the first part (skipped when empty — image-only with an
+    // empty prompt shouldn't emit a pointless `{type:text,text:""}` block), then the images.
+    let initial_prompt = if image_parts.is_empty() {
+        Message::user(user_prompt)
+    } else {
+        let mut parts = Vec::with_capacity(image_parts.len() + 1);
+        if !user_prompt.is_empty() {
+            parts.push(UserContent::text(user_prompt));
+        }
+        parts.extend(image_parts);
+        Message::User {
+            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
+        }
+    };
     arm.run(
         &phase_preamble(cfg.prompts.oneshot.as_deref(), oneshot_preamble, None, None),
-        user_prompt,
-        image_parts,
+        initial_prompt,
         1,
         cfg.progress.as_ref(),
         &|| Ok(Vec::new()),
@@ -1719,8 +1711,7 @@ pub(crate) async fn consult_with(
                 cfg.orientation.as_deref(),
                 cfg.house_rules.as_deref(),
             ),
-            user_prompt.to_string(),
-            Vec::new(),
+            Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
             cfg.progress.as_ref(),
             // Rebuilt per call (main loop, and again if run_phase forces a final
