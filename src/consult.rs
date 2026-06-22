@@ -383,6 +383,40 @@ impl ModelShape {
         }
     }
 
+    /// Does this shape have a sink for a `thinking_budget` tunable? Only the two
+    /// explicit-budget styles emit it (`budget_tokens` / `thinkingBudget`); the
+    /// effort-driven styles (Anthropic adaptive, the Gemini 3-line, DeepSeek) and the
+    /// toggle-less openai path ignore a budget entirely. Lets the `kaibo://config`
+    /// render flag a per-slot `thinking_budget` that will never leave the process.
+    pub fn sinks_thinking_budget(&self) -> bool {
+        matches!(
+            self.thinking,
+            ThinkingStyle::AnthropicBudget | ThinkingStyle::GeminiBudget
+        )
+    }
+
+    /// Does this shape have a sink for an `effort` tunable? Only the effort-driven
+    /// styles route it (`output_config.effort` / `thinkingLevel` / `reasoning_effort`);
+    /// the budget styles and the openai path drop it. Counterpart to
+    /// [`sinks_thinking_budget`](Self::sinks_thinking_budget) for the render's no-op flag.
+    pub fn sinks_effort(&self) -> bool {
+        matches!(
+            self.thinking,
+            ThinkingStyle::AnthropicAdaptive
+                | ThinkingStyle::GeminiLevel
+                | ThinkingStyle::DeepSeekEffort
+        )
+    }
+
+    /// Does this shape actually send sampling (`temperature`/`top_p`)? Kaibo runs
+    /// thinking on by default, and a model that rejects sampling under thinking
+    /// (Anthropic, any tier) has it dropped — so a per-slot `temperature` there is
+    /// inert. The toggle-less openai path (`thinking == None`) keeps sampling, as do
+    /// Gemini/DeepSeek. Mirrors the drop in [`to_params`](Self::to_params).
+    pub fn sinks_sampling(&self) -> bool {
+        self.thinking == ThinkingStyle::None || self.sampling_under_thinking
+    }
+
     /// Just the thinking block (no sampling), with the default effort — the body of the
     /// [`thinking_params`] wrapper.
     fn thinking_only(&self, budget: u64) -> Option<Value> {

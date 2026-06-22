@@ -218,16 +218,6 @@ for now, but a busy server rebuilds kernels constantly. Consider a small worker
 pool, or resetting one kernel's cwd between phases instead of rebuilding. Measure
 before optimizing.
 
-### Flaky tracing-capture tests in `tool_span.rs`
-`emits_an_error_outcome_when_the_tool_fails` (and its `ok` sibling) fail ~25% of
-the time in the *parallel* full `cargo test` run, never in isolation. Both register
-a `tracing_subscriber::registry().with(cap)` via `set_default` and assert on captured
-spans; run concurrently on cargo's test threads they race on tracing's process-global
-span store, so one test's `tool` span can go missing from the other's capture. A test
-that fails when we *didn't* make a mistake is the opposite of the teeth we want. Fix:
-serialize the two (a shared `Mutex`/`serial_test`), or capture per-span without leaning
-on global dispatch. Out of scope when found (the read-idioms/output-cap PR).
-
 ### Batch — remaining providers and the many-casts fork
 The batch tool class shipped Anthropic- and Gemini-first (`src/batch.rs`,
 `batch_submit`/`batch_get`/`batch_cancel`/`batch_list`, one `--no-batch` gate): offline,
@@ -249,7 +239,10 @@ in the module doc and `docs/devlog.md`. What's left:
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
 (shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
-DeepSeek ?, local `openai` ✗.
+DeepSeek ✗ (confirmed 2026-06-22 against the official API reference — no batch endpoint;
+its routes are chat/completions/models only, and its cost-saving lane is off-peak
+discount pricing, not a batch API; third-party batch like Novita/Together/Bedrock wraps
+the model, out of reach of the keyed `deepseek` backend), local `openai` ✗.
 
 ### Batch design hardening (cross-model Opus review, 2026-06-22)
 A cross-family review of the batch slice (Opus 4.8, run *through* `batch_submit` itself
@@ -348,17 +341,6 @@ tunables — if a provider caps output low, cap that slot, not the global, per t
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
 
-### Tunables with no sink are accepted (and rendered) silently
-A slot whose resolved `ModelShape` has no sink for a knob still accepts it,
-load-validates it, and renders it at `kaibo://config` as if effective:
-`thinking_budget` on a Gemini 3-line slot (the level line never sends a budget,
-yet the `< max_tokens` inversion check still applies to it), and
-`effort`/`thinking_budget` on an openai-kind slot (`ThinkingStyle::None` sends
-neither). The effort half of this was fixed for the 3-line (it now maps onto
-`thinkingLevel`); the rest is invisible-no-op residue. Fix shape: at load (or in
-the render), flag per-slot tunables the slot's resolved shape will never send —
-a note in the render is enough to make the no-op visible to the operator.
-
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
 `ExplorationTrace`), the curiosity + completeness behaviors, and the assertive
@@ -374,15 +356,6 @@ built-in reproduces it with no per-cast config. Still open, lower value:
 - **Debug affordance:** dump the *assembled* preamble (built-in/override + house rules)
   to a file, à la gemini-cli's `GEMINI_WRITE_SYSTEM_MD` — useful now that prompts
   compose per model from `[prompts]`, slot `preamble`, and `[context]`.
-
-### `generate_image` doesn't advertise its cast `enum`
-The consultation tools stamp the usable-cast roster onto their `cast` param as a
-JSON-Schema enum (`inject_cast_enum`, `server.rs`); `generate_image` doesn't. Its
-`cast` selects the **`image`** slot (openai-kind only), so the right menu is a
-different filter — "casts with a usable image slot", not the explorer/synth
-`usable_casts` — i.e. a `Config::image_capable_casts` to write. Add it so image gen
-is as discoverable as consultation. Advisory like the others (serde ignores the enum
-in `call_tool`), so it never rejects a config-only cast.
 
 ### Server doesn't validate backend health at startup
 Usable *casts* are now advertised — the handshake `## Casts` list and the `cast`

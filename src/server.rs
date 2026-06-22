@@ -29,7 +29,7 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, oneshot, Arm, ConsultConfig, PromptOverrides};
+use crate::consult::{consult, oneshot, Arm, ConsultConfig, ModelShape, PromptOverrides};
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
 use crate::image_gen::ImageGen;
@@ -329,7 +329,7 @@ pub struct KaiboHandler {
 /// reach a model), because an empty `enum` reads as "no valid value" to a strict
 /// client and would wrongly forbid the field, which is optional. A gated-off tool
 /// is already absent from `router`, so the lookups simply skip it.
-fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, casts: &[String]) {
+fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, tools: &[&str], casts: &[String]) {
     if casts.is_empty() {
         return;
     }
@@ -337,8 +337,8 @@ fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, casts: &[String]) {
         .iter()
         .map(|c| serde_json::Value::String(c.clone()))
         .collect();
-    for name in ["consult", "oneshot"] {
-        let Some(route) = router.map.get_mut(name) else {
+    for name in tools {
+        let Some(route) = router.map.get_mut(*name) else {
             continue;
         };
         let mut schema = (*route.attr.input_schema).clone();
@@ -462,7 +462,12 @@ impl KaiboHandler {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        inject_cast_enum(&mut tool_router, &usable);
+        inject_cast_enum(&mut tool_router, &["consult", "oneshot"], &usable);
+        // `generate_image` selects the `image` slot, not explorer/synth, so its menu is
+        // a different filter — casts with a usable image slot, not `usable_casts`. Same
+        // advisory enum so image gen is as discoverable as consultation.
+        let image_casts = config.image_capable_casts(|k| std::env::var(k).ok());
+        inject_cast_enum(&mut tool_router, &["generate_image"], &image_casts);
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
         Ok(Self {
@@ -1857,6 +1862,13 @@ fn render_config_resource(
         /// operator's own framing). Absent when unset.
         #[serde(skip_serializing_if = "Option::is_none")]
         preamble: Option<String>,
+        /// Per-slot tunables that *are* set here but this slot's resolved request shape
+        /// will never send — the honest no-op flag. A `thinking_budget` on an
+        /// effort-driven or toggle-less model, an `effort` on a budget model, a
+        /// `temperature` an Anthropic slot drops under thinking: each load-validates and
+        /// would otherwise render as if effective. Absent when every set knob has a sink.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        inert_tunables: Vec<&'static str>,
     }
 
     /// A cast's role table, keyed by role. Only configured roles appear.
@@ -1919,6 +1931,25 @@ fn render_config_resource(
                     let caps = config
                         .slot_caps(slot)
                         .expect("a loaded cast's slot backend resolves");
+                    // Resolve the slot's request shape so we can flag tunables it will
+                    // never send (e.g. a budget on an effort-driven model) — making the
+                    // invisible no-op visible rather than rendering it as if effective.
+                    let kind = config
+                        .resolve_backend(&slot.backend)
+                        .expect("a loaded cast's slot backend resolves")
+                        .kind;
+                    let shape =
+                        ModelShape::resolve(kind, &slot.id, thinking_style.unwrap_or_default());
+                    let mut inert_tunables = Vec::new();
+                    if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
+                        inert_tunables.push("thinking_budget");
+                    }
+                    if effort.is_some() && !shape.sinks_effort() {
+                        inert_tunables.push("effort");
+                    }
+                    if temperature.is_some() && !shape.sinks_sampling() {
+                        inert_tunables.push("temperature");
+                    }
                     (
                         role.key(),
                         SlotDoc {
@@ -1930,6 +1961,7 @@ fn render_config_resource(
                             effort: effort.clone(),
                             thinking_style: thinking_style.map(|s| format!("{s:?}").to_lowercase()),
                             preamble: preamble.clone(),
+                            inert_tunables,
                         },
                     )
                 })
@@ -2281,6 +2313,52 @@ mod tests {
         }
     }
 
+    /// `generate_image` advertises its own, *differently-filtered* roster: casts with a
+    /// usable `image` slot on an openai backend — not the explorer/synth `usable_casts`.
+    /// So a config-only cast that carries an openai `image` slot shows up, while a cast
+    /// with no image slot (or one on a non-openai backend) does not.
+    #[test]
+    fn generate_image_advertises_image_capable_casts_only() {
+        let h = handler_from_toml(
+            r#"
+            # An openai `image` slot on the keyless local backend → image-capable.
+            [casts.art]
+            image = { backend = "openai", id = "sd-xl" }
+
+            # An `image` slot on a non-openai backend → rig has no path → excluded.
+            [casts.wrongkind]
+            image = { backend = "anthropic", id = "imagen-ish" }
+            "#,
+        );
+        let schema = h
+            .tool_router
+            .get("generate_image")
+            .expect("generate_image advertised")
+            .input_schema
+            .clone();
+        let variants: Vec<&str> = schema
+            .get("properties")
+            .and_then(|p| p.get("cast"))
+            .and_then(|c| c.get("enum"))
+            .and_then(|e| e.as_array())
+            .unwrap_or_else(|| panic!("generate_image cast param should carry an enum:\n{schema:#?}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            variants.contains(&"art"),
+            "the openai image cast should be listed, got {variants:?}"
+        );
+        assert!(
+            !variants.contains(&"wrongkind"),
+            "a non-openai image cast has no rig path and must not be listed: {variants:?}"
+        );
+        assert!(
+            !variants.contains(&"openai"),
+            "the builtin `openai` cast has no image slot and must not be listed: {variants:?}"
+        );
+    }
+
     /// An empty roster (no cast can reach a model) leaves `cast` enum-free: an empty
     /// `enum` would read as "no valid value" and wrongly forbid the optional field.
     /// `inject_cast_enum` is the seam — driving it with `[]` keeps the test honest
@@ -2288,7 +2366,7 @@ mod tests {
     #[test]
     fn empty_cast_roster_leaves_the_param_unconstrained() {
         let mut router = KaiboHandler::tool_router();
-        inject_cast_enum(&mut router, &[]);
+        inject_cast_enum(&mut router, &["consult", "oneshot"], &[]);
         let schema = router
             .get("consult")
             .expect("tool present")
@@ -2866,6 +2944,72 @@ mod tests {
         assert!(
             body.contains("/tmp/the-repo-feature"),
             "runtime section must list the followed worktree:\n{body}"
+        );
+    }
+
+    /// A per-slot tunable that the slot's resolved request shape will never send is
+    /// flagged `inert_tunables` in the render, so the operator sees the no-op instead of
+    /// a knob that looks effective. The matrix: a budget on an effort-driven model
+    /// (Gemini 3-line, Anthropic adaptive) or the toggle-less openai path; an effort on
+    /// a budget model; a temperature an Anthropic slot drops under thinking. A knob that
+    /// *does* have a sink is never flagged.
+    #[test]
+    fn config_render_flags_inert_per_slot_tunables() {
+        let config = Config::from_toml_str(
+            r#"
+            # Gemini 3-line: takes thinkingLevel (effort), no budget.
+            [casts.gem]
+            explorer = { backend = "gemini", id = "gemini-3-pro", thinking_budget = 4096, effort = "low" }
+
+            # openai (toggle-less): sends neither effort nor budget; keeps sampling.
+            [casts.oai]
+            synth = { backend = "openai", id = "gemma-local", thinking_budget = 8192, effort = "high", temperature = 0.7 }
+
+            # Anthropic budget tier: takes budget_tokens, no effort; drops sampling under thinking.
+            [casts.ant_budget]
+            explorer = { backend = "anthropic", id = "claude-haiku-4-5", effort = "high", temperature = 0.5 }
+
+            # Anthropic adaptive: takes output_config.effort, no budget.
+            [casts.ant_adaptive]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", effort = "high", thinking_budget = 2048 }
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![]);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let inert = |cast: &str, role: &str| -> Vec<String> {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .map(|a| {
+                    a.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            inert("gem", "explorer"),
+            vec!["thinking_budget"],
+            "Gemini 3-line sinks effort (thinkingLevel) but not a budget"
+        );
+        assert_eq!(
+            inert("oai", "synth"),
+            vec!["thinking_budget", "effort"],
+            "openai sends neither thinking knob; temperature it does send"
+        );
+        assert_eq!(
+            inert("ant_budget", "explorer"),
+            vec!["effort", "temperature"],
+            "budget tier ignores effort; Anthropic drops sampling under thinking"
+        );
+        assert_eq!(
+            inert("ant_adaptive", "synth"),
+            vec!["thinking_budget"],
+            "adaptive sinks effort but rejects a budget"
         );
     }
 

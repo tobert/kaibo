@@ -14,6 +14,68 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — two honesty/discoverability fixes: image cast enum + inert-tunable flag
+
+Both came off the P3 list; both are about not lying to the caller by omission.
+
+**`generate_image` now advertises its cast enum.** The consultation tools stamp the
+usable-cast roster onto their `cast` param as a JSON-Schema enum so an agent reads the
+menu off the schema, but image gen didn't — its menu is a *different* filter, since it
+selects the `image` slot, not explorer/synth. Wrote `Config::image_capable_casts`
+(casts with an `image` slot on an openai backend whose key resolves — the only kind rig
+0.38 drives for images) and generalized `inject_cast_enum` to take the tool list, so
+the same advisory-enum machinery now serves both groups. Deliberately a *separate*
+filter from `usable_casts`: a cast with a stranded explorer key but a working image
+slot belongs on the image menu and not the consult menu, and vice versa.
+
+**`kaibo://config` flags inert per-slot tunables.** A slot whose resolved `ModelShape`
+has no sink for a knob still load-validated it and rendered it as if effective — a
+`thinking_budget` on an effort-driven model (Gemini 3-line, Anthropic adaptive) or the
+toggle-less openai path, an `effort` on a budget model, a `temperature` an Anthropic
+slot drops under thinking. Added three predicates to `ModelShape`
+(`sinks_thinking_budget` / `sinks_effort` / `sinks_sampling`) as the single source of
+truth — they mirror `write_thinking`/`to_params` exactly — and the render now lists any
+set-but-unsent knob as `inert_tunables`. Chose render-time flagging over a load-time
+warning: the same knob is live or inert depending on the model id it lands on, so the
+resolved view is where the truth is, and a `[defaults]` value that's inert for one slot
+but live for another shouldn't warn globally. Didn't *reject* inert knobs — they're
+valid config that simply doesn't apply to this model, and a slot may keep one for when
+its model id changes; surfacing beats forbidding.
+
+## 2026-06-22 — kill the `tool_span.rs` capture flake (root cause, not symptom)
+
+The two span-capturing tests in `tool_span.rs` failed ~5% of full-suite runs (the
+issue guessed ~25%), never in isolation — a test failing when we *didn't* make a
+mistake, the opposite of teeth. The issue's two guesses (serialize the pair; race on
+a "process-global span store") were both off the real mark. We traced it instead of
+guessing, and the contributing factors turned out to be one specific tracing
+fast-path:
+
+`info_span!("tool")` registers its callsite **lazily**, on first hit. While tracing's
+`has_just_one` optimization holds — true whenever ≤1 dispatcher is registered, which
+is *exactly* our case since each test installs a single subscriber via `set_default` —
+that first registration computes the callsite's `Interest` from **the registering
+thread's current default**, not from the test's installed subscriber. This binary is
+full of `consult`-loop tests that run the real tool loop with *no* subscriber. When
+one of them won the race to first-touch the `tool` callsite during a capture test's
+window, it cached `Interest::never()` against `NoSubscriber`, gating the span off
+process-wide → an empty capture. So serializing the two capture tests can't fix it:
+the poisoning thread is a *third* test with no subscriber at all.
+
+The fix matches the cause. We hold one extra registered dispatcher alive for the whole
+process (`force_multi_dispatcher`, a leaked `Dispatch::new(registry())`), forcing
+`has_just_one` false so every callsite registration consults the *registered-dispatcher
+set* — which contains a span-enabling registry — regardless of which thread triggers
+it. It is never any thread's default, so it receives no events; it exists only to keep
+the registration path honest. We kept a serialization `Mutex` over the two tests too
+(belt and suspenders against their `set_default` installs/teardowns interleaving), and
+moved them off `#[tokio::test]` onto a private current-thread runtime via `block_on`,
+so the ordering guard isn't held across an `.await` and the future polls on the same
+thread whose `set_default` is in scope. Proven: 0 failures in 150 full-suite runs
+(was ~5%), and both tests still fail under deliberate mutation of the span name and
+the outcome field. Rejected the symptom-level "just serialize" because it left the
+~1% consult-thread poisoning window open — measured, didn't assume.
+
 ## 2026-06-22 — batch: Gemini provider (second backend behind the seam)
 
 Added the second `BatchProvider` impl — Gemini inline batch — so the offline lane reaches
