@@ -152,6 +152,22 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
+### Path containment is check-then-open (a narrow TOCTOU)
+Both `resolve_root` and `resolve_attachments` (`server.rs`) check containment on the
+*canonical* path and then open/read it as a separate step — a classic check-then-open
+window. A concurrent writer could swap the canonical path for an outside-pointing symlink
+between the `contained` check and the read, escaping the boundary. Surfaced by the
+cross-family review of the batch `attach` feature (DeepSeek, 2026-06-22), which judged the
+boundary otherwise sound. The attacker model keeps it narrow: kaibo cannot write the
+workspace, so the race needs a concurrent writer to the very tree the calling agent owns
+(a self-attack), inside a sub-millisecond window. `resolve_root` is the less-exposed of
+the two — it hands the canonical path to the kaish kernel, which opens a directory fd and
+works through it — while the attachment path reads a file one-shot and discards the fd.
+Structural fix when justified: open `O_NOFOLLOW`, `fstat` the fd, re-check containment via
+`/proc/self/fd/N`, then read from the already-open fd. Deferred until the attacker model
+(a workspace writable by someone other than the caller) is real; documented in
+`resolve_attachments`' doc-comment so it isn't rediscovered.
+
 ### Review the provider retry + failure policy (and document it)
 We don't have a stated, audited answer for what a `consult`/`oneshot`
 call does when a provider misbehaves mid-flight: a 429/529 overload, a connection

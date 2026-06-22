@@ -645,6 +645,15 @@ impl KaiboHandler {
     /// attachment the caller named but we dropped would be a corrupt answer. An absolute
     /// size ceiling is enforced *before* reading (via the file's metadata) so a giant
     /// file is refused without first slurping it into memory.
+    ///
+    /// Containment is checked on the *canonical* path, then the read follows — a
+    /// check-then-open TOCTOU window, the same class `resolve_root` carries (and tracked
+    /// in `docs/issues.md`). The attacker model makes it narrow: kaibo cannot write the
+    /// workspace, so swapping the canonical path for an outside-pointing symlink in the
+    /// sub-millisecond window needs a *concurrent* writer to the very workspace the
+    /// calling agent owns — a self-attack. Closing it structurally (open `O_NOFOLLOW`,
+    /// `fstat` the fd, contain via `/proc/self/fd`, read from the fd) is deferred until
+    /// the attacker model justifies it.
     pub fn resolve_attachments(
         &self,
         paths: &[String],
