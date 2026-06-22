@@ -1991,17 +1991,47 @@ fn expand_tilde(s: &str) -> PathBuf {
 /// *via the `~` form* (`expand_tilde` uses `var_os`); `$HOME` spelled out goes through
 /// UTF-8 `std::env::var`, so on the rare non-UTF-8 home, write `~`. This is
 /// what lets a user write the environment-portable `allow_paths = ["$TMPDIR"]` /
-/// `["$XDG_RUNTIME_DIR/scratch"]` instead of hardcoding a host-specific `/tmp`. A bare
-/// `$` not forming a reference (followed by a non-name char) is left literal, shell-style;
-/// a path that genuinely contains `$name` would be read as a reference — an accepted,
-/// documented limitation (no escaping yet).
+/// `["$XDG_RUNTIME_DIR/scratch"]` instead of hardcoding a host-specific `/tmp`. `$$` writes
+/// a literal `$`; a stray `$` that begins no reference is a loud error rather than a silent
+/// literal (a typo in a boundary path is worth catching), as is a set-but-empty or
+/// non-UTF-8 variable — an empty segment must never silently re-anchor the path.
 fn expand_path(s: &str) -> anyhow::Result<PathBuf> {
     Ok(expand_tilde(&expand_env_vars(s)?))
 }
 
-/// Substitute `$VAR` and `${VAR}` from the process environment. Undefined → loud error
-/// (see [`expand_path`]). A `$` that doesn't begin a `{` or a valid name char is emitted
-/// verbatim. `[A-Za-z_][A-Za-z0-9_]*` is the accepted name shape, matching POSIX.
+/// Resolve one variable lookup to its value, refusing the two set-but-unusable cases that
+/// would otherwise misplace the read boundary *silently*. Pure (the lookup result is passed
+/// in) so the boundary-relevant rejections are unit-testable without mutating process env.
+///
+/// - **Set but empty** (`Ok("")`): an empty segment re-anchors the path — `$EMPTY/scratch`
+///   collapses to `/scratch`, `$EMPTY/` to `/` (the whole filesystem root). `undefined →
+///   error` doesn't catch this because an empty var *is* defined, so it's refused here.
+/// - **Set but non-UTF-8** (`Err(NotUnicode)`): reported accurately instead of as "not set"
+///   (the variable *is* set), pointing at `~` which handles a non-UTF-8 home via `var_os`.
+fn resolve_var(name: &str, full: &str, value: Result<String, std::env::VarError>) -> anyhow::Result<String> {
+    use std::env::VarError;
+    match value {
+        Ok(v) if v.is_empty() => bail!(
+            "path {full:?} references environment variable ${name}, which is set but empty \
+             — an empty segment would re-anchor the path (`$EMPTY/x` → `/x`, `$EMPTY/` → \
+             `/`), so it's refused"
+        ),
+        Ok(v) => Ok(v),
+        Err(VarError::NotPresent) => bail!(
+            "path {full:?} references environment variable ${name}, which is not set \
+             — set it, or write the literal path"
+        ),
+        Err(VarError::NotUnicode(_)) => bail!(
+            "path {full:?} references environment variable ${name}, which is set but not \
+             valid UTF-8 — spell it `~` if it's your home dir, else give it a UTF-8 value"
+        ),
+    }
+}
+
+/// Substitute `$VAR` and `${VAR}` from the process environment. Undefined / empty /
+/// non-UTF-8 → loud error (see [`resolve_var`]). `$$` escapes a literal `$`; a stray `$`
+/// that begins no reference is also a loud error, never a silent literal — in a boundary
+/// path it's a typo worth catching. `[A-Za-z_][A-Za-z0-9_]*` is the accepted name shape.
 fn expand_env_vars(s: &str) -> anyhow::Result<String> {
     fn is_start(c: char) -> bool {
         c.is_ascii_alphabetic() || c == '_'
@@ -2010,16 +2040,8 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
         c.is_ascii_alphanumeric() || c == '_'
     }
     fn lookup(out: &mut String, name: &str, full: &str) -> anyhow::Result<()> {
-        match std::env::var(name) {
-            Ok(val) => {
-                out.push_str(&val);
-                Ok(())
-            }
-            Err(_) => bail!(
-                "path {full:?} references environment variable ${name}, which is not set \
-                 — set it, or write the literal path"
-            ),
-        }
+        out.push_str(&resolve_var(name, full, std::env::var(name))?);
+        Ok(())
     }
 
     let mut out = String::with_capacity(s.len());
@@ -2030,6 +2052,11 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
             continue;
         }
         match chars.peek().copied() {
+            // `$$` is the escape for a literal `$` — the only way to put one in a path.
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
             Some('{') => {
                 chars.next(); // consume '{'
                 let mut name = String::new();
@@ -2073,8 +2100,13 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
                 }
                 lookup(&mut out, &name, s)?;
             }
-            // A lone '$' (end of string, or followed by a non-name char) is literal.
-            _ => out.push('$'),
+            // A `$` that begins no reference and isn't escaped is a loud error, not a
+            // silent literal — a stray `$` in a boundary path (`$1`, `$ `, a mistyped
+            // `${...}`, a trailing `$`) is a typo, and keeping it silently would mask it.
+            _ => bail!(
+                "path {s:?} has a stray '$' — write `$$` for a literal '$', or \
+                 `$NAME` / `${{NAME}}` to expand a variable"
+            ),
         }
     }
     Ok(out)
@@ -2145,6 +2177,11 @@ mod tests {
             // loud parse error (not the misleading "not set" the env lookup would give).
             "${1bad}".to_string(),     // can't start with a digit
             "${A/B}".to_string(),      // `/` is not a name char
+            // A stray `$` that begins no reference is a typo in a boundary path, refused
+            // rather than kept as a silent literal. Write `$$` for a real literal `$`.
+            "/a/$ b".to_string(),      // `$` followed by a space
+            "/cost/$100".to_string(),  // `$` followed by a digit
+            "trailing$".to_string(),   // `$` at end of string
         ] {
             assert!(
                 expand_env_vars(&bad).is_err(),
@@ -2153,20 +2190,36 @@ mod tests {
         }
     }
 
-    /// A `$` that doesn't begin a valid reference is left literal (shell-style), and a
-    /// path with no `$` at all is untouched. A bare `$1` / `$$` is *not* a reference (the
-    /// next char isn't a name-start), so it passes through — only the braced `${...}` form
-    /// treats a bad name as an error.
+    /// `$$` is the escape for a literal `$` — the only way to put one in a path — and a
+    /// path with no `$` is untouched. (A stray, unescaped `$` errors; that's covered by
+    /// `expand_env_vars_undefined_or_malformed_is_loud`.)
     #[test]
-    fn expand_env_vars_leaves_bare_dollar_and_plain_paths_alone() {
-        assert_eq!(expand_env_vars("/a/$ b").unwrap(), "/a/$ b");
-        assert_eq!(expand_env_vars("/cost/$100").unwrap(), "/cost/$100");
-        // `$$` where neither `$` is followed by a name-start char stays literal. (A `$`
-        // *is* a name-start nowhere, so `$$x` would instead try to expand `$x` — the
-        // second `$` is literal, the `x` names a var; that's deliberate, not tested here.)
-        assert_eq!(expand_env_vars("$$ ").unwrap(), "$$ ");
-        assert_eq!(expand_env_vars("trailing$").unwrap(), "trailing$");
+    fn expand_env_vars_double_dollar_escapes_a_literal_dollar() {
+        assert_eq!(expand_env_vars("a$$b").unwrap(), "a$b");
+        assert_eq!(expand_env_vars("/cost/$$100").unwrap(), "/cost/$100");
+        assert_eq!(expand_env_vars("$$").unwrap(), "$");
         assert_eq!(expand_env_vars("/data/fixtures").unwrap(), "/data/fixtures");
+    }
+
+    /// `resolve_var` refuses the two set-but-unusable cases that would silently misplace
+    /// the boundary — empty value (`$EMPTY/` → `/`) and non-UTF-8 — while a normal value
+    /// passes. Pure, so this has teeth without mutating process env (which would race the
+    /// parallel suite, and is `unsafe` besides).
+    #[test]
+    fn resolve_var_refuses_empty_and_non_utf8() {
+        use std::env::VarError;
+        use std::ffi::OsString;
+
+        assert_eq!(resolve_var("X", "$X", Ok("/tmp/scratch".into())).unwrap(), "/tmp/scratch");
+        assert!(
+            resolve_var("X", "$X", Ok(String::new())).is_err(),
+            "a set-but-empty variable must be refused — an empty segment re-anchors the path"
+        );
+        assert!(resolve_var("X", "$X", Err(VarError::NotPresent)).is_err());
+        assert!(
+            resolve_var("X", "$X", Err(VarError::NotUnicode(OsString::from("x")))).is_err(),
+            "a set-but-non-UTF-8 variable must be refused (not reported as 'not set')"
+        );
     }
 
     /// `expand_path` composes env expansion *then* tilde: `$HOME` and `~` reach the same

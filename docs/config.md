@@ -599,11 +599,13 @@ cwd/workspace lands inside that tree, kaibo infers it as the [default root](#pat
 automatically — so you configure access once and never pass `path` per call.
 
 **Path expansion.** In `root` / `allow_paths`, the file and env layers expand a leading
-`~` to `$HOME` *and* `$VAR` / `${VAR}` from the environment; an undefined variable is a
-loud load error, not a silent gap that would point the boundary somewhere unexpected. The
-CLI relies on your shell's own expansion instead. Paths with no `~`/`$` are taken as
-written. (A bare `$` not forming a reference is left literal; there's no escaping yet, so
-a directory literally named `$foo` isn't expressible in config — use the CLI for that.)
+`~` to `$HOME` *and* `$VAR` / `${VAR}` from the environment; the CLI relies on your shell's
+own expansion instead. Paths with no `~`/`$` are taken as written. A variable that is unset,
+**set but empty**, or non-UTF-8 is a loud load error rather than a silent gap that would
+misplace the boundary — an empty value matters because `$EMPTY/scratch` would collapse to
+`/scratch` and `$EMPTY/` to `/` (the whole filesystem). Write `$$` for a literal `$`; a
+stray `$` that begins no reference is itself an error, so a typo can't slip through as a
+literal segment. (A directory literally named `$foo` is written `$$foo`.)
 
 **Reading a scratch / temp space.** kaibo reads only what's in the allowed set and never
 writes anywhere — so to let it read artifacts a workflow drops in a temp dir (a diff, a

@@ -95,9 +95,11 @@ the git log. Each later release appends a new section at the top.
   `path` entirely. (Previously a literal `~` was taken verbatim and failed
   canonicalization at startup.) Environment variables make a scratch space portable:
   `allow_paths = ["$TMPDIR"]` or `["$XDG_RUNTIME_DIR/kaibo"]` lets kaibo read artifacts
-  a workflow drops in a temp dir without hardcoding a host-specific `/tmp`. An undefined
-  variable is a loud load error, never a silent gap that would misplace the read
-  boundary; the `configure` prompt now walks you through this opt-in.
+  a workflow drops in a temp dir without hardcoding a host-specific `/tmp`. A variable
+  that is unset, **set but empty**, or non-UTF-8 is a loud load error, never a silent gap
+  that would misplace the read boundary (an empty `$EMPTY/` would otherwise collapse to
+  `/`); write `$$` for a literal `$`. The `configure` prompt now walks you through this
+  opt-in.
 - **Follow git worktrees automatically.** A `path` in a linked git worktree of an
   already-allowed repo is now reachable without an `--allow-path` — so a sibling
   branch you check out next to the project (even one you spin up mid-session) just

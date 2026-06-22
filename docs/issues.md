@@ -224,9 +224,8 @@ would. Scoped out of the temp-read change deliberately (those two callers are in
 today; switching them to `expand_path` means threading `Result` through `merge_context`
 and the credential loader). Extend them to `expand_path` for one uniform rule — then a user
 never has to remember "env vars work here but not there." Low risk, mechanical; the only
-care is keeping the undefined-var error loud at load. Also unbuilt: escaping a literal `$`
-(today a path named `$foo` isn't expressible in config; a `\$` / `$$` escape would close it
-if anyone hits it).
+care is keeping the undefined/empty/non-UTF-8 errors loud at load (and that the extended
+callers get the same `$$`-escape + stray-`$`-is-error rules `expand_env_vars` enforces).
 
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read

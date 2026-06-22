@@ -36,12 +36,20 @@ before), and a variable whose *value* carries a leading `~` (`MYDIR=~/data`) sti
 A single pass only — a variable's value is never re-scanned for `$`, so there's no
 expansion-injection surprise from environment contents.
 
-**Undefined variable is a loud load error, not a passthrough.** A silent gap (`$TMPDR`
-typo → empty segment → a path that canonicalizes *somewhere*) is exactly the data-corruption
-failure mode the house rule rejects; better to refuse at startup. A bare `$` that doesn't
-form a reference stays literal, shell-style — the one accepted limitation is that a
-directory literally named `$foo` isn't expressible in config (no escaping yet; noted in
-issues.md).
+**Undefined / empty / non-UTF-8 variable is a loud load error, not a passthrough.** A
+silent gap (`$TMPDR` typo → empty segment → a path that canonicalizes *somewhere*) is
+exactly the data-corruption failure mode the house rule rejects; refuse at startup. Two
+cross-family reviews (DeepSeek V4 Pro via `consult`, Gemini 3.1 Pro via the batch lane)
+hardened this: Gemini caught that `undefined → error` does *not* cover a **set-but-empty**
+variable — `$EMPTY/scratch` collapses to `/scratch`, `$EMPTY/` to `/` (the whole
+filesystem) — a real silent boundary-widening, now refused in `resolve_var` (extracted as a
+pure seam so the rejection is unit-tested without mutating process env). Both flagged the
+`$HOME`-non-UTF-8 error conflating "set but not UTF-8" with "not set"; now distinguished.
+And on the bare-`$` question the two reviewers split — DeepSeek called shell-style
+passthrough fine, Gemini argued a stray `$` in a boundary path masks a typo and there's no
+way to write a literal `$`. Took Gemini's stricter line as the better fit for "silent
+fallbacks are a mistake": `$$` now escapes a literal `$`, and any other stray `$` is an
+error.
 
 **Scoped to the boundary knobs (`root` / `allow_paths`), not every path field.** `[context]`
 `user_files` and the key-file paths still tilde-only; extending them is consistency work,
