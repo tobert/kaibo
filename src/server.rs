@@ -28,8 +28,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::Instrument;
 
-use crate::config::{Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, oneshot, Arm, ConsultConfig, ModelShape, PromptOverrides};
+use crate::config::{Backend, Cast, Config, ModelRole, ModelSlot};
+use crate::consult::{consult, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides};
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
 use crate::image_gen::ImageGen;
@@ -223,6 +223,17 @@ pub struct BatchSubmitInput {
     /// it and its own knowledge. Batch runs them at max thinking, so it's the lane for
     /// hard questions you're willing to wait on.
     pub prompts: Vec<String>,
+
+    /// Workspace files to inline as shared context for *every* prompt in the batch —
+    /// absolute or relative paths under the allowed set (same boundary as `path`
+    /// elsewhere; worktrees included). kaibo reads each file and inlines it so its bytes
+    /// never pass through your context: say "review README.md" and attach `["README.md"]`,
+    /// or `git diff > x.diff` and attach `["x.diff"]`. Text files splice in as text;
+    /// images (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
+    /// synth model). A path outside the workspace, a directory, an oversized file, or a
+    /// binary that isn't a known image is refused with a clear error. Omit for none.
+    #[serde(default)]
+    pub attach: Vec<String>,
 
     /// Which cast (model team) runs the batch; omit for the server's default. Batch
     /// uses the cast's capable (synth) model on a batch-capable backend; `kaibo://config`
@@ -577,28 +588,38 @@ impl KaiboHandler {
             ));
         }
 
-        // Step 3: containment check — must be at-or-under an allowed tree.
-        let allowed = &self.allowed_set;
-        if allowed.iter().any(|tree| canon.starts_with(tree)) {
+        // Step 3: containment check — must be at-or-under an allowed tree (or a
+        // followed worktree of one). Shared with `resolve_attachments` so a file
+        // attachment obeys the exact same boundary as a session root, not a parallel
+        // check that could drift.
+        if self.contained(&canon) {
             return Ok(canon);
         }
+        Err(self.containment_error(&raw, &canon))
+    }
 
-        // Step 3b: worktree follow. A path that misses the static set is still
-        // admitted when it lives in a linked git worktree of an *already-allowed*
-        // repo — so a sibling worktree (a branch you check out next to the project,
-        // possibly mid-session) is reachable without an --allow-path. Resolved by
-        // reading git's link files, never by running git (subprocess/git are
-        // compiled out — see sandbox.rs). Trust flows only outward from the allowed
-        // repo: we enumerate the worktrees the allowed tree's own common git dir
-        // vouches for and never consult the candidate's `.git`, so a foreign dir
-        // can't forge its way in. Off when `follow_worktrees` is false.
-        if self.config.follow_worktrees && self.is_followed_worktree(&canon) {
-            return Ok(canon);
+    /// Is `canon` (already canonicalized) inside the allowed boundary? At-or-under a
+    /// static allowed tree, or — when `follow_worktrees` is on — inside a linked git
+    /// worktree that an already-allowed repo vouches for (a sibling branch checkout
+    /// reachable without an --allow-path). Worktree membership is resolved by reading
+    /// git's link files, never by running git (subprocess/git are compiled out — see
+    /// sandbox.rs), and trust flows only outward from the allowed repo (we enumerate
+    /// the worktrees its own common git dir names and never consult the candidate's
+    /// `.git`), so a foreign dir can't forge its way in. The single containment
+    /// predicate — `resolve_root` and `resolve_attachments` both defer to it.
+    fn contained(&self, canon: &std::path::Path) -> bool {
+        if self.allowed_set.iter().any(|tree| canon.starts_with(tree)) {
+            return true;
         }
+        self.config.follow_worktrees && self.is_followed_worktree(canon)
+    }
 
-        // Violation: name the allowed set and the three widening knobs.
-        let trees: Vec<String> = allowed.iter().map(|p| p.display().to_string()).collect();
-        Err(McpError::invalid_params(
+    /// The shared "outside the allowed set" rejection, naming the boundary and the three
+    /// widening knobs. Used wherever [`contained`](Self::contained) says no, so the
+    /// caller always learns where the edge is and how to move it.
+    fn containment_error(&self, raw: &std::path::Path, canon: &std::path::Path) -> McpError {
+        let trees: Vec<String> = self.allowed_set.iter().map(|p| p.display().to_string()).collect();
+        McpError::invalid_params(
             format!(
                 "path {} resolves to {}, which is outside the allowed set [{}]. \
                  To widen the boundary: pass --allow-path DIR on the command line, \
@@ -609,7 +630,89 @@ impl KaiboHandler {
                 trees.join(", "),
             ),
             None,
-        ))
+        )
+    }
+
+    /// Resolve caller-named attachment paths into [`Attachment`](crate::attach::Attachment)s,
+    /// read and encoded server-side so the bytes never transit the calling agent's
+    /// context. Each path obeys the *same* boundary as a session root — canonicalize
+    /// (symlinks + `..` resolved), require a regular file, then the shared
+    /// [`contained`](Self::contained) check (allowed set + followed worktrees) — so
+    /// attachments can't read outside the workspace any more than `run_kaish` can.
+    ///
+    /// Failures are loud and per-path: a missing file, a directory, an over-cap or
+    /// non-text/non-image file is a clear `invalid_params`, never a silent skip — an
+    /// attachment the caller named but we dropped would be a corrupt answer. An absolute
+    /// size ceiling is enforced *before* reading (via the file's metadata) so a giant
+    /// file is refused without first slurping it into memory.
+    ///
+    /// Containment is checked on the *canonical* path, then the read follows — a
+    /// check-then-open TOCTOU window, the same class `resolve_root` carries (and tracked
+    /// in `docs/issues.md`). The attacker model makes it narrow: kaibo cannot write the
+    /// workspace, so swapping the canonical path for an outside-pointing symlink in the
+    /// sub-millisecond window needs a *concurrent* writer to the very workspace the
+    /// calling agent owns — a self-attack. Closing it structurally (open `O_NOFOLLOW`,
+    /// `fstat` the fd, contain via `/proc/self/fd`, read from the fd) is deferred until
+    /// the attacker model justifies it.
+    pub fn resolve_attachments(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<crate::attach::Attachment>, McpError> {
+        use crate::attach::{classify, DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_TEXT_BYTES};
+        // The pre-read ceiling: whichever encoding cap is larger. `classify` applies the
+        // precise per-encoding cap after sniffing; this just bounds the read itself.
+        let read_ceiling = DEFAULT_MAX_TEXT_BYTES.max(DEFAULT_MAX_IMAGE_BYTES);
+        paths
+            .iter()
+            .map(|p| {
+                let raw = std::path::PathBuf::from(p);
+                let canon = std::fs::canonicalize(&raw).map_err(|e| {
+                    McpError::invalid_params(
+                        format!("attachment {} could not be resolved: {e}", raw.display()),
+                        None,
+                    )
+                })?;
+                // A regular file, not a directory — symmetric with resolve_root's dir
+                // check, the mirror image (we inline a file's bytes, not mount a tree).
+                let meta = std::fs::metadata(&canon).map_err(|e| {
+                    McpError::invalid_params(
+                        format!("attachment {} could not be read: {e}", canon.display()),
+                        None,
+                    )
+                })?;
+                if !meta.is_file() {
+                    return Err(McpError::invalid_params(
+                        format!("attachment {} is not a regular file", canon.display()),
+                        None,
+                    ));
+                }
+                // Same boundary as a session root.
+                if !self.contained(&canon) {
+                    return Err(self.containment_error(&raw, &canon));
+                }
+                // Bound the read by the absolute ceiling before slurping.
+                if meta.len() > read_ceiling as u64 {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "attachment {} is {} bytes, over the {read_ceiling}-byte limit",
+                            canon.display(),
+                            meta.len()
+                        ),
+                        None,
+                    ));
+                }
+                let bytes = std::fs::read(&canon).map_err(|e| {
+                    McpError::invalid_params(
+                        format!("attachment {} could not be read: {e}", canon.display()),
+                        None,
+                    )
+                })?;
+                // Label the attachment with the caller's path (what they typed), not the
+                // canonical one — it's their reference and it's what the model should see.
+                classify(p, &bytes, DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_IMAGE_BYTES)
+                    .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
+            })
+            .collect()
     }
 
     /// True when `canon` falls inside a git worktree that an already-allowed repo
@@ -1096,16 +1199,18 @@ impl KaiboHandler {
         )))
     }
 
-    /// Resolve a cast's synth slot into a submit-capable batch provider, plus its
-    /// backend name (for the returned handle) and model id (for the caller message). A
-    /// missing synth slot is the loud call-time gap; a backend whose kind has no batch
-    /// lane is refused inside the provider build (`batch::submitter`). Both surface as a
-    /// parameter error the caller can act on — pick a cast whose synth is a batch-capable
-    /// backend.
-    fn batch_submitter(
-        &self,
-        cast: &Cast,
-    ) -> Result<(Arc<dyn crate::batch::BatchProvider>, String, String), McpError> {
+    /// Resolve a cast's synth slot for batch: its slot + backend, plus the model's
+    /// resolved [`ModelCaps`]. Cheap and key-free — it does *not* build a network client,
+    /// so the caller can resolve attachments and gate on capability (both request-shaping,
+    /// not connection) before paying for a provider. A missing synth slot is the loud
+    /// call-time gap; the batch-lane check rides the later `batch::submitter` build. The
+    /// caps come from the same slot the provider will use, so the gate and the wire agree
+    /// on which model runs. Returns the whole `ModelCaps` (not just `vision`) so a future
+    /// audio/video attachment gate has its answer without growing this signature.
+    fn batch_synth<'a>(
+        &'a self,
+        cast: &'a Cast,
+    ) -> Result<(&'a ModelSlot, &'a Backend, ModelCaps), McpError> {
         let slot = cast
             .require_slot(ModelRole::Synth)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -1113,9 +1218,8 @@ impl KaiboHandler {
             .config
             .resolve_backend(&slot.backend)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
-        Ok((provider, backend.name.clone(), slot.id.clone()))
+        let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
+        Ok((slot, backend, caps))
     }
 
     /// A poll/cancel-only provider for a handle's backend. Poll and cancel need only the
@@ -1195,7 +1299,7 @@ impl KaiboHandler {
             SLA is up to 24h), and the handle is durable — it survives a server restart \
             — so come back and `batch_get` later rather than blocking on it now."
     )]
-    async fn batch_submit(
+    pub async fn batch_submit(
         &self,
         Parameters(input): Parameters<BatchSubmitInput>,
     ) -> Result<CallToolResult, McpError> {
@@ -1214,7 +1318,36 @@ impl KaiboHandler {
             "model",
             "backend",
         )?;
-        let (provider, backend_name, model) = self.batch_submitter(&cast)?;
+        let (slot, backend, caps) = self.batch_synth(&cast)?;
+        let backend_name = backend.name.clone();
+        let model = slot.id.clone();
+        // Read + containment-check the attachments before anything hits the network: a
+        // bad path is a clean refusal, not a half-submitted batch. The bytes are inlined
+        // server-side so they never transit the calling agent's context.
+        let attachments = self.resolve_attachments(&input.attach)?;
+        // Gate image attachments on the synth model's vision capability — a blind model
+        // would silently ignore (or error on) an image part, so refuse honestly up front
+        // (the project posture), naming the cast so the caller can pick a vision one. This
+        // runs before the provider is built, so a vision misconfig needs no key to report.
+        if !caps.vision
+            && attachments
+                .iter()
+                .any(|a| matches!(a, crate::attach::Attachment::Image { .. }))
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "an image attachment was given, but the synth model `{model}` on cast \
+                     `{}` doesn't accept image input. Use a vision-capable cast/model, or \
+                     attach only text files. `kaibo://config` lists each slot's `vision`.",
+                    cast.name
+                ),
+                None,
+            ));
+        }
+        // Now build the network client (resolves the key); a batch-incapable backend is
+        // refused honestly here.
+        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let items: Vec<crate::batch::BatchItem> = input
             .prompts
             .iter()
@@ -1232,7 +1365,7 @@ impl KaiboHandler {
         let span =
             tracing::info_span!("batch_submit", cast = %cast.name, model = %model, n = items.len());
         let provider_id = provider
-            .submit(&system, &items)
+            .submit(&system, &attachments, &items)
             .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;

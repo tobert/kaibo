@@ -55,7 +55,13 @@ the git log. Each later release appends a new section at the top.
   rather than wait on it. Lost a handle? `batch_list` re-discovers the batches a backend
   still holds (newest first, each with its handle, status, and progress), so a batch is
   never orphaned — defaulting across every batch-capable backend, or scoped to one with
-  `backend`.
+  `backend`. **`attach`** lets you name workspace files to inline as shared context for
+  every prompt — "review README.md" with `attach: ["README.md"]`, or `git diff > x.diff`
+  and `attach: ["x.diff"]` — so the file's bytes never pass through your own context.
+  Text files splice in as text; images (png/jpeg/gif/webp) ride as native image parts
+  (with a vision-capable synth model). Paths obey the same workspace boundary as
+  everything else (worktrees included); a file outside it, a directory, an oversized
+  file, or a binary that isn't a known image is refused with a clear error.
 - **`view_image`** — vision-capable consultation phases can read an image *file* from
   the workspace into model context (screenshots, diagrams, assets already in the tree).
 - **Multi-provider model teams.** Anthropic, DeepSeek, and Gemini natively, plus a

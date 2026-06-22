@@ -152,6 +152,22 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
+### Path containment is check-then-open (a narrow TOCTOU)
+Both `resolve_root` and `resolve_attachments` (`server.rs`) check containment on the
+*canonical* path and then open/read it as a separate step — a classic check-then-open
+window. A concurrent writer could swap the canonical path for an outside-pointing symlink
+between the `contained` check and the read, escaping the boundary. Surfaced by the
+cross-family review of the batch `attach` feature (DeepSeek, 2026-06-22), which judged the
+boundary otherwise sound. The attacker model keeps it narrow: kaibo cannot write the
+workspace, so the race needs a concurrent writer to the very tree the calling agent owns
+(a self-attack), inside a sub-millisecond window. `resolve_root` is the less-exposed of
+the two — it hands the canonical path to the kaish kernel, which opens a directory fd and
+works through it — while the attachment path reads a file one-shot and discards the fd.
+Structural fix when justified: open `O_NOFOLLOW`, `fstat` the fd, re-check containment via
+`/proc/self/fd/N`, then read from the already-open fd. Deferred until the attacker model
+(a workspace writable by someone other than the caller) is real; documented in
+`resolve_attachments`' doc-comment so it isn't rediscovered.
+
 ### Review the provider retry + failure policy (and document it)
 We don't have a stated, audited answer for what a `consult`/`oneshot`
 call does when a provider misbehaves mid-flight: a 429/529 overload, a connection
@@ -236,6 +252,19 @@ in the module doc and `docs/devlog.md`. What's left:
   proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
   is ever confirmed by probe for a batch backend, lift it there — the constant is the
   one knob to change.
+- **Attachments on `oneshot` (deferred — batch shipped).** `batch_submit` now takes
+  `attach: [paths]` — workspace files (text spliced inline, images as native base64
+  parts) read + containment-checked server-side so the bytes never transit the calling
+  agent's context (`src/attach.rs`, `server.rs::resolve_attachments`, the shared
+  `contained`/`containment_error` the session-root check also uses; both batch body
+  builders emit structured parts now). `oneshot` is the natural sibling — the same
+  "name a file instead of pasting it" win for the synchronous tool-less call — but it
+  runs through **rig**, not the hand-rolled batch HTTP, so *text* attachment is a cheap
+  prompt-string splice while *image* attachment needs rig multimodal-message building
+  (different plumbing). Consider it later; the `Attachment`/`classify` seam is reusable
+  as-is. A typed `FileRef` variant is reserved for the Gemini File API path (oversized/
+  reused media, Gemini-only) — only worth it once a genuinely-too-big-to-inline case
+  shows up.
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
 (shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
@@ -270,6 +299,19 @@ failures and a truncated page are surfaced, not hidden). Still open:
   Consider making effort a default-on floor the cast/caller can lower, the way
   `max_tokens` already is. (Distinct from the "lift the tier" bullet above — that's the
   ceiling, this is the override.)
+- **Shared `attach` duplicates per item — a payload/memory ceiling as batches grow.**
+  Attachments are shared across the batch but inlined *per item*: `anthropic_content`/
+  `gemini_parts` (`batch.rs`) re-encode every attachment into every item's request, so a
+  1 MiB attachment on a 1000-prompt batch is ~1 GiB in the JSON AST and again in the
+  serialized body. Inherent — provider batch APIs carry bytes inline per request, and
+  prompt caching doesn't shrink the JSONL — so the real fix is a guard, not dedup: bound
+  total submitted payload (sum of prompts + attachments×items) with a loud refusal before
+  it OOMs or trips the provider's body-size limit, the way single-file size is already
+  capped. Surfaced by the holistic review (Gemini Pro, 2026-06-22). Low priority until a
+  big-attachment × many-prompt batch is real — measure first; today's single-digit-prompt
+  reviews are nowhere near it. Note this interacts with the `FileRef`/File-API path
+  (`attach.rs` module doc): a `fileUri` reference is tiny and *reused* across items, so
+  remote-referenced media is the eventual escape from this duplication for large files.
 
 ### Provider model ids drift and live in code
 `consult.rs::default_models` hardcodes the explorer/synth ids per provider; they
