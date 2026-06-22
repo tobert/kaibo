@@ -14,6 +14,66 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — batch: offline max-effort fan-out (Anthropic first)
+
+Shipped the batch tool class — `batch_submit`/`batch_get`/`batch_cancel`/`batch_list`,
+the **offline, async sibling of `oneshot`**. The shape was the whole debate. Started
+from "batch mode as a param on `oneshot`" and rejected it: batch is a *different class*,
+not a flag. It's toolless **by construction** — provider batch APIs are offline and
+can't drive a tool loop — so it's built on the `oneshot` *shape* (a capable model
+answering from what it was handed), never `run_phase`. Separate verbs rather than one
+tool with modes, because submit→poll→cancel→list are genuinely distinct and "kill a fat
+top-tier batch" is a real button to want.
+
+Designed fresh for kaibo, not ported from gpal/cpal — those were a reference for what's
+*possible*, not a template. Decisions worth recording:
+
+- **Max the knobs by default.** Batch floors `max_tokens` and forces thinking at
+  `BATCH_EFFORT` regardless of how the cast's synth slot was tuned for interactive use.
+  The motivating case (Amy's): Gemini Pro is near-unusable interactively, so casts synth
+  on Flash — but batch is exactly where you reach for Pro, and the latency that makes
+  max-thinking painful synchronously is *free* once you've accepted "come back later."
+  `BATCH_EFFORT` is threaded *explicitly* through `ModelShape::to_params` rather than
+  via the `consult::thinking_params` helper — a first cut reused that helper, but it
+  would have silently baked in `consult`'s interactive `DEFAULT_EFFORT`; a cross-family
+  review caught the dead-constant trap, so batch now owns its effort independently
+  (`max_tokens` is a *floor*, never undercutting a richer slot).
+- **No state, by design.** kaibo holds nothing on disk, and we kept it that way: the
+  returned handle is `backend/provider-id`, the *whole* address. Poll/cancel/list
+  rebuild a fresh client from the backend and re-address the provider's own batch id, so
+  they survive a server restart. The split trusts a backend name to carry no `/` — so we
+  *enforced* that at config load (`config.rs`) rather than leaving it a convention the
+  slot-ref and batch-handle parsers silently bank on.
+- **A preamble of its own.** Batch shares `oneshot`'s toolless shape but not its words.
+  A cross-family review (Opus, run *through* `batch_submit` itself — dogfooding the
+  tool to critique its own design) flagged that `oneshot`'s "name what you'd need rather
+  than guessing" is right *synchronously* (a gap invites a next turn) but wrong offline
+  (there is no next turn — stopping at "I'd need X" burns the caller's one shot). So
+  `batch_preamble` (overridable via `[prompts].batch`) tells the model it gets one
+  complete, self-contained response, to spend the forced budget on depth, and to
+  *state an assumption and answer under it* rather than stall — and drops the negative
+  "guessing" framing for the positive form the CLAUDE.md rule wants.
+- **`batch_list` closes the orphan gap.** No state means a *lost* handle is a batch that
+  keeps billing with no way back to it — the review's sharpest finding. `batch_list`
+  reads the provider's own batch list (the source of truth kaibo doesn't keep): newest
+  first, each entry a ready-to-use handle with status and progress, defaulting across
+  every Anthropic backend (you may not recall which ran it) or scoped to one.
+  Per-backend failures and a truncated page are surfaced, never hidden. Live-verified
+  against 14 real historical batches — recovered every one by handle.
+
+**Anthropic first, deliberately.** Message Batches is inline (requests in one POST) and
+the wire shape is one we're confident about; Gemini (Amy's real want) and OpenAI
+(file-based) follow as their own PRs once a live probe confirms each shape — the
+"confirm, don't guess" discipline. A non-Anthropic cast is refused with a clear message
+rather than silently no-oping, the same honest-absence posture as the `ImageGen` seam.
+`batch_submit` is many-prompts/one-cast for now; the one-question/many-casts panel is N
+provider batches under a composite handle, deferred (`docs/issues.md`).
+
+The whole seam is offline-tested: pure request-shaping/response-parsing/render fns plus
+a `ScriptedBatch` driving submit→pending→done and a seeded list with no network,
+mirroring `ScriptedImageGen`. The live wire is proven by trying it (the dogfooded review
+and the `batch_list` recovery run), not by a unit test that can't reach the provider.
+
 ## 2026-06-18 — kaish-kernel 0.9.0
 
 Bumped the published dep `0.8.4 → 0.9.0`. One API break carried through: the `mcp()`

@@ -97,6 +97,10 @@ pub struct PromptOverrides {
     pub consult: Option<String>,
     /// Replaces [`oneshot_preamble`] — the thin, toolless `oneshot`.
     pub oneshot: Option<String>,
+    /// Replaces [`batch_preamble`] — the offline, max-thinking `batch_submit`. A key
+    /// of its own (not shared with `oneshot`) because the batch lane is a different
+    /// behavioral contract: one response, no follow-up, spend on depth.
+    pub batch: Option<String>,
 }
 
 /// Resolve one phase's full system prompt: the operator override if set, else the
@@ -1399,6 +1403,50 @@ pub fn oneshot_preamble() -> String {
      explicitly anything you'd need that wasn't given rather than guessing it. Keep \
      your claims grounded in the material and say where its edge is."
         .to_string()
+}
+
+/// The `batch` preamble: a capable model answering one hard question *offline*, at
+/// max thinking, with no codebase access and no tools. Deliberately **not** a reuse of
+/// [`oneshot_preamble`] — batch is the same toolless shape but a different behavioral
+/// contract, and a cross-model review of the feature caught three places the oneshot
+/// wording misfires for the async lane:
+///
+/// - **No follow-up turn.** A batch item is answered once, offline; the caller cannot
+///   clarify and there is no next turn. oneshot's "name what you'd need rather than
+///   guessing" is right *synchronously* (flagging a gap invites the caller to fill it
+///   next turn) but wrong here — stopping at "I'd need X" burns the caller's one shot
+///   for nothing. The batch contract is *state the assumption, answer under it, flag
+///   what would change* — both the answer and the diagnostic, in one pass.
+/// - **Depth is free.** The lane forces high effort + a generous token floor precisely
+///   because the latency is already accepted. The prompt says so out loud — spend the
+///   room on depth — rather than leaving that intent only in the knobs.
+/// - **Primary answer, not a footnote.** Batch is for asking the best model the hard
+///   question, so the "second opinion" framing under-positions it; the load-bearing
+///   part is "for another agent" (an external advisor owns no context), which we keep.
+///
+/// Positive framing throughout (the CLAUDE.md rule): the old "rather than guessing it"
+/// named the unwanted pathway; the replacement asks for the wanted behavior — a
+/// reasoned, labelled assumption — directly.
+pub fn batch_preamble() -> String {
+    "You are a capable model answering a hard question for another agent, offline. Work \
+     from the material it provides and your own knowledge — this call has no codebase \
+     access and no tools, so the caller owns all the context you have. This is your \
+     single response: there is no follow-up turn and the caller cannot clarify, so make \
+     the answer complete and self-contained, and spend the room you have on depth — \
+     reason the problem all the way through. Be direct and precise. Ground every claim \
+     in the material or your own knowledge, and say where the evidence runs out. Where \
+     something you'd need is missing, state the assumption you're making, answer under \
+     it, and flag what would change if the assumption is wrong."
+        .to_string()
+}
+
+/// Resolve the `batch` phase's system prompt: the operator `[prompts].batch` override
+/// if set, else the built-in [`batch_preamble`]. Batch reads no project (the `oneshot`
+/// shape), so neither the repo map nor house rules splice — the same composition
+/// `oneshot` gets, exposed as a public seam because the batch path lives outside the
+/// `ConsultConfig`-driven loop (it runs on the provider's batch lane, not [`Arm::run`]).
+pub fn batch_system_prompt(override_: Option<&str>) -> String {
+    phase_preamble(override_, batch_preamble, None, None)
 }
 
 /// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
@@ -2980,12 +3028,60 @@ mod tests {
             p.to_lowercase().contains("whole"),
             "the whole-file directive must survive: {p}"
         );
-        assert!(p.contains("grep -rn -B4 -A8"), "grep context-buffer idiom: {p}");
+        assert!(
+            p.contains("grep -rn -B4 -A8"),
+            "grep context-buffer idiom: {p}"
+        );
         // The report template the consult driver preamble is written
         // against — keep the three section names in lockstep with those.
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
             assert!(p.contains(section), "missing report section {section}: {p}");
         }
+    }
+
+    /// The batch preamble encodes the async lane's distinct contract — the three things
+    /// a cross-model review flagged the oneshot wording getting wrong for batch. These
+    /// are behavioral promises, so they get a test that fails if the prose drifts back
+    /// toward the synchronous oneshot framing.
+    #[test]
+    fn batch_preamble_encodes_the_offline_one_shot_contract() {
+        let p = batch_preamble();
+        let lower = p.to_lowercase();
+        // (1) No follow-up turn — be complete and self-contained in one response.
+        assert!(
+            lower.contains("single response") && lower.contains("no follow-up"),
+            "batch must tell the model it gets exactly one offline response: {p}"
+        );
+        // (2) Depth is free here — spend the budget the lane forces on.
+        assert!(lower.contains("depth"), "batch must ask for depth: {p}");
+        // (3) Assume-and-answer, not flag-and-stall: state the assumption and answer
+        // under it (the synchronous oneshot would say "name what you'd need").
+        assert!(
+            lower.contains("assumption") && lower.contains("answer under it"),
+            "batch must steer toward assume-and-answer, not flag-and-stall: {p}"
+        );
+        // Positive framing (the CLAUDE.md rule): it must not reintroduce the negative
+        // "rather than guessing" pathway the oneshot line used.
+        assert!(
+            !lower.contains("guess"),
+            "batch preamble must stay positively framed — no 'guess' pathway: {p}"
+        );
+        // Still the toolless, contextless shape it shares with oneshot.
+        assert!(
+            lower.contains("no codebase access") && lower.contains("no tools"),
+            "batch is the toolless, contextless shape: {p}"
+        );
+    }
+
+    /// `[prompts].batch` fully replaces the built-in batch preamble; absent, the
+    /// built-in stands. Batch reads no project, so nothing else splices.
+    #[test]
+    fn batch_system_prompt_honors_the_override() {
+        assert_eq!(batch_system_prompt(None), batch_preamble());
+        assert_eq!(
+            batch_system_prompt(Some("custom batch frame")),
+            "custom batch frame"
+        );
     }
 
     /// When the synth arm is vision-capable, the consult driver's toolset gains

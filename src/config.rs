@@ -821,6 +821,20 @@ impl Config {
         // Validate backends. These are config mistakes, not no-ops: crash loudly
         // at startup rather than fail cryptically mid-call.
         for b in backends.values() {
+            // A backend name may never contain '/'. Two wire formats split on the
+            // first slash and trust the prefix to be slash-free: the `"backend/model-id"`
+            // slot ref (`split_backend_model`) and the `"backend/provider-id"` batch
+            // handle (`server.rs::parse_batch_handle`). A slash in a backend name would
+            // silently mis-route both. Enforce the invariant the parsers rely on rather
+            // than trusting convention.
+            if b.name.contains('/') {
+                bail!(
+                    "backend name {:?} may not contain '/': backend names prefix slot \
+                     refs (\"backend/model-id\") and batch handles (\"backend/provider-id\"), \
+                     which split on the first slash",
+                    b.name
+                );
+            }
             // A base_url on a keyed kind: rig fixes those endpoints.
             if b.kind != ProviderKind::Openai && b.base_url.is_some() {
                 bail!(
@@ -1049,6 +1063,9 @@ impl Config {
         if disable.generate_image {
             self.tools.generate_image = false;
         }
+        if disable.batch {
+            self.tools.batch = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -1075,6 +1092,7 @@ pub struct ToolDisables {
     pub oneshot: bool,
     pub run_kaish: bool,
     pub generate_image: bool,
+    pub batch: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -1295,6 +1313,8 @@ struct RawPrompts {
     consult: Option<String>,
     /// Replaces the toolless `oneshot` preamble.
     oneshot: Option<String>,
+    /// Replaces the offline, max-thinking `batch_submit` preamble.
+    batch: Option<String>,
 }
 
 /// The `[orientation]` stanza — the static repo-map injected into the exploring
@@ -1335,6 +1355,7 @@ struct RawTools {
     oneshot: Option<bool>,
     run_kaish: Option<bool>,
     generate_image: Option<bool>,
+    batch: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1610,6 +1631,7 @@ fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
         explorer: non_empty("explorer", raw.explorer)?,
         consult: non_empty("consult", raw.consult)?,
         oneshot: non_empty("oneshot", raw.oneshot)?,
+        batch: non_empty("batch", raw.batch)?,
     })
 }
 
@@ -1679,6 +1701,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         generate_image: raw.generate_image.unwrap_or(d.generate_image),
+        batch: raw.batch.unwrap_or(d.batch),
     }
 }
 
@@ -1740,6 +1763,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_GENERATE_IMAGE") {
         tools.generate_image = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_BATCH") {
+        tools.batch = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);
@@ -2340,6 +2366,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("only the `openai` kind"), "got: {err}");
+    }
+
+    /// A backend name containing '/' is refused at load. Both the slot ref
+    /// (`"backend/model-id"`) and the batch handle (`"backend/provider-id"`) split on
+    /// the first slash and trust the prefix to be slash-free, so a slash-bearing name
+    /// would silently mis-route. Enforce the invariant the parsers depend on.
+    #[test]
+    fn backend_name_with_slash_is_refused() {
+        let err = Config::from_toml_str(
+            "[backends.\"foo/bar\"]\nkind = \"openai\"\nbase_url = \"http://localhost:1/v1\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may not contain '/'"), "got: {err}");
     }
 
     /// Alias collisions are loud, per level: a user cast named like a built-in

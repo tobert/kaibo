@@ -458,6 +458,7 @@ Prefer architectural answers; name the file:line that carries each claim.
 | `explorer` | `report_preamble` | the nested `explore′` sweep inside `consult` |
 | `consult` | `consult_preamble` | the `consult` driver |
 | `oneshot` | `oneshot_preamble` | the thin, toolless `oneshot` |
+| `batch` | `batch_preamble` | the offline, max-thinking `batch_submit` |
 
 **Full replace, by decision.** An override *is* the role framing, verbatim — kaibo
 does not re-wrap it. That's safe because the kaish operating contract (how to drive
@@ -506,6 +507,12 @@ resolves under its own key, so they stay **independently overridable**: a copy t
 keys = "this job's framing." The explorer has one job, so no ambiguity. A per-call
 model override (a bare slot) carries no `preamble` — overriding the model doesn't
 drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`.
+
+`batch_submit` runs the synth model too, but deliberately does **not** inherit the
+synth slot's `preamble`: its lane has a distinct behavioral contract (one offline
+response, no follow-up, spend on depth) that a slot preamble written for interactive
+synth would silently replace. Tune batch through `[prompts].batch` (or accept the
+built-in `batch_preamble`); the slot preamble stays scoped to the interactive phases.
 
 ## Repo orientation: `[orientation]`
 
