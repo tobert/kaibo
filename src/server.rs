@@ -225,8 +225,8 @@ pub struct BatchSubmitInput {
     pub prompts: Vec<String>,
 
     /// Which cast (model team) runs the batch; omit for the server's default. Batch
-    /// uses the cast's capable (synth) model on an Anthropic backend (the only batch
-    /// backend today; `kaibo://config` lists the casts).
+    /// uses the cast's capable (synth) model on a batch-capable backend; `kaibo://config`
+    /// lists the casts.
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -237,7 +237,7 @@ pub struct BatchSubmitInput {
     pub model: Option<String>,
 
     /// Run the `model` override on this backend (name or alias) instead of the cast's.
-    /// Requires `model`. Must be an Anthropic backend for now.
+    /// Requires `model`. Must be a batch-capable backend.
     #[serde(default)]
     pub backend: Option<String>,
 }
@@ -247,8 +247,8 @@ pub struct BatchSubmitInput {
 #[serde(deny_unknown_fields)]
 pub struct BatchListInput {
     /// Which backend (name or alias) to list batches from. Omit to list across every
-    /// configured Anthropic backend (the only batch kind today) — the orphan-recovery
-    /// default when you've lost a handle and don't recall which backend ran it.
+    /// configured batch-capable backend — the orphan-recovery default when you've lost a
+    /// handle and don't recall which backend ran it.
     #[serde(default)]
     pub backend: Option<String>,
 }
@@ -1093,9 +1093,10 @@ impl KaiboHandler {
 
     /// Resolve a cast's synth slot into a submit-capable batch provider, plus its
     /// backend name (for the returned handle) and model id (for the caller message). A
-    /// missing synth slot is the loud call-time gap; a non-Anthropic backend is refused
-    /// inside the provider build (the only batch backend today). Both surface as a
-    /// parameter error the caller can act on — pick a cast whose synth is Anthropic.
+    /// missing synth slot is the loud call-time gap; a backend whose kind has no batch
+    /// lane is refused inside the provider build (`batch::submitter`). Both surface as a
+    /// parameter error the caller can act on — pick a cast whose synth is a batch-capable
+    /// backend.
     fn batch_submitter(
         &self,
         cast: &Cast,
@@ -1107,7 +1108,7 @@ impl KaiboHandler {
             .config
             .resolve_backend(&slot.backend)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let provider = crate::batch::anthropic_submit(backend, slot, &self.config.defaults)
+        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         Ok((provider, backend.name.clone(), slot.id.clone()))
     }
@@ -1123,29 +1124,29 @@ impl KaiboHandler {
             .config
             .resolve_backend(backend_name)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        crate::batch::anthropic_poll(backend)
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
+        crate::batch::poller(backend).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
     }
 
     /// The set of backend names `batch_list` should query. An explicit `backend` scopes
-    /// to that one (resolved by name/alias, and refused loudly if it isn't an Anthropic
-    /// kind — the only batch backend today). Omitted, it's every configured
-    /// Anthropic-kind backend, sorted — the orphan-recovery default. No Anthropic
-    /// backend at all is a clear parameter error, not an empty list pretending nothing's
-    /// there.
+    /// to that one (resolved by name/alias, and refused loudly if its kind has no batch
+    /// lane). Omitted, it's every configured batch-capable backend, sorted — the orphan-
+    /// recovery default. No batch-capable backend at all is a clear parameter error, not an
+    /// empty list pretending nothing's there.
     fn batch_backends(&self, backend: Option<&str>) -> Result<Vec<String>, McpError> {
-        use crate::credentials::ProviderKind;
         if let Some(name) = backend {
             let b = self
                 .config
                 .resolve_backend(name)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-            if b.kind != ProviderKind::Anthropic {
+            if !crate::batch::batch_supported(b.kind) {
                 return Err(McpError::invalid_params(
                     format!(
-                        "backend {:?} is {:?}; batch is anthropic-only today, so it can't \
-                         be listed. Omit `backend` to list every Anthropic backend.",
-                        b.name, b.kind
+                        "backend {:?} ({:?}) has no batch lane, so it can't be listed \
+                         (batch-capable: {}). Omit `backend` to list every batch-capable \
+                         backend.",
+                        b.name,
+                        b.kind,
+                        crate::batch::supported_kinds_list()
                     ),
                     None,
                 ));
@@ -1156,14 +1157,12 @@ impl KaiboHandler {
             .config
             .backends
             .values()
-            .filter(|b| b.kind == ProviderKind::Anthropic)
+            .filter(|b| crate::batch::batch_supported(b.kind))
             .map(|b| b.name.clone())
             .collect();
         if names.is_empty() {
             return Err(McpError::invalid_params(
-                "no Anthropic backend is configured — batch (and thus listing) is \
-                 anthropic-only today"
-                    .to_string(),
+                "no batch-capable backend is configured".to_string(),
                 None,
             ));
         }
@@ -1180,8 +1179,9 @@ impl KaiboHandler {
             loop) — so include the context each answer needs, the same as `oneshot`. \
             Batch maxes the knobs (forces high effort + a generous token budget) \
             regardless of how the cast was tuned for interactive use. Runs the cast's \
-            synth model; Anthropic is the only batch backend today (point `cast`/`model` \
-            at one, or get a clear refusal). Args: prompts (required, a list), cast \
+            synth model on a backend that supports batch; point `cast`/`model` at one (or \
+            get a clear refusal naming the batch-capable backends). `kaibo://config` lists \
+            the casts. Args: prompts (required, a list), cast \
             (optional), model + backend (optional synth override — handy to batch a \
             Pro/Opus tier a cast synths cheaper interactively). Returns a handle; poll \
             it with `batch_get`, stop it with `batch_cancel`. This is a fire-and-forget \
@@ -1232,8 +1232,10 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         // The handle namespaces the provider id by backend, so poll/cancel re-address it
-        // without re-specifying the cast — a backend name carries no '/', nor does a
-        // provider batch id, so the split is unambiguous.
+        // without re-specifying the cast. The split is unambiguous because a *backend
+        // name* carries no '/' (enforced at config load) — so the first '/' is always the
+        // backend/id boundary, even when the provider id itself contains slashes (a Gemini
+        // id is `batches/<id>`).
         let handle = format!("{backend_name}/{provider_id}");
         let msg = format!(
             "Submitted batch `{handle}` — {} prompt(s) on cast `{}` (model `{}`). \
@@ -1304,8 +1306,8 @@ impl KaiboHandler {
             way back to a batch whose handle you've lost (kaibo holds no state, so the \
             provider's own list is the source of truth). Each entry comes with its \
             ready-to-use handle, status, and progress; feed one to `batch_get` or \
-            `batch_cancel`. Omit `backend` to list across every Anthropic backend (the \
-            only batch kind today); pass one (name or alias) to scope it. A backend that \
+            `batch_cancel`. Omit `backend` to list across every batch-capable backend; \
+            pass one (name or alias) to scope it. A backend that \
             can't be reached (no key, endpoint down) is reported rather than hiding the \
             rest, and a truncated page says so. Args: backend (optional)."
     )]
@@ -2121,10 +2123,11 @@ fn consult_result(answer: String, report: String, include_report: bool) -> CallT
 /// `kaibo://config`, since the answering model is the whole variable. `roles` is the
 /// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
 /// Pure and offline-testable.
-/// Split a batch handle (`"backend/provider-id"`) the way `batch_submit` minted it. A
-/// backend name carries no `/`, and a provider batch id (`msgbatch_…`) carries no `/`,
-/// so the first split is unambiguous. A malformed handle is a loud parameter error —
-/// the caller pasted something that wasn't a kaibo batch id.
+/// Split a batch handle (`"backend/provider-id"`) the way `batch_submit` minted it.
+/// Splitting on the *first* `/` is unambiguous because a backend name carries no `/`
+/// (enforced at config load) — so the provider id keeps any slashes of its own (an
+/// Anthropic id is `msgbatch_…`; a Gemini id is `batches/<id>`). A malformed handle is a
+/// loud parameter error — the caller pasted something that wasn't a kaibo batch id.
 fn parse_batch_handle(handle: &str) -> Result<(&str, &str), McpError> {
     handle
         .split_once('/')

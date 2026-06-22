@@ -229,17 +229,11 @@ serialize the two (a shared `Mutex`/`serial_test`), or capture per-span without 
 on global dispatch. Out of scope when found (the read-idioms/output-cap PR).
 
 ### Batch — remaining providers and the many-casts fork
-The batch tool class shipped Anthropic-first (`src/batch.rs`,
-`batch_submit`/`batch_get`/`batch_cancel`, one `--no-batch` gate): offline, toolless,
-max-effort fan-out behind the `BatchProvider` seam, with the design rationale in the
-module doc and `docs/devlog.md`. What's left:
+The batch tool class shipped Anthropic- and Gemini-first (`src/batch.rs`,
+`batch_submit`/`batch_get`/`batch_cancel`/`batch_list`, one `--no-batch` gate): offline,
+toolless, max-effort fan-out behind the `BatchProvider` seam, with the design rationale
+in the module doc and `docs/devlog.md`. What's left:
 
-- **Gemini batch** — Amy's actual want (Pro is near-unusable interactively, so casts
-  synth Flash; batch is where you reach for Pro). Its own wire shape; confirm it with a
-  live probe before wiring, don't guess. Ships alongside a `gemini-batch` **cast**
-  (synth→Pro) — no schema change, today's cast machinery. (An explicit `batch` role slot
-  — one cast serving both interactive-synth and batch-synth — stays the deferred
-  alternative if the separate-cast approach turns clumsy.)
 - **OpenAI batch** — file-based (upload JSONL, reference a file id, poll, download an
   output file), unlike Anthropic's inline POST. The output file is left in place by
   default; add a `config.toml` flag to opt into cleanup for callers who'd rather not
@@ -254,7 +248,8 @@ module doc and `docs/devlog.md`. What's left:
   one knob to change.
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
-(next), OpenAI ✓ file-based, DeepSeek ?, local `openai` ✗.
+(shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
+DeepSeek ?, local `openai` ✗.
 
 ### Batch design hardening (cross-model Opus review, 2026-06-22)
 A cross-family review of the batch slice (Opus 4.8, run *through* `batch_submit` itself

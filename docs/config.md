@@ -184,7 +184,8 @@ The `[defaults]` knobs themselves:
 
 Four backends and four same-named single-backend casts ship **in code** and
 reproduce kaibo's historical behavior exactly, so a **missing config file is not
-an error**. The TOML *merges over* this registry by name: set one field on a
+an error**. One extra built-in cast ships too — `gemini-batch`, a Gemini cast whose
+synth is Pro, for the offline batch lane (see `batch_submit`). The TOML *merges over* this registry by name: set one field on a
 built-in to retarget it, or add brand-new backends and casts. The built-in alias
 names register at **both** levels — as cast aliases (so `cast = "claude"`
 resolves) and backend aliases (so a slot ref `claude/<id>` resolves) — and are
@@ -202,6 +203,7 @@ reserved: naming a new backend or cast after one is a loud collision error.
 | `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` |
 | `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` |
+| `gemini-batch` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-pro-latest` |
 | `openai` | `openai/Gemma-4-E4B-it-GGUF` | `openai/Gemma-4-26B-A4B-it-GGUF` |
 
 ### The chimera payoff

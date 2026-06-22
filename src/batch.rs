@@ -23,10 +23,12 @@
 //! **Per-provider HTTP seam.** rig-core has no batch path, so each provider is
 //! hand-rolled behind the [`BatchProvider`] trait — the same shape as the
 //! [`ImageGen`](crate::image_gen) seam (one trait, per-kind impls, honest refusal
-//! where absent). This slice ships **Anthropic Message Batches** ([`AnthropicBatch`]),
-//! whose requests ride inline in one POST; Gemini (its own shape) and OpenAI
-//! (file-based) are tracked follow-ons in `docs/issues.md`. A non-Anthropic backend is
-//! refused loudly at resolution, never a silent no-op.
+//! where absent). Two protocols ship: **Anthropic Message Batches** ([`AnthropicBatch`]),
+//! whose requests ride inline in one POST, and **Gemini batch** ([`GeminiBatch`]), whose
+//! inline requests nest under `input_config.requests` and whose results come back inline
+//! in the batch's long-running-operation object (no separate results URL). OpenAI batch
+//! (file-based) is a tracked follow-on in `docs/issues.md`. An unsupported backend kind
+//! is refused loudly at resolution ([`submitter`]/[`poller`]), never a silent no-op.
 //!
 //! **No persistent state.** kaibo holds nothing on disk; a batch id *is* the provider's
 //! own id, so poll/cancel rebuild a fresh client from the backend and re-address it. A
@@ -94,6 +96,12 @@ pub enum BatchPoll {
     Cancelling,
     /// Finished — every item's outcome, succeeded or not.
     Done(Vec<BatchAnswer>),
+    /// The whole batch reached a terminal *non-success* state with no per-item results
+    /// to hand back (a Gemini cancel/fail/expire, which is instant-terminal rather than
+    /// Anthropic's interim `Cancelling`). `state` is the provider's raw state string;
+    /// `message` is its reason. Distinct from `Done(vec![])` — that would render as
+    /// "0 results" and read like success; this names the failure honestly.
+    Failed { state: String, message: String },
 }
 
 /// One batch as the provider's list endpoint reports it — enough to re-address and
@@ -399,6 +407,9 @@ pub fn render_poll(poll: &BatchPoll, label: &str) -> String {
             s.push_str(&format!("\n———\nkaibo · batch · {label}"));
             s
         }
+        BatchPoll::Failed { state, message } => {
+            format!("Batch ended in {state} — {message}. No per-item results to return.")
+        }
     }
 }
 
@@ -465,25 +476,14 @@ impl AnthropicBatch {
     fn require_anthropic(backend: &Backend) -> Result<()> {
         if backend.kind != ProviderKind::Anthropic {
             return Err(anyhow!(
-                "batch is only available on anthropic-kind backends today; backend {:?} \
-                 is {:?}. Gemini and OpenAI batch are tracked follow-ons (docs/issues.md) \
-                 — point the cast's synth slot at an Anthropic backend to batch now.",
+                "this is the Anthropic batch provider, but backend {:?} is {:?}. \
+                 (Batch dispatch should never route a non-Anthropic backend here; see \
+                 `submitter`/`poller`.)",
                 backend.name,
                 backend.kind
             ));
         }
         Ok(())
-    }
-
-    /// A reqwest client carrying the backend's per-request deadline. Same TLS wiring as
-    /// every other client build site: install ring before `.build()`.
-    fn http_client(backend: &Backend) -> Result<reqwest::Client> {
-        crate::tls::ensure_crypto_provider();
-        reqwest::Client::builder()
-            .timeout(backend.request_timeout)
-            .connect_timeout(backend.request_timeout.min(Duration::from_secs(10)))
-            .build()
-            .map_err(|e| anyhow!("http client init: {e}"))
     }
 
     /// A submit-capable client: the cast's synth slot, shaped to batch's maxed knobs.
@@ -492,7 +492,7 @@ impl AnthropicBatch {
         let tunables = slot.tunables(ModelRole::Synth, defaults);
         let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
         Ok(Self {
-            http: Self::http_client(backend)?,
+            http: batch_http_client(backend)?,
             api_key: backend.resolve_key()?,
             model: slot.id.clone(),
             max_tokens,
@@ -505,7 +505,7 @@ impl AnthropicBatch {
     pub fn from_backend(backend: &Backend) -> Result<Self> {
         Self::require_anthropic(backend)?;
         Ok(Self {
-            http: Self::http_client(backend)?,
+            http: batch_http_client(backend)?,
             api_key: backend.resolve_key()?,
             model: String::new(),
             max_tokens: 0,
@@ -638,21 +638,462 @@ impl BatchProvider for AnthropicBatch {
     }
 }
 
-/// Build a submit-capable provider from a resolved cast slot + backend (refuses a
-/// non-Anthropic backend honestly).
-pub fn anthropic_submit(
+// --- Gemini provider -------------------------------------------------------
+
+/// Gemini's API base. The keyed Gemini backend carries no `base_url` (rig fixes its
+/// endpoint), so batch addresses the service directly, as Anthropic does.
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// A reqwest client carrying the backend's per-request deadline, with ring installed
+/// before `.build()` (the TLS invariant — every client build site does this). Shared by
+/// both batch providers.
+fn batch_http_client(backend: &Backend) -> Result<reqwest::Client> {
+    crate::tls::ensure_crypto_provider();
+    reqwest::Client::builder()
+        .timeout(backend.request_timeout)
+        .connect_timeout(backend.request_timeout.min(Duration::from_secs(10)))
+        .build()
+        .map_err(|e| anyhow!("http client init: {e}"))
+}
+
+/// Read a (possibly string-encoded) count field. Gemini's `batchStats` numbers arrive as
+/// JSON *strings* (`"1"`), not numbers — `as_u64` alone would silently read them as 0,
+/// the kind of quiet miscount the project forbids. A missing/garbage field is 0.
+fn gemini_num(v: &Value, key: &str) -> u64 {
+    match v.get(key) {
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Progress `(completed, total)` from a batch's `metadata.batchStats`. `completed` sums
+/// the terminal buckets (succeeded + failed); `total` is `requestCount`. Shared by the
+/// status poll and the list view so both count progress the same way.
+fn gemini_progress(meta: Option<&Value>) -> (u64, u64) {
+    let stats = meta.and_then(|m| m.get("batchStats"));
+    let n = |k: &str| stats.map(|s| gemini_num(s, k)).unwrap_or(0);
+    (
+        n("successfulRequestCount") + n("failedRequestCount"),
+        n("requestCount"),
+    )
+}
+
+/// Join the non-thought `text` parts of a Gemini response's first candidate. With
+/// `includeThoughts` on, the reasoning rides as separate `"thought": true` parts; those
+/// are the model's scratchpad, not its answer, so the answer is the text parts that are
+/// *not* thoughts (a final answer part may still carry a `thoughtSignature` — that's not
+/// a thought part, so it stays).
+fn gemini_message_text(response: &Value) -> String {
+    response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Locate a batch's inlined per-item responses. Gemini puts them in the long-running
+/// operation's `response.inlinedResponses.inlinedResponses` once done; the same array is
+/// mirrored under `metadata.output.inlinedResponses.inlinedResponses`, so we accept
+/// either (the LRO result first).
+fn gemini_inlined_array(v: &Value) -> Option<&Vec<Value>> {
+    fn at(root: &Value) -> Option<&Vec<Value>> {
+        root.get("inlinedResponses")
+            .and_then(|i| i.get("inlinedResponses"))
+            .and_then(Value::as_array)
+    }
+    v.get("response")
+        .and_then(at)
+        .or_else(|| v.get("metadata").and_then(|m| m.get("output")).and_then(at))
+}
+
+/// Parse the inlined-responses array into per-item [`BatchAnswer`]s. Each element carries
+/// its `metadata.key` plus either a `response` (the model's content) or an `error`
+/// (surfaced per item, never silently dropped — the Anthropic per-item ethos).
+fn parse_gemini_inlined(arr: &[Value]) -> Vec<BatchAnswer> {
+    arr.iter()
+        .map(|el| {
+            let custom_id = el
+                .get("metadata")
+                .and_then(|m| m.get("key"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let text = if let Some(resp) = el.get("response") {
+                Ok(gemini_message_text(resp))
+            } else if let Some(err) = el.get("error") {
+                let detail = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| err.to_string());
+                Err(format!("provider error: {detail}"))
+            } else {
+                Err("no response or error in result item".to_string())
+            };
+            BatchAnswer { custom_id, text }
+        })
+        .collect()
+}
+
+/// Pull the batch's operation `name` (`batches/<id>`) out of a submit/status response.
+fn parse_gemini_name(v: &Value) -> Result<String> {
+    v.get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("gemini batch response has no string `name`: {v}"))
+}
+
+/// Map a status response onto a [`BatchPoll`]. The `state` enum drives it: pending/running
+/// → progress; succeeded → the inlined results; cancelled/failed/expired → either the
+/// partial results that *did* land before the terminal event, or (none) a [`Failed`] that
+/// names the state honestly rather than a misleading empty `Done`.
+///
+/// [`Failed`]: BatchPoll::Failed
+fn parse_gemini_poll(v: &Value) -> Result<BatchPoll> {
+    let meta = v.get("metadata");
+    let state = meta
+        .and_then(|m| m.get("state"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("gemini batch has no `metadata.state`: {v}"))?;
+    match state {
+        "BATCH_STATE_PENDING" | "BATCH_STATE_RUNNING" => {
+            let (completed, total) = gemini_progress(meta);
+            Ok(BatchPoll::Pending { completed, total })
+        }
+        "BATCH_STATE_SUCCEEDED" => {
+            let arr = gemini_inlined_array(v).ok_or_else(|| {
+                anyhow!(
+                    "succeeded gemini batch has no inlined responses — a file-based output \
+                     (responsesFile) isn't supported; kaibo only submits inline batches: {v}"
+                )
+            })?;
+            Ok(BatchPoll::Done(parse_gemini_inlined(arr)))
+        }
+        "BATCH_STATE_CANCELLED" | "BATCH_STATE_FAILED" | "BATCH_STATE_EXPIRED" => {
+            // Items that finished before the terminal event still carry results — hand
+            // those back rather than throwing them away.
+            if let Some(arr) = gemini_inlined_array(v) {
+                if !arr.is_empty() {
+                    return Ok(BatchPoll::Done(parse_gemini_inlined(arr)));
+                }
+            }
+            let message = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "batch did not complete".to_string());
+            Ok(BatchPoll::Failed {
+                state: state.to_string(),
+                message,
+            })
+        }
+        other => Err(anyhow!("unknown gemini batch state {other:?}: {v}")),
+    }
+}
+
+/// Parse one operation from the list endpoint into a [`BatchListItem`]. The operation
+/// `name` (`batches/<id>`) is the provider id; status is the raw `metadata.state`.
+fn parse_gemini_list_item(op: &Value) -> Result<BatchListItem> {
+    let provider_id = op
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("gemini batch list item has no `name`: {op}"))?
+        .to_string();
+    let meta = op.get("metadata");
+    let status = meta
+        .and_then(|m| m.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("BATCH_STATE_UNSPECIFIED")
+        .to_string();
+    let (completed, total) = gemini_progress(meta);
+    let created_at = meta
+        .and_then(|m| m.get("createTime"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(BatchListItem {
+        provider_id,
+        status,
+        completed,
+        total,
+        created_at,
+    })
+}
+
+/// Parse the list endpoint's `{ operations: [...], nextPageToken }` page. A `nextPageToken`
+/// means more exist (so a truncated view announces itself); an absent `operations` key is
+/// an empty page (the endpoint omits it when there are no batches), not an error.
+fn parse_gemini_list(v: &Value) -> Result<(Vec<BatchListItem>, bool)> {
+    let items = match v.get("operations").and_then(Value::as_array) {
+        Some(ops) => ops
+            .iter()
+            .map(parse_gemini_list_item)
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let has_more = v
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    Ok((items, has_more))
+}
+
+/// Build the Gemini inline-batch request body. Each item becomes one
+/// `{ request: GenerateContentRequest, metadata: { key } }`: the shared `system` rides as
+/// `systemInstruction`, the prompt as a single user `content`, and `maxOutputTokens` is
+/// merged into the `generationConfig` the maxed thinking block already produced (Gemini
+/// nests the completion budget *and* `thinkingConfig` there, unlike Anthropic's top-level
+/// `max_tokens` — so the bodies can't be shared). Pure so the wire shape is pinned without
+/// a network.
+pub fn gemini_batch_body(
+    max_tokens: u64,
+    system: &str,
+    params: &Option<Value>,
+    items: &[BatchItem],
+) -> Value {
+    let requests: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            // Start from the shaping's generationConfig (the thinking block) and fold the
+            // floored completion budget in beside it.
+            let mut gen = params
+                .as_ref()
+                .and_then(|p| p.get("generationConfig"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            gen.insert("maxOutputTokens".into(), json!(max_tokens));
+            let mut req = Map::new();
+            if !system.is_empty() {
+                req.insert(
+                    "systemInstruction".into(),
+                    json!({ "parts": [{ "text": system }] }),
+                );
+            }
+            req.insert(
+                "contents".into(),
+                json!([{ "role": "user", "parts": [{ "text": it.prompt }] }]),
+            );
+            req.insert("generationConfig".into(), Value::Object(gen));
+            json!({ "request": Value::Object(req), "metadata": { "key": it.custom_id } })
+        })
+        .collect();
+    json!({
+        "batch": {
+            "display_name": "kaibo-batch",
+            "input_config": { "requests": { "requests": requests } }
+        }
+    })
+}
+
+/// Gemini batch over HTTP. Mirrors [`AnthropicBatch`]: holds the connection (client, key,
+/// base) plus the per-submit shaping (model, floored `max_tokens`, the maxed thinking
+/// block). Poll/cancel/list need only the connection, so a [`from_backend`](Self::from_backend)
+/// client (no model) drives those after a restart.
+pub struct GeminiBatch {
+    http: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    /// Submit-only: empty on a poll/cancel-only client.
+    model: String,
+    max_tokens: u64,
+    params: Option<Value>,
+}
+
+impl GeminiBatch {
+    /// Refuse a non-Gemini backend loudly — dispatch ([`submitter`]/[`poller`]) should
+    /// never route one here, so this is a belt-and-suspenders contract guard.
+    fn require_gemini(backend: &Backend) -> Result<()> {
+        if backend.kind != ProviderKind::Gemini {
+            return Err(anyhow!(
+                "this is the Gemini batch provider, but backend {:?} is {:?}. (Batch \
+                 dispatch should never route a non-Gemini backend here; see \
+                 `submitter`/`poller`.)",
+                backend.name,
+                backend.kind
+            ));
+        }
+        Ok(())
+    }
+
+    fn base_url(backend: &Backend) -> String {
+        backend
+            .base_url
+            .clone()
+            .unwrap_or_else(|| GEMINI_API_BASE.to_string())
+    }
+
+    /// A submit-capable client: the cast's synth slot, shaped to batch's maxed knobs.
+    pub fn from_slot(backend: &Backend, slot: &ModelSlot, defaults: &Defaults) -> Result<Self> {
+        Self::require_gemini(backend)?;
+        let tunables = slot.tunables(ModelRole::Synth, defaults);
+        let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
+        Ok(Self {
+            http: batch_http_client(backend)?,
+            api_key: backend.resolve_key()?,
+            base_url: Self::base_url(backend),
+            model: slot.id.clone(),
+            max_tokens,
+            params,
+        })
+    }
+
+    /// A poll/cancel/list-only client (no model).
+    pub fn from_backend(backend: &Backend) -> Result<Self> {
+        Self::require_gemini(backend)?;
+        Ok(Self {
+            http: batch_http_client(backend)?,
+            api_key: backend.resolve_key()?,
+            base_url: Self::base_url(backend),
+            model: String::new(),
+            max_tokens: 0,
+            params: None,
+        })
+    }
+
+    /// GET/POST a JSON object, returning the parsed body or a loud error with the raw text.
+    async fn send_json(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Value> {
+        let resp = req
+            .header("x-goog-api-key", &self.api_key)
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .map_err(|e| anyhow!("gemini batch {what} failed: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow!("reading gemini batch {what} body: {e}"))?;
+        if !status.is_success() {
+            return Err(anyhow!("gemini batch {what} {status}: {text}"));
+        }
+        serde_json::from_str(&text).with_context(|| format!("parsing gemini batch {what}: {text}"))
+    }
+}
+
+#[async_trait]
+impl BatchProvider for GeminiBatch {
+    async fn submit(&self, system: &str, items: &[BatchItem]) -> Result<String> {
+        if self.model.is_empty() {
+            return Err(anyhow!(
+                "this batch client was built for poll/cancel only (no model) — submit \
+                 needs a synth slot"
+            ));
+        }
+        if items.is_empty() {
+            return Err(anyhow!("a batch needs at least one prompt"));
+        }
+        let body = gemini_batch_body(self.max_tokens, system, &self.params, items);
+        let url = format!(
+            "{}/models/{}:batchGenerateContent",
+            self.base_url, self.model
+        );
+        let v = self
+            .send_json(
+                self.http.post(&url).body(serde_json::to_vec(&body)?),
+                "submit",
+            )
+            .await?;
+        parse_gemini_name(&v)
+    }
+
+    async fn poll(&self, batch_id: &str) -> Result<BatchPoll> {
+        let url = format!("{}/{}", self.base_url, batch_id);
+        let v = self.send_json(self.http.get(&url), "status").await?;
+        parse_gemini_poll(&v)
+    }
+
+    async fn cancel(&self, batch_id: &str) -> Result<()> {
+        let url = format!("{}/{}:cancel", self.base_url, batch_id);
+        self.send_json(self.http.post(&url), "cancel").await?;
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<(Vec<BatchListItem>, bool)> {
+        // One page at the API's max (100), newest-first by default; `nextPageToken` rides
+        // back as `has_more` so a truncated view announces itself (orphan recovery wants
+        // the recent tail).
+        let url = format!("{}/batches?pageSize=100", self.base_url);
+        let v = self.send_json(self.http.get(&url), "list").await?;
+        parse_gemini_list(&v)
+    }
+}
+
+// --- Dispatch --------------------------------------------------------------
+
+/// Does this provider kind have a batch lane? The single source of truth — dispatch
+/// ([`submitter`]/[`poller`]), `batch_list`'s backend filter, and refusal messages all
+/// defer to it, so adding a provider is a one-line change here. Keep the `matches!` arm in
+/// step with the per-kind impls below.
+pub fn batch_supported(kind: ProviderKind) -> bool {
+    matches!(kind, ProviderKind::Anthropic | ProviderKind::Gemini)
+}
+
+/// The batch-capable kinds as a display list, derived from [`batch_supported`] so a refusal
+/// names the live set without a hand-maintained string that drifts as providers are added.
+pub fn supported_kinds_list() -> String {
+    [
+        ProviderKind::Anthropic,
+        ProviderKind::DeepSeek,
+        ProviderKind::Gemini,
+        ProviderKind::Openai,
+    ]
+    .into_iter()
+    .filter(|k| batch_supported(*k))
+    .map(ProviderKind::canonical_name)
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// The refusal for an unsupported backend kind — shared by [`submitter`] and [`poller`] so
+/// the message stays in one place. Names the live supported set via [`supported_kinds_list`].
+fn unsupported(backend: &Backend) -> anyhow::Error {
+    anyhow!(
+        "backend {:?} ({:?}) has no batch lane. Point the cast's synth slot at a \
+         batch-capable backend ({}); `kaibo://config` lists the casts.",
+        backend.name,
+        backend.kind,
+        supported_kinds_list()
+    )
+}
+
+/// Build a submit-capable provider from a resolved cast slot + backend, dispatching on the
+/// backend kind. An unsupported kind is refused honestly (the [`ImageGen`](crate::image_gen)
+/// posture).
+pub fn submitter(
     backend: &Backend,
     slot: &ModelSlot,
     defaults: &Defaults,
 ) -> Result<Arc<dyn BatchProvider>> {
-    Ok(Arc::new(AnthropicBatch::from_slot(
-        backend, slot, defaults,
-    )?))
+    match backend.kind {
+        ProviderKind::Anthropic => Ok(Arc::new(AnthropicBatch::from_slot(
+            backend, slot, defaults,
+        )?)),
+        ProviderKind::Gemini => Ok(Arc::new(GeminiBatch::from_slot(backend, slot, defaults)?)),
+        _ => Err(unsupported(backend)),
+    }
 }
 
-/// Build a poll/cancel-only provider from a resolved backend.
-pub fn anthropic_poll(backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
-    Ok(Arc::new(AnthropicBatch::from_backend(backend)?))
+/// Build a poll/cancel/list-only provider from a resolved backend, dispatching on kind.
+pub fn poller(backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
+    match backend.kind {
+        ProviderKind::Anthropic => Ok(Arc::new(AnthropicBatch::from_backend(backend)?)),
+        ProviderKind::Gemini => Ok(Arc::new(GeminiBatch::from_backend(backend)?)),
+        _ => Err(unsupported(backend)),
+    }
 }
 
 #[cfg(test)]
@@ -933,10 +1374,12 @@ mod tests {
         assert!(matches!(&answers[2].text, Err(m) if m.contains("expired")));
     }
 
-    /// A non-Anthropic backend is refused at construction — this slice has no batch
-    /// path for the other protocols. Honest absence, the ImageGen posture.
+    /// The Anthropic provider refuses any non-Anthropic backend at construction — the
+    /// belt-and-suspenders guard behind dispatch (which should never route one here).
+    /// Honest absence, the ImageGen posture. (Cross-kind *dispatch* refusal is covered by
+    /// `dispatch_refuses_unsupported_kinds`.)
     #[test]
-    fn non_anthropic_backend_refused() {
+    fn anthropic_provider_refuses_non_anthropic() {
         for kind in [
             ProviderKind::DeepSeek,
             ProviderKind::Gemini,
@@ -950,7 +1393,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("non-anthropic batch ({kind:?}) must be refused"));
             assert!(
-                err.to_string().contains("only available on anthropic-kind"),
+                err.to_string().contains("Anthropic batch provider"),
                 "error should explain the anthropic-only constraint: {err}"
             );
         }
@@ -1071,6 +1514,313 @@ mod tests {
         assert!(out.contains("the answer"));
         assert!(out.contains("[1] — failed: expired"));
         assert!(out.contains("kaibo · batch · anthropic · claude-sonnet-4-6"));
+    }
+
+    // --- Gemini ------------------------------------------------------------
+
+    /// Gemini's maxed shape lands in `generationConfig` (the completion budget is nested
+    /// there, not top-level): a budget-tier id carries `thinkingConfig.thinkingBudget`.
+    #[test]
+    fn gemini_shaping_nests_thinking_in_generation_config() {
+        let (max_tokens, params) = batch_shaping(
+            ProviderKind::Gemini,
+            "gemini-3.5-flash",
+            &tunables("high", 100),
+        );
+        assert!(max_tokens >= BATCH_MAX_TOKENS_FLOOR);
+        let params = params.expect("a gemini slot carries a thinking block");
+        let tc = &params["generationConfig"]["thinkingConfig"];
+        assert!(
+            tc["thinkingBudget"].as_u64().unwrap() >= BATCH_THINKING_BUDGET,
+            "gemini batch floors the thinking budget: {params}"
+        );
+    }
+
+    /// A pure `gemini-3-*` line id takes `thinkingLevel`, forced to BATCH_EFFORT — the
+    /// per-role effort lever, not a token budget. (The `gemini-batch` cast itself synths
+    /// `gemini-pro-latest`, which classifies as a *budget*-tier id; this exercises the
+    /// other Gemini thinking tier so both paths through `batch_shaping` are covered.)
+    #[test]
+    fn gemini_3_line_uses_thinking_level_at_batch_effort() {
+        let (_max, params) = batch_shaping(
+            ProviderKind::Gemini,
+            "gemini-3-pro-preview",
+            &tunables("low", 100),
+        );
+        let params = params.expect("a gemini-3 line carries a thinking block");
+        assert_eq!(
+            params["generationConfig"]["thinkingConfig"]["thinkingLevel"], BATCH_EFFORT,
+            "the 3-line forces BATCH_EFFORT as thinkingLevel: {params}"
+        );
+    }
+
+    /// The body nests maxOutputTokens *beside* the shaping's thinkingConfig in one
+    /// generationConfig (Gemini's shape, not Anthropic's top-level max_tokens), carries
+    /// the shared system as systemInstruction, and keys each item by its custom_id.
+    #[test]
+    fn gemini_body_merges_system_maxtokens_and_thinking() {
+        let (max_tokens, params) = batch_shaping(
+            ProviderKind::Gemini,
+            "gemini-3-pro-preview",
+            &tunables("high", 0),
+        );
+        let items = vec![
+            BatchItem {
+                custom_id: "0".into(),
+                prompt: "first".into(),
+            },
+            BatchItem {
+                custom_id: "1".into(),
+                prompt: "second".into(),
+            },
+        ];
+        let body = gemini_batch_body(max_tokens, "be terse", &params, &items);
+        let reqs = body["batch"]["input_config"]["requests"]["requests"]
+            .as_array()
+            .expect("requests array");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0]["metadata"]["key"], "0");
+        assert_eq!(
+            reqs[0]["request"]["systemInstruction"]["parts"][0]["text"],
+            "be terse"
+        );
+        assert_eq!(
+            reqs[0]["request"]["contents"][0]["parts"][0]["text"],
+            "first"
+        );
+        let gc = &reqs[0]["request"]["generationConfig"];
+        // maxOutputTokens and the thinking block coexist in one generationConfig.
+        assert_eq!(gc["maxOutputTokens"].as_u64().unwrap(), max_tokens);
+        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "high");
+        assert_eq!(reqs[1]["metadata"]["key"], "1");
+        assert_eq!(
+            reqs[1]["request"]["contents"][0]["parts"][0]["text"],
+            "second"
+        );
+    }
+
+    /// An empty system prompt omits systemInstruction entirely (Gemini rejects an empty
+    /// one) rather than sending a blank block.
+    #[test]
+    fn gemini_body_omits_empty_system() {
+        let items = vec![BatchItem {
+            custom_id: "0".into(),
+            prompt: "q".into(),
+        }];
+        let body = gemini_batch_body(1024, "", &None, &items);
+        let req = &body["batch"]["input_config"]["requests"]["requests"][0]["request"];
+        assert!(
+            req.get("systemInstruction").is_none(),
+            "empty system must be omitted: {req}"
+        );
+        // maxOutputTokens still lands even with no shaping params.
+        assert_eq!(
+            req["generationConfig"]["maxOutputTokens"].as_u64().unwrap(),
+            1024
+        );
+    }
+
+    #[test]
+    fn gemini_name_reads_or_errors() {
+        assert_eq!(
+            parse_gemini_name(&json!({ "name": "batches/abc123" })).unwrap(),
+            "batches/abc123"
+        );
+        assert!(parse_gemini_name(&json!({ "no": "name" })).is_err());
+    }
+
+    /// batchStats counts arrive as JSON *strings*; progress reads them anyway (a number
+    /// read as 0 would be a silent miscount). completed = succeeded + failed.
+    #[test]
+    fn gemini_progress_reads_string_counts() {
+        let v = json!({ "metadata": { "batchStats": {
+            "requestCount": "10", "pendingRequestCount": "7",
+            "successfulRequestCount": "2", "failedRequestCount": "1"
+        }}});
+        assert_eq!(gemini_progress(v.get("metadata")), (3, 10));
+    }
+
+    #[test]
+    fn gemini_poll_pending_running_and_unknown() {
+        let pend = json!({ "metadata": { "state": "BATCH_STATE_PENDING",
+            "batchStats": { "requestCount": "2", "pendingRequestCount": "2" } } });
+        assert_eq!(
+            parse_gemini_poll(&pend).unwrap(),
+            BatchPoll::Pending {
+                completed: 0,
+                total: 2
+            }
+        );
+        let run = json!({ "metadata": { "state": "BATCH_STATE_RUNNING",
+            "batchStats": { "requestCount": "2", "successfulRequestCount": "1" } } });
+        assert_eq!(
+            parse_gemini_poll(&run).unwrap(),
+            BatchPoll::Pending {
+                completed: 1,
+                total: 2
+            }
+        );
+        // No state, or an unknown one, is a broken contract surfaced loudly.
+        assert!(parse_gemini_poll(&json!({ "metadata": {} })).is_err());
+        assert!(parse_gemini_poll(&json!({ "metadata": { "state": "WAT" } })).is_err());
+    }
+
+    /// A succeeded batch yields per-item answers; thought parts are filtered out of the
+    /// text, a final answer part keeping its thoughtSignature stays, and a per-item error
+    /// is surfaced rather than dropped.
+    #[test]
+    fn gemini_poll_succeeded_parses_inlined() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_SUCCEEDED" },
+            "response": { "inlinedResponses": { "inlinedResponses": [
+                { "metadata": { "key": "0" }, "response": { "candidates": [ { "content": { "parts": [
+                    { "text": "thinking out loud", "thought": true },
+                    { "text": "the ", "thoughtSignature": "sig" },
+                    { "text": "answer" }
+                ] } } ] } },
+                { "metadata": { "key": "1" }, "error": { "code": 7, "message": "permission denied" } }
+            ] } }
+        });
+        let poll = parse_gemini_poll(&v).unwrap();
+        let answers = match poll {
+            BatchPoll::Done(a) => a,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].custom_id, "0");
+        // Thought part dropped; the two real text parts joined; the signature is irrelevant.
+        assert_eq!(answers[0].text, Ok("the answer".to_string()));
+        assert!(matches!(&answers[1].text, Err(m) if m.contains("permission denied")));
+    }
+
+    /// A cancelled batch with no partial results is a [`BatchPoll::Failed`] naming the
+    /// state and reason — not a misleading empty `Done`. (Gemini cancel is instant-
+    /// terminal, so there's no `Cancelling` interim like Anthropic's.)
+    #[test]
+    fn gemini_poll_cancelled_with_no_results_is_failed() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_CANCELLED",
+                "batchStats": { "requestCount": "1", "pendingRequestCount": "1" } },
+            "error": { "code": 13, "message": "Batch x failed without error." }
+        });
+        assert_eq!(
+            parse_gemini_poll(&v).unwrap(),
+            BatchPoll::Failed {
+                state: "BATCH_STATE_CANCELLED".into(),
+                message: "Batch x failed without error.".into()
+            }
+        );
+    }
+
+    /// A cancelled batch that *did* finish some items before the terminal event hands
+    /// those partial results back rather than throwing them away.
+    #[test]
+    fn gemini_poll_cancelled_with_partials_is_done() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_CANCELLED",
+                "output": { "inlinedResponses": { "inlinedResponses": [
+                    { "metadata": { "key": "0" }, "response": { "candidates": [ { "content": { "parts": [ { "text": "done in time" } ] } } ] } }
+                ] } } }
+        });
+        match parse_gemini_poll(&v).unwrap() {
+            BatchPoll::Done(a) => {
+                assert_eq!(a.len(), 1);
+                assert_eq!(a[0].text, Ok("done in time".to_string()));
+            }
+            other => panic!("expected Done with partials, got {other:?}"),
+        }
+    }
+
+    /// A succeeded batch whose output is a file (not inline) is refused loudly — kaibo only
+    /// submits inline batches, so a file output is an unhandled shape, not silent emptiness.
+    #[test]
+    fn gemini_poll_succeeded_without_inline_errors() {
+        let v = json!({ "metadata": { "state": "BATCH_STATE_SUCCEEDED",
+            "output": { "responsesFile": "files/abc" } } });
+        assert!(parse_gemini_poll(&v).is_err());
+    }
+
+    /// The list endpoint reads `operations` (not `data`) and treats `nextPageToken` as the
+    /// has-more flag. The operation `name` is the provider id (`batches/<id>`).
+    #[test]
+    fn gemini_list_parses_operations_and_page_token() {
+        let v = json!({
+            "operations": [
+                { "name": "batches/aaa", "metadata": { "state": "BATCH_STATE_RUNNING",
+                    "createTime": "2026-06-22T00:00:00Z",
+                    "batchStats": { "requestCount": "4", "successfulRequestCount": "1" } } },
+                { "name": "batches/bbb", "metadata": { "state": "BATCH_STATE_SUCCEEDED",
+                    "batchStats": { "requestCount": "2", "successfulRequestCount": "2" } } }
+            ],
+            "nextPageToken": "tok"
+        });
+        let (items, has_more) = parse_gemini_list(&v).unwrap();
+        assert!(has_more);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].provider_id, "batches/aaa");
+        assert_eq!(items[0].status, "BATCH_STATE_RUNNING");
+        assert_eq!((items[0].completed, items[0].total), (1, 4));
+        assert_eq!(items[0].created_at.as_deref(), Some("2026-06-22T00:00:00Z"));
+        // An empty list omits `operations` entirely — that's an empty page, not an error.
+        let (empty, more) = parse_gemini_list(&json!({})).unwrap();
+        assert!(empty.is_empty() && !more);
+    }
+
+    /// A non-Gemini backend is refused at GeminiBatch construction — the dispatch guard.
+    #[test]
+    fn gemini_provider_refuses_non_gemini() {
+        let mut b = anthropic_backend();
+        b.kind = ProviderKind::Anthropic;
+        let slot = ModelSlot::bare(&b.name, "claude-sonnet-4-6");
+        let err = GeminiBatch::from_slot(&b, &slot, &Defaults::default())
+            .err()
+            .expect("non-gemini must be refused");
+        assert!(err.to_string().contains("Gemini batch provider"), "{err}");
+    }
+
+    /// Dispatch refuses a kind with no batch lane (DeepSeek / local openai) and points at
+    /// the supported casts; `batch_supported` agrees with that set.
+    #[test]
+    fn dispatch_refuses_unsupported_kinds() {
+        assert!(batch_supported(ProviderKind::Anthropic));
+        assert!(batch_supported(ProviderKind::Gemini));
+        assert!(!batch_supported(ProviderKind::DeepSeek));
+        assert!(!batch_supported(ProviderKind::Openai));
+        for kind in [ProviderKind::DeepSeek, ProviderKind::Openai] {
+            let mut b = anthropic_backend();
+            b.kind = kind;
+            b.name = format!("{kind:?}").to_lowercase();
+            let slot = ModelSlot::bare(&b.name, "m");
+            let err = submitter(&b, &slot, &Defaults::default())
+                .err()
+                .unwrap_or_else(|| panic!("{kind:?} must be refused"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no batch lane"),
+                "refusal explains the gap: {err}"
+            );
+            // The supported set is named dynamically from `batch_supported`, so the message
+            // tracks the live set rather than a hand-maintained string.
+            assert!(
+                msg.contains("anthropic") && msg.contains("gemini"),
+                "refusal names the live supported set: {err}"
+            );
+            assert!(poller(&b).is_err());
+        }
+    }
+
+    /// Failed renders a clear terminal line (state + reason), not a "0 results" success.
+    #[test]
+    fn render_failed_names_state_and_reason() {
+        let out = render_poll(
+            &BatchPoll::Failed {
+                state: "BATCH_STATE_EXPIRED".into(),
+                message: "ran past its 24h window".into(),
+            },
+            "gemini · gemini-3-pro-preview",
+        );
+        assert!(out.contains("BATCH_STATE_EXPIRED"));
+        assert!(out.contains("ran past its 24h window"));
     }
 
     /// The scripted provider drives a full submit → pending → done flow offline.

@@ -14,6 +14,71 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — batch: Gemini provider (second backend behind the seam)
+
+Added the second `BatchProvider` impl — Gemini inline batch — so the offline lane reaches
+the model Amy actually wants there: Gemini **Pro**. Pro is near-unusable interactively
+(slow), but batch is exactly where that latency is free, so it's the natural home for it.
+Shipped a ready-made `gemini-batch` **cast** (synth → `gemini-pro-latest`) rather than
+adding a `batch` role slot to the schema — today's cast machinery already expresses "a
+team whose synth is Pro," and the per-call `model`/`backend` override covers the rest. The
+deferred `batch`-role-slot alternative stays parked; it earns its keep only if one cast
+needing *both* a cheap interactive synth and a Pro batch synth becomes common.
+
+The seam paid off: the trait, the stateless `backend/provider-id` handle, the
+ScriptedBatch offline harness, and the four verbs were all reused unchanged. What's
+genuinely Gemini-shaped lives in pure, offline-tested functions, and dispatch moved into
+`batch.rs` (`submitter`/`poller`/`batch_supported`) so `server.rs` no longer hardcodes a
+provider — it asks the module, and an unsupported kind is refused in one place.
+
+**Probed the wire shape, didn't guess** (the CLAUDE.md rule, and the `issues.md` entry
+demanded it). The live probe earned its keep — Gemini's batch differs from Anthropic's in
+ways no amount of reading would have settled:
+
+- **Body shape can't be shared.** Gemini nests *both* the completion budget
+  (`maxOutputTokens`) and the thinking block under one `generationConfig`, where Anthropic
+  carries `max_tokens` top-level. So `gemini_batch_body` folds the floored budget into the
+  `generationConfig` that `ModelShape::to_params` already produced, beside `thinkingConfig`
+  — and the maxed-knobs shaping (`batch_shaping`) was reused verbatim across both.
+- **Results come back inline in the long-running-operation object**, not behind a separate
+  results URL (Anthropic's `results_url` + JSONL). No second fetch.
+- **`batchStats` counts arrive as JSON strings** (`"7"`), not numbers — `as_u64` alone
+  would have silently read them as 0, exactly the quiet miscount the project forbids. The
+  count reader handles both.
+- **Cancel is instant-terminal**, not Anthropic's interim "canceling" you poll through. A
+  cancelled/failed/expired Gemini batch is `done:true` immediately with a top-level
+  operation error and (usually) no per-item output. `Done(vec![])` would render as
+  "0 results" and read like success — wrong — so added a `BatchPoll::Failed { state,
+  message }` variant that names the terminal state honestly. Partial results that *did*
+  land before the terminal event are still handed back as `Done`.
+- **List lives under `operations`** (not `data`) and paginates via `nextPageToken` (not
+  `has_more`); an empty list omits the key entirely, so that's an empty page, not an error.
+- **The slashed provider id just worked.** A Gemini handle is `gemini/batches/<id>` — the
+  id itself contains a slash — but `parse_batch_handle`'s split-on-*first*-slash plus the
+  no-slash-in-backend-name invariant (enforced at config load) already made that
+  unambiguous. The Anthropic-era design absorbed it for free.
+
+`includeThoughts` is on (inherited from the shaping), so a Gemini answer carries the
+reasoning as separate `"thought": true` parts; confirmed against a live thinking batch
+that the answer text is the *non*-thought parts (a final answer part may still carry a
+`thoughtSignature` — that's not a thought part, so it stays). The whole seam is
+offline-tested (pure shaping/parsing fns + ScriptedBatch), and the live wire was proven
+end-to-end through the actual MCP server: submit → list → poll → `## [0] Pong.`, plus a
+cancel that lands in `Failed`, plus a non-batch cast refused with the supported set named.
+
+**The dogfood earned its keep twice.** Running a real `gemini-batch` job through the
+reconnected server surfaced that the cast's pinned synth `gemini-3-pro-preview` was
+*retired* — and exposed a sharp edge of Gemini's batch lane: submit **accepted** the dead
+model (`BATCH_STATE_PENDING`), and the failure only landed as a *per-item* error when the
+request actually ran ("This model … is no longer available"). The per-item failure
+surfacing did exactly its job — the answer came back as `## [0] — failed: provider error:
+…` rather than a silent empty — but it's a reminder that Gemini batch does no model
+validation at submit time. The fix is the drift-resistant default: the cast synths
+`gemini-pro-latest` (the alias, today resolving to `gemini-3.1-pro-preview`) rather than a
+pinned preview that gets retired out from under us — `provider-model-ids` drift, made
+concrete. Confirmed live: `gemini-pro-latest`, `gemini-3.1-pro-preview`, and `gemini-2.5-pro`
+all 200 on a synchronous `generateContent`; `gemini-3-pro-preview` 404s.
+
 ## 2026-06-22 — batch: offline max-effort fan-out (Anthropic first)
 
 Shipped the batch tool class — `batch_submit`/`batch_get`/`batch_cancel`/`batch_list`,

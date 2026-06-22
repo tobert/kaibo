@@ -1187,6 +1187,31 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         ]);
         m.insert(name.clone(), Cast { name, slots });
     }
+    // gemini-batch: the offline lane's cast. Pro is near-unusable interactively (slow),
+    // so casts synth Flash; batch is exactly where the latency is free, so this cast
+    // synths Gemini Pro. Uses the `gemini-pro-latest` *alias* deliberately, not a pinned
+    // preview id: pinned Pro previews get retired out from under us (a live batch dogfood
+    // caught `gemini-3-pro-preview` 404ing mid-flight — submit accepted it, the per-item
+    // request failed at run time), so the latest-alias is the drift-resistant default.
+    // Override in config.toml to pin a specific Pro. Explorer stays the cheap flash-lite
+    // (batch is toolless and won't touch it, but the cast is usable for consult too).
+    let gemini_batch = "gemini-batch".to_string();
+    m.insert(
+        gemini_batch.clone(),
+        Cast {
+            name: gemini_batch,
+            slots: BTreeMap::from([
+                (
+                    ModelRole::Explorer,
+                    ModelSlot::bare("gemini", "gemini-flash-lite-latest"),
+                ),
+                (
+                    ModelRole::Synth,
+                    ModelSlot::bare("gemini", "gemini-pro-latest"),
+                ),
+            ]),
+        },
+    );
     m
 }
 
