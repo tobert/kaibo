@@ -215,6 +215,19 @@ the scripted `CompletionClient` (`test_support.rs`) is the natural guard.
 
 ## P3 — Infra, perf, polish
 
+### Path expansion is inconsistent: `$VAR` only in `root` / `allow_paths`
+`expand_path` (`config.rs`) expands `$VAR` / `${VAR}` and a leading `~` for the boundary
+knobs (`root`, `allow_paths`), but `[context]` `user_files` (`merge_context`) and the
+key-file paths (`api_key_file`) still go through `expand_tilde` — tilde only. So
+`user_files = ["$XDG_CONFIG_HOME/notes.md"]` silently fails to expand where `allow_paths`
+would. Scoped out of the temp-read change deliberately (those two callers are infallible
+today; switching them to `expand_path` means threading `Result` through `merge_context`
+and the credential loader). Extend them to `expand_path` for one uniform rule — then a user
+never has to remember "env vars work here but not there." Low risk, mechanical; the only
+care is keeping the undefined-var error loud at load. Also unbuilt: escaping a literal `$`
+(today a path named `$foo` isn't expressible in config; a `\$` / `$$` escape would close it
+if anyone hits it).
+
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read
 time* rather than configured — currently `follow_worktrees` (the knob) and

@@ -596,10 +596,29 @@ precedence rule as `--root`). To lift all limits: `--allow-path /`.
 **Set it once.** Putting your whole workspace tree in `allow_paths`
 (`["~/src"]`) means every project under it is in-bounds, and because the client's
 cwd/workspace lands inside that tree, kaibo infers it as the [default root](#path-containment)
-automatically — so you configure access once and never pass `path` per call. A
-leading `~` in `root` / `allow_paths` expands to `$HOME` (file and env layers), the
-same as key files and `[context]` paths; the CLI relies on your shell's own
-expansion. Other paths are taken as written.
+automatically — so you configure access once and never pass `path` per call.
+
+**Path expansion.** In `root` / `allow_paths`, the file and env layers expand a leading
+`~` to `$HOME` *and* `$VAR` / `${VAR}` from the environment; an undefined variable is a
+loud load error, not a silent gap that would point the boundary somewhere unexpected. The
+CLI relies on your shell's own expansion instead. Paths with no `~`/`$` are taken as
+written. (A bare `$` not forming a reference is left literal; there's no escaping yet, so
+a directory literally named `$foo` isn't expressible in config — use the CLI for that.)
+
+**Reading a scratch / temp space.** kaibo reads only what's in the allowed set and never
+writes anywhere — so to let it read artifacts a workflow drops in a temp dir (a diff, a
+generated file, a log), add that dir to `allow_paths`. Write it portably with the env var
+rather than a host-specific literal, so it resolves on whatever machine kaibo runs on:
+
+```toml
+[server]
+allow_paths = ["~/src", "$TMPDIR", "$XDG_RUNTIME_DIR/kaibo"]
+```
+
+`$TMPDIR` (POSIX) and `$XDG_RUNTIME_DIR` (XDG) land on the per-user scratch dir on macOS
+and sandboxed Linux respectively, where a bare `/tmp` would be wrong. This is an opt-in:
+widening to a shared, world-writable space like `/tmp` is a real (read-only) boundary
+move, so kaibo never adds it for you.
 
 **When defaulting does *not* happen.** If `--allow-path` is set to a tree that does
 not contain the launch cwd and no `--root` is given, there is no default root: the

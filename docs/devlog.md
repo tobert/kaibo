@@ -14,6 +14,43 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — `$VAR` expansion in `root` / `allow_paths`, for portable scratch reads
+
+Amy asked the real question behind "can a user easily allow kaibo to read `/tmp`?": the
+mechanism existed (`--allow-path` / `KAIBO_ALLOW_PATHS` / `[server] allow_paths`), but the
+*path* you had to write was host-specific — a literal `/tmp` is wrong on macOS (per-user
+`/var/folders/...`) and on sandboxed Linux (`$XDG_RUNTIME_DIR`). kaibo already followed
+XDG for the config file but had no XDG/POSIX awareness in the read boundary. The fix is to
+let `root` / `allow_paths` expand `$VAR` / `${VAR}` (and the leading `~` they already did),
+so `allow_paths = ["$TMPDIR"]` resolves per machine.
+
+**Chose general `$VAR` expansion over a curated temp-var set or an `--allow-tmp` knob.**
+Amy's call: the general form is least-surprising to anyone who's used a shell, and it
+costs no more than the narrow one — `$TMPDIR`/`$XDG_RUNTIME_DIR`/`$HOME` all just fall out,
+plus whatever else a user names. A one-off `--allow-tmp` switch would have been more magic
+for less reach.
+
+**Expansion order is env-first, then tilde.** Two reasons it's not the other way: the
+tilde step keeps operating on an `OsString` `$HOME` (a non-UTF-8 home survives, as it did
+before), and a variable whose *value* carries a leading `~` (`MYDIR=~/data`) still expands.
+A single pass only — a variable's value is never re-scanned for `$`, so there's no
+expansion-injection surprise from environment contents.
+
+**Undefined variable is a loud load error, not a passthrough.** A silent gap (`$TMPDR`
+typo → empty segment → a path that canonicalizes *somewhere*) is exactly the data-corruption
+failure mode the house rule rejects; better to refuse at startup. A bare `$` that doesn't
+form a reference stays literal, shell-style — the one accepted limitation is that a
+directory literally named `$foo` isn't expressible in config (no escaping yet; noted in
+issues.md).
+
+**Scoped to the boundary knobs (`root` / `allow_paths`), not every path field.** `[context]`
+`user_files` and the key-file paths still tilde-only; extending them is consistency work,
+not the temp-read goal, and it widens the fallible surface — logged as a follow-up rather
+than smuggled in. The rest of the surface Amy asked for shipped together: the `configure`
+prompt gained an opt-in read-scope step, the containment-error message names the portable
+`$TMPDIR` form, and `docs/config.md` documents it — so a user meets the idiom wherever they
+hit the boundary.
+
 ## 2026-06-22 — `oneshot` grows `attach` (the interactive twin of batch attach)
 
 Amy's framing: `oneshot` should be as close to `batch` as the API split allows — "call

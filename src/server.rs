@@ -646,7 +646,9 @@ impl KaiboHandler {
                 "path {} resolves to {}, which is outside the allowed set [{}]. \
                  To widen the boundary: pass --allow-path DIR on the command line, \
                  set KAIBO_ALLOW_PATHS=DIR (colon-separated), or add \
-                 `[server] allow_paths = [\"DIR\"]` in config.toml.",
+                 `[server] allow_paths = [\"DIR\"]` in config.toml. The config and env \
+                 forms expand `$VAR` / `${{VAR}}` and a leading `~`, so a scratch dir \
+                 reads portably as `\"$TMPDIR\"` / `\"$XDG_RUNTIME_DIR/...\"`.",
                 raw.display(),
                 canon.display(),
                 trees.join(", "),
@@ -1744,7 +1746,16 @@ default.
 (`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
 the secret stays outside it. Tell me which env vars to set or files to write, and let \
 me put the keys in myself.
-5. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
+5. (Optional) Read scope. By default kaibo reads only the project tree it's pointed at \
+(plus linked git worktrees), and it only ever *reads* — never writes. If a workflow \
+hands kaibo artifacts to read from a scratch space — a diff, a generated file, a log \
+dropped in a temp dir — name that space in `[server] allow_paths` so it's in bounds. \
+Prefer the host-portable form `allow_paths = [\"$TMPDIR\"]` or \
+`[\"$XDG_RUNTIME_DIR/scratch\"]` over a hardcoded `/tmp` — `$VAR` / `${VAR}` and a \
+leading `~` expand in these paths, resolving per machine. Ask me whether I want a scratch \
+space readable before adding one: it widens what the team can see (read-only, but still a \
+real boundary), so it's a deliberate opt-in, not a default.
+6. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
 the config and keys — both load once at startup.";
 
 /// The prompts kaibo advertises (`list_prompts`). Currently just `configure`.

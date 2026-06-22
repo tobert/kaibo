@@ -989,17 +989,19 @@ impl Config {
         let tools = merge_tools(server.tools.unwrap_or_default());
         let default_cast = server.cast.unwrap_or_else(|| "anthropic".to_string());
         let log = server.log.unwrap_or_else(|| "kaibo=info".to_string());
-        // Tilde-expand `root` and `allow_paths` (file *and* env layers both land here
-        // as strings), so a hand-edited `~/src` resolves to `$HOME/src` like key files
-        // and `[context]` paths already do — rather than a literal `~` that fails
-        // canonicalization at startup. Absolute/relative paths pass through unchanged.
-        let root = server.root.as_deref().map(expand_tilde);
+        // Expand `$VAR`/`${VAR}` and a leading `~` in `root` / `allow_paths` (file *and*
+        // env layers both land here as strings), so a hand-edited `~/src` or the portable
+        // `$TMPDIR` / `$XDG_RUNTIME_DIR/scratch` resolves per-environment rather than a
+        // literal token that fails canonicalization at startup. An undefined variable is a
+        // loud load error (`expand_path`), not a silent empty segment. Absolute/relative
+        // paths with no `~`/`$` pass through unchanged.
+        let root = server.root.as_deref().map(expand_path).transpose()?;
         let allow_paths = server
             .allow_paths
             .unwrap_or_default()
             .iter()
-            .map(|s| expand_tilde(s))
-            .collect();
+            .map(|s| expand_path(s))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default());
@@ -1979,6 +1981,91 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Expand `$VAR` / `${VAR}` references *and* a leading `~`, in that order — the
+/// portable path form for `root` / `allow_paths`. An undefined variable is a **loud
+/// error**, never a silent empty segment that would point the read boundary somewhere
+/// surprising (crashing beats data corruption): a typo'd `$TMPDR` fails at load, not by
+/// quietly granting `/`. Env expansion runs *first* so a leading `~` in a variable's
+/// *value* is still expanded (`MYDIR=~/data; allow_paths=["$MYDIR"]` works), and so the
+/// tilde step keeps operating on an `OsString` `$HOME` (non-UTF-8 homes survive). This is
+/// what lets a user write the environment-portable `allow_paths = ["$TMPDIR"]` /
+/// `["$XDG_RUNTIME_DIR/scratch"]` instead of hardcoding a host-specific `/tmp`. A bare
+/// `$` not forming a reference (followed by a non-name char) is left literal, shell-style;
+/// a path that genuinely contains `$name` would be read as a reference — an accepted,
+/// documented limitation (no escaping yet).
+fn expand_path(s: &str) -> anyhow::Result<PathBuf> {
+    Ok(expand_tilde(&expand_env_vars(s)?))
+}
+
+/// Substitute `$VAR` and `${VAR}` from the process environment. Undefined → loud error
+/// (see [`expand_path`]). A `$` that doesn't begin a `{` or a valid name char is emitted
+/// verbatim. `[A-Za-z_][A-Za-z0-9_]*` is the accepted name shape, matching POSIX.
+fn expand_env_vars(s: &str) -> anyhow::Result<String> {
+    fn is_start(c: char) -> bool {
+        c.is_ascii_alphabetic() || c == '_'
+    }
+    fn is_continue(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+    fn lookup(out: &mut String, name: &str, full: &str) -> anyhow::Result<()> {
+        match std::env::var(name) {
+            Ok(val) => {
+                out.push_str(&val);
+                Ok(())
+            }
+            Err(_) => bail!(
+                "path {full:?} references environment variable ${name}, which is not set \
+                 — set it, or write the literal path"
+            ),
+        }
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('{') => {
+                chars.next(); // consume '{'
+                let mut name = String::new();
+                let mut closed = false;
+                for nc in chars.by_ref() {
+                    if nc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(nc);
+                }
+                if !closed {
+                    bail!("path {s:?} has an unterminated ${{...}} reference");
+                }
+                if name.is_empty() {
+                    bail!("path {s:?} has an empty ${{}} reference");
+                }
+                lookup(&mut out, &name, s)?;
+            }
+            Some(nc) if is_start(nc) => {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if is_continue(nc) {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                lookup(&mut out, &name, s)?;
+            }
+            // A lone '$' (end of string, or followed by a non-name char) is literal.
+            _ => out.push('$'),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2005,6 +2092,67 @@ mod tests {
                 "{verbatim:?} must pass through unchanged"
             );
         }
+    }
+
+    // --- expand_env_vars / expand_path ---------------------------------------
+
+    /// `$VAR` and `${VAR}` resolve from the environment; both spellings agree. Uses
+    /// `HOME` (always set in the test env) as the live variable so the test doesn't
+    /// mutate process env — which would race the parallel suite.
+    #[test]
+    fn expand_env_vars_resolves_both_spellings() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+
+        assert_eq!(expand_env_vars("$HOME/src").unwrap(), format!("{home}/src"));
+        assert_eq!(expand_env_vars("${HOME}/src").unwrap(), format!("{home}/src"));
+        // A reference mid-path, and back-to-back text.
+        assert_eq!(expand_env_vars("/x/${HOME}y").unwrap(), format!("/x/{home}y"));
+    }
+
+    /// An undefined variable is a loud error, not a silent empty segment — the property
+    /// that keeps a typo'd `$TMPDR` from quietly widening the read boundary. Covers the
+    /// bare form, the braced form, and the malformed `${` / `${}` shapes.
+    #[test]
+    fn expand_env_vars_undefined_or_malformed_is_loud() {
+        // A name we can be confident is unset in any sane test environment.
+        let unset = "KAIBO_DEFINITELY_UNSET_VAR_9Q";
+        assert!(std::env::var(unset).is_err(), "test precondition: {unset} unset");
+
+        for bad in [
+            format!("${unset}"),
+            format!("${{{unset}}}"),
+            "${UNTERMINATED".to_string(),
+            "${}".to_string(),
+        ] {
+            assert!(
+                expand_env_vars(&bad).is_err(),
+                "{bad:?} must fail loudly, not expand to a silent gap"
+            );
+        }
+    }
+
+    /// A `$` that doesn't begin a valid reference is left literal (shell-style), and a
+    /// path with no `$` at all is untouched.
+    #[test]
+    fn expand_env_vars_leaves_bare_dollar_and_plain_paths_alone() {
+        assert_eq!(expand_env_vars("/a/$ b").unwrap(), "/a/$ b");
+        assert_eq!(expand_env_vars("/cost/$100").unwrap(), "/cost/$100");
+        assert_eq!(expand_env_vars("/data/fixtures").unwrap(), "/data/fixtures");
+    }
+
+    /// `expand_path` composes env expansion *then* tilde: `$HOME` and `~` reach the same
+    /// place, and `~` still works when no variable is present (the boundary knobs depend
+    /// on both forms resolving).
+    #[test]
+    fn expand_path_does_env_then_tilde() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let home = home.trim_end_matches('/');
+
+        assert_eq!(expand_path("~/src").unwrap(), PathBuf::from(format!("{home}/src")));
+        assert_eq!(expand_path("$HOME/src").unwrap(), PathBuf::from(format!("{home}/src")));
+        assert_eq!(expand_path("/data/fixtures").unwrap(), PathBuf::from("/data/fixtures"));
+        // Undefined variable propagates as an error through expand_path, not a panic.
+        assert!(expand_path("$KAIBO_DEFINITELY_UNSET_VAR_9Q/x").is_err());
     }
 
     // --- built-in equivalence -------------------------------------------------
