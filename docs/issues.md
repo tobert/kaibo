@@ -218,16 +218,6 @@ for now, but a busy server rebuilds kernels constantly. Consider a small worker
 pool, or resetting one kernel's cwd between phases instead of rebuilding. Measure
 before optimizing.
 
-### Flaky tracing-capture tests in `tool_span.rs`
-`emits_an_error_outcome_when_the_tool_fails` (and its `ok` sibling) fail ~25% of
-the time in the *parallel* full `cargo test` run, never in isolation. Both register
-a `tracing_subscriber::registry().with(cap)` via `set_default` and assert on captured
-spans; run concurrently on cargo's test threads they race on tracing's process-global
-span store, so one test's `tool` span can go missing from the other's capture. A test
-that fails when we *didn't* make a mistake is the opposite of the teeth we want. Fix:
-serialize the two (a shared `Mutex`/`serial_test`), or capture per-span without leaning
-on global dispatch. Out of scope when found (the read-idioms/output-cap PR).
-
 ### Batch — remaining providers and the many-casts fork
 The batch tool class shipped Anthropic- and Gemini-first (`src/batch.rs`,
 `batch_submit`/`batch_get`/`batch_cancel`/`batch_list`, one `--no-batch` gate): offline,
@@ -249,7 +239,10 @@ in the module doc and `docs/devlog.md`. What's left:
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
 (shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
-DeepSeek ?, local `openai` ✗.
+DeepSeek ✗ (confirmed 2026-06-22 against the official API reference — no batch endpoint;
+its routes are chat/completions/models only, and its cost-saving lane is off-peak
+discount pricing, not a batch API; third-party batch like Novita/Together/Bedrock wraps
+the model, out of reach of the keyed `deepseek` backend), local `openai` ✗.
 
 ### Batch design hardening (cross-model Opus review, 2026-06-22)
 A cross-family review of the batch slice (Opus 4.8, run *through* `batch_submit` itself

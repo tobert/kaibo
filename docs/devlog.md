@@ -14,6 +14,40 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-22 — kill the `tool_span.rs` capture flake (root cause, not symptom)
+
+The two span-capturing tests in `tool_span.rs` failed ~5% of full-suite runs (the
+issue guessed ~25%), never in isolation — a test failing when we *didn't* make a
+mistake, the opposite of teeth. The issue's two guesses (serialize the pair; race on
+a "process-global span store") were both off the real mark. We traced it instead of
+guessing, and the contributing factors turned out to be one specific tracing
+fast-path:
+
+`info_span!("tool")` registers its callsite **lazily**, on first hit. While tracing's
+`has_just_one` optimization holds — true whenever ≤1 dispatcher is registered, which
+is *exactly* our case since each test installs a single subscriber via `set_default` —
+that first registration computes the callsite's `Interest` from **the registering
+thread's current default**, not from the test's installed subscriber. This binary is
+full of `consult`-loop tests that run the real tool loop with *no* subscriber. When
+one of them won the race to first-touch the `tool` callsite during a capture test's
+window, it cached `Interest::never()` against `NoSubscriber`, gating the span off
+process-wide → an empty capture. So serializing the two capture tests can't fix it:
+the poisoning thread is a *third* test with no subscriber at all.
+
+The fix matches the cause. We hold one extra registered dispatcher alive for the whole
+process (`force_multi_dispatcher`, a leaked `Dispatch::new(registry())`), forcing
+`has_just_one` false so every callsite registration consults the *registered-dispatcher
+set* — which contains a span-enabling registry — regardless of which thread triggers
+it. It is never any thread's default, so it receives no events; it exists only to keep
+the registration path honest. We kept a serialization `Mutex` over the two tests too
+(belt and suspenders against their `set_default` installs/teardowns interleaving), and
+moved them off `#[tokio::test]` onto a private current-thread runtime via `block_on`,
+so the ordering guard isn't held across an `.await` and the future polls on the same
+thread whose `set_default` is in scope. Proven: 0 failures in 150 full-suite runs
+(was ~5%), and both tests still fail under deliberate mutation of the span name and
+the outcome field. Rejected the symptom-level "just serialize" because it left the
+~1% consult-thread poisoning window open — measured, didn't assume.
+
 ## 2026-06-22 — batch: Gemini provider (second backend behind the seam)
 
 Added the second `BatchProvider` impl — Gemini inline batch — so the offline lane reaches
