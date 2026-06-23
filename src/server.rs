@@ -719,8 +719,11 @@ impl KaiboHandler {
     /// Failures are loud and per-path: a missing file, a directory, an over-cap or
     /// non-text/non-image file is a clear `invalid_params`, never a silent skip — an
     /// attachment the caller named but we dropped would be a corrupt answer. An absolute
-    /// size ceiling is enforced *before* reading (via the file's metadata) so a giant
-    /// file is refused without first slurping it into memory.
+    /// per-file size ceiling is enforced *before* reading (via the file's metadata) so a
+    /// giant file is refused without first slurping it into memory; a batch-level count cap
+    /// and cumulative-byte budget ([`check_attachment_bounds`](crate::attach::check_attachment_bounds))
+    /// bound the *whole call* the same way — a stray thousand-file glob, or many
+    /// individually-legal files summing to an OOM, is refused before the offending read.
     ///
     /// **The read goes through the read-only kaish VFS, not `std::fs::read`** — the same
     /// mechanism `view_image` uses. The canonicalize + containment check above is the
@@ -737,15 +740,24 @@ impl KaiboHandler {
         &self,
         paths: &[String],
     ) -> Result<Vec<crate::attach::Attachment>, McpError> {
-        use crate::attach::{classify, DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_TEXT_BYTES};
+        use crate::attach::{
+            check_attachment_bounds, classify, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_IMAGE_BYTES,
+            DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TOTAL_BYTES,
+        };
         // The pre-read ceiling: whichever encoding cap is larger. `classify` applies the
         // precise per-encoding cap after sniffing; this just bounds the read itself.
         let read_ceiling = DEFAULT_MAX_TEXT_BYTES.max(DEFAULT_MAX_IMAGE_BYTES);
+        // Fail fast on count *before* canonicalizing the whole list (a stray glob could
+        // name thousands). The cumulative-byte budget is enforced per file below as the
+        // running total grows — before each read, so an oversized batch never slurps in.
+        check_attachment_bounds(paths.len(), 0, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_TOTAL_BYTES)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         // One read-only worker per distinct containing tree, reused across attachments
         // under it (a worker owns a thread + kernel build, so we don't want one per file).
         let mut workers: std::collections::HashMap<PathBuf, KaishWorker> =
             std::collections::HashMap::new();
         let mut out = Vec::with_capacity(paths.len());
+        let mut total_bytes: u64 = 0;
         for p in paths {
             let raw = std::path::PathBuf::from(p);
             let canon = std::fs::canonicalize(&raw).map_err(|e| {
@@ -783,6 +795,17 @@ impl KaiboHandler {
                     None,
                 ));
             }
+            // Cumulative budget across the batch, checked *before* this file's read so a
+            // batch of individually-legal files can't sum to an out-of-memory read. The
+            // running total saturates so a crafted size can't wrap past the budget.
+            total_bytes = total_bytes.saturating_add(meta.len());
+            check_attachment_bounds(
+                out.len() + 1,
+                total_bytes,
+                DEFAULT_MAX_ATTACHMENTS,
+                DEFAULT_MAX_TOTAL_BYTES,
+            )
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
             // Read *through the VFS* rooted at the containing tree — see the doc-comment.
             // A swapped escaping symlink is refused at the mount, not read through.
             if !workers.contains_key(&tree) {
