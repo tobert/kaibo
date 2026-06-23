@@ -172,6 +172,29 @@ otherwise sound. The attacker model stays narrow (a self-attack: a concurrent wr
 caller's own workspace, sub-millisecond window). Worth closing for symmetry when the model
 justifies it, but lower priority than the attachment read that one-shot-followed a symlink.
 
+### Attachment reads have no streaming/cumulative resource bounds (DoS, self-attack)
+Surfaced by the Gemini Pro batch review of the VFS-read change (2026-06-23). These are
+**pre-existing** (the old `std::fs::read` + `.collect()` path had them too) and all in the
+self-attack model (the caller owns the request and the workspace), so they're DoS, not
+confidentiality — but the attachment surface should be bounded structurally like the rest:
+- **Per-file size cap is check-then-read, not streaming.** `resolve_attachments` checks
+  `std::fs::metadata` length against `read_ceiling`, then `worker.read_file` slurps the whole
+  file with **no byte cap** (`Job::Read` deliberately skips the script-output cap). A file
+  swapped for a huge one *after* the metadata check is read whole into a `Vec<u8>` → OOM. Fix
+  wants a *streaming* cap in the read path (a `read_file` that takes a limit and aborts past
+  `limit+1`), which needs a `KaishWorker`/kaish-vfs API that bounds the read — not just a
+  pre-check. (`classify` enforces the cap only *after* the full read, too late for memory.)
+- **A special file (FIFO/device) swapped in can hang the read.** `is_file()` rejects a FIFO
+  at check time, but a regular file swapped for a FIFO before the read blocks
+  `worker.read_file` indefinitely (single worker thread; `request_timeout` covers only the
+  model call, not attachment resolution). Wants an `O_NONBLOCK`/`tokio::time::timeout` bound
+  on the read.
+- **No cumulative cap across attachments.** Each file passes the per-file ceiling, but
+  `paths.len()` and the running total of `out` bytes are unbounded — N×(under-cap) files load
+  N× into memory. Wants a hard cap on attachment count and a cumulative byte budget.
+Low priority (self-attack DoS), but cheap to land together as an "attachment resource bounds"
+pass. The streaming cap is the one with real teeth and needs the kaish-vfs read API.
+
 ### The `<file>` attachment wrapper doesn't escape its body
 `Attachment::wrapped_text` (`attach.rs`) wraps a text attachment as
 `<file path="…">{body}</file>` without escaping `body`, so a file that itself contains a
