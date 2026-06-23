@@ -42,6 +42,16 @@ use std::sync::LazyLock;
 /// every prompt (the `[context]` no-cap mistake in `docs/issues.md` is the lesson).
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 1 << 20; // 1 MiB
 
+/// Hard cap on the *number* of attachments in one call. The per-file caps bound a single
+/// file; this bounds the batch — a caller that names a thousand files (a stray glob, say)
+/// is a mistake to surface, not silently absorb. Generous; split a larger batch.
+pub const DEFAULT_MAX_ATTACHMENTS: usize = 64;
+
+/// Hard cap on the *cumulative* raw bytes of all attachments in one call — the batch-level
+/// sibling of the per-file caps, so N under-cap files can't sum to an out-of-memory read.
+/// Generous (several max-size files fit) but bounded.
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 1 << 25; // 32 MiB across all attachments in a call
+
 /// Cap on an attached *image*'s raw (pre-base64) bytes — reuses
 /// [`crate::view_image::DEFAULT_MAX_IMAGE_BYTES`] so a read image and an attached one
 /// share one ceiling.
@@ -61,6 +71,34 @@ pub enum Attachment {
         mime: &'static str,
         data_b64: String,
     },
+}
+
+/// Refuse an attachment batch that busts the count or cumulative-byte budget — loud, never
+/// a silent drop (a dropped attachment the caller named would be a corrupt answer). Pure
+/// and cap-injected (the same shape as [`classify`]) so the bounds are unit-testable
+/// without cap-sized fixtures. Called twice in `resolve_attachments`: once on `count`
+/// alone (with `total = 0`) to fail fast *before* canonicalizing a huge path list, then on
+/// the real cumulative `total` (a saturating sum of metadata sizes) *before* any file is
+/// read — so an oversized batch never slurps into memory.
+pub fn check_attachment_bounds(
+    count: usize,
+    total_bytes: u64,
+    max_count: usize,
+    max_total: u64,
+) -> Result<()> {
+    if count > max_count {
+        bail!(
+            "too many attachments: {count} named, but at most {max_count} can ride one \
+             call — split the batch or attach fewer files"
+        );
+    }
+    if total_bytes > max_total {
+        bail!(
+            "attachments total {total_bytes} bytes, over the {max_total}-byte budget for \
+             one call — attach fewer or smaller files (each file's own size cap still applies)"
+        );
+    }
+    Ok(())
 }
 
 /// Neutralize any `<file>`-tag lookalike in an attachment body so it can't read as a
@@ -288,6 +326,37 @@ mod tests {
         let err = classify("notes.txt", &big, 32, DEFAULT_MAX_IMAGE_BYTES)
             .expect_err("a text file over the cap must be refused, not truncated");
         assert!(err.to_string().contains("text cap"), "names the cap: {err}");
+    }
+
+    /// The batch-level bounds refuse too many files and too many cumulative bytes, before
+    /// any read — the per-file caps don't cover "1,000 small files" or "N under-cap files
+    /// summing to an OOM". Saturating sum so a crafted size can't wrap past the budget.
+    #[test]
+    fn attachment_bounds_refuse_too_many_or_too_large() {
+        // Within bounds: ok (and the budget is an inclusive max).
+        assert!(check_attachment_bounds(3, 60, 64, 1 << 25).is_ok());
+        assert!(
+            check_attachment_bounds(1, 10, 64, 10).is_ok(),
+            "exactly at budget is fine"
+        );
+        assert!(
+            check_attachment_bounds(0, 0, 64, 1 << 25).is_ok(),
+            "empty is fine"
+        );
+
+        // Count cap: one too many is refused, naming the limit (total irrelevant here).
+        let err = check_attachment_bounds(65, 0, 64, 1 << 25).expect_err("65 > 64 refused");
+        assert!(
+            err.to_string().contains("too many attachments"),
+            "names the count cap: {err}"
+        );
+
+        // Cumulative cap: count is fine, but the bytes bust the budget.
+        let err = check_attachment_bounds(2, 12, 64, 10).expect_err("12 > 10 refused");
+        assert!(
+            err.to_string().contains("budget"),
+            "names the byte budget: {err}"
+        );
     }
 
     /// A body that itself contains the literal close delimiter can't terminate the

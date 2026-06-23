@@ -192,6 +192,24 @@ async fn attachment_in_a_second_allowed_tree_reads_through_its_own_worker() {
     }
 }
 
+/// Too many attachments in one call is refused up front — the batch-level count cap,
+/// checked before any filesystem work (a stray glob shouldn't canonicalize thousands of
+/// paths). The cap is `DEFAULT_MAX_ATTACHMENTS` (64); 65 dummy paths trip it before any
+/// of them is even resolved, so they needn't exist.
+#[tokio::test]
+async fn too_many_attachments_is_refused() {
+    let handler = handler_rooted_at(tempdir().unwrap().path());
+    let many: Vec<String> = (0..65).map(|i| format!("/nonexistent/f{i}.txt")).collect();
+    let err = handler
+        .resolve_attachments(&many)
+        .await
+        .expect_err("more than the count cap must be refused");
+    assert!(
+        format!("{err:?}").contains("too many attachments"),
+        "refusal names the count cap, got: {err:?}"
+    );
+}
+
 // --- vision gate: an image to a blind synth is refused offline ----------------
 
 /// `batch_submit` with an image attachment on a synth model pinned vision-blind is

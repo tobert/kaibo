@@ -144,7 +144,10 @@ the git log. Each later release appends a new section at the top.
 - **Bounded resource use.** Each kaish script is capped (30 s wall-clock, 8 KB
   output, 64 MB scratch — over-cap fails loudly, never a silent drop), and the model
   loops stop at turn limits, so a runaway consultation can't melt the machine or the
-  budget. All configurable.
+  budget. All configurable. Attachments are bounded too: a per-file size cap, plus a
+  per-call cap on attachment *count* (64) and *cumulative* bytes (32 MiB), so a stray
+  thousand-file glob or many small files summing to an out-of-memory read is refused
+  loudly before anything is slurped in.
 - **Attachments are read through the read-only VFS.** A named attachment's bytes are
   read *through* the same read-only kaish mount the shell uses (rooted at the file's
   containing allowed tree), not a separate `std::fs` read after the containment check.
