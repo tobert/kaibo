@@ -91,6 +91,20 @@ Connection knobs only — models never live here:
   single completion. `0` is rejected at load (it would time out every call
   instantly).
 
+  **Failure policy (no retry, by design).** kaibo does not retry a failed provider
+  call — there is no backoff and no `max_retries` knob. A 429/503/529 overload, a
+  connection reset, a partial stream, or a wedged backend that hits `request_timeout`
+  all fail the single completion, and `consult`/`oneshot` surface that as a **clean
+  tool-result error** (`is_error`) naming the cast and the underlying detail. The
+  rationale: a consult is an *optional* augmentation, so the calling agent should read
+  the failure and proceed without the second opinion (or call again) rather than have
+  its own tool call fail at the protocol layer. Retrying is the caller's decision; for a
+  reliably-slow backend, raise its `request_timeout_secs` rather than expecting kaibo to
+  paper over it. Automatic retry/backoff belongs in the shared HTTP layer (rig already
+  ships an `ExponentialBackoff`, wired only into its streaming path today) — landing it
+  for the non-streaming completion path is tracked as an upstream contribution in
+  `docs/issues.md`, not hand-rolled here.
+
 ### Casts: `[casts.<name>]`
 
 A role table. Each slot is a `"backend/model-id"` string (the common case — the

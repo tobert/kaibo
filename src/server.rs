@@ -1073,7 +1073,7 @@ impl KaiboHandler {
             session = session.is_some(),
         );
         progress.emit(PhaseEvent::PhaseStarted { phase: "consult" });
-        let out = consult(
+        let out = match consult(
             &input.question,
             input.context.as_deref(),
             root,
@@ -1084,7 +1084,12 @@ impl KaiboHandler {
         )
         .instrument(span)
         .await
-        .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        {
+            Ok(out) => out,
+            // A provider/model-loop failure is a clean tool-result error the host can
+            // proceed past, not a JSON-RPC internal_error. See `consultation_failed`.
+            Err(e) => return Ok(consultation_failed("consult", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
         // Provenance: name the cast and the models that answered, so a caller (a
@@ -1147,10 +1152,14 @@ impl KaiboHandler {
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
-        let answer = oneshot(&input.prompt, &attachments, &arm, &cfg)
+        let answer = match oneshot(&input.prompt, &attachments, &arm, &cfg)
             .instrument(span)
             .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        {
+            Ok(answer) => answer,
+            // A provider failure is a clean tool-result error, same as `consult`.
+            Err(e) => return Ok(consultation_failed("oneshot", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
         let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)]);
@@ -2334,6 +2343,24 @@ fn consult_result(answer: String, report: String, include_report: bool) -> CallT
     result
 }
 
+/// Surface a *runtime* consultation failure as a **tool-result error** (`is_error =
+/// true`) rather than a protocol-level `internal_error`. A consult is an *optional*
+/// augmentation: when a provider misbehaves (overload, reset, or a wedged backend that
+/// hits the `request_timeout`), the calling agent should read a clear message and proceed
+/// *without* the second opinion — not have its own tool call fail at the JSON-RPC layer.
+/// The message names the tool, the cast, and the underlying detail so the host can decide
+/// whether to retry. kaibo does **not** retry on its own (one completion is bounded by the
+/// backend's `request_timeout`/`connect_timeout`); see the failure-policy FAQ and
+/// `docs/config.md`. Setup errors *before* the model call — an unknown cast, an attachment
+/// outside the boundary, a missing key — stay `McpError`, since those are the caller's to
+/// fix, not transient.
+fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(format!(
+        "{tool} could not complete (cast `{cast}`): {err:#}. The model or its provider \
+         failed — kaibo does not retry, so proceed without this consultation or try again."
+    ))])
+}
+
 /// Append a one-line provenance footer naming the cast and the model(s) that
 /// produced `answer`. The point is legibility: a caller — a cross-model study most
 /// of all — should see *which* model answered without cross-referencing
@@ -2948,6 +2975,28 @@ mod tests {
             .expect("consult answer is text content")
             .text
             .clone()
+    }
+
+    /// A runtime consultation failure (a provider overload/reset/timeout from the model
+    /// loop) surfaces as a **tool-result error** — `is_error = true` carrying the provider
+    /// detail — not a protocol-level `internal_error`. That's what lets the calling agent
+    /// read "the consult failed, here's why" and proceed without the second opinion.
+    #[test]
+    fn consultation_failed_is_a_tool_error_carrying_the_detail() {
+        let err = anyhow::anyhow!("model loop failed: backend returned 529 overloaded");
+        let result = consultation_failed("consult", "deepseek", err);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a provider failure is a tool-result error, not a success"
+        );
+        let text = answer_text(&result);
+        assert!(text.contains("consult"), "names the tool: {text}");
+        assert!(text.contains("deepseek"), "names the cast: {text}");
+        assert!(
+            text.contains("529 overloaded"),
+            "preserves the provider detail so the host can decide: {text}"
+        );
     }
 
     /// Provenance footer: the answer keeps its text, and the cast plus every labelled

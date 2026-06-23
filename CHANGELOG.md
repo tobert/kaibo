@@ -116,6 +116,13 @@ the git log. Each later release appends a new section at the top.
   config, per-role reasoning effort, generous completion-token headroom).
 - **Multi-turn sessions** via `session_id`, and optional OTLP/HTTP trace export
   (`[telemetry]`, off by default).
+- **A failed provider doesn't fail your turn.** When a model or its provider misbehaves
+  (a 429/529 overload, a connection reset, a wedged backend that hits the
+  `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the
+  cast and the underlying detail — so the calling agent reads "the consult failed, here's
+  why" and proceeds without the second opinion, instead of its own tool call failing at
+  the protocol layer. kaibo does not retry (a consult is optional augmentation); the
+  policy is documented in the README FAQ and `docs/config.md`.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
 

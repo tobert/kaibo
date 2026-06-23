@@ -294,6 +294,18 @@ APIs, with keys you supply. kaish itself reaches nothing: no network, no credent
 Telemetry is off by default and, when on, only opens an *outbound* OTLP connection
 you configure.
 
+**What happens if a provider is overloaded or down (a 429/529, a reset, a wedged
+backend)?** kaibo does **not** retry — a single completion is bounded by the backend's
+`request_timeout` (default 15 min, the wall-clock for one model call) and a ≤10s
+`connect_timeout` that fails a dead endpoint fast. When a provider fails, the consult
+returns a **clean tool-result error** (`is_error`) naming the cast and the underlying
+detail, rather than a protocol-level error — because a consult is an *optional* second
+opinion, so your agent should read "the consult failed, here's why" and proceed without
+it (or call again), not have its own turn fail. Retrying is the calling agent's decision;
+if a provider is reliably slow, raise that backend's `request_timeout_secs`. (Automatic
+retry/backoff belongs in the HTTP layer — tracked as an upstream `rig` contribution in
+[`docs/issues.md`](docs/issues.md).)
+
 **What's the cost?** `consult` spends tokens on the provider behind the chosen cast. A
 family-mixing cast (cheap local explorer + hosted synth) keeps the broad, token-heavy
 sweeping cheap and pays the strong model only for the answer. The agent conversations
