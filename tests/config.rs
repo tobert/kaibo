@@ -1587,21 +1587,37 @@ fn an_empty_slot_preamble_is_a_loud_error() {
 
 // --- [orientation] static repo map --------------------------------------------
 
-/// No `[orientation]` table → on by default, 256-file ceiling.
+/// No `[orientation]` table → on by default, 256-file ceiling, depth-4 fallback.
 #[test]
 fn orientation_defaults_on_with_256_ceiling() {
     let c = Config::builtin();
     assert!(c.orientation.enabled);
     assert_eq!(c.orientation.full_list_max_files, 256);
+    assert_eq!(c.orientation.tree_max_depth, 4);
 }
 
-/// The table tunes both knobs.
+/// The table tunes every knob.
 #[test]
 fn orientation_table_tunes_enabled_and_ceiling() {
-    let c = Config::from_toml_str("[orientation]\nenabled = false\nfull_list_max_files = 1000\n")
-        .unwrap();
+    let c = Config::from_toml_str(
+        "[orientation]\nenabled = false\nfull_list_max_files = 1000\ntree_max_depth = 6\n",
+    )
+    .unwrap();
     assert!(!c.orientation.enabled);
     assert_eq!(c.orientation.full_list_max_files, 1000);
+    assert_eq!(c.orientation.tree_max_depth, 6);
+}
+
+/// A zero `tree_max_depth` is a loud load error — it would render an empty
+/// directory map; disable instead.
+#[test]
+fn a_zero_tree_depth_is_a_loud_error() {
+    let err = Config::from_toml_str("[orientation]\ntree_max_depth = 0\n")
+        .expect_err("a zero depth must be rejected");
+    assert!(
+        format!("{err:#}").contains("tree_max_depth"),
+        "names the knob: {err:#}"
+    );
 }
 
 /// A zero ceiling is a loud load error — it would refuse every repo; disable

@@ -853,8 +853,10 @@ impl KaiboHandler {
     /// Assemble the static repo-orientation map for this call against the resolved
     /// `root` — the `[orientation]` block injected into the exploring preamble. Runs
     /// the kernel's own `glob` server-side (no model turn). A repo over the file
-    /// ceiling is a loud `internal_error` (the operator chose that limit), per
-    /// `OrientationConfig::assemble`. Only the *exploring* tools call this.
+    /// ceiling gets a directory map, and one too large for even that gets a short
+    /// discover-as-you-go note — never a refusal, per `OrientationConfig::assemble`.
+    /// Errors here are real failures (kernel spawn, unparseable enumeration), not
+    /// size. Only the *exploring* tools call this.
     async fn orientation(&self, root: &std::path::Path) -> Result<Option<Arc<str>>, McpError> {
         self.config
             .orientation

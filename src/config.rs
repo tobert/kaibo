@@ -1392,16 +1392,18 @@ struct RawPrompts {
 }
 
 /// The `[orientation]` stanza — the static repo-map injected into the exploring
-/// preamble. Both fields optional; defaults are on with a 256-file ceiling. See
-/// [`OrientationConfig`].
+/// preamble. All fields optional; defaults are on with a 256-file ceiling and a
+/// 4-level fallback tree. See [`OrientationConfig`].
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOrientation {
     /// Inject the map at all. Default `true`.
     enabled: Option<bool>,
-    /// File-count ceiling for the full-list form; over it, a call is refused.
-    /// Default `256`.
+    /// File-count ceiling for the full-list form; over it, the map falls back to a
+    /// directory tree. Default `256`.
     full_list_max_files: Option<usize>,
+    /// How many directory levels the fallback tree descends. Default `4`.
+    tree_max_depth: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1714,7 +1716,9 @@ fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
 
 /// Resolve `[orientation]`. A zero `full_list_max_files` would refuse *every* repo
 /// (no project has zero files), which is never the intent — disable it via
-/// `enabled = false` instead. Loud at load rather than a baffling per-call error.
+/// `enabled = false` instead. A zero `tree_max_depth` would render an empty
+/// directory map, which is equally pointless. Both are loud at load rather than a
+/// baffling per-call result.
 fn merge_orientation(raw: RawOrientation) -> Result<OrientationConfig> {
     let d = OrientationConfig::default();
     let full_list_max_files = raw.full_list_max_files.unwrap_or(d.full_list_max_files);
@@ -1724,9 +1728,17 @@ fn merge_orientation(raw: RawOrientation) -> Result<OrientationConfig> {
              every repo; set `enabled = false` to turn the map off instead"
         );
     }
+    let tree_max_depth = raw.tree_max_depth.unwrap_or(d.tree_max_depth);
+    if tree_max_depth == 0 {
+        bail!(
+            "[orientation] tree_max_depth must be > 0 — a zero depth renders an empty \
+             directory map; set `enabled = false` to turn the map off instead"
+        );
+    }
     Ok(OrientationConfig {
         enabled: raw.enabled.unwrap_or(d.enabled),
         full_list_max_files,
+        tree_max_depth,
     })
 }
 
