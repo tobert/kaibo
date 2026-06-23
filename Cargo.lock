@@ -1261,6 +1261,7 @@ dependencies = [
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.32.1",
+ "regex",
  "reqwest",
  "rig-core",
  "rmcp",

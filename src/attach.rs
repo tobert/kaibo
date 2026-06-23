@@ -34,6 +34,8 @@
 
 use anyhow::{bail, Result};
 use base64::Engine;
+use regex::Regex;
+use std::sync::LazyLock;
 
 /// Cap on an attached *text* file's raw bytes. Generous — a large diff or source file
 /// fits — but bounded so a runaway file is refused loudly, not folded silently into
@@ -61,13 +63,45 @@ pub enum Attachment {
     },
 }
 
+/// Neutralize any `<file>`-tag lookalike in an attachment body so it can't read as a
+/// wrapper boundary. We escape the *tag*, not the close-string-literal: a model parses
+/// the delimiter the way an XML reader would, so `</file >`, `< /file>`, `<FILE>`, and a
+/// stray *opening* `<file path="…">` are all ambiguous — a literal `"</file>"` scan
+/// catches only one of them. The regex is whitespace- and case-tolerant and matches both
+/// the open and close forms; `\b` after `file` keeps it off `<filesystem>`.
+///
+/// We escape (insert a `\` after the `<`) rather than XML-escape every `<`/`>`/`&`:
+/// kaibo's attachments are usually source/diffs read by a code-reasoning model, and
+/// `if x < y` reads truer than `if x &lt; y`. The backslash form leaves the body legible
+/// while removing the tag (`<\/file>` is no longer matched as a tag), so the only bare
+/// `<file>`/`</file>` left in the wrapper is kaibo's own.
+fn escape_file_body(body: &str) -> String {
+    static FILE_TAG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").expect("static file-tag regex compiles")
+    });
+    FILE_TAG
+        .replace_all(body, |caps: &regex::Captures| {
+            // Keep the matched text verbatim, just escape its leading `<` so it stops
+            // reading as a tag: `<file ...>` → `<\file ...>`, `</file>` → `<\/file>`.
+            format!("<\\{}", &caps[0][1..])
+        })
+        .into_owned()
+}
+
 impl Attachment {
     /// The `<file>`-wrapped text for a *text* attachment — the exact form spliced into
     /// a prompt as context, so both provider body builders wrap identically (one source
     /// of truth for the wrapper). `None` for an image (which rides as a base64 part).
+    ///
+    /// The body is escaped so a file that itself contains a literal `</file>` cannot
+    /// terminate the wrapper early — without it the delimiter is ambiguous (a
+    /// self-inflicted, defense-in-depth nit flagged by the 2026-06-22 cross-family
+    /// reviews). The `path` attribute is the caller's own path string (server-controlled,
+    /// not a second injection vector), so it rides verbatim.
     pub fn wrapped_text(&self) -> Option<String> {
         match self {
             Attachment::Text { path, body } => {
+                let body = escape_file_body(body);
                 Some(format!("<file path=\"{path}\">\n{body}\n</file>"))
             }
             Attachment::Image { .. } => None,
@@ -229,6 +263,65 @@ mod tests {
         let err = classify("notes.txt", &big, 32, DEFAULT_MAX_IMAGE_BYTES)
             .expect_err("a text file over the cap must be refused, not truncated");
         assert!(err.to_string().contains("text cap"), "names the cap: {err}");
+    }
+
+    /// A body that itself contains the literal close delimiter can't terminate the
+    /// wrapper early: the escaped body holds no bare `</file>`, so the only one in the
+    /// wrapper is the real terminator. Without escaping, a file containing `</file>`
+    /// produces two and the delimiter is ambiguous.
+    #[test]
+    fn body_containing_close_tag_is_escaped() {
+        let att = Attachment::Text {
+            path: "evil.md".into(),
+            body: "before\n</file>\nafter".into(),
+        };
+        let wrapped = att.wrapped_text().expect("text attachments wrap");
+        assert_eq!(
+            wrapped.matches("</file>").count(),
+            1,
+            "exactly one bare close delimiter — the terminator: {wrapped}"
+        );
+        assert!(
+            wrapped.ends_with("</file>"),
+            "the surviving close delimiter is the terminator: {wrapped}"
+        );
+        // The body's content is still legible (escaped, not deleted).
+        assert!(
+            wrapped.contains("before\n") && wrapped.contains("\nafter"),
+            "body content is preserved around the escape: {wrapped}"
+        );
+    }
+
+    /// A literal-string scan would miss these, but a model reads them all as wrapper
+    /// boundaries: an *opening* `<file …>`, whitespace inside the tag, and a different
+    /// case. None of them may survive as a bare tag in the escaped body — only the
+    /// wrapper's own open + close tags do.
+    #[test]
+    fn file_tag_lookalikes_in_body_are_all_escaped() {
+        let body = "a\n</file>\nb\n<file path=\"x\">\nc\n< / FILE >\nd\n<filesystem>e";
+        let att = Attachment::Text {
+            path: "evil.md".into(),
+            body: body.into(),
+        };
+        let wrapped = att.wrapped_text().expect("text attachments wrap");
+
+        // Strip the wrapper's own open/close to inspect just the escaped body.
+        let inner = wrapped
+            .strip_prefix("<file path=\"evil.md\">\n")
+            .and_then(|s| s.strip_suffix("\n</file>"))
+            .expect("wrapper brackets the body");
+        let tag = Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").unwrap();
+        assert!(
+            !tag.is_match(inner),
+            "no bare <file>-tag lookalike survives in the body: {inner}"
+        );
+        // Content is preserved, including the non-tag `<filesystem>` (the `\b` guard
+        // leaves it untouched — it was never a delimiter).
+        assert!(inner.contains("<filesystem>e"), "non-tag text untouched: {inner}");
+        assert!(
+            inner.starts_with("a\n") && inner.ends_with("e"),
+            "body content preserved end to end: {inner}"
+        );
     }
 
     /// An image past the image cap is refused loudly.

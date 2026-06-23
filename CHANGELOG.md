@@ -131,5 +131,10 @@ the git log. Each later release appends a new section at the top.
   output, 64 MB scratch — over-cap fails loudly, never a silent drop), and the model
   loops stop at turn limits, so a runaway consultation can't melt the machine or the
   budget. All configurable.
+- **Attachment wrappers can't be confused by their own contents.** An attached file
+  that itself contains a `<file>`-tag lookalike — a `</file>` close, a stray opening
+  `<file …>`, or a whitespace/case variant — no longer reads as a wrapper boundary; the
+  tag is escaped in the body, so the line between an attachment and the prompt stays
+  unambiguous across `oneshot` and batch.
 
 [0.2.0]: https://github.com/tobert/kaibo/releases/tag/v0.2.0
