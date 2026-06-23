@@ -88,9 +88,13 @@ the git log. Each later release appends a new section at the top.
   and still land on the project. The scope handshake and `kaibo://config` tag the
   root as inferred. An `--allow-path` that excludes the cwd leaves no default root —
   kaibo never defaults to a path its own containment check would reject.
-- **`~` *and* `$VAR` / `${VAR}` expand in `[server] root` and `allow_paths`**
-  (config-file and `KAIBO_*` env layers), matching the tilde handling key files and
-  `[context]` paths already get. Set `allow_paths = ["~/src"]` once and every project
+- **`~` *and* `$VAR` / `${VAR}` expand in every config path — `[server] root`,
+  `allow_paths`, `[context] user_files`, and a backend's `api_key_file`** (config-file
+  and `KAIBO_*` env layers). One uniform rule: you never have to remember "env vars work
+  here but not there." `user_files = ["$XDG_CONFIG_HOME/notes.md"]` and
+  `api_key_file = "$XDG_CONFIG_HOME/keys/anthropic"` now resolve per-environment instead
+  of failing on a literal `$` (those two were previously tilde-only). Set
+  `allow_paths = ["~/src"]` once and every project
   under it is in-bounds — with cwd inferred as the default root, you stop thinking about
   `path` entirely. (Previously a literal `~` was taken verbatim and failed
   canonicalization at startup.) Environment variables make a scratch space portable:
