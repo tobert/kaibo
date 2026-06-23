@@ -1097,7 +1097,7 @@ impl KaiboHandler {
             session = session.is_some(),
         );
         progress.emit(PhaseEvent::PhaseStarted { phase: "consult" });
-        let out = consult(
+        let out = match consult(
             &input.question,
             input.context.as_deref(),
             root,
@@ -1108,7 +1108,12 @@ impl KaiboHandler {
         )
         .instrument(span)
         .await
-        .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        {
+            Ok(out) => out,
+            // A provider/model-loop failure is a clean tool-result error the host can
+            // proceed past, not a JSON-RPC internal_error. See `consultation_failed`.
+            Err(e) => return Ok(consultation_failed("consult", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
         // Provenance: name the cast and the models that answered, so a caller (a
@@ -1171,10 +1176,14 @@ impl KaiboHandler {
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
-        let answer = oneshot(&input.prompt, &attachments, &arm, &cfg)
+        let answer = match oneshot(&input.prompt, &attachments, &arm, &cfg)
             .instrument(span)
             .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        {
+            Ok(answer) => answer,
+            // A provider failure is a clean tool-result error, same as `consult`.
+            Err(e) => return Ok(consultation_failed("oneshot", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
         let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)]);
@@ -2358,6 +2367,93 @@ fn consult_result(answer: String, report: String, include_report: bool) -> CallT
     result
 }
 
+/// How a runtime consultation failure should be framed to the calling agent — derived
+/// from the error chain by [`classify_failure`].
+#[derive(Debug, PartialEq, Eq)]
+enum FailureKind {
+    /// A transient provider condition (overload / rate-limit / timeout / reset). Worth a
+    /// caller-driven manual retry.
+    TransientProvider,
+    /// A non-transient model/provider error (auth, bad request). Retrying won't help.
+    Provider,
+    /// A kaibo-*side* failure (e.g. the synth's kaish kernel failed to build) — not the
+    /// provider's fault, so we must not say it was.
+    Internal,
+}
+
+/// Classify a consultation failure from its error chain. This is a **heuristic on the
+/// error text**, by necessity: rig collapses the HTTP status into the response *body*
+/// (`CompletionError::ProviderError(text)` carries Anthropic's `overloaded_error` JSON, a
+/// Gemini `RESOURCE_EXHAUSTED`, etc. — not the number `529`), so we match the providers'
+/// transient *vocabulary* rather than a status code. The model loop wraps its errors as
+/// `"model loop failed: …"` (`consult.rs`); an error chain lacking that marker came from
+/// *before* a model ran (a kaish kernel build inside the toolset factory), so it's a
+/// kaibo-side failure, not the provider's.
+fn classify_failure(err: &anyhow::Error) -> FailureKind {
+    let s = format!("{err:#}").to_lowercase();
+    let from_model_loop = s.contains("model loop failed") || s.contains("model used all");
+    if !from_model_loop {
+        return FailureKind::Internal;
+    }
+    // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
+    // transport layer (reqwest timeouts/resets from our own `request_timeout`).
+    const TRANSIENT: &[&str] = &[
+        "overload",        // Anthropic 529 overloaded_error, Gemini
+        "rate limit",      // generic
+        "rate_limit",      // OpenAI/DeepSeek/Anthropic error `type`s
+        "ratelimit",
+        "resource_exhausted", // Gemini 429
+        "too many requests",  // 429 reason phrase
+        "timed out",          // reqwest / gateway
+        "timeout",
+        "connection reset",
+        "reset by peer",
+        "connection closed",
+        "broken pipe",
+        "temporarily",     // "temporarily unavailable"
+        "unavailable",     // 503 / Gemini UNAVAILABLE
+        "try again",
+    ];
+    if TRANSIENT.iter().any(|t| s.contains(t)) {
+        FailureKind::TransientProvider
+    } else {
+        FailureKind::Provider
+    }
+}
+
+/// Surface a *runtime* consultation failure as a **tool-result error** (`is_error =
+/// true`) rather than a protocol-level `internal_error`. A consult is an *optional*
+/// augmentation: the calling agent should read a clear message and proceed *without* the
+/// second opinion — not have its own tool call fail at the JSON-RPC layer. The framing is
+/// tailored by [`classify_failure`] so the agent can drive the right next step: a
+/// transient overload/timeout invites a manual retry (kaibo does **not** retry on its own
+/// — one completion is bounded by the backend's `request_timeout`/`connect_timeout`; see
+/// the failure-policy FAQ and `docs/config.md`), a non-transient provider error doesn't,
+/// and a kaibo-side failure is named honestly rather than blamed on the provider. Setup
+/// errors *before* the model call — unknown cast, an attachment outside the boundary, a
+/// missing key — stay `McpError`, since those are the caller's to fix.
+fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolResult {
+    let detail = format!("{err:#}");
+    let guidance = match classify_failure(&err) {
+        FailureKind::TransientProvider => {
+            "This looks like a transient provider condition (overload, rate limit, or \
+             timeout). kaibo does not retry automatically — you may retry this call, or \
+             proceed without the consultation."
+        }
+        FailureKind::Provider => {
+            "The model or its provider rejected the request; retrying is unlikely to help \
+             — proceed without the consultation, or check the cast and config."
+        }
+        FailureKind::Internal => {
+            "This is a kaibo-side error (not the provider) — please report it; you can \
+             still proceed without the consultation."
+        }
+    };
+    CallToolResult::error(vec![Content::text(format!(
+        "{tool} could not complete (cast `{cast}`): {detail}. {guidance}"
+    ))])
+}
+
 /// Append a one-line provenance footer naming the cast and the model(s) that
 /// produced `answer`. The point is legibility: a caller — a cross-model study most
 /// of all — should see *which* model answered without cross-referencing
@@ -2972,6 +3068,83 @@ mod tests {
             .expect("consult answer is text content")
             .text
             .clone()
+    }
+
+    /// A runtime consultation failure surfaces as a **tool-result error** (`is_error =
+    /// true`) carrying the detail — not a protocol-level `internal_error` — so the calling
+    /// agent reads "the consult failed, here's why" and proceeds without the second
+    /// opinion. The message names the tool and cast and preserves the underlying chain.
+    #[test]
+    fn consultation_failed_is_a_tool_error_carrying_the_detail() {
+        let err = anyhow::anyhow!("model loop failed: ProviderError: overloaded_error");
+        let result = consultation_failed("consult", "deepseek", err);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a provider failure is a tool-result error, not a success"
+        );
+        let text = answer_text(&result);
+        assert!(text.contains("consult"), "names the tool: {text}");
+        assert!(text.contains("deepseek"), "names the cast: {text}");
+        assert!(
+            text.contains("overloaded_error"),
+            "preserves the underlying detail so the host can decide: {text}"
+        );
+    }
+
+    /// A *transient* provider condition (overload / rate-limit / timeout / reset) is
+    /// classified as retryable, so the message invites the calling agent to drive a manual
+    /// retry. We match the providers' transient *vocabulary*, not a status number: rig
+    /// collapses the HTTP status into the response *body* (`ProviderError(text)`), so the
+    /// numeric code isn't reliably present.
+    #[test]
+    fn transient_provider_failure_suggests_a_manual_retry() {
+        for body in [
+            "model loop failed: ProviderError: {\"type\":\"overloaded_error\"}",
+            "model loop failed: ProviderError: rate_limit_error",
+            "model loop failed: HttpError: error sending request: operation timed out",
+            "model loop failed: HttpError: connection reset by peer",
+            "model loop failed: ProviderError: RESOURCE_EXHAUSTED",
+        ] {
+            let result = consultation_failed("consult", "gemini", anyhow::anyhow!(body));
+            let text = answer_text(&result).to_lowercase();
+            assert!(
+                text.contains("retry"),
+                "a transient failure should invite a manual retry: {body} -> {text}"
+            );
+        }
+    }
+
+    /// A *non-transient* provider error (auth / bad request) does not invite a retry —
+    /// retrying won't help — but is still a clean tool-result error.
+    #[test]
+    fn non_transient_provider_failure_does_not_suggest_retry() {
+        let err = anyhow::anyhow!("model loop failed: ProviderError: invalid_request_error");
+        let text = answer_text(&consultation_failed("consult", "anthropic", err));
+        assert!(
+            !text.to_lowercase().contains("you may retry")
+                && !text.to_lowercase().contains("retry this call"),
+            "a non-transient error must not invite a retry: {text}"
+        );
+    }
+
+    /// A kaibo-*side* failure (a kaish kernel build, not the model loop) must not be
+    /// blamed on the provider — the message names it as a kaibo internal error. (DeepSeek
+    /// review, 2026-06-23: the synth's kernel spawns inside the consult error shadow, so a
+    /// spawn failure would otherwise read as "the provider failed, proceed without it".)
+    #[test]
+    fn internal_failure_is_not_blamed_on_the_provider() {
+        let err = anyhow::anyhow!("failed to build read-only kaish kernel: out of memory");
+        let text = answer_text(&consultation_failed("consult", "deepseek", err));
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("kaibo"),
+            "a kaibo-side failure is named as such, not the provider's fault: {text}"
+        );
+        assert!(
+            !lower.contains("provider failed") && !lower.contains("provider rejected"),
+            "must not claim the provider failed: {text}"
+        );
     }
 
     /// Provenance footer: the answer keeps its text, and the cast plus every labelled

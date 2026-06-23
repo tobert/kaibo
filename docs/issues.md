@@ -207,23 +207,33 @@ close tag) in the one wrapper so batch and oneshot inherit it together; the `pat
 attribute is server-controlled (the caller's path string), not a second injection point of
 concern. Lower priority than a real delimiter the model is told to trust.
 
-### Review the provider retry + failure policy (and document it)
-We don't have a stated, audited answer for what a `consult`/`oneshot`
-call does when a provider misbehaves mid-flight: a 429/529 overload, a connection
-reset, a partial stream, or a wedged-but-connected backend. Today the only explicit
-guard is the per-backend `request_timeout_secs` (default 900, `config.md`) that bounds
-a *single* completion — but whether rig retries with backoff, how many times, and
-whether a terminal provider error surfaces to the caller as a clean tool error (so the
-host agent can proceed *without* the consultation) versus failing the whole call is
-unverified. Surfaced in README review (an SRE reviewer asked "what happens on a
-DeepSeek 529?" and we couldn't answer from the docs).
+### Upstream a retry/backoff for rig's non-streaming completion path
+The provider failure *policy* is now stated, audited, and documented (README FAQ +
+`docs/config.md`, shipped): kaibo does **no** retry; one completion is bounded by the
+backend `request_timeout`/`connect_timeout`, and a provider failure surfaces as a clean
+**tool-result error** (`is_error`, `server.rs::consultation_failed`) the host can proceed
+past rather than an opaque `internal_error`. What's left is the *mechanism* we chose not
+to hand-roll: automatic retry/backoff for transient overload (429/503/529/reset).
 
-Do: trace the actual path through `consult.rs` → the rig client (`tls.rs`/client
-construction) → reqwest; confirm or add retry/backoff with a cap; make a terminal
-failure a clean, named tool error rather than an opaque internal_error; then document
-the policy in the README FAQ (it currently only promises "a down provider surfaces a
-clean error" loosely) and `docs/config.md`. A failing-first test that injects a 529 via
-the scripted `CompletionClient` (`test_support.rs`) is the natural guard.
+The decision (with Amy, 2026-06-23) was **not** to build a retry loop inside kaibo —
+that belongs in the shared HTTP layer, and hand-rolling it cuts against the anti-fork
+grain (cf. the TTS "wait for rig" call). rig *already ships* `ExponentialBackoff` /
+`RetryPolicy` (`rig-core 0.38 http_client/retry.rs`) but wires it **only into SSE
+streaming** (`http_client/sse.rs::with_retry_policy`); the non-streaming completion path
+kaibo uses gets none. So the right move is an **upstream rig contribution**: wire the
+existing retry policy into the non-streaming completion call (idempotent provider calls,
+a small cap, transient-status classification). If/when rig lands it, kaibo inherits
+retry for free and the FAQ/`config.md` policy text updates to match. Until then, the
+documented no-retry-fail-clean behavior stands and is the honest answer.
+
+Related cleanup (DeepSeek review, 2026-06-23): the synth's kaish kernel is spawned
+*lazily inside* the consult tool-loop (the toolset factory), so a kernel-build failure
+lands in the same error shadow as a provider error. `consultation_failed` now classifies
+it as `Internal` (named as a kaibo-side failure, not blamed on the provider) so it's no
+longer *mislabelled* — but the cleaner fix is to spawn the driver's kernel in the handler
+*before* the `consult()` call (the way `orientation` already does) and map a spawn failure
+to `McpError::internal_error`, matching `run_kaish`. Low priority (kernel build is
+in-process and reliable); the classification covers the user-facing symptom today.
 
 ## P3 — Infra, perf, polish
 
