@@ -98,9 +98,13 @@ Connection knobs only — models never live here:
   tool-result error** (`is_error`) naming the cast and the underlying detail. The
   rationale: a consult is an *optional* augmentation, so the calling agent should read
   the failure and proceed without the second opinion (or call again) rather than have
-  its own tool call fail at the protocol layer. Retrying is the caller's decision; for a
-  reliably-slow backend, raise its `request_timeout_secs` rather than expecting kaibo to
-  paper over it. Automatic retry/backoff belongs in the shared HTTP layer (rig already
+  its own tool call fail at the protocol layer. The message is classified so the agent
+  can drive the right next step: a *transient* condition (overload / rate-limit /
+  timeout / reset) invites a manual retry, a non-transient one (auth / bad request) does
+  not, and a kaibo-side failure is named as such. (Classification is a heuristic on the
+  provider's error *vocabulary*, not the HTTP status — rig surfaces the response body,
+  not the code.) Retrying is the caller's decision; for a reliably-slow backend, raise
+  its `request_timeout_secs` rather than expecting kaibo to paper over it. Automatic retry/backoff belongs in the shared HTTP layer (rig already
   ships an `ExponentialBackoff`, wired only into its streaming path today) — landing it
   for the non-streaming completion path is tracked as an upstream contribution in
   `docs/issues.md`, not hand-rolled here.

@@ -121,8 +121,11 @@ the git log. Each later release appends a new section at the top.
   `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the
   cast and the underlying detail — so the calling agent reads "the consult failed, here's
   why" and proceeds without the second opinion, instead of its own tool call failing at
-  the protocol layer. kaibo does not retry (a consult is optional augmentation); the
-  policy is documented in the README FAQ and `docs/config.md`.
+  the protocol layer. The message is tailored to the failure: a *transient* condition
+  (overload / rate-limit / timeout) invites a manual retry the agent can drive, a
+  non-transient one (auth / bad request) doesn't, and a kaibo-side error is named as such
+  rather than blamed on the provider. kaibo does not retry automatically (a consult is
+  optional augmentation); the policy is documented in the README FAQ and `docs/config.md`.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
 

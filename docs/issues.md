@@ -214,6 +214,15 @@ a small cap, transient-status classification). If/when rig lands it, kaibo inher
 retry for free and the FAQ/`config.md` policy text updates to match. Until then, the
 documented no-retry-fail-clean behavior stands and is the honest answer.
 
+Related cleanup (DeepSeek review, 2026-06-23): the synth's kaish kernel is spawned
+*lazily inside* the consult tool-loop (the toolset factory), so a kernel-build failure
+lands in the same error shadow as a provider error. `consultation_failed` now classifies
+it as `Internal` (named as a kaibo-side failure, not blamed on the provider) so it's no
+longer *mislabelled* — but the cleaner fix is to spawn the driver's kernel in the handler
+*before* the `consult()` call (the way `orientation` already does) and map a spawn failure
+to `McpError::internal_error`, matching `run_kaish`. Low priority (kernel build is
+in-process and reliable); the classification covers the user-facing symptom today.
+
 ## P3 — Infra, perf, polish
 
 ### Path expansion is inconsistent: `$VAR` only in `root` / `allow_paths`
