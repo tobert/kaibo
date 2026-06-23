@@ -131,5 +131,11 @@ the git log. Each later release appends a new section at the top.
   output, 64 MB scratch — over-cap fails loudly, never a silent drop), and the model
   loops stop at turn limits, so a runaway consultation can't melt the machine or the
   budget. All configurable.
+- **Attachments are read through the read-only VFS.** A named attachment's bytes are
+  read *through* the same read-only kaish mount the shell uses (rooted at the file's
+  containing allowed tree), not a separate `std::fs` read after the containment check.
+  The VFS refuses to follow a symlink out of the allowed tree at read time, so a path
+  swapped for an out-of-tree symlink *after* the check is rejected structurally rather
+  than by racing a re-check — the boundary holds regardless of timing.
 
 [0.2.0]: https://github.com/tobert/kaibo/releases/tag/v0.2.0

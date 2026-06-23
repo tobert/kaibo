@@ -38,8 +38,8 @@ fn fake_png() -> Vec<u8> {
 // --- happy paths: a workspace file inlines ----------------------------------
 
 /// A UTF-8 file inside the workspace resolves to a Text attachment carrying its body.
-#[test]
-fn workspace_text_file_inlines_as_text() {
+#[tokio::test]
+async fn workspace_text_file_inlines_as_text() {
     let root = tempdir().unwrap();
     let file = root.path().join("README.md");
     fs::write(&file, "# kaibo\nhello\n").unwrap();
@@ -47,6 +47,7 @@ fn workspace_text_file_inlines_as_text() {
 
     let atts = handler
         .resolve_attachments(&[file.to_string_lossy().to_string()])
+        .await
         .expect("an in-workspace text file must inline");
     assert_eq!(atts.len(), 1);
     match &atts[0] {
@@ -56,8 +57,8 @@ fn workspace_text_file_inlines_as_text() {
 }
 
 /// A workspace image resolves to an Image attachment with the sniffed mime.
-#[test]
-fn workspace_image_file_inlines_as_image() {
+#[tokio::test]
+async fn workspace_image_file_inlines_as_image() {
     let root = tempdir().unwrap();
     let file = root.path().join("logo.png");
     fs::write(&file, fake_png()).unwrap();
@@ -65,6 +66,7 @@ fn workspace_image_file_inlines_as_image() {
 
     let atts = handler
         .resolve_attachments(&[file.to_string_lossy().to_string()])
+        .await
         .expect("an in-workspace image must inline");
     match &atts[0] {
         Attachment::Image { mime, .. } => assert_eq!(*mime, "image/png"),
@@ -76,8 +78,8 @@ fn workspace_image_file_inlines_as_image() {
 
 /// An attachment whose path resolves *outside* the allowed set is refused, naming the
 /// boundary and a widening knob — the same rejection a session root gets.
-#[test]
-fn attachment_outside_allowed_set_is_rejected() {
+#[tokio::test]
+async fn attachment_outside_allowed_set_is_rejected() {
     let allowed = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let secret = outside.path().join("secret.txt");
@@ -86,6 +88,7 @@ fn attachment_outside_allowed_set_is_rejected() {
 
     let err = handler
         .resolve_attachments(&[secret.to_string_lossy().to_string()])
+        .await
         .expect_err("a file outside the workspace must be refused");
     let msg = format!("{err:?}");
     assert!(
@@ -97,8 +100,8 @@ fn attachment_outside_allowed_set_is_rejected() {
 /// A symlink *inside* the workspace whose target is outside is refused: `canonicalize`
 /// resolves the link, so the containment check sees the real outside path. This proves
 /// the boundary is canonicalize-based, not string-prefix-based — the read-escape teeth.
-#[test]
-fn attachment_symlink_escaping_workspace_is_rejected() {
+#[tokio::test]
+async fn attachment_symlink_escaping_workspace_is_rejected() {
     let allowed = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let secret = outside.path().join("secret.txt");
@@ -109,6 +112,7 @@ fn attachment_symlink_escaping_workspace_is_rejected() {
 
     let err = handler
         .resolve_attachments(&[link.to_string_lossy().to_string()])
+        .await
         .expect_err("a symlink whose target is outside must be refused");
     let msg = format!("{err:?}");
     assert!(
@@ -119,8 +123,8 @@ fn attachment_symlink_escaping_workspace_is_rejected() {
 
 /// A directory is not a regular file — refused, since attachments inline a file's bytes
 /// rather than mount a tree (the mirror image of `resolve_root`'s dir requirement).
-#[test]
-fn attachment_directory_is_rejected() {
+#[tokio::test]
+async fn attachment_directory_is_rejected() {
     let root = tempdir().unwrap();
     let sub = root.path().join("sub");
     fs::create_dir(&sub).unwrap();
@@ -128,6 +132,7 @@ fn attachment_directory_is_rejected() {
 
     let err = handler
         .resolve_attachments(&[sub.to_string_lossy().to_string()])
+        .await
         .expect_err("a directory must be refused");
     assert!(
         format!("{err:?}").contains("not a regular file"),
@@ -137,8 +142,8 @@ fn attachment_directory_is_rejected() {
 
 /// A binary file that is neither valid UTF-8 nor a recognized image is refused rather
 /// than inlined as mojibake — crash over corruption, even from inside the workspace.
-#[test]
-fn attachment_binary_inside_workspace_is_refused() {
+#[tokio::test]
+async fn attachment_binary_inside_workspace_is_refused() {
     let root = tempdir().unwrap();
     let file = root.path().join("mystery.bin");
     fs::write(&file, [0x00, 0xFF, 0xFE, 0xFD]).unwrap();
@@ -146,11 +151,45 @@ fn attachment_binary_inside_workspace_is_refused() {
 
     let err = handler
         .resolve_attachments(&[file.to_string_lossy().to_string()])
+        .await
         .expect_err("non-text non-image binary must be refused");
     assert!(
         format!("{err:?}").contains("neither valid UTF-8"),
         "rejection must explain the encoding gap, got: {err:?}"
     );
+}
+
+// --- the VFS read path: per-tree worker rooting --------------------------------
+
+/// An attachment in a *second* allowed tree (not the default root) reads correctly. This
+/// exercises the new read path's tree selection: `resolve_attachments` reads through a
+/// kaish worker rooted at the attachment's *containing* allowed tree, so picking the right
+/// one is load-bearing — a worker rooted at the wrong tree would fail the VFS read
+/// (the file sits outside its mount). Proves the read goes through the VFS, mounted right.
+#[tokio::test]
+async fn attachment_in_a_second_allowed_tree_reads_through_its_own_worker() {
+    let root = tempdir().unwrap();
+    let other = tempdir().unwrap();
+    let file = other.path().join("notes.md");
+    fs::write(&file, "# notes\nsecond-tree-body\n").unwrap();
+
+    // Two allowed trees: the default root and a second --allow-path.
+    let mut config = Config::builtin();
+    config.root = Some(root.path().to_path_buf());
+    config.allow_paths = vec![other.path().to_path_buf()];
+    let handler = KaiboHandler::new(config).expect("handler builds");
+
+    let atts = handler
+        .resolve_attachments(&[file.to_string_lossy().to_string()])
+        .await
+        .expect("a file in a second allowed tree must inline");
+    match &atts[0] {
+        Attachment::Text { body, .. } => assert!(
+            body.contains("second-tree-body"),
+            "body read through the second tree's worker: {body}"
+        ),
+        other => panic!("expected Text, got {other:?}"),
+    }
 }
 
 // --- vision gate: an image to a blind synth is refused offline ----------------

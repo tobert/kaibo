@@ -630,10 +630,32 @@ impl KaiboHandler {
     /// `.git`), so a foreign dir can't forge its way in. The single containment
     /// predicate — `resolve_root` and `resolve_attachments` both defer to it.
     fn contained(&self, canon: &std::path::Path) -> bool {
-        if self.allowed_set.iter().any(|tree| canon.starts_with(tree)) {
-            return true;
+        self.containing_tree(canon).is_some()
+    }
+
+    /// The allowed tree (or followed-worktree root) that contains `canon`, or `None` when
+    /// it's outside the boundary — the *which-tree* sibling of [`contained`](Self::contained)
+    /// (which is just `is_some()` on this). A static `allow_path` wins over a followed
+    /// worktree, matching the precedence in `contained`'s original form. The returned root
+    /// is what an attachment read mounts a read-only kaish worker at, so the VFS refuses a
+    /// symlink escaping *that* tree (see [`resolve_attachments`](Self::resolve_attachments)).
+    fn containing_tree(&self, canon: &std::path::Path) -> Option<PathBuf> {
+        if let Some(tree) = self.allowed_set.iter().find(|tree| canon.starts_with(tree)) {
+            return Some(tree.clone());
         }
-        self.config.follow_worktrees && self.is_followed_worktree(canon)
+        if self.config.follow_worktrees {
+            for tree in self.allowed_set.iter() {
+                if let Some(common) = crate::worktree::common_git_dir(tree) {
+                    if let Some(wt) = crate::worktree::vouched_worktrees(&common)
+                        .into_iter()
+                        .find(|wt| canon.starts_with(wt))
+                    {
+                        return Some(wt);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The shared "outside the allowed set" rejection, naming the boundary and the three
@@ -691,8 +713,8 @@ impl KaiboHandler {
     /// read and encoded server-side so the bytes never transit the calling agent's
     /// context. Each path obeys the *same* boundary as a session root — canonicalize
     /// (symlinks + `..` resolved), require a regular file, then the shared
-    /// [`contained`](Self::contained) check (allowed set + followed worktrees) — so
-    /// attachments can't read outside the workspace any more than `run_kaish` can.
+    /// [`containing_tree`](Self::containing_tree) check (allowed set + followed worktrees)
+    /// — so attachments can't read outside the workspace any more than `run_kaish` can.
     ///
     /// Failures are loud and per-path: a missing file, a directory, an over-cap or
     /// non-text/non-image file is a clear `invalid_params`, never a silent skip — an
@@ -700,15 +722,18 @@ impl KaiboHandler {
     /// size ceiling is enforced *before* reading (via the file's metadata) so a giant
     /// file is refused without first slurping it into memory.
     ///
-    /// Containment is checked on the *canonical* path, then the read follows — a
-    /// check-then-open TOCTOU window, the same class `resolve_root` carries (and tracked
-    /// in `docs/issues.md`). The attacker model makes it narrow: kaibo cannot write the
-    /// workspace, so swapping the canonical path for an outside-pointing symlink in the
-    /// sub-millisecond window needs a *concurrent* writer to the very workspace the
-    /// calling agent owns — a self-attack. Closing it structurally (open `O_NOFOLLOW`,
-    /// `fstat` the fd, contain via `/proc/self/fd`, read from the fd) is deferred until
-    /// the attacker model justifies it.
-    pub fn resolve_attachments(
+    /// **The read goes through the read-only kaish VFS, not `std::fs::read`** — the same
+    /// mechanism `view_image` uses. The canonicalize + containment check above is the
+    /// *friendly early error*; the read itself is mounted on a [`KaishWorker`] rooted at
+    /// the attachment's containing tree, whose VFS re-resolves at read time and refuses to
+    /// follow a symlink out of that tree (proved by `tests/containment.rs`'s
+    /// `mount_layer_symlink_*` battery). That closes the check-then-open TOCTOU window the
+    /// old `std::fs::read` left open — a path swapped for an out-of-tree symlink after the
+    /// check is rejected at the mount layer regardless of timing, structurally rather than
+    /// by racing a re-check. One worker is spawned per *distinct* containing tree and
+    /// reused across attachments under it, so the common case (files under one project
+    /// root) builds a single worker.
+    pub async fn resolve_attachments(
         &self,
         paths: &[String],
     ) -> Result<Vec<crate::attach::Attachment>, McpError> {
@@ -716,77 +741,76 @@ impl KaiboHandler {
         // The pre-read ceiling: whichever encoding cap is larger. `classify` applies the
         // precise per-encoding cap after sniffing; this just bounds the read itself.
         let read_ceiling = DEFAULT_MAX_TEXT_BYTES.max(DEFAULT_MAX_IMAGE_BYTES);
-        paths
-            .iter()
-            .map(|p| {
-                let raw = std::path::PathBuf::from(p);
-                let canon = std::fs::canonicalize(&raw).map_err(|e| {
-                    McpError::invalid_params(
-                        format!("attachment {} could not be resolved: {e}", raw.display()),
-                        None,
-                    )
-                })?;
-                // A regular file, not a directory — symmetric with resolve_root's dir
-                // check, the mirror image (we inline a file's bytes, not mount a tree).
-                let meta = std::fs::metadata(&canon).map_err(|e| {
-                    McpError::invalid_params(
-                        format!("attachment {} could not be read: {e}", canon.display()),
-                        None,
-                    )
-                })?;
-                if !meta.is_file() {
-                    return Err(McpError::invalid_params(
-                        format!("attachment {} is not a regular file", canon.display()),
-                        None,
-                    ));
-                }
-                // Same boundary as a session root.
-                if !self.contained(&canon) {
-                    return Err(self.containment_error(&raw, &canon));
-                }
-                // Bound the read by the absolute ceiling before slurping.
-                if meta.len() > read_ceiling as u64 {
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "attachment {} is {} bytes, over the {read_ceiling}-byte limit",
-                            canon.display(),
-                            meta.len()
-                        ),
-                        None,
-                    ));
-                }
-                let bytes = std::fs::read(&canon).map_err(|e| {
-                    McpError::invalid_params(
-                        format!("attachment {} could not be read: {e}", canon.display()),
-                        None,
-                    )
-                })?;
-                // Label the attachment with the caller's path (what they typed), not the
-                // canonical one — it's their reference and it's what the model should see.
+        // One read-only worker per distinct containing tree, reused across attachments
+        // under it (a worker owns a thread + kernel build, so we don't want one per file).
+        let mut workers: std::collections::HashMap<PathBuf, KaishWorker> =
+            std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(paths.len());
+        for p in paths {
+            let raw = std::path::PathBuf::from(p);
+            let canon = std::fs::canonicalize(&raw).map_err(|e| {
+                McpError::invalid_params(
+                    format!("attachment {} could not be resolved: {e}", raw.display()),
+                    None,
+                )
+            })?;
+            // A regular file, not a directory — symmetric with resolve_root's dir
+            // check, the mirror image (we inline a file's bytes, not mount a tree).
+            let meta = std::fs::metadata(&canon).map_err(|e| {
+                McpError::invalid_params(
+                    format!("attachment {} could not be read: {e}", canon.display()),
+                    None,
+                )
+            })?;
+            if !meta.is_file() {
+                return Err(McpError::invalid_params(
+                    format!("attachment {} is not a regular file", canon.display()),
+                    None,
+                ));
+            }
+            // Same boundary as a session root — and the tree to root the VFS read at.
+            let tree = self
+                .containing_tree(&canon)
+                .ok_or_else(|| self.containment_error(&raw, &canon))?;
+            // Bound the read by the absolute ceiling before slurping.
+            if meta.len() > read_ceiling as u64 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attachment {} is {} bytes, over the {read_ceiling}-byte limit",
+                        canon.display(),
+                        meta.len()
+                    ),
+                    None,
+                ));
+            }
+            // Read *through the VFS* rooted at the containing tree — see the doc-comment.
+            // A swapped escaping symlink is refused at the mount, not read through.
+            if !workers.contains_key(&tree) {
+                let worker = KaishWorker::spawn_with(&tree, self.config.sandbox.clone())
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("attachment reader for {}: {e:#}", tree.display()),
+                            None,
+                        )
+                    })?;
+                workers.insert(tree.clone(), worker);
+            }
+            let bytes = workers[&tree].read_file(canon.clone()).await.map_err(|e| {
+                McpError::invalid_params(
+                    format!("attachment {} could not be read: {e:#}", canon.display()),
+                    None,
+                )
+            })?;
+            // Label the attachment with the caller's path (what they typed), not the
+            // canonical one — it's their reference and it's what the model should see.
+            out.push(
                 classify(p, &bytes, DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_IMAGE_BYTES)
-                    .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
-            })
-            .collect()
+                    .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?,
+            );
+        }
+        Ok(out)
     }
 
-    /// True when `canon` falls inside a git worktree that an already-allowed repo
-    /// vouches for. The trusted side does the vouching: for each allowed tree we
-    /// resolve *its* common git dir and enumerate the worktrees that common dir
-    /// names; `canon` is admitted only if it sits inside one. We never read
-    /// `canon`'s own `.git`, so a forged pointer there can't smuggle a foreign path
-    /// in. Pure file reads on the (rare) containment-miss path — see
-    /// [`crate::worktree`].
-    fn is_followed_worktree(&self, canon: &std::path::Path) -> bool {
-        self.allowed_set.iter().any(|tree| {
-            crate::worktree::common_git_dir(tree)
-                .map(|common| {
-                    crate::worktree::vouched_worktrees(&common)
-                        .iter()
-                        .any(|wt| canon.starts_with(wt))
-                })
-                .unwrap_or(false)
-        })
-    }
 
     /// The worktrees the follow feature currently admits *beyond* the static allowed
     /// set — for the `kaibo://config` runtime section, so the live boundary stays
@@ -1129,7 +1153,7 @@ impl KaiboHandler {
         let arm = self.arm(&cast, ModelRole::Synth)?;
         // Read + containment-check the attachments (same boundary as a session root); the
         // bytes are inlined server-side so they never transit the calling agent's context.
-        let attachments = self.resolve_attachments(&input.attach)?;
+        let attachments = self.resolve_attachments(&input.attach).await?;
         // Gate image attachments on the model's vision capability (shared with batch).
         self.gate_image_attachments(arm.caps.vision, &attachments, &arm.model, &cast.name)?;
         let progress = progress_sink(peer, &meta);
@@ -1383,7 +1407,7 @@ impl KaiboHandler {
         // Read + containment-check the attachments before anything hits the network: a
         // bad path is a clean refusal, not a half-submitted batch. The bytes are inlined
         // server-side so they never transit the calling agent's context.
-        let attachments = self.resolve_attachments(&input.attach)?;
+        let attachments = self.resolve_attachments(&input.attach).await?;
         // Gate image attachments on the synth model's vision capability before the
         // provider is built — so a vision misconfig needs no key to report.
         self.gate_image_attachments(caps.vision, &attachments, &model, &cast.name)?;
