@@ -151,5 +151,12 @@ the git log. Each later release appends a new section at the top.
   The VFS refuses to follow a symlink out of the allowed tree at read time, so a path
   swapped for an out-of-tree symlink *after* the check is rejected structurally rather
   than by racing a re-check — the boundary holds regardless of timing.
+- **Attachment wrappers can't be confused by their own contents.** Neither an attached
+  file's *body* nor its *name* can forge the `<file>` wrapper boundary anymore. A body
+  holding a `<file>`-tag lookalike — a `</file>` close, a stray opening `<file …>`, or a
+  whitespace/case variant — is escaped, and the caller's path (a legal filename can hold
+  `"`, `>`, or newlines) is attribute-escaped, so a maliciously-named file can't inject a
+  second wrapper. The line between an attachment and the prompt stays unambiguous across
+  `oneshot` and batch.
 
 [0.2.0]: https://github.com/tobert/kaibo/releases/tag/v0.2.0

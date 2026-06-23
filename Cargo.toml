@@ -64,6 +64,11 @@ base64 = "0.22"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
 # raw structs turns a typo'd key into a startup error rather than a silent no-op.
 toml = "0.8"
+# Neutralizing `<file>`-tag lookalikes in an attachment body (attach.rs) — a literal
+# scan can't catch the whitespace/case variants a model would still read as a
+# delimiter. Pure Rust, no C, so it's clear of the aws-lc/OpenSSL ban; already in the
+# tree transitively via kaish-kernel, named here so the dep is ours, not implicit.
+regex = "1"
 
 # MCP server (stdio only — never bind a socket; the FS is the boundary).
 rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }

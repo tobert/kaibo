@@ -195,18 +195,6 @@ confidentiality — but the attachment surface should be bounded structurally li
 Low priority (self-attack DoS), but cheap to land together as an "attachment resource bounds"
 pass. The streaming cap is the one with real teeth and needs the kaish-vfs read API.
 
-### The `<file>` attachment wrapper doesn't escape its body
-`Attachment::wrapped_text` (`attach.rs`) wraps a text attachment as
-`<file path="…">{body}</file>` without escaping `body`, so a file that itself contains a
-literal `</file>` produces a malformed wrapper — the model *may* still read it as intended
-(LLMs are robust to it), but the delimiter is ambiguous. Shared by both attach surfaces
-(batch body builders + oneshot), and self-inflicted (the caller owns the workspace file),
-so low-stakes — flagged by both cross-family reviews (DeepSeek + Gemini, 2026-06-22) as a
-defense-in-depth nit, not a bug. Fix when it bites: escape the body (CDATA, or replace the
-close tag) in the one wrapper so batch and oneshot inherit it together; the `path`
-attribute is server-controlled (the caller's path string), not a second injection point of
-concern. Lower priority than a real delimiter the model is told to trust.
-
 ### Upstream a retry/backoff for rig's non-streaming completion path
 The provider failure *policy* is now stated, audited, and documented (README FAQ +
 `docs/config.md`, shipped): kaibo does **no** retry; one completion is bounded by the
