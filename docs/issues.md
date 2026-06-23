@@ -152,36 +152,25 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
-### Path containment is check-then-open (a narrow TOCTOU)
-Both `resolve_root` and `resolve_attachments` (`server.rs`) check containment on the
-*canonical* path and then open/read it as a separate step — a classic check-then-open
-window. A concurrent writer could swap the canonical path for an outside-pointing symlink
-between the `contained` check and the read, escaping the boundary. Surfaced by the
-cross-family review of the batch `attach` feature (DeepSeek, 2026-06-22), which judged the
-boundary otherwise sound. The attacker model keeps it narrow: kaibo cannot write the
-workspace, so the race needs a concurrent writer to the very tree the calling agent owns
-(a self-attack), inside a sub-millisecond window. `resolve_root` is the less-exposed of
-the two — it hands the canonical path to the kaish kernel, which opens a directory fd and
-works through it — while the attachment path reads a file one-shot with `std::fs::read`
-and discards the fd.
+### Path containment check-then-open in `resolve_root` (the attachment half is closed)
+The attachment half **shipped**: `resolve_attachments` (`server.rs`) now reads *through the
+read-only kaish VFS* (`worker.read_file` on a `KaishWorker` rooted at the attachment's
+containing tree, one worker per distinct tree), not `std::fs::read`. The VFS resolves within
+its mount and refuses to follow a symlink out of the allowed tree, so a path swapped for an
+out-of-tree symlink after the friendly early check is rejected at the mount layer regardless
+of timing — the check-then-open window closes structurally. Teeth: `tests/attach.rs`
+proves the read goes through a worker mounted at the *correct* containing tree (a wrong
+mount fails the read), atop the `mount_layer_symlink_*` battery that proves the VFS refuses
+escapes. (No flaky racy TOCTOU test, per the project's no-flaky-tests stance.)
 
-**Likely structural fix: read attachments *through the kaish VFS*, not `std::fs::read`** —
-the project's own "read-only is structural" mechanism, and `view_image` already does
-exactly this (`view_image.rs`: `worker.read_file(&canon)` on a `KaishWorker`, the same
-read-only mount `run_kaish` uses). The VFS resolves within its mount and **refuses to
-follow a symlink out of the allowed tree** (proved by `tests/containment.rs`'s
-`mount_layer_symlink_in_allowed_pointing_outside`), so a swapped escaping symlink is
-rejected regardless of timing — the window closes structurally, and it's portable (no
-`/proc`, no `O_NOFOLLOW` per-platform dance). `resolve_attachments` keeps its
-`std`-level canonicalize + `contained` check for the friendly early error; the *read*
-moves to the worker. Open wrinkle to settle when we build it: `resolve_attachments` spans
-multiple allowed trees + followed worktrees, while a `KaishWorker` is rooted at one tree —
-so either root a worker per containing tree, or reuse the worker `batch_submit` would
-already have. A flaky racy "prove the TOCTOU" test isn't worth it (the project hates flaky
-tests); the deterministic proof is that the VFS refuses the escaping read — extend the
-mount-layer test to the attachment path. Deferred until the attacker model (a workspace
-writable by someone other than the caller) is real, but it's *more correct* regardless, so
-likely worth doing on its own merits. Documented in `resolve_attachments`' doc-comment.
+**Still open — `resolve_root`.** It also checks containment on the canonical path then hands
+it to the kaish kernel as the mount root, a separate step. It's the *less-exposed* half: the
+kernel opens the root as a directory fd and works through it (vs. the old one-shot
+`std::fs::read` the attachment path used), and the mount itself re-resolves reads. Surfaced
+by the batch `attach` cross-family review (DeepSeek, 2026-06-22), which judged the boundary
+otherwise sound. The attacker model stays narrow (a self-attack: a concurrent writer to the
+caller's own workspace, sub-millisecond window). Worth closing for symmetry when the model
+justifies it, but lower priority than the attachment read that one-shot-followed a symlink.
 
 ### The `<file>` attachment wrapper doesn't escape its body
 `Attachment::wrapped_text` (`attach.rs`) wraps a text attachment as
