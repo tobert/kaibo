@@ -13,7 +13,7 @@
 //!   project root and canonicalize-checked to stay *within* it — a configured
 //!   `../escape` (or a symlink out) is refused, so the same containment that
 //!   bounds the read-only shell also bounds what gets injected.
-//! - **`user_files`** are absolute (tilde already expanded at config merge) and
+//! - **`user_files`** are absolute (`$VAR`/`~` already expanded at config merge) and
 //!   **read-required**: the operator named this file deliberately, so a missing
 //!   one is a loud error, not a silent skip. These live *outside* the sandbox's
 //!   allowed set on purpose — they're read here in trusted Rust at the server
@@ -32,13 +32,13 @@ use anyhow::{bail, Context, Result};
 /// Resolved `[context]` configuration: which files to splice into preambles.
 /// Built by `config.rs::merge_context` from the on-disk `[context]` table (with
 /// `project_files` defaulting to `["AGENTS.md"]`); `user_files` arrive already
-/// tilde-expanded so `assemble` does pure filesystem work.
+/// `$VAR`/`~`-expanded so `assemble` does pure filesystem work.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextConfig {
     /// Root-relative files read if present (absent is normal). Default
     /// `["AGENTS.md"]`. Each must canonicalize to at-or-under the project root.
     pub project_files: Vec<String>,
-    /// Absolute files (tilde already expanded) read unconditionally — a missing
+    /// Absolute files (`$VAR`/`~` already expanded) read unconditionally — a missing
     /// one is an error, since the operator declared it. Default empty.
     pub user_files: Vec<PathBuf>,
 }

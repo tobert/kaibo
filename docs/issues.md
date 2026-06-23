@@ -152,68 +152,78 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
-### Path containment is check-then-open (a narrow TOCTOU)
-Both `resolve_root` and `resolve_attachments` (`server.rs`) check containment on the
-*canonical* path and then open/read it as a separate step — a classic check-then-open
-window. A concurrent writer could swap the canonical path for an outside-pointing symlink
-between the `contained` check and the read, escaping the boundary. Surfaced by the
-cross-family review of the batch `attach` feature (DeepSeek, 2026-06-22), which judged the
-boundary otherwise sound. The attacker model keeps it narrow: kaibo cannot write the
-workspace, so the race needs a concurrent writer to the very tree the calling agent owns
-(a self-attack), inside a sub-millisecond window. `resolve_root` is the less-exposed of
-the two — it hands the canonical path to the kaish kernel, which opens a directory fd and
-works through it — while the attachment path reads a file one-shot with `std::fs::read`
-and discards the fd.
+### Path containment check-then-open in `resolve_root` (the attachment half is closed)
+The attachment half **shipped**: `resolve_attachments` (`server.rs`) now reads *through the
+read-only kaish VFS* (`worker.read_file` on a `KaishWorker` rooted at the attachment's
+containing tree, one worker per distinct tree), not `std::fs::read`. The VFS resolves within
+its mount and refuses to follow a symlink out of the allowed tree, so a path swapped for an
+out-of-tree symlink after the friendly early check is rejected at the mount layer regardless
+of timing — the check-then-open window closes structurally. Teeth: `tests/attach.rs`
+proves the read goes through a worker mounted at the *correct* containing tree (a wrong
+mount fails the read), atop the `mount_layer_symlink_*` battery that proves the VFS refuses
+escapes. (No flaky racy TOCTOU test, per the project's no-flaky-tests stance.)
 
-**Likely structural fix: read attachments *through the kaish VFS*, not `std::fs::read`** —
-the project's own "read-only is structural" mechanism, and `view_image` already does
-exactly this (`view_image.rs`: `worker.read_file(&canon)` on a `KaishWorker`, the same
-read-only mount `run_kaish` uses). The VFS resolves within its mount and **refuses to
-follow a symlink out of the allowed tree** (proved by `tests/containment.rs`'s
-`mount_layer_symlink_in_allowed_pointing_outside`), so a swapped escaping symlink is
-rejected regardless of timing — the window closes structurally, and it's portable (no
-`/proc`, no `O_NOFOLLOW` per-platform dance). `resolve_attachments` keeps its
-`std`-level canonicalize + `contained` check for the friendly early error; the *read*
-moves to the worker. Open wrinkle to settle when we build it: `resolve_attachments` spans
-multiple allowed trees + followed worktrees, while a `KaishWorker` is rooted at one tree —
-so either root a worker per containing tree, or reuse the worker `batch_submit` would
-already have. A flaky racy "prove the TOCTOU" test isn't worth it (the project hates flaky
-tests); the deterministic proof is that the VFS refuses the escaping read — extend the
-mount-layer test to the attachment path. Deferred until the attacker model (a workspace
-writable by someone other than the caller) is real, but it's *more correct* regardless, so
-likely worth doing on its own merits. Documented in `resolve_attachments`' doc-comment.
+**Still open — `resolve_root`.** It also checks containment on the canonical path then hands
+it to the kaish kernel as the mount root, a separate step. It's the *less-exposed* half: the
+kernel opens the root as a directory fd and works through it (vs. the old one-shot
+`std::fs::read` the attachment path used), and the mount itself re-resolves reads. Surfaced
+by the batch `attach` cross-family review (DeepSeek, 2026-06-22), which judged the boundary
+otherwise sound. The attacker model stays narrow (a self-attack: a concurrent writer to the
+caller's own workspace, sub-millisecond window). Worth closing for symmetry when the model
+justifies it, but lower priority than the attachment read that one-shot-followed a symlink.
 
-### Review the provider retry + failure policy (and document it)
-We don't have a stated, audited answer for what a `consult`/`oneshot`
-call does when a provider misbehaves mid-flight: a 429/529 overload, a connection
-reset, a partial stream, or a wedged-but-connected backend. Today the only explicit
-guard is the per-backend `request_timeout_secs` (default 900, `config.md`) that bounds
-a *single* completion — but whether rig retries with backoff, how many times, and
-whether a terminal provider error surfaces to the caller as a clean tool error (so the
-host agent can proceed *without* the consultation) versus failing the whole call is
-unverified. Surfaced in README review (an SRE reviewer asked "what happens on a
-DeepSeek 529?" and we couldn't answer from the docs).
+### Attachment reads have no streaming/cumulative resource bounds (DoS, self-attack)
+Surfaced by the Gemini Pro batch review of the VFS-read change (2026-06-23). These are
+**pre-existing** (the old `std::fs::read` + `.collect()` path had them too) and all in the
+self-attack model (the caller owns the request and the workspace), so they're DoS, not
+confidentiality — but the attachment surface should be bounded structurally like the rest:
+- **Per-file size cap is check-then-read, not streaming.** `resolve_attachments` checks
+  `std::fs::metadata` length against `read_ceiling`, then `worker.read_file` slurps the whole
+  file with **no byte cap** (`Job::Read` deliberately skips the script-output cap). A file
+  swapped for a huge one *after* the metadata check is read whole into a `Vec<u8>` → OOM. Fix
+  wants a *streaming* cap in the read path (a `read_file` that takes a limit and aborts past
+  `limit+1`), which needs a `KaishWorker`/kaish-vfs API that bounds the read — not just a
+  pre-check. (`classify` enforces the cap only *after* the full read, too late for memory.)
+- **A special file (FIFO/device) swapped in can hang the read.** `is_file()` rejects a FIFO
+  at check time, but a regular file swapped for a FIFO before the read blocks
+  `worker.read_file` indefinitely (single worker thread; `request_timeout` covers only the
+  model call, not attachment resolution). Wants an `O_NONBLOCK`/`tokio::time::timeout` bound
+  on the read.
+- **No cumulative cap across attachments.** Each file passes the per-file ceiling, but
+  `paths.len()` and the running total of `out` bytes are unbounded — N×(under-cap) files load
+  N× into memory. Wants a hard cap on attachment count and a cumulative byte budget.
+Low priority (self-attack DoS), but cheap to land together as an "attachment resource bounds"
+pass. The streaming cap is the one with real teeth and needs the kaish-vfs read API.
 
-Do: trace the actual path through `consult.rs` → the rig client (`tls.rs`/client
-construction) → reqwest; confirm or add retry/backoff with a cap; make a terminal
-failure a clean, named tool error rather than an opaque internal_error; then document
-the policy in the README FAQ (it currently only promises "a down provider surfaces a
-clean error" loosely) and `docs/config.md`. A failing-first test that injects a 529 via
-the scripted `CompletionClient` (`test_support.rs`) is the natural guard.
+### Upstream a retry/backoff for rig's non-streaming completion path
+The provider failure *policy* is now stated, audited, and documented (README FAQ +
+`docs/config.md`, shipped): kaibo does **no** retry; one completion is bounded by the
+backend `request_timeout`/`connect_timeout`, and a provider failure surfaces as a clean
+**tool-result error** (`is_error`, `server.rs::consultation_failed`) the host can proceed
+past rather than an opaque `internal_error`. What's left is the *mechanism* we chose not
+to hand-roll: automatic retry/backoff for transient overload (429/503/529/reset).
+
+The decision (with Amy, 2026-06-23) was **not** to build a retry loop inside kaibo —
+that belongs in the shared HTTP layer, and hand-rolling it cuts against the anti-fork
+grain (cf. the TTS "wait for rig" call). rig *already ships* `ExponentialBackoff` /
+`RetryPolicy` (`rig-core 0.38 http_client/retry.rs`) but wires it **only into SSE
+streaming** (`http_client/sse.rs::with_retry_policy`); the non-streaming completion path
+kaibo uses gets none. So the right move is an **upstream rig contribution**: wire the
+existing retry policy into the non-streaming completion call (idempotent provider calls,
+a small cap, transient-status classification). If/when rig lands it, kaibo inherits
+retry for free and the FAQ/`config.md` policy text updates to match. Until then, the
+documented no-retry-fail-clean behavior stands and is the honest answer.
+
+Related cleanup (DeepSeek review, 2026-06-23): the synth's kaish kernel is spawned
+*lazily inside* the consult tool-loop (the toolset factory), so a kernel-build failure
+lands in the same error shadow as a provider error. `consultation_failed` now classifies
+it as `Internal` (named as a kaibo-side failure, not blamed on the provider) so it's no
+longer *mislabelled* — but the cleaner fix is to spawn the driver's kernel in the handler
+*before* the `consult()` call (the way `orientation` already does) and map a spawn failure
+to `McpError::internal_error`, matching `run_kaish`. Low priority (kernel build is
+in-process and reliable); the classification covers the user-facing symptom today.
 
 ## P3 — Infra, perf, polish
-
-### Path expansion is inconsistent: `$VAR` only in `root` / `allow_paths`
-`expand_path` (`config.rs`) expands `$VAR` / `${VAR}` and a leading `~` for the boundary
-knobs (`root`, `allow_paths`), but `[context]` `user_files` (`merge_context`) and the
-key-file paths (`api_key_file`) still go through `expand_tilde` — tilde only. So
-`user_files = ["$XDG_CONFIG_HOME/notes.md"]` silently fails to expand where `allow_paths`
-would. Scoped out of the temp-read change deliberately (those two callers are infallible
-today; switching them to `expand_path` means threading `Result` through `merge_context`
-and the credential loader). Extend them to `expand_path` for one uniform rule — then a user
-never has to remember "env vars work here but not there." Low risk, mechanical; the only
-care is keeping the undefined/empty/non-UTF-8 errors loud at load (and that the extended
-callers get the same `$$`-escape + stray-`$`-is-error rules `expand_env_vars` enforces).
 
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read

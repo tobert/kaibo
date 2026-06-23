@@ -88,9 +88,13 @@ the git log. Each later release appends a new section at the top.
   and still land on the project. The scope handshake and `kaibo://config` tag the
   root as inferred. An `--allow-path` that excludes the cwd leaves no default root —
   kaibo never defaults to a path its own containment check would reject.
-- **`~` *and* `$VAR` / `${VAR}` expand in `[server] root` and `allow_paths`**
-  (config-file and `KAIBO_*` env layers), matching the tilde handling key files and
-  `[context]` paths already get. Set `allow_paths = ["~/src"]` once and every project
+- **`~` *and* `$VAR` / `${VAR}` expand in every config path — `[server] root`,
+  `allow_paths`, `[context] user_files`, and a backend's `api_key_file`** (config-file
+  and `KAIBO_*` env layers). One uniform rule: you never have to remember "env vars work
+  here but not there." `user_files = ["$XDG_CONFIG_HOME/notes.md"]` and
+  `api_key_file = "$XDG_CONFIG_HOME/keys/anthropic"` now resolve per-environment instead
+  of failing on a literal `$` (those two were previously tilde-only). Set
+  `allow_paths = ["~/src"]` once and every project
   under it is in-bounds — with cwd inferred as the default root, you stop thinking about
   `path` entirely. (Previously a literal `~` was taken verbatim and failed
   canonicalization at startup.) Environment variables make a scratch space portable:
@@ -116,6 +120,16 @@ the git log. Each later release appends a new section at the top.
   config, per-role reasoning effort, generous completion-token headroom).
 - **Multi-turn sessions** via `session_id`, and optional OTLP/HTTP trace export
   (`[telemetry]`, off by default).
+- **A failed provider doesn't fail your turn.** When a model or its provider misbehaves
+  (a 429/529 overload, a connection reset, a wedged backend that hits the
+  `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the
+  cast and the underlying detail — so the calling agent reads "the consult failed, here's
+  why" and proceeds without the second opinion, instead of its own tool call failing at
+  the protocol layer. The message is tailored to the failure: a *transient* condition
+  (overload / rate-limit / timeout) invites a manual retry the agent can drive, a
+  non-transient one (auth / bad request) doesn't, and a kaibo-side error is named as such
+  rather than blamed on the provider. kaibo does not retry automatically (a consult is
+  optional augmentation); the policy is documented in the README FAQ and `docs/config.md`.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
 
@@ -131,6 +145,12 @@ the git log. Each later release appends a new section at the top.
   output, 64 MB scratch — over-cap fails loudly, never a silent drop), and the model
   loops stop at turn limits, so a runaway consultation can't melt the machine or the
   budget. All configurable.
+- **Attachments are read through the read-only VFS.** A named attachment's bytes are
+  read *through* the same read-only kaish mount the shell uses (rooted at the file's
+  containing allowed tree), not a separate `std::fs` read after the containment check.
+  The VFS refuses to follow a symlink out of the allowed tree at read time, so a path
+  swapped for an out-of-tree symlink *after* the check is rejected structurally rather
+  than by racing a re-check — the boundary holds regardless of timing.
 - **Attachment wrappers can't be confused by their own contents.** Neither an attached
   file's *body* nor its *name* can forge the `<file>` wrapper boundary anymore. A body
   holding a `<file>`-tag lookalike — a `</file>` close, a stray opening `<file …>`, or a
