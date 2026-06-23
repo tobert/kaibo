@@ -305,7 +305,8 @@ pub struct Backend {
     pub base_url: Option<String>,
     /// Env var to read the API key from (checked before `api_key_file`).
     pub api_key_env: Option<String>,
-    /// Key-file path (`~` expanded). Used when the env var is unset/blank.
+    /// Key-file path, stored already `$VAR`/`~`-expanded (resolved once at load in
+    /// `from_toml_str`). Used when the env var is unset/blank.
     pub api_key_file: Option<String>,
     /// When true, a missing key falls back to a placeholder bearer token instead of
     /// erroring (the keyless local-server case).
@@ -342,8 +343,9 @@ impl Backend {
             }
         }
 
-        // then a configured key file, *if it exists*.
-        if let Some(file) = self.api_key_file.as_deref().map(expand_tilde) {
+        // then a configured key file, *if it exists*. The path was `$VAR`/`~`-expanded
+        // once at load (see `from_toml_str`), so it's used verbatim here.
+        if let Some(file) = self.api_key_file.as_deref().map(PathBuf::from) {
             if file.exists() {
                 // env already handled above, so pass None — `resolve` reads the file
                 // and errors loudly on empty/unreadable (for keyed AND keyless).
@@ -396,8 +398,9 @@ impl Backend {
                 }
             }
         }
-        // then a configured key file, if it exists (contents unread — see above).
-        if let Some(file) = self.api_key_file.as_deref().map(expand_tilde) {
+        // then a configured key file, if it exists (contents unread — see above). The
+        // path was `$VAR`/`~`-expanded once at load, so it's used verbatim here.
+        if let Some(file) = self.api_key_file.as_deref().map(PathBuf::from) {
             if file.exists() {
                 return KeyStatus::Present;
             }
@@ -886,6 +889,19 @@ impl Config {
             }
         }
 
+        // Expand `$VAR`/`${VAR}` and a leading `~` in each backend's `api_key_file` — the
+        // same uniform rule `root`/`allow_paths` get, so a portable `$XDG_CONFIG_HOME/key`
+        // (or the built-in `~/.gemini-api-key`) resolves per-environment. Done once here,
+        // loudly on an undefined/empty/non-UTF-8 variable, so the use-sites
+        // (`resolve_key`/`key_status`) read an already-resolved path and stay infallible —
+        // `key_status` feeds the offline cast-usability classifiers, which can't take a
+        // `Result`. Absolute/plain paths pass through unchanged.
+        for b in backends.values_mut() {
+            if let Some(f) = b.api_key_file.as_deref() {
+                b.api_key_file = Some(expand_path(f)?.to_string_lossy().into_owned());
+            }
+        }
+
         // Backend aliases: built-ins first, then file-declared. Collisions are loud,
         // per level.
         let mut backend_aliases: BTreeMap<String, String> = BTreeMap::new();
@@ -1004,7 +1020,7 @@ impl Config {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
-        let context = merge_context(raw.context.unwrap_or_default());
+        let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
         let mut sandbox = merge_sandbox(raw.sandbox.unwrap_or_default());
@@ -1652,11 +1668,14 @@ fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
 
 /// Resolve `[context]`. A *missing* `project_files` keeps the built-in
 /// `["AGENTS.md"]` default (vendor-neutral, opt-out by an explicit empty list);
-/// `user_files` default to empty and are tilde-expanded here so `assemble` is
-/// pure filesystem work. The files themselves are read lazily, per call, against
-/// the resolved root — not here — so a config load never touches a project.
-fn merge_context(raw: RawContext) -> ContextConfig {
-    ContextConfig {
+/// `user_files` default to empty and are `$VAR`/`~`-expanded here (via `expand_path`,
+/// the same uniform rule `root`/`allow_paths` get) so `assemble` is pure filesystem
+/// work and a portable `$XDG_CONFIG_HOME/notes.md` resolves per-environment. An
+/// undefined/empty/non-UTF-8 variable is a loud load error, not a silent gap. The files
+/// themselves are read lazily, per call, against the resolved root — not here — so a
+/// config load never touches a project.
+fn merge_context(raw: RawContext) -> anyhow::Result<ContextConfig> {
+    Ok(ContextConfig {
         project_files: raw
             .project_files
             .unwrap_or_else(|| vec!["AGENTS.md".to_string()]),
@@ -1664,9 +1683,9 @@ fn merge_context(raw: RawContext) -> ContextConfig {
             .user_files
             .unwrap_or_default()
             .iter()
-            .map(|s| expand_tilde(s))
-            .collect(),
-    }
+            .map(|s| expand_path(s))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    })
 }
 
 /// Resolve `[prompts]`. Each override is taken verbatim (full replace), but an
@@ -2235,6 +2254,64 @@ mod tests {
         assert_eq!(expand_path("/data/fixtures").unwrap(), PathBuf::from("/data/fixtures"));
         // Undefined variable propagates as an error through expand_path, not a panic.
         assert!(expand_path("$KAIBO_DEFINITELY_UNSET_VAR_9Q/x").is_err());
+    }
+
+    // --- uniform $VAR expansion: [context] user_files + backend api_key_file ----
+    //
+    // The boundary knobs (`root`/`allow_paths`) already take `$VAR`; these two paths
+    // lagged on tilde-only. One uniform rule means a user never has to remember "env
+    // vars work here but not there." Uses `$HOME` (always set) so no test mutates env.
+
+    /// `[context] user_files` expands `$VAR` *and* `~`, not tilde alone — so a portable
+    /// `$XDG_CONFIG_HOME/notes.md` resolves rather than landing as a literal token.
+    #[test]
+    fn user_files_expand_env_vars_not_just_tilde() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let home = home.trim_end_matches('/');
+        let cfg =
+            Config::from_toml_str("[context]\nuser_files = [\"$HOME/notes.md\", \"~/other.md\"]")
+                .unwrap();
+        assert_eq!(
+            cfg.context.user_files,
+            vec![
+                PathBuf::from(format!("{home}/notes.md")),
+                PathBuf::from(format!("{home}/other.md")),
+            ]
+        );
+    }
+
+    /// A backend's `api_key_file` expands `$VAR` too, resolved once at load (so the
+    /// use-sites stay infallible) and stored expanded.
+    #[test]
+    fn api_key_file_expands_env_vars_not_just_tilde() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let home = home.trim_end_matches('/');
+        let cfg =
+            Config::from_toml_str("[backends.anthropic]\napi_key_file = \"$HOME/.akey\"").unwrap();
+        let b = cfg.resolve_backend("anthropic").unwrap();
+        assert_eq!(b.api_key_file.as_deref(), Some(format!("{home}/.akey").as_str()));
+    }
+
+    /// An undefined variable in either path is a loud load error — never a silent gap
+    /// that would point a key read or a context file at the wrong place.
+    #[test]
+    fn undefined_var_in_user_files_or_api_key_file_is_loud_at_load() {
+        let unset = "KAIBO_DEFINITELY_UNSET_VAR_9Q";
+        assert!(std::env::var(unset).is_err(), "test precondition: {unset} unset");
+        assert!(
+            Config::from_toml_str(&format!(
+                "[context]\nuser_files = [\"${unset}/notes.md\"]"
+            ))
+            .is_err(),
+            "undefined var in user_files must fail at load"
+        );
+        assert!(
+            Config::from_toml_str(&format!(
+                "[backends.anthropic]\napi_key_file = \"${unset}/k\""
+            ))
+            .is_err(),
+            "undefined var in api_key_file must fail at load"
+        );
     }
 
     // --- built-in equivalence -------------------------------------------------
