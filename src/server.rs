@@ -2016,9 +2016,10 @@ fn render_config_resource(
         /// the value — the operator configured this pointer.
         #[serde(skip_serializing_if = "Option::is_none")]
         api_key_env: Option<String>,
-        /// Key file path as configured (`~` unexpanded; expansion happens at
-        /// key-resolution time). Used when the env var is unset/blank.
-        /// The PATH, not its contents.
+        /// Key file path, resolved (`$VAR`/`~` expanded once at config load), so this
+        /// shows the absolute path kaibo actually reads — consistent with how
+        /// `allowed_paths`/`default_root` render resolved here. Used when the env var is
+        /// unset/blank. The PATH, not its contents.
         #[serde(skip_serializing_if = "Option::is_none")]
         api_key_file: Option<String>,
         /// True when a missing key falls back to a placeholder (keyless endpoint).

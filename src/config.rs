@@ -898,7 +898,9 @@ impl Config {
         // `Result`. Absolute/plain paths pass through unchanged.
         for b in backends.values_mut() {
             if let Some(f) = b.api_key_file.as_deref() {
-                b.api_key_file = Some(expand_path(f)?.to_string_lossy().into_owned());
+                let expanded = expand_path(f)?;
+                let what = format!("backend {:?} api_key_file", b.name);
+                b.api_key_file = Some(expanded_to_utf8(expanded, &what)?);
             }
         }
 
@@ -2018,6 +2020,19 @@ fn expand_path(s: &str) -> anyhow::Result<PathBuf> {
     Ok(expand_tilde(&expand_env_vars(s)?))
 }
 
+/// Convert an [`expand_path`] result back to an owned `String` for the few fields stored
+/// as text (a backend's `api_key_file`), failing **loudly** on a non-UTF-8 result rather
+/// than lossily mangling it. The `~` form expands `$HOME` through `var_os`, so a non-UTF-8
+/// home survives into the `PathBuf` (see `expand_path`'s note); a `to_string_lossy` there
+/// would replace those bytes with U+FFFD and the key file would mis-resolve as "absent" —
+/// a silent corruption. Paths kept as `PathBuf` (`root`/`allow_paths`/`user_files`) don't
+/// need this; they carry the bytes intact.
+fn expanded_to_utf8(p: PathBuf, what: &str) -> anyhow::Result<String> {
+    p.into_os_string().into_string().map_err(|os| {
+        anyhow!("{what} expanded to a non-UTF-8 path ({os:?}); write it in UTF-8")
+    })
+}
+
 /// Resolve one variable lookup to its value, refusing the two set-but-unusable cases that
 /// would otherwise misplace the read boundary *silently*. Pure (the lookup result is passed
 /// in) so the boundary-relevant rejections are unit-testable without mutating process env.
@@ -2254,6 +2269,25 @@ mod tests {
         assert_eq!(expand_path("/data/fixtures").unwrap(), PathBuf::from("/data/fixtures"));
         // Undefined variable propagates as an error through expand_path, not a panic.
         assert!(expand_path("$KAIBO_DEFINITELY_UNSET_VAR_9Q/x").is_err());
+    }
+
+    /// The expanded-path → `String` conversion rejects a non-UTF-8 result loudly rather
+    /// than lossily mangling it (a non-UTF-8 `$HOME` reached via a `~` path would become
+    /// U+FFFD bytes and mis-resolve at key time — a silent corruption we refuse). A normal
+    /// path round-trips byte-for-byte.
+    #[cfg(unix)]
+    #[test]
+    fn expanded_to_utf8_rejects_non_utf8_loudly() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF, 0xFE]));
+        assert!(
+            expanded_to_utf8(bad, "test").is_err(),
+            "a non-UTF-8 expanded path must fail loudly, not lossily convert"
+        );
+        assert_eq!(
+            expanded_to_utf8(PathBuf::from("/home/u/.key"), "test").unwrap(),
+            "/home/u/.key"
+        );
     }
 
     // --- uniform $VAR expansion: [context] user_files + backend api_key_file ----
