@@ -1965,6 +1965,8 @@ impl KaiboHandler {
     async fn wait(
         &self,
         Parameters(input): Parameters<WaitInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         // No silent clamp — a model picks its own block; only an absurd value is refused,
         // loudly. The client's tool-call timeout and the user's interrupt are the real
@@ -1981,12 +1983,52 @@ impl KaiboHandler {
                 ));
             }
         }
-        let floor = wait_level_floor(input.level.as_deref())?;
+        let return_floor = wait_level_floor(input.level.as_deref())?;
         let limit = input.limit.unwrap_or(20);
         let timeout = std::time::Duration::from_secs(input.timeout_secs.unwrap_or(60));
 
-        // Block on the activity stream (consult progress + completions) up to the timeout.
-        let records = self.notifications.wait_drain(timeout, floor, limit).await;
+        // The live view for the *human*: while this call is open, stream the Info-level
+        // narrative (each kaish command, sweep, milestone) as `notifications/progress` on
+        // this call's token, so the client renders it in real time — the channel sync
+        // `consult` used, reopened on demand. Independent of what we *return* to the model
+        // (Warn+ by default): the human watches the show, the model gets the salient bits.
+        let info_floor = crate::mcp_log::rank(LoggingLevel::Info);
+        let token = progress_token(&meta);
+        // Drain down to whichever is lower — Info (to stream) when a token is present,
+        // else just the return floor (don't consume narrative no one is watching).
+        let drain_floor = if token.is_some() {
+            info_floor.min(return_floor)
+        } else {
+            return_floor
+        };
+        let seq = AtomicU64::new(0);
+        let records = self
+            .notifications
+            .wait_drain_with(timeout, drain_floor, return_floor, limit, |rec| {
+                // Stream Info+ to the human's progress channel; the model's return is the
+                // separate `return_floor` collection inside `wait_drain_with`.
+                if let Some(token) = &token {
+                    if crate::mcp_log::rank(rec.level) >= info_floor {
+                        let param = ProgressNotificationParam {
+                            progress_token: token.clone(),
+                            progress: seq.fetch_add(1, Ordering::Relaxed) as f64,
+                            total: None,
+                            message: Some(format!(
+                                "[{}] {}",
+                                wait_level_label(rec.level),
+                                rec.message
+                            )),
+                        };
+                        let peer = peer.clone();
+                        // Fire-and-forget, like `ProgressReporter`: don't make the drain
+                        // loop await a notification it doesn't depend on.
+                        tokio::spawn(async move {
+                            let _ = peer.notify_progress(param).await;
+                        });
+                    }
+                }
+            })
+            .await;
 
         // Gentle batch poll: a batch is provider-side with no push, so fold in a one-shot
         // status for any batch handle named. Non-batch handles are ignored here (consult
@@ -1994,6 +2036,13 @@ impl KaiboHandler {
         let mut batch_lines = Vec::new();
         for h in &input.handles {
             if !is_batch_handle(h) {
+                continue;
+            }
+            // Respect batch gating, like `get`/`cancel` — don't poll a batch handle on a
+            // server that has batch turned off. A per-handle note, not a hard error: it
+            // never sinks the rest of the `wait`.
+            if let Err(e) = self.ensure_batch_enabled(h) {
+                batch_lines.push(format!("{h} — {}", e.message));
                 continue;
             }
             let line = match parse_batch_handle(h) {

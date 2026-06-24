@@ -193,22 +193,58 @@ impl NotificationBuffer {
         floor: u8,
         limit: usize,
     ) -> Vec<LogRecord> {
+        // The simple form: drain and return at one floor, no side-channel.
+        self.wait_drain_with(timeout, floor, floor, limit, |_| {})
+            .await
+    }
+
+    /// The streaming core behind [`wait_drain`]: drain every record at or above
+    /// `drain_floor`, hand each to `on_drained` (the `wait` tool streams the Info-level
+    /// narrative to the client's progress channel here), and *return* those at or above
+    /// `return_floor` (capped at `limit`). It blocks until a returnable record lands or
+    /// the deadline passes — so a default `wait` streams the narrative the whole time and
+    /// returns only when something the model should act on (a completion) arrives.
+    ///
+    /// `drain_floor` ≤ `return_floor`: the caller drains *down to* what it streams (Info)
+    /// while returning only the salient (Warn+). A drained-but-not-returned record is
+    /// consumed — it was delivered via `on_drained` — so the narrative isn't left to pile
+    /// up once it's been streamed.
+    pub async fn wait_drain_with<F: FnMut(&LogRecord)>(
+        &self,
+        timeout: std::time::Duration,
+        drain_floor: u8,
+        return_floor: u8,
+        limit: usize,
+        mut on_drained: F,
+    ) -> Vec<LogRecord> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut collected: Vec<LogRecord> = Vec::new();
         loop {
-            let got = self.drain(floor, limit);
-            if !got.is_empty() {
-                return got;
+            for rec in self.drain(drain_floor, usize::MAX) {
+                on_drained(&rec);
+                if rank(rec.level) >= return_floor && collected.len() < limit {
+                    collected.push(rec);
+                }
+            }
+            if !collected.is_empty() {
+                return collected;
             }
             // Register the wake future *before* re-checking, so a push between the drain
             // above and the await below leaves a permit rather than being missed.
             let notified = self.notify.notified();
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return self.drain(floor, limit);
+                for rec in self.drain(drain_floor, usize::MAX) {
+                    on_drained(&rec);
+                    if rank(rec.level) >= return_floor && collected.len() < limit {
+                        collected.push(rec);
+                    }
+                }
+                return collected;
             }
             tokio::select! {
                 _ = notified => {}
-                _ = tokio::time::sleep(remaining) => return self.drain(floor, limit),
+                _ = tokio::time::sleep(remaining) => {}
             }
         }
     }
@@ -302,7 +338,11 @@ impl McpBridgeLayer {
 impl<S: Subscriber> Layer<S> for McpBridgeLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        if !meta.target().starts_with(KAIBO_TARGET) {
+        // Exactly `kaibo` or a `kaibo::` submodule — boundary-checked so a hypothetical
+        // `kaibox` target can't slip onto the bridge. (The per-layer EnvFilter already
+        // scopes to `kaibo`, so this is belt-and-suspenders.)
+        let target = meta.target();
+        if target != KAIBO_TARGET && !target.starts_with("kaibo::") {
             return;
         }
         let mut visitor = FieldVisitor::default();
@@ -431,6 +471,33 @@ mod tests {
             1,
             "the unmatched Info record is left in the ring"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_drain_with_streams_everything_but_returns_only_the_salient() {
+        let buf = NotificationBuffer::new(8);
+        buf.push(rec(LoggingLevel::Info, "kaish a"));
+        buf.push(rec(LoggingLevel::Warning, "job done"));
+        buf.push(rec(LoggingLevel::Info, "kaish b"));
+
+        let mut streamed = Vec::new();
+        let returned = buf
+            .wait_drain_with(
+                std::time::Duration::from_secs(5),
+                rank(LoggingLevel::Info), // drain down to Info (to stream)
+                rank(LoggingLevel::Warning), // return only the Warn-bar records
+                20,
+                |r| streamed.push(r.message.clone()),
+            )
+            .await;
+
+        // The human side (on_drained) sees the whole narrative, in order…
+        assert_eq!(streamed, vec!["kaish a", "job done", "kaish b"]);
+        // …while the model's return is just the promote-to-model record.
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].message, "job done");
+        // Everything drained is consumed — the streamed narrative isn't left to pile up.
+        assert!(buf.is_empty());
     }
 
     #[test]
