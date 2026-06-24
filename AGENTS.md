@@ -189,32 +189,10 @@ How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherit
 
 ## Commit style
 
-Commits explain **why, not what** — the diff already shows what changed. Write the
-body as a short summary of the *decisions* behind the change and their rationale,
-drawn from the working conversation: what we chose, what we rejected, and why (when
-a why was stated). A few sentences of reasoning beat a bullet list of files.
-
-- **Subject:** imperative, the decision or outcome — not "update sandbox.rs".
-- **Body:** the reasoning and tradeoffs. Cite a decision's source when it matters.
-- Don't narrate the code; point to `docs/issues.md` for follow-ups.
-- End every message with a `Co-Authored-By:` trailer crediting the model that
-  actually did the work (might not be a Claude — we are a community here), e.g.
-  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
-
-Example:
-
-```
-Sandbox the explorer behind a read-only kaish
-
-The explorer must read the project but never mutate it. Chose kaish's read-only
-VFS mount plus a denylist over a hand-rolled file API: the mount makes "read-only"
-structural rather than honor-system. We confirmed git/touch bypass the mount
-(unblocked, `git init` returned 0 and made a real .git), so those are shadow-
-blocked at the registry too. Tests prove the boundary and that the blocks have
-teeth.
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-```
+Commit and pull request bodies should usually summarize the decisions behind the
+change, **drawn from the conversation with the user**. Commit messages briefly explain
+what happened as context for the more important task of explaining the decisions we
+made.
 
 ## Pull requests & the changelog
 
