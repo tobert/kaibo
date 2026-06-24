@@ -85,7 +85,9 @@ struct Args {
     #[arg(long)]
     no_generate_image: bool,
 
-    /// Don't advertise the batch tools (`batch_submit`/`batch_get`/`batch_cancel`).
+    /// Don't advertise `batch_submit`. The shared `get`/`cancel`/`list` verbs remain as
+    /// long as `consult` is on (they also collect consult jobs); they drop only when both
+    /// `--no-batch` and `--no-consult` are set.
     #[arg(long)]
     no_batch: bool,
 

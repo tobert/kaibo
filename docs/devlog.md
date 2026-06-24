@@ -14,6 +14,58 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-24 — Async consult (`consult_submit`), unified collect verbs, and a 24h `list` trim
+
+The seed was a self-observation: Claude (the caller) was spawning throwaway sub-agents
+*just* to hold a blocking `consult` open in the background. That's the missing primitive
+hand-rolled out of the only async construct an agent has — and a bad version of it (a full
+agent context for zero reasoning, lossy relay of the answer, no progress visibility). So:
+make `consult` submittable.
+
+**Async needs in-process state, not disk persistence.** The instinct was "we'll need
+persistence at that point." We didn't. `batch` gets async *for free* because the work lives
+at the provider and the handle *is* the provider's id — but a consult's tool loop runs
+*inside* kaibo, so an async consult has to hold the live loop in-process. That's
+statefulness, not durability. For a stdio server whose lifetime *is* the caller's session,
+disk buys nothing — a restart has no context to resume into. So `JobStore` (`src/jobs.rs`)
+is a clone of the `SessionStore` pattern: `Arc<Mutex<LruCache>>`, capacity-LRU, no TTL,
+diskless. A job dies with the session, exactly as the sub-agent it replaces did.
+
+**The scratch-collision worry was unfounded.** Pre-work assumption: concurrent consults
+share the `/` `MemoryFs` scratch. They don't — `consult.rs` already spawns a fresh
+`KaishWorker` (own kernel + scratch) per call, so the isolation was always per-call. No
+isolation work was needed; read-only project + per-call scratch already pay for it.
+
+**Collapsed the management verbs by handle shape, not an op-enum.** Rather than
+`consult_get`/`consult_cancel` paralleling `batch_get`/`batch_cancel`/`batch_list`, the
+collect verbs unified into one `get`/`cancel`/`list` that route on the handle (`/` ⇒ batch
+`backend/id`, else consult `job-N`). Rejected the one-tool-with-`op`-enum collapse:
+tool-calling models dispatch reliably by *tool*, far less by an enum arg, and the per-op
+required-args differ (get/cancel need a handle, list doesn't). Net 6→5 async tools, one
+mental model ("submit returns a handle; get/cancel/list manage handles"), and consult
+gained a `list` it never had. The verbs gate on `batch || consult` (present while either
+is on), and `list`'s batch section degrades to a *note* when no batch backend is
+configured rather than sinking the consult-jobs section — a local-only setup is the common
+case there.
+
+**`list` recency filter: status, reframed as time.** Amy flagged the batch list dumping
+42 entries (token waste). The literal "drop old stuff" reading barely helps — almost all
+42 were *recent* but *terminal* (done). The waste is finished batches, not old ones. But a
+24h window captures it anyway: the offline SLA is ≤24h, so a batch older than a day is
+done and still collectible by its handle. So default-trim to the last 24h (Amy's call),
+`all: true` for orphan archaeology, and an undateable batch is *kept* not hidden (losing
+sight of a batch is worse than a line). **Brought in `chrono`** for the RFC3339 parse
+rather than hand-rolling calendar math — Amy's preference, and it's already in the tree
+(kaish-kernel / rmcp / schemars), used parse-only so its `clock` feature stays off and no
+new dep (or aws-lc) rides in.
+
+**Completion notification is a clue, not a trigger — proven live.** A finished job emits an
+`info` `tracing` event that rides the existing tracing→MCP `notifications/message` bridge.
+But we tested it: the notification does *not* surface into Claude Code's agent loop (it
+goes to the client's log/debug view). So it's advisory — useful for a human watching logs
+or a client that surfaces them; the calling agent still closes the loop by remembering its
+handle and polling. No MCP primitive wakes the agent, and we didn't pretend otherwise.
+
 ## 2026-06-22 — `$VAR` expansion in `root` / `allow_paths`, for portable scratch reads
 
 Amy asked the real question behind "can a user easily allow kaibo to read `/tmp`?": the

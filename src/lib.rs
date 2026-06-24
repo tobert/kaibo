@@ -25,6 +25,7 @@ pub mod credentials;
 pub mod explorer;
 pub mod generate_image;
 pub mod image_gen;
+pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;
 pub mod orientation;
