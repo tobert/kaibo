@@ -16,9 +16,12 @@
 //!
 //! **Eviction is capacity-LRU, like sessions** — a job is dropped only when a newer
 //! submit pushes it past the cap as the least-recently-used; touching it (`get`/
-//! `cancel`) promotes it. A still-*running* job that gets evicted is not aborted: the
-//! spawned task owns its own `Arc` of the status cell, so it runs to completion against
-//! a cell nobody will read, then drops — no panic, no orphaned handle, no disk.
+//! `cancel`) promotes it. A still-*running* job that gets evicted is **aborted** (its
+//! `Job` drop aborts the task): once the store drops a job its id is unreachable
+//! (`get`/`cancel` return not-found), so letting an orphaned consult run on would just
+//! burn provider tokens against a cell nobody can read. The spawned task owns its own
+//! `Arc` of the status cell, so the cell stays valid until the task actually stops —
+//! no panic, no disk.
 
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -83,6 +86,52 @@ struct Job {
     started: Instant,
 }
 
+impl Drop for Job {
+    /// Abort the task when its `Job` is dropped — i.e. when the store evicts it (LRU) or
+    /// the whole store goes away. Dropping an `AbortHandle` does *not* abort the task on
+    /// its own, so without this an evicted-but-still-running consult would run to
+    /// completion against an unreachable cell, burning provider tokens for an answer no
+    /// `get` can ever return. A finished or already-canceled job's abort is a harmless
+    /// no-op. `get`/`cancel`/`list` only clone the `Arc<Job>` transiently under the store
+    /// lock, so this fires on the *last* reference — true unreachability — not on a poll.
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+/// A drop guard for the spawned task: if the task's future ends *without* landing a
+/// result — a panic (we build `panic = unwind`, so tokio catches it and the state would
+/// otherwise sit at `Running` forever) or an abort that drops the future at its await
+/// point — record a terminal failure instead of leaving `get` to report "still running"
+/// with no end. The task disarms it on the normal path so it never overwrites a real
+/// outcome. On an *abort* the cell is usually unreachable anyway (canceled, or evicted),
+/// so the write is harmless; on a *panic* of a still-live job it's the difference between
+/// an eternal hang and an honest failure.
+struct FinishGuard {
+    state: Arc<Mutex<JobState>>,
+    armed: bool,
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Reached only on an unwind/abort before the task disarmed us. Lock the state
+        // (the task holds no lock at its await point, so no deadlock) and fail it iff it
+        // never reached a terminal state.
+        if let Ok(mut s) = self.state.lock() {
+            if matches!(*s, JobState::Running) {
+                *s = JobState::Failed(
+                    "the consultation task ended without completing (it panicked or was \
+                     aborted)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
 /// A cap-based LRU of async consultations, keyed by a kaibo-minted job id (`job-N`).
 #[derive(Clone)]
 pub struct JobStore {
@@ -114,31 +163,43 @@ impl JobStore {
         let task_state = state.clone();
         let task_id = id.clone();
         let handle = tokio::spawn(async move {
+            // Armed until the future returns: if it panics or is aborted at its await
+            // point, this guard records a terminal failure instead of leaving the job
+            // stuck `Running`. Disarmed once `fut.await` returns normally below.
+            let mut guard = FinishGuard {
+                state: task_state.clone(),
+                armed: true,
+            };
             let outcome = fut.await;
-            let mut s = task_state.lock().expect("job state mutex poisoned");
-            // Only land the result if a `cancel` didn't race in while we were
-            // finishing — a caller who asked to cancel gets `Canceled`, not a
-            // surprise late answer.
-            if matches!(*s, JobState::Running) {
-                let succeeded = outcome.is_ok();
-                *s = match outcome {
-                    Ok(result) => JobState::Done(result),
-                    Err(text) => JobState::Failed(text),
-                };
-                drop(s); // release the state lock before the log emit
+            {
+                let mut s = task_state.lock().expect("job state mutex poisoned");
+                // Only land the result if a `cancel` didn't race in while we were
+                // finishing — a caller who asked to cancel gets `Canceled`, not a
+                // surprise late answer.
+                if matches!(*s, JobState::Running) {
+                    let succeeded = outcome.is_ok();
+                    *s = match outcome {
+                        Ok(result) => JobState::Done(result),
+                        Err(text) => JobState::Failed(text),
+                    };
+                    drop(s); // release the state lock before the log emit
 
-                // Soft completion signal: a `tracing` event under the `kaibo` target rides
-                // the existing tracing→MCP `notifications/message` bridge (`mcp_log`), so a
-                // client watching the log stream gets a nudge to collect. Advisory only —
-                // no MCP primitive wakes the agent, so polling stays the contract; this is
-                // the clue, not a trigger. (A canceled job never reaches here — its task is
-                // aborted — so we don't ping for it.)
-                if succeeded {
-                    tracing::info!(job = %task_id, "async job finished — collect it with `get`");
-                } else {
-                    tracing::warn!(job = %task_id, "async job failed — `get` it for the reason");
+                    // Completion signal at **Warn** — kaibo's "the calling model should
+                    // see this" level (not severity): a finished/failed job is exactly
+                    // what a `wait` drains by default, and the `mcp_log` bridge also
+                    // mirrors it to a watching client. Still advisory — no MCP primitive
+                    // wakes the agent, so polling/`wait` stays the contract. (A canceled
+                    // job never reaches here — its task is aborted — no ping for it.)
+                    if succeeded {
+                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job finished — collect it with `get`");
+                    } else {
+                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job failed — `get` it for the reason");
+                    }
                 }
             }
+            // The future returned (no panic) — disarm so the guard's Drop is a no-op and
+            // can't overwrite the outcome (or a raced `Canceled`).
+            guard.armed = false;
         });
 
         let job = Arc::new(Job {
@@ -347,6 +408,46 @@ mod tests {
         let id = store.submit("cast `x`", async { Ok(done("fast")) });
         let _ = await_terminal(&store, &id).await;
         assert_eq!(store.cancel(&id), CancelOutcome::AlreadyFinished);
+    }
+
+    #[tokio::test]
+    async fn eviction_aborts_a_still_running_job() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        let store = JobStore::new(cap(1));
+        // job-1's tail sets this flag *if* it ever runs to completion. It shouldn't —
+        // eviction must abort it before the gate is released.
+        let ran_tail = Arc::new(AtomicBool::new(false));
+        let flag = ran_tail.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _evicted = store.submit("a", async move {
+            let _ = rx.await;
+            flag.store(true, AOrd::SeqCst);
+            Ok(done("a"))
+        });
+        // A second submit at cap 1 evicts the first → its `Job` drops → task aborts.
+        let _b = store.submit("b", async { Ok(done("b")) });
+        // Release the gate; an aborted task must never run its tail.
+        let _ = tx.send(());
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !ran_tail.load(AOrd::SeqCst),
+            "an evicted running job must be aborted, not run to completion (token waste)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_lands_as_failed_not_stuck_running() {
+        // tokio catches the spawned task's panic (we don't await its JoinHandle); without
+        // the FinishGuard the state would sit at Running forever. The guard turns the
+        // unwind into a terminal Failed, so `await_terminal` resolves instead of spinning.
+        let store = JobStore::new(cap(4));
+        let id = store.submit("cast `x`", async { panic!("boom in the consult loop") });
+        assert!(
+            matches!(await_terminal(&store, &id).await, JobState::Failed(_)),
+            "a panicking task must land as Failed, not hang in Running forever"
+        );
     }
 
     #[tokio::test]

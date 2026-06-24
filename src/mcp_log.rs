@@ -20,6 +20,22 @@
 //! before any layer sees them, so MCP verbosity can't exceed stderr's. Fine while
 //! the operator drives both with one filter; a per-layer filter is the upgrade if
 //! someone needs MCP-debug over an info stderr.
+//!
+//! **kaibo's level convention — audience, not severity.** Within the `kaibo` target
+//! tree, levels route a record to *who needs it*, not how dire it is:
+//! - **Error** — a real kaibo error: to the watching client, to the calling model's
+//!   `wait` drain, and to stderr.
+//! - **Warn = "the calling model should see this"** — salient/actionable (a job
+//!   finished or failed, the research budget ran out), *not* a dire warning. This is
+//!   the level `wait` returns to the model by default. Any kaibo code (and kaish, via
+//!   a future hook) marks something for the model's attention by emitting it at Warn.
+//! - **Info** — the watchable narrative: each kaish command, sweep, and milestone (see
+//!   [`TracingSink`](crate::progress::TracingSink)). The user's live "watch it work"
+//!   view; the model only pulls it into `wait` on request.
+//! - **Debug** — the true firehose, off by default.
+//!
+//! The convention is safe to assert here because [`KAIBO_TARGET`] filtering means
+//! rig/reqwest's *severity*-sense `warn!`s never reach this bridge — only kaibo's own.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;

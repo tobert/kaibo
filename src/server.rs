@@ -40,7 +40,7 @@ use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
 use crate::mcp_log;
-use crate::progress::{NullSink, PhaseEvent, ProgressSink};
+use crate::progress::{NullSink, PhaseEvent, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::SessionStore;
 
@@ -185,6 +185,18 @@ pub struct ConsultInput {
     /// (an empty report is itself the signal that the consult delegated no sweep).
     #[serde(default)]
     pub include_report: bool,
+
+    /// Workspace files to put in front of the investigation — absolute or relative
+    /// (relative reads from the project root) paths that must live **under the project
+    /// root** so the consult can reach them through its read-only shell. Unlike
+    /// `oneshot`/`batch` attach, kaibo does **not** inline these — it names them in the
+    /// investigation prompt and the consult model reads them itself (`cat -n`) when it's
+    /// ready, in full, building its own narrative. Use it to hand the consult a focus —
+    /// "review this diff" with `["changes.diff"]` (write it under the repo first), or the
+    /// specific files a question centers on — without pasting their bytes into your
+    /// context. A path outside the root, a directory, or a missing file is a clear error.
+    #[serde(default)]
+    pub attach: Vec<String>,
 }
 
 /// Arguments to the unified `get` / `cancel` tools: one handle that addresses either
@@ -724,6 +736,66 @@ impl KaiboHandler {
         )
     }
 
+    /// Validate caller-named `consult` attachments and return them as **root-relative
+    /// paths the model reads itself** — no bytes are read here, unlike
+    /// [`resolve_attachments`](Self::resolve_attachments), which inlines for the tool-less
+    /// tools. Each path must canonicalize to a regular file *under the consult's `root`*,
+    /// because the consult reads it through a kaish worker rooted there; an out-of-root
+    /// path is refused with guidance. The returned relative paths are what the model
+    /// `cat`s and what [`consult_user_prompt`](crate::consult::consult_user_prompt) names
+    /// in the driver prompt — deferring the IO to the model's own reads.
+    fn resolve_consult_attachments(
+        root: &std::path::Path,
+        attach: &[String],
+    ) -> Result<Vec<String>, McpError> {
+        let mut out = Vec::with_capacity(attach.len());
+        for p in attach {
+            let raw = std::path::PathBuf::from(p);
+            // A relative path reads from the project root (where the model's shell starts).
+            let joined = if raw.is_absolute() {
+                raw.clone()
+            } else {
+                root.join(&raw)
+            };
+            let canon = std::fs::canonicalize(&joined).map_err(|e| {
+                McpError::invalid_params(
+                    format!("attached file {} could not be resolved: {e}", raw.display()),
+                    None,
+                )
+            })?;
+            let meta = std::fs::metadata(&canon).map_err(|e| {
+                McpError::invalid_params(
+                    format!("attached file {} could not be read: {e}", canon.display()),
+                    None,
+                )
+            })?;
+            if !meta.is_file() {
+                return Err(McpError::invalid_params(
+                    format!("attached file {} is not a regular file", canon.display()),
+                    None,
+                ));
+            }
+            // Must be under the consult's root — the tree its read-only shell is mounted
+            // at, so anything outside it the model simply can't `cat`. (oneshot/batch
+            // attach inline from anywhere in the allowed set; consult reads in situ.)
+            let rel = canon.strip_prefix(root).map_err(|_| {
+                McpError::invalid_params(
+                    format!(
+                        "attached file {} resolves outside the project root {} — consult \
+                         reads attachments through its shell, so they must live under the \
+                         project. Paste it into `context`, or use `oneshot`/`batch` attach \
+                         (which inline a file from anywhere in the allowed set).",
+                        raw.display(),
+                        root.display(),
+                    ),
+                    None,
+                )
+            })?;
+            out.push(rel.display().to_string());
+        }
+        Ok(out)
+    }
+
     /// Refuse image attachments to a vision-blind model, naming the cast so the caller
     /// can pick a vision-capable one. Shared by the tool-less attach surfaces (`batch` and
     /// `oneshot`) so the refusal reads identically and lives in one place; a blind model
@@ -1073,10 +1145,13 @@ impl KaiboHandler {
             (optional; a change summary or pasted source to seed the investigation — \
             trusted as starting evidence), path (project dir; optional if the server \
             has a default root), cast (optional), session_id (optional; opaque \
-            conversation key), include_report (optional; attach the explorer's report \
-            as structured_content for debugging the hand-off), and optional \
-            explorer_model / synth_model overrides (a model id, sent verbatim; add \
-            explorer_backend / synth_backend to retarget the slot's backend). For a \
+            conversation key), attach (optional; workspace files under the project root \
+            to put in front of the investigation — kaibo names them and the model reads \
+            them itself with the shell, no inlining, so 'review this diff' is \
+            attach:[\"changes.diff\"] with no paste), include_report (optional; attach \
+            the explorer's report as structured_content for debugging the hand-off), and \
+            optional explorer_model / synth_model overrides (a model id, sent verbatim; \
+            add explorer_backend / synth_backend to retarget the slot's backend). For a \
             thin answer with no codebase access, use `oneshot` instead."
     )]
     async fn consult(
@@ -1121,6 +1196,9 @@ impl KaiboHandler {
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
+            // Validated to live under `root` (the model reads them via its shell); not
+            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
+            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -1176,7 +1254,7 @@ impl KaiboHandler {
             collect later — the async sibling of `consult`, the way `batch_submit` is to \
             `oneshot`. Same investigation (a capable model drives the read-only kaish \
             shell, reads spans, delegates sweeps, answers with `file:line` citations), \
-            same args as `consult` (question, context, path, cast, session_id, \
+            same args as `consult` (question, context, path, cast, session_id, attach, \
             include_report, model/backend overrides) — it just hands back a handle \
             instead of holding your turn open while it thinks. Reach for it to run \
             several consults at once (a cross-model study: submit one per cast, collect \
@@ -1221,12 +1299,17 @@ impl KaiboHandler {
                 .unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             sandbox: self.config.sandbox.clone(),
-            // An async job streams to no live peer — progress is collected via
-            // `get`'s status line, not the MCP progress channel.
-            progress: Arc::new(NullSink),
+            // An async job has no live MCP peer to push progress notifications to, so
+            // route its liveness onto the `tracing` stream: the `mcp_log` bridge mirrors
+            // it to a watching client (the live view sync `consult` had) and the
+            // notification buffer tees it for `wait`. See [`TracingSink`].
+            progress: Arc::new(TracingSink),
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
+            // Validated to live under `root` (the model reads them via its shell); not
+            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
+            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
         };
 
         // Owned captures for the `'static` spawned task. The session store is `Clone`
@@ -1326,10 +1409,12 @@ impl KaiboHandler {
             synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
-            // oneshot reads no project: no house rules, no repo map, no shell.
+            // oneshot reads no project: no house rules, no repo map, no shell — and no
+            // consult-style attachments (it inlines its `attach` files via `oneshot()`).
             house_rules: None,
             prompts: self.resolved_prompts(&cast),
             orientation: None,
+            attachments: Vec::new(),
         };
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
@@ -1785,8 +1870,12 @@ impl KaiboHandler {
                     let hidden = if input.all {
                         0
                     } else {
+                        // Read the clock once, not once per item.
+                        let now = now_epoch_secs();
                         let before = entries.len();
-                        entries.retain(|(_, it)| is_recent_batch(it));
+                        entries.retain(|(_, it)| {
+                            batch_within_window(it, now, BATCH_RECENCY_WINDOW_SECS)
+                        });
                         before - entries.len()
                     };
                     sections.push(crate::batch::render_list(&entries, &errors, &truncated));
@@ -2782,21 +2871,23 @@ fn is_batch_handle(handle: &str) -> bool {
 /// caller tokens without losing anything actionable.
 const BATCH_RECENCY_WINDOW_SECS: i64 = 24 * 3600;
 
-/// Was this batch created within the last 24h? The default `list` recency filter. A
-/// batch kaibo can't date (no or unparseable `created_at`) counts as recent, so it's
-/// shown rather than silently hidden — losing sight of a batch is worse than an extra
-/// line. "Now" is read from `SystemTime`, so chrono's `clock` feature stays off.
-fn is_recent_batch(it: &crate::batch::BatchListItem) -> bool {
-    let now = std::time::SystemTime::now()
+/// Unix epoch seconds now, for the `list` recency window — read once per `list` call and
+/// passed into [`batch_within_window`], not re-read per item. A pre-epoch system clock
+/// (impossible in practice) reads as 0, which keeps everything: fail-open, never hide a
+/// batch on a clock glitch. From `SystemTime`, so chrono's `clock` feature stays off.
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    batch_within_window(it, now, BATCH_RECENCY_WINDOW_SECS)
+        .unwrap_or(0)
 }
 
-/// The pure core of [`is_recent_batch`], with `now` injected so the keep/drop boundary is
-/// testable without the clock. Undateable → kept; a future timestamp (clock skew) yields
-/// a negative age, still within the window, so also kept.
+/// Is this batch within `window_secs` of `now_epoch`? The `list` recency filter, with
+/// `now` injected so the keep/drop boundary is testable without the clock and the clock
+/// is read once per call rather than per item. A batch kaibo can't date (no or
+/// unparseable `created_at`) is kept, not silently hidden — losing sight of a batch is
+/// worse than an extra line; a future timestamp (clock skew) yields a negative age, still
+/// within the window, so also kept.
 fn batch_within_window(it: &crate::batch::BatchListItem, now_epoch: i64, window_secs: i64) -> bool {
     match it
         .created_at
@@ -2941,6 +3032,42 @@ mod tests {
     use super::*;
     use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
+
+    /// consult `attach` validates files are under the consult root (so the model's shell
+    /// can `cat` them) and returns them as relative paths; a file outside the root — even
+    /// a real, readable one — is refused, since the shell couldn't reach it. The root here
+    /// stands in for any tree, including a followed worktree (which `resolve_root` returns
+    /// as the root verbatim).
+    #[test]
+    fn consult_attach_keeps_under_root_relative_and_rejects_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(root_canon.join("src")).unwrap();
+        std::fs::write(root_canon.join("src/jobs.rs"), b"// in tree").unwrap();
+
+        // A relative path resolves to its root-relative form (what the model `cat`s).
+        let rel =
+            KaiboHandler::resolve_consult_attachments(&root_canon, &["src/jobs.rs".to_string()])
+                .expect("an in-tree file resolves");
+        assert_eq!(rel, vec!["src/jobs.rs".to_string()]);
+
+        // A file outside the root is refused, even though it exists and is readable.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = std::fs::canonicalize(outside.path())
+            .unwrap()
+            .join("x.diff");
+        std::fs::write(&outside_file, b"diff").unwrap();
+        let err = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            &[outside_file.display().to_string()],
+        )
+        .expect_err("an out-of-root file must be refused");
+        assert!(
+            err.message.contains("outside the project root"),
+            "the refusal names the boundary: {}",
+            err.message
+        );
+    }
 
     fn batch_item(created_at: Option<&str>) -> crate::batch::BatchListItem {
         crate::batch::BatchListItem {

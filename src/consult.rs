@@ -31,8 +31,8 @@ use anyhow::{anyhow, Context, Result};
 use rig_core::agent::{HookAction, PromptHook};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
-    ToolResultContent, UserContent,
+    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
+    UserContent,
 };
 use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition};
 use rig_core::providers::{anthropic, deepseek, gemini, openai};
@@ -849,6 +849,13 @@ pub struct ConsultConfig {
     /// resolved root (only for the exploring tools — `explore`/`consult`); `Default`
     /// is `None`, so offline tests run the unchanged preamble.
     pub orientation: Option<Arc<str>>,
+    /// Caller-attached files, as **root-relative paths the model reads itself** via the
+    /// shell — *not* inlined bytes. Unlike `oneshot`/`batch` attach (toolless, so kaibo
+    /// inlines), `consult` has kaish, so attach just *names* the files in the driver's
+    /// prompt and lets the model `cat` them when it's ready — no upfront IO, the model
+    /// builds its narrative its own way. The server validates each path lands under the
+    /// consult's root (so the shell can reach it) before filling this. `Default` is empty.
+    pub attachments: Vec<String>,
 }
 
 impl Default for ConsultConfig {
@@ -862,6 +869,7 @@ impl Default for ConsultConfig {
             house_rules: None,
             prompts: PromptOverrides::default(),
             orientation: None,
+            attachments: Vec::new(),
         }
     }
 }
@@ -1565,9 +1573,14 @@ pub async fn oneshot(
 /// and steers the model to re-confirm any span a prior answer cited: the exploration
 /// runs fresh every turn (we never replay the stored report — it'd be stale), so the
 /// code is the ground truth, not the old answer.
-pub fn consult_user_prompt(question: &str, context: Option<&str>, history: &[QaTurn]) -> String {
+pub fn consult_user_prompt(
+    question: &str,
+    context: Option<&str>,
+    history: &[QaTurn],
+    attached: &[String],
+) -> String {
     let context = context.map(str::trim).filter(|c| !c.is_empty());
-    if history.is_empty() && context.is_none() {
+    if history.is_empty() && context.is_none() && attached.is_empty() {
         return question.to_string();
     }
     let mut prompt = String::new();
@@ -1601,6 +1614,17 @@ pub fn consult_user_prompt(question: &str, context: Option<&str>, history: &[QaT
              question reaches that it didn't cover. Where the code you read and the \
              context genuinely disagree, the code wins.\n\n",
         ));
+    }
+    if !attached.is_empty() {
+        prompt.push_str(
+            "The caller attached these files as central to the question — read them in \
+             full with the shell as you build your answer (`cat -n PATH`). They live \
+             under the project root, so a relative path reads directly:\n",
+        );
+        for f in attached {
+            prompt.push_str(&format!("- {f}\n"));
+        }
+        prompt.push('\n');
     }
     prompt.push_str(&format!("Now answer the current question:\n\n{question}"));
     prompt
@@ -1756,7 +1780,7 @@ pub(crate) async fn consult_session_turn(
         Some((store, id)) => store.history(id),
         None => Vec::new(),
     };
-    let user_prompt = consult_user_prompt(question, context, &history);
+    let user_prompt = consult_user_prompt(question, context, &history, &cfg.attachments);
 
     let out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
 
@@ -2151,9 +2175,18 @@ mod tests {
         assert_eq!(reqs.len(), 1, "oneshot is exactly one upstream request");
         // The text file rode inline as `<file>`-wrapped context, ahead of the prompt.
         let ut = &reqs[0].user_text;
-        assert!(ut.contains("<file path=\"README.md\">"), "text file inlined as context: {ut}");
-        assert!(ut.contains("hello world"), "the file body rode inline: {ut}");
-        assert!(ut.contains("review these"), "the prompt is still present: {ut}");
+        assert!(
+            ut.contains("<file path=\"README.md\">"),
+            "text file inlined as context: {ut}"
+        );
+        assert!(
+            ut.contains("hello world"),
+            "the file body rode inline: {ut}"
+        );
+        assert!(
+            ut.contains("review these"),
+            "the prompt is still present: {ut}"
+        );
         // The image rode as a native image part, not flattened into text.
         assert!(
             saw_image.load(Ordering::SeqCst),
@@ -2184,12 +2217,24 @@ mod tests {
                 Ok(text_response("done"))
             })
             .build();
-        oneshot("just ask", &[], &arm(&client, MODEL), &ConsultConfig::default())
-            .await
-            .unwrap();
+        oneshot(
+            "just ask",
+            &[],
+            &arm(&client, MODEL),
+            &ConsultConfig::default(),
+        )
+        .await
+        .unwrap();
         let reqs = client.requests_for(MODEL);
-        assert_eq!(reqs[0].user_text.trim(), "just ask", "bare prompt, no wrapper");
-        assert!(!saw_image.load(Ordering::SeqCst), "no attachment, no image part");
+        assert_eq!(
+            reqs[0].user_text.trim(),
+            "just ask",
+            "bare prompt, no wrapper"
+        );
+        assert!(
+            !saw_image.load(Ordering::SeqCst),
+            "no attachment, no image part"
+        );
     }
 
     /// An image-only attach with an empty prompt sends *just* the image part — no empty
@@ -3622,8 +3667,38 @@ mod tests {
     #[test]
     fn empty_history_yields_the_bare_question() {
         assert_eq!(
-            consult_user_prompt("Where is the sandbox enforced?", None, &[]),
+            consult_user_prompt("Where is the sandbox enforced?", None, &[], &[]),
             "Where is the sandbox enforced?"
+        );
+    }
+
+    /// Attached files are named in the prompt (for the model to `cat` itself) and steered
+    /// to read them in full — and they're listed before the question, like context.
+    #[test]
+    fn attached_files_are_named_for_the_model_to_read() {
+        let prompt = consult_user_prompt(
+            "Does the diff weaken the sandbox?",
+            None,
+            &[],
+            &["changes.diff".to_string(), "src/sandbox.rs".to_string()],
+        );
+        assert!(
+            prompt.contains("changes.diff"),
+            "names each attached file:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("src/sandbox.rs"),
+            "names each attached file:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("cat -n"),
+            "steers the model to read them with the shell:\n{prompt}"
+        );
+        let listed = prompt.find("changes.diff").unwrap();
+        let question = prompt.find("Does the diff weaken").unwrap();
+        assert!(
+            listed < question,
+            "attachments precede the question:\n{prompt}"
         );
     }
 
@@ -3635,7 +3710,7 @@ mod tests {
             QaTurn::new("What is kaish?", "A read-only shell (src/sandbox.rs)."),
             QaTurn::new("Who calls it?", "consult drives it (src/consult.rs)."),
         ];
-        let prompt = consult_user_prompt("And explore?", None, &history);
+        let prompt = consult_user_prompt("And explore?", None, &history, &[]);
 
         for needle in [
             "What is kaish?",

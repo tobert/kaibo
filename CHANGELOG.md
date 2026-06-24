@@ -20,8 +20,13 @@ the git log. Each later release appends a new section at the top.
   family answers with `cast`. Optionally seed it with `context` (a change summary or
   pasted source), trusted as starting evidence while it investigates for more. The
   answer carries a provenance footer naming the cast and the models that produced it.
-  Args: `question`, `context`, `path`, `cast`, `session_id`, `include_report`, and
-  per-call `explorer_model` / `synth_model` (+ `_backend`) overrides.
+  Args: `question`, `context`, `path`, `cast`, `session_id`, `attach`, `include_report`,
+  and per-call `explorer_model` / `synth_model` (+ `_backend`) overrides. **`attach`**
+  names workspace files (under the project root) to put in front of the investigation —
+  unlike the tool-less tools' attach, kaibo does *not* inline them; it names them in the
+  prompt and the consult model reads them itself with the shell when it's ready, in full,
+  building its own narrative. "Review this diff" is `attach: ["changes.diff"]` with no
+  paste; the files just have to live under the root the consult reads (a worktree counts).
 - **`consult_submit`** — the *async sibling* of `consult` (as batch is to `oneshot`):
   start a consultation in the background and get back a handle (`job-N`) instead of
   holding your turn open while a deep investigation runs. Same investigation, same args

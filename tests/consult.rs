@@ -58,6 +58,7 @@ fn consult_seed_context_is_framed_as_trusted_evidence() {
         "What blocks writes?",
         Some("src/sandbox.rs:95 read-only mount"),
         &[],
+        &[],
     );
 
     assert!(p.contains("What blocks writes?"), "question present");
@@ -88,11 +89,11 @@ fn consult_prompt_without_context_or_history_is_the_bare_question() {
     // steer lives in the consult preamble, not this prompt. Whitespace-only context
     // is no context — don't pretend there's evidence.
     assert_eq!(
-        consult_user_prompt("What blocks writes?", None, &[]),
+        consult_user_prompt("What blocks writes?", None, &[], &[]),
         "What blocks writes?"
     );
     assert_eq!(
-        consult_user_prompt("Q?", Some("  \n  "), &[]),
+        consult_user_prompt("Q?", Some("  \n  "), &[], &[]),
         "Q?",
         "blank context should behave like None"
     );
