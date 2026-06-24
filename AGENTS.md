@@ -103,10 +103,14 @@ project and cannot run external commands.
   into the generic entry points (`run_phase`, `consult_with`, `consult_session_turn`),
   while the public `consult`/`oneshot` run on arms the server resolves with
   `Arm::from_slot` — the single live construction point that wraps the real rig client.
-- **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
-  before new work. Delete entries when they ship; don't mark them done. The *why*
-  behind a ship moves to **`docs/devlog.md`** (dated, newest-first, why-not-what —
-  the curated narrative git can't carry), not the commit log alone.
+- **Working notes — three files, kept current as you go.** `signoff.md` (repo root,
+  *ephemeral, not committed*) is the cross-session handoff a fresh process can't
+  reconstruct — what we were doing and what's next; melt it into the two durable docs
+  and delete it once it has a home. **`docs/issues.md`** is the live tracker — open
+  work only, kept cheap to skim before new work; delete entries when they ship, don't
+  mark them done. The *why* behind a ship moves to **`docs/devlog.md`** (dated,
+  newest-first, why-not-what — the curated narrative git can't carry), not the commit
+  log alone. Code is truth; the notes track what isn't in it yet.
 - **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
   under active development upstream. A version bump can change its API — when you
   bump, adapt kaibo to the new shape, don't pin around it. (If you're co-developing
