@@ -82,6 +82,23 @@ the git log. Each later release appends a new section at the top.
   (with a vision-capable synth model). Paths obey the same workspace boundary as
   everything else (worktrees included); a file outside it, a directory, an oversized
   file, or a binary that isn't a known image is refused with a clear error.
+- **`wait`** — block briefly and productively for your async work instead of
+  blind-polling `get`. Fire off consults and batches, do your other work, then `wait`
+  when you're ready to spend a minute on kaibo: it blocks up to `timeout_secs` (you
+  choose — no clamp; interruptible) and returns as soon as something lands, or on a clean
+  timeout. By default it hands back what kaibo flags as worth your attention (a job
+  finished/failed, a research-limit) plus which consult jobs are still running; pass
+  `level: "info"` to also pull the watchable narrative — each kaish command, sweep, and
+  milestone the agents ran — into your context. Name batch handles in `handles` to fold a
+  one-shot poll of them in too. Nothing wakes you (you choose when to block) and it isn't
+  the source of truth — `get`/`list` are; a clean empty return just means nothing new yet.
+  This pairs with launching work in parallel: submit several, do everything else, then
+  `wait` to merge the outputs.
+- **Async consults are watchable again.** A `consult_submit` job now streams its liveness
+  (each kaish command, sweep, and milestone) onto kaibo's logging channel — the live
+  "watch it work" view a synchronous `consult` always had, restored for the async path.
+  It rides kaibo's level convention (Info = the narrative; Warn = "the calling model
+  should see this"), so a watching client sees the show and `wait` pulls the salient bits.
 - **`get` / `cancel` / `list`** — one shared surface to collect, stop, and survey
   *both* kinds of async work, told apart by the handle: a batch handle is
   `backend/provider-id`, a consult job is `job-N`. `get <handle>` returns a progress/

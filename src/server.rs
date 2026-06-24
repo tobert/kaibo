@@ -326,6 +326,36 @@ pub struct ListInput {
     pub all: bool,
 }
 
+/// Arguments to the `wait` tool. See [`ConsultInput`] for the `deny_unknown_fields`
+/// rationale.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WaitInput {
+    /// How long to block, in seconds (default 60). You choose — kaibo does not clamp it;
+    /// your client's own tool-call timeout and your ability to interrupt are the real
+    /// bounds. For a very long park, prefer calling `wait` again each time it returns
+    /// over one giant block. A value over 3600 is a loud error, not a silent trim.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    /// Max records to return (default 20, newest activity last).
+    #[serde(default)]
+    pub limit: Option<usize>,
+
+    /// The lowest level to return to you: `warn` (default — what kaibo flags as "the
+    /// calling model should see this": a job finished or failed, a research-limit), `info`
+    /// (also the watchable narrative — each kaish command, sweep, milestone), `error`, or
+    /// `debug` (the firehose). Not severity — `warn` is the salience bar, not a problem.
+    #[serde(default)]
+    pub level: Option<String>,
+
+    /// Optional handles to also check this call: a batch handle (`backend/provider-id`)
+    /// is polled once and its current status appended (consult jobs already surface via
+    /// the activity stream). Omit to just drain the activity stream + see running jobs.
+    #[serde(default)]
+    pub handles: Vec<String>,
+}
+
 /// Arguments to the `run_kaish` tool. See [`ConsultInput`] for the
 /// `deny_unknown_fields` rationale.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -362,6 +392,12 @@ pub struct KaiboHandler {
     /// shared `get`/`cancel`/`list`). Same `Arc<Mutex<LruCache>>` shape as `sessions`, so
     /// the per-request handler clones all share one registry (see [`JobStore`]).
     jobs: JobStore,
+    /// The pull-side notification ring the `wait` tool drains — the same kaibo-target
+    /// records the `mcp_log` bridge streams to the client, teed for on-demand pull.
+    /// `new` seeds an unwired default (nothing pushes to it); `main` swaps in the shared
+    /// ring via [`with_notifications`](Self::with_notifications) so the bridge layer feeds
+    /// it. `Clone` shares one ring (see [`NotificationBuffer`](crate::mcp_log::NotificationBuffer)).
+    notifications: crate::mcp_log::NotificationBuffer,
     /// The client's MCP log floor (a [`mcp_log::rank`]), written by `logging/setLevel`
     /// and read by the log-drain task. `Arc<AtomicU8>` so every per-request handler
     /// clone — and the drain task in `main` — share the one cell; a `setLevel` on any
@@ -461,6 +497,7 @@ impl KaiboHandler {
             (gating.batch || gating.consult, "get"),
             (gating.batch || gating.consult, "cancel"),
             (gating.batch || gating.consult, "list"),
+            (gating.batch || gating.consult, "wait"),
         ] {
             if !enabled {
                 assert!(
@@ -561,11 +598,23 @@ impl KaiboHandler {
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
             jobs,
+            // An unwired default — nothing pushes to it until `main` swaps in the shared
+            // ring the bridge layer feeds (see `with_notifications`). So a handler built
+            // for a test has a valid, empty buffer and `wait` simply drains nothing.
+            notifications: crate::mcp_log::NotificationBuffer::new(512),
             mcp_log_level: Arc::new(AtomicU8::new(mcp_log::rank(mcp_log::DEFAULT_LEVEL))),
             allowed_set: Arc::new(allowed),
             default_root: Arc::new(default_root),
             default_root_inferred,
         })
+    }
+
+    /// Swap in the shared notification ring `main` also handed the bridge layer, so the
+    /// `wait` tool drains the records the layer pushes. A builder (not a `new` param) to
+    /// keep `new(config)` unchanged for the many call sites and tests.
+    pub fn with_notifications(mut self, buffer: crate::mcp_log::NotificationBuffer) -> Self {
+        self.notifications = buffer;
+        self
     }
 
     /// A handle to the shared MCP log floor, for the drain task in `main` to read.
@@ -1895,6 +1944,79 @@ impl KaiboHandler {
         )]))
     }
 
+    #[tool(
+        description = "Block briefly for your async work to make progress, then return \
+            what happened — the way to *productively park* instead of blind-polling `get`. \
+            Fire off consults (`consult_submit`) and batches (`batch_submit`), do your \
+            other work (your own sub-agents included), then call `wait` when you're ready \
+            to spend a minute on kaibo: it blocks up to `timeout_secs` (you choose; no \
+            clamp — you can always interrupt) and returns as soon as something lands, or \
+            on a clean timeout. By default it hands back the records kaibo flagged for you \
+            (a job finished or failed, a research-limit) plus which consult jobs are still \
+            running; pass `level:\"info\"` to also pull the watchable narrative (each kaish \
+            command, sweep, and milestone the agents ran) into your context. Name batch \
+            handles in `handles` to fold their current status in too (kaibo polls them \
+            once). Nothing here wakes you — you choose when to block — and it's not the \
+            source of truth: `get`/`list` are. A clean empty return just means nothing new \
+            yet; `wait` again to keep parking. Args: timeout_secs (optional, default 60), \
+            limit (optional, default 20), level (optional: warn|info|error|debug), handles \
+            (optional list to also poll)."
+    )]
+    async fn wait(
+        &self,
+        Parameters(input): Parameters<WaitInput>,
+    ) -> Result<CallToolResult, McpError> {
+        // No silent clamp — a model picks its own block; only an absurd value is refused,
+        // loudly. The client's tool-call timeout and the user's interrupt are the real
+        // ceilings (see `WaitInput::timeout_secs`).
+        if let Some(t) = input.timeout_secs {
+            if t > 3600 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "timeout_secs {t} is over 3600 (1h) — pass a smaller value, or \
+                         call `wait` again each time it returns; a single block is capped \
+                         by your client's tool-call timeout anyway."
+                    ),
+                    None,
+                ));
+            }
+        }
+        let floor = wait_level_floor(input.level.as_deref())?;
+        let limit = input.limit.unwrap_or(20);
+        let timeout = std::time::Duration::from_secs(input.timeout_secs.unwrap_or(60));
+
+        // Block on the activity stream (consult progress + completions) up to the timeout.
+        let records = self.notifications.wait_drain(timeout, floor, limit).await;
+
+        // Gentle batch poll: a batch is provider-side with no push, so fold in a one-shot
+        // status for any batch handle named. Non-batch handles are ignored here (consult
+        // jobs surface through the stream + the running-jobs footer).
+        let mut batch_lines = Vec::new();
+        for h in &input.handles {
+            if !is_batch_handle(h) {
+                continue;
+            }
+            let line = match parse_batch_handle(h) {
+                Ok((backend, id)) => match self.batch_poller(backend) {
+                    Ok(provider) => match provider.poll(id).await {
+                        Ok(poll) => format!("{h} — {}", batch_poll_brief(&poll)),
+                        Err(e) => format!("{h} — poll failed: {e:#}"),
+                    },
+                    Err(e) => format!("{h} — {}", e.message),
+                },
+                Err(e) => format!("{h} — {}", e.message),
+            };
+            batch_lines.push(line);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(render_wait(
+            &records,
+            &batch_lines,
+            &self.jobs,
+            timeout,
+        ))]))
+    }
+
     /// Refuse a batch-shaped handle when batch is gated off — `get`/`cancel` survive as
     /// long as *either* capability is on, so a handle can arrive for a disabled one.
     fn ensure_batch_enabled(&self, handle: &str) -> Result<(), McpError> {
@@ -2866,6 +2988,92 @@ fn is_batch_handle(handle: &str) -> bool {
     handle.contains('/')
 }
 
+/// Map a `wait` `level` string to a [`mcp_log::rank`] floor. `warn` (the default) is
+/// kaibo's "the calling model should see this" bar — salience, not severity.
+fn wait_level_floor(level: Option<&str>) -> Result<u8, McpError> {
+    let l = match level.unwrap_or("warn").to_ascii_lowercase().as_str() {
+        "debug" => LoggingLevel::Debug,
+        "info" => LoggingLevel::Info,
+        "warn" | "warning" => LoggingLevel::Warning,
+        "error" => LoggingLevel::Error,
+        other => {
+            return Err(McpError::invalid_params(
+                format!("level must be one of debug|info|warn|error, got {other:?}"),
+                None,
+            ))
+        }
+    };
+    Ok(crate::mcp_log::rank(l))
+}
+
+/// A short, readable tag for a record's level in `wait` output.
+fn wait_level_label(level: LoggingLevel) -> &'static str {
+    match level {
+        LoggingLevel::Debug => "debug",
+        LoggingLevel::Info => "info",
+        LoggingLevel::Notice => "note",
+        LoggingLevel::Warning => "warn",
+        LoggingLevel::Error
+        | LoggingLevel::Critical
+        | LoggingLevel::Alert
+        | LoggingLevel::Emergency => "error",
+    }
+}
+
+/// One-line status for a batch poll, for the `wait` footer — not the full results (`get`
+/// the handle for those).
+fn batch_poll_brief(poll: &crate::batch::BatchPoll) -> String {
+    match poll {
+        crate::batch::BatchPoll::Pending { completed, total } => {
+            format!("running, {completed}/{total} done")
+        }
+        crate::batch::BatchPoll::Cancelling => "canceling".to_string(),
+        crate::batch::BatchPoll::Done(answers) => {
+            format!("complete — {} result(s); `get` it", answers.len())
+        }
+        crate::batch::BatchPoll::Failed { state, .. } => format!("ended ({state})"),
+    }
+}
+
+/// Render a `wait` result: the drained activity records (each tagged by level), any
+/// gentle batch-poll lines, and a footer naming the consult jobs still running.
+fn render_wait(
+    records: &[crate::mcp_log::LogRecord],
+    batch_lines: &[String],
+    jobs: &JobStore,
+    timeout: std::time::Duration,
+) -> String {
+    let mut s = String::new();
+    if records.is_empty() && batch_lines.is_empty() {
+        s.push_str(&format!("Nothing new in {}s.", timeout.as_secs()));
+    } else {
+        for r in records {
+            s.push_str(&format!("[{}] {}\n", wait_level_label(r.level), r.message));
+        }
+        for b in batch_lines {
+            s.push_str(b);
+            s.push('\n');
+        }
+    }
+    let running: Vec<String> = jobs
+        .list()
+        .into_iter()
+        .filter(|(_, snap)| matches!(snap.state, JobState::Running))
+        .map(|(id, _)| id)
+        .collect();
+    s.push('\n');
+    if running.is_empty() {
+        s.push_str("No consult jobs still running.");
+    } else {
+        s.push_str(&format!("Still running: {}.", running.join(", ")));
+    }
+    s.push_str(
+        " `get <handle>` to collect a finished one, `list` for the full picture, or \
+         `wait` again to keep parking.",
+    );
+    s
+}
+
 /// The default `list` recency window: 24h. A provider's offline SLA is ≤24h, so an
 /// older batch is done and still collectible by its handle — trimming it saves the
 /// caller tokens without losing anything actionable.
@@ -3067,6 +3275,54 @@ mod tests {
             "the refusal names the boundary: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn wait_level_floor_parses_the_salience_words_and_rejects_junk() {
+        use crate::mcp_log::rank;
+        // Default is the Warn bar — "the calling model should see this".
+        assert_eq!(wait_level_floor(None).unwrap(), rank(LoggingLevel::Warning));
+        assert_eq!(
+            wait_level_floor(Some("info")).unwrap(),
+            rank(LoggingLevel::Info)
+        );
+        assert_eq!(
+            wait_level_floor(Some("WARN")).unwrap(),
+            rank(LoggingLevel::Warning)
+        );
+        assert_eq!(
+            wait_level_floor(Some("error")).unwrap(),
+            rank(LoggingLevel::Error)
+        );
+        assert!(
+            wait_level_floor(Some("loud")).is_err(),
+            "an unknown level is a loud error, not a silent default"
+        );
+    }
+
+    #[test]
+    fn render_wait_tags_records_and_footers_running_jobs() {
+        let jobs = JobStore::new(std::num::NonZeroUsize::new(4).unwrap());
+        let recs = vec![crate::mcp_log::LogRecord {
+            level: LoggingLevel::Warning,
+            target: "kaibo::jobs".into(),
+            message: "async job finished — collect it with `get`".into(),
+            fields: serde_json::Map::new(),
+        }];
+        let out = render_wait(&recs, &[], &jobs, std::time::Duration::from_secs(60));
+        assert!(out.contains("[warn]"), "tags the record's level: {out}");
+        assert!(
+            out.contains("async job finished"),
+            "carries the message: {out}"
+        );
+        assert!(
+            out.contains("No consult jobs still running"),
+            "footer reports none running: {out}"
+        );
+
+        // No records, no batch lines → the clean empty line, naming the wait length.
+        let empty = render_wait(&[], &[], &jobs, std::time::Duration::from_secs(30));
+        assert!(empty.contains("Nothing new in 30s"), "clean empty: {empty}");
     }
 
     fn batch_item(created_at: Option<&str>) -> crate::batch::BatchListItem {

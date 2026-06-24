@@ -10,9 +10,9 @@ use kaibo::server::{KaiboHandler, ToolGating};
 
 /// Every advertised tool, sorted (the order `advertised_tools` returns). `consult` and
 /// `batch` each carry a `*_submit` under their own flag; the collect verbs `get`/
-/// `cancel`/`list` are *shared* — they manage both kinds of handle and stay advertised
-/// as long as either capability is on, so they belong to neither flag exclusively.
-const ALL_TOOLS: [&str; 9] = [
+/// `cancel`/`list`/`wait` are *shared* — they manage both kinds of handle and stay
+/// advertised as long as either capability is on, so they belong to neither flag.
+const ALL_TOOLS: [&str; 10] = [
     "batch_submit",
     "cancel",
     "consult",
@@ -22,6 +22,7 @@ const ALL_TOOLS: [&str; 9] = [
     "list",
     "oneshot",
     "run_kaish",
+    "wait",
 ];
 
 fn advertised(gating: ToolGating) -> Vec<String> {
@@ -107,7 +108,7 @@ fn each_flag_removes_exactly_its_own_tools() {
 /// single-flag gate would fail the "stays with the other capability on" cases.
 #[test]
 fn shared_collect_verbs_track_both_capabilities() {
-    const VERBS: [&str; 3] = ["get", "cancel", "list"];
+    const VERBS: [&str; 4] = ["get", "cancel", "list", "wait"];
 
     // consult on, batch off — the verbs still serve consult jobs.
     let consult_only = advertised(ToolGating {

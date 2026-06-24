@@ -152,6 +152,16 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
+### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
+`tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
+the handler infers it as the default root. It fails intermittently (~1 in 5 full
+`cargo test` runs) and passes in isolation and on re-run — a parallel-execution race on
+the shared process cwd, not a logic bug (untouched by the async-consult work). Fix is to
+make the test not depend on the ambient cwd — drive it through an explicit root/config
+fixture, or serialize the cwd-reading tests. Low priority; it's a test-quality issue, the
+boundary itself is sound.
+
+
 ### Async consult (`consult_submit` + shared `get`/`cancel`/`list`) — follow-ups
 The async-consult surface shipped (`src/jobs.rs` `JobStore`, `consult_submit` in
 `server.rs`, the unified handle-dispatched `get`/`cancel`/`list`). Open polish:
