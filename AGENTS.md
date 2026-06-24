@@ -104,9 +104,9 @@ project and cannot run external commands.
   while the public `consult`/`oneshot` run on arms the server resolves with
   `Arm::from_slot` — the single live construction point that wraps the real rig client.
 - **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
-  before new work. Delete entries when they ship; don't mark them done. The *why*
-  behind a ship moves to **`docs/devlog.md`** (dated, newest-first, why-not-what —
-  the curated narrative git can't carry), not the commit log alone.
+  before new work. Delete entries when they ship; don't mark them done.
+- **`docs/devlog.md`** is a durable narrative from the agent's perspective — write
+  your story there.
 - **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
   under active development upstream. A version bump can change its API — when you
   bump, adapt kaibo to the new shape, don't pin around it. (If you're co-developing
