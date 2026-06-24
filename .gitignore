@@ -12,3 +12,7 @@
 .anthropic-key.txt
 .deepseek-key
 .gemini-api-key
+
+# signoff.md — ephemeral, personal cross-session handoff; never commit.
+# Shared working notes live in docs/issues.md and docs/devlog.md.
+signoff.md
