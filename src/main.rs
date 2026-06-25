@@ -63,8 +63,9 @@ struct Args {
     no_follow_worktrees: bool,
 
     /// Default cast when a call omits it (a built-in name or a cast defined in
-    /// config.toml). Built-ins: anthropic | deepseek | gemini | openai (plus
-    /// aliases: claude, google, local, …). Replaces the old --provider flag
+    /// config.toml). Built-ins: anthropic | deepseek | gemini | openai-local
+    /// (plus aliases: claude, google, local, …) and the batch casts gemini-batch
+    /// | anthropic-batch. Replaces the old --provider flag
     /// (clap rejects the unknown flag loudly).
     #[arg(long)]
     cast: Option<String>,

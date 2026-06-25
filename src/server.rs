@@ -3710,7 +3710,7 @@ mod tests {
     /// The live cast roster is stamped onto each consultation tool's `cast` param as
     /// a JSON-Schema `enum`, so an agent reads the menu off the schema it fills
     /// arguments from — the fix for casts being discoverable only in handshake prose
-    /// a host may truncate. The keyless local `openai` cast is always usable, so it
+    /// a host may truncate. The keyless local `openai-local` cast is always usable, so it
     /// anchors the assertion regardless of which API keys the test env carries.
     #[test]
     fn consultation_tools_advertise_the_live_cast_enum() {

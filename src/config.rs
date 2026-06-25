@@ -728,6 +728,12 @@ impl Config {
         self.casts
             .iter()
             .filter(|(_, cast)| {
+                // A batch cast is refused by `generate_image` (it staffs `batch_submit`
+                // only), so never advertise it here even if it carries an image slot —
+                // the menu must match the gate.
+                if cast.batch {
+                    return false;
+                }
                 let Some(slot) = cast.slot(ModelRole::Image) else {
                     return false;
                 };
@@ -848,13 +854,13 @@ impl Config {
                     rb.apply_to(&mut b)?;
                     // A NEW openai-kind backend must say where it points: the
                     // use-time fallback (OPENAI_BASE_URL, else the local default)
-                    // belongs to the built-in `openai` backend alone — inherited
-                    // here it would silently dial the wrong server and fail as a
-                    // cryptic 404 mid-call instead of loudly at load.
+                    // belongs to the built-in `openai-local` backend alone —
+                    // inherited here it would silently dial the wrong server and fail
+                    // as a cryptic 404 mid-call instead of loudly at load.
                     if b.kind == ProviderKind::Openai && b.base_url.is_none() {
                         bail!(
                             "backend {name:?} (kind \"openai\") must set base_url — \
-                             only the built-in `openai` backend falls back to \
+                             only the built-in `openai-local` backend falls back to \
                              OPENAI_BASE_URL / the local default"
                         );
                     }
@@ -2683,7 +2689,7 @@ mod tests {
     /// `Unconfigured` ones — and reports each survivor's state so the handshake can tag
     /// a local one. With only an Anthropic key in the env, the keyed built-ins that lack
     /// keys (deepseek, gemini) drop out; anthropic and the Anthropic-synth `anthropic-batch`
-    /// are Ready and the keyless `openai` is LocalUnverified. (The roster spans both lanes;
+    /// are Ready and the keyless `openai-local` is LocalUnverified. (The roster spans both lanes;
     /// the per-tool `cast` enums partition it by `batch`.) This is the source of the
     /// truthful "## Casts" handshake list.
     #[test]
@@ -2723,16 +2729,24 @@ mod tests {
 
             [casts.wrongkind]
             image = { backend = "anthropic", id = "imagen-ish" }
+
+            # A batch cast with an otherwise-valid openai image slot: `generate_image`
+            # refuses batch casts, so the menu must NOT advertise it.
+            [casts.batchart]
+            batch = true
+            synth = "gemini/gemini-pro-latest"
+            image = { backend = "openai-local", id = "sd-xl" }
             "#,
         )
         .unwrap();
         // No env key at all: the openai image cast still qualifies (keyless local),
-        // the anthropic-backed one is excluded by kind, and the built-in agent-only
-        // casts (no image slot) never appear.
+        // the anthropic-backed one is excluded by kind, the batch cast is excluded by
+        // lane (refused by the tool), and the built-in agent-only casts (no image slot)
+        // never appear.
         assert_eq!(
             cfg.image_capable_casts(|_| None),
             vec!["art".to_string()],
-            "only the openai-backed image cast is image-capable"
+            "only the openai-backed, non-batch image cast is image-capable"
         );
         // An anthropic key in the env changes nothing — wrong kind stays excluded.
         let with_key = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
