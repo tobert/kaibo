@@ -47,14 +47,31 @@ impl ProviderKind {
         matches!(self, ProviderKind::Openai)
     }
 
-    /// The canonical lower-case name of this kind — also the name of its built-in
-    /// backend and cast (so a bare `--cast anthropic` resolves to the built-ins).
+    /// The canonical lower-case name of this kind — the wire-protocol id used in
+    /// kind listings and error messages, and (for the keyed kinds) the name of the
+    /// built-in backend and cast, so a bare `--cast anthropic` resolves to the
+    /// built-ins. The OpenAI built-in's *name* diverges from this id — see
+    /// [`ProviderKind::builtin_name`].
     pub fn canonical_name(self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::DeepSeek => "deepseek",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Openai => "openai",
+        }
+    }
+
+    /// The name of this kind's built-in backend and cast. Equals [`canonical_name`]
+    /// for the keyed providers, but the OpenAI-compatible built-in is named
+    /// `openai-local`: its default endpoint is a *local* keyless server (Gemma via an
+    /// OpenAI-compatible host), so the bare `openai` — which is really the wire
+    /// protocol's id — would misrepresent what the built-in points at. `openai` is
+    /// deliberately *not* an alias of it, so a user can name their own backend
+    /// `[backends.openai]` (a hosted endpoint) without colliding.
+    pub fn builtin_name(self) -> &'static str {
+        match self {
+            ProviderKind::Openai => "openai-local",
+            _ => self.canonical_name(),
         }
     }
 

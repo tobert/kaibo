@@ -4,7 +4,7 @@
 # or point at it with --config <path> / KAIBO_CONFIG.
 #
 # EVERYTHING here is optional. With no config file at all, kaibo runs exactly as it
-# does today: four built-in BACKENDS (connections: anthropic/deepseek/gemini/openai)
+# does today: four built-in BACKENDS (connections: anthropic/deepseek/gemini/openai-local)
 # and four same-named single-backend CASTS (compositions: role → "backend/model-id")
 # ship in code; this file only OVERRIDES fields or ADDS backends and casts.
 # `[profiles]` is gone — a config that still carries it is a load error pointing at
@@ -206,7 +206,7 @@ kind = "gemini"
 api_key_env  = "GEMINI_API_KEY"
 api_key_file = "~/.gemini-api-key"
 
-[backends.openai]                            # aliases: local, lemonade, gemma, gemma4
+[backends.openai-local]                            # aliases: local, lemonade, gemma, gemma4
 kind = "openai"
 base_url = "http://localhost:13305/api/v1"   # also overridable via OPENAI_BASE_URL
 api_key_env  = "OPENAI_API_KEY"
@@ -217,7 +217,7 @@ key_optional = true                          # keyless local default → placeho
 #     A new backend must declare its `kind`; it seeds that kind's default key
 #     sources, then your fields apply on top. A new openai-kind backend must also
 #     set `base_url` (the OPENAI_BASE_URL / local-default fallback belongs to the
-#     built-in `openai` backend alone — a forgotten base_url is a load error, not
+#     built-in `openai-local` backend alone — a forgotten base_url is a load error, not
 #     a silent dial of the wrong server). ---
 
 # Hosted OpenAI, keyed.
@@ -272,7 +272,7 @@ synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude 
 image    = "sd/sdxl-turbo"                  # image gen stays local — Stable Diffusion
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
-#     the local-default `openai` backend. ---
+#     the local-default `openai-local` backend. ---
 
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"

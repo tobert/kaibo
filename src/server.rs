@@ -527,11 +527,19 @@ impl KaiboHandler {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
+        // A batch cast (`batch = true`) staffs `batch_submit` *only*, so the rosters split
+        // by lane: the interactive tools advertise the non-batch casts, `batch_submit`
+        // advertises the batch ones. The gate enforces the same split at call time; this
+        // just keeps the advertised menu honest so an agent doesn't pick a cast its tool
+        // will refuse.
+        let (batch_usable, interactive_usable): (Vec<String>, Vec<String>) =
+            usable.into_iter().partition(|n| config.cast_is_batch(n));
         inject_cast_enum(
             &mut tool_router,
             &["consult", "consult_submit", "oneshot"],
-            &usable,
+            &interactive_usable,
         );
+        inject_cast_enum(&mut tool_router, &["batch_submit"], &batch_usable);
         // `generate_image` selects the `image` slot, not explorer/synth, so its menu is
         // a different filter — casts with a usable image slot, not `usable_casts`. Same
         // advisory enum so image gen is as discoverable as consultation.
@@ -1101,6 +1109,46 @@ impl KaiboHandler {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))
     }
 
+    /// Refuse an interactive tool (`consult`/`consult_submit`/`oneshot`/`generate_image`)
+    /// on a batch cast. A `batch = true` cast's synth is a big, slow, expensive model
+    /// tuned for free offline batch latency (Gemini Pro, Claude Opus); driving it through
+    /// an interactive tool loop is the wrong-and-costly mistake this gate exists to stop.
+    /// Points the caller at the lane that fits.
+    fn reject_batch_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        if cast.batch {
+            return Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` is a batch cast (batch = true) — submit it with `batch_submit`, \
+                     not `{tool}`. Its synth is a big, slow model tuned for free offline batch \
+                     latency; running it interactively would be slow and expensive. Pick a \
+                     non-batch cast for `{tool}`.",
+                    cast.name
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse `batch_submit` on a non-batch cast — the other half of the lane split. A
+    /// batch cast must positively declare `batch = true`, so an ordinary interactive cast
+    /// is never silently batched (an accidental Opus/Pro batch is just as costly the other
+    /// way). Points the caller at the built-in batch casts.
+    fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
+        if !cast.batch {
+            return Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` is not a batch cast — `batch_submit` needs a cast that declares \
+                     `batch = true` (the built-ins `gemini-batch`, `anthropic-batch`, or your \
+                     own in config.toml). For an interactive answer, use `consult`/`oneshot`.",
+                    cast.name
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     /// Apply a per-call model override to one of `cast`'s slots.
     ///
     /// The model id rides *verbatim* — an id containing `/` (HuggingFace-style
@@ -1236,6 +1284,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
+        self.reject_batch_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1348,6 +1397,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
+        self.reject_batch_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1466,6 +1516,7 @@ impl KaiboHandler {
         meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast)?;
+        self.reject_batch_cast(&cast, "oneshot")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Synth,
@@ -1564,6 +1615,7 @@ impl KaiboHandler {
         Parameters(input): Parameters<GenerateImageInput>,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast.clone())?;
+        self.reject_batch_cast(&cast, "generate_image")?;
         // Optional per-call override on the image slot: `image_model` keeps the slot's
         // backend; `image_backend` retargets it (and works on a cast with no image slot
         // at all). The "pass the backend override arg" error now names a real arg.
@@ -1708,6 +1760,7 @@ impl KaiboHandler {
             ));
         }
         let mut cast = self.resolve_cast(input.cast)?;
+        self.require_batch_cast(&cast)?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Synth,
@@ -3676,10 +3729,123 @@ mod tests {
                 .and_then(|e| e.as_array())
                 .unwrap_or_else(|| panic!("{tool}: cast param should carry an enum:\n{schema:#?}"));
             assert!(
-                variants.iter().any(|v| v == "openai"),
+                variants.iter().any(|v| v == "openai-local"),
                 "{tool}: cast enum should list the always-usable local cast, got {variants:?}"
             );
         }
+    }
+
+    /// The cast roster splits by lane on the advertised `cast` enums: the interactive
+    /// tools list non-batch casts, `batch_submit` lists batch casts — so an agent reading
+    /// the schema never offers a cast the tool will refuse. Driven through a keyless local
+    /// gemini backend so both a batch and an interactive cast are usable regardless of
+    /// which API keys the test env carries.
+    #[test]
+    fn cast_enums_split_by_lane() {
+        let h = handler_from_toml(
+            r#"
+            # A keyless (placeholder) batch-capable backend so both casts are "usable"
+            # offline — the partition is exercised with teeth, not trivially empty.
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.mybatch]
+            batch = true
+            synth = "gem/some-pro"
+
+            [casts.myinteractive]
+            explorer = "gem/some-lite"
+            synth = "gem/some-flash"
+            "#,
+        );
+        let enum_of = |tool: &str| -> Vec<String> {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let casts = enum_of(tool);
+            assert!(
+                casts.iter().any(|c| c == "myinteractive"),
+                "{tool} enum should list the interactive cast, got {casts:?}"
+            );
+            assert!(
+                !casts.iter().any(|c| c == "mybatch"),
+                "{tool} enum must not list a batch cast, got {casts:?}"
+            );
+        }
+        let batch = enum_of("batch_submit");
+        assert!(
+            batch.iter().any(|c| c == "mybatch"),
+            "batch_submit enum should list the batch cast, got {batch:?}"
+        );
+        assert!(
+            !batch.iter().any(|c| c == "myinteractive"),
+            "batch_submit enum must not list an interactive cast, got {batch:?}"
+        );
+    }
+
+    /// The lane gate's two halves, tested directly: an interactive tool refuses a batch
+    /// cast (naming the cast and `batch_submit`), and `batch_submit` refuses a non-batch
+    /// cast — while each accepts the cast that fits its lane.
+    #[test]
+    fn lane_gate_refuses_the_wrong_lane() {
+        let h = handler();
+        let batch = h.config.resolve_cast("gemini-batch").unwrap().clone();
+        let interactive = h.config.resolve_cast("anthropic").unwrap().clone();
+
+        let err = h
+            .reject_batch_cast(&batch, "consult")
+            .expect_err("an interactive tool must refuse a batch cast");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("gemini-batch") && msg.contains("batch_submit"),
+            "refusal should name the cast and point at batch_submit, got: {msg}"
+        );
+        assert!(h.reject_batch_cast(&interactive, "consult").is_ok());
+
+        let err = h
+            .require_batch_cast(&interactive)
+            .expect_err("batch_submit must refuse a non-batch cast");
+        assert!(
+            format!("{err:?}").contains("not a batch cast"),
+            "refusal should explain the cast isn't a batch cast"
+        );
+        assert!(h.require_batch_cast(&batch).is_ok());
+    }
+
+    /// The gate is wired into the live `batch_submit` handler and fires *before* any
+    /// network: a non-batch cast is refused with no key and no provider call. (`consult`/
+    /// `oneshot` wire the mirror gate the same way, right after `resolve_cast`.)
+    #[tokio::test]
+    async fn batch_submit_handler_refuses_a_non_batch_cast() {
+        let h = handler();
+        let err = h
+            .batch_submit(Parameters(BatchSubmitInput {
+                prompts: vec!["q".to_string()],
+                attach: vec![],
+                cast: Some("anthropic".to_string()),
+                model: None,
+                backend: None,
+            }))
+            .await
+            .expect_err("batch_submit must refuse an interactive cast");
+        assert!(
+            format!("{err:?}").contains("not a batch cast"),
+            "the handler must reject before building any provider client"
+        );
     }
 
     /// `generate_image` advertises its own, *differently-filtered* roster: casts with a
@@ -3692,7 +3858,7 @@ mod tests {
             r#"
             # An openai `image` slot on the keyless local backend → image-capable.
             [casts.art]
-            image = { backend = "openai", id = "sd-xl" }
+            image = { backend = "openai-local", id = "sd-xl" }
 
             # An `image` slot on a non-openai backend → rig has no path → excluded.
             [casts.wrongkind]
@@ -3725,8 +3891,8 @@ mod tests {
             "a non-openai image cast has no rig path and must not be listed: {variants:?}"
         );
         assert!(
-            !variants.contains(&"openai"),
-            "the builtin `openai` cast has no image slot and must not be listed: {variants:?}"
+            !variants.contains(&"openai-local"),
+            "the builtin `openai-local` cast has no image slot and must not be listed: {variants:?}"
         );
     }
 
@@ -4519,7 +4685,7 @@ mod tests {
 
             # openai (toggle-less): sends neither effort nor budget; keeps sampling.
             [casts.oai]
-            synth = { backend = "openai", id = "gemma-local", thinking_budget = 8192, effort = "high", temperature = 0.7 }
+            synth = { backend = "openai-local", id = "gemma-local", thinking_budget = 8192, effort = "high", temperature = 0.7 }
 
             # Anthropic budget tier: takes budget_tokens, no effort; drops sampling under thinking.
             [casts.ant_budget]
@@ -4601,7 +4767,7 @@ mod tests {
             "config resource must show the allowed set:\n{body}"
         );
         // Backends and casts include the built-in four.
-        for name in ["anthropic", "deepseek", "gemini", "openai"] {
+        for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
             assert!(
                 body.contains(&format!("[backends.{name}]")),
                 "config resource must list the {name} backend:\n{body}"
@@ -4945,7 +5111,7 @@ mod tests {
         let config = Config::from_toml_str(
             r#"
             [casts.pinned]
-            synth = { backend = "openai", id = "llava", vision = true, max_tokens = 999 }
+            synth = { backend = "openai-local", id = "llava", vision = true, max_tokens = 999 }
             "#,
         )
         .unwrap();
@@ -4954,7 +5120,7 @@ mod tests {
         h.override_model(&mut cast, ModelRole::Synth, "other-model", None)
             .unwrap();
         let slot = cast.slot(ModelRole::Synth).unwrap();
-        assert_eq!(slot.backend, "openai", "backend kept");
+        assert_eq!(slot.backend, "openai-local", "backend kept");
         assert_eq!(slot.id, "other-model");
         assert_eq!(slot.vision, None, "caps pin dropped — classifies fresh");
         assert_eq!(slot.max_tokens, None, "per-slot tunables dropped");
@@ -5000,7 +5166,7 @@ mod tests {
     #[test]
     fn an_org_prefixed_model_id_stays_on_the_slots_backend() {
         let h = handler();
-        let mut cast = h.resolve_cast(Some("openai".into())).unwrap();
+        let mut cast = h.resolve_cast(Some("openai-local".into())).unwrap();
         h.override_model(
             &mut cast,
             ModelRole::Explorer,
@@ -5009,7 +5175,10 @@ mod tests {
         )
         .unwrap();
         let slot = cast.slot(ModelRole::Explorer).unwrap();
-        assert_eq!(slot.backend, "openai", "the configured backend is kept");
+        assert_eq!(
+            slot.backend, "openai-local",
+            "the configured backend is kept"
+        );
         assert_eq!(slot.id, "google/gemma-3-27b-it", "the id rides verbatim");
     }
 

@@ -128,7 +128,8 @@ impl Default for Defaults {
 /// The roles a cast's model slots can serve. Explorer and synth are the agent
 /// phases; the media roles (the pal-merge production models — see `docs/issues.md`
 /// "Media spine") are present only when configured: an absent slot means the
-/// capability is absent, not an error (built-in casts always carry explorer+synth).
+/// capability is absent, not an error (the four interactive built-in casts carry
+/// explorer+synth; the batch built-ins carry synth only).
 ///
 /// **`Tts` is a reserved, unwired seam.** It parses and resolves into a cast slot,
 /// but nothing consumes it — and won't until rig's provider coverage fills in: as
@@ -440,6 +441,13 @@ pub struct Cast {
     pub name: String,
     /// The role table: which slot serves each [`ModelRole`].
     pub slots: BTreeMap<ModelRole, ModelSlot>,
+    /// Positively declares this cast for the offline batch lane: `batch = true`
+    /// staffs `batch_submit` *only*. Its synth is a big, slow, expensive model tuned
+    /// for free batch latency (Gemini Pro, Claude Opus), so running it through an
+    /// interactive tool loop (`consult`/`oneshot`) is the wrong-and-costly mistake —
+    /// the gate refuses the mix in both directions (`server.rs`). Default `false`
+    /// (interactive); the batch-capable-synth requirement is checked at config load.
+    pub batch: bool,
 }
 
 impl Cast {
@@ -626,6 +634,14 @@ impl Config {
             "unknown cast {name:?}; known casts: {}",
             names.join(", ")
         ))
+    }
+
+    /// Whether `name` (a canonical cast name) is declared for the batch lane. Used to
+    /// partition the live roster onto the right tools' `cast` enums — batch casts to
+    /// `batch_submit`, the rest to the interactive tools. A name not in the registry
+    /// reads as non-batch (the caller already worked from canonical keys).
+    pub fn cast_is_batch(&self, name: &str) -> bool {
+        self.casts.get(name).is_some_and(|c| c.batch)
     }
 
     /// Resolve a backend by name or alias (the seam slot refs and per-call
@@ -923,7 +939,14 @@ impl Config {
             let cast = casts.entry(name.clone()).or_insert_with(|| Cast {
                 name: name.clone(),
                 slots: BTreeMap::new(),
+                batch: false,
             });
+            // `batch` is sticky: omitting it leaves a built-in batch cast batch (so a
+            // file can retune `gemini-batch`'s model without un-batching it); set it
+            // explicitly to declare or clear the lane.
+            if let Some(b) = rc.batch {
+                cast.batch = b;
+            }
             for (role, raw_slot) in rc.slots() {
                 let slot = raw_slot
                     .clone()
@@ -939,7 +962,7 @@ impl Config {
         // Resolve every slot's backend ref through the alias map (stored canonical),
         // and validate the slot. Unknown backend → loud error naming the known set.
         for cast in casts.values_mut() {
-            let Cast { name, slots } = cast;
+            let Cast { name, slots, batch } = cast;
             for (role, slot) in slots.iter_mut() {
                 if !backends.contains_key(&slot.backend) {
                     match backend_aliases.get(&slot.backend) {
@@ -985,6 +1008,28 @@ impl Config {
                         role.key(),
                         t.thinking_budget,
                         t.max_tokens
+                    );
+                }
+            }
+            // A batch cast is staffed by `batch_submit` — a toolless oneshot on the synth
+            // slot — so it MUST carry a synth slot whose backend actually has a batch API.
+            // Catch the misdeclaration loudly at load (a `batch = true` deepseek cast, say),
+            // not as a baffling refusal or a 400 at submit time.
+            if *batch {
+                let synth = slots.get(&ModelRole::Synth).ok_or_else(|| {
+                    anyhow!(
+                        "cast {name:?}: batch = true needs a synth slot \
+                         (batch_submit runs the synth model)"
+                    )
+                })?;
+                let kind = backends[&synth.backend].kind;
+                if !crate::batch::batch_supported(kind) {
+                    bail!(
+                        "cast {name:?}: batch = true but the synth backend {:?} ({}) has no \
+                         batch API — batch casts must synth a batch-capable backend ({})",
+                        synth.backend,
+                        kind.canonical_name(),
+                        crate::batch::supported_kinds_list(),
                     );
                 }
             }
@@ -1175,7 +1220,10 @@ fn builtin_aliases(name: &str) -> Vec<String> {
     let v: &[&str] = match name {
         "anthropic" => &["claude"],
         "gemini" => &["google"],
-        "openai" => &["local", "lemonade", "gemma", "gemma4"],
+        // The local-default built-in. `openai` is *not* an alias: that's the wire
+        // protocol's id, and leaving it free lets a user name their own backend
+        // `[backends.openai]` (e.g. the hosted API) without an alias collision.
+        "openai-local" => &["local", "lemonade", "gemma", "gemma4"],
         _ => &[],
     };
     v.iter().map(|s| s.to_string()).collect()
@@ -1208,7 +1256,7 @@ fn builtin_backends(defaults: &Defaults) -> BTreeMap<String, Backend> {
         ProviderKind::Openai,
     ] {
         let mut b = backend_template(kind, defaults);
-        b.name = kind.canonical_name().to_string();
+        b.name = kind.builtin_name().to_string();
         m.insert(b.name.clone(), b);
     }
     m
@@ -1225,7 +1273,7 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         ProviderKind::Gemini,
         ProviderKind::Openai,
     ] {
-        let name = kind.canonical_name().to_string();
+        let name = kind.builtin_name().to_string();
         let (explorer, synth) = default_models(kind);
         // Only the agent roles are seeded: a media role (image, tts) appears in
         // the table only when a config asks for it — absent means the capability
@@ -1234,31 +1282,52 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             (ModelRole::Explorer, ModelSlot::bare(&name, explorer)),
             (ModelRole::Synth, ModelSlot::bare(&name, synth)),
         ]);
-        m.insert(name.clone(), Cast { name, slots });
+        m.insert(
+            name.clone(),
+            Cast {
+                name,
+                slots,
+                batch: false,
+            },
+        );
     }
-    // gemini-batch: the offline lane's cast. Pro is near-unusable interactively (slow),
-    // so casts synth Flash; batch is exactly where the latency is free, so this cast
-    // synths Gemini Pro. Uses the `gemini-pro-latest` *alias* deliberately, not a pinned
-    // preview id: pinned Pro previews get retired out from under us (a live batch dogfood
-    // caught `gemini-3-pro-preview` 404ing mid-flight — submit accepted it, the per-item
-    // request failed at run time), so the latest-alias is the drift-resistant default.
-    // Override in config.toml to pin a specific Pro. Explorer stays the cheap flash-lite
-    // (batch is toolless and won't touch it, but the cast is usable for consult too).
+    // The offline batch lane's built-in casts (`batch = true`): staffed by a single
+    // big, slow, capable synth — the model whose latency is *free* in batch but
+    // near-unusable interactively. They carry synth only: batch is a toolless oneshot
+    // (no explorer sweep), and the interactive tools that used an explorer now refuse a
+    // batch cast outright, so an explorer slot here would be dead weight advertising a
+    // consult-usability the lane no longer has.
+    //
+    // gemini-batch synths Gemini Pro via the `gemini-pro-latest` *alias*, deliberately
+    // not a pinned preview id: pinned Pro previews get retired out from under us (a live
+    // batch dogfood caught `gemini-3-pro-preview` 404ing mid-flight — submit accepted it,
+    // the per-item request failed at run time), so the latest-alias is drift-resistant.
     let gemini_batch = "gemini-batch".to_string();
     m.insert(
         gemini_batch.clone(),
         Cast {
             name: gemini_batch,
-            slots: BTreeMap::from([
-                (
-                    ModelRole::Explorer,
-                    ModelSlot::bare("gemini", "gemini-flash-lite-latest"),
-                ),
-                (
-                    ModelRole::Synth,
-                    ModelSlot::bare("gemini", "gemini-pro-latest"),
-                ),
-            ]),
+            slots: BTreeMap::from([(
+                ModelRole::Synth,
+                ModelSlot::bare("gemini", "gemini-pro-latest"),
+            )]),
+            batch: true,
+        },
+    );
+    // anthropic-batch synths Claude Opus — the Anthropic analogue of Gemini Pro, the big
+    // model whose batch latency is free. Anthropic has no `-latest` alias convention, so
+    // the id is pinned (`claude-opus-4-8`); when it's retired, bump it here or pin a
+    // current Opus in config.toml.
+    let anthropic_batch = "anthropic-batch".to_string();
+    m.insert(
+        anthropic_batch.clone(),
+        Cast {
+            name: anthropic_batch,
+            slots: BTreeMap::from([(
+                ModelRole::Synth,
+                ModelSlot::bare("anthropic", "claude-opus-4-8"),
+            )]),
+            batch: true,
         },
     );
     m
@@ -1508,6 +1577,10 @@ impl RawBackend {
 #[serde(deny_unknown_fields)]
 struct RawCast {
     aliases: Option<Vec<String>>,
+    /// Declares the cast for the offline batch lane (`batch_submit` only). Absent
+    /// reads as `false` for a fresh cast; on a built-in batch cast it's omitted to
+    /// keep the existing flag, set explicitly to flip it. See [`Cast::batch`].
+    batch: Option<bool>,
     explorer: Option<RawSlot>,
     synth: Option<RawSlot>,
     image: Option<RawSlot>,
@@ -2381,17 +2454,122 @@ mod tests {
         assert!(!b.key_optional);
     }
 
-    /// All four built-in casts exist, each single-backend with explorer+synth.
+    /// All four interactive built-in casts exist, each single-backend with
+    /// explorer+synth, and none is flagged for the batch lane.
     #[test]
     fn all_four_builtin_casts_resolve() {
         let cfg = Config::builtin();
-        for name in ["anthropic", "deepseek", "gemini", "openai"] {
+        for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
             let cast = cfg.resolve_cast(name).unwrap();
+            assert!(
+                !cast.batch,
+                "interactive built-in {name:?} must not be a batch cast"
+            );
             for role in [ModelRole::Explorer, ModelRole::Synth] {
                 let slot = cast.require_slot(role).unwrap();
                 assert_eq!(slot.backend, name, "built-in casts are single-backend");
             }
         }
+    }
+
+    /// The built-in batch casts positively declare `batch = true`, carry **synth only**
+    /// (batch is a toolless oneshot — an explorer slot would be dead weight), and synth a
+    /// batch-capable backend. Pins the lane's shape so an accidental explorer slot or a
+    /// dropped flag fails here.
+    #[test]
+    fn builtin_batch_casts_are_synth_only_and_flagged() {
+        let cfg = Config::builtin();
+        for (name, backend) in [("gemini-batch", "gemini"), ("anthropic-batch", "anthropic")] {
+            let cast = cfg.resolve_cast(name).unwrap();
+            assert!(cast.batch, "{name:?} must declare batch = true");
+            assert!(
+                cast.slot(ModelRole::Explorer).is_none(),
+                "{name:?} is a batch cast — toolless, so it carries no explorer slot"
+            );
+            let synth = cast.require_slot(ModelRole::Synth).unwrap();
+            assert_eq!(synth.backend, backend, "{name:?} synths its named backend");
+            assert!(
+                crate::batch::batch_supported(cfg.backends[&synth.backend].kind),
+                "{name:?} must synth a batch-capable backend"
+            );
+        }
+    }
+
+    /// A `batch = true` cast whose synth backend has no batch API is a misdeclaration —
+    /// caught loudly at config load, not as a 400 at submit time. The message names the
+    /// cast and the live batch-capable set.
+    #[test]
+    fn batch_cast_on_non_batch_backend_is_a_load_error() {
+        let err = Config::from_toml_str(
+            r#"
+            [casts.bad]
+            batch = true
+            synth = "deepseek/deepseek-v4-pro"
+            "#,
+        )
+        .expect_err("a batch cast on a non-batch backend must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bad") && msg.contains("batch"),
+            "load error must name the cast and the batch problem, got: {msg}"
+        );
+    }
+
+    /// A `batch = true` cast with no synth slot can't run `batch_submit` (which runs the
+    /// synth model), so it's refused at load rather than failing cryptically on submit.
+    #[test]
+    fn batch_cast_without_synth_is_a_load_error() {
+        let err = Config::from_toml_str(
+            r#"
+            [casts.bad]
+            batch = true
+            explorer = "gemini/gemini-flash-lite-latest"
+            "#,
+        )
+        .expect_err("a batch cast with no synth slot must not load");
+        assert!(
+            format!("{err:#}").contains("synth"),
+            "load error must name the missing synth slot"
+        );
+    }
+
+    /// `batch` round-trips from `[casts.<name>]`: a fresh cast defaults non-batch, an
+    /// explicit `batch = true` (on a batch-capable synth) declares the lane, and the flag
+    /// is sticky over a built-in — retuning `gemini-batch`'s model leaves it batch.
+    #[test]
+    fn batch_flag_parses_defaults_false_and_is_sticky() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.fresh]
+            synth = "anthropic/claude-sonnet-4-6"
+
+            [casts.declared]
+            batch = true
+            synth = "anthropic/claude-opus-4-8"
+
+            [casts.gemini-batch]
+            synth = "gemini/gemini-3-pro-preview"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !cfg.resolve_cast("fresh").unwrap().batch,
+            "absent batch ⇒ false"
+        );
+        assert!(
+            cfg.resolve_cast("declared").unwrap().batch,
+            "batch = true ⇒ true"
+        );
+        let gb = cfg.resolve_cast("gemini-batch").unwrap();
+        assert!(
+            gb.batch,
+            "retuning a built-in batch cast leaves it batch (sticky)"
+        );
+        assert_eq!(
+            gb.require_slot(ModelRole::Synth).unwrap().id,
+            "gemini-3-pro-preview",
+            "the file override reached the synth slot"
+        );
     }
 
     // --- usability: the unconfigured-install signal ---------------------------
@@ -2407,7 +2585,7 @@ mod tests {
         api_key_file = "/nonexistent-kaibo-test/deepseek"
         [backends.gemini]
         api_key_file = "/nonexistent-kaibo-test/gemini"
-        [backends.openai]
+        [backends.openai-local]
         api_key_file = "/nonexistent-kaibo-test/openai"
     "#;
 
@@ -2447,7 +2625,7 @@ mod tests {
     #[test]
     fn cast_usability_local_unverified_for_keyless_placeholder() {
         let cfg = Config::from_toml_str(&format!(
-            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"openai/m1\"\nsynth=\"openai/m2\""
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"openai-local/m1\"\nsynth=\"openai-local/m2\""
         ))
         .unwrap();
         let cast = cfg.resolve_cast("t").unwrap();
@@ -2475,7 +2653,7 @@ mod tests {
     #[test]
     fn cast_usability_local_unverified_when_mixing_present_and_placeholder() {
         let cfg = Config::from_toml_str(&format!(
-            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"openai/m2\""
+            "{NO_KEY_FILES}\n[casts.t]\nexplorer=\"anthropic/m1\"\nsynth=\"openai-local/m2\""
         ))
         .unwrap();
         let cast = cfg.resolve_cast("t").unwrap();
@@ -2504,8 +2682,10 @@ mod tests {
     /// `usable_casts` keeps only the casts that can reach a model — filtering out the
     /// `Unconfigured` ones — and reports each survivor's state so the handshake can tag
     /// a local one. With only an Anthropic key in the env, the keyed built-ins that lack
-    /// keys (deepseek, gemini) drop out; anthropic is Ready and the keyless `openai` is
-    /// LocalUnverified. This is the source of the truthful "## Casts" handshake list.
+    /// keys (deepseek, gemini) drop out; anthropic and the Anthropic-synth `anthropic-batch`
+    /// are Ready and the keyless `openai` is LocalUnverified. (The roster spans both lanes;
+    /// the per-tool `cast` enums partition it by `batch`.) This is the source of the
+    /// truthful "## Casts" handshake list.
     #[test]
     fn usable_casts_filters_unconfigured_and_reports_state() {
         let cfg = Config::from_toml_str(NO_KEY_FILES).unwrap();
@@ -2515,7 +2695,8 @@ mod tests {
             usable,
             vec![
                 ("anthropic".to_string(), CastUsability::Ready),
-                ("openai".to_string(), CastUsability::LocalUnverified),
+                ("anthropic-batch".to_string(), CastUsability::Ready),
+                ("openai-local".to_string(), CastUsability::LocalUnverified),
             ],
             "only keyed-and-present + keyless casts survive, with their state"
         );
@@ -2523,7 +2704,7 @@ mod tests {
         let none = cfg.usable_casts(|_| None);
         assert_eq!(
             none,
-            vec![("openai".to_string(), CastUsability::LocalUnverified)],
+            vec![("openai-local".to_string(), CastUsability::LocalUnverified)],
             "no env key ⇒ only the keyless local cast is usable"
         );
     }
@@ -2538,7 +2719,7 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [casts.art]
-            image = { backend = "openai", id = "sd-xl" }
+            image = { backend = "openai-local", id = "sd-xl" }
 
             [casts.wrongkind]
             image = { backend = "anthropic", id = "imagen-ish" }
@@ -2567,12 +2748,12 @@ mod tests {
         assert_eq!(cfg.resolve_cast("claude").unwrap().name, "anthropic");
         assert_eq!(cfg.resolve_cast("google").unwrap().name, "gemini");
         for a in ["local", "lemonade", "gemma", "gemma4"] {
-            assert_eq!(cfg.resolve_cast(a).unwrap().name, "openai");
+            assert_eq!(cfg.resolve_cast(a).unwrap().name, "openai-local");
         }
         // Backend level.
         assert_eq!(cfg.resolve_backend("claude").unwrap().name, "anthropic");
         assert_eq!(cfg.resolve_backend("google").unwrap().name, "gemini");
-        assert_eq!(cfg.resolve_backend("local").unwrap().name, "openai");
+        assert_eq!(cfg.resolve_backend("local").unwrap().name, "openai-local");
         // And a slot ref written against an alias canonicalizes at load.
         let cfg = Config::from_toml_str(
             r#"
@@ -2634,8 +2815,8 @@ mod tests {
     /// form: only the FIRST `/` splits backend from id.
     #[test]
     fn slot_ref_splits_on_the_first_slash_only() {
-        let (backend, id) = parse_slot_ref("openai/Qwen/Qwen3-32B").unwrap();
-        assert_eq!(backend, "openai");
+        let (backend, id) = parse_slot_ref("openai-local/Qwen/Qwen3-32B").unwrap();
+        assert_eq!(backend, "openai-local");
         assert_eq!(id, "Qwen/Qwen3-32B");
         assert!(parse_slot_ref("no-slash-here").is_err());
         assert!(parse_slot_ref("/id-only").is_err());
@@ -2879,7 +3060,7 @@ mod tests {
         Config::from_toml_str(
             r#"
             [casts.x]
-            synth = { backend = "openai", id = "m", max_tokens = 1000, thinking_budget = 2000 }
+            synth = { backend = "openai-local", id = "m", max_tokens = 1000, thinking_budget = 2000 }
             "#,
         )
         .unwrap();

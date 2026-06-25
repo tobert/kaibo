@@ -42,7 +42,7 @@ pub struct GenerateImageInput {
     /// What to draw. A plain-language description; passed verbatim to the image model.
     pub prompt: String,
 
-    /// Cast: a built-in name ("openai", …) or a cast from config.toml. The cast must
+    /// Cast: a built-in name ("openai-local", …) or a cast from config.toml. The cast must
     /// carry an `image` slot on an OpenAI-compatible backend. Omit to use the default
     /// cast.
     #[serde(default)]

@@ -231,9 +231,13 @@ async fn image_attachment_to_blind_synth_is_refused() {
     slots.insert(ModelRole::Synth, slot);
     config.casts.insert(
         "blindcast".to_string(),
+        // `batch = true`: this exercises `batch_submit`, which now refuses a non-batch
+        // cast before the vision gate. Anthropic is batch-capable, so the cast is valid;
+        // the vision pin is what we're actually testing here.
         Cast {
             name: "blindcast".to_string(),
             slots,
+            batch: true,
         },
     );
     let handler = KaiboHandler::new(config).expect("handler builds");
