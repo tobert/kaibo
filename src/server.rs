@@ -5,11 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
+use rmcp::ErrorData as McpError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -22,15 +23,14 @@ use rmcp::model::{
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
-use rmcp::ErrorData as McpError;
-use rmcp::{tool, tool_handler, tool_router, RoleServer};
+use rmcp::{RoleServer, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, ModelRole, ModelSlot};
 use crate::consult::{
-    consult, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides,
+    Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides, consult, oneshot,
 };
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
@@ -41,7 +41,7 @@ use crate::kaish_syntax::{
 };
 use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink, TracingSink};
-use crate::sandbox::{builtin_schemas, KaishWorker};
+use crate::sandbox::{KaishWorker, builtin_schemas};
 use crate::session::SessionStore;
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -915,8 +915,8 @@ impl KaiboHandler {
         paths: &[String],
     ) -> Result<Vec<crate::attach::Attachment>, McpError> {
         use crate::attach::{
-            check_attachment_bounds, classify, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_IMAGE_BYTES,
-            DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TOTAL_BYTES,
+            DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_TEXT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES, check_attachment_bounds, classify,
         };
         // The pre-read ceiling: whichever encoding cap is larger. `classify` applies the
         // precise per-encoding cap after sniffing; this just bounds the read itself.
@@ -924,8 +924,13 @@ impl KaiboHandler {
         // Fail fast on count *before* canonicalizing the whole list (a stray glob could
         // name thousands). The cumulative-byte budget is enforced per file below as the
         // running total grows — before each read, so an oversized batch never slurps in.
-        check_attachment_bounds(paths.len(), 0, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_TOTAL_BYTES)
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+        check_attachment_bounds(
+            paths.len(),
+            0,
+            DEFAULT_MAX_ATTACHMENTS,
+            DEFAULT_MAX_TOTAL_BYTES,
+        )
+        .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         // One read-only worker per distinct containing tree, reused across attachments
         // under it (a worker owns a thread + kernel build, so we don't want one per file).
         let mut workers: std::collections::HashMap<PathBuf, KaishWorker> =
@@ -1257,7 +1262,12 @@ impl KaiboHandler {
         // (consult views it with `view_image`, which only a vision synth carries). Refuse
         // here, before the loop, the same honest up-front refusal oneshot/batch give.
         let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
-        Self::gate_consult_image_attachments(&attachments, synth.caps.vision, &synth.model, &cast.name)?;
+        Self::gate_consult_image_attachments(
+            &attachments,
+            synth.caps.vision,
+            &synth.model,
+            &cast.name,
+        )?;
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1360,7 +1370,12 @@ impl KaiboHandler {
         // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
         // synth) is a clean synchronous refusal, not a job that fails on poll.
         let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
-        Self::gate_consult_image_attachments(&attachments, synth.caps.vision, &synth.model, &cast.name)?;
+        Self::gate_consult_image_attachments(
+            &attachments,
+            synth.caps.vision,
+            &synth.model,
+            &cast.name,
+        )?;
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1783,7 +1798,18 @@ impl KaiboHandler {
         }
         self.ensure_consult_enabled(&input.handle)?;
         match self.jobs.get(&input.handle) {
-            Some(snap) => Ok(render_job(&input.handle, snap)),
+            Some(snap) => {
+                // Collecting a terminal job retires its completion ping from the `wait`
+                // ring — otherwise that stale Warn lingers and the next `wait` returns on
+                // it immediately instead of blocking for new work. A Running job has no
+                // ping yet; a Canceled one never emitted one — both are no-ops, so this is
+                // safe to call unconditionally, but we scope it to the terminal states the
+                // ping actually exists for.
+                if matches!(snap.state, JobState::Done(_) | JobState::Failed(_)) {
+                    self.notifications.discard_job_pings(&input.handle);
+                }
+                Ok(render_job(&input.handle, snap))
+            }
             None => Err(McpError::invalid_params(
                 format!(
                     "no consultation job `{}` — it may have finished and been evicted by \
@@ -3171,7 +3197,7 @@ fn wait_level_floor(level: Option<&str>) -> Result<u8, McpError> {
             return Err(McpError::invalid_params(
                 format!("level must be one of debug|info|warn|error, got {other:?}"),
                 None,
-            ))
+            ));
         }
     };
     Ok(crate::mcp_log::rank(l))
@@ -3409,8 +3435,8 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
+    use rmcp::model::{NumberOrString, PromptMessageContent};
 
     /// consult `attach` validates files are under the consult root (so the model's shell
     /// can `cat` them) and returns them as relative paths; a file outside the root — even
@@ -3470,7 +3496,10 @@ mod tests {
         )
         .expect("both resolve");
         let by_path = |p: &str| out.iter().find(|a| a.path == p).unwrap().is_image;
-        assert!(by_path("shot.txt"), "PNG bytes classify as image despite .txt");
+        assert!(
+            by_path("shot.txt"),
+            "PNG bytes classify as image despite .txt"
+        );
         assert!(
             !by_path("notes.png"),
             "UTF-8 bytes classify as text despite .png"
@@ -3491,8 +3520,13 @@ mod tests {
             is_image: false,
         }];
         // Blind synth + image → refused, naming the cast and the vision requirement.
-        let err = KaiboHandler::gate_consult_image_attachments(&img, false, "deepseek-v4-pro", "deepseek")
-            .expect_err("an image to a blind synth must be refused");
+        let err = KaiboHandler::gate_consult_image_attachments(
+            &img,
+            false,
+            "deepseek-v4-pro",
+            "deepseek",
+        )
+        .expect_err("an image to a blind synth must be refused");
         assert!(
             err.message.contains("can't see images") && err.message.contains("deepseek"),
             "the refusal names the cause and the cast: {}",
@@ -3801,6 +3835,78 @@ mod tests {
         );
     }
 
+    /// A job's completion ping (a Warn carrying `job=<id>`) sits in the `wait` ring until
+    /// drained. Collecting that job with `get` must retire its ping — otherwise the ping
+    /// lingers and the next `wait` returns on it instantly instead of blocking for new
+    /// work (the "`wait` returns too fast" bug). An *uncollected* job's ping is untouched,
+    /// so it still wakes a later `wait`.
+    #[tokio::test]
+    async fn get_on_a_terminal_job_retires_its_wait_ping() {
+        use crate::jobs::JobResult;
+        use crate::mcp_log::LogRecord;
+        use rmcp::model::LoggingLevel;
+
+        fn ping(job: &str) -> LogRecord {
+            let mut fields = serde_json::Map::new();
+            fields.insert("job".into(), serde_json::Value::String(job.into()));
+            LogRecord {
+                level: LoggingLevel::Warning,
+                target: "kaibo::jobs".into(),
+                message: format!("async job finished — collect it with `get` ({job})"),
+                fields,
+            }
+        }
+
+        let h = handler();
+        // Two finished jobs; we only collect the first.
+        let collected = h.jobs.submit("test", async {
+            Ok(JobResult {
+                answer: "answer".into(),
+                report: None,
+            })
+        });
+        let other = h.jobs.submit("test", async {
+            Ok(JobResult {
+                answer: "answer".into(),
+                report: None,
+            })
+        });
+        // Both must reach a terminal state before `get` will evict (Running has no ping).
+        for id in [&collected, &other] {
+            for _ in 0..1000 {
+                match h.jobs.get(id).map(|s| s.state) {
+                    Some(JobState::Running) | None => tokio::task::yield_now().await,
+                    Some(_) => break,
+                }
+            }
+        }
+        // Seed both pings, the way the finishing tasks' `tracing::warn!` would.
+        h.notifications.push_record(ping(&collected));
+        h.notifications.push_record(ping(&other));
+
+        h.get(Parameters(HandleInput {
+            handle: collected.clone(),
+        }))
+        .await
+        .expect("get collects the finished job");
+
+        // The collected job's ping is gone; the uncollected one's survives to wake a
+        // later `wait`.
+        let left: Vec<String> = h
+            .notifications
+            .drain(crate::mcp_log::rank(LoggingLevel::Warning), 20)
+            .into_iter()
+            .map(|r| {
+                r.fields
+                    .get("job")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(left, vec![other], "only the uncollected job's ping remains");
+    }
+
     /// Progress is opt-in: with no `progressToken` in `_meta` we send nothing, so the
     /// sink must be the no-op. (A `consult` with no token is byte-for-byte its old
     /// silent self.)
@@ -4058,19 +4164,19 @@ mod tests {
         );
         let text = read_text(TOOLS_URI, &[]);
         for needle in [
-            "attach",          // the attachment guidance moved here
-            "inlined",         // the consult-vs-oneshot attach distinction
-            "whole file",      // the toolless-model whole-files steer
-            "verbatim",        // the model-id override semantics
-            "_backend",        // the retarget-the-slot mechanic
-            "job-N",           // the consult handle shape
+            "attach",              // the attachment guidance moved here
+            "inlined",             // the consult-vs-oneshot attach distinction
+            "whole file",          // the toolless-model whole-files steer
+            "verbatim",            // the model-id override semantics
+            "_backend",            // the retarget-the-slot mechanic
+            "job-N",               // the consult handle shape
             "backend/provider-id", // the batch handle shape
-            "fire-and-forget", // the async-workflow framing
-            "read-only",       // the kaish shell boundary
-            "126",             // the exit-code contract
-            "worktree",        // attach/path reaches a followed git worktree
-            "Reviewing a change", // prefer whole files over a diff for review
-            "view_image",      // consult opens an attached image with view_image
+            "fire-and-forget",     // the async-workflow framing
+            "read-only",           // the kaish shell boundary
+            "126",                 // the exit-code contract
+            "worktree",            // attach/path reaches a followed git worktree
+            "Reviewing a change",  // prefer whole files over a diff for review
+            "view_image",          // consult opens an attached image with view_image
         ] {
             assert!(
                 text.contains(needle),

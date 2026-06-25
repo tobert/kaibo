@@ -37,18 +37,18 @@
 //! The convention is safe to assert here because [`KAIBO_TARGET`] filtering means
 //! rig/reqwest's *severity*-sense `warn!`s never reach this bridge — only kaibo's own.
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
+use rmcp::RoleServer;
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::Peer;
-use rmcp::RoleServer;
 use serde_json::{Map, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 /// Only events under this target tree are mirrored to MCP — kaibo's own logs, never
 /// the chatter from `rig`/`reqwest`/`rmcp` a broad `RUST_LOG` would otherwise pull
@@ -182,6 +182,26 @@ impl NotificationBuffer {
         }
         *q = kept;
         taken
+    }
+
+    /// Seed a record straight into the ring, bypassing the `tracing` layer — for tests
+    /// that need a job's completion ping present without standing up a subscriber (whose
+    /// callsite-interest capture is flaky; see project memory). Same effect as a real
+    /// layer push, minus the client-channel tee.
+    #[cfg(test)]
+    pub(crate) fn push_record(&self, record: LogRecord) {
+        self.push(record);
+    }
+
+    /// Drop any buffered record carrying `job = <id>` — the completion ping a finished
+    /// job pushed (`jobs.rs`, at **Warn**). Once that job is collected via `get`, the ping
+    /// is stale news: left in the ring it would make the *next* `wait` return instantly on
+    /// old activity instead of blocking for something new (the "`wait` returns too fast"
+    /// bug). Idempotent — a ping a live `wait` already drained leaves nothing to remove —
+    /// and scoped to the one id, so an *uncollected* job's ping still wakes a later `wait`.
+    pub fn discard_job_pings(&self, id: &str) {
+        self.lock()
+            .retain(|rec| rec.fields.get("job").and_then(Value::as_str) != Some(id));
     }
 
     /// Block up to `timeout` for records at or above `floor`, returning as soon as any
@@ -498,6 +518,44 @@ mod tests {
         assert_eq!(returned[0].message, "job done");
         // Everything drained is consumed — the streamed narrative isn't left to pile up.
         assert!(buf.is_empty());
+    }
+
+    /// A finished job's completion ping (carrying `job=<id>`) is retired when that job is
+    /// collected — but only that job's ping. The bug it guards: a stale ping left in the
+    /// ring makes the next `wait` return instantly instead of blocking for new work.
+    #[test]
+    fn discard_job_pings_drops_only_the_named_jobs_ping() {
+        fn ping(job: &str) -> LogRecord {
+            let mut fields = Map::new();
+            fields.insert("job".into(), Value::String(job.into()));
+            LogRecord {
+                level: LoggingLevel::Warning,
+                target: "kaibo::jobs".into(),
+                message: format!("async job finished — collect it with `get` ({job})"),
+                fields,
+            }
+        }
+        let buf = NotificationBuffer::new(8);
+        buf.push(ping("job-1"));
+        buf.push(ping("job-2"));
+        buf.push(rec(LoggingLevel::Warning, "a jobless warn")); // no `job` field
+
+        buf.discard_job_pings("job-1");
+
+        // job-1's ping is gone; job-2's and the jobless warn survive (drain proves what's
+        // left and in what order).
+        let left: Vec<String> = buf
+            .drain(rank(LoggingLevel::Warning), 20)
+            .into_iter()
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                "async job finished — collect it with `get` (job-2)".to_string(),
+                "a jobless warn".to_string(),
+            ]
+        );
     }
 
     #[test]
