@@ -1379,12 +1379,12 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Start a `consult` in the background and get back a `job-N` handle \
-            to collect later — the async sibling of `consult` (same investigation, same \
-            args). Reach for it to run several consults at once (a cross-model study: \
+        description = "Submit a `consult` and get a `job-N` handle back immediately — kaibo \
+            runs it in the background. The async sibling of `consult` (same investigation, \
+            same args). Reach for it to run several consults at once (a cross-model study: \
             submit one per cast, collect them all) or when a deep consult would otherwise \
-            block you: submit, go do other work, then `get` the answer (`cancel` stops it, \
-            `list` shows what's in flight, `wait` parks for results). The job lives for \
+            block you: submit, go do other work, then `wait` parks for results / `get` the \
+            answer (`cancel` stops it, `list` shows what's in flight). The job lives for \
             this server session only — collect it before you reconnect. For an answer in \
             this turn, use `consult`. See `kaibo://tools` for the async workflow."
     )]
