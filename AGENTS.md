@@ -139,6 +139,28 @@ Local musl repro (no system zig needed): `pip install ziglang` in a venv,
 x86_64-unknown-linux-musl`. Verify the boundary with `cargo tree -i aws-lc-rs`
 (empty) and `ldd target/.../kaibo` (`not a dynamic executable`).
 
+## Writing for models
+
+Every prompt, preamble, tool description, and cheatsheet is text some model reads.
+When we touch one, we **re-read the whole block and judge it holistically** — not the
+diff in isolation. The ratchet is *compression* (改善): over time a block should carry
+more impact per token and avoid accreting clauses.
+
+Two audiences are optimized differently:
+
+- **Client-facing text** — the MCP server instructions and each tool's `description`
+  in `server.rs`, read by the *calling* agent. Density is existential here because it's
+  *resident* cost: the descriptions load into the caller's context every session
+  whether or not the tool is ever called — an unused tool still bills the user. We ask
+  people to spend a few tokens on kaibo in every session they connect us; each one has
+  to earn its place and be additive to their experience. Terse, concrete, no clause
+  that doesn't pay rent.
+- **Agent-facing text** — preambles, the kaish cheatsheet, the casts' answering
+  instructions, read by the commercial models *we* drive, with windows in the hundreds
+  of thousands to millions of tokens. Here verbosity is *licensed where it shapes
+  behavior*: say it a few ways, frame positively, be explicit (see **Driving the
+  models**). Verbose to install behavior, never verbose by default.
+
 ## Driving the models
 
 How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherits them.

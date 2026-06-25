@@ -69,9 +69,15 @@ the git log. Each later release appends a new section at the top.
   no state: the handle is the whole address, so poll/cancel survive a restart, and a
   failed item is surfaced per-item rather than dropped. Runs on **Anthropic and Gemini**
   backends (OpenAI batch is a tracked follow-on); a cast whose synth has no batch lane is
-  refused with a clear message naming the ones that do. For Gemini there's a ready-made
-  `gemini-batch` cast that synths Gemini **Pro** — the tier you reach for offline, where
-  its latency is free. Gated by `--no-batch` (one flag over every verb). Batch carries its
+  refused with a clear message naming the ones that do. Two ready-made batch casts ship:
+  `gemini-batch` (synth Gemini **Pro**) and `anthropic-batch` (synth Claude **Opus**) —
+  the tier you reach for offline, where its latency is free. Both declare **`batch = true`**,
+  which dedicates them to the batch lane: `batch_submit` takes a batch cast and the
+  interactive tools (`consult`/`oneshot`) refuse one — and vice versa — so a big,
+  offline-tuned model is never run interactively (slow, expensive) by accident. Mark your
+  own cast `batch = true` in `config.toml` (its synth must be a batch-capable backend; the
+  per-tool `cast` menu lists the casts each tool actually accepts). Gated by `--no-batch`
+  (one flag over every verb). Batch carries its
   own system preamble fit to the offline lane — one complete, self-contained response with
   no follow-up, told to spend on depth — overridable via `[prompts].batch` like the other
   phases. While a batch runs, `get` reminds you to go do other work and check back

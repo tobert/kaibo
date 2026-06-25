@@ -589,3 +589,13 @@ question is whether the content/cost of a logs signal is worth it given traces
 already carry the prompts/completions. The session's `otlp-mcp` collector is the
 sink for a probe.
 
+
+### Flaky: `containment::omitted_path_zero_config_infers_cwd_as_default_root`
+Failed once under a full `cargo test`, passed in isolation and on the next full run.
+The test reads process-global `current_dir()`; containment.rs has two cwd-reading
+tests and the harness runs a binary's tests on parallel threads, so a cwd-sensitive
+assert can race. Not tied to any one feature (the batch-cast work that surfaced it
+touches no root logic). Fix candidates: serialize the cwd-reading tests (a shared
+mutex / `serial_test`), or have the test assert against an explicit root rather than
+the ambient cwd. Cross-reference [[tracing-callsite-interest-poisoning]] — same
+"global state shared across a binary's tests" failure class.

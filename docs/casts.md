@@ -53,11 +53,11 @@ composition, compositions choose connections.
 
 ```toml
 # --- backends: connections only. The four built-ins (anthropic, deepseek,
-#     gemini, openai) ship in code with today's key sources; a stanza here
+#     gemini, openai-local) ship in code with today's key sources; a stanza here
 #     retargets one or adds a new one. ---
 
 # (No stanza needed for the local llama.cpp default: `gemma` is a built-in
-#  alias of the `openai` backend, which already points at localhost:13305.
+#  alias of the `openai-local` backend, which already points at localhost:13305.
 #  Built-in alias names are reserved — `[backends.gemma]` would be a loud
 #  collision error, not a redefinition.)
 
@@ -104,7 +104,7 @@ Rules, in the loud-over-silent house style:
   user; git history is the record.
 - **Built-in equivalence:** four built-in backends + four same-named
   single-backend casts. Today's profile aliases — `claude`→`anthropic`,
-  `google`→`gemini`, `local`/`lemonade`/`gemma`/`gemma4`→`openai` — register
+  `google`→`gemini`, `local`/`lemonade`/`gemma`/`gemma4`→`openai-local` — register
   at *both* levels (cast aliases so `cast = "claude"` resolves, backend
   aliases so a slot ref `claude/<id>` resolves), and user stanzas can declare
   their own `aliases = [...]` at either level. A missing config file and

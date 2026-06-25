@@ -32,15 +32,16 @@ fn builtin_reproduces_the_historical_defaults() {
     // The per-request LLM deadline default: 15 min (see Defaults::default).
     assert_eq!(c.defaults.request_timeout, Duration::from_secs(900));
 
-    // Four built-in backends + four same-named single-backend casts, carrying
-    // the model ids that used to live on the profiles.
+    // Four built-in backends + four single-backend casts, carrying the model ids
+    // that used to live on the profiles. Named after their kind, except the OpenAI
+    // built-in, which is `openai-local` (it defaults to a local endpoint).
     for kind in [
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
         ProviderKind::Openai,
     ] {
-        let name = kind.canonical_name();
+        let name = kind.builtin_name();
         let backend = c.resolve_backend(name).unwrap();
         assert_eq!(backend.kind, kind);
         assert_eq!(backend.request_timeout, Duration::from_secs(900));
@@ -51,7 +52,7 @@ fn builtin_reproduces_the_historical_defaults() {
         let s = cast.require_slot(ModelRole::Synth).unwrap();
         assert_eq!(e.id, explorer, "{kind:?} explorer");
         assert_eq!(s.id, synth, "{kind:?} synth");
-        // Built-in casts are single-backend, named after their kind.
+        // Built-in casts are single-backend, named by `builtin_name`.
         assert_eq!(e.backend, name);
         assert_eq!(s.backend, name);
 
@@ -111,8 +112,8 @@ fn builtin_aliases_resolve_at_both_levels() {
     for a in ["local", "lemonade", "gemma", "gemma4"] {
         assert_eq!(
             c.resolve_cast(a).unwrap().name,
-            "openai",
-            "{a:?} should alias the openai cast"
+            "openai-local",
+            "{a:?} should alias the openai-local cast"
         );
     }
     // Backend level.
@@ -121,8 +122,8 @@ fn builtin_aliases_resolve_at_both_levels() {
     for a in ["local", "lemonade", "gemma", "gemma4"] {
         assert_eq!(
             c.resolve_backend(a).unwrap().name,
-            "openai",
-            "{a:?} should alias the openai backend"
+            "openai-local",
+            "{a:?} should alias the openai-local backend"
         );
     }
 }
@@ -224,14 +225,14 @@ fn a_chimera_cast_spans_backends_with_both_slot_forms() {
 #[test]
 fn slot_refs_split_on_the_first_slash_only() {
     // HuggingFace-style ids keep their inner slash: only the FIRST `/` splits.
-    let (backend, id) = parse_slot_ref("openai/Qwen/Qwen3-32B").unwrap();
-    assert_eq!(backend, "openai");
+    let (backend, id) = parse_slot_ref("openai-local/Qwen/Qwen3-32B").unwrap();
+    assert_eq!(backend, "openai-local");
     assert_eq!(id, "Qwen/Qwen3-32B");
     // And the same through the TOML string form.
     let c = Config::from_toml_str(
         r#"
         [casts.hf]
-        synth = "openai/Qwen/Qwen3-32B"
+        synth = "openai-local/Qwen/Qwen3-32B"
         "#,
     )
     .unwrap();
@@ -315,7 +316,7 @@ fn a_vision_pin_on_a_slot_wins_over_the_classifier() {
     let c = Config::from_toml_str(
         r#"
         [casts.x]
-        explorer = { backend = "openai", id = "llava-13b", vision = true }
+        explorer = { backend = "openai-local", id = "llava-13b", vision = true }
         synth = { backend = "anthropic", id = "claude-sonnet-4-6", vision = false }
         "#,
     )
@@ -363,7 +364,7 @@ fn two_openai_backends_resolve_to_distinct_endpoints() {
     assert_eq!(llama.resolved_base_url(), "http://localhost:8080/v1");
     // The built-ins are still present alongside.
     assert!(c.resolve_backend("anthropic").is_ok());
-    assert!(c.resolve_cast("openai").is_ok());
+    assert!(c.resolve_cast("openai-local").is_ok());
 }
 
 #[test]
@@ -371,7 +372,7 @@ fn a_builtin_openai_backend_without_base_url_uses_the_env_default() {
     // No explicit base_url → the resolved URL is whatever OPENAI_BASE_URL/default
     // yields (env-robust check).
     let c = Config::builtin();
-    let b = c.resolve_backend("openai").unwrap();
+    let b = c.resolve_backend("openai-local").unwrap();
     assert_eq!(b.resolved_base_url(), openai_base_url());
 }
 
@@ -509,7 +510,7 @@ fn an_unknown_backend_in_a_slot_names_the_known_backends() {
     let msg = format!("{err:#}");
     assert!(msg.contains("unknown backend \"nope\""), "got: {msg}");
     assert!(msg.contains("known backends"), "got: {msg}");
-    for known in ["anthropic", "deepseek", "gemini", "openai"] {
+    for known in ["anthropic", "deepseek", "gemini", "openai-local"] {
         assert!(msg.contains(known), "should name {known}, got: {msg}");
     }
 }
@@ -662,7 +663,7 @@ fn a_new_openai_backend_without_base_url_is_rejected_loudly() {
     // A user-declared openai-kind backend with a forgotten base_url would
     // silently dial the global default endpoint (OPENAI_BASE_URL or the local
     // llama.cpp server) — a wrong-server 404 mid-call. Only the built-in
-    // `openai` backend keeps that fallback; a new stanza must say where it points.
+    // `openai-local` backend keeps that fallback; a new stanza must say where it points.
     let err = Config::from_toml_str(
         r#"
         [backends.sd]
@@ -677,10 +678,10 @@ fn a_new_openai_backend_without_base_url_is_rejected_loudly() {
         "names the missing key, got: {msg}"
     );
     assert!(msg.contains("sd"), "names the backend, got: {msg}");
-    // The built-in `openai` backend keeps the env/default fallback: overriding
+    // The built-in `openai-local` backend keeps the env/default fallback: overriding
     // it without base_url stays valid, and a config-less load is unchanged.
-    let c = Config::from_toml_str("[backends.openai]\nkey_optional = false\n").unwrap();
-    assert!(c.resolve_backend("openai").unwrap().base_url.is_none());
+    let c = Config::from_toml_str("[backends.openai-local]\nkey_optional = false\n").unwrap();
+    assert!(c.resolve_backend("openai-local").unwrap().base_url.is_none());
 }
 
 #[test]
@@ -731,7 +732,7 @@ fn an_inverted_thinking_budget_is_rejected_at_the_resolved_slot() {
     Config::from_toml_str(
         r#"
         [casts.x]
-        synth = { backend = "openai", id = "m", max_tokens = 1000, thinking_budget = 2000 }
+        synth = { backend = "openai-local", id = "m", max_tokens = 1000, thinking_budget = 2000 }
         "#,
     )
     .expect("openai-kind slots have no budget/headroom coupling");
@@ -790,7 +791,7 @@ fn out_of_range_sampling_is_a_loud_error() {
     let err = Config::from_toml_str(
         r#"
         [casts.x]
-        synth = { backend = "openai", id = "m", temperature = 3.0 }
+        synth = { backend = "openai-local", id = "m", temperature = 3.0 }
         "#,
     )
     .unwrap_err();
@@ -1281,8 +1282,8 @@ fn the_shipped_example_config_parses() {
 fn a_bare_slot_carries_no_pins_or_tunables() {
     // `ModelSlot::bare` is the shape a per-call model override produces: the new
     // id classifies fresh, so no pin or tunable from the old slot may ride along.
-    let slot = ModelSlot::bare("openai", "some-model");
-    assert_eq!(slot.qualified(), "openai/some-model");
+    let slot = ModelSlot::bare("openai-local", "some-model");
+    assert_eq!(slot.qualified(), "openai-local/some-model");
     assert_eq!(slot.vision, None);
     assert_eq!(slot.max_tokens, None);
     assert_eq!(slot.thinking_budget, None);
@@ -1551,7 +1552,7 @@ fn a_slot_carries_a_per_model_preamble() {
     let c = Config::from_toml_str(
         r#"
         [casts.team]
-        explorer = { backend = "openai", id = "Gemma-4-E4B-it", preamble = "You are a careful reader." }
+        explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "You are a careful reader." }
         synth = "anthropic/claude-sonnet-4-6"
         "#,
     )

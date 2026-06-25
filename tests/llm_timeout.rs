@@ -43,14 +43,14 @@ async fn oneshot_aborts_when_the_provider_never_responds() {
     // deadline so the test is quick but the mechanism is the production one.
     let cfg = Config::builtin();
     let mut backend = cfg
-        .resolve_backend("openai")
+        .resolve_backend("openai-local")
         .expect("built-in openai backend")
         .clone();
     backend.base_url = Some(base_url);
     backend.key_optional = true;
     backend.request_timeout = Duration::from_secs(2);
 
-    let cast = cfg.resolve_cast("openai").expect("built-in openai cast");
+    let cast = cfg.resolve_cast("openai-local").expect("built-in openai cast");
     let slot = cast
         .require_slot(ModelRole::Synth)
         .expect("openai cast has a synth slot");

@@ -69,7 +69,7 @@ Connection knobs only — models never live here:
   path) — this is what lets any number of openai-kind backends (hosted GPT, two
   local llama.cpp servers, an image server) be live at once, each its own name.
   A *new* openai-kind backend must set it: the `OPENAI_BASE_URL`/local-default
-  fallback belongs to the built-in `openai` backend alone, so a forgotten
+  fallback belongs to the built-in `openai-local` backend alone, so a forgotten
   `base_url` is a load error, not a silent dial of the wrong server. For the
   keyed kinds rig fixes the endpoint, so a `base_url` there is a config error,
   surfaced loudly — not silently ignored.
@@ -124,12 +124,13 @@ image    = "sd/sdxl-turbo"                  # image gen stays local
 
 # table form: id + capability pins + per-slot tunables
 # synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
-# explorer = { backend = "openai", id = "Gemma-4-E4B-it", preamble = "..." }  # per-model prompt
+# explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }  # per-model prompt
 ```
 
 - **Known roles:** `explorer`, `synth`, `image`, `tts`. A typo'd role (or a typo'd
   per-slot knob) is a loud load error, not a silent no-op. A cast may omit roles —
-  built-ins always carry explorer+synth; a user cast that omits one is valid
+  the four interactive built-ins carry explorer+synth, the batch built-ins carry
+  synth only; a user cast that omits a role is valid
   config, and the tool that needs the missing role fails loudly *at call time*,
   naming the gap ("cast `tts-box` has no synth slot"). Absent = capability absent.
   (Nothing consumes `image`/`tts` yet; they land with the production builtins.
@@ -202,27 +203,36 @@ The `[defaults]` knobs themselves:
 
 Four backends and four same-named single-backend casts ship **in code** and
 reproduce kaibo's historical behavior exactly, so a **missing config file is not
-an error**. One extra built-in cast ships too — `gemini-batch`, a Gemini cast whose
-synth is Pro, for the offline batch lane (see `batch_submit`). The TOML *merges over* this registry by name: set one field on a
-built-in to retarget it, or add brand-new backends and casts. The built-in alias
-names register at **both** levels — as cast aliases (so `cast = "claude"`
-resolves) and backend aliases (so a slot ref `claude/<id>` resolves) — and are
-reserved: naming a new backend or cast after one is a loud collision error.
+an error**. Two extra built-in casts ship for the offline batch lane —
+`gemini-batch` (synth Gemini Pro) and `anthropic-batch` (synth Claude Opus). Both
+declare `batch = true`, which staffs `batch_submit` *only*: the interactive tools
+(`consult`/`oneshot`) refuse a batch cast, and `batch_submit` refuses a non-batch
+cast, so a big offline-tuned model is never run interactively by accident (and vice
+versa). A batch cast carries **synth only** (batch is toolless) and its synth must
+sit on a batch-capable backend (Anthropic or Gemini) — declaring `batch = true`
+elsewhere is a loud load error. The TOML *merges over* this registry by name: set
+one field on a built-in to retarget it (the `batch` flag is sticky — retuning
+`gemini-batch`'s model leaves it batch), or add brand-new backends and casts. The
+built-in alias names register at **both** levels — as cast aliases (so
+`cast = "claude"` resolves) and backend aliases (so a slot ref `claude/<id>`
+resolves) — and are reserved: naming a new backend or cast after one is a loud
+collision error.
 
 | backend | kind | base_url | key env / file | aliases |
 |---|---|---|---|---|
 | `anthropic` | anthropic | — | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
 | `deepseek` | deepseek | — | `DEEPSEEK_API_KEY` / `~/.deepseek-key` | — |
 | `gemini` | gemini | — | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
-| `openai` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
+| `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
 
-| cast | explorer | synth |
-|---|---|---|
-| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` |
-| `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` |
-| `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` |
-| `gemini-batch` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-pro-latest` |
-| `openai` | `openai/Gemma-4-E4B-it-GGUF` | `openai/Gemma-4-26B-A4B-it-GGUF` |
+| cast | explorer | synth | batch |
+|---|---|---|---|
+| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
+| `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` | |
+| `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
+| `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
+| `gemini-batch` | — | `gemini/gemini-pro-latest` | ✓ |
+| `anthropic-batch` | — | `anthropic/claude-opus-4-8` | ✓ |
 
 ### The chimera payoff
 
@@ -511,7 +521,7 @@ model-aware; the prose is too). The per-model knob is `preamble` on the cast's
 
 ```toml
 [casts.local]
-explorer = { backend = "openai", id = "Gemma-4-E4B-it", preamble = "You are a careful reader; quote exact lines." }
+explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "You are a careful reader; quote exact lines." }
 synth    = "anthropic/claude-sonnet-4-6"   # no per-model prompt; uses [prompts] or built-in
 ```
 

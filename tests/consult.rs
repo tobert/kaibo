@@ -580,7 +580,7 @@ fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
 
     // And the built-in `openai` cast resolves to exactly those, on the openai backend.
     let cfg = Config::builtin();
-    let cast = cfg.resolve_cast("openai").expect("built-in openai cast");
+    let cast = cfg.resolve_cast("openai-local").expect("built-in openai cast");
     let e = cast
         .require_slot(ModelRole::Explorer)
         .expect("explorer slot");
@@ -1285,8 +1285,8 @@ async fn recomposed_consult_runs_against_local_gemma() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         root,
-        &builtin_arm("openai", ModelRole::Explorer),
-        &builtin_arm("openai", ModelRole::Synth),
+        &builtin_arm("openai-local", ModelRole::Explorer),
+        &builtin_arm("openai-local", ModelRole::Synth),
         &cfg,
         None,
     )
@@ -1315,7 +1315,7 @@ async fn recomposed_consult_runs_against_local_gemma() {
 #[tokio::test]
 #[ignore = "hits the local OpenAI-compatible (Gemma) server (oneshot); run with --ignored while it's up"]
 async fn oneshot_answers_from_pasted_context() {
-    let arm = builtin_arm("openai", ModelRole::Synth);
+    let arm = builtin_arm("openai-local", ModelRole::Synth);
 
     let answer = oneshot(
         "Context: src/sandbox.rs builds a read-only kernel; the LocalFs read-only \
