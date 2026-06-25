@@ -2353,7 +2353,9 @@ kaibo carry the files. Two shapes, by tool:
 - **`consult` / `consult_submit` — named, not inlined.** The consult model has its own
   shell, so kaibo simply *names* your attached files in the investigation prompt and the
   model reads them itself (`cat -n`), in full, when it's ready. Hand it the files a
-  question centers on as a focus: `attach: [\"src/server.rs\", \"src/sandbox.rs\"]`.
+  question centers on as a focus: `attach: [\"src/server.rs\", \"src/sandbox.rs\"]`. These
+  are text files it reads with the shell — for an image, reach for `oneshot` / `batch_submit`,
+  whose `attach` carries it as a native vision part.
 - **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
   read the repo — so kaibo splices the file bytes straight into the prompt. Give them the
   *whole* file(s): `[\"README.md\", \"src/server.rs\"]`, not a snippet. Top-tier models
@@ -2424,7 +2426,8 @@ One small surface drives both kinds:
   batches section shows the last 24h (anything older is done and still collectible by its
   handle); pass `all: true` for the full history.
 - **`wait`** is how you *productively park*: submit your async work, do your other work,
-  then call `wait` to block briefly (up to `timeout_secs`, your choice) and return as soon
+  then call `wait` to block briefly (up to `timeout_secs` — your choice, to a 3600s
+  ceiling) and return as soon
   as something lands — or on a clean timeout. By default it hands back what kaibo flagged
   for you (a job finished or failed); pass `level: \"info\"` to also pull in the watchable
   narrative — each kaish command, sweep, and milestone the agents ran.
