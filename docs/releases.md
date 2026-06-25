@@ -45,10 +45,20 @@ the free GitHub-native signing/attestation layer. Specifically:
    Pro is off the table** — at $165/yr it would buy us orchestration of a build it isn't
    doing (we're native-matrix) plus notarization we can wire ourselves. If GoReleaser
    ever enters, it's the free OSS version, as a back-half channel publisher.
-4. **The ghcr container image is demoted to optional.** kaibo is a stdio MCP server that
-   operators launch as a *subprocess*; a container adds `docker run -i` + read-only-mount
-   friction that two independent reviewers called actively hostile for this shape. If we
-   ship it, the friction gets documented loudly and it's gated on real demand.
+4. **Ship the ghcr image as a first-class, early distribution path — not optional**
+   (decided with Amy, 2026-06-25). The reviewers' "stdio + container is hostile" objection
+   was scoped to a *host* agent hand-building `docker run -i` mounts; the **devcontainer**
+   case flips it — inside a devcontainer everything is already containerized and mounts are
+   declared in `devcontainer.json`, so a kaibo container is *idiomatic*. It also doubles as
+   an **OS-enforced containment layer beneath kaibo's own read-only sandbox** (belt and
+   suspenders): it doesn't replace the app-level boundary, it backstops it — limiting
+   blast radius if the sandbox code has a bug, and giving the operator a place to shape
+   kaibo's outbound-to-provider egress (controlled egress, *not* full isolation, or the
+   provider calls die). Non-negotiables: **multiarch** (amd64+arm64, from the per-arch
+   musl binaries we already build), **non-root by default** (`distroless:nonroot`), and
+   **documented user/volume mapping**. The real friction is *not* `-i` — it's UID/volume
+   mapping (podman `--userns=keep-id` vs docker `-u $(id -u):$(id -g)` against a read-only
+   project mount), which the configurator pass resolves (see "Container UX" below).
 
 ## Why we revised (the investigation)
 
@@ -164,14 +174,40 @@ The transparency payoff; all free, no middleman.
   --certificate-oidc-issuer …` and `gh attestation verify` invocations. Verification an
   operator can't run is theater.
 
-### PR 4 — ghcr distroless image *(optional / demoted — gated on demand)*
-Only if there's a real consumer; kaibo is stdio, so weigh it honestly.
-- Multi-arch `amd64`+`arm64` image `FROM gcr.io/distroless/static`, copying the static musl
-  binary; `COPY --chown=nonroot` / `USER nonroot`. Push to `ghcr.io/tobert/kaibo` (+`latest`).
-- Workflow gains ghcr login + `packages: write`; `cosign` signs the image too.
-- **Document the stdio friction loudly:** `docker run -i` is mandatory (silent EOF-exit
-  otherwise), and the operator must volume-mount any codebase the agent reads (read-only).
-  Smoke-test an outbound HTTPS call (TLS certs present in distroless).
+### PR 4 — ghcr distroless image (multiarch, non-root) — a first-class distribution path
+Lands *after* signing so the image is **born signed** — we don't ship an unsigned primary
+artifact.
+- **Multiarch `amd64`+`arm64`** manifest `FROM gcr.io/distroless/static:nonroot`, copying
+  the static musl binaries already built per-arch; `USER nonroot`. Push to
+  `ghcr.io/tobert/kaibo` (+`latest`); `cosign` signs the image with the PR 3 machinery.
+- Workflow gains ghcr login + `packages: write`.
+- **User/volume mapping is the core UX to document** (not `-i`): a read-only project mount +
+  UID mapping (docker `-u $(id -u):$(id -g)`, podman `--userns=keep-id`), and the
+  **devcontainer recipe** — the sweet spot, where mounts are already declared and kaibo
+  slots in as an MCP server. There is no truly zero-mount form (kaibo's job is reading your
+  code), so the documented baseline mounts cwd read-only; the configurator tailors the rest.
+- **Graceful no-stdin error**, not a silent EOF-exit 0 — the entrypoint detects a missing
+  stdin and prints a clear message (`distroless` has no shell to debug into). Smoke-test an
+  outbound HTTPS call (TLS certs present in distroless).
+
+### Container UX: the configurator / `reconfigure` pass (related host-agent workstream)
+The Docker downside is real — a verbose `docker run -i -u … -v …` line is painful to get
+right in `claude mcp add`, and iterating means a frustrating remove/re-add loop. Fix it in
+two phases: a known-good **baseline** `mcp add` (cwd mounted read-only) connects you, then a
+companion **`/reconfigure`** rewrites the *stored* MCP config **in place** for the user's
+real setup — podman vs docker, UID mapping, extra roots/worktrees, network policy,
+devcontainer nesting — which kills the re-add loop (you edit `~/.claude.json`, you don't
+re-run `mcp add`).
+
+**Where it lives matters for the invariants:** kaibo is read-only and runs no external
+commands, so it **cannot** write `~/.claude.json` or run docker itself. So `reconfigure` is
+a **host-agent skill / a kaibo-provided MCP *prompt***: kaibo *advises* (it already knows
+the roots/mounts it needs and exposes them via `kaibo://config`, so it can hand the agent
+the exact `-v` flags), and the host agent *acts* (edits the config with its own tools). That
+split keeps kaibo's stdio/read-only invariants intact. A tiny generated `kaibo-docker`
+wrapper script is an alternative the configurator could emit (point `mcp add` at the wrapper,
+iterate the wrapper, not the stored command). This is a distribution-UX workstream that
+rides alongside PR 4, not release-pipeline YAML.
 
 ### PR 5 — channels (Homebrew first), gated on demand
 - **Pre-req (external):** create the `tobert/homebrew-kaibo` tap repo + a token with access.
@@ -205,8 +241,13 @@ reference for the signing/attestation layer other projects lack:
 
 ## Open decisions
 
-- **Docker (PR 4): keep / demote / drop.** Leaning *demote-or-drop* — two reviewers judged a
-  container a poor fit for a subprocess-launched stdio server. Final call before PR 4.
+- **Docker — RESOLVED (2026-06-25, with Amy): keep & promote** to a first-class, early
+  distribution path (multiarch, non-root default, devcontainer-friendly). See decision 4 and
+  PR 4.
+- **Configurator / `reconfigure` ownership & scope** — a kaibo MCP prompt, a Claude Code
+  skill, or both? How much does it auto-detect (podman/devcontainer/UID) vs. ask? It edits a
+  sensitive file (`~/.claude.json`) with the *host agent's* tools (kaibo can't), so consent/
+  safety shape it. Design when PR 4's container UX is real.
 - **How many channels?** Few (a brew tap) → hand-roll, no GoReleaser. Many (brew+scoop+winget+nfpm)
   → bring in GoReleaser-OSS as the back-half. Decide when demand is real, not now.
 - **macOS signing timeline** — notarization needs the $99/yr Apple account; decide when a
