@@ -2,9 +2,9 @@
 
 解剖（かいぼう）ships as a single static-ish binary per platform. This document is the
 *living* plan for how we build and publish those binaries — the sequence of PRs that
-gets us from "a workflow that has never fired" to "signed, attested, multi-channel
-releases an agent operator can trust." Update it as PRs land; it is the durable map the
-conversation can't reconstruct.
+gets us from "a workflow that has never fired" to "signed, attested releases an agent
+operator can trust." Update it as PRs land; it is the durable map the conversation
+can't reconstruct.
 
 > **Gating note.** This whole pipeline is **parked behind the pre-1.0 work** — kaibo is
 > not ready for a public release yet, and we will not cut `v*` tags in anger until that
@@ -16,199 +16,198 @@ conversation can't reconstruct.
 
 ## Where we are now
 
-`.github/workflows/release.yml` already exists: a hand-rolled 6-target matrix (musl
-static via `cargo-zigbuild`, native macOS/Windows), `tar.gz`/`zip` packaging, sha256
-sidecars, and a `softprops/action-gh-release` publish on a `v*` tag. **It has never
-fired.** It is a good baseline — the static-musl + ring/no-aws-lc groundwork is real —
-but it does no Docker, no signing, no package channels, and it pins its actions by
+`.github/workflows/release.yml` already exists: a hand-rolled 6-target matrix that
+builds **natively per platform** — Linux `x86_64`/`aarch64` musl (fully static via
+`cargo-zigbuild`), macOS `x86_64`/`aarch64` (native `cargo build` on `macos-latest`),
+Windows `x86_64` MSVC (native, `+crt-static`) — then packages `tar.gz`/`zip`, writes
+sha256 sidecars, and publishes on a `v*` tag. **It has never fired.** It is a good
+baseline (the static-musl + ring/no-aws-lc groundwork is real), but it does no signing,
+no provenance, no container image, no package channels, and it pins its actions by
 floating tag.
 
-## The decisions (2026-06-25, with Amy)
+## The decisions (settled 2026-06-25, with Amy)
 
-1. **Adopt GoReleaser.** Replace the hand-rolled matrix with a `.goreleaser.yml` driven
-   by `goreleaser-action`. Amy has run GoReleaser on `otel-cli` (Go) for years, so the
-   `.goreleaser` shape, ghcr `dockers`/`docker_manifests`, and `brews` tap pattern are
-   familiar — kaibo reuses those patterns rather than inventing them. One config
-   collapses build + archive + checksum + changelog + release, and unlocks
-   Homebrew/Scoop/Winget, Docker, and signing as additive blocks.
-2. **Container images on `ghcr.io`, distroless base.** Same OIDC/`GITHUB_TOKEN` trust
-   path as the repo, no Docker Hub account or pull-rate tax. Base
-   `gcr.io/distroless/static` (CA certs / tzdata / nonroot user available if the stdio
-   process ever needs them), multi-arch `amd64`+`arm64` via `docker_manifests` — mirrors
-   the `otel-cli` ghcr layout.
-3. **Sigstore keyless signing + SLSA provenance.** `cosign` keyless (OIDC, *no
-   long-lived key to manage or leak*) over the archives, checksums, and image, plus
-   GitHub build-provenance attestation. This is new ground — `otel-cli` has no `signs:`
-   block — and it is the concrete payoff of staying on public CI (see "Why public CI").
+The short version: **stay OSS and GitHub-native; do not adopt a release framework for
+capability we already have.** The spine is the *existing native matrix*, hardened, plus
+the free GitHub-native signing/attestation layer. Specifically:
 
-## Why GoReleaser, and the one thing Go never made us face
+1. **Keep the native matrix on GitHub-hosted runners.** Each platform builds on its own
+   runner (native macOS, native Windows MSVC, Linux musl via zigbuild). Because we build
+   natively, there is **no cross-compile** — so no Apple-SDK hack, and **Windows stays
+   MSVC** (no ABI change, no invariant to reword). GitHub-hosted runners are fine; no
+   self-hosted runner needed.
+2. **Transparency payoff via GitHub-native tooling, no middleman:** `cosign` **keyless**
+   signing (OIDC, no long-lived key to leak), **SLSA build provenance** via
+   `actions/attest-build-provenance` (free, GitHub-native), and an **SBOM** via `syft`.
+   None of this needs a release framework or a paid service.
+3. **GoReleaser is optional, OSS-only, and later.** Reach for it *only if* package-manager
+   channel fan-out (Homebrew + Scoop + Winget + nfpm) grows into real toil. **GoReleaser
+   Pro is off the table** — at $165/yr it would buy us orchestration of a build it isn't
+   doing (we're native-matrix) plus notarization we can wire ourselves. If GoReleaser
+   ever enters, it's the free OSS version, as a back-half channel publisher.
+4. **The ghcr container image is demoted to optional.** kaibo is a stdio MCP server that
+   operators launch as a *subprocess*; a container adds `docker run -i` + read-only-mount
+   friction that two independent reviewers called actively hostile for this shape. If we
+   ship it, the friction gets documented loudly and it's gated on real demand.
 
-GoReleaser's **Rust builder** (`builder: rust`, since v2.5) defaults to `cargo-zigbuild`
-— the *same* toolchain the current workflow already uses for musl. So the build engine
-doesn't change; GoReleaser just orchestrates it and everything downstream.
+## Why we revised (the investigation)
 
-The gotcha: **`cargo-zigbuild` can target `windows-gnu` but not `windows-msvc`** (zig
-links its bundled MinGW-w64, not MSVC). `otel-cli` cross-compiles MSVC-free Windows
-trivially *because it's Go*; Rust+zig cannot. GoReleaser's OSS path builds every target
-on **one Linux runner** (multi-runner "split & merge" is a **Pro** feature), so the
-coherent OSS choice is to cross-compile all targets from Linux:
+Earlier the same day we had chosen "adopt GoReleaser, single Linux runner." Two findings
+flipped it; recording them so the reversal isn't mysterious later:
 
-| Target | How | Notes |
-| --- | --- | --- |
-| `x86_64-unknown-linux-musl` | zigbuild | fully static (`not a dynamic executable`) |
-| `aarch64-unknown-linux-musl` | zigbuild | fully static |
-| `x86_64-apple-darwin` | zigbuild cross | builds unsigned; notarization deferred |
-| `aarch64-apple-darwin` | zigbuild cross | builds unsigned; notarization deferred |
-| `x86_64-pc-windows-gnu` | zigbuild cross | **was `-msvc`** — see invariant change below |
+- **The macOS cross-compile that justified GoReleaser doesn't work for us.** GoReleaser's
+  headline value is its cross-compile matrix (zigbuild every target from one runner). But
+  `cargo-zigbuild` can't link an Apple-`darwin` target from Linux without the proprietary
+  Apple SDK (zig can't bundle it — Apple's EULA), and kaibo specifically pulls
+  `rustls-platform-verifier` → `security-framework`/`core-foundation`, which FFI into
+  Apple frameworks. So macOS *must* build on a real Mac — which is exactly where
+  GoReleaser stops building anything and becomes pure orchestration of archive/checksum/
+  release steps we already have in ~10 lines of bash. We'd carry a framework for the one
+  feature we can't use.
+- **There is no service to outsource this to, and the reason is structural.** The most
+  serious venture swing at "release engineering as a service" — **axo (axodotdev)**, Ashley
+  Williams, VC-backed, 2022 — built exactly this (cargo-dist + hosted release pages +
+  updater + analytics) and wound down; `axo.dev` is now a parked domain and the tool
+  (`dist`) survives only community-maintained. The market keeps re-converging on
+  OSS-tool-on-your-CI (GoReleaser, JReleaser, dist). *Why* the SaaS starves: the **build**
+  needs your runners/toolchain, the **signing** needs *your* identity (a service holding
+  it is the supply-chain single-point-of-trust the security-conscious refuse — Sigstore's
+  keyless design exists precisely to avoid a key-holding middleman), and the **publish**
+  step is thin git PRs. What's left to bill for is hosted pages + analytics — nice, not
+  need. So **free OSS + GitHub-native is the industry equilibrium, and it happens to align
+  exactly with kaibo's transparency/no-middleman values.**
+- **A cross-family review hardened the specifics** (Gemini batch + DeepSeek consult, run
+  *through kaibo's own tools* — dogfooding the review). Their validated findings are folded
+  into the PRs below.
 
-**This cross-compile-from-one-runner is only feasible because of the TLS invariant**
-(rustls + ring, no aws-lc-sys / no OpenSSL): a C-free tree is what lets zig link
-darwin/windows-gnu without an MSVC install or a fragile aws-lc cross-build. The
-invariant we already hold is what makes the cheap path possible.
+## Why public CI, hardened (not local builds)
 
-### Invariant change this forces (do not skip)
+Amy's instinct was that *no* public CI keeps kaibo off the radar of botnets hunting CI to
+attack, and that local builds might feel more honest. The analysis landed the other way;
+recording it so we don't reopen it:
 
-The CLAUDE.md **Build & release** section currently says *"Windows statically links the
-CRT via `+crt-static`"* (MSVC). Moving to `cargo-zigbuild` makes that **`x86_64-pc-
-windows-gnu`, statically linked against zig's bundled MinGW-w64.** The PR that lands the
-GoReleaser build (PR 2 below) must reword that bullet and the `.cargo/config.toml`
-note. For a CLI/MCP binary the gnu ABI is a non-issue; we trade the MSVC ABI for a
-single-runner OSS build. *(Open question — see below — is whether keeping MSVC + native
-runners is worth GoReleaser Pro. Default answer: no.)*
-
-## The deferred paid toll (no tool removes these)
-
-- **macOS notarization** — needs a Mac + an Apple Developer account ($99/yr). Until
-  then macOS binaries are *unsigned*: a Homebrew-tap install is fine (not quarantined),
-  but a direct download trips Gatekeeper (`xattr -d com.apple.quarantine`). Document
-  honestly; revisit when a public release justifies the cost.
-- **Windows Authenticode** — needs a code-signing cert ($). Until then the `.exe` is
-  unsigned (SmartScreen friction). Same posture: document, defer.
-
-Both are *automatable* by GoReleaser when we choose to pay; they're a cost decision, not
-a tooling gap.
-
-## Why public CI (and not local builds)
-
-Amy's instinct was that *no* public CI keeps kaibo off the radar of botnets hunting CI
-to attack, and that local builds might feel more honest. The analysis landed the other
-way, and it's worth recording so we don't reopen it:
-
-- The mass-attack vectors hunt for workflows that run on **fork PRs** (free-runner
-  crypto-mining) or that leak **long-lived secrets**. A **tag-only + `workflow_dispatch`**
-  release workflow with **no PAT** dodges both by shape.
+- Mass-attack vectors hunt for workflows that run on **fork PRs** (free-runner mining) or
+  leak **long-lived secrets**. A **tag-only + `workflow_dispatch`** release workflow with
+  **no PAT** dodges both by shape.
 - The real residual risk is a **compromised third-party action** (cf. the
   `tj-actions/changed-files` incident). Mitigation is cheap: **pin every `uses:` to a
-  commit SHA**, which every PR below does.
-- **Local builds fight the transparency goal.** A public CI log is a third-party-
-  witnessed, reproducible record; a laptop is an opaque box whose provenance is "Amy
-  says so." The modern answer to "why trust this binary" is **keyless provenance
-  attestation**, which is only cheaply attainable from public CI with OIDC — local
-  builds *structurally cannot* produce it. So public CI, hardened, maximizes
-  transparency **and** minimizes realistic attack surface; going dark trades the goal
-  for obscurity.
-- If hardware control is ever the itch, a **self-hosted runner** scratches it without
-  losing the public workflow — but for a tag-only release the GitHub-hosted runners
-  cost nothing and carry less surface. Not planned.
+  commit SHA** (PR 2).
+- **Local builds fight the transparency goal.** A public CI log is a third-party-witnessed,
+  reproducible record; a laptop is an opaque box whose provenance is "Amy says so." The
+  modern answer to "why trust this binary" is **keyless provenance attestation**, only
+  cheaply attainable from public CI with OIDC — local builds *structurally cannot* produce
+  it. So public CI, hardened, maximizes transparency **and** minimizes realistic attack
+  surface.
+
+## Cross-family review findings (folded into the PRs)
+
+Validated and actionable, with their home PR:
+
+- **"C-free" is imprecise** (both reviewers). `ring` *does* compile C/asm (via `cc` /
+  `zig cc`); the tree is free of *cmake/autotools/OpenSSL/aws-lc system-C*, not free of C.
+  Tighten the wording in `release.yml` comments and the CLAUDE.md **Build & release** /
+  **TLS** lines when PR 2/3 touches them. (No behavior change — the invariant holds; `cargo
+  tree -i aws-lc-rs` stays empty.)
+- **cosign keyless `verify-blob` fails without identity flags** (Gemini). A bare verify
+  *cannot* work for keyless — PR 3 docs must show the exact
+  `--certificate-identity "...release.yml@refs/tags/vX.Y.Z"` +
+  `--certificate-oidc-issuer "https://token.actions.githubusercontent.com"`. Signing nobody
+  can verify is theater.
+- **Add an SBOM** (Gemini). `syft` → SPDX/CycloneDX alongside the signatures (PR 3). For a
+  security-minded operator, "what's in it" is arguably more useful than "where it was built."
+- **Reproducible archives** (Gemini). Set `mod_timestamp`/`SOURCE_DATE_EPOCH` from the commit
+  date so the `tar.gz` is byte-stable (PR 2).
+- **Linking ≠ running** (DeepSeek). The validation gate must *run* each built binary
+  (`kaibo --version`) per target, not just `ldd`/`file` — a binary can link and still crash
+  at startup. The native matrix already exercises each platform on its own runner, which is
+  the right place to add the smoke run (PR 2).
+- **Distroless TLS cert smoke test** (DeepSeek). `rustls-native-certs`/`openssl-probe` should
+  find `/etc/ssl/certs/ca-certificates.crt` in `distroless/static` (it bundles CAs), with
+  `webpki-root-certs` as the bundled fallback — but smoke-test an outbound HTTPS call in the
+  image (PR 4).
+- **Homebrew tap is a blocking external prereq** (DeepSeek). `tobert/homebrew-kaibo` must
+  exist before PR 5 — a pre-PR-5 checklist item, not buried in prose.
+- **Container `-i` is a silent failure mode** (both). Without stdin attached, the MCP server
+  gets immediate EOF and exits 0 — the hardest failure to debug, and `distroless/static` has
+  no shell to `docker exec` into. Document prominently (PR 4).
 
 ---
 
 ## The PR sequence
 
 Each PR lands on its own branch in a **git worktree** (Amy's workflow for this series),
-goes up as a PR, gets a **cross-family review** (a different model lineage than wrote
-it), and updates `CHANGELOG.md` where user-facing. They're ordered lowest-coupling
-first; signing comes after the artifacts exist; channels (which need external repos)
-come last.
-
-> **Pre-flight (not a PR):** fire the *existing* `release.yml` once via
-> `workflow_dispatch` to confirm the current matrix still produces good binaries — a
-> known-good baseline before GoReleaser's complexity. If it's already untrusted, skip
-> straight to PR 2 and validate there with `goreleaser release --snapshot --clean`.
+goes up as a PR, gets a **cross-family review**, and updates `CHANGELOG.md` where
+user-facing. Ordered lowest-coupling first; signing after artifacts exist; channels last.
 
 ### PR 1 — this document
-The living plan itself (`docs/releases.md`). Settles the decisions above. No pipeline
-change. *(You are reading the artifact.)*
+The living plan itself (`docs/releases.md`) + a `docs/issues.md` pointer. Settles the
+decisions above. No pipeline change. *(You are reading the artifact.)*
 
-### PR 2 — GoReleaser core: build + archive + checksum + release
-The foundation everything hangs off.
-- Add `.goreleaser.yml` (`version: 2`, `builder: rust`, the 5 targets above), `archives`
-  (`tar.gz`; `zip` override for windows), `checksum`, `changelog`.
-- Replace the hand-rolled matrix in `release.yml` with a thin `goreleaser-action`
-  workflow — **SHA-pinned** actions, keep `tags: ["v*"]` + `workflow_dispatch`, minimal
-  `permissions`. Install rust + zig + `cargo-zigbuild` in the job (GoReleaser does *not*
-  install them; it does run `rustup target add`).
-- **Reword the CLAUDE.md Windows invariant** (`-msvc` → `-gnu`) and the `.cargo/config.toml`
-  note.
-- **Validation gate:** `goreleaser release --snapshot --clean` builds all 5 targets
-  locally; confirm the musl binary is `not a dynamic executable` (`ldd`), the macOS
-  cross-link succeeds (ring-only/no-aws-lc is what lets it), and the windows-gnu `.exe`
-  is produced. `cargo tree -i aws-lc-rs` stays empty.
-- Cross-family review (build/release surface — a real look, not a glance).
+### PR 2 — harden & extend the existing native matrix
+No framework, no ABI change — sharpen what's already there.
+- **SHA-pin every `uses:`** to a commit digest (the `tj-actions` lesson); confirm minimal
+  `permissions` and keep `tags: ["v*"]` + `workflow_dispatch`.
+- **Add a `--version` smoke run** per target on its native runner (linking ≠ running), and
+  **`mod_timestamp`** from the commit date for reproducible archives.
+- Tighten the **"C-free" wording** in the workflow comments (and CLAUDE.md if touched).
+- **Validation gate:** the matrix already builds all six natively; confirm the musl binary
+  is `not a dynamic executable` (`ldd`) and `cargo tree -i aws-lc-rs` is empty.
+- Cross-family review (release surface — a real look).
 
-### PR 3 — ghcr distroless multi-arch image
-- `dockers:` (amd64 + arm64) + `docker_manifests:` → `ghcr.io/tobert/kaibo:<tag>` and
-  `:latest`, mirroring the `otel-cli` layout. `release/Dockerfile` `FROM
-  gcr.io/distroless/static` copying the static musl binary.
-- Workflow gains ghcr login + `packages: write`.
-- Document the **stdio caveat** in the image usage (`docker run -i ...`): the image is
-  for a pinned, pullable env, not a long-running service (kaibo never binds a socket).
+### PR 3 — keyless signing + SLSA provenance + SBOM (GitHub-native)
+The transparency payoff; all free, no middleman.
+- `cosign` **keyless** signing (`cosign-installer`) over the archives + checksums.
+- **SLSA build provenance** via `actions/attest-build-provenance`; add `id-token: write`
+  + `attestations: write`.
+- **SBOM** via `syft` (SPDX/CycloneDX), attached to the release.
+- **Document verification** in the README — the exact `cosign verify-blob --certificate-identity …
+  --certificate-oidc-issuer …` and `gh attestation verify` invocations. Verification an
+  operator can't run is theater.
 
-### PR 4 — Sigstore keyless signing + SLSA provenance
-The transparency payoff; new ground vs. otel-cli.
-- `signs:` (cosign keyless, `cosign-installer`) over checksums + artifacts; `docker_signs:`
-  for the image.
-- GitHub build-provenance attestation (`actions/attest-build-provenance`); add
-  `id-token: write` + `attestations: write`.
-- Document verification (`cosign verify-blob` / `gh attestation verify`) in the README so
-  an operator can actually check it — signing nobody verifies is theater.
+### PR 4 — ghcr distroless image *(optional / demoted — gated on demand)*
+Only if there's a real consumer; kaibo is stdio, so weigh it honestly.
+- Multi-arch `amd64`+`arm64` image `FROM gcr.io/distroless/static`, copying the static musl
+  binary; `COPY --chown=nonroot` / `USER nonroot`. Push to `ghcr.io/tobert/kaibo` (+`latest`).
+- Workflow gains ghcr login + `packages: write`; `cosign` signs the image too.
+- **Document the stdio friction loudly:** `docker run -i` is mandatory (silent EOF-exit
+  otherwise), and the operator must volume-mount any codebase the agent reads (read-only).
+  Smoke-test an outbound HTTPS call (TLS certs present in distroless).
 
-### PR 5 — Homebrew tap
-- `brews:` → `tobert/homebrew-kaibo` tap (mirror otel-cli: `url_template`, `repository`,
-  `skip_upload: "auto"` so prerelease tags don't publish). Requires creating the tap repo
-  and a token with access.
-- *(Optional, fold-or-defer:)* `nfpms:` (deb/rpm/apk) as otel-cli does — kaibo is niche,
-  so gate on whether anyone wants distro packages.
-
-### PR 6 — Windows channels: Scoop + Winget
-Additive, lowest priority (smallest audience). Winget also needs an external PR to
-`microsoft/winget-pkgs`. Land only if Windows demand is real.
+### PR 5 — channels (Homebrew first), gated on demand
+- **Pre-req (external):** create the `tobert/homebrew-kaibo` tap repo + a token with access.
+- A Homebrew formula push (a small action, or a hand-rolled step). **This is the one place
+  GoReleaser-OSS earns its keep** — if/when we want brew **and** Scoop **and** Winget **and**
+  nfpm, its declarative, correct-by-construction channel blocks beat hand-rolling each. Reach
+  for it *here, OSS-only*, not as the spine. Until channels multiply, hand-roll the one tap.
 
 ### Deferred decisions (own PRs when the cost is justified)
-- **macOS notarization** — Apple Developer account + a Mac runner (or GoReleaser Pro
-  split to a native macOS runner). Cost decision.
-- **Windows Authenticode** — code-signing cert. Cost decision.
+- **macOS notarization** — Apple Developer account ($99/yr) for the cert; we already build on
+  a Mac runner, so the notarization step is scriptable (or a GoReleaser-OSS `notarize` block
+  if it's in by then). Until then macOS binaries are unsigned: a Homebrew-tap install is fine,
+  a direct download trips Gatekeeper (`xattr -d com.apple.quarantine`).
+- **Windows Authenticode** — a code-signing cert ($). Until then the `.exe` is unsigned
+  (SmartScreen friction). MSVC-native (our path) is *less* AV-hostile than a MinGW/gnu build
+  would have been, but unsigned is still unsigned.
 
 ---
 
 ## Future: reuse this pipeline elsewhere
 
-If this pipeline works out, Amy wants to bring the modern bits to other projects. The
-broadly *reusable* parts are the **signing + provenance attestation, distroless base,
-and ghcr hardening** patterns — kaibo becomes the reference for the signing/attestation
-layer those projects don't have yet. The **build** layer does *not* generalize, and the
-reason is exactly the `windows-gnu` constraint kaibo accepts:
-
-- **otel-cli (Go).** Go cross-compiles native Windows MSVC-free, so it stays on the
-  Pro-free native-cross path and keeps its existing nfpms/brew/docker blocks. It just
-  gains the signing/attestation layer.
-- **winit / GUI projects (Rust).** These are the case kaibo's cheap path *can't* be
-  copied onto. winit drags in the Windows desktop/graphics stack (`windows-rs`, wgpu,
-  DirectX), which is **MSVC-centric** — `windows-gnu` is nominally a target but the
-  ecosystem assumes msvc, so `cargo-zigbuild`'s gnu-only Windows build won't serve them.
-  That is precisely where **GoReleaser Pro split-and-merge** (or a dedicated native
-  `windows-msvc` runner job) earns its cost. Don't copy kaibo's one-runner gnu build
-  onto a winit app and expect it to link.
+The broadly *reusable* part is the **GitHub-native signing + SLSA provenance + SBOM layer**
+— it's language-agnostic and bolts onto any tag-triggered workflow. kaibo becomes the
+reference for the signing/attestation layer other projects lack:
+- **otel-cli (Go)** already runs GoReleaser-OSS; it just gains the `cosign`/attestation/SBOM
+  layer.
+- **winit / GUI projects (Rust)** — a native-matrix spine generalizes to them fine (native
+  Windows runners build MSVC, which the Windows graphics stack — `windows-rs`/wgpu/DirectX —
+  needs). The only thing that *wouldn't* have generalized was the abandoned single-runner
+  zigbuild-cross path (gnu-only Windows); since we're native-matrix, that concern is moot.
 
 ## Open decisions
 
-- **Windows ABI — RESOLVED for kaibo (2026-06-25, with Amy): `windows-gnu`.** One OSS
-  runner, no Pro, no MSVC. Fine for a CLI/MCP binary, and Pro's cost would only buy the
-  MSVC ABI + native notarization we're deferring anyway. *This resolution is
-  kaibo-specific* — winit/GUI Rust projects need MSVC (see "reuse this pipeline
-  elsewhere"), so the decision does not carry to them.
-- **Drop a platform?** kaibo's audience is agent-operator dev machines — Linux + macOS
-  are the weight; Windows is nonzero but small. We keep all five for now; if windows-gnu
-  cross-compile proves fragile, dropping Windows (or moving it to nfpms/brew only) is on
-  the table.
-- **nfpms in PR 5 or skip?** Gate on real demand for distro packages.
+- **Docker (PR 4): keep / demote / drop.** Leaning *demote-or-drop* — two reviewers judged a
+  container a poor fit for a subprocess-launched stdio server. Final call before PR 4.
+- **How many channels?** Few (a brew tap) → hand-roll, no GoReleaser. Many (brew+scoop+winget+nfpm)
+  → bring in GoReleaser-OSS as the back-half. Decide when demand is real, not now.
+- **macOS signing timeline** — notarization needs the $99/yr Apple account; decide when a
+  public release makes Gatekeeper friction worth paying down.
