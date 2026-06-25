@@ -20,8 +20,24 @@ the git log. Each later release appends a new section at the top.
   family answers with `cast`. Optionally seed it with `context` (a change summary or
   pasted source), trusted as starting evidence while it investigates for more. The
   answer carries a provenance footer naming the cast and the models that produced it.
-  Args: `question`, `context`, `path`, `cast`, `session_id`, `include_report`, and
-  per-call `explorer_model` / `synth_model` (+ `_backend`) overrides.
+  Args: `question`, `context`, `path`, `cast`, `session_id`, `attach`, `include_report`,
+  and per-call `explorer_model` / `synth_model` (+ `_backend`) overrides. **`attach`**
+  names workspace files (under the project root) to put in front of the investigation —
+  unlike the tool-less tools' attach, kaibo does *not* inline them; it names them in the
+  prompt and the consult model reads them itself with the shell when it's ready, in full,
+  building its own narrative. "Review this diff" is `attach: ["changes.diff"]` with no
+  paste; the files just have to live under the root the consult reads (a worktree counts).
+- **`consult_submit`** — the *async sibling* of `consult` (as batch is to `oneshot`):
+  start a consultation in the background and get back a handle (`job-N`) instead of
+  holding your turn open while a deep investigation runs. Same investigation, same args
+  as `consult`. Built for running several consults at once — a cross-model study submits
+  one per `cast` and collects them all — or for not blocking on a long answer: submit, go
+  do other work, collect later. Jobs are in-memory and live only for the server session
+  (no restart survival), evicted by capacity like sessions. Replaces the pattern of
+  spawning a throwaway sub-agent just to hold a blocking `consult` open. On completion a
+  job emits a soft notification on the MCP logging channel (a clue for a client watching
+  the log stream) — advisory only, since no MCP primitive wakes the calling agent;
+  collecting by handle stays the contract.
 - **`oneshot`** — a thin, direct second opinion from a model outside your family:
   prompt in, answer out, no codebase access and no tools, exactly one upstream
   request. The counterpart to `consult` for when you already own the context (you've
@@ -39,10 +55,10 @@ the git log. Each later release appends a new section at the top.
   `gpt-image` / DALL·E, or a local Stable-Diffusion server). Its `cast` parameter
   advertises the casts that actually carry a usable image slot as a schema enum, so a
   host agent picks one off the schema — as discoverable as the consultation tools.
-- **Batch (`batch_submit` / `batch_get` / `batch_cancel` / `batch_list`)** — the
-  *offline, async sibling* of `oneshot`: submit a list of tool-less prompts, get a
-  handle, poll it, read every answer when the provider's batch lane finishes — no call
-  held open per answer. Built for fanning many prompts (or one hard question you'll wait on) at a
+- **Batch (`batch_submit`)** — the *offline, async sibling* of `oneshot`: submit a list
+  of tool-less prompts, get a handle, then collect it with the shared `get`/`cancel`/
+  `list` verbs (see below) — read every answer when the provider's batch lane finishes,
+  no call held open per answer. Built for fanning many prompts (or one hard question you'll wait on) at a
   top-tier model: it maxes the knobs (forces high thinking effort + a generous token
   budget) regardless of how the cast was tuned for interactive use, and a per-call
   `model`/`backend` override lets you batch a Pro/Opus tier a cast otherwise synths
@@ -55,8 +71,8 @@ the git log. Each later release appends a new section at the top.
   its latency is free. Gated by `--no-batch` (one flag over every verb). Batch carries its
   own system preamble fit to the offline lane — one complete, self-contained response with
   no follow-up, told to spend on depth — overridable via `[prompts].batch` like the other
-  phases. While a batch runs, `batch_get` reminds you to go do other work and check back
-  rather than wait on it. Lost a handle? `batch_list` re-discovers the batches a backend
+  phases. While a batch runs, `get` reminds you to go do other work and check back
+  rather than wait on it. Lost a handle? `list` re-discovers the batches a backend
   still holds (newest first, each with its handle, status, and progress), so a batch is
   never orphaned — defaulting across every batch-capable backend, or scoped to one with
   `backend`. **`attach`** lets you name workspace files to inline as shared context for
@@ -66,6 +82,35 @@ the git log. Each later release appends a new section at the top.
   (with a vision-capable synth model). Paths obey the same workspace boundary as
   everything else (worktrees included); a file outside it, a directory, an oversized
   file, or a binary that isn't a known image is refused with a clear error.
+- **`wait`** — block briefly and productively for your async work instead of
+  blind-polling `get`. Fire off consults and batches, do your other work, then `wait`
+  when you're ready to spend a minute on kaibo: it blocks up to `timeout_secs` (you
+  choose — no clamp; interruptible) and returns as soon as something lands, or on a clean
+  timeout. By default it hands back what kaibo flags as worth your attention (a job
+  finished/failed, a research-limit) plus which consult jobs are still running; pass
+  `level: "info"` to also pull the watchable narrative — each kaish command, sweep, and
+  milestone the agents ran — into your context. Name batch handles in `handles` to fold a
+  one-shot poll of them in too. Nothing wakes you (you choose when to block) and it isn't
+  the source of truth — `get`/`list` are; a clean empty return just means nothing new yet.
+  This pairs with launching work in parallel: submit several, do everything else, then
+  `wait` to merge the outputs.
+- **Async consults are watchable again.** A `consult_submit` job now streams its liveness
+  (each kaish command, sweep, and milestone) onto kaibo's logging channel — the live
+  "watch it work" view a synchronous `consult` always had, restored for the async path.
+  It rides kaibo's level convention (Info = the narrative; Warn = "the calling model
+  should see this"), so a watching client sees the show and `wait` pulls the salient bits.
+- **`get` / `cancel` / `list`** — one shared surface to collect, stop, and survey
+  *both* kinds of async work, told apart by the handle: a batch handle is
+  `backend/provider-id`, a consult job is `job-N`. `get <handle>` returns a progress/
+  status line while the work runs and the full result when it lands; `cancel <handle>`
+  stops it; `list` shows everything in flight — your in-memory consult jobs plus the
+  batches each backend still holds — each with a ready-to-use handle. One mental model
+  for everything you submit. The verbs stay available as long as either `consult` or
+  batch is enabled (gated off only when both are). `list` trims its batch section to the
+  **last 24 hours** by default — a provider keeps months of finished batches and dumping
+  them all just burns tokens, while anything older is done and still collectible by its
+  handle; it reports how many it hid and takes `all: true` for the full history (true
+  orphan recovery). Consult jobs are always shown in full.
 - **`view_image`** — vision-capable consultation phases can read an image *file* from
   the workspace into model context (screenshots, diagrams, assets already in the tree).
 - **Multi-provider model teams.** Anthropic, DeepSeek, and Gemini natively, plus a

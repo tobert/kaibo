@@ -29,15 +29,18 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, ModelRole, ModelSlot};
-use crate::consult::{consult, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides};
+use crate::consult::{
+    consult, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides,
+};
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
 use crate::image_gen::ImageGen;
+use crate::jobs::{CancelOutcome, JobResult, JobSnapshot, JobState, JobStore};
 use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
 use crate::mcp_log;
-use crate::progress::{NullSink, PhaseEvent, ProgressSink};
+use crate::progress::{NullSink, PhaseEvent, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::SessionStore;
 
@@ -182,6 +185,31 @@ pub struct ConsultInput {
     /// (an empty report is itself the signal that the consult delegated no sweep).
     #[serde(default)]
     pub include_report: bool,
+
+    /// Workspace files to put in front of the investigation — absolute or relative
+    /// (relative reads from the project root) paths that must live **under the project
+    /// root** so the consult can reach them through its read-only shell. Unlike
+    /// `oneshot`/`batch` attach, kaibo does **not** inline these — it names them in the
+    /// investigation prompt and the consult model reads them itself (`cat -n`) when it's
+    /// ready, in full, building its own narrative. Use it to hand the consult a focus —
+    /// "review this diff" with `["changes.diff"]` (write it under the repo first), or the
+    /// specific files a question centers on — without pasting their bytes into your
+    /// context. A path outside the root, a directory, or a missing file is a clear error.
+    #[serde(default)]
+    pub attach: Vec<String>,
+}
+
+/// Arguments to the unified `get` / `cancel` tools: one handle that addresses either
+/// kind of async work. See [`ConsultInput`] for the `deny_unknown_fields` rationale.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandleInput {
+    /// The handle of the async work to act on. Two shapes, told apart by the `/`:
+    /// a **batch** handle from `batch_submit` is `backend/provider-id` (e.g.
+    /// `anthropic/msgbatch_…`, durable — survives a restart); a **consult** handle from
+    /// `consult_submit` is `job-N` (e.g. `job-1`, in-memory — lives only for this server
+    /// session). kaibo routes by the handle, so you pass the same one you were given.
+    pub handle: String,
 }
 
 /// Arguments to the `oneshot` tool. See [`ConsultInput`] for the
@@ -275,25 +303,57 @@ pub struct BatchSubmitInput {
     pub backend: Option<String>,
 }
 
-/// Arguments to `batch_list`: an optional backend to scope the listing to.
+/// Arguments to the unified `list`: an optional backend to scope the *batch* portion
+/// of the listing to. Live consult jobs (in-memory, not backend-bound) are always
+/// listed regardless.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct BatchListInput {
+pub struct ListInput {
     /// Which backend (name or alias) to list batches from. Omit to list across every
     /// configured batch-capable backend — the orphan-recovery default when you've lost a
-    /// handle and don't recall which backend ran it.
+    /// handle and don't recall which backend ran it. Does not affect the consult-jobs
+    /// section, which is always shown.
     #[serde(default)]
     pub backend: Option<String>,
+
+    /// Show *all* batches, including ones created more than 24h ago. By default the
+    /// batches section is trimmed to the last 24 hours (a provider keeps months of
+    /// finished batches, and dumping them all just burns tokens — the offline SLA is
+    /// ≤24h, so anything older is done and still collectible by its handle). Set
+    /// `all: true` for the full history — true orphan recovery of an old batch. A batch
+    /// kaibo can't date (no timestamp) is always shown, never silently hidden.
+    #[serde(default)]
+    pub all: bool,
 }
 
-/// Arguments to `batch_get` / `batch_cancel`: the opaque handle `batch_submit`
-/// returned (`"backend/provider-id"`).
+/// Arguments to the `wait` tool. See [`ConsultInput`] for the `deny_unknown_fields`
+/// rationale.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct BatchHandleInput {
-    /// The batch handle kaibo returned from `batch_submit` (e.g.
-    /// `anthropic/msgbatch_…`). kaibo holds no state — the handle is the whole address.
-    pub batch_id: String,
+pub struct WaitInput {
+    /// How long to block, in seconds (default 60). You choose — kaibo does not clamp it;
+    /// your client's own tool-call timeout and your ability to interrupt are the real
+    /// bounds. For a very long park, prefer calling `wait` again each time it returns
+    /// over one giant block. A value over 3600 is a loud error, not a silent trim.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    /// Max records to return (default 20, newest activity last).
+    #[serde(default)]
+    pub limit: Option<usize>,
+
+    /// The lowest level to return to you: `warn` (default — what kaibo flags as "the
+    /// calling model should see this": a job finished or failed, a research-limit), `info`
+    /// (also the watchable narrative — each kaish command, sweep, milestone), `error`, or
+    /// `debug` (the firehose). Not severity — `warn` is the salience bar, not a problem.
+    #[serde(default)]
+    pub level: Option<String>,
+
+    /// Optional handles to also check this call: a batch handle (`backend/provider-id`)
+    /// is polled once and its current status appended (consult jobs already surface via
+    /// the activity stream). Omit to just drain the activity stream + see running jobs.
+    #[serde(default)]
+    pub handles: Vec<String>,
 }
 
 /// Arguments to the `run_kaish` tool. See [`ConsultInput`] for the
@@ -328,6 +388,16 @@ pub struct KaiboHandler {
     /// Multi-turn `consult` sessions. Internally an `Arc<Mutex<_>>`, so the
     /// per-request handler clones all share one cache (see [`SessionStore`]).
     sessions: SessionStore,
+    /// In-flight + collectable async consultations (`consult_submit`, collected via the
+    /// shared `get`/`cancel`/`list`). Same `Arc<Mutex<LruCache>>` shape as `sessions`, so
+    /// the per-request handler clones all share one registry (see [`JobStore`]).
+    jobs: JobStore,
+    /// The pull-side notification ring the `wait` tool drains — the same kaibo-target
+    /// records the `mcp_log` bridge streams to the client, teed for on-demand pull.
+    /// `new` seeds an unwired default (nothing pushes to it); `main` swaps in the shared
+    /// ring via [`with_notifications`](Self::with_notifications) so the bridge layer feeds
+    /// it. `Clone` shares one ring (see [`NotificationBuffer`](crate::mcp_log::NotificationBuffer)).
+    notifications: crate::mcp_log::NotificationBuffer,
     /// The client's MCP log floor (a [`mcp_log::rank`]), written by `logging/setLevel`
     /// and read by the log-drain task. `Arc<AtomicU8>` so every per-request handler
     /// clone — and the drain task in `main` — share the one cell; a `setLevel` on any
@@ -409,14 +479,25 @@ impl KaiboHandler {
         // exists before dropping it — a stale name is a build-time bug we want loud.
         for (enabled, name) in [
             (gating.consult, "consult"),
+            // `consult_submit` is the async sibling of `consult` — same capability, a
+            // submit/collect surface rather than a blocking one — so it shares the
+            // `consult` gate. (docs/issues.md tracks a dedicated flag if anyone needs
+            // only one shape.) The verbs that *collect* its handles (`get`/`cancel`/
+            // `list`) are shared with batch and gated below.
+            (gating.consult, "consult_submit"),
             (gating.oneshot, "oneshot"),
             (gating.run_kaish, "run_kaish"),
             (gating.generate_image, "generate_image"),
-            // One `--no-batch` flag drops all batch routes together.
+            // `--no-batch` drops `batch_submit`; the shared collect verbs live below.
             (gating.batch, "batch_submit"),
-            (gating.batch, "batch_get"),
-            (gating.batch, "batch_cancel"),
-            (gating.batch, "batch_list"),
+            // `get`/`cancel`/`list` manage *both* batch and consult handles, so they
+            // stay as long as *either* capability is on, and drop only when both are
+            // gated off. Routing by handle shape inside each verb refuses a handle whose
+            // own capability is disabled.
+            (gating.batch || gating.consult, "get"),
+            (gating.batch || gating.consult, "cancel"),
+            (gating.batch || gating.consult, "list"),
+            (gating.batch || gating.consult, "wait"),
         ] {
             if !enabled {
                 assert!(
@@ -495,7 +576,11 @@ impl KaiboHandler {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        inject_cast_enum(&mut tool_router, &["consult", "oneshot"], &usable);
+        inject_cast_enum(
+            &mut tool_router,
+            &["consult", "consult_submit", "oneshot"],
+            &usable,
+        );
         // `generate_image` selects the `image` slot, not explorer/synth, so its menu is
         // a different filter — casts with a usable image slot, not `usable_casts`. Same
         // advisory enum so image gen is as discoverable as consultation.
@@ -503,16 +588,33 @@ impl KaiboHandler {
         inject_cast_enum(&mut tool_router, &["generate_image"], &image_casts);
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
+        // Async-consult jobs reuse the session capacity for now — both are diskless,
+        // client-keyed, capacity-LRU registries. (docs/issues.md tracks giving jobs
+        // their own `job_capacity` knob.)
+        let jobs = JobStore::new(config.defaults.session_capacity);
         Ok(Self {
             config: Arc::new(config),
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
+            jobs,
+            // An unwired default — nothing pushes to it until `main` swaps in the shared
+            // ring the bridge layer feeds (see `with_notifications`). So a handler built
+            // for a test has a valid, empty buffer and `wait` simply drains nothing.
+            notifications: crate::mcp_log::NotificationBuffer::new(512),
             mcp_log_level: Arc::new(AtomicU8::new(mcp_log::rank(mcp_log::DEFAULT_LEVEL))),
             allowed_set: Arc::new(allowed),
             default_root: Arc::new(default_root),
             default_root_inferred,
         })
+    }
+
+    /// Swap in the shared notification ring `main` also handed the bridge layer, so the
+    /// `wait` tool drains the records the layer pushes. A builder (not a `new` param) to
+    /// keep `new(config)` unchanged for the many call sites and tests.
+    pub fn with_notifications(mut self, buffer: crate::mcp_log::NotificationBuffer) -> Self {
+        self.notifications = buffer;
+        self
     }
 
     /// A handle to the shared MCP log floor, for the drain task in `main` to read.
@@ -662,7 +764,11 @@ impl KaiboHandler {
     /// widening knobs. Used wherever [`contained`](Self::contained) says no, so the
     /// caller always learns where the edge is and how to move it.
     fn containment_error(&self, raw: &std::path::Path, canon: &std::path::Path) -> McpError {
-        let trees: Vec<String> = self.allowed_set.iter().map(|p| p.display().to_string()).collect();
+        let trees: Vec<String> = self
+            .allowed_set
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         McpError::invalid_params(
             format!(
                 "path {} resolves to {}, which is outside the allowed set [{}]. \
@@ -677,6 +783,66 @@ impl KaiboHandler {
             ),
             None,
         )
+    }
+
+    /// Validate caller-named `consult` attachments and return them as **root-relative
+    /// paths the model reads itself** — no bytes are read here, unlike
+    /// [`resolve_attachments`](Self::resolve_attachments), which inlines for the tool-less
+    /// tools. Each path must canonicalize to a regular file *under the consult's `root`*,
+    /// because the consult reads it through a kaish worker rooted there; an out-of-root
+    /// path is refused with guidance. The returned relative paths are what the model
+    /// `cat`s and what [`consult_user_prompt`](crate::consult::consult_user_prompt) names
+    /// in the driver prompt — deferring the IO to the model's own reads.
+    fn resolve_consult_attachments(
+        root: &std::path::Path,
+        attach: &[String],
+    ) -> Result<Vec<String>, McpError> {
+        let mut out = Vec::with_capacity(attach.len());
+        for p in attach {
+            let raw = std::path::PathBuf::from(p);
+            // A relative path reads from the project root (where the model's shell starts).
+            let joined = if raw.is_absolute() {
+                raw.clone()
+            } else {
+                root.join(&raw)
+            };
+            let canon = std::fs::canonicalize(&joined).map_err(|e| {
+                McpError::invalid_params(
+                    format!("attached file {} could not be resolved: {e}", raw.display()),
+                    None,
+                )
+            })?;
+            let meta = std::fs::metadata(&canon).map_err(|e| {
+                McpError::invalid_params(
+                    format!("attached file {} could not be read: {e}", canon.display()),
+                    None,
+                )
+            })?;
+            if !meta.is_file() {
+                return Err(McpError::invalid_params(
+                    format!("attached file {} is not a regular file", canon.display()),
+                    None,
+                ));
+            }
+            // Must be under the consult's root — the tree its read-only shell is mounted
+            // at, so anything outside it the model simply can't `cat`. (oneshot/batch
+            // attach inline from anywhere in the allowed set; consult reads in situ.)
+            let rel = canon.strip_prefix(root).map_err(|_| {
+                McpError::invalid_params(
+                    format!(
+                        "attached file {} resolves outside the project root {} — consult \
+                         reads attachments through its shell, so they must live under the \
+                         project. Paste it into `context`, or use `oneshot`/`batch` attach \
+                         (which inline a file from anywhere in the allowed set).",
+                        raw.display(),
+                        root.display(),
+                    ),
+                    None,
+                )
+            })?;
+            out.push(rel.display().to_string());
+        }
+        Ok(out)
     }
 
     /// Refuse image attachments to a vision-blind model, naming the cast so the caller
@@ -809,8 +975,8 @@ impl KaiboHandler {
             // Read *through the VFS* rooted at the containing tree — see the doc-comment.
             // A swapped escaping symlink is refused at the mount, not read through.
             if !workers.contains_key(&tree) {
-                let worker = KaishWorker::spawn_with(&tree, self.config.sandbox.clone())
-                    .map_err(|e| {
+                let worker =
+                    KaishWorker::spawn_with(&tree, self.config.sandbox.clone()).map_err(|e| {
                         McpError::internal_error(
                             format!("attachment reader for {}: {e:#}", tree.display()),
                             None,
@@ -833,7 +999,6 @@ impl KaiboHandler {
         }
         Ok(out)
     }
-
 
     /// The worktrees the follow feature currently admits *beyond* the static allowed
     /// set — for the `kaibo://config` runtime section, so the live boundary stays
@@ -1054,10 +1219,13 @@ impl KaiboHandler {
             (optional; a change summary or pasted source to seed the investigation — \
             trusted as starting evidence), path (project dir; optional if the server \
             has a default root), cast (optional), session_id (optional; opaque \
-            conversation key), include_report (optional; attach the explorer's report \
-            as structured_content for debugging the hand-off), and optional \
-            explorer_model / synth_model overrides (a model id, sent verbatim; add \
-            explorer_backend / synth_backend to retarget the slot's backend). For a \
+            conversation key), attach (optional; workspace files under the project root \
+            to put in front of the investigation — kaibo names them and the model reads \
+            them itself with the shell, no inlining, so 'review this diff' is \
+            attach:[\"changes.diff\"] with no paste), include_report (optional; attach \
+            the explorer's report as structured_content for debugging the hand-off), and \
+            optional explorer_model / synth_model overrides (a model id, sent verbatim; \
+            add explorer_backend / synth_backend to retarget the slot's backend). For a \
             thin answer with no codebase access, use `oneshot` instead."
     )]
     async fn consult(
@@ -1102,6 +1270,9 @@ impl KaiboHandler {
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
+            // Validated to live under `root` (the model reads them via its shell); not
+            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
+            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -1153,6 +1324,125 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Start a `consult` in the background and get back a job id to \
+            collect later — the async sibling of `consult`, the way `batch_submit` is to \
+            `oneshot`. Same investigation (a capable model drives the read-only kaish \
+            shell, reads spans, delegates sweeps, answers with `file:line` citations), \
+            same args as `consult` (question, context, path, cast, session_id, attach, \
+            include_report, model/backend overrides) — it just hands back a handle \
+            instead of holding your turn open while it thinks. Reach for it to run \
+            several consults at once (a cross-model study: submit one per cast, collect \
+            them all) or when a deep consult would otherwise block you: submit, go do \
+            other work, then `get <job-id>` for the answer. Stop one early with \
+            `cancel <job-id>`; see everything in flight with `list`. Returns a job id like \
+            `job-1`; the job lives for this server session only (no restart survival — \
+            collect it before you reconnect). For an answer right now in one call, use \
+            `consult`."
+    )]
+    async fn consult_submit(
+        &self,
+        Parameters(input): Parameters<ConsultInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.resolve_root(input.path)?;
+        // Resolve cast + per-call overrides + arms exactly as `consult` does — all the
+        // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
+        // so a bad submit is a clean error, not a job that fails on poll.
+        let mut cast = self.resolve_cast(input.cast)?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            input.explorer_model.as_deref(),
+            input.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            input.synth_model.as_deref(),
+            input.synth_backend.as_deref(),
+            "synth_model",
+            "synth_backend",
+        )?;
+        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        let synth = self.arm(&cast, ModelRole::Synth)?;
+        let defaults = &self.config.defaults;
+        let cfg = ConsultConfig {
+            explorer_max_turns: input
+                .explorer_max_turns
+                .unwrap_or(defaults.explorer_max_turns),
+            synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
+            sandbox: self.config.sandbox.clone(),
+            // An async job has no live MCP peer to push progress notifications to, so
+            // route its liveness onto the `tracing` stream: the `mcp_log` bridge mirrors
+            // it to a watching client (the live view sync `consult` had) and the
+            // notification buffer tees it for `wait`. See [`TracingSink`].
+            progress: Arc::new(TracingSink),
+            house_rules: self.house_rules(&root)?,
+            prompts: self.resolved_prompts(&cast),
+            orientation: self.orientation(&root).await?,
+            // Validated to live under `root` (the model reads them via its shell); not
+            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
+            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
+        };
+
+        // Owned captures for the `'static` spawned task. The session store is `Clone`
+        // (an `Arc` inside), so the task holds its own handle and rebuilds the borrow
+        // (`&store, &id`) inside the async block where both live.
+        let question = input.question.clone();
+        let context = input.context.clone();
+        let sessions = self.sessions.clone();
+        let session_id = input.session_id.clone();
+        let include_report = input.include_report;
+        let cast_name = cast.name.clone();
+        let explorer_model = explorer.model.clone();
+        let synth_model = synth.model.clone();
+        let label =
+            format!("cast `{cast_name}` (explorer `{explorer_model}`, synth `{synth_model}`)");
+
+        let job_id = self.jobs.submit(label, async move {
+            let session = session_id.as_ref().map(|id| (&sessions, id.as_str()));
+            match consult(
+                &question,
+                context.as_deref(),
+                root,
+                &explorer,
+                &synth,
+                &cfg,
+                session,
+            )
+            .await
+            {
+                Ok(out) => {
+                    let answer = with_provenance(
+                        out.answer,
+                        &cast_name,
+                        &[
+                            ("explorer", explorer_model.as_str()),
+                            ("synth", synth_model.as_str()),
+                        ],
+                    );
+                    Ok(JobResult {
+                        answer,
+                        report: include_report.then_some(out.report),
+                    })
+                }
+                // Render the failure to its final text here (classification + guidance),
+                // so `get` wraps a ready string without re-deriving anything.
+                Err(e) => Err(consultation_failure_text("consult", &cast_name, e)),
+            }
+        });
+
+        let msg = format!(
+            "Submitted consultation `{job_id}` on cast `{}`. It runs in the \
+             background — go do other work and `get {job_id}` for the answer; \
+             `cancel {job_id}` stops it. Nothing to wait on now.",
+            cast.name
+        );
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
         description = "Ask a model *outside your own family* a thin, direct question \
             — prompt in, answer out, no codebase access and no tools. The counterpart \
             to `consult`: use `oneshot` when you already own the context (you've pasted \
@@ -1193,10 +1483,12 @@ impl KaiboHandler {
             synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
             progress: progress.clone(),
-            // oneshot reads no project: no house rules, no repo map, no shell.
+            // oneshot reads no project: no house rules, no repo map, no shell — and no
+            // consult-style attachments (it inlines its `attach` files via `oneshot()`).
             house_rules: None,
             prompts: self.resolved_prompts(&cast),
             orientation: None,
+            attachments: Vec::new(),
         };
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
@@ -1353,7 +1645,7 @@ impl KaiboHandler {
         crate::batch::poller(backend).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
     }
 
-    /// The set of backend names `batch_list` should query. An explicit `backend` scopes
+    /// The set of backend names `list` should query. An explicit `backend` scopes
     /// to that one (resolved by name/alias, and refused loudly if its kind has no batch
     /// lane). Omitted, it's every configured batch-capable backend, sorted — the orphan-
     /// recovery default. No batch-capable backend at all is a clear parameter error, not an
@@ -1409,12 +1701,13 @@ impl KaiboHandler {
             get a clear refusal naming the batch-capable backends). `kaibo://config` lists \
             the casts. Args: prompts (required, a list), cast \
             (optional), model + backend (optional synth override — handy to batch a \
-            Pro/Opus tier a cast synths cheaper interactively). Returns a handle; poll \
-            it with `batch_get`, stop it with `batch_cancel`. This is a fire-and-forget \
+            Pro/Opus tier a cast synths cheaper interactively). Returns a handle \
+            (`backend/provider-id`); poll it with `get <handle>`, stop it with \
+            `cancel <handle>`, find a lost one with `list`. This is a fire-and-forget \
             lane: submit, then go do other work — don't sit in a wait/sleep loop holding \
             your turn open. A batch can take minutes to hours (the provider's offline \
             SLA is up to 24h), and the handle is durable — it survives a server restart \
-            — so come back and `batch_get` later rather than blocking on it now."
+            — so come back and `get` it later rather than blocking on it now."
     )]
     pub async fn batch_submit(
         &self,
@@ -1478,8 +1771,8 @@ impl KaiboHandler {
         let handle = format!("{backend_name}/{provider_id}");
         let msg = format!(
             "Submitted batch `{handle}` — {} prompt(s) on cast `{}` (model `{}`). \
-             Poll it with `batch_get` (it'll show progress, then per-item answers when \
-             done); stop it with `batch_cancel`.",
+             Poll it with `get {handle}` (it'll show progress, then per-item answers when \
+             done); stop it with `cancel {handle}`.",
             items.len(),
             cast.name,
             model
@@ -1488,103 +1781,343 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Poll a batch by the handle `batch_submit` returned. While it runs \
-            you get a progress line; once it's done you get every item's answer (each \
-            labelled by its index), with per-item failures surfaced rather than dropped. \
-            kaibo holds no state — the handle is the whole address, so this works across \
-            a server restart. Poll occasionally, not in a tight loop: if it's still \
-            pending, go do other work and check back later rather than sleeping on it — \
-            the handle keeps, so there's no rush and nothing to lose. Args: batch_id \
-            (the handle from `batch_submit`)."
+        description = "Collect a submitted async job by its handle — the one surface for \
+            both `batch_submit` and `consult_submit`. kaibo tells the two apart by the \
+            handle: a **batch** handle is `backend/provider-id` (durable; this polls the \
+            provider, returning a progress line while it runs and every item's answer — \
+            labelled by index, per-item failures surfaced — once it's done), and a \
+            **consult** handle is `job-N` (in-memory, this session; returns a status line \
+            while it investigates, then the full grounded answer with its provenance \
+            footer, or the failure reason). Either way: collect occasionally, not in a \
+            tight loop — if it's still working, go do other work and check back; nothing \
+            is lost by waiting. Args: handle (from `batch_submit` or `consult_submit`)."
     )]
-    async fn batch_get(
+    async fn get(
         &self,
-        Parameters(input): Parameters<BatchHandleInput>,
+        Parameters(input): Parameters<HandleInput>,
     ) -> Result<CallToolResult, McpError> {
-        let (backend_name, provider_id) = parse_batch_handle(&input.batch_id)?;
-        let provider = self.batch_poller(backend_name)?;
-        let span = tracing::info_span!("batch_get", handle = %input.batch_id);
-        let poll = provider
-            .poll(provider_id)
-            .instrument(span)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        let label = format!("{backend_name} · {provider_id}");
+        if is_batch_handle(&input.handle) {
+            self.ensure_batch_enabled(&input.handle)?;
+            let (backend_name, provider_id) = parse_batch_handle(&input.handle)?;
+            let provider = self.batch_poller(backend_name)?;
+            let span = tracing::info_span!("get", handle = %input.handle);
+            let poll = provider
+                .poll(provider_id)
+                .instrument(span)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            let label = format!("{backend_name} · {provider_id}");
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::batch::render_poll(&poll, &label),
+            )]));
+        }
+        self.ensure_consult_enabled(&input.handle)?;
+        match self.jobs.get(&input.handle) {
+            Some(snap) => Ok(render_job(&input.handle, snap)),
+            None => Err(McpError::invalid_params(
+                format!(
+                    "no consultation job `{}` — it may have finished and been evicted by \
+                     newer submits, been canceled, or never existed. Consult job ids look \
+                     like `job-1` and live only for this server session.",
+                    input.handle
+                ),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        description = "Stop a running async job by its handle — works for both kinds. A \
+            **batch** handle (`backend/provider-id`) tells the provider to stop scheduling \
+            new requests (any already in flight finish); `get` it afterward for the final \
+            per-item results. A **consult** handle (`job-N`) aborts the investigation; \
+            `get` it afterward and it reports canceled. A job that already finished is \
+            left alone. Args: handle (from `batch_submit` or `consult_submit`)."
+    )]
+    async fn cancel(
+        &self,
+        Parameters(input): Parameters<HandleInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if is_batch_handle(&input.handle) {
+            self.ensure_batch_enabled(&input.handle)?;
+            let (backend_name, provider_id) = parse_batch_handle(&input.handle)?;
+            let provider = self.batch_poller(backend_name)?;
+            let span = tracing::info_span!("cancel", handle = %input.handle);
+            provider
+                .cancel(provider_id)
+                .instrument(span)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Requested cancellation of batch `{}`. `get` it for the final per-item \
+                 results.",
+                input.handle
+            ))]));
+        }
+        self.ensure_consult_enabled(&input.handle)?;
+        let msg = match self.jobs.cancel(&input.handle) {
+            CancelOutcome::Canceled => format!("Canceled consultation `{}`.", input.handle),
+            CancelOutcome::AlreadyFinished => format!(
+                "Consultation `{}` had already finished — `get` it for the answer.",
+                input.handle
+            ),
+            CancelOutcome::Unknown => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "no consultation job `{}` to cancel — it may have finished and \
+                         been evicted, or never existed.",
+                        input.handle
+                    ),
+                    None,
+                ));
+            }
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "List your async work — both the consult jobs in flight this session \
+            and the batches the providers still know about — each with a ready-to-use \
+            handle for `get` / `cancel`. The consult-jobs section is in-memory (this \
+            session only); the batches section is the way back to a batch whose handle you \
+            lost (kaibo holds no state — the provider's own list is the source of truth). \
+            By default the batches section shows only the **last 24 hours** — a provider \
+            keeps months of finished batches and listing them all just burns tokens, and \
+            anything older is done and still collectible by its handle; pass `all: true` \
+            for the full history (true orphan recovery of an old batch). `backend` scopes \
+            only the batches section (omit it to sweep every batch-capable backend); \
+            consult jobs are always shown in full. An unreachable backend is reported \
+            rather than hiding the rest. Args: backend (optional), all (optional, default \
+            false)."
+    )]
+    async fn list(
+        &self,
+        Parameters(input): Parameters<ListInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut sections: Vec<String> = Vec::new();
+
+        // Consult jobs first — in-memory, this session, always shown when consult is on.
+        if self.config.tools.consult {
+            sections.push(render_jobs_section(&self.jobs.list()));
+        }
+
+        // Batches — provider-side and durable; `backend` scopes this section only. A
+        // batch-resolution failure (no batch-capable backend, or a bad explicit
+        // `backend`) becomes a *section note*, not a hard error — so it never sinks the
+        // consult-jobs section above it. (A local-only setup with batch on but no
+        // hosted backend is the common case here.)
+        if self.config.tools.batch {
+            match self.batch_backends(input.backend.as_deref()) {
+                Ok(backends) => {
+                    let mut entries: Vec<(String, crate::batch::BatchListItem)> = Vec::new();
+                    let mut errors: Vec<(String, String)> = Vec::new();
+                    let mut truncated: Vec<String> = Vec::new();
+                    for name in backends {
+                        // One keyless or unreachable backend never sinks the whole
+                        // listing — turn its failure into a per-backend note (the
+                        // per-item-failure ethos, at the backend grain).
+                        let listed = match self.batch_poller(&name) {
+                            Ok(provider) => {
+                                let span = tracing::info_span!("list", backend = %name);
+                                provider.list().instrument(span).await
+                            }
+                            Err(e) => Err(anyhow::anyhow!("{}", e.message)),
+                        };
+                        match listed {
+                            Ok((items, has_more)) => {
+                                if has_more {
+                                    truncated.push(name.clone());
+                                }
+                                for it in items {
+                                    let handle = format!("{}/{}", name, it.provider_id);
+                                    entries.push((handle, it));
+                                }
+                            }
+                            Err(e) => errors.push((name, format!("{e:#}"))),
+                        }
+                    }
+                    // Trim to the last 24h by default — a provider keeps months of
+                    // finished batches, and dumping them all every call just burns the
+                    // caller's tokens. The SLA is ≤24h, so anything older is done and
+                    // still collectible by its handle; `all: true` shows the full history.
+                    // An undateable batch (no/garbled timestamp) is kept, never hidden.
+                    let hidden = if input.all {
+                        0
+                    } else {
+                        // Read the clock once, not once per item.
+                        let now = now_epoch_secs();
+                        let before = entries.len();
+                        entries.retain(|(_, it)| {
+                            batch_within_window(it, now, BATCH_RECENCY_WINDOW_SECS)
+                        });
+                        before - entries.len()
+                    };
+                    sections.push(crate::batch::render_list(&entries, &errors, &truncated));
+                    if hidden > 0 {
+                        sections.push(format!(
+                            "({hidden} batch(es) older than 24h hidden — `list` with \
+                             `all: true` to see the full history.)"
+                        ));
+                    }
+                }
+                Err(e) => sections.push(format!("Batches: unavailable — {}", e.message)),
+            }
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
-            crate::batch::render_poll(&poll, &label),
+            sections.join("\n\n"),
         )]))
     }
 
     #[tool(
-        description = "Cancel a running batch by its handle. The provider stops scheduling \
-            new requests; any already in flight finish. Poll with `batch_get` afterward \
-            for the final per-item results. Args: batch_id (the handle from \
-            `batch_submit`)."
+        description = "Block briefly for your async work to make progress, then return \
+            what happened — the way to *productively park* instead of blind-polling `get`. \
+            Fire off consults (`consult_submit`) and batches (`batch_submit`), do your \
+            other work (your own sub-agents included), then call `wait` when you're ready \
+            to spend a minute on kaibo: it blocks up to `timeout_secs` (you choose; no \
+            clamp — you can always interrupt) and returns as soon as something lands, or \
+            on a clean timeout. By default it hands back the records kaibo flagged for you \
+            (a job finished or failed, a research-limit) plus which consult jobs are still \
+            running; pass `level:\"info\"` to also pull the watchable narrative (each kaish \
+            command, sweep, and milestone the agents ran) into your context. Name batch \
+            handles in `handles` to fold their current status in too (kaibo polls them \
+            once). Nothing here wakes you — you choose when to block — and it's not the \
+            source of truth: `get`/`list` are. A clean empty return just means nothing new \
+            yet; `wait` again to keep parking. Args: timeout_secs (optional, default 60), \
+            limit (optional, default 20), level (optional: warn|info|error|debug), handles \
+            (optional list to also poll)."
     )]
-    async fn batch_cancel(
+    async fn wait(
         &self,
-        Parameters(input): Parameters<BatchHandleInput>,
+        Parameters(input): Parameters<WaitInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
     ) -> Result<CallToolResult, McpError> {
-        let (backend_name, provider_id) = parse_batch_handle(&input.batch_id)?;
-        let provider = self.batch_poller(backend_name)?;
-        let span = tracing::info_span!("batch_cancel", handle = %input.batch_id);
-        provider
-            .cancel(provider_id)
-            .instrument(span)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Requested cancellation of batch `{}`. Poll it with `batch_get` for the \
-             final per-item results.",
-            input.batch_id
+        // No silent clamp — a model picks its own block; only an absurd value is refused,
+        // loudly. The client's tool-call timeout and the user's interrupt are the real
+        // ceilings (see `WaitInput::timeout_secs`).
+        if let Some(t) = input.timeout_secs {
+            if t > 3600 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "timeout_secs {t} is over 3600 (1h) — pass a smaller value, or \
+                         call `wait` again each time it returns; a single block is capped \
+                         by your client's tool-call timeout anyway."
+                    ),
+                    None,
+                ));
+            }
+        }
+        let return_floor = wait_level_floor(input.level.as_deref())?;
+        let limit = input.limit.unwrap_or(20);
+        let timeout = std::time::Duration::from_secs(input.timeout_secs.unwrap_or(60));
+
+        // The live view for the *human*: while this call is open, stream the Info-level
+        // narrative (each kaish command, sweep, milestone) as `notifications/progress` on
+        // this call's token, so the client renders it in real time — the channel sync
+        // `consult` used, reopened on demand. Independent of what we *return* to the model
+        // (Warn+ by default): the human watches the show, the model gets the salient bits.
+        let info_floor = crate::mcp_log::rank(LoggingLevel::Info);
+        let token = progress_token(&meta);
+        // Drain down to whichever is lower — Info (to stream) when a token is present,
+        // else just the return floor (don't consume narrative no one is watching).
+        let drain_floor = if token.is_some() {
+            info_floor.min(return_floor)
+        } else {
+            return_floor
+        };
+        let seq = AtomicU64::new(0);
+        let records = self
+            .notifications
+            .wait_drain_with(timeout, drain_floor, return_floor, limit, |rec| {
+                // Stream Info+ to the human's progress channel; the model's return is the
+                // separate `return_floor` collection inside `wait_drain_with`.
+                if let Some(token) = &token {
+                    if crate::mcp_log::rank(rec.level) >= info_floor {
+                        let param = ProgressNotificationParam {
+                            progress_token: token.clone(),
+                            progress: seq.fetch_add(1, Ordering::Relaxed) as f64,
+                            total: None,
+                            message: Some(format!(
+                                "[{}] {}",
+                                wait_level_label(rec.level),
+                                rec.message
+                            )),
+                        };
+                        let peer = peer.clone();
+                        // Fire-and-forget, like `ProgressReporter`: don't make the drain
+                        // loop await a notification it doesn't depend on.
+                        tokio::spawn(async move {
+                            let _ = peer.notify_progress(param).await;
+                        });
+                    }
+                }
+            })
+            .await;
+
+        // Gentle batch poll: a batch is provider-side with no push, so fold in a one-shot
+        // status for any batch handle named. Non-batch handles are ignored here (consult
+        // jobs surface through the stream + the running-jobs footer).
+        let mut batch_lines = Vec::new();
+        for h in &input.handles {
+            if !is_batch_handle(h) {
+                continue;
+            }
+            // Respect batch gating, like `get`/`cancel` — don't poll a batch handle on a
+            // server that has batch turned off. A per-handle note, not a hard error: it
+            // never sinks the rest of the `wait`.
+            if let Err(e) = self.ensure_batch_enabled(h) {
+                batch_lines.push(format!("{h} — {}", e.message));
+                continue;
+            }
+            let line = match parse_batch_handle(h) {
+                Ok((backend, id)) => match self.batch_poller(backend) {
+                    Ok(provider) => match provider.poll(id).await {
+                        Ok(poll) => format!("{h} — {}", batch_poll_brief(&poll)),
+                        Err(e) => format!("{h} — poll failed: {e:#}"),
+                    },
+                    Err(e) => format!("{h} — {}", e.message),
+                },
+                Err(e) => format!("{h} — {}", e.message),
+            };
+            batch_lines.push(line);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(render_wait(
+            &records,
+            &batch_lines,
+            &self.jobs,
+            timeout,
         ))]))
     }
 
-    #[tool(
-        description = "List the batches a backend still knows about, newest first — the \
-            way back to a batch whose handle you've lost (kaibo holds no state, so the \
-            provider's own list is the source of truth). Each entry comes with its \
-            ready-to-use handle, status, and progress; feed one to `batch_get` or \
-            `batch_cancel`. Omit `backend` to list across every batch-capable backend; \
-            pass one (name or alias) to scope it. A backend that \
-            can't be reached (no key, endpoint down) is reported rather than hiding the \
-            rest, and a truncated page says so. Args: backend (optional)."
-    )]
-    async fn batch_list(
-        &self,
-        Parameters(input): Parameters<BatchListInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let backends = self.batch_backends(input.backend.as_deref())?;
-        let mut entries: Vec<(String, crate::batch::BatchListItem)> = Vec::new();
-        let mut errors: Vec<(String, String)> = Vec::new();
-        let mut truncated: Vec<String> = Vec::new();
-        for name in backends {
-            // Build the poller and list per backend, turning any failure into a
-            // per-backend note — one keyless or unreachable backend never sinks the
-            // whole listing (the per-item-failure ethos, at the backend grain).
-            let listed = match self.batch_poller(&name) {
-                Ok(provider) => {
-                    let span = tracing::info_span!("batch_list", backend = %name);
-                    provider.list().instrument(span).await
-                }
-                Err(e) => Err(anyhow::anyhow!("{}", e.message)),
-            };
-            match listed {
-                Ok((items, has_more)) => {
-                    if has_more {
-                        truncated.push(name.clone());
-                    }
-                    for it in items {
-                        let handle = format!("{}/{}", name, it.provider_id);
-                        entries.push((handle, it));
-                    }
-                }
-                Err(e) => errors.push((name, format!("{e:#}"))),
-            }
+    /// Refuse a batch-shaped handle when batch is gated off — `get`/`cancel` survive as
+    /// long as *either* capability is on, so a handle can arrive for a disabled one.
+    fn ensure_batch_enabled(&self, handle: &str) -> Result<(), McpError> {
+        if self.config.tools.batch {
+            return Ok(());
         }
-        Ok(CallToolResult::success(vec![Content::text(
-            crate::batch::render_list(&entries, &errors, &truncated),
-        )]))
+        Err(McpError::invalid_params(
+            format!(
+                "`{handle}` looks like a batch handle (`backend/id`), but batch is \
+                 disabled on this server (--no-batch)."
+            ),
+            None,
+        ))
+    }
+
+    /// Refuse a consult-job handle (`job-N`) when consult is gated off.
+    fn ensure_consult_enabled(&self, handle: &str) -> Result<(), McpError> {
+        if self.config.tools.consult {
+            return Ok(());
+        }
+        Err(McpError::invalid_params(
+            format!(
+                "`{handle}` looks like a consult job (`job-N`), but consult is disabled \
+                 on this server (--no-consult)."
+            ),
+            None,
+        ))
     }
 }
 
@@ -2424,9 +2957,9 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
     // transport layer (reqwest timeouts/resets from our own `request_timeout`).
     const TRANSIENT: &[&str] = &[
-        "overload",        // Anthropic 529 overloaded_error, Gemini
-        "rate limit",      // generic
-        "rate_limit",      // OpenAI/DeepSeek/Anthropic error `type`s
+        "overload",   // Anthropic 529 overloaded_error, Gemini
+        "rate limit", // generic
+        "rate_limit", // OpenAI/DeepSeek/Anthropic error `type`s
         "ratelimit",
         "resource_exhausted", // Gemini 429
         "too many requests",  // 429 reason phrase
@@ -2436,8 +2969,8 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
         "reset by peer",
         "connection closed",
         "broken pipe",
-        "temporarily",     // "temporarily unavailable"
-        "unavailable",     // 503 / Gemini UNAVAILABLE
+        "temporarily", // "temporarily unavailable"
+        "unavailable", // 503 / Gemini UNAVAILABLE
         "try again",
     ];
     if TRANSIENT.iter().any(|t| s.contains(t)) {
@@ -2459,6 +2992,16 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 /// errors *before* the model call — unknown cast, an attachment outside the boundary, a
 /// missing key — stay `McpError`, since those are the caller's to fix.
 fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(consultation_failure_text(
+        tool, cast, err,
+    ))])
+}
+
+/// The rendered failure text (detail + classified guidance) for a consultation that
+/// errored — the body of [`consultation_failed`], split out so the async path
+/// ([`consult_submit`]) can store a ready string in a [`JobState::Failed`] and the
+/// unified `get` wrap it without re-classifying.
+fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> String {
     let detail = format!("{err:#}");
     let guidance = match classify_failure(&err) {
         FailureKind::TransientProvider => {
@@ -2475,9 +3018,34 @@ fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolRe
              still proceed without the consultation."
         }
     };
-    CallToolResult::error(vec![Content::text(format!(
-        "{tool} could not complete (cast `{cast}`): {detail}. {guidance}"
-    ))])
+    format!("{tool} could not complete (cast `{cast}`): {detail}. {guidance}")
+}
+
+/// Render an async consultation job for the unified `get`: a status line while it runs,
+/// the grounded answer (and optional report) when it's done, the stored failure text on
+/// error, or a canceled notice. Mirrors the synchronous `consult` result shape so an
+/// agent reads the same thing whether it asked synchronously or collected a job.
+fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
+    match snap.state {
+        JobState::Running => CallToolResult::success(vec![Content::text(format!(
+            "Consultation `{id}` is still running — {} ({}s elapsed). No need to wait: go \
+             do other work and `get` it again later.",
+            snap.label,
+            snap.age.as_secs(),
+        ))]),
+        JobState::Done(result) => {
+            let include_report = result.report.is_some();
+            consult_result(
+                result.answer,
+                result.report.unwrap_or_default(),
+                include_report,
+            )
+        }
+        JobState::Failed(text) => CallToolResult::error(vec![Content::text(text)]),
+        JobState::Canceled => CallToolResult::success(vec![Content::text(format!(
+            "Consultation `{id}` was canceled."
+        ))]),
+    }
 }
 
 /// Append a one-line provenance footer naming the cast and the model(s) that
@@ -2486,6 +3054,154 @@ fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolRe
 /// `kaibo://config`, since the answering model is the whole variable. `roles` is the
 /// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
 /// Pure and offline-testable.
+/// Which kind of async work a handle addresses. A batch handle carries a `/`
+/// (`backend/provider-id`); a consult job id (`job-N`) never does, and a backend name
+/// carries no `/` either (enforced at config load), so the presence of a `/` is an
+/// unambiguous batch-vs-consult discriminator for the unified `get`/`cancel` verbs.
+fn is_batch_handle(handle: &str) -> bool {
+    handle.contains('/')
+}
+
+/// Map a `wait` `level` string to a [`mcp_log::rank`] floor. `warn` (the default) is
+/// kaibo's "the calling model should see this" bar — salience, not severity.
+fn wait_level_floor(level: Option<&str>) -> Result<u8, McpError> {
+    let l = match level.unwrap_or("warn").to_ascii_lowercase().as_str() {
+        "debug" => LoggingLevel::Debug,
+        "info" => LoggingLevel::Info,
+        "warn" | "warning" => LoggingLevel::Warning,
+        "error" => LoggingLevel::Error,
+        other => {
+            return Err(McpError::invalid_params(
+                format!("level must be one of debug|info|warn|error, got {other:?}"),
+                None,
+            ))
+        }
+    };
+    Ok(crate::mcp_log::rank(l))
+}
+
+/// A short, readable tag for a record's level in `wait` output.
+fn wait_level_label(level: LoggingLevel) -> &'static str {
+    match level {
+        LoggingLevel::Debug => "debug",
+        LoggingLevel::Info => "info",
+        LoggingLevel::Notice => "note",
+        LoggingLevel::Warning => "warn",
+        LoggingLevel::Error
+        | LoggingLevel::Critical
+        | LoggingLevel::Alert
+        | LoggingLevel::Emergency => "error",
+    }
+}
+
+/// One-line status for a batch poll, for the `wait` footer — not the full results (`get`
+/// the handle for those).
+fn batch_poll_brief(poll: &crate::batch::BatchPoll) -> String {
+    match poll {
+        crate::batch::BatchPoll::Pending { completed, total } => {
+            format!("running, {completed}/{total} done")
+        }
+        crate::batch::BatchPoll::Cancelling => "canceling".to_string(),
+        crate::batch::BatchPoll::Done(answers) => {
+            format!("complete — {} result(s); `get` it", answers.len())
+        }
+        crate::batch::BatchPoll::Failed { state, .. } => format!("ended ({state})"),
+    }
+}
+
+/// Render a `wait` result: the drained activity records (each tagged by level), any
+/// gentle batch-poll lines, and a footer naming the consult jobs still running.
+fn render_wait(
+    records: &[crate::mcp_log::LogRecord],
+    batch_lines: &[String],
+    jobs: &JobStore,
+    timeout: std::time::Duration,
+) -> String {
+    let mut s = String::new();
+    if records.is_empty() && batch_lines.is_empty() {
+        s.push_str(&format!("Nothing new in {}s.", timeout.as_secs()));
+    } else {
+        for r in records {
+            s.push_str(&format!("[{}] {}\n", wait_level_label(r.level), r.message));
+        }
+        for b in batch_lines {
+            s.push_str(b);
+            s.push('\n');
+        }
+    }
+    let running: Vec<String> = jobs
+        .list()
+        .into_iter()
+        .filter(|(_, snap)| matches!(snap.state, JobState::Running))
+        .map(|(id, _)| id)
+        .collect();
+    s.push('\n');
+    if running.is_empty() {
+        s.push_str("No consult jobs still running.");
+    } else {
+        s.push_str(&format!("Still running: {}.", running.join(", ")));
+    }
+    s.push_str(
+        " `get <handle>` to collect a finished one, `list` for the full picture, or \
+         `wait` again to keep parking.",
+    );
+    s
+}
+
+/// The default `list` recency window: 24h. A provider's offline SLA is ≤24h, so an
+/// older batch is done and still collectible by its handle — trimming it saves the
+/// caller tokens without losing anything actionable.
+const BATCH_RECENCY_WINDOW_SECS: i64 = 24 * 3600;
+
+/// Unix epoch seconds now, for the `list` recency window — read once per `list` call and
+/// passed into [`batch_within_window`], not re-read per item. A pre-epoch system clock
+/// (impossible in practice) reads as 0, which keeps everything: fail-open, never hide a
+/// batch on a clock glitch. From `SystemTime`, so chrono's `clock` feature stays off.
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Is this batch within `window_secs` of `now_epoch`? The `list` recency filter, with
+/// `now` injected so the keep/drop boundary is testable without the clock and the clock
+/// is read once per call rather than per item. A batch kaibo can't date (no or
+/// unparseable `created_at`) is kept, not silently hidden — losing sight of a batch is
+/// worse than an extra line; a future timestamp (clock skew) yields a negative age, still
+/// within the window, so also kept.
+fn batch_within_window(it: &crate::batch::BatchListItem, now_epoch: i64, window_secs: i64) -> bool {
+    match it
+        .created_at
+        .as_deref()
+        .and_then(crate::batch::rfc3339_to_epoch)
+    {
+        Some(created) => now_epoch - created <= window_secs,
+        None => true,
+    }
+}
+
+/// Render the consult-jobs section of `list`: the in-memory async consultations this
+/// session, newest-first, each with its handle and a one-line state. Empty is itself
+/// informative ("none"), so the section always renders.
+fn render_jobs_section(jobs: &[(String, JobSnapshot)]) -> String {
+    if jobs.is_empty() {
+        return "Consult jobs (this session): none.".to_string();
+    }
+    let mut s = String::from("Consult jobs (this session), newest first:");
+    for (id, snap) in jobs {
+        let state = match &snap.state {
+            JobState::Running => format!("running, {}s", snap.age.as_secs()),
+            JobState::Done(_) => "done — `get` it for the answer".to_string(),
+            JobState::Failed(_) => "failed — `get` it for the reason".to_string(),
+            JobState::Canceled => "canceled".to_string(),
+        };
+        s.push_str(&format!("\n  {id} — {} [{state}]", snap.label));
+    }
+    s.push_str("\n\nCollect one with `get <job-id>`; stop one with `cancel <job-id>`.");
+    s
+}
+
 /// Split a batch handle (`"backend/provider-id"`) the way `batch_submit` minted it.
 /// Splitting on the *first* `/` is unambiguous because a backend name carries no `/`
 /// (enforced at config load) — so the provider id keeps any slashes of its own (an
@@ -2599,6 +3315,140 @@ mod tests {
     use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
 
+    /// consult `attach` validates files are under the consult root (so the model's shell
+    /// can `cat` them) and returns them as relative paths; a file outside the root — even
+    /// a real, readable one — is refused, since the shell couldn't reach it. The root here
+    /// stands in for any tree, including a followed worktree (which `resolve_root` returns
+    /// as the root verbatim).
+    #[test]
+    fn consult_attach_keeps_under_root_relative_and_rejects_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(root_canon.join("src")).unwrap();
+        std::fs::write(root_canon.join("src/jobs.rs"), b"// in tree").unwrap();
+
+        // A relative path resolves to its root-relative form (what the model `cat`s).
+        let rel =
+            KaiboHandler::resolve_consult_attachments(&root_canon, &["src/jobs.rs".to_string()])
+                .expect("an in-tree file resolves");
+        assert_eq!(rel, vec!["src/jobs.rs".to_string()]);
+
+        // A file outside the root is refused, even though it exists and is readable.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = std::fs::canonicalize(outside.path())
+            .unwrap()
+            .join("x.diff");
+        std::fs::write(&outside_file, b"diff").unwrap();
+        let err = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            &[outside_file.display().to_string()],
+        )
+        .expect_err("an out-of-root file must be refused");
+        assert!(
+            err.message.contains("outside the project root"),
+            "the refusal names the boundary: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn wait_level_floor_parses_the_salience_words_and_rejects_junk() {
+        use crate::mcp_log::rank;
+        // Default is the Warn bar — "the calling model should see this".
+        assert_eq!(wait_level_floor(None).unwrap(), rank(LoggingLevel::Warning));
+        assert_eq!(
+            wait_level_floor(Some("info")).unwrap(),
+            rank(LoggingLevel::Info)
+        );
+        assert_eq!(
+            wait_level_floor(Some("WARN")).unwrap(),
+            rank(LoggingLevel::Warning)
+        );
+        assert_eq!(
+            wait_level_floor(Some("error")).unwrap(),
+            rank(LoggingLevel::Error)
+        );
+        assert!(
+            wait_level_floor(Some("loud")).is_err(),
+            "an unknown level is a loud error, not a silent default"
+        );
+    }
+
+    #[test]
+    fn render_wait_tags_records_and_footers_running_jobs() {
+        let jobs = JobStore::new(std::num::NonZeroUsize::new(4).unwrap());
+        let recs = vec![crate::mcp_log::LogRecord {
+            level: LoggingLevel::Warning,
+            target: "kaibo::jobs".into(),
+            message: "async job finished — collect it with `get`".into(),
+            fields: serde_json::Map::new(),
+        }];
+        let out = render_wait(&recs, &[], &jobs, std::time::Duration::from_secs(60));
+        assert!(out.contains("[warn]"), "tags the record's level: {out}");
+        assert!(
+            out.contains("async job finished"),
+            "carries the message: {out}"
+        );
+        assert!(
+            out.contains("No consult jobs still running"),
+            "footer reports none running: {out}"
+        );
+
+        // No records, no batch lines → the clean empty line, naming the wait length.
+        let empty = render_wait(&[], &[], &jobs, std::time::Duration::from_secs(30));
+        assert!(empty.contains("Nothing new in 30s"), "clean empty: {empty}");
+    }
+
+    fn batch_item(created_at: Option<&str>) -> crate::batch::BatchListItem {
+        crate::batch::BatchListItem {
+            provider_id: "id".into(),
+            status: "ended".into(),
+            completed: 1,
+            total: 1,
+            created_at: created_at.map(str::to_string),
+        }
+    }
+
+    /// The `list` recency filter's keep/drop boundary, with `now` pinned so it doesn't
+    /// depend on the wall clock. `now` = 2026-06-24T18:00:00Z (epoch 1782756000).
+    #[test]
+    fn batch_recency_window_keeps_recent_and_undateable_drops_old() {
+        let now = crate::batch::rfc3339_to_epoch("2026-06-24T18:00:00Z").unwrap();
+        let window = 24 * 3600;
+
+        // 2h old → kept.
+        assert!(batch_within_window(
+            &batch_item(Some("2026-06-24T16:00:00Z")),
+            now,
+            window
+        ));
+        // 30h old → dropped.
+        assert!(!batch_within_window(
+            &batch_item(Some("2026-06-23T12:00:00Z")),
+            now,
+            window
+        ));
+        // Exactly at the 24h edge → kept (boundary is inclusive).
+        assert!(batch_within_window(
+            &batch_item(Some("2026-06-23T18:00:00Z")),
+            now,
+            window
+        ));
+        // Undateable (no timestamp, or garbage) → kept, never silently hidden.
+        assert!(batch_within_window(&batch_item(None), now, window));
+        assert!(batch_within_window(
+            &batch_item(Some("whenever")),
+            now,
+            window
+        ));
+        // Future timestamp (clock skew) → kept.
+        assert!(batch_within_window(
+            &batch_item(Some("2026-06-25T00:00:00Z")),
+            now,
+            window
+        ));
+    }
+
     /// A small stand-in builtin set so resource rendering is offline-testable.
     fn sample_schemas() -> Vec<ToolSchema> {
         vec![
@@ -2672,7 +3522,9 @@ mod tests {
             .and_then(|p| p.get("cast"))
             .and_then(|c| c.get("enum"))
             .and_then(|e| e.as_array())
-            .unwrap_or_else(|| panic!("generate_image cast param should carry an enum:\n{schema:#?}"))
+            .unwrap_or_else(|| {
+                panic!("generate_image cast param should carry an enum:\n{schema:#?}")
+            })
             .iter()
             .filter_map(|v| v.as_str())
             .collect();

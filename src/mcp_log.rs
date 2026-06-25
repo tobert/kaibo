@@ -20,6 +20,22 @@
 //! before any layer sees them, so MCP verbosity can't exceed stderr's. Fine while
 //! the operator drives both with one filter; a per-layer filter is the upgrade if
 //! someone needs MCP-debug over an info stderr.
+//!
+//! **kaibo's level convention — audience, not severity.** Within the `kaibo` target
+//! tree, levels route a record to *who needs it*, not how dire it is:
+//! - **Error** — a real kaibo error: to the watching client, to the calling model's
+//!   `wait` drain, and to stderr.
+//! - **Warn = "the calling model should see this"** — salient/actionable (a job
+//!   finished or failed, the research budget ran out), *not* a dire warning. This is
+//!   the level `wait` returns to the model by default. Any kaibo code (and kaish, via
+//!   a future hook) marks something for the model's attention by emitting it at Warn.
+//! - **Info** — the watchable narrative: each kaish command, sweep, and milestone (see
+//!   [`TracingSink`](crate::progress::TracingSink)). The user's live "watch it work"
+//!   view; the model only pulls it into `wait` on request.
+//! - **Debug** — the true firehose, off by default.
+//!
+//! The convention is safe to assert here because [`KAIBO_TARGET`] filtering means
+//! rig/reqwest's *severity*-sense `warn!`s never reach this bridge — only kaibo's own.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -106,6 +122,150 @@ impl LogRecord {
     }
 }
 
+/// A bounded, in-memory ring of recent [`LogRecord`]s — the pull side of the bridge.
+/// The same events the [`McpBridgeLayer`] streams to a watching client are teed here so
+/// the calling model can *drain* them on demand via the `wait` tool, filtered to the
+/// level it cares about (Warn+ by default — kaibo's "the model should see this" bar).
+///
+/// Capacity-bounded (oldest dropped), per session, deliver-once: a drained record is
+/// removed. It is **not** load-bearing — `get`/`list` stay the authoritative source of a
+/// job's state; a record that ages out just means the model uses `get`. `Clone` shares
+/// one `Arc<Mutex<_>>` + `Notify`, so the layer (which pushes) and the handler (which
+/// drains) hold the same ring. The mutex is only ever held for `VecDeque` ops, never
+/// across an `.await`.
+#[derive(Clone)]
+pub struct NotificationBuffer {
+    inner: Arc<std::sync::Mutex<std::collections::VecDeque<LogRecord>>>,
+    notify: Arc<tokio::sync::Notify>,
+    cap: usize,
+}
+
+impl NotificationBuffer {
+    /// A ring holding at most `cap` records.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(cap),
+            )),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            cap,
+        }
+    }
+
+    /// Append a record, dropping the oldest if at capacity, and wake one waiter. Called
+    /// from the sync layer, so it never blocks or awaits. `notify_one` stores a permit if
+    /// no one is waiting yet, so a push that races a `wait`'s registration isn't missed.
+    fn push(&self, record: LogRecord) {
+        {
+            let mut q = self.lock();
+            if q.len() == self.cap {
+                q.pop_front();
+            }
+            q.push_back(record);
+        }
+        self.notify.notify_one();
+    }
+
+    /// Remove and return up to `limit` records at or above `floor` (a [`rank`]), oldest
+    /// first; records below `floor` stay in the ring (a later lower-floor drain, or the
+    /// cap, takes them). Deliver-once: a returned record is gone.
+    pub fn drain(&self, floor: u8, limit: usize) -> Vec<LogRecord> {
+        let mut q = self.lock();
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::with_capacity(q.len());
+        for rec in q.drain(..) {
+            if taken.len() < limit && rank(rec.level) >= floor {
+                taken.push(rec);
+            } else {
+                kept.push_back(rec);
+            }
+        }
+        *q = kept;
+        taken
+    }
+
+    /// Block up to `timeout` for records at or above `floor`, returning as soon as any
+    /// land (up to `limit`) or the deadline passes (then a final drain, possibly empty).
+    /// The clean-exit contract: never an error, never an indefinite hang.
+    pub async fn wait_drain(
+        &self,
+        timeout: std::time::Duration,
+        floor: u8,
+        limit: usize,
+    ) -> Vec<LogRecord> {
+        // The simple form: drain and return at one floor, no side-channel.
+        self.wait_drain_with(timeout, floor, floor, limit, |_| {})
+            .await
+    }
+
+    /// The streaming core behind [`wait_drain`]: drain every record at or above
+    /// `drain_floor`, hand each to `on_drained` (the `wait` tool streams the Info-level
+    /// narrative to the client's progress channel here), and *return* those at or above
+    /// `return_floor` (capped at `limit`). It blocks until a returnable record lands or
+    /// the deadline passes — so a default `wait` streams the narrative the whole time and
+    /// returns only when something the model should act on (a completion) arrives.
+    ///
+    /// `drain_floor` ≤ `return_floor`: the caller drains *down to* what it streams (Info)
+    /// while returning only the salient (Warn+). A drained-but-not-returned record is
+    /// consumed — it was delivered via `on_drained` — so the narrative isn't left to pile
+    /// up once it's been streamed.
+    pub async fn wait_drain_with<F: FnMut(&LogRecord)>(
+        &self,
+        timeout: std::time::Duration,
+        drain_floor: u8,
+        return_floor: u8,
+        limit: usize,
+        mut on_drained: F,
+    ) -> Vec<LogRecord> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut collected: Vec<LogRecord> = Vec::new();
+        loop {
+            for rec in self.drain(drain_floor, usize::MAX) {
+                on_drained(&rec);
+                if rank(rec.level) >= return_floor && collected.len() < limit {
+                    collected.push(rec);
+                }
+            }
+            if !collected.is_empty() {
+                return collected;
+            }
+            // Register the wake future *before* re-checking, so a push between the drain
+            // above and the await below leaves a permit rather than being missed.
+            let notified = self.notify.notified();
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                for rec in self.drain(drain_floor, usize::MAX) {
+                    on_drained(&rec);
+                    if rank(rec.level) >= return_floor && collected.len() < limit {
+                        collected.push(rec);
+                    }
+                }
+                return collected;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        }
+    }
+
+    /// Records currently buffered. For tests and the `wait` footer.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// True when the ring is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<LogRecord>> {
+        self.inner
+            .lock()
+            .expect("notification buffer mutex poisoned")
+    }
+}
+
 /// Collects an event's fields into a JSON map, pulling the special `message` field
 /// out as a plain string. Everything else is captured with its `Debug`/typed value
 /// so structured logging (`tracing::info!(provider = %p, …)`) survives onto the wire.
@@ -156,18 +316,33 @@ impl Visit for FieldVisitor {
 /// doesn't flood the MCP client with dependency noise.
 pub struct McpBridgeLayer {
     tx: UnboundedSender<LogRecord>,
+    /// The pull-side ring, teed alongside the push channel: the same record streamed to
+    /// the client is buffered for the `wait` tool to drain. `None` when no buffer is
+    /// wired (e.g. a test subscriber).
+    buffer: Option<NotificationBuffer>,
 }
 
 impl McpBridgeLayer {
     pub fn new(tx: UnboundedSender<LogRecord>) -> Self {
-        Self { tx }
+        Self { tx, buffer: None }
+    }
+
+    /// Tee each mirrored record into `buffer` as well as the client channel, so the
+    /// calling model can drain it via `wait`.
+    pub fn with_buffer(mut self, buffer: NotificationBuffer) -> Self {
+        self.buffer = Some(buffer);
+        self
     }
 }
 
 impl<S: Subscriber> Layer<S> for McpBridgeLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        if !meta.target().starts_with(KAIBO_TARGET) {
+        // Exactly `kaibo` or a `kaibo::` submodule — boundary-checked so a hypothetical
+        // `kaibox` target can't slip onto the bridge. (The per-layer EnvFilter already
+        // scopes to `kaibo`, so this is belt-and-suspenders.)
+        let target = meta.target();
+        if target != KAIBO_TARGET && !target.starts_with("kaibo::") {
             return;
         }
         let mut visitor = FieldVisitor::default();
@@ -178,6 +353,11 @@ impl<S: Subscriber> Layer<S> for McpBridgeLayer {
             message: visitor.message.unwrap_or_default(),
             fields: visitor.fields,
         };
+        // Tee to the pull-side ring (for `wait`) before the push channel (for the
+        // streaming client). Both are infallible/non-blocking — never panic in a log path.
+        if let Some(buffer) = &self.buffer {
+            buffer.push(record.clone());
+        }
         // A closed channel means the drain task is gone (shutdown) — drop silently;
         // there is nowhere left to deliver, and we must never panic in a log path.
         let _ = self.tx.send(record);
@@ -207,6 +387,118 @@ pub async fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(level: LoggingLevel, message: &str) -> LogRecord {
+        LogRecord {
+            level,
+            target: "kaibo::test".into(),
+            message: message.into(),
+            fields: Map::new(),
+        }
+    }
+
+    #[test]
+    fn buffer_drain_filters_by_level_and_leaves_the_rest() {
+        let buf = NotificationBuffer::new(8);
+        buf.push(rec(LoggingLevel::Info, "kaish a"));
+        buf.push(rec(LoggingLevel::Warning, "job done"));
+        buf.push(rec(LoggingLevel::Info, "kaish b"));
+
+        // Default drain at the Warn floor takes only the promote-to-model record; the
+        // Info narrative stays for a lower-floor drain.
+        let warn = buf.drain(rank(LoggingLevel::Warning), 20);
+        assert_eq!(warn.len(), 1);
+        assert_eq!(warn[0].message, "job done");
+        assert_eq!(buf.len(), 2, "the two Info records stay");
+
+        // A later Info-floor drain gets them, oldest-first.
+        let info = buf.drain(rank(LoggingLevel::Info), 20);
+        let msgs: Vec<_> = info.iter().map(|r| r.message.as_str()).collect();
+        assert_eq!(msgs, vec!["kaish a", "kaish b"]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn buffer_drops_oldest_past_capacity() {
+        let buf = NotificationBuffer::new(2);
+        buf.push(rec(LoggingLevel::Warning, "1"));
+        buf.push(rec(LoggingLevel::Warning, "2"));
+        buf.push(rec(LoggingLevel::Warning, "3")); // evicts "1"
+        let got: Vec<_> = buf
+            .drain(rank(LoggingLevel::Info), 20)
+            .into_iter()
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(got, vec!["2".to_string(), "3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn wait_drain_returns_when_a_record_lands() {
+        let buf = NotificationBuffer::new(8);
+        let pusher = buf.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            pusher.push(rec(LoggingLevel::Warning, "landed"));
+        });
+        let got = buf
+            .wait_drain(
+                std::time::Duration::from_secs(5),
+                rank(LoggingLevel::Warning),
+                20,
+            )
+            .await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message, "landed");
+    }
+
+    #[tokio::test]
+    async fn wait_drain_times_out_clean_and_empty() {
+        let buf = NotificationBuffer::new(8);
+        // Only an Info record, but we wait at the Warn floor — nothing matches, so it
+        // must time out cleanly (empty), never hang or error. A short real timeout keeps
+        // the test fast without tokio's test-util time control.
+        buf.push(rec(LoggingLevel::Info, "narrative"));
+        let got = buf
+            .wait_drain(
+                std::time::Duration::from_millis(80),
+                rank(LoggingLevel::Warning),
+                20,
+            )
+            .await;
+        assert!(got.is_empty(), "no Warn+ record ⇒ clean empty return");
+        assert_eq!(
+            buf.len(),
+            1,
+            "the unmatched Info record is left in the ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_drain_with_streams_everything_but_returns_only_the_salient() {
+        let buf = NotificationBuffer::new(8);
+        buf.push(rec(LoggingLevel::Info, "kaish a"));
+        buf.push(rec(LoggingLevel::Warning, "job done"));
+        buf.push(rec(LoggingLevel::Info, "kaish b"));
+
+        let mut streamed = Vec::new();
+        let returned = buf
+            .wait_drain_with(
+                std::time::Duration::from_secs(5),
+                rank(LoggingLevel::Info), // drain down to Info (to stream)
+                rank(LoggingLevel::Warning), // return only the Warn-bar records
+                20,
+                |r| streamed.push(r.message.clone()),
+            )
+            .await;
+
+        // The human side (on_drained) sees the whole narrative, in order…
+        assert_eq!(streamed, vec!["kaish a", "job done", "kaish b"]);
+        // …while the model's return is just the promote-to-model record.
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].message, "job done");
+        // Everything drained is consumed — the streamed narrative isn't left to pile up.
+        assert!(buf.is_empty());
+    }
 
     #[test]
     fn tracing_levels_map_to_mcp_levels() {

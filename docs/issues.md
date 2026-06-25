@@ -152,6 +152,41 @@ completes, while a pure-script spin still dies at 30s.
 
 ## P2 — Focused fixes & hardening
 
+### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
+`tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
+the handler infers it as the default root. It fails intermittently (~1 in 5 full
+`cargo test` runs) and passes in isolation and on re-run — a parallel-execution race on
+the shared process cwd, not a logic bug (untouched by the async-consult work). Fix is to
+make the test not depend on the ambient cwd — drive it through an explicit root/config
+fixture, or serialize the cwd-reading tests. Low priority; it's a test-quality issue, the
+boundary itself is sound.
+
+
+### Async consult (`consult_submit` + shared `get`/`cancel`/`list`) — follow-ups
+The async-consult surface shipped (`src/jobs.rs` `JobStore`, `consult_submit` in
+`server.rs`, the unified handle-dispatched `get`/`cancel`/`list`). Open polish:
+- **Dedicated `job_capacity` knob.** Jobs currently reuse `defaults.session_capacity`
+  for their LRU cap (`server.rs`, `JobStore::new` call). Fine for a trial — both are
+  diskless client-keyed registries — but a job result is heavier than a `QaTurn`, so a
+  separate `[defaults] job_capacity` (+ `KAIBO_JOB_CAPACITY`) is the honest knob. Mirror
+  `session_capacity`'s plumbing in `config.rs`.
+- **Progress into the job.** `consult_submit` runs on a `NullSink`, so `get` reports only
+  "running, Ns" — not sweep/turn beats. A buffering `ProgressSink` stored on the job
+  (drained by `get`) would restore the visibility a synchronous `consult` streams. Cheap,
+  high-value; the reason the subagent-wrapper pattern felt opaque.
+- **Completion notification is log-only (by necessity).** A finished job emits an `info`
+  `tracing` event onto the MCP `notifications/message` bridge (`mcp_log`). Confirmed live:
+  Claude Code does *not* surface that into the agent's loop (it's a client log/debug
+  signal), and no MCP primitive wakes the caller — so it's a clue for a human/log-watching
+  client, not a trigger. Don't build polling-avoidance on it. If a client that *does*
+  surface server notifications to its agent shows up, this already works for it.
+- **Independent gate.** The async trio shares the `--no-consult` flag; a `--no-consult-async`
+  (or splitting submit vs. blocking) is the per-tool-gate ideal if anyone wants only one
+  shape. Low priority — they're one capability.
+- **Restart survival is intentionally out of scope.** Jobs die with the session (stdio
+  lifetime = caller session), matching the subagent pattern they replace. Persisting them
+  to disk is a *different product* (kaibo-as-daemon); don't add it without that decision.
+
 ### Path containment check-then-open in `resolve_root` (the attachment half is closed)
 The attachment half **shipped**: `resolve_attachments` (`server.rs`) now reads *through the
 read-only kaish VFS* (`worker.read_file` on a `KaishWorker` rooted at the attachment's

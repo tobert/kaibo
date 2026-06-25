@@ -329,6 +329,19 @@ fn parse_list_item(v: &Value) -> Result<BatchListItem> {
     })
 }
 
+/// Parse an RFC3339 timestamp to Unix epoch seconds — the shapes our batch providers
+/// emit (Anthropic `2026-06-22T15:40:08.480837+00:00`, Gemini
+/// `2026-06-24T15:53:10.062475197Z`). `chrono` (already in the tree via kaish-kernel /
+/// rmcp / schemars) handles the offset and fractional seconds; we only *parse* with it
+/// and read "now" from `SystemTime`, so its `clock` feature stays off and no new
+/// transitive dep rides in. Returns `None` on anything it can't read, so the `list`
+/// recency filter *keeps* (never silently drops) an item it can't date.
+pub fn rfc3339_to_epoch(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
 /// Parse the list endpoint's `{ data: [...], has_more }` page into items (in the order
 /// the provider returned them — newest first) plus the `has_more` flag, so a caller
 /// learns a truncated page is truncated instead of mistaking it for the whole set.
@@ -423,7 +436,7 @@ fn parse_results_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
 pub fn render_poll(poll: &BatchPoll, label: &str) -> String {
     match poll {
         BatchPoll::Pending { completed, total } => {
-            format!("Batch in progress — {completed}/{total} requests done. No need to wait on it — go do other work and `batch_get` this id again later (it can take minutes to hours; the handle keeps).")
+            format!("Batch in progress — {completed}/{total} requests done. No need to wait on it — go do other work and `get` this handle again later (it can take minutes to hours; the handle keeps).")
         }
         BatchPoll::Cancelling => {
             "Batch is being canceled; poll again for the final per-item results.".to_string()
@@ -447,7 +460,7 @@ pub fn render_poll(poll: &BatchPoll, label: &str) -> String {
     }
 }
 
-/// Render a `batch_list` result for the calling agent. Each entry is a ready-to-use
+/// Render the batches section of `list` for the calling agent. Each entry is a ready-to-use
 /// `(handle, item)`; `errors` are per-backend failures (a backend with no key or an
 /// unreachable endpoint is reported, not silently skipped — one bad backend never
 /// hides the rest); `truncated` names backends whose page hit `has_more` (so a partial
@@ -472,7 +485,7 @@ pub fn render_list(
         }
     }
     if !entries.is_empty() {
-        s.push_str("\n\nPoll one with `batch_get <handle>`; cancel with `batch_cancel <handle>`.");
+        s.push_str("\n\nPoll one with `get <handle>`; cancel with `cancel <handle>`.");
     }
     if !truncated.is_empty() {
         s.push_str(&format!(
@@ -1108,7 +1121,7 @@ impl BatchProvider for GeminiBatch {
 // --- Dispatch --------------------------------------------------------------
 
 /// Does this provider kind have a batch lane? The single source of truth — dispatch
-/// ([`submitter`]/[`poller`]), `batch_list`'s backend filter, and refusal messages all
+/// ([`submitter`]/[`poller`]), `list`'s backend filter, and refusal messages all
 /// defer to it, so adding a provider is a one-line change here. Keep the `matches!` arm in
 /// step with the per-kind impls below.
 pub fn batch_supported(kind: ProviderKind) -> bool {
@@ -1269,6 +1282,50 @@ mod tests {
     use super::*;
     use crate::config::{Defaults, ModelSlot};
 
+    #[test]
+    fn rfc3339_epoch_known_anchors() {
+        // The Unix epoch itself, and a hand-verified anchor (2000-01-01 = 946684800).
+        assert_eq!(rfc3339_to_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00Z"), Some(946_684_800));
+    }
+
+    #[test]
+    fn rfc3339_epoch_handles_provider_shapes() {
+        // Anthropic (`+00:00`, microseconds) and Gemini (`Z`, nanoseconds) — the
+        // fraction is ignored, both are UTC, so each equals its whole-second instant.
+        assert_eq!(
+            rfc3339_to_epoch("2026-06-22T15:40:08.480837+00:00"),
+            rfc3339_to_epoch("2026-06-22T15:40:08Z"),
+        );
+        assert_eq!(
+            rfc3339_to_epoch("2026-06-24T15:53:10.062475197Z"),
+            rfc3339_to_epoch("2026-06-24T15:53:10Z"),
+        );
+    }
+
+    #[test]
+    fn rfc3339_epoch_applies_the_offset() {
+        // 01:00 at +01:00 is the same instant as 00:00 UTC — UTC = civil − offset.
+        assert_eq!(
+            rfc3339_to_epoch("2000-01-01T01:00:00+01:00"),
+            rfc3339_to_epoch("2000-01-01T00:00:00Z"),
+        );
+        // A negative offset pushes the instant later in UTC.
+        assert_eq!(
+            rfc3339_to_epoch("2000-01-01T00:00:00-05:00"),
+            Some(946_684_800 + 5 * 3600),
+        );
+    }
+
+    #[test]
+    fn rfc3339_epoch_rejects_garbage() {
+        // Unparseable input is None, so the recency filter keeps the item rather than
+        // silently dropping a batch it couldn't date.
+        assert_eq!(rfc3339_to_epoch("not-a-timestamp"), None);
+        assert_eq!(rfc3339_to_epoch("2026-06-24"), None);
+        assert_eq!(rfc3339_to_epoch(""), None);
+    }
+
     fn anthropic_backend() -> Backend {
         Backend {
             name: "anthropic".into(),
@@ -1374,8 +1431,14 @@ mod tests {
                 prompt: "second".into(),
             },
         ];
-        let body =
-            anthropic_batch_body("claude-sonnet-4-6", max_tokens, "be terse", &params, &[], &items);
+        let body = anthropic_batch_body(
+            "claude-sonnet-4-6",
+            max_tokens,
+            "be terse",
+            &params,
+            &[],
+            &items,
+        );
         let reqs = body["requests"].as_array().expect("requests array");
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0]["custom_id"], "0");
@@ -1413,14 +1476,26 @@ mod tests {
                 prompt: "and this".into(),
             },
         ];
-        let body = anthropic_batch_body("claude-sonnet-4-6", 1024, "sys", &None, &attachments, &items);
+        let body = anthropic_batch_body(
+            "claude-sonnet-4-6",
+            1024,
+            "sys",
+            &None,
+            &attachments,
+            &items,
+        );
         let content = &body["requests"][0]["params"]["messages"][0]["content"];
-        let blocks = content.as_array().expect("attachments make content a block array");
+        let blocks = content
+            .as_array()
+            .expect("attachments make content a block array");
         // [text-attachment, image-attachment, prompt]
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0]["type"], "text");
         assert!(
-            blocks[0]["text"].as_str().unwrap().contains("path=\"README.md\""),
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("path=\"README.md\""),
             "the text block wraps the file: {}",
             blocks[0]["text"]
         );
@@ -1781,7 +1856,10 @@ mod tests {
             .expect("parts array");
         assert_eq!(parts.len(), 3);
         assert!(
-            parts[0]["text"].as_str().unwrap().contains("path=\"diff.patch\""),
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("path=\"diff.patch\""),
             "the text part wraps the file: {}",
             parts[0]["text"]
         );
@@ -2016,7 +2094,10 @@ mod tests {
         let id = provider.submit("sys", &[], &items).await.unwrap();
         assert_eq!(id, "msgbatch_test");
         assert_eq!(provider.submits()[0].0, "sys");
-        assert!(provider.submits()[0].1.is_empty(), "no attachments in this flow");
+        assert!(
+            provider.submits()[0].1.is_empty(),
+            "no attachments in this flow"
+        );
         assert!(matches!(
             provider.poll(&id).await.unwrap(),
             BatchPoll::Pending { .. }

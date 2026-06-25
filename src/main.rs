@@ -85,7 +85,9 @@ struct Args {
     #[arg(long)]
     no_generate_image: bool,
 
-    /// Don't advertise the batch tools (`batch_submit`/`batch_get`/`batch_cancel`).
+    /// Don't advertise `batch_submit`. The shared `get`/`cancel`/`list` verbs remain as
+    /// long as `consult` is on (they also collect consult jobs); they drop only when both
+    /// `--no-batch` and `--no-consult` are set.
     #[arg(long)]
     no_batch: bool,
 
@@ -148,6 +150,11 @@ async fn main() -> Result<()> {
     // before then — startup — buffer here and flush when draining begins, so the
     // client sees them too.
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The pull-side ring: the bridge layer tees kaibo-target records here so the `wait`
+    // tool can drain them on demand (the same records it streams to the client). Created
+    // before the subscriber so the layer and the handler share one ring. Bounded — old
+    // records age out; it's a convenience, not the authoritative job state.
+    let notifications = mcp_log::NotificationBuffer::new(512);
     // Per-layer filters, not one global EnvFilter. The OTLP layer must see rig's
     // `rig::*` spans — the GenAI trace tree is the whole point — while stderr and
     // the MCP bridge stay scoped to the `kaibo` target. A single global filter would
@@ -171,7 +178,11 @@ async fn main() -> Result<()> {
                 .with_writer(std::io::stderr)
                 .with_filter(kaibo_filter()),
         )
-        .with(McpBridgeLayer::new(log_tx).with_filter(kaibo_filter()))
+        .with(
+            McpBridgeLayer::new(log_tx)
+                .with_buffer(notifications.clone())
+                .with_filter(kaibo_filter()),
+        )
         .init();
 
     // A zero-tool server is a misconfiguration, not a mode: refuse it loudly here,
@@ -218,7 +229,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let handler = KaiboHandler::new(config)?;
+    let handler = KaiboHandler::new(config)?.with_notifications(notifications);
     // Log the resolved (canonicalized) allowed set so the operator can verify the
     // containment boundary without inspecting config files.
     tracing::info!(

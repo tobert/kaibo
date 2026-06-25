@@ -82,6 +82,43 @@ impl ProgressSink for NullSink {
     fn emit(&self, _event: PhaseEvent) {}
 }
 
+/// A [`ProgressSink`] that maps each [`PhaseEvent`] onto kaibo's `tracing` stream under
+/// the `kaibo::consult` target. An *async* phase has no live MCP peer to push progress
+/// notifications to, so this is how it stays legible: the `mcp_log` bridge mirrors these
+/// `tracing` events to a watching client (the live "watch it work" view sync `consult`
+/// gave), and the notification ring buffer tees them for `wait`.
+///
+/// Levels follow kaibo's convention — **Warn = "promote to the calling model"**, Info =
+/// the watchable narrative — *not* severity:
+/// - `KaishRun`, the sweep events, and phase start/finish → **Info**: each shell command
+///   and milestone, the user's continuous view.
+/// - `TurnCapReached` → **Warn**: the caller should know the research budget ran out and
+///   the answer was written early, so it surfaces in the model's `wait` drain.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TracingSink;
+
+impl ProgressSink for TracingSink {
+    fn emit(&self, event: PhaseEvent) {
+        // `event.message()` is the same tidy one-liner sync consult streamed; reuse it so
+        // the two channels read identically. The level branch is the only divergence.
+        let msg = event.message();
+        if promotes_to_caller(&event) {
+            tracing::warn!(target: "kaibo::consult", "{msg}");
+        } else {
+            tracing::info!(target: "kaibo::consult", "{msg}");
+        }
+    }
+}
+
+/// Does this event clear kaibo's **Warn** bar — "the calling model should see this"? Only
+/// the research-limit beat does today (the answer was written early, which changes how a
+/// caller reads it); the rest are the Info-level narrative. Split out as a pure predicate
+/// so the convention is testable without a `tracing` subscriber (whose capture tests are
+/// flaky — see project memory).
+fn promotes_to_caller(event: &PhaseEvent) -> bool {
+    matches!(event, PhaseEvent::TurnCapReached)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +187,46 @@ mod tests {
     fn null_sink_swallows_events() {
         // No panic, no state — the no-op contract.
         NullSink.emit(PhaseEvent::SweepFinished);
+    }
+
+    /// The Warn-bar convention: only `TurnCapReached` promotes to the calling model; the
+    /// rest are the Info-level narrative. Pure predicate, so no flaky `tracing` capture.
+    #[test]
+    fn only_the_research_limit_promotes_to_the_caller() {
+        assert!(promotes_to_caller(&PhaseEvent::TurnCapReached));
+        for event in [
+            PhaseEvent::PhaseStarted { phase: "consult" },
+            PhaseEvent::PhaseFinished { phase: "consult" },
+            PhaseEvent::SweepStarted {
+                question: "q".into(),
+            },
+            PhaseEvent::SweepFinished,
+            PhaseEvent::KaishRun {
+                script: "cat -n x".into(),
+            },
+        ] {
+            assert!(
+                !promotes_to_caller(&event),
+                "{event:?} is Info-narrative, not a caller promotion"
+            );
+        }
+    }
+
+    #[test]
+    fn tracing_sink_handles_every_variant_without_panic() {
+        // The thin adapter must take every event (levels are verified live / by the pure
+        // predicate above, not by a flaky subscriber-capture test).
+        let sink = TracingSink;
+        sink.emit(PhaseEvent::PhaseStarted { phase: "consult" });
+        sink.emit(PhaseEvent::KaishRun {
+            script: "grep -rn TODO .".into(),
+        });
+        sink.emit(PhaseEvent::SweepStarted {
+            question: "where?".into(),
+        });
+        sink.emit(PhaseEvent::SweepFinished);
+        sink.emit(PhaseEvent::TurnCapReached);
+        sink.emit(PhaseEvent::PhaseFinished { phase: "consult" });
     }
 
     /// `Arc<dyn ProgressSink>` must be `Debug` (it rides inside `ConsultConfig`,

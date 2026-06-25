@@ -76,6 +76,10 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.18"
+# RFC3339 parsing for the `list` recency filter only — already in the tree (kaish-kernel
+# / rmcp / schemars). Parsing needs just `alloc`; "now" comes from `SystemTime`, so the
+# `clock` feature (and its iana-time-zone dep) stays off.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # OpenTelemetry traces (opt-in, off by default — see src/telemetry.rs + config.rs).
 # rig-core already emits the GenAI span tree (invoke_agent → chat → tool, with
