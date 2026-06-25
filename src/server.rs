@@ -177,9 +177,10 @@ pub struct ConsultInput {
     #[serde(default)]
     pub include_report: bool,
 
-    /// Workspace files under the project root to put in front of the investigation. kaibo
-    /// names them and the consult model reads them itself (not inlined) — e.g.
-    /// `["changes.diff"]` to review a diff. See `kaibo://tools`.
+    /// Workspace files (under the project root or a followed git worktree) to put in front
+    /// of the investigation. kaibo names them and the consult model reads them itself (not
+    /// inlined) — hand it the files a question centers on, or the whole files a change
+    /// touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 }
@@ -1472,12 +1473,13 @@ impl KaiboHandler {
     #[tool(
         description = "Generate an image from a text prompt and return it inline. A \
             capability tool: no codebase investigation, no shell — the cast's `image` model \
-            draws what you describe and hands back the picture plus a short caption. The \
-            cast must carry an `image` slot on an OpenAI-compatible backend (hosted \
-            gpt-image/DALL·E, or a local Stable-Diffusion server); `kaibo://config` shows \
-            which casts qualify. Takes `size` (\"WxH\", default 1024x1024) and the usual \
-            `cast` / `image_model` / `image_backend` selectors. A picture too large to \
-            inline is a clear error, not a silent drop."
+            draws what you describe and hands back the picture plus a short caption. Runs \
+            the cast's `image` slot — an OpenAI-compatible backend (hosted gpt-image/DALL·E, \
+            or a local Stable-Diffusion server); `image_backend` can retarget to one even on \
+            a cast that carries no image slot, and `kaibo://config` shows which casts qualify \
+            as-is. Takes `size` (\"WxH\", default 1024x1024) plus the usual `cast` / \
+            `image_model` / `image_backend` selectors (see `kaibo://tools`). A picture too \
+            large to inline is a clear error, not a silent drop."
     )]
     pub async fn generate_image(
         &self,
@@ -1735,7 +1737,8 @@ impl KaiboHandler {
         description = "Stop a running async job by its handle — works for both kinds \
             (`backend/provider-id` batch or `job-N` consult). A batch stops scheduling new \
             requests (any in flight finish); a consult aborts the investigation; `get` it \
-            afterward for the final state. A job that already finished is left alone."
+            afterward for the final state. A job that already finished is left alone. See \
+            `kaibo://tools` for the async workflow."
     )]
     async fn cancel(
         &self,
@@ -2349,9 +2352,8 @@ kaibo carry the files. Two shapes, by tool:
 
 - **`consult` / `consult_submit` — named, not inlined.** The consult model has its own
   shell, so kaibo simply *names* your attached files in the investigation prompt and the
-  model reads them itself (`cat -n`), in full, when it's ready. Hand it a focus this way:
-  `attach: [\"changes.diff\"]` says \"review this diff\" with no paste (write the diff
-  under the repo first, e.g. `git diff > changes.diff`). Paths are under the project root.
+  model reads them itself (`cat -n`), in full, when it's ready. Hand it the files a
+  question centers on as a focus: `attach: [\"src/server.rs\", \"src/sandbox.rs\"]`.
 - **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
   read the repo — so kaibo splices the file bytes straight into the prompt. Give them the
   *whole* file(s): `[\"README.md\", \"src/server.rs\"]`, not a snippet. Top-tier models
@@ -2361,8 +2363,15 @@ kaibo carry the files. Two shapes, by tool:
   native image parts and want a vision-capable model (`kaibo://config` shows each slot's
   `vision`).
 
-Prefer whole files to excerpts; prefer a prose summary of *intent* to a raw paste. A
-path outside the allowed set, a directory, a missing file, an oversized file, or a binary
+Prefer whole files to excerpts, and a prose summary of *intent* to a raw paste — your
+intent is the part kaibo can't recover from the source itself. **Reviewing a change?**
+Lead with the whole files it touched and describe what you did; the answering models tend
+to review better from the full files than from a diff alone. A diff can ride along to
+point at the moved lines (`git diff > changes.diff` under the repo, then attach it), but
+prefer the files — the diff is a pointer, not the context. Paths resolve under kaibo's
+allowed set: the project root, plus any linked git worktree kaibo is following — a
+sibling-branch checkout next to the repo just works, and `kaibo://config` shows the live
+set. A path outside that set, a directory, a missing file, an oversized file, or a binary
 that isn't a known image is refused with a clear error — kaibo tells you, it doesn't drop
 it silently.
 
@@ -2375,9 +2384,10 @@ you're running is the whole value: a fresh set of eyes on your work.
 
 For a one-off without editing config, override the model on the call itself:
 
-- `consult` / `consult_submit`: `explorer_model` and/or `synth_model`.
-- `oneshot` / `batch_submit`: `model`.
-- `generate_image`: `image_model`.
+- `consult` / `consult_submit`: `explorer_model` (+ `explorer_backend`) and/or
+  `synth_model` (+ `synth_backend`).
+- `oneshot` / `batch_submit`: `model` (+ `backend`).
+- `generate_image`: `image_model` (+ `image_backend`).
 
 A model id is sent **verbatim** — an id with a `/` in it (HuggingFace-style
 `org/model-name`) is still one id, not a path. The `*_model` override keeps the slot's
@@ -3933,6 +3943,8 @@ mod tests {
             "fire-and-forget", // the async-workflow framing
             "read-only",       // the kaish shell boundary
             "126",             // the exit-code contract
+            "worktree",        // attach/path reaches a followed git worktree
+            "Reviewing a change", // prefer whole files over a diff for review
         ] {
             assert!(
                 text.contains(needle),
