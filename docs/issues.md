@@ -312,18 +312,23 @@ in-process and reliable); the classification covers the user-facing symptom toda
 
 ## P3 — Infra, perf, polish
 
-### Release pipeline — GoReleaser, ghcr, signing (plan in `docs/releases.md`)
+### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
 The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
-tracker pointer. Direction settled 2026-06-25 (w/ Amy): **adopt GoReleaser** (the Rust
-builder = the same `cargo-zigbuild` engine `release.yml` already uses), **ghcr.io
-distroless** multi-arch images, **Sigstore keyless signing + SLSA provenance**. The
-existing `.github/workflows/release.yml` (6-target matrix, never fired) gets replaced by
-a thin SHA-pinned `goreleaser-action` workflow. **Parked behind the pre-1.0 work** — we
-don't cut `v*` tags until kaibo is release-ready; the PRs land incrementally before then.
-One invariant change rides PR 2: Windows moves `-msvc` → `-gnu` (zigbuild can't target
-MSVC), which the CLAUDE.md **Build & release** section must reword. Sequenced PRs (1
-plan doc → 2 GoReleaser core → 3 ghcr image → 4 signing → 5 brew → 6 scoop/winget) in
-the doc; delete this entry when the pipeline ships.
+tracker pointer. Direction settled 2026-06-25 (w/ Amy): **stay OSS / GitHub-native** —
+keep the existing native `release.yml` matrix (native macOS, native Windows MSVC, Linux
+musl via zigbuild) on GitHub-hosted runners, harden it (SHA-pin actions, `--version`
+smoke per target, reproducible archives), then add the transparency payoff with free
+GitHub-native tooling: `cosign` **keyless** signing + **SLSA provenance**
+(`actions/attest-build-provenance`) + an **SBOM** (`syft`). **No GoReleaser as the spine**
+(its cross-compile value doesn't apply — macOS can't cross from Linux given
+`security-framework`, so we build native anyway); GoReleaser-OSS is an *optional later*
+back-half **only if** package channels (brew/scoop/winget/nfpm) multiply. **GoReleaser Pro
+and any release-as-a-service are off the table** (the latter doesn't viably exist — see the
+doc's axo note). No Windows ABI change — MSVC stays, so the CLAUDE.md invariant is
+untouched. ghcr distroless image is **demoted/optional** (stdio server = `docker run -i`
+friction). **Parked behind the pre-1.0 work** — no `v*` tags until release-ready. Sequenced
+PRs (1 plan doc → 2 harden matrix → 3 signing/provenance/SBOM → 4 optional ghcr image →
+5 channels, gated on demand) in the doc; delete this entry when the pipeline ships.
 
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read
