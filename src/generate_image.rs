@@ -53,14 +53,14 @@ pub struct GenerateImageInput {
     #[serde(default)]
     pub size: Option<String>,
 
-    /// Override the `image` slot's model id (sent verbatim — an id with "/" is one
-    /// id). Keeps the slot's configured backend unless `image_backend` retargets it.
+    /// Override the `image` slot's model id. See `kaibo://tools` for override semantics
+    /// (pair with `image_backend` to also retarget — which works even on a cast with no
+    /// `image` slot).
     #[serde(default)]
     pub image_model: Option<String>,
 
-    /// Run the `image_model` override on this backend (name or alias) instead of the
-    /// slot's configured one. Requires `image_model`; together they replace the slot
-    /// wholesale, so this also works on a cast that carries no `image` slot at all.
+    /// Run the `image_model` override on this backend (name or alias). Requires
+    /// `image_model`. See `kaibo://tools`.
     #[serde(default)]
     pub image_backend: Option<String>,
 }
