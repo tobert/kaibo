@@ -51,13 +51,59 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 - **Media moves by VFS path; base64 only at the edges** (provider wire, MCP
   content). Scratch `MemoryFs` is the working bus — bounded now that kaish landed
   `ByteBudget` (kaish-vfs, 2026-06-10; kaibo pickup tracked in the P2 entry below).
-  A future `--out-dir` adds a third mount: project **ro** / scratch **rw-bounded** /
-  `/out` **rw** mapped to a user-specified real directory, off by default.
-  Read-only-is-the-product survives precisely: the project mount stays ro; bytes
-  land on the real filesystem only where the user explicitly pointed. Failing-first
-  tests when it lands: writes outside `/out` refused; project ro even with out-dir set.
+  **RW mounts — design settled 2026-06-25 (w/ Amy), supersedes the inline-only
+  `--out-dir` plan.** Instead of a special-case artifact dir, kaibo gains a *general*
+  set of writable mounts: `rw_paths` (CLI `--rw-path` / `KAIBO_RW_PATHS` /
+  `[server] rw_paths`, default none) — the read-only `allow_paths` shape with the
+  mount flag flipped, reusing the same `$VAR` expansion + canonicalize + contain
+  machinery (`config.rs` `expand_env_vars`/`resolve_var`, `server.rs` containment).
+  Decisions that fell out of the conversation:
+  - **The invariant relocates, it doesn't weaken.** Not "kaibo is read-only" but
+    *kaibo never writes to the project under analysis; writes are confined to RW
+    mounts the user explicitly named (default none)*. The project mount stays ro
+    always — no flag, no per-tool exception. The CLAUDE.md "Read-only is the product"
+    invariant (lever 1) reworded to this when it lands; teeth-test unchanged (mount
+    the project writable, watch the denial tests fail).
+  - **Uniform, not staged per tool.** The RW mounts wire the *same* into every kaish
+    kernel — `run_kaish`, the `consult` driver, the `explore′` sub-agent — one
+    `build_sandbox`. Rejected a "consult stays read-only" carve-out: a user who
+    configures an RW space expects kaibo to use it, and per-tool RW rules are a
+    cognitive tax on both human and agent. consult *does* get RW — and this is the
+    substrate for future RW kaibo tasks (the arc image-gen → image2image → … already
+    traces it).
+  - **Longest-prefix routing makes nested RW-in-ro a feature**, not a footgun:
+    `~/src/$repo/scratch` RW inside the `~/src/$repo` ro project routes correctly —
+    the scratch subtree writable, the rest of the repo ro (it's already how
+    `VfsRouter` resolves `/` MemoryFs vs. the project mount). The hard safety
+    invariant is **canonicalize-before-route** (resolve `..`/symlinks *then*
+    longest-match): `scratch/../secret` and a symlink in `scratch/` → out-of-subtree
+    both canonicalize onto the ro project mount and the write is refused. Failing-first
+    write-escape test mirrors the read-escape battery; confirm kaish's VFS
+    canonicalizes-then-routes for *write* ops, not just reads.
+  - **No byte budget on real-FS mounts** — the filesystem is the backstop (its own
+    limits; tmpfs its own size); kaibo reimplementing quota would be worse (blind to
+    external/concurrent writers) and against the don't-fork-the-platform grain. ENOSPC
+    must surface as a *loud* kaish write error and we never deliver a truncated
+    artifact as valid (the delivery path sniffs MIME, so a half-written PNG fails
+    decode). The `/` `MemoryFs` scratch *keeps* its `ByteBudget` — RAM has no
+    filesystem to stop an OOM — so "RAM scratch bounded, real-FS mounts unbounded" is
+    a principled asymmetry; comment it in `sandbox.rs` so it isn't "unified" away.
+  - **Danger is surfaced, not blocked** (broad RW is the user's call — they could set
+    `~/src` RW and ask kaibo to *code*). Warn loudly on broad named roots (`$HOME`,
+    `/`, a dir with many pre-existing files); refuse only the catastrophic (an empty
+    `$VAR` segment is already a load error; an RW mount at `/`). `/configure` steers
+    to `$TMPDIR` / `$XDG_CACHE_HOME/kaibo`. **Surfacing channels are an open design
+    point (2026-06-25, in progress)** — stdio has no synchronous human so friction
+    must be *config-time*, runtime is surface-only: startup stderr warning, a
+    graduated config-time ack for the broadest roots, and/or a `kaibo://config`
+    `[runtime]` breadth field the agent can relay.
+  - **Prompt-injection note for the threat model:** consult-can-write means a consult
+    reading attacker-controlled repo content ("write X to /tmp/Y") can now *act* on
+    it — bounded to the named RW mount, can't escape or execute, can't touch the
+    project, but it's a real new instruction-following exposure to document honestly
+    when this lands.
 - **Delivery over MCP:** small images inline as `Content::image` (rmcp 0.16,
-  `model/content.rs:165`); large objects flush to `/out` and return as
+  `model/content.rs:165`); large objects flush to a RW mount and return as
   `RawContent::ResourceLink` (`model/content.rs:140`) instead of base64 blobs.
 - **Capabilities are data on the `ModelShape` seam** — SHIPPED
   2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
@@ -78,13 +124,16 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 **Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
 SHIPPED 2026-06-11, path-only. (2) **image-out — SHIPPED 2026-06-13** as the
 `generate_image` capability tool (live-verified; see the top Last pass), inline
-`Content::image` only. **Next: (3)** the deferred large-artifact + composition work —
-`--out-dir` (project **ro** / scratch **rw-bounded** / `/out` **rw**, off by default;
-failing-first tests: writes outside `/out` refused, project ro even with out-dir set)
-+ `ResourceLink` delivery for objects over the inline cap, and the kaish-builtin/VFS
-surface for *composition* (image2image, feeding a generated artifact to another tool in
-a `run_kaish` script). Those builtins need the per-builtin timeout (its own P1 entry)
-before a minutes-long model call. Additive after that.
+`Content::image` only. **Next: (3)** the general **RW mounts** above (the design that
+supersedes the inline-only `--out-dir`): `rw_paths` wired uniformly into every kernel,
+then `ResourceLink` delivery for artifacts over the inline cap (flush to a RW mount),
+then the kaish-builtin/VFS surface for *composition* (image2image, feeding a generated
+artifact to another tool in a `run_kaish` script). The composition builtins need the
+per-builtin timeout (its own P1 entry) before a minutes-long model call; artifact
+delivery to a RW mount doesn't, so it can land first. Failing-first tests when RW
+lands: write outside a named RW mount refused, project ro even with RW set,
+canonicalize-before-route write-escape (symlink/`..` out of an RW subtree refused),
+ENOSPC surfaces loud. Additive after that.
 
 **Open design points (for the production builtins):** session history records
 `[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const
