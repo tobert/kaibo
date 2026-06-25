@@ -6,11 +6,15 @@ gets us from "a workflow that has never fired" to "signed, attested releases an 
 operator can trust." Update it as PRs land; it is the durable map the conversation
 can't reconstruct.
 
-> **Gating note.** This whole pipeline is **parked behind the pre-1.0 work** — kaibo is
-> not ready for a public release yet, and we will not cut `v*` tags in anger until that
-> lands. The value of writing the plan now is to *settle the decisions* so we don't
-> re-litigate them later, and to let the PRs land incrementally (each is independently
-> reviewable and mergeable) as the runway clears. Nothing here forces a release.
+> **Gating note.** This whole pipeline is **parked behind the pre-1.0 work**. The hard
+> gate on **widening the audience** (announcing, promoting) is that kaibo must be **super
+> easy to install and use** first — for a tool whose users are *other people's agents*,
+> install friction is fatal. So the container + `/reconfigure` UX below isn't side-prep,
+> it's *on the critical path to going wide*. The engineering PRs (and even a `v*` tag) can
+> land before then; the go-wide moment waits on the ease bar. The value of writing the plan
+> now is to *settle the decisions* so we don't re-litigate them, and to let the PRs land
+> incrementally (each independently reviewable) as the runway clears. Nothing here forces a
+> release.
 
 ---
 
