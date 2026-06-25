@@ -741,9 +741,10 @@ impl KaiboHandler {
     /// [`resolve_attachments`](Self::resolve_attachments), which inlines for the tool-less
     /// tools. Each path must canonicalize to a regular file *under the consult's `root`*,
     /// because the consult reads it through a kaish worker rooted there; an out-of-root
-    /// path is refused with guidance. The returned relative paths are what the model
-    /// `cat`s and what [`consult_user_prompt`](crate::consult::consult_user_prompt) names
-    /// in the driver prompt — deferring the IO to the model's own reads.
+    /// path is refused with guidance. The returned relative paths are what the model opens
+    /// itself — a text file with `cat -n`, an image with `view_image` — and what
+    /// [`consult_user_prompt`](crate::consult::consult_user_prompt) names in the driver
+    /// prompt, deferring the byte-level IO to the model's own reads.
     fn resolve_consult_attachments(
         root: &std::path::Path,
         attach: &[String],
@@ -794,9 +795,20 @@ impl KaiboHandler {
             // Sniff the file's type so the driver prompt routes it to the right tool: a
             // text file the model reads with `cat -n`, an image it views with `view_image`
             // (which `cat` would refuse as binary). Classify by content, not extension — a
-            // 16-byte prefix covers every magic number `sniff_mime` knows; `view_image`
-            // re-sniffs the full bytes authoritatively through the VFS at view time, so
-            // this is just the routing hint, and an unreadable prefix simply reads as text.
+            // 16-byte prefix covers every magic number `sniff_mime` knows.
+            //
+            // This prefix is read with `std::fs`, NOT through the kaish VFS the way
+            // `resolve_attachments` reads its bytes — a deliberate, bounded exception, not
+            // an oversight. There, the bytes are *inlined into the model's context*, so a
+            // raced symlink-swap could exfiltrate out-of-tree content to the model — which
+            // is exactly why that read is VFS-mounted (it re-resolves and refuses an
+            // escaping symlink). Here the 16 bytes never leave this function: they feed
+            // `sniff_mime` to a bool and are dropped. And kaibo's adversary is the *model*,
+            // which has no control over filesystem timing to drive a swap. The authoritative
+            // image read still goes through the read-only VFS in `view_image` at view time,
+            // re-sniffing the full bytes with full containment — so the worst case of a
+            // raced swap here is a misrouted hint (cat vs view_image) the model recovers
+            // from, never an escape or a leak. An unreadable prefix simply reads as text.
             let is_image = {
                 use std::io::Read;
                 let mut buf = [0u8; 16];
@@ -814,11 +826,12 @@ impl KaiboHandler {
     }
 
     /// Refuse an image attachment to a vision-blind consult synth — the consult analog of
-    /// [`gate_image_attachments`]. consult never inlines an image's bytes; it routes the
-    /// caller to view it with the `view_image` tool, which is only wired in when the synth
-    /// is vision-capable. So an image attached to a blind synth could never be seen —
-    /// refuse honestly up front, naming the cast, rather than name a file the model has no
-    /// way to open. Text attachments (and the no-attachment case) always pass.
+    /// [`gate_image_attachments`]. consult never inlines an image's bytes; the model opens
+    /// an attached image with the `view_image` tool, which is only wired into the toolset
+    /// when the synth is vision-capable (see `consult_tools`). So an image attached to a
+    /// blind synth could never be seen — refuse honestly up front, naming the cast, rather
+    /// than let the prompt name a file the model has no way to open. Text attachments (and
+    /// the no-attachment case) always pass.
     fn gate_consult_image_attachments(
         attachments: &[crate::consult::ConsultAttachment],
         vision: bool,
