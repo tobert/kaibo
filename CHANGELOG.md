@@ -118,6 +118,16 @@ the git log. Each later release appends a new section at the top.
 - **Operator ignore files** via a `[kaish.ignore]` config stanza.
 - **Thinking on by default,** with model-aware request shaping (per-provider thinking
   config, per-role reasoning effort, generous completion-token headroom).
+- **Repo orientation in the preamble.** Before a `consult`/`explore` investigates,
+  kaibo splices the project's layout into the exploring preamble so the model starts
+  *knowing* where things are instead of spending its first turns discovering them.
+  Small repos get the complete file list; larger ones (over `[orientation]
+  full_list_max_files`, default 256) get a depth-limited **directory map** (`dir/  N
+  files` lines, `tree_max_depth` deep, default 4) instead of a refused call; a repo
+  too large for even that map gets a short note pointing at discovery tools. The map
+  is never silently skipped and a big repo is never an error — orientation is an
+  enhancement, so its absence just costs the model a few discovery turns it always
+  could have taken.
 - **Multi-turn sessions** via `session_id`, and optional OTLP/HTTP trace export
   (`[telemetry]`, off by default).
 - **A failed provider doesn't fail your turn.** When a model or its provider misbehaves

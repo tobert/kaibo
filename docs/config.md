@@ -544,7 +544,8 @@ Agentless/Aider, made free — no model in the loop).
 ```toml
 [orientation]
 enabled = true               # default; set false to turn the map off
-full_list_max_files = 256    # ≤ this → inject the full list; above → refuse the call
+full_list_max_files = 256    # ≤ this → inject the full file list; above → directory map
+tree_max_depth = 4           # how deep the fallback directory map descends
 ```
 
 How it works: the server runs the kernel's **own** `glob -a --json '**/*'` server-side
@@ -553,12 +554,20 @@ would get (same VFS, same ignore rules), so the map can't disagree with what the
 explorer's own `glob`/`grep` sees. `-a` includes hidden config (`.github/`, `.cargo/`);
 the ignore filter still drops `.git`/`target`.
 
-Size-gated, by file count:
+Size-gated, with a graceful descent — orientation is an *enhancement* (the model always
+has `glob`/`grep`/`explore′`), so its absence is never fatal and the call is never refused
+for being large:
 - **≤ `full_list_max_files`** → the complete file list is spliced in.
-- **above it** → the call is **refused loudly** (`internal_error` naming the knob).
-  A big repo is an explicit error, not a silent partial dump — raise the limit, set `enabled = false`,
-  or point a cast that explores via `grep` at it. (`full_list_max_files = 0` is a load
-  error: it would refuse every repo; disable instead.)
+- **above it** → a **directory map**: the same files folded into a depth-limited tree of
+  `dir/  N files` lines, descending `tree_max_depth` levels (deeper files stay counted at
+  the deepest shown directory). The names are traded for structure; the model recovers them
+  with `glob 'DIR/**/*'` / `grep -rn`.
+- **above it *and* the directory map would itself exceed `full_list_max_files` lines** (a very
+  large or very wide repo) → a short **discover-as-you-go note** naming the discovery tools.
+  Skipped maps are logged (`tracing::warn`), not silent.
+
+`full_list_max_files = 0` is a load error (it would refuse every repo — disable instead), as is
+`tree_max_depth = 0` (it would render an empty map).
 
 It rides the **exploring** phases only — the `consult` driver and its nested
 `explore′` sweep. The toolless `oneshot` reads no project, so it gets no map. Like
