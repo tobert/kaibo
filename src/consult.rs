@@ -817,6 +817,23 @@ impl Arm {
 /// thinking budget, sampling) ride each [`Arm`] (they track the slot's model);
 /// what remains here are the loop bounds the caller may dial per request, the
 /// sandbox limits, and the progress sink.
+/// One caller-attached file, classified so the driver's prompt can route it to the
+/// right tool. `consult` never inlines an attachment's bytes — text files the model
+/// reads itself with `cat -n`, images it views with `view_image` (the image-analog of
+/// `cat`, present whenever the synth is vision-capable). The server sniffs each file's
+/// magic bytes to set `is_image`, so a `.png` named `.txt` (or vice versa) is routed by
+/// content, not extension — matching how `view_image` re-sniffs authoritatively at read.
+#[derive(Debug, Clone)]
+pub struct ConsultAttachment {
+    /// Root-relative path the model passes to `cat -n` or `view_image`.
+    pub path: String,
+    /// True when the file sniffed as a known image type — route it to `view_image`, not
+    /// the shell. A consult that carries an image attachment must run a vision-capable
+    /// synth (the server gates this up front, the same honest refusal `oneshot`/`batch`
+    /// give a blind model).
+    pub is_image: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConsultConfig {
     /// Bounds each cheap `explore′` sweep — it's cheap, let it rip.
@@ -849,13 +866,14 @@ pub struct ConsultConfig {
     /// resolved root (only for the exploring tools — `explore`/`consult`); `Default`
     /// is `None`, so offline tests run the unchanged preamble.
     pub orientation: Option<Arc<str>>,
-    /// Caller-attached files, as **root-relative paths the model reads itself** via the
-    /// shell — *not* inlined bytes. Unlike `oneshot`/`batch` attach (toolless, so kaibo
-    /// inlines), `consult` has kaish, so attach just *names* the files in the driver's
-    /// prompt and lets the model `cat` them when it's ready — no upfront IO, the model
-    /// builds its narrative its own way. The server validates each path lands under the
-    /// consult's root (so the shell can reach it) before filling this. `Default` is empty.
-    pub attachments: Vec<String>,
+    /// Caller-attached files, as **root-relative paths the model reads itself** — *not*
+    /// inlined bytes. Unlike `oneshot`/`batch` attach (toolless, so kaibo inlines),
+    /// `consult` has tools, so attach just *names* each file in the driver's prompt and
+    /// lets the model open it when it's ready: a text file with `cat -n`, an image with
+    /// `view_image` (per [`ConsultAttachment::is_image`]) — no upfront IO, the model builds
+    /// its narrative its own way. The server validates each path lands under the consult's
+    /// root and sniffs its type before filling this. `Default` is empty.
+    pub attachments: Vec<ConsultAttachment>,
 }
 
 impl Default for ConsultConfig {
@@ -1577,7 +1595,7 @@ pub fn consult_user_prompt(
     question: &str,
     context: Option<&str>,
     history: &[QaTurn],
-    attached: &[String],
+    attached: &[ConsultAttachment],
 ) -> String {
     let context = context.map(str::trim).filter(|c| !c.is_empty());
     if history.is_empty() && context.is_none() && attached.is_empty() {
@@ -1616,13 +1634,32 @@ pub fn consult_user_prompt(
         ));
     }
     if !attached.is_empty() {
+        let (images, texts): (Vec<&ConsultAttachment>, Vec<&ConsultAttachment>) =
+            attached.iter().partition(|a| a.is_image);
         prompt.push_str(
-            "The caller attached these files as central to the question — read them in \
-             full with the shell as you build your answer (`cat -n PATH`). They live \
-             under the project root, so a relative path reads directly:\n",
+            "The caller attached these files as central to the question. They live under \
+             the project root, so a relative path opens directly. Open each as you build \
+             your answer:\n",
         );
-        for f in attached {
-            prompt.push_str(&format!("- {f}\n"));
+        if !texts.is_empty() {
+            prompt.push_str(
+                "\nText files — read each in full with the shell (`cat -n PATH`):\n",
+            );
+            for a in &texts {
+                prompt.push_str(&format!("- {}\n", a.path));
+            }
+        }
+        if !images.is_empty() {
+            // Images are binary — `cat` refuses them; the model has a `view_image` tool
+            // (present because the synth is vision-capable, gated server-side) that hands
+            // it the actual picture. Route images there, never to the shell.
+            prompt.push_str(
+                "\nImages — view each with the `view_image` tool (`view_image PATH`), which \
+                 hands you the picture itself; don't `cat` an image:\n",
+            );
+            for a in &images {
+                prompt.push_str(&format!("- {}\n", a.path));
+            }
         }
         prompt.push('\n');
     }
@@ -3672,15 +3709,15 @@ mod tests {
         );
     }
 
-    /// Attached files are named in the prompt (for the model to `cat` itself) and steered
-    /// to read them in full — and they're listed before the question, like context.
+    /// Text attachments are named in the prompt (for the model to `cat` itself) and
+    /// steered to read them in full — and they're listed before the question, like context.
     #[test]
     fn attached_files_are_named_for_the_model_to_read() {
         let prompt = consult_user_prompt(
             "Does the diff weaken the sandbox?",
             None,
             &[],
-            &["changes.diff".to_string(), "src/sandbox.rs".to_string()],
+            &[text_attach("changes.diff"), text_attach("src/sandbox.rs")],
         );
         assert!(
             prompt.contains("changes.diff"),
@@ -3700,6 +3737,58 @@ mod tests {
             listed < question,
             "attachments precede the question:\n{prompt}"
         );
+    }
+
+    /// An image attachment must be routed to `view_image`, never to `cat` (which refuses
+    /// binary). With a mix, each file lands under the right instruction: text → `cat -n`,
+    /// image → `view_image`. This is the prompt half of the image-attach support; the
+    /// server gates a vision-blind synth before we ever get here.
+    #[test]
+    fn image_attachments_are_routed_to_view_image_not_cat() {
+        let prompt = consult_user_prompt(
+            "What does the banner show, and does it match the brand doc?",
+            None,
+            &[],
+            &[
+                image_attach("docs/brand/banner-teal.png"),
+                text_attach("docs/brand/README.md"),
+            ],
+        );
+        // The image is steered to view_image and explicitly kept away from the shell.
+        let view_at = prompt
+            .find("view_image")
+            .expect("image must be routed to view_image");
+        let img_at = prompt
+            .find("banner-teal.png")
+            .expect("image is named in the prompt");
+        // The image name sits under the view_image instruction, not the cat -n one.
+        let cat_at = prompt.find("cat -n").expect("text section names cat -n");
+        assert!(
+            view_at < img_at,
+            "the image is listed under the view_image instruction:\n{prompt}"
+        );
+        // The text file is under the cat -n section.
+        let readme_at = prompt
+            .find("README.md")
+            .expect("text file is named in the prompt");
+        assert!(
+            cat_at < readme_at,
+            "the text file is listed under the cat -n instruction:\n{prompt}"
+        );
+    }
+
+    fn text_attach(path: &str) -> ConsultAttachment {
+        ConsultAttachment {
+            path: path.to_string(),
+            is_image: false,
+        }
+    }
+
+    fn image_attach(path: &str) -> ConsultAttachment {
+        ConsultAttachment {
+            path: path.to_string(),
+            is_image: true,
+        }
     }
 
     /// With history, every prior turn appears, the current question appears, and the

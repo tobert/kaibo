@@ -178,9 +178,10 @@ pub struct ConsultInput {
     pub include_report: bool,
 
     /// Workspace files (under the project root or a followed git worktree) to put in front
-    /// of the investigation. kaibo names them and the consult model reads them itself (not
-    /// inlined) — hand it the files a question centers on, or the whole files a change
-    /// touched. See `kaibo://tools`.
+    /// of the investigation. kaibo names them and the consult model opens them itself (not
+    /// inlined) — a text file with `cat -n`, an image with `view_image` (so an attached
+    /// image needs a vision-capable cast). Hand it the files a question centers on, or the
+    /// whole files a change touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 }
@@ -746,7 +747,7 @@ impl KaiboHandler {
     fn resolve_consult_attachments(
         root: &std::path::Path,
         attach: &[String],
-    ) -> Result<Vec<String>, McpError> {
+    ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         let mut out = Vec::with_capacity(attach.len());
         for p in attach {
             let raw = std::path::PathBuf::from(p);
@@ -790,9 +791,53 @@ impl KaiboHandler {
                     None,
                 )
             })?;
-            out.push(rel.display().to_string());
+            // Sniff the file's type so the driver prompt routes it to the right tool: a
+            // text file the model reads with `cat -n`, an image it views with `view_image`
+            // (which `cat` would refuse as binary). Classify by content, not extension — a
+            // 16-byte prefix covers every magic number `sniff_mime` knows; `view_image`
+            // re-sniffs the full bytes authoritatively through the VFS at view time, so
+            // this is just the routing hint, and an unreadable prefix simply reads as text.
+            let is_image = {
+                use std::io::Read;
+                let mut buf = [0u8; 16];
+                let n = std::fs::File::open(&canon)
+                    .and_then(|mut f| f.read(&mut buf))
+                    .unwrap_or(0);
+                crate::view_image::sniff_mime(&buf[..n]).is_some()
+            };
+            out.push(crate::consult::ConsultAttachment {
+                path: rel.display().to_string(),
+                is_image,
+            });
         }
         Ok(out)
+    }
+
+    /// Refuse an image attachment to a vision-blind consult synth — the consult analog of
+    /// [`gate_image_attachments`]. consult never inlines an image's bytes; it routes the
+    /// caller to view it with the `view_image` tool, which is only wired in when the synth
+    /// is vision-capable. So an image attached to a blind synth could never be seen —
+    /// refuse honestly up front, naming the cast, rather than name a file the model has no
+    /// way to open. Text attachments (and the no-attachment case) always pass.
+    fn gate_consult_image_attachments(
+        attachments: &[crate::consult::ConsultAttachment],
+        vision: bool,
+        model: &str,
+        cast: &str,
+    ) -> Result<(), McpError> {
+        if !vision && attachments.iter().any(|a| a.is_image) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "an image was attached, but the consult synth `{model}` on cast `{cast}` \
+                     can't see images — consult opens an attached image with its `view_image` \
+                     tool, which only a vision-capable synth carries. Use a vision-capable \
+                     cast, or attach only text files. `kaibo://config` lists each slot's \
+                     `vision`."
+                ),
+                None,
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse image attachments to a vision-blind model, naming the cast so the caller
@@ -1195,6 +1240,11 @@ impl KaiboHandler {
         // onto the wire when the client supplied a token, else a no-op sink.
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
+        // Resolve + classify attachments, then gate: an image needs a vision-capable synth
+        // (consult views it with `view_image`, which only a vision synth carries). Refuse
+        // here, before the loop, the same honest up-front refusal oneshot/batch give.
+        let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
+        Self::gate_consult_image_attachments(&attachments, synth.caps.vision, &synth.model, &cast.name)?;
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1205,9 +1255,7 @@ impl KaiboHandler {
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
-            // Validated to live under `root` (the model reads them via its shell); not
-            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
-            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
+            attachments,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -1296,6 +1344,10 @@ impl KaiboHandler {
         let explorer = self.arm(&cast, ModelRole::Explorer)?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         let defaults = &self.config.defaults;
+        // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
+        // synth) is a clean synchronous refusal, not a job that fails on poll.
+        let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
+        Self::gate_consult_image_attachments(&attachments, synth.caps.vision, &synth.model, &cast.name)?;
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1310,9 +1362,7 @@ impl KaiboHandler {
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
-            // Validated to live under `root` (the model reads them via its shell); not
-            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
-            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
+            attachments,
         };
 
         // Owned captures for the `'static` spawned task. The session store is `Clone`
@@ -2351,11 +2401,13 @@ pass back through *your* context. That's the whole point: keep your context lean
 kaibo carry the files. Two shapes, by tool:
 
 - **`consult` / `consult_submit` — named, not inlined.** The consult model has its own
-  shell, so kaibo simply *names* your attached files in the investigation prompt and the
-  model reads them itself (`cat -n`), in full, when it's ready. Hand it the files a
-  question centers on as a focus: `attach: [\"src/server.rs\", \"src/sandbox.rs\"]`. These
-  are text files it reads with the shell — for an image, reach for `oneshot` / `batch_submit`,
-  whose `attach` carries it as a native vision part.
+  tools, so kaibo simply *names* your attached files in the investigation prompt and the
+  model opens each itself, in full, when it's ready: a text file with the shell (`cat -n`),
+  an image with its `view_image` tool. Hand it the files a question centers on as a focus:
+  `attach: [\"src/server.rs\", \"docs/architecture.png\"]`. An attached image needs a
+  vision-capable cast — view_image only exists when the synth can see — so kaibo refuses an
+  image to a blind synth up front rather than name a file it could never open. (The
+  toolless `oneshot` / `batch_submit` instead *inline* an image as a native vision part.)
 - **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
   read the repo — so kaibo splices the file bytes straight into the prompt. Give them the
   *whole* file(s): `[\"README.md\", \"src/server.rs\"]`, not a snippet. Top-tier models
@@ -3363,7 +3415,8 @@ mod tests {
         let rel =
             KaiboHandler::resolve_consult_attachments(&root_canon, &["src/jobs.rs".to_string()])
                 .expect("an in-tree file resolves");
-        assert_eq!(rel, vec!["src/jobs.rs".to_string()]);
+        assert_eq!(rel.len(), 1);
+        assert_eq!(rel[0].path, "src/jobs.rs");
 
         // A file outside the root is refused, even though it exists and is readable.
         let outside = tempfile::tempdir().unwrap();
@@ -3381,6 +3434,62 @@ mod tests {
             "the refusal names the boundary: {}",
             err.message
         );
+    }
+
+    /// consult `attach` sniffs each file's *content* (not its extension) so the driver
+    /// prompt routes it to the right tool: a text file to `cat -n`, an image to
+    /// `view_image`. A PNG signature classifies as an image even named `.txt`, and a UTF-8
+    /// file classifies as text even named `.png` — content is the ground truth, matching
+    /// how `view_image` re-sniffs at read time.
+    #[test]
+    fn consult_attach_classifies_images_by_content_not_extension() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        // A real PNG magic number, deliberately misnamed `.txt`.
+        let png_sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(root_canon.join("shot.txt"), png_sig).unwrap();
+        // UTF-8 source, deliberately misnamed `.png`.
+        std::fs::write(root_canon.join("notes.png"), b"// just text").unwrap();
+
+        let out = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            &["shot.txt".to_string(), "notes.png".to_string()],
+        )
+        .expect("both resolve");
+        let by_path = |p: &str| out.iter().find(|a| a.path == p).unwrap().is_image;
+        assert!(by_path("shot.txt"), "PNG bytes classify as image despite .txt");
+        assert!(
+            !by_path("notes.png"),
+            "UTF-8 bytes classify as text despite .png"
+        );
+    }
+
+    /// An image attached to a vision-blind consult synth is refused honestly up front —
+    /// consult would have no way to show it (no `view_image` without vision), so naming the
+    /// file would be a lie. A vision synth passes; text-only always passes either way.
+    #[test]
+    fn consult_image_attach_is_gated_on_synth_vision() {
+        let img = vec![crate::consult::ConsultAttachment {
+            path: "shot.png".to_string(),
+            is_image: true,
+        }];
+        let txt = vec![crate::consult::ConsultAttachment {
+            path: "notes.md".to_string(),
+            is_image: false,
+        }];
+        // Blind synth + image → refused, naming the cast and the vision requirement.
+        let err = KaiboHandler::gate_consult_image_attachments(&img, false, "deepseek-v4-pro", "deepseek")
+            .expect_err("an image to a blind synth must be refused");
+        assert!(
+            err.message.contains("can't see images") && err.message.contains("deepseek"),
+            "the refusal names the cause and the cast: {}",
+            err.message
+        );
+        // Vision synth + image → fine; blind synth + text-only → fine.
+        KaiboHandler::gate_consult_image_attachments(&img, true, "claude-sonnet-4-6", "anthropic")
+            .expect("a vision synth accepts an image");
+        KaiboHandler::gate_consult_image_attachments(&txt, false, "deepseek-v4-pro", "deepseek")
+            .expect("text-only needs no vision");
     }
 
     #[test]
@@ -3948,6 +4057,7 @@ mod tests {
             "126",             // the exit-code contract
             "worktree",        // attach/path reaches a followed git worktree
             "Reviewing a change", // prefer whole files over a diff for review
+            "view_image",      // consult opens an attached image with view_image
         ] {
             assert!(
                 text.contains(needle),
