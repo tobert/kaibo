@@ -88,15 +88,17 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
     decode). The `/` `MemoryFs` scratch *keeps* its `ByteBudget` — RAM has no
     filesystem to stop an OOM — so "RAM scratch bounded, real-FS mounts unbounded" is
     a principled asymmetry; comment it in `sandbox.rs` so it isn't "unified" away.
-  - **Danger is surfaced, not blocked** (broad RW is the user's call — they could set
-    `~/src` RW and ask kaibo to *code*). Warn loudly on broad named roots (`$HOME`,
-    `/`, a dir with many pre-existing files); refuse only the catastrophic (an empty
-    `$VAR` segment is already a load error; an RW mount at `/`). `/configure` steers
-    to `$TMPDIR` / `$XDG_CACHE_HOME/kaibo`. **Surfacing channels are an open design
-    point (2026-06-25, in progress)** — stdio has no synchronous human so friction
-    must be *config-time*, runtime is surface-only: startup stderr warning, a
-    graduated config-time ack for the broadest roots, and/or a `kaibo://config`
-    `[runtime]` breadth field the agent can relay.
+  - **Danger is surfaced, not policed — and lightly** (settled 2026-06-25 w/ Amy).
+    The consent is already in the *shape*: RW is off by default, every writable mount
+    is an explicitly-named path, and the user opted in by naming it. That's enough —
+    kaibo doesn't gate or grade breadth (no file-count heuristic, no graduated ack
+    flag, no refusal on a target choice; a broad mount like `~/src`, used to ask kaibo
+    to *code*, is the user's call). The only surfacing is a startup **warning** when a
+    resolved RW mount equals `/` (always) or `$HOME` (and even that lightly). Structural
+    load errors still stand — an empty `$VAR` segment refuses, since that's a malformed
+    path, not a target choice. `/configure` steers toward `$TMPDIR` /
+    `$XDG_CACHE_HOME/kaibo` as the good default without pushing back. Posture:
+    narrowly-scoped, tightly-controlled RW, surfaced not policed.
   - **Prompt-injection note for the threat model:** consult-can-write means a consult
     reading attacker-controlled repo content ("write X to /tmp/Y") can now *act* on
     it — bounded to the named RW mount, can't escape or execute, can't touch the
