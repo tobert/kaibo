@@ -24,9 +24,12 @@ the git log. Each later release appends a new section at the top.
   and per-call `explorer_model` / `synth_model` (+ `_backend`) overrides. **`attach`**
   names workspace files (under the project root) to put in front of the investigation —
   unlike the tool-less tools' attach, kaibo does *not* inline them; it names them in the
-  prompt and the consult model reads them itself with the shell when it's ready, in full,
-  building its own narrative. "Review this diff" is `attach: ["changes.diff"]` with no
-  paste; the files just have to live under the root the consult reads (a worktree counts).
+  prompt and the consult model opens each itself when it's ready, in full, building its own
+  narrative: a text file with the shell (`cat -n`), an **image** with its `view_image` tool.
+  An attached image therefore needs a vision-capable cast — kaibo refuses one to a
+  vision-blind synth up front (the same honest refusal `oneshot`/`batch` give) rather than
+  name a file the model could never open. The files just have to live under the root the
+  consult reads (a worktree counts).
 - **`consult_submit`** — the *async sibling* of `consult` (as batch is to `oneshot`):
   start a consultation in the background and get back a handle (`job-N`) instead of
   holding your turn open while a deep investigation runs. Same investigation, same args

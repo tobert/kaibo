@@ -5,11 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
+use rmcp::ErrorData as McpError;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -22,15 +23,14 @@ use rmcp::model::{
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
-use rmcp::ErrorData as McpError;
-use rmcp::{tool, tool_handler, tool_router, RoleServer};
+use rmcp::{RoleServer, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, ModelRole, ModelSlot};
 use crate::consult::{
-    consult, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides,
+    Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides, consult, oneshot,
 };
 use crate::explorer::format_output;
 use crate::generate_image::GenerateImageInput;
@@ -41,7 +41,7 @@ use crate::kaish_syntax::{
 };
 use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressSink, TracingSink};
-use crate::sandbox::{builtin_schemas, KaishWorker};
+use crate::sandbox::{KaishWorker, builtin_schemas};
 use crate::session::SessionStore;
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -178,9 +178,10 @@ pub struct ConsultInput {
     pub include_report: bool,
 
     /// Workspace files (under the project root or a followed git worktree) to put in front
-    /// of the investigation. kaibo names them and the consult model reads them itself (not
-    /// inlined) — hand it the files a question centers on, or the whole files a change
-    /// touched. See `kaibo://tools`.
+    /// of the investigation. kaibo names them and the consult model opens them itself (not
+    /// inlined) — a text file with `cat -n`, an image with `view_image` (so an attached
+    /// image needs a vision-capable cast). Hand it the files a question centers on, or the
+    /// whole files a change touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 }
@@ -740,13 +741,14 @@ impl KaiboHandler {
     /// [`resolve_attachments`](Self::resolve_attachments), which inlines for the tool-less
     /// tools. Each path must canonicalize to a regular file *under the consult's `root`*,
     /// because the consult reads it through a kaish worker rooted there; an out-of-root
-    /// path is refused with guidance. The returned relative paths are what the model
-    /// `cat`s and what [`consult_user_prompt`](crate::consult::consult_user_prompt) names
-    /// in the driver prompt — deferring the IO to the model's own reads.
+    /// path is refused with guidance. The returned relative paths are what the model opens
+    /// itself — a text file with `cat -n`, an image with `view_image` — and what
+    /// [`consult_user_prompt`](crate::consult::consult_user_prompt) names in the driver
+    /// prompt, deferring the byte-level IO to the model's own reads.
     fn resolve_consult_attachments(
         root: &std::path::Path,
         attach: &[String],
-    ) -> Result<Vec<String>, McpError> {
+    ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         let mut out = Vec::with_capacity(attach.len());
         for p in attach {
             let raw = std::path::PathBuf::from(p);
@@ -790,9 +792,65 @@ impl KaiboHandler {
                     None,
                 )
             })?;
-            out.push(rel.display().to_string());
+            // Sniff the file's type so the driver prompt routes it to the right tool: a
+            // text file the model reads with `cat -n`, an image it views with `view_image`
+            // (which `cat` would refuse as binary). Classify by content, not extension — a
+            // 16-byte prefix covers every magic number `sniff_mime` knows.
+            //
+            // This prefix is read with `std::fs`, NOT through the kaish VFS the way
+            // `resolve_attachments` reads its bytes — a deliberate, bounded exception, not
+            // an oversight. There, the bytes are *inlined into the model's context*, so a
+            // raced symlink-swap could exfiltrate out-of-tree content to the model — which
+            // is exactly why that read is VFS-mounted (it re-resolves and refuses an
+            // escaping symlink). Here the 16 bytes never leave this function: they feed
+            // `sniff_mime` to a bool and are dropped. And kaibo's adversary is the *model*,
+            // which has no control over filesystem timing to drive a swap. The authoritative
+            // image read still goes through the read-only VFS in `view_image` at view time,
+            // re-sniffing the full bytes with full containment — so the worst case of a
+            // raced swap here is a misrouted hint (cat vs view_image) the model recovers
+            // from, never an escape or a leak. An unreadable prefix simply reads as text.
+            let is_image = {
+                use std::io::Read;
+                let mut buf = [0u8; 16];
+                let n = std::fs::File::open(&canon)
+                    .and_then(|mut f| f.read(&mut buf))
+                    .unwrap_or(0);
+                crate::view_image::sniff_mime(&buf[..n]).is_some()
+            };
+            out.push(crate::consult::ConsultAttachment {
+                path: rel.display().to_string(),
+                is_image,
+            });
         }
         Ok(out)
+    }
+
+    /// Refuse an image attachment to a vision-blind consult synth — the consult analog of
+    /// [`gate_image_attachments`]. consult never inlines an image's bytes; the model opens
+    /// an attached image with the `view_image` tool, which is only wired into the toolset
+    /// when the synth is vision-capable (see `consult_tools`). So an image attached to a
+    /// blind synth could never be seen — refuse honestly up front, naming the cast, rather
+    /// than let the prompt name a file the model has no way to open. Text attachments (and
+    /// the no-attachment case) always pass.
+    fn gate_consult_image_attachments(
+        attachments: &[crate::consult::ConsultAttachment],
+        vision: bool,
+        model: &str,
+        cast: &str,
+    ) -> Result<(), McpError> {
+        if !vision && attachments.iter().any(|a| a.is_image) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "an image was attached, but the consult synth `{model}` on cast `{cast}` \
+                     can't see images — consult opens an attached image with its `view_image` \
+                     tool, which only a vision-capable synth carries. Use a vision-capable \
+                     cast, or attach only text files. `kaibo://config` lists each slot's \
+                     `vision`."
+                ),
+                None,
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse image attachments to a vision-blind model, naming the cast so the caller
@@ -857,8 +915,8 @@ impl KaiboHandler {
         paths: &[String],
     ) -> Result<Vec<crate::attach::Attachment>, McpError> {
         use crate::attach::{
-            check_attachment_bounds, classify, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_IMAGE_BYTES,
-            DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TOTAL_BYTES,
+            DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_TEXT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES, check_attachment_bounds, classify,
         };
         // The pre-read ceiling: whichever encoding cap is larger. `classify` applies the
         // precise per-encoding cap after sniffing; this just bounds the read itself.
@@ -866,8 +924,13 @@ impl KaiboHandler {
         // Fail fast on count *before* canonicalizing the whole list (a stray glob could
         // name thousands). The cumulative-byte budget is enforced per file below as the
         // running total grows — before each read, so an oversized batch never slurps in.
-        check_attachment_bounds(paths.len(), 0, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_TOTAL_BYTES)
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+        check_attachment_bounds(
+            paths.len(),
+            0,
+            DEFAULT_MAX_ATTACHMENTS,
+            DEFAULT_MAX_TOTAL_BYTES,
+        )
+        .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         // One read-only worker per distinct containing tree, reused across attachments
         // under it (a worker owns a thread + kernel build, so we don't want one per file).
         let mut workers: std::collections::HashMap<PathBuf, KaishWorker> =
@@ -1195,6 +1258,16 @@ impl KaiboHandler {
         // onto the wire when the client supplied a token, else a no-op sink.
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
+        // Resolve + classify attachments, then gate: an image needs a vision-capable synth
+        // (consult views it with `view_image`, which only a vision synth carries). Refuse
+        // here, before the loop, the same honest up-front refusal oneshot/batch give.
+        let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
+        Self::gate_consult_image_attachments(
+            &attachments,
+            synth.caps.vision,
+            &synth.model,
+            &cast.name,
+        )?;
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1205,9 +1278,7 @@ impl KaiboHandler {
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
-            // Validated to live under `root` (the model reads them via its shell); not
-            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
-            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
+            attachments,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -1296,6 +1367,15 @@ impl KaiboHandler {
         let explorer = self.arm(&cast, ModelRole::Explorer)?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         let defaults = &self.config.defaults;
+        // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
+        // synth) is a clean synchronous refusal, not a job that fails on poll.
+        let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
+        Self::gate_consult_image_attachments(
+            &attachments,
+            synth.caps.vision,
+            &synth.model,
+            &cast.name,
+        )?;
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1310,9 +1390,7 @@ impl KaiboHandler {
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
-            // Validated to live under `root` (the model reads them via its shell); not
-            // inlined — consult defers the IO to its own `cat`s. See [`ConsultInput::attach`].
-            attachments: Self::resolve_consult_attachments(&root, &input.attach)?,
+            attachments,
         };
 
         // Owned captures for the `'static` spawned task. The session store is `Clone`
@@ -1720,7 +1798,18 @@ impl KaiboHandler {
         }
         self.ensure_consult_enabled(&input.handle)?;
         match self.jobs.get(&input.handle) {
-            Some(snap) => Ok(render_job(&input.handle, snap)),
+            Some(snap) => {
+                // Collecting a terminal job retires its completion ping from the `wait`
+                // ring — otherwise that stale Warn lingers and the next `wait` returns on
+                // it immediately instead of blocking for new work. A Running job has no
+                // ping yet; a Canceled one never emitted one — both are no-ops, so this is
+                // safe to call unconditionally, but we scope it to the terminal states the
+                // ping actually exists for.
+                if matches!(snap.state, JobState::Done(_) | JobState::Failed(_)) {
+                    self.notifications.discard_job_pings(&input.handle);
+                }
+                Ok(render_job(&input.handle, snap))
+            }
             None => Err(McpError::invalid_params(
                 format!(
                     "no consultation job `{}` — it may have finished and been evicted by \
@@ -2351,11 +2440,13 @@ pass back through *your* context. That's the whole point: keep your context lean
 kaibo carry the files. Two shapes, by tool:
 
 - **`consult` / `consult_submit` — named, not inlined.** The consult model has its own
-  shell, so kaibo simply *names* your attached files in the investigation prompt and the
-  model reads them itself (`cat -n`), in full, when it's ready. Hand it the files a
-  question centers on as a focus: `attach: [\"src/server.rs\", \"src/sandbox.rs\"]`. These
-  are text files it reads with the shell — for an image, reach for `oneshot` / `batch_submit`,
-  whose `attach` carries it as a native vision part.
+  tools, so kaibo simply *names* your attached files in the investigation prompt and the
+  model opens each itself, in full, when it's ready: a text file with the shell (`cat -n`),
+  an image with its `view_image` tool. Hand it the files a question centers on as a focus:
+  `attach: [\"src/server.rs\", \"docs/architecture.png\"]`. An attached image needs a
+  vision-capable cast — view_image only exists when the synth can see — so kaibo refuses an
+  image to a blind synth up front rather than name a file it could never open. (The
+  toolless `oneshot` / `batch_submit` instead *inline* an image as a native vision part.)
 - **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
   read the repo — so kaibo splices the file bytes straight into the prompt. Give them the
   *whole* file(s): `[\"README.md\", \"src/server.rs\"]`, not a snippet. Top-tier models
@@ -3106,7 +3197,7 @@ fn wait_level_floor(level: Option<&str>) -> Result<u8, McpError> {
             return Err(McpError::invalid_params(
                 format!("level must be one of debug|info|warn|error, got {other:?}"),
                 None,
-            ))
+            ));
         }
     };
     Ok(crate::mcp_log::rank(l))
@@ -3344,8 +3435,8 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
+    use rmcp::model::{NumberOrString, PromptMessageContent};
 
     /// consult `attach` validates files are under the consult root (so the model's shell
     /// can `cat` them) and returns them as relative paths; a file outside the root — even
@@ -3363,7 +3454,8 @@ mod tests {
         let rel =
             KaiboHandler::resolve_consult_attachments(&root_canon, &["src/jobs.rs".to_string()])
                 .expect("an in-tree file resolves");
-        assert_eq!(rel, vec!["src/jobs.rs".to_string()]);
+        assert_eq!(rel.len(), 1);
+        assert_eq!(rel[0].path, "src/jobs.rs");
 
         // A file outside the root is refused, even though it exists and is readable.
         let outside = tempfile::tempdir().unwrap();
@@ -3381,6 +3473,70 @@ mod tests {
             "the refusal names the boundary: {}",
             err.message
         );
+    }
+
+    /// consult `attach` sniffs each file's *content* (not its extension) so the driver
+    /// prompt routes it to the right tool: a text file to `cat -n`, an image to
+    /// `view_image`. A PNG signature classifies as an image even named `.txt`, and a UTF-8
+    /// file classifies as text even named `.png` — content is the ground truth, matching
+    /// how `view_image` re-sniffs at read time.
+    #[test]
+    fn consult_attach_classifies_images_by_content_not_extension() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        // A real PNG magic number, deliberately misnamed `.txt`.
+        let png_sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(root_canon.join("shot.txt"), png_sig).unwrap();
+        // UTF-8 source, deliberately misnamed `.png`.
+        std::fs::write(root_canon.join("notes.png"), b"// just text").unwrap();
+
+        let out = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            &["shot.txt".to_string(), "notes.png".to_string()],
+        )
+        .expect("both resolve");
+        let by_path = |p: &str| out.iter().find(|a| a.path == p).unwrap().is_image;
+        assert!(
+            by_path("shot.txt"),
+            "PNG bytes classify as image despite .txt"
+        );
+        assert!(
+            !by_path("notes.png"),
+            "UTF-8 bytes classify as text despite .png"
+        );
+    }
+
+    /// An image attached to a vision-blind consult synth is refused honestly up front —
+    /// consult would have no way to show it (no `view_image` without vision), so naming the
+    /// file would be a lie. A vision synth passes; text-only always passes either way.
+    #[test]
+    fn consult_image_attach_is_gated_on_synth_vision() {
+        let img = vec![crate::consult::ConsultAttachment {
+            path: "shot.png".to_string(),
+            is_image: true,
+        }];
+        let txt = vec![crate::consult::ConsultAttachment {
+            path: "notes.md".to_string(),
+            is_image: false,
+        }];
+        // Blind synth + image → refused, naming the cast and the vision requirement.
+        let err = KaiboHandler::gate_consult_image_attachments(
+            &img,
+            false,
+            "deepseek-v4-pro",
+            "deepseek",
+        )
+        .expect_err("an image to a blind synth must be refused");
+        assert!(
+            err.message.contains("can't see images") && err.message.contains("deepseek"),
+            "the refusal names the cause and the cast: {}",
+            err.message
+        );
+        // Vision synth + image → fine; blind synth + text-only → fine.
+        KaiboHandler::gate_consult_image_attachments(&img, true, "claude-sonnet-4-6", "anthropic")
+            .expect("a vision synth accepts an image");
+        KaiboHandler::gate_consult_image_attachments(&txt, false, "deepseek-v4-pro", "deepseek")
+            .expect("text-only needs no vision");
     }
 
     #[test]
@@ -3679,6 +3835,78 @@ mod tests {
         );
     }
 
+    /// A job's completion ping (a Warn carrying `job=<id>`) sits in the `wait` ring until
+    /// drained. Collecting that job with `get` must retire its ping — otherwise the ping
+    /// lingers and the next `wait` returns on it instantly instead of blocking for new
+    /// work (the "`wait` returns too fast" bug). An *uncollected* job's ping is untouched,
+    /// so it still wakes a later `wait`.
+    #[tokio::test]
+    async fn get_on_a_terminal_job_retires_its_wait_ping() {
+        use crate::jobs::JobResult;
+        use crate::mcp_log::LogRecord;
+        use rmcp::model::LoggingLevel;
+
+        fn ping(job: &str) -> LogRecord {
+            let mut fields = serde_json::Map::new();
+            fields.insert("job".into(), serde_json::Value::String(job.into()));
+            LogRecord {
+                level: LoggingLevel::Warning,
+                target: "kaibo::jobs".into(),
+                message: format!("async job finished — collect it with `get` ({job})"),
+                fields,
+            }
+        }
+
+        let h = handler();
+        // Two finished jobs; we only collect the first.
+        let collected = h.jobs.submit("test", async {
+            Ok(JobResult {
+                answer: "answer".into(),
+                report: None,
+            })
+        });
+        let other = h.jobs.submit("test", async {
+            Ok(JobResult {
+                answer: "answer".into(),
+                report: None,
+            })
+        });
+        // Both must reach a terminal state before `get` will evict (Running has no ping).
+        for id in [&collected, &other] {
+            for _ in 0..1000 {
+                match h.jobs.get(id).map(|s| s.state) {
+                    Some(JobState::Running) | None => tokio::task::yield_now().await,
+                    Some(_) => break,
+                }
+            }
+        }
+        // Seed both pings, the way the finishing tasks' `tracing::warn!` would.
+        h.notifications.push_record(ping(&collected));
+        h.notifications.push_record(ping(&other));
+
+        h.get(Parameters(HandleInput {
+            handle: collected.clone(),
+        }))
+        .await
+        .expect("get collects the finished job");
+
+        // The collected job's ping is gone; the uncollected one's survives to wake a
+        // later `wait`.
+        let left: Vec<String> = h
+            .notifications
+            .drain(crate::mcp_log::rank(LoggingLevel::Warning), 20)
+            .into_iter()
+            .map(|r| {
+                r.fields
+                    .get("job")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(left, vec![other], "only the uncollected job's ping remains");
+    }
+
     /// Progress is opt-in: with no `progressToken` in `_meta` we send nothing, so the
     /// sink must be the no-op. (A `consult` with no token is byte-for-byte its old
     /// silent self.)
@@ -3936,18 +4164,19 @@ mod tests {
         );
         let text = read_text(TOOLS_URI, &[]);
         for needle in [
-            "attach",          // the attachment guidance moved here
-            "inlined",         // the consult-vs-oneshot attach distinction
-            "whole file",      // the toolless-model whole-files steer
-            "verbatim",        // the model-id override semantics
-            "_backend",        // the retarget-the-slot mechanic
-            "job-N",           // the consult handle shape
+            "attach",              // the attachment guidance moved here
+            "inlined",             // the consult-vs-oneshot attach distinction
+            "whole file",          // the toolless-model whole-files steer
+            "verbatim",            // the model-id override semantics
+            "_backend",            // the retarget-the-slot mechanic
+            "job-N",               // the consult handle shape
             "backend/provider-id", // the batch handle shape
-            "fire-and-forget", // the async-workflow framing
-            "read-only",       // the kaish shell boundary
-            "126",             // the exit-code contract
-            "worktree",        // attach/path reaches a followed git worktree
-            "Reviewing a change", // prefer whole files over a diff for review
+            "fire-and-forget",     // the async-workflow framing
+            "read-only",           // the kaish shell boundary
+            "126",                 // the exit-code contract
+            "worktree",            // attach/path reaches a followed git worktree
+            "Reviewing a change",  // prefer whole files over a diff for review
+            "view_image",          // consult opens an attached image with view_image
         ] {
             assert!(
                 text.contains(needle),
