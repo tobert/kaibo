@@ -325,10 +325,14 @@ GitHub-native tooling: `cosign` **keyless** signing + **SLSA provenance**
 back-half **only if** package channels (brew/scoop/winget/nfpm) multiply. **GoReleaser Pro
 and any release-as-a-service are off the table** (the latter doesn't viably exist — see the
 doc's axo note). No Windows ABI change — MSVC stays, so the CLAUDE.md invariant is
-untouched. ghcr distroless image is **demoted/optional** (stdio server = `docker run -i`
-friction). **Parked behind the pre-1.0 work** — no `v*` tags until release-ready. Sequenced
-PRs (1 plan doc → 2 harden matrix → 3 signing/provenance/SBOM → 4 optional ghcr image →
-5 channels, gated on demand) in the doc; delete this entry when the pipeline ships.
+untouched. The **ghcr image is a first-class, early distribution path** (multiarch, non-root
+default, devcontainer-friendly; an OS-enforced containment layer under kaibo's own read-only
+sandbox) — with a companion **`/reconfigure`** host-agent prompt to tame the docker/podman/
+devcontainer `mcp add` config friction (kaibo advises via `kaibo://config`, the host agent
+edits — kaibo can't write configs or run docker). **Parked behind the pre-1.0 work** — no
+`v*` tags until release-ready. Sequenced PRs (1 plan doc → 2 harden matrix → 3 signing/
+provenance/SBOM → 4 ghcr image + container UX → 5 channels, gated on demand) in the doc;
+delete this entry when the pipeline ships.
 
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read
