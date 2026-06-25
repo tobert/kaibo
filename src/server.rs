@@ -61,6 +61,13 @@ const CONFIG_URI: &str = "kaibo://config";
 /// user copies to `~/.config/kaibo/config.toml`. Most useful on a fresh install,
 /// where the setup guidance points at it.
 const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
+/// Long-form "how to wield the tools well" guidance — attachments, cast/model
+/// selection, the sync↔async pairs and their handles, and the read-only shell's
+/// idioms. The tool schemas stay terse and point here, so the repetition and positive
+/// framing that helps a calling model use the tools lives in a resource the host loads
+/// on demand, not in every agent's startup context (the AGENTS.md prompt-writing split:
+/// terse where it's always loaded, generous where it's pulled).
+const TOOLS_URI: &str = "kaibo://tools";
 /// `docs/config.example.toml`, embedded at compile time so it ships *inside* the
 /// binary — `cargo install kaibo` lays down no docs, so reading the file at runtime
 /// would 404 at exactly the fresh-install moment the example matters most.
@@ -110,61 +117,49 @@ impl ToolGating {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConsultInput {
-    /// The question to investigate about the project. Say what you did or want to
-    /// know in prose — what you changed and why, the behavior you're asking about.
-    /// kaibo locates and reads the real, current code itself, so describing your
-    /// intent beats pasting a diff or a file dump it would only re-read from disk.
+    /// The question to investigate. Say in prose what you did or want to know — kaibo
+    /// locates and reads the real, current code itself, so your intent beats a pasted diff.
     pub question: String,
 
-    /// Optional context to seed the investigation — a change/diff *summary*, a prior
-    /// report, or pasted source kaibo can't reach. It's treated as trusted starting
-    /// evidence: kaibo trusts a cited `file:line` rather than re-deriving it, and
-    /// spends its turns getting more where the context runs out. Prefer a prose
-    /// summary of intent over a raw diff — kaibo reads the current code itself.
+    /// Optional starting evidence — a change/diff *summary* or pasted source kaibo can't
+    /// reach. Trusted: kaibo extends it rather than re-deriving cited spans. Prefer a prose
+    /// summary of intent over a raw diff.
     #[serde(default)]
     pub context: Option<String>,
 
-    /// Absolute path to the project to explore. Optional when the server has a
-    /// default root — an explicit `--root`, or the launch cwd inferred when it's
-    /// inside the allowed set. Must be at-or-under an allowed tree; see
-    /// `kaibo://config` for the server's current allowed set and how to widen it.
+    /// Absolute path to the project to explore. Optional when the server has a default
+    /// root; must be at-or-under an allowed tree (`kaibo://config` shows the set).
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Which cast (model team) runs this call; omit for the server's default.
-    /// Pick from this param's `enum` — the casts live right now; `kaibo://config`
-    /// lists every configured cast and backend, with their aliases.
+    /// Which cast (model team) runs this call; omit for the server's default. Pick from
+    /// this param's `enum`; `kaibo://config` lists every cast and backend.
     #[serde(default)]
     pub cast: Option<String>,
 
-    /// Override the explorer (investigation) model id. Sent verbatim — an id
-    /// containing "/" (HuggingFace-style org/model) is still one id. Keeps the
-    /// slot's configured backend unless `explorer_backend` retargets it.
+    /// Override the explorer (investigation) model id. See `kaibo://tools` for override
+    /// semantics (ids are verbatim; pair with `explorer_backend` to also retarget).
     #[serde(default)]
     pub explorer_model: Option<String>,
 
-    /// Run the explorer override on this backend (name or alias) instead of the
-    /// slot's configured one. Requires `explorer_model`; together they replace
-    /// the slot wholesale, so this also works on a role the cast doesn't carry.
+    /// Run the explorer override on this backend (name or alias). Requires
+    /// `explorer_model`. See `kaibo://tools`.
     #[serde(default)]
     pub explorer_backend: Option<String>,
 
-    /// Override the synthesizer (final-answer) model id. Sent verbatim — an id
-    /// containing "/" is still one id. Keeps the slot's configured backend
-    /// unless `synth_backend` retargets it.
+    /// Override the synthesizer (final-answer) model id. See `kaibo://tools` for override
+    /// semantics (pair with `synth_backend` to also retarget).
     #[serde(default)]
     pub synth_model: Option<String>,
 
-    /// Run the synth override on this backend (name or alias) instead of the
-    /// slot's configured one. Requires `synth_model`; together they replace the
-    /// slot wholesale, so this also works on a role the cast doesn't carry.
+    /// Run the synth override on this backend (name or alias). Requires `synth_model`.
+    /// See `kaibo://tools`.
     #[serde(default)]
     pub synth_backend: Option<String>,
 
-    /// Opaque session id to make this a multi-turn consult. When set, kaibo replays
-    /// this session's prior `(question, answer)` pairs as context and records this
-    /// turn into it; the exploration still runs fresh. Omit it for a stateless,
-    /// one-shot consult. Sessions are evicted by capacity, not time.
+    /// Opaque session id for a multi-turn consult: kaibo replays this session's prior
+    /// `(question, answer)` pairs and records this turn; exploration still runs fresh.
+    /// Omit for a stateless call. Sessions are evicted by capacity, not time.
     #[serde(default)]
     pub session_id: Option<String>,
 
@@ -172,29 +167,20 @@ pub struct ConsultInput {
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
 
-    /// Max tool-loop turns for the consult driver loop itself (default 100 — it now
-    /// drives the whole investigation, delegating sweeps and reading spans).
+    /// Max tool-loop turns for the consult driver loop itself (default 100).
     #[serde(default)]
     pub synth_max_turns: Option<usize>,
 
-    /// Surface the explorer's aggregated report (the `explore′` sweeps the consult
-    /// delegated) as `structured_content` alongside the answer. Off by default: the
-    /// report can be large and most clients feed structured content to the model, so
-    /// a normal consult stays lean — opt in for "show your work" / debugging the
-    /// hand-off. When on, the report rides separately and is surfaced even if empty
-    /// (an empty report is itself the signal that the consult delegated no sweep).
+    /// Attach the explorer's aggregated report as `structured_content` alongside the
+    /// answer, for debugging the hand-off. Off by default (it can be large; an empty
+    /// report means the consult delegated no sweep).
     #[serde(default)]
     pub include_report: bool,
 
-    /// Workspace files to put in front of the investigation — absolute or relative
-    /// (relative reads from the project root) paths that must live **under the project
-    /// root** so the consult can reach them through its read-only shell. Unlike
-    /// `oneshot`/`batch` attach, kaibo does **not** inline these — it names them in the
-    /// investigation prompt and the consult model reads them itself (`cat -n`) when it's
-    /// ready, in full, building its own narrative. Use it to hand the consult a focus —
-    /// "review this diff" with `["changes.diff"]` (write it under the repo first), or the
-    /// specific files a question centers on — without pasting their bytes into your
-    /// context. A path outside the root, a directory, or a missing file is a clear error.
+    /// Workspace files (under the project root or a followed git worktree) to put in front
+    /// of the investigation. kaibo names them and the consult model reads them itself (not
+    /// inlined) — hand it the files a question centers on, or the whole files a change
+    /// touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 }
@@ -204,11 +190,9 @@ pub struct ConsultInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandleInput {
-    /// The handle of the async work to act on. Two shapes, told apart by the `/`:
-    /// a **batch** handle from `batch_submit` is `backend/provider-id` (e.g.
-    /// `anthropic/msgbatch_…`, durable — survives a restart); a **consult** handle from
-    /// `consult_submit` is `job-N` (e.g. `job-1`, in-memory — lives only for this server
-    /// session). kaibo routes by the handle, so you pass the same one you were given.
+    /// The handle of the async work to act on — a `backend/provider-id` batch (durable) or
+    /// a `job-N` consult (this session). kaibo routes by the handle, so pass back the one
+    /// you were given. See `kaibo://tools`.
     pub handle: String,
 }
 
@@ -218,42 +202,29 @@ pub struct HandleInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OneshotInput {
-    /// The prompt to send the model. There's no codebase access on this call, so
-    /// include whatever context the answer needs (pasted source, a spec, the data) —
-    /// the model answers from this and its own knowledge, nothing else.
+    /// The prompt to send the model. No codebase access on this call, so include whatever
+    /// context the answer needs (or `attach` files) — the model answers from this and its
+    /// own knowledge.
     pub prompt: String,
 
-    /// Workspace files to inline as context for the prompt — absolute or relative paths
-    /// under the allowed set (same boundary as `path` elsewhere; worktrees included).
-    /// kaibo reads each file and inlines it so its bytes never pass through your context.
-    /// Prefer **whole files**: a tool-less model has no way to go read the repo itself, so
-    /// give it the full file(s) it needs — `["README.md", "src/server.rs"]` — not a snippet.
-    /// Top-tier models carry very large context windows (1M+ tokens), so don't be stingy —
-    /// attach whole files, even several, rather than trimming; it has plenty of room to work
-    /// with the full source. (A `git diff > changes.diff` then `["changes.diff"]` works for
-    /// reviewing *uncommitted* changes, but a diff is leaner context than the files
-    /// themselves.) The same surface as `batch_submit`'s `attach`, on the interactive
-    /// (synchronous) call. Text files splice in
-    /// as text; images (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
-    /// model). A path outside the workspace, a directory, an oversized file, or a binary that
-    /// isn't a known image is refused with a clear error. Omit for none.
+    /// Workspace files to inline as context — kaibo reads them so their bytes never pass
+    /// through your context. Prefer **whole files** (a tool-less model can't read the repo
+    /// itself); images need a vision-capable model. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 
-    /// Which cast (model team) runs this call; omit for the server's default. Pick
-    /// from this param's `enum` — the casts live right now; `kaibo://config` lists
-    /// every configured cast and backend, with their aliases. kaibo runs the cast's
-    /// capable (synth) model.
+    /// Which cast (model team) runs this call; omit for the server's default. kaibo runs
+    /// the cast's capable (synth) model. `kaibo://config` lists the casts.
     #[serde(default)]
     pub cast: Option<String>,
 
-    /// Override the model id. Sent verbatim — an id containing "/" is still one id.
-    /// Keeps the slot's configured backend unless `backend` retargets it.
+    /// Override the model id. See `kaibo://tools` for override semantics (pair with
+    /// `backend` to also retarget).
     #[serde(default)]
     pub model: Option<String>,
 
-    /// Run the model override on this backend (name or alias) instead of the
-    /// slot's configured one. Requires `model`.
+    /// Run the `model` override on this backend (name or alias). Requires `model`.
+    /// See `kaibo://tools`.
     #[serde(default)]
     pub backend: Option<String>,
 }
@@ -263,42 +234,29 @@ pub struct OneshotInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BatchSubmitInput {
-    /// The prompts to fan out, one batch item each. Like `oneshot`, there's no
-    /// codebase access — each prompt carries its own context; the model answers from
-    /// it and its own knowledge. Batch runs them at max thinking, so it's the lane for
-    /// hard questions you're willing to wait on.
+    /// The prompts to fan out, one batch item each. Like `oneshot`, no codebase access —
+    /// each prompt carries its own context (or `attach` shared files). Run at max thinking,
+    /// for hard questions you'll wait on.
     pub prompts: Vec<String>,
 
-    /// Workspace files to inline as shared context for *every* prompt in the batch —
-    /// absolute or relative paths under the allowed set (same boundary as `path`
-    /// elsewhere; worktrees included). kaibo reads each file and inlines it so its bytes
-    /// never pass through your context. Prefer **whole files**: a tool-less model has no way
-    /// to go read the repo itself, so give it the full file(s) it needs —
-    /// `["README.md", "src/server.rs"]` — not a snippet. Top-tier models carry very large
-    /// context windows (1M+ tokens), so don't be stingy — attach whole files, even several,
-    /// rather than trimming. (A `git diff > changes.diff` then `["changes.diff"]` works for
-    /// reviewing *uncommitted* changes, but a diff is leaner context than the files
-    /// themselves.) Text files splice in as text; images
-    /// (png/jpeg/gif/webp) ride as native image parts (needs a vision-capable
-    /// synth model). A path outside the workspace, a directory, an oversized file, or a
-    /// binary that isn't a known image is refused with a clear error. Omit for none.
+    /// Workspace files to inline as shared context for *every* prompt — kaibo reads them so
+    /// their bytes never pass through your context. Prefer **whole files**; images need a
+    /// vision-capable synth model. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 
-    /// Which cast (model team) runs the batch; omit for the server's default. Batch
-    /// uses the cast's capable (synth) model on a batch-capable backend; `kaibo://config`
-    /// lists the casts.
+    /// Which cast (model team) runs the batch; omit for the server's default. Uses the
+    /// cast's synth model on a batch-capable backend. `kaibo://config` lists the casts.
     #[serde(default)]
     pub cast: Option<String>,
 
-    /// Override the synth model id. Sent verbatim — an id containing "/" is still one
-    /// id. Keeps the cast's backend unless `backend` retargets it. Reach for this to
-    /// batch a top-tier model the cast synths something cheaper for interactive use.
+    /// Override the synth model id — reach for it to batch a top-tier model the cast synths
+    /// cheaper for interactive use. See `kaibo://tools`.
     #[serde(default)]
     pub model: Option<String>,
 
-    /// Run the `model` override on this backend (name or alias) instead of the cast's.
-    /// Requires `model`. Must be a batch-capable backend.
+    /// Run the `model` override on this backend (name or alias). Requires `model`; must be
+    /// batch-capable. See `kaibo://tools`.
     #[serde(default)]
     pub backend: Option<String>,
 }
@@ -309,19 +267,15 @@ pub struct BatchSubmitInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListInput {
-    /// Which backend (name or alias) to list batches from. Omit to list across every
-    /// configured batch-capable backend — the orphan-recovery default when you've lost a
-    /// handle and don't recall which backend ran it. Does not affect the consult-jobs
-    /// section, which is always shown.
+    /// Which backend (name or alias) to list batches from. Omit to sweep every
+    /// batch-capable backend (orphan recovery for a lost handle). Does not affect the
+    /// consult-jobs section, which is always shown.
     #[serde(default)]
     pub backend: Option<String>,
 
-    /// Show *all* batches, including ones created more than 24h ago. By default the
-    /// batches section is trimmed to the last 24 hours (a provider keeps months of
-    /// finished batches, and dumping them all just burns tokens — the offline SLA is
-    /// ≤24h, so anything older is done and still collectible by its handle). Set
-    /// `all: true` for the full history — true orphan recovery of an old batch. A batch
-    /// kaibo can't date (no timestamp) is always shown, never silently hidden.
+    /// Show *all* batches, including ones older than 24h. By default the batches section is
+    /// trimmed to the last 24 hours (older ones are done and still collectible by their
+    /// handle); set `all: true` for the full history. An undateable batch is always shown.
     #[serde(default)]
     pub all: bool,
 }
@@ -331,10 +285,9 @@ pub struct ListInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WaitInput {
-    /// How long to block, in seconds (default 60). You choose — kaibo does not clamp it;
-    /// your client's own tool-call timeout and your ability to interrupt are the real
-    /// bounds. For a very long park, prefer calling `wait` again each time it returns
-    /// over one giant block. A value over 3600 is a loud error, not a silent trim.
+    /// How long to block, in seconds (default 60). No clamp — your client's tool-call
+    /// timeout and your ability to interrupt are the real bounds; over 3600 is a loud
+    /// error. For a long park, prefer calling `wait` again over one giant block.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
@@ -342,16 +295,15 @@ pub struct WaitInput {
     #[serde(default)]
     pub limit: Option<usize>,
 
-    /// The lowest level to return to you: `warn` (default — what kaibo flags as "the
-    /// calling model should see this": a job finished or failed, a research-limit), `info`
-    /// (also the watchable narrative — each kaish command, sweep, milestone), `error`, or
-    /// `debug` (the firehose). Not severity — `warn` is the salience bar, not a problem.
+    /// Lowest level to return: `warn` (default — what kaibo flags for you: a job finished
+    /// or failed), `info` (also the watchable narrative — each kaish command, sweep,
+    /// milestone), `error`, or `debug`. A salience bar, not severity.
     #[serde(default)]
     pub level: Option<String>,
 
-    /// Optional handles to also check this call: a batch handle (`backend/provider-id`)
-    /// is polled once and its current status appended (consult jobs already surface via
-    /// the activity stream). Omit to just drain the activity stream + see running jobs.
+    /// Optional batch handles (`backend/provider-id`) to also poll once this call, status
+    /// appended. Consult jobs already surface via the activity stream. Omit to just drain
+    /// it.
     #[serde(default)]
     pub handles: Vec<String>,
 }
@@ -364,11 +316,9 @@ pub struct RunKaishInput {
     /// The kaish (sh-like) script to run against the read-only project.
     pub script: String,
 
-    /// Absolute path to the project. Optional when the server has a default root
-    /// — an explicit `--root`, or the launch cwd inferred when it's inside the
-    /// allowed set. Must be at-or-under an allowed tree; see
-    /// `kaibo://config` for the server's current allowed set and how to widen it.
-    /// Each call starts at this root — there is no persistent cwd across calls.
+    /// Absolute path to the project. Optional when the server has a default root; must be
+    /// at-or-under an allowed tree (`kaibo://config` shows the set). Each call starts fresh
+    /// at this root — there is no persistent cwd across calls.
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -1201,32 +1151,17 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Ask a model *outside your own family* about a codebase and get \
-            a grounded, cited answer — kaibo is the door to a second opinion from \
-            DeepSeek, Gemini, Anthropic, or a local model. Pick which one answers with \
-            `cast` (e.g. `deepseek`, `gemini`, `anthropic`; the `cast` enum lists the \
-            teams live right now, `kaibo://config` has the full set). A capable model \
-            drives a read-only kaish shell (cat/grep/find/jq/pipelines): it reads \
-            precise spans directly and delegates broad repo sweeps to a fast explorer \
-            sub-agent, then answers with concrete `file:line` citations. It finds and \
-            reads the relevant code itself — describe what you did or want to know \
-            (what you changed and why, the behavior in question) in prose; don't paste \
-            a diff or dump files, kaibo reads the real, current source from disk and \
-            your intent is the part it can't recover on its own. Read-only: it never \
-            modifies the project. For a multi-turn conversation, pass a stable \
-            session_id: kaibo replays that session's prior question/answer pairs (the \
-            exploration still runs fresh each turn). Args: question (required), context \
-            (optional; a change summary or pasted source to seed the investigation — \
-            trusted as starting evidence), path (project dir; optional if the server \
-            has a default root), cast (optional), session_id (optional; opaque \
-            conversation key), attach (optional; workspace files under the project root \
-            to put in front of the investigation — kaibo names them and the model reads \
-            them itself with the shell, no inlining, so 'review this diff' is \
-            attach:[\"changes.diff\"] with no paste), include_report (optional; attach \
-            the explorer's report as structured_content for debugging the hand-off), and \
-            optional explorer_model / synth_model overrides (a model id, sent verbatim; \
-            add explorer_backend / synth_backend to retarget the slot's backend). For a \
-            thin answer with no codebase access, use `oneshot` instead."
+        description = "Ask a model *outside your own family* about a codebase and get a \
+            grounded, cited answer — kaibo is the door to a second opinion from DeepSeek, \
+            Gemini, Anthropic, or a local model. A capable model drives a read-only shell: \
+            it reads precise spans, delegates broad sweeps to a fast explorer sub-agent, \
+            and answers with concrete `file:line` citations. Describe in prose what you \
+            did or want to know — kaibo finds and reads the real, current source itself, so \
+            your intent matters more than a pasted diff. Pick the answering team with \
+            `cast`; pass a stable `session_id` for a multi-turn thread; `attach` workspace \
+            files to focus it. Read-only — it never modifies the project. For a thin answer \
+            with no codebase access use `oneshot`; to run it in the background use \
+            `consult_submit`. See `kaibo://tools` for attachments, casts, and overrides."
     )]
     async fn consult(
         &self,
@@ -1324,20 +1259,14 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Start a `consult` in the background and get back a job id to \
-            collect later — the async sibling of `consult`, the way `batch_submit` is to \
-            `oneshot`. Same investigation (a capable model drives the read-only kaish \
-            shell, reads spans, delegates sweeps, answers with `file:line` citations), \
-            same args as `consult` (question, context, path, cast, session_id, attach, \
-            include_report, model/backend overrides) — it just hands back a handle \
-            instead of holding your turn open while it thinks. Reach for it to run \
-            several consults at once (a cross-model study: submit one per cast, collect \
-            them all) or when a deep consult would otherwise block you: submit, go do \
-            other work, then `get <job-id>` for the answer. Stop one early with \
-            `cancel <job-id>`; see everything in flight with `list`. Returns a job id like \
-            `job-1`; the job lives for this server session only (no restart survival — \
-            collect it before you reconnect). For an answer right now in one call, use \
-            `consult`."
+        description = "Start a `consult` in the background and get back a `job-N` handle \
+            to collect later — the async sibling of `consult` (same investigation, same \
+            args). Reach for it to run several consults at once (a cross-model study: \
+            submit one per cast, collect them all) or when a deep consult would otherwise \
+            block you: submit, go do other work, then `get` the answer (`cancel` stops it, \
+            `list` shows what's in flight, `wait` parks for results). The job lives for \
+            this server session only — collect it before you reconnect. For an answer in \
+            this turn, use `consult`. See `kaibo://tools` for the async workflow."
     )]
     async fn consult_submit(
         &self,
@@ -1443,17 +1372,14 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Ask a model *outside your own family* a thin, direct question \
-            — prompt in, answer out, no codebase access and no tools. The counterpart \
-            to `consult`: use `oneshot` when you already own the context (you've pasted \
-            what's needed, or the question is general) and just want another model's \
-            take; use `consult` when kaibo should investigate a codebase for you. Pick \
-            which model answers with `cast` (e.g. `deepseek`, `gemini`, `anthropic`; \
-            the `cast` enum lists the teams live now, `kaibo://config` has the full \
-            set) — kaibo runs the cast's capable (synth) model. Exactly one upstream \
-            request; you are responsible for any context the model needs. Args: prompt \
-            (required), cast (optional), and an optional model (with optional backend) \
-            override."
+        description = "Ask a model *outside your own family* a thin, direct question — \
+            prompt in, answer out, no codebase access and no tools. The counterpart to \
+            `consult`: use `oneshot` when you already own the context (you've pasted or \
+            `attach`ed what's needed, or the question is general); use `consult` when kaibo \
+            should investigate a codebase. Pick the answering team with `cast` — kaibo runs \
+            its capable (synth) model; you own any context the model needs. To fan many \
+            prompts offline, use `batch_submit`. See `kaibo://tools` for attachments and \
+            overrides."
     )]
     async fn oneshot(
         &self,
@@ -1508,18 +1434,14 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Run a kaish (sh-like) script against the read-only project; \
-            returns exit code + stdout + stderr. Browse code with line numbers, and \
-            read generously — `cat -n FILE` for a whole file (reach for it first), \
-            `grep -rn PATTERN .` to locate across files, `cat -n FILE | sed -n \
-            '40,80p'` for a slice of a large one; compose \
-            builtins with pipes (grep/jq/awk/find/...). Read-only: writes and external \
-            commands are refused (exit 126 = blocked by the sandbox; a script killed \
-            for running too long exits 124). Each call starts at the project root — \
-            there is no persistent cwd. Learn more kaish without spending a turn: the \
-            `kaibo://kaish/*` resources (syntax, builtins, vfs, scatter, …) or run \
-            `help`/`help syntax`/`help <builtin>` in the script itself. Args: script \
-            (required), path (project dir; optional if the server has a default root)."
+        description = "Run a kaish (sh-like) script against the read-only project; returns \
+            exit code + stdout + stderr. Read generously with line numbers — `cat -n FILE` \
+            for a whole file (reach for it first), `grep -rn PATTERN .` to locate across \
+            files, `cat -n FILE | sed -n '40,80p'` for a slice — and compose builtins with \
+            pipes (grep/jq/awk/find/…). Read-only: writes and external commands are refused \
+            (exit 126 = blocked, 124 = timed out); each call starts fresh at the project \
+            root. See `kaibo://tools` and the `kaibo://kaish/*` resources (or `help` in the \
+            script) for kaish idioms and the bash habits that don't carry over."
     )]
     pub async fn run_kaish(
         &self,
@@ -1550,16 +1472,14 @@ impl KaiboHandler {
 
     #[tool(
         description = "Generate an image from a text prompt and return it inline. A \
-            capability tool: no codebase investigation, no shell — kaibo's image model \
-            (the cast's `image` slot) draws what you describe and hands back the picture \
-            as an image plus a short caption. The cast must carry an `image` slot on an \
-            OpenAI-compatible backend (hosted gpt-image/DALL·E, or a local \
-            Stable-Diffusion server speaking /v1/images/generations); see kaibo://config \
-            for the configured casts. The image rides back inline (size-capped); a \
-            picture too large to inline is a clear error, not a silent drop. Args: \
-            prompt (required), cast (optional), size (\"WxH\", default 1024x1024), \
-            image_model (override the slot's model id) + image_backend (retarget it, \
-            works even on a cast with no image slot)."
+            capability tool: no codebase investigation, no shell — the cast's `image` model \
+            draws what you describe and hands back the picture plus a short caption. Runs \
+            the cast's `image` slot — an OpenAI-compatible backend (hosted gpt-image/DALL·E, \
+            or a local Stable-Diffusion server); `image_backend` can retarget to one even on \
+            a cast that carries no image slot, and `kaibo://config` shows which casts qualify \
+            as-is. Takes `size` (\"WxH\", default 1024x1024) plus the usual `cast` / \
+            `image_model` / `image_backend` selectors (see `kaibo://tools`). A picture too \
+            large to inline is a clear error, not a silent drop."
     )]
     pub async fn generate_image(
         &self,
@@ -1689,25 +1609,15 @@ impl KaiboHandler {
 
     #[tool(
         description = "Submit a batch of tool-less questions to run *offline* at max \
-            thinking, and get back a handle to poll — the async sibling of `oneshot`. \
-            Use it to fan many prompts (or one hard question you'll wait on) at a \
-            top-tier model without holding a call open per answer: the provider runs \
-            them on its cheaper batch lane and kaibo hands back the id. Each prompt is \
-            self-contained — no codebase access, no tools (batch can't drive a tool \
-            loop) — so include the context each answer needs, the same as `oneshot`. \
-            Batch maxes the knobs (forces high effort + a generous token budget) \
-            regardless of how the cast was tuned for interactive use. Runs the cast's \
-            synth model on a backend that supports batch; point `cast`/`model` at one (or \
-            get a clear refusal naming the batch-capable backends). `kaibo://config` lists \
-            the casts. Args: prompts (required, a list), cast \
-            (optional), model + backend (optional synth override — handy to batch a \
-            Pro/Opus tier a cast synths cheaper interactively). Returns a handle \
-            (`backend/provider-id`); poll it with `get <handle>`, stop it with \
-            `cancel <handle>`, find a lost one with `list`. This is a fire-and-forget \
-            lane: submit, then go do other work — don't sit in a wait/sleep loop holding \
-            your turn open. A batch can take minutes to hours (the provider's offline \
-            SLA is up to 24h), and the handle is durable — it survives a server restart \
-            — so come back and `get` it later rather than blocking on it now."
+            thinking, and get back a durable `backend/provider-id` handle — the async \
+            sibling of `oneshot`. Fan many prompts (or one hard question) at a top-tier \
+            model on the provider's cheaper batch lane without holding a call open per \
+            answer. Each prompt is self-contained (no codebase access, no tools) — include \
+            the context each needs, or `attach` files. Runs the cast's synth model on a \
+            batch-capable backend (point `cast`/`model` at one, or get a clear refusal \
+            naming them). Fire-and-forget: submit, go do other work, then `get` the handle \
+            (`cancel` stops it, `list` finds a lost one, `wait` parks for results). The \
+            handle survives a server restart. See `kaibo://tools` for the async workflow."
     )]
     pub async fn batch_submit(
         &self,
@@ -1782,15 +1692,12 @@ impl KaiboHandler {
 
     #[tool(
         description = "Collect a submitted async job by its handle — the one surface for \
-            both `batch_submit` and `consult_submit`. kaibo tells the two apart by the \
-            handle: a **batch** handle is `backend/provider-id` (durable; this polls the \
-            provider, returning a progress line while it runs and every item's answer — \
-            labelled by index, per-item failures surfaced — once it's done), and a \
-            **consult** handle is `job-N` (in-memory, this session; returns a status line \
-            while it investigates, then the full grounded answer with its provenance \
-            footer, or the failure reason). Either way: collect occasionally, not in a \
-            tight loop — if it's still working, go do other work and check back; nothing \
-            is lost by waiting. Args: handle (from `batch_submit` or `consult_submit`)."
+            both `batch_submit` and `consult_submit`. kaibo tells the two apart by handle \
+            shape (`backend/provider-id` is a durable batch; `job-N` is an in-memory \
+            consult) and returns a progress line while it works, the full result once it's \
+            done (batch: every item's answer, labelled by index, per-item failures \
+            surfaced). Collect occasionally, not in a tight loop — nothing is lost by \
+            waiting. See `kaibo://tools` for the async workflow."
     )]
     async fn get(
         &self,
@@ -1827,12 +1734,11 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Stop a running async job by its handle — works for both kinds. A \
-            **batch** handle (`backend/provider-id`) tells the provider to stop scheduling \
-            new requests (any already in flight finish); `get` it afterward for the final \
-            per-item results. A **consult** handle (`job-N`) aborts the investigation; \
-            `get` it afterward and it reports canceled. A job that already finished is \
-            left alone. Args: handle (from `batch_submit` or `consult_submit`)."
+        description = "Stop a running async job by its handle — works for both kinds \
+            (`backend/provider-id` batch or `job-N` consult). A batch stops scheduling new \
+            requests (any in flight finish); a consult aborts the investigation; `get` it \
+            afterward for the final state. A job that already finished is left alone. See \
+            `kaibo://tools` for the async workflow."
     )]
     async fn cancel(
         &self,
@@ -1876,19 +1782,13 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "List your async work — both the consult jobs in flight this session \
-            and the batches the providers still know about — each with a ready-to-use \
-            handle for `get` / `cancel`. The consult-jobs section is in-memory (this \
-            session only); the batches section is the way back to a batch whose handle you \
-            lost (kaibo holds no state — the provider's own list is the source of truth). \
-            By default the batches section shows only the **last 24 hours** — a provider \
-            keeps months of finished batches and listing them all just burns tokens, and \
-            anything older is done and still collectible by its handle; pass `all: true` \
-            for the full history (true orphan recovery of an old batch). `backend` scopes \
-            only the batches section (omit it to sweep every batch-capable backend); \
-            consult jobs are always shown in full. An unreachable backend is reported \
-            rather than hiding the rest. Args: backend (optional), all (optional, default \
-            false)."
+        description = "List your async work — the consult jobs in flight this session and \
+            the batches the providers still know about — each with a ready-to-use handle \
+            for `get`/`cancel`. The way back to a batch whose handle you lost (kaibo holds \
+            no state — the provider's own list is the source of truth). By default the \
+            batches section shows the last 24h; pass `all: true` for the full history. \
+            `backend` scopes only the batches section. An unreachable backend is reported, \
+            not hidden. See `kaibo://tools` for the async workflow."
     )]
     async fn list(
         &self,
@@ -1972,20 +1872,13 @@ impl KaiboHandler {
     #[tool(
         description = "Block briefly for your async work to make progress, then return \
             what happened — the way to *productively park* instead of blind-polling `get`. \
-            Fire off consults (`consult_submit`) and batches (`batch_submit`), do your \
-            other work (your own sub-agents included), then call `wait` when you're ready \
-            to spend a minute on kaibo: it blocks up to `timeout_secs` (you choose; no \
-            clamp — you can always interrupt) and returns as soon as something lands, or \
-            on a clean timeout. By default it hands back the records kaibo flagged for you \
-            (a job finished or failed, a research-limit) plus which consult jobs are still \
-            running; pass `level:\"info\"` to also pull the watchable narrative (each kaish \
-            command, sweep, and milestone the agents ran) into your context. Name batch \
-            handles in `handles` to fold their current status in too (kaibo polls them \
-            once). Nothing here wakes you — you choose when to block — and it's not the \
-            source of truth: `get`/`list` are. A clean empty return just means nothing new \
-            yet; `wait` again to keep parking. Args: timeout_secs (optional, default 60), \
-            limit (optional, default 20), level (optional: warn|info|error|debug), handles \
-            (optional list to also poll)."
+            Submit consults and batches, do your other work, then `wait`: it blocks up to \
+            `timeout_secs` (you choose; no clamp) and returns as soon as something lands or \
+            on a clean timeout. By default it hands back what kaibo flagged for you (a job \
+            finished or failed) plus which consults are still running; `level:\"info\"` \
+            also pulls the watchable narrative (each kaish command, sweep, milestone). Name \
+            batch `handles` to fold their status in. `get`/`list` are the source of truth; \
+            nothing here wakes you, and nothing is lost by waiting. See `kaibo://tools`."
     )]
     async fn wait(
         &self,
@@ -2289,6 +2182,13 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
             "kaibo read-only sandbox",
             "kaibo's read-only boundary: line-number browsing idioms and the exit-code contract.",
         ),
+        markdown_resource(
+            TOOLS_URI,
+            "kaibo: using the tools",
+            "How to wield kaibo's tools well: attachments, picking a cast/model, the \
+             sync↔async pairs and their handles, and read-only-shell idioms. The tool \
+             schemas stay terse and point here.",
+        ),
     ];
     for (topic, description) in topics() {
         resources.push(markdown_resource(
@@ -2431,9 +2331,141 @@ fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
 
 /// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
 /// one kaibo serves. Pure and offline-testable; the handler wraps the result.
+/// The body of the `kaibo://tools` resource. Written generously and positively (the
+/// AGENTS.md house style): name the good idiom, say the high-value things a couple of
+/// ways, and reserve the few "no"s for habits a calling model carries in from `bash`
+/// that genuinely won't work here. This is the long-form home for guidance the tool
+/// schemas only gesture at, so it can afford the repetition the schemas can't.
+const TOOLS_DOC: &str = "\
+# Using kaibo's tools
+
+kaibo lends your work a second opinion from models *outside your own family*, and a
+read-only window into a codebase. The tool schemas stay terse on purpose; this is the
+longer guide to wielding them well. Read it once and you'll pick the right tool and the
+right arguments by feel.
+
+## Hand a model files without pasting them: `attach`
+
+Every path you `attach` is read by kaibo, under its read-only boundary — the bytes never
+pass back through *your* context. That's the whole point: keep your context lean, let
+kaibo carry the files. Two shapes, by tool:
+
+- **`consult` / `consult_submit` — named, not inlined.** The consult model has its own
+  shell, so kaibo simply *names* your attached files in the investigation prompt and the
+  model reads them itself (`cat -n`), in full, when it's ready. Hand it the files a
+  question centers on as a focus: `attach: [\"src/server.rs\", \"src/sandbox.rs\"]`. These
+  are text files it reads with the shell — for an image, reach for `oneshot` / `batch_submit`,
+  whose `attach` carries it as a native vision part.
+- **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
+  read the repo — so kaibo splices the file bytes straight into the prompt. Give them the
+  *whole* file(s): `[\"README.md\", \"src/server.rs\"]`, not a snippet. Top-tier models
+  carry very large context windows (1M+ tokens), so be generous — attach whole files,
+  several if they're relevant, rather than trimming. The model has room to work; let it
+  see the full picture. Text files splice in as text; images (png/jpeg/gif/webp) ride as
+  native image parts and want a vision-capable model (`kaibo://config` shows each slot's
+  `vision`).
+
+Prefer whole files to excerpts, and a prose summary of *intent* to a raw paste — your
+intent is the part kaibo can't recover from the source itself. **Reviewing a change?**
+Lead with the whole files it touched and describe what you did; the answering models tend
+to review better from the full files than from a diff alone. A diff can ride along to
+point at the moved lines (`git diff > changes.diff` under the repo, then attach it), but
+prefer the files — the diff is a pointer, not the context. Paths resolve under kaibo's
+allowed set: the project root, plus any linked git worktree kaibo is following — a
+sibling-branch checkout next to the repo just works, and `kaibo://config` shows the live
+set. A path outside that set, a directory, a missing file, an oversized file, or a binary
+that isn't a known image is refused with a clear error — kaibo tells you, it doesn't drop
+it silently.
+
+## Pick the team: `cast`, and per-call model overrides
+
+A **cast** is a model team. Omit `cast` for the server's default, or name one — the
+`cast` parameter's enum lists the casts live right now, and `kaibo://config` has the full
+roster with every backend and alias. Picking a cast from a *different* family than the one
+you're running is the whole value: a fresh set of eyes on your work.
+
+For a one-off without editing config, override the model on the call itself:
+
+- `consult` / `consult_submit`: `explorer_model` (+ `explorer_backend`) and/or
+  `synth_model` (+ `synth_backend`).
+- `oneshot` / `batch_submit`: `model` (+ `backend`).
+- `generate_image`: `image_model` (+ `image_backend`).
+
+A model id is sent **verbatim** — an id with a `/` in it (HuggingFace-style
+`org/model-name`) is still one id, not a path. The `*_model` override keeps the slot's
+configured backend; pair it with the matching `*_backend` (`synth_backend`, `backend`,
+`image_backend`, …) to retarget the slot to a different connection wholesale — which also
+lets you fill a role the cast doesn't otherwise carry.
+
+## Answer now, or hand off and collect later
+
+Each investigation/answer tool comes in a synchronous form and an async sibling. Use the
+sync form when you want the answer in this turn; reach for the async form to run several
+at once, or when a deep job would otherwise block you.
+
+- **`consult` → `consult_submit`.** Same investigation, but submit hands back a job
+  handle and runs in the background. Great for a cross-model study: submit one per cast,
+  go do other work, collect them all.
+- **`oneshot` → `batch_submit`.** Same toolless answer, but batch fans many prompts onto
+  the provider's cheaper offline lane at max thinking, and hands back a handle.
+
+**Handles tell you their kind by shape**, and you pass back whatever you were given:
+
+- A **consult** handle is `job-N` (e.g. `job-1`). It's in-memory — it lives for *this*
+  server session only, so collect it before you reconnect.
+- A **batch** handle is `backend/provider-id` (e.g. `anthropic/msgbatch_…`). It's durable
+  — it survives a server restart, so you can always come back for it.
+
+One small surface drives both kinds:
+
+- **`get <handle>`** collects a job — a progress line while it works, the full answer once
+  it's done (batch: every item's answer, labelled by index, per-item failures surfaced).
+- **`cancel <handle>`** stops a running job. A job that already finished is left alone.
+- **`list`** shows everything: consult jobs in flight this session, and the batches the
+  providers still know about — the way back to a handle you've lost. By default the
+  batches section shows the last 24h (anything older is done and still collectible by its
+  handle); pass `all: true` for the full history.
+- **`wait`** is how you *productively park*: submit your async work, do your other work,
+  then call `wait` to block briefly (up to `timeout_secs` — your choice, to a 3600s
+  ceiling) and return as soon
+  as something lands — or on a clean timeout. By default it hands back what kaibo flagged
+  for you (a job finished or failed); pass `level: \"info\"` to also pull in the watchable
+  narrative — each kaish command, sweep, and milestone the agents ran.
+
+This is a fire-and-forget lane. Submit, then go do other work — don't sit in a tight
+poll/sleep loop holding your turn open. `wait` when you're ready to spend a minute;
+`get`/`list` are the source of truth. Nothing here wakes you, and nothing is lost by
+waiting — the handles keep.
+
+## Driving the read-only shell (`run_kaish`)
+
+`run_kaish` runs a kaish (sh-like) script against the project and returns exit code +
+stdout + stderr. Lead with the idioms that produce accurate `file:line`s: `cat -n FILE`
+to read a whole file (reach for it first), `grep -rn PATTERN .` to locate across files,
+`cat -n FILE | sed -n '40,80p'` for a slice of a large one. Compose builtins with pipes
+(`grep`/`jq`/`awk`/`find`/…). Each call starts fresh at the project root.
+
+A few habits from `bash` that *won't* carry over here — reach for the kaish form instead:
+
+- `$VAR` is **one word**, always — kaish never splits it on whitespace. When you actually
+  want to split, use the `split` builtin; that's the deliberate form.
+- Adjacent tokens don't paste together — quote to join: `\"$dir/file.txt\"`, not
+  `$dir/file.txt`.
+- This shell is **read-only**: a write, a redirect that would create a file, or an
+  external command is refused (exit 126 = blocked by the sandbox; 124 = killed for running
+  too long). That's the boundary working, not a bug — read freely, and don't try to mutate.
+
+Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
+vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
+`help <builtin>` right in the script.
+";
+
 fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     if uri == SANDBOX_URI {
         return Some(kaibo_sandbox_doc());
+    }
+    if uri == TOOLS_URI {
+        return Some(TOOLS_DOC.to_string());
     }
     if let Some(name) = uri.strip_prefix(BUILTIN_PREFIX) {
         // An unregistered builtin is a miss (not-found), not an "unknown topic" stub.
@@ -3887,6 +3919,41 @@ mod tests {
             text.contains("Variables"),
             "syntax topic should cover Variables:\n{text}"
         );
+    }
+
+    /// The schemas point at `kaibo://tools` for the long-form guidance they no longer
+    /// carry, so the resource must be both advertised (a client can discover it) and
+    /// readable, and it must actually hold the guidance that moved out of the schemas:
+    /// the attachment semantics, the override mechanics, and the async handle shapes. If
+    /// any of these drift out of the doc, a caller following the schema's pointer lands
+    /// on a page that no longer answers the question the terse schema deferred.
+    #[test]
+    fn tools_doc_is_advertised_and_carries_the_moved_guidance() {
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        assert!(
+            uris.iter().any(|u| u == TOOLS_URI),
+            "must advertise the tools doc, got {uris:?}"
+        );
+        let text = read_text(TOOLS_URI, &[]);
+        for needle in [
+            "attach",          // the attachment guidance moved here
+            "inlined",         // the consult-vs-oneshot attach distinction
+            "whole file",      // the toolless-model whole-files steer
+            "verbatim",        // the model-id override semantics
+            "_backend",        // the retarget-the-slot mechanic
+            "job-N",           // the consult handle shape
+            "backend/provider-id", // the batch handle shape
+            "fire-and-forget", // the async-workflow framing
+            "read-only",       // the kaish shell boundary
+            "126",             // the exit-code contract
+            "worktree",        // attach/path reaches a followed git worktree
+            "Reviewing a change", // prefer whole files over a diff for review
+        ] {
+            assert!(
+                text.contains(needle),
+                "tools doc must cover {needle:?}:\n{text}"
+            );
+        }
     }
 
     #[test]

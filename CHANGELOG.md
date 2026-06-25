@@ -127,6 +127,13 @@ the git log. Each later release appends a new section at the top.
   tunable the slot's resolved model shape will never send (an `inert_tunables` list —
   e.g. a `thinking_budget` on an effort-only model, an `effort` on a budget-only one),
   so a no-op knob is visible to the operator instead of rendering as if effective.
+- **`kaibo://tools` resource — the long-form guide to wielding the tools.** Attachments
+  (named-for-the-shell on `consult` vs inlined on `oneshot`/`batch`), picking a `cast`
+  and per-call model/backend overrides, the sync↔async pairs and their handle shapes
+  (`job-N` vs `backend/provider-id`), and the read-only shell's idioms — including the
+  `bash` habits that don't carry over. The tool schemas themselves are now terse and
+  point here, so the depth a calling model needs loads on demand instead of riding in
+  every agent's startup context (~40% lighter tool descriptions at connect time).
 - **Zero-config workspace root.** When no `--root` is set, kaibo adopts its launch
   cwd as the inferred default root (it already scoped containment to that cwd, and
   MCP clients start stdio servers with cwd = workspace), so a call may omit `path`
