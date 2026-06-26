@@ -62,6 +62,21 @@ struct Args {
     #[arg(long)]
     no_follow_worktrees: bool,
 
+    /// Where capability tools (generate_image) write their artifacts. A kaibo-owned
+    /// dir, default $XDG_CACHE_HOME/kaibo (else ~/.cache/kaibo). Written handler-side,
+    /// never through kaish; also mounted read-only into kaish so a later consult can
+    /// read a generated artifact back. Also settable via KAIBO_OUT_DIR or
+    /// [server] out_dir (those expand a leading `~`/`$VAR`; on the CLI your shell does).
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+
+    /// Don't make the artifact out-dir readable: skip mounting it into kaish and keep it
+    /// out of the containment allowed-set. kaibo still writes artifacts there and returns
+    /// the path, but won't read them back (no consult read-back, no out-dir `attach`).
+    /// Also settable via KAIBO_NO_OUT_DIR_READABLE or [server] out_dir_readable = false.
+    #[arg(long = "no-out-dir-read")]
+    no_out_dir_read: bool,
+
     /// Default cast when a call omits it (a built-in name or a cast defined in
     /// config.toml). Built-ins: anthropic | deepseek | gemini | openai-local
     /// (plus aliases: claude, google, local, …) and the batch casts gemini-batch
@@ -142,6 +157,8 @@ async fn main() -> Result<()> {
         args.no_follow_worktrees,
         args.project_context_file.clone(),
         args.user_context_file.clone(),
+        args.out_dir.clone(),
+        args.no_out_dir_read,
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
@@ -206,10 +223,54 @@ async fn main() -> Result<()> {
     // build — a typo must crash here, not silently leave the builtin enabled.
     config.validate_against_builtins(&kaibo::sandbox::builtin_names()?)?;
 
+    // Artifact out-dir startup handling — only when a capability can write there. The
+    // read surface + its safety are documented on `Config::out_dir`; here we (1) warn on
+    // the two risky shapes that aren't hard-refused, then (2) pre-create the dir so the
+    // read-back mount is present from the first call (it's decided at kernel-build time and
+    // skipped if the dir is absent, which would otherwise miss a long-lived consult session
+    // started before the first generate_image). Creation failure isn't fatal —
+    // `write_artifact` retries and fails loudly at call time.
+    if config.tools.generate_image {
+        // `$HOME` as the out-dir read-mounts adjacent secrets (`~/.ssh`, key files) into
+        // kaish — warn, but don't refuse (a deliberate broad home cache is the user's call).
+        if std::env::var_os("HOME")
+            .is_some_and(|h| config.out_dir.as_path() == std::path::Path::new(&h))
+        {
+            tracing::warn!(
+                out_dir = %config.out_dir.display(),
+                "out_dir is your home directory — it's mounted read-only into kaish, so a \
+                 consult can read (and send to a model) anything under it, including \
+                 adjacent secrets. Prefer a narrow kaibo-owned dir (default $XDG_CACHE_HOME/kaibo)."
+            );
+        }
+        // The shared-temp fallback (no XDG/HOME) defaulted read-back off (see
+        // `DefaultOutDir::SharedTemp`); tell the operator how to restore it. Detected by the
+        // forced-off readable on a temp-rooted dir.
+        if !config.out_dir_readable && config.out_dir.starts_with(std::env::temp_dir()) {
+            tracing::warn!(
+                out_dir = %config.out_dir.display(),
+                "no XDG cache or HOME found — artifacts go to a shared system temp dir and \
+                 read-back into kaish is disabled (a shared temp isn't safe to auto-mount). \
+                 generate_image still works and returns the path; to enable consult read-back \
+                 / out-dir attach, set KAIBO_OUT_DIR (or [server] out_dir) to a kaibo-owned \
+                 directory."
+            );
+        }
+        if let Err(e) = std::fs::create_dir_all(&config.out_dir) {
+            tracing::warn!(
+                out_dir = %config.out_dir.display(),
+                error = %e,
+                "could not pre-create the artifact out-dir; generate_image will retry at \
+                 call time and fail loudly there if it still can't write"
+            );
+        }
+    }
+
     tracing::info!(
         cast = %config.default_cast,
         root = ?config.root.as_ref().map(|p| p.display().to_string()),
         allow_paths = ?config.allow_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        out_dir = %config.out_dir.display(),
         backends = ?config.backends.keys().collect::<Vec<_>>(),
         casts = ?config.casts.keys().collect::<Vec<_>>(),
         gating = ?config.tools,

@@ -392,3 +392,124 @@ fn builtin_schemas_enumerate_the_read_toolbox() {
         );
     }
 }
+
+// --- artifact out-dir read-back mount ----------------------------------------
+//
+// A capability writes its artifact to the out-dir (handler-side `std::fs`); the
+// out-dir is mounted *read-only* into the kernel so a later consult/run_kaish can read
+// it back. These pin the three properties that matter: the read-back works, it is
+// read-*only* (kaish still can't write the out-dir), and it widens read-*scope* to the
+// out-dir alone — never its siblings. Non-dotted tempdir prefixes so the absolute paths
+// don't trip kaish's dot-filename tokenization.
+
+/// Build a `SandboxConfig` whose only non-default field is the artifact out-dir.
+fn sandbox_with_out_dir(out_dir: &std::path::Path) -> SandboxConfig {
+    SandboxConfig {
+        out_dir: Some(out_dir.to_path_buf()),
+        ..SandboxConfig::default()
+    }
+}
+
+/// A generated artifact in the out-dir is readable back through kaish — the whole point
+/// of the read-only mount (a consult can inspect what `generate_image` produced).
+#[tokio::test(flavor = "current_thread")]
+async fn out_dir_artifacts_are_readable() {
+    let proj = tempfile::Builder::new()
+        .prefix("kaibo-proj")
+        .tempdir()
+        .unwrap();
+    let out = tempfile::Builder::new()
+        .prefix("kaibo-out")
+        .tempdir()
+        .unwrap();
+    let artifact = out.path().join("kaibo-image-1-2-3.png");
+    fs::write(&artifact, b"PNGBYTESHERE").unwrap();
+
+    let kernel =
+        build_readonly_kernel_with(proj.path(), &sandbox_with_out_dir(out.path())).unwrap();
+    let r = run(&kernel, &format!("cat {}", artifact.display()))
+        .await
+        .unwrap();
+
+    assert!(
+        r.ok(),
+        "reading an out-dir artifact must succeed, got {r:?}"
+    );
+    assert!(
+        r.text_out().contains("PNGBYTESHERE"),
+        "the artifact bytes must come back, got {:?}",
+        r.text_out()
+    );
+}
+
+/// The out-dir mount is **read-only**: kaish cannot write into it. The handler owns the
+/// only write path (`std::fs`); this proves the read-back mount didn't open a kaish
+/// write surface. Teeth: mount it with `LocalFs::new` instead of `read_only` and the
+/// write lands — the read-only mount is the only thing refusing it.
+#[tokio::test(flavor = "current_thread")]
+async fn out_dir_is_read_only_to_kaish() {
+    let proj = tempfile::Builder::new()
+        .prefix("kaibo-proj")
+        .tempdir()
+        .unwrap();
+    let out = tempfile::Builder::new()
+        .prefix("kaibo-out")
+        .tempdir()
+        .unwrap();
+
+    let kernel =
+        build_readonly_kernel_with(proj.path(), &sandbox_with_out_dir(out.path())).unwrap();
+    let target = out.path().join("kaish-wrote-this.txt");
+    let r = run(&kernel, &format!("echo pwned > {}", target.display()))
+        .await
+        .unwrap();
+
+    assert!(
+        !r.ok(),
+        "a write into the read-only out-dir must be refused, got {r:?}"
+    );
+    assert!(
+        r.err.contains("read-only"),
+        "the refusal should cite the read-only mount, got {r:?}"
+    );
+    assert!(
+        !target.exists(),
+        "kaish must not create a real file in the out-dir"
+    );
+}
+
+/// The read-back mount widens read-*scope* to the out-dir **only** — never its parent
+/// or siblings. A secret in a sibling directory (outside both the project and the
+/// out-dir) must stay unreadable: it routes to the `/` MemoryFs scratch and the bytes
+/// never surface. This is why the out-dir default is a kaibo-owned subdir, not bare
+/// `/tmp` — mounting the narrow dir can't expose a neighbor.
+#[tokio::test(flavor = "current_thread")]
+async fn out_dir_mount_does_not_expose_siblings() {
+    let proj = tempfile::Builder::new()
+        .prefix("kaibo-proj")
+        .tempdir()
+        .unwrap();
+    let out = tempfile::Builder::new()
+        .prefix("kaibo-out")
+        .tempdir()
+        .unwrap();
+    // A sibling of the out-dir, outside every mount. Its secret must stay invisible.
+    let sibling = tempfile::Builder::new()
+        .prefix("kaibo-sib")
+        .tempdir()
+        .unwrap();
+    let secret = sibling.path().join("secret.txt");
+    fs::write(&secret, b"SECRETLEAKMARKER").unwrap();
+
+    let kernel =
+        build_readonly_kernel_with(proj.path(), &sandbox_with_out_dir(out.path())).unwrap();
+    let r = run(&kernel, &format!("cat {}", secret.display()))
+        .await
+        .unwrap();
+
+    assert!(
+        !r.text_out().contains("SECRETLEAKMARKER"),
+        "a sibling of the out-dir must not be readable, got {:?}",
+        r.text_out()
+    );
+}

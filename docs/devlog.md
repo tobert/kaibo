@@ -14,6 +14,94 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-26 — Artifact out-dir: `generate_image` writes a file, hands back the path
+
+The narrow *specific-tool* write the RW-mount deferral pointed at, now built.
+`generate_image` no longer streams a base64 blob inline; it writes the image to a
+kaibo-owned **out-dir** and returns the absolute path. The caller's context pays nothing
+for a multi-MiB picture until it chooses to open the file — and a generated image is an
+artifact worth keeping, so a durable home beats an inline blob that evaporates.
+
+**The shape, and what we rejected getting there (conversation w/ Amy).**
+- **Path, not `ResourceLink`.** We weighed returning an MCP `ResourceLink` (+ the
+  bytes served lazily as a binary resource on `resources/read`). Dropped it: a
+  spec-compliant client resolves a `ResourceLink` by reading it back *from the server*,
+  so kaibo would grow a `file://` `resources/read` channel that bypasses project
+  containment — a genuinely new read surface needing its own hard-look review — for no
+  win over a plain path the calling agent opens with its own tools. "Just files,
+  wherever `--out-dir` points" (Amy) is the whole feature.
+- **Handler-side write, never kaish.** The artifact is written with `std::fs` in the
+  tool handler (`generate_image::write_artifact`). kaish is untouched — all four
+  read-only levers in `sandbox.rs` still hold, kaish can't write anywhere. The
+  "read-only is the product" invariant didn't move; it gained one sentence naming the
+  capability-tool write path.
+- **Out-dir is read-back-mounted.** The dir is mounted **read-only** into every kaish
+  kernel (`build_readonly_kernel_and_vfs`, the existing `VfsRouter` multi-mount — *not*
+  the deferred general-RW machinery) so a later `consult`/`run_kaish` can read a
+  generated artifact back. This is forward substrate for image2image; nothing needs it
+  yet (the agent opens the path itself).
+- **Default `$XDG_CACHE_HOME/kaibo`, and *why* it's kaibo-owned, not `/tmp`.** Amy first
+  said `/tmp`; we landed on the XDG cache because the read-back mount widens read-*scope*
+  to whatever the out-dir is — and a consult can ship what kaish reads to a remote model.
+  Mounting bare `/tmp` would expose every other process's temp files to a consult.
+  A kaibo-owned subdir keeps the read-scope to *our own* generated artifacts. The
+  containment test pins exactly this: the out-dir is readable, a sibling is **not**.
+  Durable (a cache, not auto-cleared) by choice — "change it later if users ask" (Amy);
+  no cleanup built.
+
+**The inline cap is gone.** `GENERATE_IMAGE_MAX_BYTES` existed only to bound base64 in
+the caller's context; with path delivery there's nothing to bound, so a large image is
+just a large file. The over-cap error path (and its test) retired with it.
+
+**Teeth.** `tests/sandbox.rs` `out_dir_*` battery: artifact readable back, out-dir
+**read-only** to kaish (mount it `LocalFs::new` and the write-denial assert fails), and
+a sibling of the out-dir **not** exposed. `tests/config.rs` pins the `out_dir`
+precedence (default < file < env < CLI) and the sandbox mirror. `tests/generate_image`
+covers the write (bytes verbatim, ext from MIME, unique names, lazy dir creation) and
+path-only delivery. `docs/sandbox-probes.md` gained Battery E for the live audit.
+
+The read-scope boundary moving — even narrowly to a kaibo-owned cache — is the part of
+this that deserved the careful look; it's why this PR wants a cross-family review on the
+mount + the out-dir read path specifically.
+
+**Follow-up from the reviews — out-dir is fully *readable*, with an off switch (Amy).**
+The Gemini review flagged that an artifact couldn't be re-`attach`ed to a follow-up
+consult/oneshot (the out-dir wasn't in the containment `allowed_set`, and consult-attach
+required a subpath of the project root). Amy's call: make the out-dir readable rather than
+leave the wart — *"add out-dir to allowed_set for read and have a way to disable that … I
+don't think this would be surprising."* So one knob, `out_dir_readable` (default true,
+`--no-out-dir-read` / `KAIBO_NO_OUT_DIR_READABLE` / `[server] out_dir_readable`), now gates
+**both** sides of out-dir readability together — the kaish read-back mount *and* the
+allowed-set membership — so "readable" stays one concept. When on: the out-dir joins
+`allowed_set` (so oneshot/batch `attach` and per-call `path` accept it), and
+`resolve_consult_attachments` accepts an out-dir file as an *absolute* path (the consult
+shell mounts root + out-dir, the only two trees it can read; an in-root file stays
+root-relative, an out-dir file is absolute, anything else refused). When off: no mount, not
+in the allowed-set — kaibo writes artifacts and returns paths but never reads them back.
+Surfaced in `config.example.toml`, `kaibo://config`, and `docs/config.md` so it's
+adjustable and visible, per Amy. The boundary still only ever widens to the kaibo-owned
+out-dir (the consult-attach test pins that a *sibling* of the out-dir is still refused).
+
+**Safe default for the no-XDG/no-HOME case — a real exfil hole closed (Gemini + Amy).**
+A scenario-driven Gemini Pro batch (attachments via kaibo, asked to *play through* the
+code paths) confirmed Amy's instinct that the `temp_dir()/kaibo` fallback was a genuine
+hole, not just untidy: in a stripped container with no `$XDG_CACHE_HOME`/`$HOME`, kaibo
+landed in a *world-shared* temp and auto-mounted it read-only into kaish. An attacker who
+pre-plants `<tmp>/kaibo` as a symlink to `/etc` or `/home/<someone>` would have kaibo
+canonicalize it, mount the **target** read-only, add it to `allowed_set`, and a consult
+could exfiltrate it — the `out_dir = "/"` guard doesn't catch a symlink to a non-`/` tree.
+Fix (Amy's "no XDG ⇒ no automatic permission", Gemini's refined option b): classify the
+default out-dir (`DefaultOutDir::Cache` vs `SharedTemp` in `config.rs`), and when it's the
+shared-temp fallback default **read-back off** — kaibo still *writes* the artifact and
+returns the path (no frustrating hard failure in a container; the agent opens it with its
+own tools), but won't auto-mount a world-shared temp. An explicit `out_dir` is trusted
+(read-back on); an explicit `out_dir_readable` always wins. A startup warning in `main.rs`
+and primed `configure`-prompt prose (step 5, `server.rs`) tell the agent how to restore
+read-back by naming a kaibo-owned dir. The remaining write-side symlink (artifact dropped
+at a symlink's target) is a low-severity nuisance — unique names prevent overwrite —
+tracked in `docs/issues.md`, not the critical read path. Tested via injected-env
+classification (`default_out_dir_from`, all three branches incl. the empty-`$VAR` guard).
+
 ## 2026-06-26 — Stayed read-only: retired per-builtin timeouts *and* deferred general RW mounts
 
 Two linked decisions in one session, one posture: **kaibo stays read-only as the product;

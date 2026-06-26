@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use kaibo::config::{
-    default_models, parse_slot_ref, Backend, Config, ModelRole, ModelSlot, ToolDisables,
+    default_models, default_out_dir, parse_slot_ref, Backend, Config, ModelRole, ModelSlot,
+    ToolDisables,
 };
 use kaibo::consult::ThinkingStyleOverride;
 use kaibo::credentials::{openai_base_url, ProviderKind, PLACEHOLDER_OPENAI_KEY};
@@ -874,6 +875,8 @@ fn cli_cast_wins_over_env_and_file() {
         false,  // --no-follow-worktrees not passed
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
+        None,   // no --out-dir
+        false,  // out-dir stays readable
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -901,6 +904,8 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         false,
         vec![],
         vec![],
+        None,
+        false,
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1631,5 +1636,118 @@ fn a_zero_orientation_ceiling_is_a_loud_error() {
     assert!(
         format!("{err:#}").contains("full_list_max_files"),
         "names the knob: {err:#}"
+    );
+}
+
+/// The artifact out-dir layers like the rest of config — default < file < env < CLI —
+/// and the resolved value is mirrored onto the sandbox so the read-back mount tracks it.
+#[test]
+fn out_dir_layers_default_file_env_and_cli() {
+    use std::path::Path;
+
+    // Unset → the kaibo-owned XDG-cache default (same process, same env, so equal).
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(
+        c.out_dir,
+        default_out_dir(),
+        "an unset out_dir falls back to the default, not empty"
+    );
+    assert_eq!(
+        c.sandbox.out_dir.as_deref(),
+        Some(c.out_dir.as_path()),
+        "the sandbox mirrors out_dir for the read-back mount"
+    );
+
+    // File: [server] out_dir wins over the default.
+    let c = Config::from_toml_str("[server]\nout_dir = \"/var/kaibo-art\"\n").unwrap();
+    assert_eq!(c.out_dir, Path::new("/var/kaibo-art"));
+
+    // Env: KAIBO_OUT_DIR beats the file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[server]\nout_dir = \"/file/kaibo-art\"\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_OUT_DIR", "/env/kaibo-art")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.out_dir, Path::new("/env/kaibo-art"), "env beats file");
+
+    // CLI: --out-dir beats everything and updates the sandbox mirror too.
+    let mut c = Config::builtin();
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        vec![],
+        vec![],
+        Some("/cli/kaibo-art".into()),
+        false,
+    );
+    assert_eq!(c.out_dir, Path::new("/cli/kaibo-art"));
+    assert_eq!(
+        c.sandbox.out_dir.as_deref(),
+        Some(Path::new("/cli/kaibo-art")),
+        "CLI override updates the sandbox mirror so the mount tracks the final dir"
+    );
+}
+
+/// `out_dir_readable` (default true) gates the read-back mount mirror: off means the
+/// out-dir is not mounted into kaish, layering default < file < env < CLI like the rest.
+#[test]
+fn out_dir_readable_gates_the_mount_mirror() {
+    // Default on: the sandbox mirror is set so the kernel builder mounts it.
+    let c = Config::from_toml_str("").unwrap();
+    assert!(c.out_dir_readable);
+    assert_eq!(c.sandbox.out_dir.as_deref(), Some(c.out_dir.as_path()));
+
+    // File off: no mount mirror.
+    let c = Config::from_toml_str("[server]\nout_dir_readable = false\n").unwrap();
+    assert!(!c.out_dir_readable);
+    assert!(
+        c.sandbox.out_dir.is_none(),
+        "an unreadable out-dir is not mounted"
+    );
+
+    // Env off (KAIBO_NO_OUT_DIR_READABLE).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_NO_OUT_DIR_READABLE", "1")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert!(!c.out_dir_readable, "env disables readability");
+    assert!(c.sandbox.out_dir.is_none());
+
+    // CLI --no-out-dir-read disables it and clears the mirror.
+    let mut c = Config::builtin();
+    assert!(c.sandbox.out_dir.is_some(), "builtin default is readable");
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        vec![],
+        vec![],
+        None,
+        true,
+    );
+    assert!(!c.out_dir_readable);
+    assert!(
+        c.sandbox.out_dir.is_none(),
+        "CLI --no-out-dir-read clears the mount mirror"
+    );
+}
+
+/// `out_dir = "/"` is refused at load: the out-dir is mounted read-only into kaish, so
+/// `/` would expose the whole host filesystem to a consult. A loud error, not a silent
+/// host-wide read scope.
+#[test]
+fn out_dir_root_is_refused() {
+    let err = Config::from_toml_str("[server]\nout_dir = \"/\"\n")
+        .expect_err("out_dir = / must be a loud load error, not a host-wide read mount");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("out_dir") && msg.contains("/"),
+        "the refusal should name out_dir and `/`: {msg}"
     );
 }

@@ -59,6 +59,19 @@
 # (also: --no-follow-worktrees, KAIBO_NO_FOLLOW_WORKTREES).
 # follow_worktrees = true
 
+# Where capability tools (generate_image) write their artifacts. A kaibo-owned dir,
+# default $XDG_CACHE_HOME/kaibo (else ~/.cache/kaibo). kaibo writes there directly
+# (never through kaish) and returns the file path. Also: --out-dir, KAIBO_OUT_DIR
+# (these expand ~ / $VAR). `/` is refused (it would read-mount the whole host).
+# out_dir = "~/.cache/kaibo"
+
+# Whether the out-dir is part of kaibo's *read* surface (default true): mounted
+# read-only into kaish so a consult can read an artifact back, and joined to the
+# allowed-set so an out-dir path can be `attach`ed or targeted as a call `path`. Set
+# false for the tightest boundary — kaibo still writes artifacts and returns the path
+# but never reads them back (also: --no-out-dir-read, KAIBO_NO_OUT_DIR_READABLE).
+# out_dir_readable = true
+
 # Default cast (by name or alias) when a call omits `cast`. The old `provider`
 # key is a load error (unknown field) — see docs/casts.md for the rename map.
 cast = "anthropic"
