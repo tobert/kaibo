@@ -118,10 +118,13 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
     it — bounded to the named RW mount, can't escape or execute, can't touch the
     project, but it's a real new instruction-following exposure to document honestly
     when this lands.
-- **Delivery over MCP:** small images inline as `Content::image` (rmcp 0.16,
-  `model/content.rs:165`); large objects flush to a tool-specific out-dir (a narrow
-  per-capability path, not the deferred general RW mount) and return as
-  `RawContent::ResourceLink` (`model/content.rs:140`) instead of base64 blobs.
+- **Delivery over MCP — DECIDED 2026-06-26 (w/ Amy):** a capability writes its
+  artifact to a kaibo-owned **out-dir** and returns the **absolute path as text** —
+  no inline base64 blob, no `ResourceLink`/resource-read channel. The resource path
+  was weighed and dropped: it'd add a `file://` `resources/read` surface that
+  bypasses project containment (its own hard-look review) for no win over a plain
+  path the calling agent opens with its own tools. The earlier "small inline,
+  large→`ResourceLink`" split retires with it.
 - **Capabilities are data on the `ModelShape` seam** — SHIPPED
   2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
   `vision` pin in the role table, resolved caps at `kaibo://config`. The vision
@@ -140,19 +143,18 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 
 **Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
 SHIPPED 2026-06-11, path-only. (2) **image-out — SHIPPED 2026-06-13** as the
-`generate_image` capability tool (live-verified; see the top Last pass), inline
-`Content::image` only. **Next:** stays narrow — the general **RW mounts** are DEFERRED
-(see the banner above): kaibo stays read-only, and any future write is a *specific
-capability tool* writing its own artifact (the `generate_image` shape), not a broad
-mount and not `consult`. So a larger-than-inline artifact would flush to a
-tool-specific path and return as `ResourceLink` — a narrow per-tool out-dir, decided
-when the first over-inline-cap capability needs it, **not** the general `rw_paths`
-surface. The kaish-builtin/VFS *composition* path (image2image piped in a `run_kaish`
-script) is the **only** thing that would run a minutes-long model call *under the script
-clock* and revive the per-builtin-timeout problem; as long as capabilities stay
-handler-side MCP tools, it never arises — so that work was retired, not built (devlog
-2026-06-26). If composition is ever revisited, the upstream timeout seam already exists
-(`ctx.patient(budget) -> PatientGuard`, kaish 0.8.2+).
+`generate_image` capability tool, **artifact out-dir SHIPPED 2026-06-26**: it now
+writes the image to the kaibo-owned out-dir (`server.out_dir`, default
+`$XDG_CACHE_HOME/kaibo`) and hands back the path — the narrow *specific-tool* write the
+RW-mount deferral pointed at, never the broad `rw_paths` surface and not `consult`. The
+out-dir is mounted read-only into kaish for read-back (see the devlog 2026-06-26 entry
+for the design + the read-scope tradeoff). **Next:** the kaish-builtin/VFS *composition*
+path (image2image piped in a `run_kaish` script) is the **only** thing that would run a
+minutes-long model call *under the script clock* and revive the per-builtin-timeout
+problem; as long as capabilities stay handler-side MCP tools, it never arises — so that
+work was retired, not built (devlog 2026-06-26). If composition is ever revisited, the
+upstream timeout seam already exists (`ctx.patient(budget) -> PatientGuard`, kaish
+0.8.2+).
 
 **Open design points (for the production builtins):** session history records
 `[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const

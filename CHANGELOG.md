@@ -53,11 +53,21 @@ the git log. Each later release appends a new section at the top.
 - **`run_kaish`** — drive the read-only kaish shell yourself, no model in the loop:
   exit code + stdout + stderr.
 - **`generate_image`** — kaibo's first *capability* (an artifact handed back to the
-  caller, not reasoning run into kaibo's own models): prompt → image, returned inline
-  as MCP image content. OpenAI-compatible image backends only (hosted
-  `gpt-image` / DALL·E, or a local Stable-Diffusion server). Its `cast` parameter
-  advertises the casts that actually carry a usable image slot as a schema enum, so a
-  host agent picks one off the schema — as discoverable as the consultation tools.
+  caller, not reasoning run into kaibo's own models): prompt → image, **written to a
+  file**, with the path returned (open it to view). No inline blob, so a multi-MiB
+  picture costs your context nothing until you read it. Files land in kaibo's artifact
+  out-dir (`server.out_dir` / `KAIBO_OUT_DIR` / `--out-dir`, default
+  `$XDG_CACHE_HOME/kaibo`); that dir is also mounted read-only into kaish, so a later
+  `consult`/`run_kaish` can read a generated artifact back. OpenAI-compatible image
+  backends only (hosted `gpt-image` / DALL·E, or a local Stable-Diffusion server). Its
+  `cast` parameter advertises the casts that actually carry a usable image slot as a
+  schema enum, so a host agent picks one off the schema — as discoverable as the
+  consultation tools.
+- **Artifact out-dir** — capability tools write their outputs to a kaibo-owned
+  directory (`server.out_dir` / `KAIBO_OUT_DIR` / `--out-dir`, default
+  `$XDG_CACHE_HOME/kaibo`, else `~/.cache/kaibo`). kaibo writes there directly (never
+  through kaish — the read-only sandbox is unchanged) and mounts it read-only into kaish
+  so consultations can read a generated artifact back. Visible at `kaibo://config`.
 - **Batch (`batch_submit`)** — the *offline, async sibling* of `oneshot`: submit a list
   of tool-less prompts, get a handle, then collect it with the shared `get`/`cancel`/
   `list` verbs (see below) — read every answer when the provider's batch lane finishes,

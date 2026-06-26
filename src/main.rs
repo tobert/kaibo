@@ -62,6 +62,14 @@ struct Args {
     #[arg(long)]
     no_follow_worktrees: bool,
 
+    /// Where capability tools (generate_image) write their artifacts. A kaibo-owned
+    /// dir, default $XDG_CACHE_HOME/kaibo (else ~/.cache/kaibo). Written handler-side,
+    /// never through kaish; also mounted read-only into kaish so a later consult can
+    /// read a generated artifact back. Also settable via KAIBO_OUT_DIR or
+    /// [server] out_dir (those expand a leading `~`/`$VAR`; on the CLI your shell does).
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+
     /// Default cast when a call omits it (a built-in name or a cast defined in
     /// config.toml). Built-ins: anthropic | deepseek | gemini | openai-local
     /// (plus aliases: claude, google, local, …) and the batch casts gemini-batch
@@ -142,6 +150,7 @@ async fn main() -> Result<()> {
         args.no_follow_worktrees,
         args.project_context_file.clone(),
         args.user_context_file.clone(),
+        args.out_dir.clone(),
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
@@ -210,6 +219,7 @@ async fn main() -> Result<()> {
         cast = %config.default_cast,
         root = ?config.root.as_ref().map(|p| p.display().to_string()),
         allow_paths = ?config.allow_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        out_dir = %config.out_dir.display(),
         backends = ?config.backends.keys().collect::<Vec<_>>(),
         casts = ?config.casts.keys().collect::<Vec<_>>(),
         gating = ?config.tools,

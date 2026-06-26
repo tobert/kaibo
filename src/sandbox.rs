@@ -154,6 +154,15 @@ pub struct SandboxConfig {
     /// `[kaish.ignore]`. Defaults to [`IgnoreConfig::agent`] (`.gitignore` + built-in
     /// defaults, enforced scope) so omitting the stanza preserves today's behavior.
     pub ignore: IgnoreConfig,
+    /// The capability artifact out-dir ([`crate::config::Config::out_dir`]), mounted
+    /// **read-only** into the kernel so a consult/run_kaish can read a generated
+    /// artifact back. This widens read-*scope* to the kaibo-owned cache only — it is
+    /// **not** a write path (the handler writes via `std::fs`; kaish never does), so the
+    /// read-only invariant is untouched. `None` (the default) mounts nothing; the mount
+    /// is also skipped until the dir exists (created lazily on the first artifact write)
+    /// and when it already falls under the project mount. See
+    /// [`build_readonly_kernel_and_vfs`].
+    pub out_dir: Option<PathBuf>,
 }
 
 impl Default for SandboxConfig {
@@ -164,6 +173,7 @@ impl Default for SandboxConfig {
             scratch_limit_bytes: DEFAULT_SCRATCH_LIMIT_BYTES,
             disable_builtins: Vec::new(),
             ignore: IgnoreConfig::agent(),
+            out_dir: None,
         }
     }
 }
@@ -233,6 +243,27 @@ fn build_readonly_kernel_and_vfs(
     vfs.mount("/", MemoryFs::with_budget(scratch_budget));
     // The project itself: real files, read-only.
     vfs.mount(&mount_point, LocalFs::read_only(&root));
+
+    // The capability artifact out-dir, mounted **read-only** so a consult/run_kaish can
+    // read a generated artifact back (the `generate_image` output, etc.). It's the same
+    // `LocalFs::read_only` the project rides, so this only adds read-*scope* to the
+    // kaibo-owned cache — never a write path (the handler writes via `std::fs`; kaish
+    // can't). Skipped when (a) unset, (b) the dir doesn't exist yet (created lazily on
+    // the first write — nothing to read until then), or (c) it already falls under the
+    // project mount (the project's read-only `LocalFs` already serves it; a second mount
+    // would just shadow it identically). Canonicalize first so the mount point matches
+    // how kaish resolves an absolute path (symlinks/`..` resolved), and so the
+    // under-root check can't be fooled by a symlink — the same canonicalize-then-decide
+    // discipline as `resolve_root`.
+    if let Some(out_dir) = sandbox.out_dir.as_ref() {
+        if let Ok(canon) = out_dir.canonicalize() {
+            let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if canon != root_canon && !canon.starts_with(&root_canon) {
+                let out_mount = canon.to_string_lossy().to_string();
+                vfs.mount(&out_mount, LocalFs::read_only(&canon));
+            }
+        }
+    }
 
     // Keep a handle to the project router before it disappears into the backend, so
     // the worker can read bytes through these mounts (the kernel's own `vfs()` won't

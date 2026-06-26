@@ -158,6 +158,29 @@ path arg itself, and a file (vs. directory) is refused at the parameter boundary
 
 ---
 
+## 4b. Battery E — the artifact out-dir is read-only and narrow
+
+The artifact out-dir (`kaibo://config` → `out_dir`, default `$XDG_CACHE_HOME/kaibo`) is
+mounted **read-only** into kaish so a consult can read a generated artifact back. Probe
+that it stays read-only and doesn't expose its neighbors. First generate an artifact (a
+`generate_image` call, or just note an existing `$OUT/kaibo-image-*.png`), then via
+`run_kaish` with `$OUT` = the resolved out_dir:
+
+```sh
+cat $OUT/<some-artifact>                 ; echo "read-back=$?"     # 0 — readable
+echo x > $OUT/kaish-wrote-this           ; echo "write=$?"        # non-zero — read-only
+cat $OUT/../<sibling>/secret             ; echo "sibling=$?"      # not found — narrow
+```
+
+**Pass:** the read-back succeeds (exit 0), the write is refused with `permission denied:
+filesystem read-only` and creates no real file, and a path that climbs out of the
+out-dir routes into the empty `/` MemoryFs and 404s — the mount exposes the out-dir
+alone, never its parent or siblings. This is why the default out-dir is a kaibo-owned
+subdir, not bare `/tmp`. Pinned continuously by the `out_dir_*` battery in
+`tests/sandbox.rs`.
+
+---
+
 ## 5. The always-on guard: the test suites
 
 The live probes are a periodic spot-check; the *continuous* guard is the test tree.

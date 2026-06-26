@@ -1600,15 +1600,16 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Generate an image from a text prompt and return it inline. A \
-            capability tool: no codebase investigation, no shell — the cast's `image` model \
-            draws what you describe and hands back the picture plus a short caption. Runs \
-            the cast's `image` slot — an OpenAI-compatible backend (hosted gpt-image/DALL·E, \
-            or a local Stable-Diffusion server); `image_backend` can retarget to one even on \
-            a cast that carries no image slot, and `kaibo://config` shows which casts qualify \
-            as-is. Takes `size` (\"WxH\", default 1024x1024) plus the usual `cast` / \
-            `image_model` / `image_backend` selectors (see `kaibo://tools`). A picture too \
-            large to inline is a clear error, not a silent drop."
+        description = "Generate an image from a text prompt; it's written to a file and \
+            the path is returned (open it to view — no inline blob, so a large picture \
+            costs you nothing until you read it). A capability tool: no codebase \
+            investigation, no shell — the cast's `image` model draws what you describe. \
+            Runs the cast's `image` slot — an OpenAI-compatible backend (hosted \
+            gpt-image/DALL·E, or a local Stable-Diffusion server); `image_backend` can \
+            retarget to one even on a cast that carries no image slot, and `kaibo://config` \
+            shows which casts qualify as-is. Takes `size` (\"WxH\", default 1024x1024) plus \
+            the usual `cast` / `image_model` / `image_backend` selectors (see \
+            `kaibo://tools`). Files land in kaibo's artifact dir (`kaibo://config`)."
     )]
     pub async fn generate_image(
         &self,
@@ -1651,7 +1652,16 @@ impl KaiboHandler {
             }
         };
 
+        // Write the artifact to the kaibo-owned out-dir and hand back its path — no
+        // inline blob. The write is handler-side `std::fs` (never kaish), so the
+        // read-only sandbox is untouched. A write failure is the operator's environment
+        // (a full disk, an unwritable cache dir), not the caller's request, so it maps
+        // to an internal error — and we never report success on a half-written artifact.
+        let path = crate::generate_image::write_artifact(&self.config.out_dir, &image)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
         Ok(CallToolResult::success(crate::generate_image::to_content(
+            &path,
             &image,
             &input.prompt,
             size,
@@ -2663,6 +2673,10 @@ fn render_config_resource(
         default_root_inferred: bool,
         /// Default cast name (what a call omitting `cast` gets).
         default_cast: String,
+        /// Where capability tools (generate_image) write artifacts. A kaibo-owned dir,
+        /// also mounted read-only into kaish so a consult can read an artifact back — so
+        /// it's part of the read-scope, surfaced here for transparency.
+        out_dir: String,
         /// Runtime-derived state — computed at read time, not configured. Distinct
         /// from the static knobs above so a reader can tell "what kaibo discovered"
         /// from "what the operator set".
@@ -2939,6 +2953,9 @@ fn render_config_resource(
         scratch_limit_bytes,
         disable_builtins,
         ignore,
+        // Surfaced at the top level from `config.out_dir` (the authoritative copy);
+        // this sandbox field is the read-back-mount mirror, so skip it here.
+        out_dir: _,
     } = &config.sandbox;
     let crate::config::Defaults {
         explorer_max_turns,
@@ -2969,6 +2986,7 @@ fn render_config_resource(
         default_root: default_root.map(|p| p.display().to_string()),
         default_root_inferred,
         default_cast: config.default_cast.clone(),
+        out_dir: config.out_dir.display().to_string(),
         runtime: RuntimeDoc {
             follow_worktrees: config.follow_worktrees,
             followed_worktrees: followed_worktrees

@@ -1,19 +1,29 @@
-//! `generate_image` — the MCP capability tool: prompt → image, returned inline.
+//! `generate_image` — the MCP capability tool: prompt → image, written to the
+//! artifact out-dir, path handed back.
 //!
 //! This is a *capability*, not consultation: no `run_phase` model loop, no kaish
 //! shell. The handler resolves the cast's `image` slot into an [`ImageGen`]
-//! ([`crate::image_gen`]), generates the bytes, sniffs their MIME, and hands them
-//! back as an MCP [`Content::image`] alongside a short text caption. The provider
-//! logic lives behind the [`ImageGen`] seam so this whole path is exercised offline
-//! by a scripted backend; the live wire is proven by an `#[ignore]`d probe.
+//! ([`crate::image_gen`]), generates the bytes, sniffs their MIME, writes the artifact
+//! to the kaibo-owned out-dir ([`crate::config::Config::out_dir`]), and hands back the
+//! **absolute path** as a short text caption. The provider logic lives behind the
+//! [`ImageGen`] seam so this whole path is exercised offline by a scripted backend; the
+//! live wire is proven by an `#[ignore]`d probe.
 //!
-//! **Scratch/inline only, by design (this slice).** The bytes ride back inline,
-//! base64 on the MCP edge, capped at [`GENERATE_IMAGE_MAX_BYTES`]. An image past the
-//! cap is an honest, loud error — large-artifact delivery (`--out-dir` +
-//! `ResourceLink`) and the kaish-builtin/VFS composition surface (for image2image
-//! pipelines) are tracked follow-ons in `docs/issues.md`, not silent truncation here.
+//! **Path delivery, not inline.** The image is written to disk and only its path
+//! crosses the MCP edge — no base64 blob in the tool result, so a multi-MiB picture
+//! costs the calling agent nothing until it chooses to open the file. The write is
+//! handler-side (`std::fs`), never through kaish, so the read-only sandbox is
+//! untouched; the out-dir is separately mounted *read-only* into kaish so a later
+//! consult can read the artifact back. There is no inline size cap — the old
+//! `GENERATE_IMAGE_MAX_BYTES` guard existed only to bound base64 in context and is gone
+//! with inline delivery. The decision (path over `ResourceLink`) is recorded in
+//! `docs/issues.md`.
 
-use anyhow::{anyhow, Result};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context, Result};
 use rmcp::model::Content;
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
@@ -24,17 +34,6 @@ use crate::view_image::sniff_mime;
 /// Default square size when the caller doesn't ask for one. Generous enough to be
 /// useful; a turbo SD model or a hosted gpt-image both accept it.
 pub const DEFAULT_SIZE: (u32, u32) = (1024, 1024);
-
-/// Inline-delivery cap for a *generated* image — its own knob, deliberately looser
-/// than [`view_image`](crate::view_image)'s `DEFAULT_MAX_IMAGE_BYTES`. The two pull
-/// in opposite directions: `view_image` reads workspace files (screenshots/diagrams,
-/// rarely large) and wants a tight cap so a stray read can't flood model context; a
-/// generated 1024² PNG routinely lands several MiB, and the cap is enforced *after*
-/// the (paid) call, so it must be generous enough that a rejection is genuinely
-/// exceptional, not routine. 20 MiB clears typical SD/gpt-image output with room to
-/// spare; past it is a loud error until large-artifact delivery (`--out-dir` /
-/// `ResourceLink`) lands.
-pub const GENERATE_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 /// Arguments to `generate_image`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -82,9 +81,9 @@ pub enum GenerateError {
     /// The image backend / provider call failed (network, auth, rate-limit, an empty
     /// response). Not the caller's fault — maps to an MCP internal error.
     Backend(anyhow::Error),
-    /// The bytes came back but can't be delivered as asked — an unrecognized format,
-    /// or over the inline cap. The caller can change the request — maps to an MCP
-    /// invalid-params error.
+    /// The bytes came back but can't be delivered as asked — an unrecognized format
+    /// (not a real image). The caller can change the request (pick another model) —
+    /// maps to an MCP invalid-params error.
     Unusable(String),
 }
 
@@ -124,13 +123,14 @@ pub fn parse_size(spec: Option<&str>) -> Result<(u32, u32)> {
     Ok((parse(w, "width")?, parse(h, "height")?))
 }
 
-/// Generate one image: call the backend, sniff the MIME, enforce the inline cap.
+/// Generate one image: call the backend, sniff the MIME.
 ///
 /// Errors loudly, and *categorized* (see [`GenerateError`]): a failed/empty
-/// generation is [`GenerateError::Backend`]; bytes in an unrecognized format or over
-/// the inline cap are [`GenerateError::Unusable`] (the caller can fix those). None of
-/// these is a silent fallback — a blob we can't recognize is suspicious, not
-/// something to mislabel, and an over-cap image is refused, never quietly dropped.
+/// generation is [`GenerateError::Backend`]; bytes in an unrecognized format are
+/// [`GenerateError::Unusable`] (the caller can pick another model). Neither is a silent
+/// fallback — a blob we can't recognize is suspicious, not something to mislabel. There
+/// is no size cap: the artifact is written to disk, not inlined, so a large image is
+/// fine ([`write_artifact`] is the next step).
 pub async fn generate(
     image_gen: &dyn ImageGen,
     prompt: &str,
@@ -147,33 +147,72 @@ pub async fn generate(
             bytes.len()
         ))
     })?;
-    if bytes.len() > GENERATE_IMAGE_MAX_BYTES {
-        return Err(GenerateError::Unusable(format!(
-            "generated image is {} bytes, over the {} byte inline cap; large-artifact \
-             delivery (--out-dir / ResourceLink) is not yet wired — lower the size or use a \
-             model that emits smaller images",
-            bytes.len(),
-            GENERATE_IMAGE_MAX_BYTES
-        )));
-    }
     Ok(GeneratedImage { bytes, mime })
 }
 
-/// Assemble the MCP content for a generated image: the image part (base64 on the
-/// wire) plus a short text caption so a client rendering only text still sees what
-/// happened.
-pub fn to_content(image: &GeneratedImage, prompt: &str, size: (u32, u32)) -> Vec<Content> {
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+/// The file extension for a sniffed image MIME. Total over the four formats
+/// [`sniff_mime`] recognizes — an artifact only reaches here after a successful sniff,
+/// so the fallback (`bin`) is unreachable in practice but keeps the function total.
+fn mime_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
+/// A unique artifact filename: `kaibo-image-<unix_nanos>-<pid>-<counter>.<ext>`. The
+/// nanosecond clock plus the process id plus a monotonic in-process counter make a
+/// collision astronomically unlikely without pulling in an RNG dependency — two writes
+/// in the same process get distinct counters, and two processes differ on pid.
+fn unique_artifact_name(ext: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("kaibo-image-{nanos}-{}-{n}.{ext}", std::process::id())
+}
+
+/// Write a generated image to `out_dir`, returning its absolute path.
+///
+/// Handler-side `std::fs` — this is the *only* write path for an artifact, and it never
+/// touches kaish, so the read-only sandbox is unaffected. Creates `out_dir` on demand
+/// (the lazy creation the read-back mount waits on) and errors loudly on any failure
+/// (a full disk or unwritable cache dir is the operator's environment, not the caller's
+/// request — the handler maps it to an internal error). Never delivers a half-written
+/// artifact as success: a failed write is an `Err`, not a quietly dropped image.
+pub fn write_artifact(out_dir: &Path, image: &GeneratedImage) -> Result<PathBuf> {
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating artifact out-dir {}", out_dir.display()))?;
+    let path = out_dir.join(unique_artifact_name(mime_ext(image.mime)));
+    std::fs::write(&path, &image.bytes)
+        .with_context(|| format!("writing artifact to {}", path.display()))?;
+    Ok(path)
+}
+
+/// The MCP content for a written artifact: a single text caption naming the size, MIME,
+/// byte count, and the **absolute path** the calling agent opens to view it. No image
+/// part — delivery is by path, not inline base64 (see the module doc).
+pub fn to_content(
+    path: &Path,
+    image: &GeneratedImage,
+    prompt: &str,
+    size: (u32, u32),
+) -> Vec<Content> {
     let caption = format!(
-        "Generated a {}×{} {} ({:.1} KiB) for: {}",
+        "Generated a {}×{} {} ({:.1} KiB) for: {}\nSaved to {} — open it to view.",
         size.0,
         size.1,
         image.mime,
         image.bytes.len() as f64 / 1024.0,
-        prompt
+        prompt,
+        path.display(),
     );
-    vec![Content::image(data, image.mime), Content::text(caption)]
+    vec![Content::text(caption)]
 }
 
 #[cfg(test)]
@@ -211,13 +250,71 @@ mod tests {
             vec![("a red circle".to_string(), (640, 480))],
             "the prompt and size must reach the backend verbatim"
         );
+    }
 
-        let content = to_content(&img, "a red circle", (640, 480));
-        // First part is the image; the caption rides as text.
-        let is_image = matches!(content.first().map(|c| c.raw.as_image()), Some(Some(_)));
+    #[test]
+    fn write_artifact_writes_bytes_with_the_right_ext_and_unique_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = GeneratedImage {
+            bytes: fake_png(32),
+            mime: "image/png",
+        };
+        let p1 = write_artifact(dir.path(), &img).expect("write succeeds");
+        let p2 = write_artifact(dir.path(), &img).expect("second write succeeds");
+        // Bytes land verbatim on disk — no truncation, no re-encode.
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            img.bytes,
+            "file holds the exact bytes"
+        );
+        // Extension comes from the sniffed MIME.
+        assert_eq!(p1.extension().and_then(|e| e.to_str()), Some("png"));
+        // Two writes never collide — the artifact channel must not clobber.
+        assert_ne!(p1, p2, "each artifact gets a distinct path");
+        assert!(p1.starts_with(dir.path()), "artifact lands inside out_dir");
+    }
+
+    #[test]
+    fn write_artifact_creates_a_missing_out_dir() {
+        // The read-back mount waits on lazy creation — write_artifact must make the dir.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("does/not/exist/yet");
+        let img = GeneratedImage {
+            bytes: fake_png(8),
+            mime: "image/png",
+        };
+        let p = write_artifact(&nested, &img).expect("write creates the dir tree");
         assert!(
-            is_image,
-            "the first content part must be the image: {content:?}"
+            p.exists(),
+            "artifact written under a freshly-created out_dir"
+        );
+    }
+
+    #[test]
+    fn to_content_delivers_the_path_not_an_inline_image() {
+        let img = GeneratedImage {
+            bytes: fake_png(16),
+            mime: "image/png",
+        };
+        let path = Path::new("/cache/kaibo/kaibo-image-1-2-3.png");
+        let content = to_content(path, &img, "a red circle", (640, 480));
+        // Exactly one part, and it is text (no base64 image part rides along).
+        assert_eq!(
+            content.len(),
+            1,
+            "path delivery is a single text part: {content:?}"
+        );
+        let is_image = matches!(content.first().map(|c| c.raw.as_image()), Some(Some(_)));
+        assert!(!is_image, "no inline image part — delivery is by path");
+        let text = content[0]
+            .raw
+            .as_text()
+            .expect("the part is text")
+            .text
+            .clone();
+        assert!(
+            text.contains("/cache/kaibo/kaibo-image-1-2-3.png"),
+            "the caption names the artifact path: {text}"
         );
     }
 
@@ -231,19 +328,6 @@ mod tests {
         assert!(
             matches!(err, GenerateError::Unusable(ref m) if m.contains("unrecognized format")),
             "expected a caller-fixable Unusable naming the format problem: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn generate_rejects_oversized_as_unusable() {
-        // A valid png header followed by enough filler to exceed the inline cap.
-        let backend = ScriptedImageGen::returning(fake_png(GENERATE_IMAGE_MAX_BYTES + 1));
-        let err = generate(&backend, "x", DEFAULT_SIZE)
-            .await
-            .expect_err("an over-cap image must error, never be silently dropped");
-        assert!(
-            matches!(err, GenerateError::Unusable(ref m) if m.contains("inline cap")),
-            "expected a caller-fixable Unusable naming the cap: {err:?}"
         );
     }
 

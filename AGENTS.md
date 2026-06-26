@@ -61,10 +61,20 @@ project and cannot run external commands.
   disk), and (3) external commands disabled. The `Blocked` wrapper survives only for
   the config-driven `[sandbox].disable_builtins`, which can make the box *stricter* —
   see the module doc-comment. Any change here keeps `tests/sandbox.rs` green and adds
-  a test that can fail. Read-*scope* is also
-  bounded: every call's path must canonicalize (symlinks, `..` resolved) into the
-  allowed set (`--root` / `--allow-path`, launch cwd when unset), enforced in
-  `server.rs::resolve_root` with tests in `tests/containment.rs`.
+  a test that can fail. The one *write* path is a **capability tool writing its own
+  artifact**, handler-side via `std::fs`, only to the kaibo-owned **out-dir**
+  (`config.out_dir`, default `$XDG_CACHE_HOME/kaibo`) — never through kaish, so all four
+  levers above are untouched: kaish still cannot write anywhere. (`generate_image` is
+  the only such tool today.) Read-*scope* is also bounded: every call's path must
+  canonicalize (symlinks, `..` resolved) into the allowed set (`--root` /
+  `--allow-path`, launch cwd when unset) **plus the out-dir**, which is mounted
+  *read-only* into kaish so a consult can read a generated artifact back — a deliberate,
+  narrow widening to kaibo's own cache (a consult *can* ship those own-generated
+  artifacts to a model; that's expected, not a leak). Enforced in
+  `server.rs::resolve_root` and the out-dir mount in
+  `sandbox.rs::build_readonly_kernel_and_vfs`, with tests in `tests/containment.rs` and
+  the `out_dir_*` battery in `tests/sandbox.rs` (artifact readable, out-dir read-only to
+  kaish, siblings of the out-dir *not* exposed).
 - **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.

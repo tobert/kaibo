@@ -537,6 +537,13 @@ pub struct Config {
     /// `--no-follow-worktrees`, `KAIBO_NO_FOLLOW_WORKTREES`, or
     /// `[server] follow_worktrees = false`) to keep the boundary strictly static.
     pub follow_worktrees: bool,
+    /// Where capability tools write their artifacts (`generate_image` today). A
+    /// kaibo-owned dir, default `$XDG_CACHE_HOME/kaibo` (see [`default_out_dir`]),
+    /// settable via `--out-dir` / `KAIBO_OUT_DIR` / `[server] out_dir`. Written
+    /// *handler-side* (`std::fs`), never through kaish — the read-only sandbox is
+    /// untouched. It *is* mounted read-only into kaish (see [`SandboxConfig::out_dir`])
+    /// so a later consult can read a generated artifact back.
+    pub out_dir: PathBuf,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -1072,6 +1079,12 @@ impl Config {
             .map(|s| expand_path(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
+        // The artifact out-dir: expanded like root/allow_paths, else the kaibo-owned
+        // XDG-cache default. Always resolves (a capability write needs a home).
+        let out_dir = match server.out_dir.as_deref() {
+            Some(s) => expand_path(s)?,
+            None => default_out_dir(),
+        };
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
@@ -1080,6 +1093,10 @@ impl Config {
         // The ignore policy lives in its own `[kaish.ignore]` stanza (behavior, not
         // safety), but resolves onto the same struct the kernel builder consumes.
         sandbox.ignore = merge_kaish(raw.kaish.unwrap_or_default())?;
+        // Mirror the artifact out-dir onto the sandbox so the kernel builder mounts it
+        // read-only (the read-back seam — see `build_readonly_kernel_and_vfs`). The
+        // handler writes it via `std::fs`; this mount only lets kaish *read* it back.
+        sandbox.out_dir = Some(out_dir.clone());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
         // real intent (there's no "unbounded" escape hatch by design: an unbounded
@@ -1097,6 +1114,7 @@ impl Config {
             root,
             allow_paths,
             follow_worktrees,
+            out_dir,
             default_cast,
             log,
             tools,
@@ -1139,9 +1157,16 @@ impl Config {
         disable_follow_worktrees: bool,
         project_context_files: Vec<String>,
         user_context_files: Vec<PathBuf>,
+        out_dir: Option<PathBuf>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
+        }
+        // CLI out-dir wins. Mirror it onto the sandbox too, so the read-back mount
+        // tracks the final resolved dir (the merge set both; keep them in lockstep).
+        if let Some(out_dir) = out_dir {
+            self.sandbox.out_dir = Some(out_dir.clone());
+            self.out_dir = out_dir;
         }
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
         // never force it on over a `[server] follow_worktrees = false` in the file.
@@ -1492,6 +1517,9 @@ struct RawServer {
     /// Follow git worktrees of an already-allowed repo. Default `true`. Env:
     /// `KAIBO_NO_FOLLOW_WORKTREES`. CLI: `--no-follow-worktrees`.
     follow_worktrees: Option<bool>,
+    /// Where capability tools write artifacts. Default `$XDG_CACHE_HOME/kaibo` (see
+    /// [`default_out_dir`]). Env: `KAIBO_OUT_DIR`. CLI: `--out-dir`. Expands `$VAR`/`~`.
+    out_dir: Option<String>,
     /// The default cast (was `provider` before the backends/casts split; the old
     /// key is now an unknown-field load error via `deny_unknown_fields`).
     cast: Option<String>,
@@ -1833,6 +1861,9 @@ fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
         disable_builtins: raw.disable_builtins.unwrap_or(d.disable_builtins),
         // Resolved separately from `[kaish.ignore]` and stitched in by `merge`.
         ignore: d.ignore,
+        // The artifact out-dir comes from `[server] out_dir` (not `[sandbox]`) and is
+        // mirrored on by `merge`; None here means "no read-back mount" until then.
+        out_dir: d.out_dir,
     }
 }
 
@@ -1912,6 +1943,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_FOLLOW_WORKTREES") {
         server.follow_worktrees = Some(false);
+    }
+    if let Some(v) = get("KAIBO_OUT_DIR") {
+        server.out_dir = Some(v);
     }
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);
@@ -2071,6 +2105,25 @@ pub fn default_config_path() -> Option<PathBuf> {
             .join("kaibo")
             .join("config.toml")
     })
+}
+
+/// The default artifact out-dir: `$XDG_CACHE_HOME/kaibo`, else `~/.cache/kaibo`, else
+/// `temp_dir()/kaibo` when neither var is set. Unlike [`default_config_path`] this
+/// *always* resolves — a capability that writes an artifact must have a home even with
+/// `$HOME` unset, so the system temp dir is the last-resort floor rather than `None`.
+/// It's a kaibo-*owned* subdir on purpose: the dir is mounted read-only into kaish so a
+/// later consult/run_kaish can read a generated artifact back, and scoping it to a
+/// kaibo subdir (not bare `/tmp`) keeps that read-scope to our own artifacts, never a
+/// shared temp full of other processes' files. Durable (a cache, not auto-cleared) by
+/// design — artifacts persist; cleanup is a future concern, revisited only if it bites.
+pub fn default_out_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("kaibo");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(home).join(".cache").join("kaibo");
+    }
+    std::env::temp_dir().join("kaibo")
 }
 
 /// Expand a leading `~` or `~/...` to `$HOME`. Leaves every other path untouched —

@@ -288,6 +288,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | config file location | — | `KAIBO_CONFIG` | `--config <path>` |
 | default root | `server.root` | `KAIBO_ROOT` | `--root` |
 | additional allowed trees | `server.allow_paths` *(list)* | `KAIBO_ALLOW_PATHS` *(colon-separated)* | `--allow-path DIR` *(repeatable)* |
+| artifact out-dir | `server.out_dir` | `KAIBO_OUT_DIR` | `--out-dir DIR` |
 | default cast | `server.cast` | `KAIBO_CAST` | `--cast` |
 | disable a tool | `server.tools.<t> = false` | `KAIBO_NO_<T>` | `--no-<t>` |
 | log filter | `server.log` | `RUST_LOG` *(wins)* / `KAIBO_LOG` | — |
@@ -703,6 +704,34 @@ The worktrees currently followed are listed at `kaibo://config` under `[runtime]
 (see below), recomputed on each read so a mid-session worktree shows up without a
 reconnect.
 
+## Artifact out-dir: `server.out_dir`
+
+Capability tools (today, `generate_image`) write their output to a **kaibo-owned
+out-dir** and hand back the path — no inline blob, so a large artifact costs the
+caller's context nothing until it opens the file. Default `$XDG_CACHE_HOME/kaibo`
+(else `~/.cache/kaibo`, else `<temp>/kaibo`); set it explicitly with any of:
+
+```toml
+[server]
+out_dir = "~/kaibo-artifacts"   # expands ~ / $VAR like root/allow_paths
+```
+
+```sh
+KAIBO_OUT_DIR=/data/kaibo-art kaibo     # env
+kaibo --out-dir /data/kaibo-art         # CLI (wins over env/file)
+```
+
+Two properties make this safe with the read-only invariant. **kaibo writes the out-dir
+directly** (`std::fs`), never through kaish — the read-only sandbox levers are
+untouched, and kaish still cannot write anywhere. **The out-dir is mounted *read-only*
+into kaish**, so a later `consult`/`run_kaish` can read a generated artifact back. That
+read-back is a deliberate, narrow widening of read-scope to kaibo's own cache — which is
+why the default is a kaibo-owned subdir, not bare `/tmp`: mounting a shared temp would
+expose every other process's files to a consult (and a consult can ship what it reads to
+a model). Point `out_dir` at a kaibo-owned directory if you override it. It's durable (a
+cache, not auto-cleared) — artifacts accumulate; clear it yourself if it grows. The
+resolved path shows at `kaibo://config` as `out_dir`.
+
 ## kaibo://config
 
 An MCP resource at the URI `kaibo://config` (`application/toml`) exposes the server's
@@ -711,6 +740,7 @@ operator) the full picture:
 
 - `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
 - `default_root` — the `--root` value, if set
+- `out_dir` — where capability tools write artifacts (also mounted read-only into kaish)
 - `default_cast` — which cast is used when a call omits `cast`
 - `runtime` — state *computed at read time*, kept distinct from the configured
   knobs above so a reader can tell "what kaibo discovered" from "what the operator
