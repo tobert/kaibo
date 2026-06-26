@@ -180,15 +180,24 @@ fn unique_artifact_name(ext: &str) -> String {
 /// Write a generated image to `out_dir`, returning its absolute path.
 ///
 /// Handler-side `std::fs` — this is the *only* write path for an artifact, and it never
-/// touches kaish, so the read-only sandbox is unaffected. Creates `out_dir` on demand
-/// (the lazy creation the read-back mount waits on) and errors loudly on any failure
-/// (a full disk or unwritable cache dir is the operator's environment, not the caller's
-/// request — the handler maps it to an internal error). Never delivers a half-written
-/// artifact as success: a failed write is an `Err`, not a quietly dropped image.
+/// touches kaish, so the read-only sandbox is unaffected. Creates `out_dir` if absent
+/// (normally pre-created at startup; this is the defensive fallback) and errors loudly
+/// on any failure (a full disk or unwritable cache dir is the operator's environment,
+/// not the caller's request — the handler maps it to an internal error). Never delivers
+/// a half-written artifact as success: a failed write is an `Err`, not a quietly dropped
+/// image. Returns the *canonical* absolute path (see the in-fn note).
 pub fn write_artifact(out_dir: &Path, image: &GeneratedImage) -> Result<PathBuf> {
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("creating artifact out-dir {}", out_dir.display()))?;
-    let path = out_dir.join(unique_artifact_name(mime_ext(image.mime)));
+    // Canonicalize the dir (it exists now) so the path we return matches the read-only
+    // out-dir mount kaish sees: that mount is keyed on the *canonical* out-dir, so a
+    // symlinked out_dir (e.g. `~/.cache/kaibo` under a symlinked `$HOME`) would otherwise
+    // hand the model a path that doesn't resolve through the VFS on read-back. It also
+    // gives the calling agent the real resolved absolute path.
+    let dir = out_dir
+        .canonicalize()
+        .with_context(|| format!("resolving artifact out-dir {}", out_dir.display()))?;
+    let path = dir.join(unique_artifact_name(mime_ext(image.mime)));
     std::fs::write(&path, &image.bytes)
         .with_context(|| format!("writing artifact to {}", path.display()))?;
     Ok(path)
@@ -271,7 +280,11 @@ mod tests {
         assert_eq!(p1.extension().and_then(|e| e.to_str()), Some("png"));
         // Two writes never collide — the artifact channel must not clobber.
         assert_ne!(p1, p2, "each artifact gets a distinct path");
-        assert!(p1.starts_with(dir.path()), "artifact lands inside out_dir");
+        // The returned path is canonical (matches the read-back mount), so compare
+        // against the canonicalized dir — on macOS a tempdir under /var resolves to
+        // /private/var, which a raw `dir.path()` prefix check would miss.
+        let dir_canon = dir.path().canonicalize().unwrap();
+        assert!(p1.starts_with(&dir_canon), "artifact lands inside out_dir");
     }
 
     #[test]

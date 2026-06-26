@@ -1085,6 +1085,18 @@ impl Config {
             Some(s) => expand_path(s)?,
             None => default_out_dir(),
         };
+        // Refuse `/` outright: the out-dir is mounted *read-only into kaish*, so `/` would
+        // hand a consult read of the entire host filesystem (and a consult can ship what
+        // it reads to a model). Never a real artifact dir — a loud load error, not a
+        // silent host-wide exposure. ($HOME is the softer case — warned at startup in
+        // `main`, not refused, since a deliberately-broad home cache is the user's call.)
+        if out_dir == PathBuf::from("/") {
+            bail!(
+                "[server] out_dir resolves to `/` — refusing: the out-dir is mounted \
+                 read-only into kaish, so `/` would expose the whole host filesystem to a \
+                 consult. Point it at a kaibo-owned directory (default $XDG_CACHE_HOME/kaibo)."
+            );
+        }
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;

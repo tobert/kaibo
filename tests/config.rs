@@ -1687,3 +1687,17 @@ fn out_dir_layers_default_file_env_and_cli() {
         "CLI override updates the sandbox mirror so the mount tracks the final dir"
     );
 }
+
+/// `out_dir = "/"` is refused at load: the out-dir is mounted read-only into kaish, so
+/// `/` would expose the whole host filesystem to a consult. A loud error, not a silent
+/// host-wide read scope.
+#[test]
+fn out_dir_root_is_refused() {
+    let err = Config::from_toml_str("[server]\nout_dir = \"/\"\n")
+        .expect_err("out_dir = / must be a loud load error, not a host-wide read mount");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("out_dir") && msg.contains("/"),
+        "the refusal should name out_dir and `/`: {msg}"
+    );
+}

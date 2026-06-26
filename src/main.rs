@@ -224,6 +224,19 @@ async fn main() -> Result<()> {
     // and surfaces the hard error loudly at call time — but a warning lets the operator
     // catch an unwritable cache dir early.
     if config.tools.generate_image {
+        // A broad out-dir is read-only-mounted into kaish, so a consult could read (and
+        // ship to a model) anything under it. `/` is refused at load; warn on `$HOME`,
+        // where the adjacent-secret files (`~/.ssh`, provider key files) live — the user
+        // may have meant a narrow subdir. A warning, not a refusal: a deliberate broad
+        // home cache is their call.
+        if std::env::var_os("HOME").is_some_and(|h| config.out_dir == PathBuf::from(h)) {
+            tracing::warn!(
+                out_dir = %config.out_dir.display(),
+                "out_dir is your home directory — it's mounted read-only into kaish, so a \
+                 consult can read (and send to a model) anything under it, including \
+                 adjacent secrets. Prefer a narrow kaibo-owned dir (default $XDG_CACHE_HOME/kaibo)."
+            );
+        }
         if let Err(e) = std::fs::create_dir_all(&config.out_dir) {
             tracing::warn!(
                 out_dir = %config.out_dir.display(),
