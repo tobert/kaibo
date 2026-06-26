@@ -531,14 +531,12 @@ impl KaiboHandler {
             }
         };
 
-        // The artifact out-dir joins the read allowed-set when readable, so an out-dir
-        // path can be `attach`ed (oneshot/batch) or targeted as a call `path` — keeping
-        // the attach/containment surface in step with the read-only kaish mount. Added
-        // *after* the default-root resolution above so it never becomes the inferred
-        // default root. Canonicalized (normally pre-created at startup); skipped silently
-        // when it doesn't exist yet (nothing to read until an artifact lands) or already
-        // falls under an allowed tree. Unlike `--root`/`--allow-path` a missing out-dir is
-        // not a loud error — it's auto-defaulted and lazily created, so absence is normal.
+        // When readable, the out-dir joins the allowed-set so an out-dir path can be
+        // `attach`ed or targeted as a call `path` — the containment half of the read
+        // surface on [`crate::config::Config::out_dir`], kept in step with the kaish mount.
+        // Added *after* default-root resolution so it never becomes the inferred root.
+        // Skipped silently when it doesn't exist yet or already falls under an allowed tree
+        // — unlike `--root`/`--allow-path`, a missing auto-defaulted out-dir isn't an error.
         if config.out_dir_readable {
             if let Ok(canon) = std::fs::canonicalize(&config.out_dir) {
                 if canon.is_dir() && !allowed.iter().any(|tree| canon.starts_with(tree)) {

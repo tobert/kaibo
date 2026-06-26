@@ -154,15 +154,11 @@ pub struct SandboxConfig {
     /// `[kaish.ignore]`. Defaults to [`IgnoreConfig::agent`] (`.gitignore` + built-in
     /// defaults, enforced scope) so omitting the stanza preserves today's behavior.
     pub ignore: IgnoreConfig,
-    /// The capability artifact out-dir ([`crate::config::Config::out_dir`]), mounted
-    /// **read-only** into the kernel so a consult/run_kaish can read a generated
-    /// artifact back. This widens read-*scope* to the kaibo-owned cache only — it is
-    /// **not** a write path (the handler writes via `std::fs`; kaish never does), so the
-    /// read-only invariant is untouched. `None` (the default) mounts nothing; the mount
-    /// is also skipped when the dir doesn't exist (normally pre-created at startup in
-    /// `main`, so this is the defensive fallback for a gated-off or uncreatable dir) and
-    /// when it already falls under the project mount. See
-    /// [`build_readonly_kernel_and_vfs`].
+    /// The readable artifact out-dir to mount **read-only** into the kernel for read-back
+    /// — `Some` iff `out_dir_readable` (see [`crate::config::Config::out_dir`] for the
+    /// policy and why this is a read mount, not a write path). `None` mounts nothing.
+    /// [`build_readonly_kernel_and_vfs`] also skips it when the dir doesn't exist yet or
+    /// already falls under the project mount.
     pub out_dir: Option<PathBuf>,
 }
 
@@ -245,18 +241,13 @@ fn build_readonly_kernel_and_vfs(
     // The project itself: real files, read-only.
     vfs.mount(&mount_point, LocalFs::read_only(&root));
 
-    // The capability artifact out-dir, mounted **read-only** so a consult/run_kaish can
-    // read a generated artifact back (the `generate_image` output, etc.). It's the same
-    // `LocalFs::read_only` the project rides, so this only adds read-*scope* to the
-    // kaibo-owned cache — never a write path (the handler writes via `std::fs`; kaish
-    // can't). Skipped when (a) unset, (b) the dir doesn't exist (normally pre-created at
-    // startup in `main` when generate_image is enabled, so this guards the gated-off /
-    // uncreatable case — nothing to read until an artifact lands anyway), or (c) it
-    // already falls under the project mount (the project's read-only `LocalFs` already
-    // serves it; a second mount would just shadow it identically). Canonicalize first so the mount point matches
-    // how kaish resolves an absolute path (symlinks/`..` resolved), and so the
-    // under-root check can't be fooled by a symlink — the same canonicalize-then-decide
-    // discipline as `resolve_root`.
+    // The readable artifact out-dir, mounted read-only for read-back (see
+    // [`crate::config::Config::out_dir`]). Same `LocalFs::read_only` as the project, so no
+    // write path is opened. Skipped when unset, when the dir doesn't exist yet (nothing to
+    // read until an artifact lands), or when it already falls under the project mount.
+    // Canonicalize first so the mount point matches how kaish resolves an absolute path
+    // and the under-root check can't be fooled by a symlink — the canonicalize-then-decide
+    // discipline `resolve_root` uses.
     if let Some(out_dir) = sandbox.out_dir.as_ref() {
         if let Ok(canon) = out_dir.canonicalize() {
             let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());

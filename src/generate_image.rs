@@ -9,15 +9,11 @@
 //! [`ImageGen`] seam so this whole path is exercised offline by a scripted backend; the
 //! live wire is proven by an `#[ignore]`d probe.
 //!
-//! **Path delivery, not inline.** The image is written to disk and only its path
-//! crosses the MCP edge — no base64 blob in the tool result, so a multi-MiB picture
-//! costs the calling agent nothing until it chooses to open the file. The write is
-//! handler-side (`std::fs`), never through kaish, so the read-only sandbox is
-//! untouched; the out-dir is separately mounted *read-only* into kaish so a later
-//! consult can read the artifact back. There is no inline size cap — the old
-//! `GENERATE_IMAGE_MAX_BYTES` guard existed only to bound base64 in context and is gone
-//! with inline delivery. The decision (path over `ResourceLink`) is recorded in
-//! `docs/issues.md`.
+//! **Path delivery, not inline.** Only the path crosses the MCP edge — no base64 blob in
+//! the tool result, so a multi-MiB picture costs the calling agent nothing until it opens
+//! the file. (No inline size cap: the old `GENERATE_IMAGE_MAX_BYTES` only bounded base64
+//! in context. The path-over-`ResourceLink` decision is in `docs/issues.md`.) The out-dir
+//! write/read-back model and its safety live on [`crate::config::Config::out_dir`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,13 +175,12 @@ fn unique_artifact_name(ext: &str) -> String {
 
 /// Write a generated image to `out_dir`, returning its absolute path.
 ///
-/// Handler-side `std::fs` — this is the *only* write path for an artifact, and it never
-/// touches kaish, so the read-only sandbox is unaffected. Creates `out_dir` if absent
-/// (normally pre-created at startup; this is the defensive fallback) and errors loudly
-/// on any failure (a full disk or unwritable cache dir is the operator's environment,
-/// not the caller's request — the handler maps it to an internal error). Never delivers
-/// a half-written artifact as success: a failed write is an `Err`, not a quietly dropped
-/// image. Returns the *canonical* absolute path (see the in-fn note).
+/// The one write path for an artifact: handler-side `std::fs`, never kaish (see
+/// [`crate::config::Config::out_dir`]). Creates `out_dir` if absent, returns the
+/// *canonical* absolute path so it matches the read-back mount (see the in-fn note), and
+/// errors loudly on any failure (a full disk / unwritable dir → the handler maps it to an
+/// internal error). Never reports a half-written artifact as success — a failed write is
+/// an `Err`.
 pub fn write_artifact(out_dir: &Path, image: &GeneratedImage) -> Result<PathBuf> {
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("creating artifact out-dir {}", out_dir.display()))?;

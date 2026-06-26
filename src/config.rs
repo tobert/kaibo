@@ -537,21 +537,32 @@ pub struct Config {
     /// `--no-follow-worktrees`, `KAIBO_NO_FOLLOW_WORKTREES`, or
     /// `[server] follow_worktrees = false`) to keep the boundary strictly static.
     pub follow_worktrees: bool,
-    /// Where capability tools write their artifacts (`generate_image` today). A
-    /// kaibo-owned dir, default `$XDG_CACHE_HOME/kaibo` (see [`default_out_dir`]),
-    /// settable via `--out-dir` / `KAIBO_OUT_DIR` / `[server] out_dir`. Written
-    /// *handler-side* (`std::fs`), never through kaish — the read-only sandbox is
-    /// untouched. It *is* mounted read-only into kaish (see [`SandboxConfig::out_dir`])
-    /// so a later consult can read a generated artifact back.
+    /// **The artifact out-dir — canonical reference for the whole feature.** Where
+    /// capability tools (`generate_image` today) write their output; default
+    /// `$XDG_CACHE_HOME/kaibo` (see [`DefaultOutDir`]), set via `--out-dir` /
+    /// `KAIBO_OUT_DIR` / `[server] out_dir`. The pieces elsewhere link here rather than
+    /// restate this:
+    ///
+    /// - **Write is handler-side `std::fs`, never through kaish** ([`crate::generate_image::write_artifact`]).
+    ///   So the four read-only sandbox levers are untouched — kaish still can't write
+    ///   anywhere; the out-dir is the *one* place kaibo writes, and only a capability tool
+    ///   does it.
+    /// - **Read-back is gated by [`out_dir_readable`](Self::out_dir_readable)** (default
+    ///   on). When on, the out-dir is mounted *read-only* into kaish
+    ///   ([`SandboxConfig::out_dir`], via `build_readonly_kernel_and_vfs`) **and** joined
+    ///   to the containment allowed-set (in [`crate::server`]), so a consult
+    ///   can read an artifact back and an out-dir path can be `attach`ed or targeted as a
+    ///   call `path`. This is the read-*scope* widening — bounded to the kaibo-owned dir,
+    ///   and a real exfil surface (a consult can ship what it reads to a model), which is
+    ///   why the dir is kaibo-owned and narrow, why `out_dir = "/"` is refused and `$HOME`
+    ///   warned, and why the untrusted shared-temp fallback defaults read-back *off* (see
+    ///   [`DefaultOutDir`]).
     pub out_dir: PathBuf,
-    /// Whether the out-dir is part of kaibo's *read* surface: mounted read-only into
-    /// kaish (so a consult can read an artifact back) **and** joined to the containment
-    /// allowed-set (so an out-dir path can be `attach`ed or targeted as a call `path`).
-    /// Default `true` — kaibo wrote the artifact, so reading it back is the unsurprising
-    /// default. Set `false` (`[server] out_dir_readable = false`,
-    /// `KAIBO_NO_OUT_DIR_READABLE`, `--no-out-dir-read`) for the tightest boundary: kaibo
-    /// still writes the artifact and returns its path, but never reads it back itself.
-    /// Gates both surfaces together so "readable" stays one concept.
+    /// Gates the out-dir's whole *read* surface (mount + allowed-set) as one concept — see
+    /// [`out_dir`](Self::out_dir) for what that surface is and why. Default `true`
+    /// (`false` via `[server] out_dir_readable = false` / `KAIBO_NO_OUT_DIR_READABLE` /
+    /// `--no-out-dir-read`): kaibo still writes artifacts and returns their paths, but
+    /// never reads them back.
     pub out_dir_readable: bool,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
@@ -1100,11 +1111,9 @@ impl Config {
                 (d.into_path(), shared)
             }
         };
-        // Refuse `/` outright: the out-dir is mounted *read-only into kaish*, so `/` would
-        // hand a consult read of the entire host filesystem (and a consult can ship what
-        // it reads to a model). Never a real artifact dir — a loud load error, not a
-        // silent host-wide exposure. ($HOME is the softer case — warned at startup in
-        // `main`, not refused, since a deliberately-broad home cache is the user's call.)
+        // Refuse `/` outright: it would read-mount the whole host filesystem into kaish
+        // (the read-scope concern on `Config::out_dir`). Never a real artifact dir — a loud
+        // load error. ($HOME is the softer case, warned at startup in `main`, not refused.)
         if out_dir.as_path() == std::path::Path::new("/") {
             bail!(
                 "[server] out_dir resolves to `/` — refusing: the out-dir is mounted \
@@ -1112,12 +1121,9 @@ impl Config {
                  consult. Point it at a kaibo-owned directory (default $XDG_CACHE_HOME/kaibo)."
             );
         }
-        // Whether the out-dir is part of the read surface (mount + allowed-set). Gates
-        // both surfaces together. Defaults ON for a kaibo-owned dir, but OFF when the
-        // out-dir is the *unsafe shared-temp fallback* (no XDG/HOME): kaibo still writes
-        // artifacts there, but won't auto-mount a world-shared temp into kaish — a planted
-        // symlink could redirect the read mount and a consult could exfiltrate. An
-        // explicit `out_dir_readable` always wins (the operator's deliberate choice).
+        // Read-back default: ON for a kaibo-owned dir, OFF for the untrusted shared-temp
+        // fallback (see [`DefaultOutDir::SharedTemp`] for why). An explicit
+        // `out_dir_readable` always wins.
         let out_dir_readable = server.out_dir_readable.unwrap_or(!default_shared_temp);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;

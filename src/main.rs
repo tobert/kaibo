@@ -223,20 +223,16 @@ async fn main() -> Result<()> {
     // build — a typo must crash here, not silently leave the builtin enabled.
     config.validate_against_builtins(&kaibo::sandbox::builtin_names()?)?;
 
-    // Pre-create the artifact out-dir so the read-only read-back mount is present for
-    // every kaish kernel from the first call. The mount is decided at kernel-build time
-    // and skipped when the dir doesn't exist yet; a `consult` session built *before* the
-    // first `generate_image` keeps a long-lived `run_kaish` worker, so without this its
-    // model couldn't `cat` an artifact created mid-session. Only when a capability can
-    // actually write there. Not fatal — `write_artifact` does its own `create_dir_all`
-    // and surfaces the hard error loudly at call time — but a warning lets the operator
-    // catch an unwritable cache dir early.
+    // Artifact out-dir startup handling — only when a capability can write there. The
+    // read surface + its safety are documented on `Config::out_dir`; here we (1) warn on
+    // the two risky shapes that aren't hard-refused, then (2) pre-create the dir so the
+    // read-back mount is present from the first call (it's decided at kernel-build time and
+    // skipped if the dir is absent, which would otherwise miss a long-lived consult session
+    // started before the first generate_image). Creation failure isn't fatal —
+    // `write_artifact` retries and fails loudly at call time.
     if config.tools.generate_image {
-        // A broad out-dir is read-only-mounted into kaish, so a consult could read (and
-        // ship to a model) anything under it. `/` is refused at load; warn on `$HOME`,
-        // where the adjacent-secret files (`~/.ssh`, provider key files) live — the user
-        // may have meant a narrow subdir. A warning, not a refusal: a deliberate broad
-        // home cache is their call.
+        // `$HOME` as the out-dir read-mounts adjacent secrets (`~/.ssh`, key files) into
+        // kaish — warn, but don't refuse (a deliberate broad home cache is the user's call).
         if std::env::var_os("HOME")
             .is_some_and(|h| config.out_dir.as_path() == std::path::Path::new(&h))
         {
@@ -247,11 +243,9 @@ async fn main() -> Result<()> {
                  adjacent secrets. Prefer a narrow kaibo-owned dir (default $XDG_CACHE_HOME/kaibo)."
             );
         }
-        // No XDG cache and no HOME → the out-dir fell back to a world-shared system temp,
-        // and config defaulted read-back OFF there (a planted symlink in a shared temp
-        // could redirect the read mount). Tell the operator how to restore read-back: name
-        // a kaibo-owned out_dir. (Detected by the forced-off readable on a temp-rooted dir;
-        // an explicit out_dir under temp with readable left on won't trip this.)
+        // The shared-temp fallback (no XDG/HOME) defaulted read-back off (see
+        // `DefaultOutDir::SharedTemp`); tell the operator how to restore it. Detected by the
+        // forced-off readable on a temp-rooted dir.
         if !config.out_dir_readable && config.out_dir.starts_with(std::env::temp_dir()) {
             tracing::warn!(
                 out_dir = %config.out_dir.display(),
