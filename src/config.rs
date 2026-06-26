@@ -1088,11 +1088,17 @@ impl Config {
             .map(|s| expand_path(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
-        // The artifact out-dir: expanded like root/allow_paths, else the kaibo-owned
-        // XDG-cache default. Always resolves (a capability write needs a home).
-        let out_dir = match server.out_dir.as_deref() {
-            Some(s) => expand_path(s)?,
-            None => default_out_dir(),
+        // The artifact out-dir: expanded like root/allow_paths, else the default. An
+        // explicitly-named out_dir is the operator's call (trusted); the auto default is
+        // flagged when it fell back to a *world-shared* system temp (no XDG/HOME), so the
+        // read-back default below can withhold the mount there.
+        let (out_dir, default_shared_temp) = match server.out_dir.as_deref() {
+            Some(s) => (expand_path(s)?, false),
+            None => {
+                let d = default_out_dir_from(|k| std::env::var_os(k));
+                let shared = d.is_shared_temp();
+                (d.into_path(), shared)
+            }
         };
         // Refuse `/` outright: the out-dir is mounted *read-only into kaish*, so `/` would
         // hand a consult read of the entire host filesystem (and a consult can ship what
@@ -1106,9 +1112,13 @@ impl Config {
                  consult. Point it at a kaibo-owned directory (default $XDG_CACHE_HOME/kaibo)."
             );
         }
-        // Whether the out-dir is part of the read surface (mount + allowed-set), default
-        // on. Gates both surfaces, so they can't drift apart.
-        let out_dir_readable = server.out_dir_readable.unwrap_or(true);
+        // Whether the out-dir is part of the read surface (mount + allowed-set). Gates
+        // both surfaces together. Defaults ON for a kaibo-owned dir, but OFF when the
+        // out-dir is the *unsafe shared-temp fallback* (no XDG/HOME): kaibo still writes
+        // artifacts there, but won't auto-mount a world-shared temp into kaish — a planted
+        // symlink could redirect the read mount and a consult could exfiltrate. An
+        // explicit `out_dir_readable` always wins (the operator's deliberate choice).
+        let out_dir_readable = server.out_dir_readable.unwrap_or(!default_shared_temp);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
@@ -2145,23 +2155,56 @@ pub fn default_config_path() -> Option<PathBuf> {
     })
 }
 
-/// The default artifact out-dir: `$XDG_CACHE_HOME/kaibo`, else `~/.cache/kaibo`, else
-/// `temp_dir()/kaibo` when neither var is set. Unlike [`default_config_path`] this
-/// *always* resolves — a capability that writes an artifact must have a home even with
-/// `$HOME` unset, so the system temp dir is the last-resort floor rather than `None`.
-/// It's a kaibo-*owned* subdir on purpose: the dir is mounted read-only into kaish so a
-/// later consult/run_kaish can read a generated artifact back, and scoping it to a
-/// kaibo subdir (not bare `/tmp`) keeps that read-scope to our own artifacts, never a
-/// shared temp full of other processes' files. Durable (a cache, not auto-cleared) by
-/// design — artifacts persist; cleanup is a future concern, revisited only if it bites.
+/// The default artifact out-dir, classified by how much kaibo can trust it — the
+/// distinction the read-back default keys off (see [`default_out_dir_from`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultOutDir {
+    /// A kaibo-owned cache under `$XDG_CACHE_HOME` or `~/.cache` — a narrow, isolated dir
+    /// kaibo trusts enough to auto-mount read-only for read-back.
+    Cache(PathBuf),
+    /// A subdir of the shared system temp dir — the last resort when neither
+    /// `$XDG_CACHE_HOME` nor `$HOME` is set (a stripped container, a systemd unit). A
+    /// *world-shared* location: kaibo writes artifacts here but must **not** auto-grant
+    /// read-back (the kaish mount + allowed-set), because a pre-planted symlink in a
+    /// world-writable temp could redirect the read mount onto an attacker-chosen tree and
+    /// a consult could exfiltrate it. Read-back here is opt-in via an explicit `out_dir`.
+    SharedTemp(PathBuf),
+}
+
+impl DefaultOutDir {
+    /// The resolved path, regardless of trust class.
+    pub fn into_path(self) -> PathBuf {
+        match self {
+            Self::Cache(p) | Self::SharedTemp(p) => p,
+        }
+    }
+    /// True for the untrusted shared-temp fallback (no XDG/HOME).
+    pub fn is_shared_temp(&self) -> bool {
+        matches!(self, Self::SharedTemp(_))
+    }
+}
+
+/// Classify the default out-dir from an injected env getter — `$XDG_CACHE_HOME/kaibo`,
+/// else `~/.cache/kaibo`, else the shared-temp fallback `<temp>/kaibo`. The testable core
+/// of [`default_out_dir`]. *Always* resolves (unlike [`default_config_path`]) — a
+/// capability that writes an artifact must have a home even with `$HOME` unset — but the
+/// shared-temp last resort is tagged [`DefaultOutDir::SharedTemp`] so the caller can
+/// withhold read-back there (a kaibo-owned cache is safe to auto-mount; a world-shared
+/// temp is not). Durable (a cache, not auto-cleared) by design — artifacts persist.
+fn default_out_dir_from(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> DefaultOutDir {
+    if let Some(xdg) = get("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
+        return DefaultOutDir::Cache(PathBuf::from(xdg).join("kaibo"));
+    }
+    if let Some(home) = get("HOME").filter(|s| !s.is_empty()) {
+        return DefaultOutDir::Cache(PathBuf::from(home).join(".cache").join("kaibo"));
+    }
+    DefaultOutDir::SharedTemp(std::env::temp_dir().join("kaibo"))
+}
+
+/// The default artifact out-dir path (see [`default_out_dir_from`] for the trust
+/// classification the read-back default keys off).
 pub fn default_out_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
-        return PathBuf::from(xdg).join("kaibo");
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
-        return PathBuf::from(home).join(".cache").join("kaibo");
-    }
-    std::env::temp_dir().join("kaibo")
+    default_out_dir_from(|k| std::env::var_os(k)).into_path()
 }
 
 /// Expand a leading `~` or `~/...` to `$HOME`. Leaves every other path untouched —
@@ -2331,6 +2374,49 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- default_out_dir classification ---------------------------------------
+
+    /// The default out-dir is a trusted kaibo-owned cache when `$XDG_CACHE_HOME` or
+    /// `$HOME` is set, but the *untrusted shared-temp fallback* when neither is — the
+    /// distinction the read-back default keys off (no XDG/HOME ⇒ read-back defaults off,
+    /// so kaibo never auto-mounts a world-shared temp into kaish). Env is injected so the
+    /// no-HOME container case is deterministic without touching the real environment.
+    #[test]
+    fn default_out_dir_classifies_cache_vs_shared_temp() {
+        let xdg = default_out_dir_from(|k| (k == "XDG_CACHE_HOME").then(|| "/x/cache".into()));
+        assert_eq!(xdg, DefaultOutDir::Cache(PathBuf::from("/x/cache/kaibo")));
+        assert!(!xdg.is_shared_temp());
+
+        let home = default_out_dir_from(|k| (k == "HOME").then(|| "/home/me".into()));
+        assert_eq!(
+            home,
+            DefaultOutDir::Cache(PathBuf::from("/home/me/.cache/kaibo"))
+        );
+
+        // XDG wins over HOME when both are set.
+        let both = default_out_dir_from(|k| match k {
+            "XDG_CACHE_HOME" => Some("/x/cache".into()),
+            "HOME" => Some("/home/me".into()),
+            _ => None,
+        });
+        assert_eq!(both, DefaultOutDir::Cache(PathBuf::from("/x/cache/kaibo")));
+
+        // Neither set (a stripped container): the untrusted shared-temp fallback.
+        let none = default_out_dir_from(|_| None);
+        assert!(
+            none.is_shared_temp(),
+            "no XDG/HOME must classify as shared temp"
+        );
+        assert_eq!(none.into_path(), std::env::temp_dir().join("kaibo"));
+
+        // An empty value is treated as unset (no silent empty path segment).
+        let empty = default_out_dir_from(|k| (k == "XDG_CACHE_HOME").then(|| "".into()));
+        assert!(
+            empty.is_shared_temp(),
+            "an empty $XDG_CACHE_HOME is not a usable dir"
+        );
+    }
 
     // --- expand_tilde ---------------------------------------------------------
 

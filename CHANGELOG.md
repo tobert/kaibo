@@ -72,7 +72,12 @@ the git log. Each later release appends a new section at the top.
   `consult`/`oneshot`/`batch` or targeted as a call `path`. Set `out_dir_readable = false`
   (`--no-out-dir-read` / `KAIBO_NO_OUT_DIR_READABLE`) to keep the out-dir out of kaibo's
   read surface entirely — artifacts are still written and their paths returned, but kaibo
-  never reads them back. `out_dir = "/"` is refused. Visible at `kaibo://config`.
+  never reads them back. `out_dir = "/"` is refused. In a stripped environment with no
+  `$XDG_CACHE_HOME` and no `$HOME` (a container), the out-dir falls back to a world-shared
+  system temp and read-back **defaults off** for safety — kaibo won't auto-mount a shared
+  temp into kaish (a planted symlink could redirect the read mount); `generate_image` still
+  works and returns the path, and you can opt back in by naming a kaibo-owned `out_dir`.
+  Visible at `kaibo://config`.
 - **Batch (`batch_submit`)** — the *offline, async sibling* of `oneshot`: submit a list
   of tool-less prompts, get a handle, then collect it with the shared `get`/`cancel`/
   `list` verbs (see below) — read every answer when the provider's batch lane finishes,

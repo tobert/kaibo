@@ -741,6 +741,16 @@ kaish mount, not in the allowed-set. kaibo still writes artifacts and returns th
 (the calling agent opens them with its own tools), but kaibo itself never reads them back.
 The tightest boundary, for anyone who'd rather artifacts not re-enter kaibo's read scope.
 
+**No XDG cache, no `$HOME` (containers).** When neither `$XDG_CACHE_HOME` nor `$HOME` is
+set, the default out-dir falls back to a subdir of the system temp dir — a *world-shared*
+location. kaibo will still write artifacts there, but **read-back defaults off** in that
+case: it won't auto-mount a shared temp into kaish, because a symlink planted in a
+world-writable temp could redirect the read mount onto an attacker-chosen tree (which a
+consult could then ship to a model). `generate_image` keeps working and returns the path;
+to enable read-back, set `out_dir` to a kaibo-owned directory you name (an explicit
+`out_dir` is trusted, so read-back defaults on for it). An explicit `out_dir_readable`
+always wins, either way.
+
 ## kaibo://config
 
 An MCP resource at the URI `kaibo://config` (`application/toml`) exposes the server's

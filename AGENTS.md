@@ -72,7 +72,10 @@ project and cannot run external commands.
   allowed-set, so a consult can read a generated artifact back and an out-dir path can be
   `attach`ed/targeted — a deliberate, narrow widening to kaibo's own cache (a consult
   *can* ship those own-generated artifacts to a model; that's expected, not a leak).
-  `out_dir_readable = false` removes both; `out_dir = "/"` is refused at load. Enforced in
+  `out_dir_readable = false` removes both; `out_dir = "/"` is refused at load; and when the
+  out-dir falls back to a **world-shared system temp** (no XDG cache, no `$HOME`) read-back
+  *defaults off* — kaibo writes artifacts there but won't auto-mount a shared temp (a
+  planted symlink could redirect the read mount). Enforced in
   `server.rs::resolve_root` and the out-dir mount in
   `sandbox.rs::build_readonly_kernel_and_vfs`, with tests in `tests/containment.rs` and
   the `out_dir_*` battery in `tests/sandbox.rs` (artifact readable, out-dir read-only to

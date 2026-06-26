@@ -195,6 +195,17 @@ the example slots.
 
 ## P2 — Focused fixes & hardening
 
+### `write_artifact` follows a symlinked out-dir (low-severity arbitrary file drop)
+Surfaced by the Gemini review of the out-dir PR (2026-06-26). `generate_image::write_artifact`
+canonicalizes the out-dir before writing, so if the out-dir path is a symlink the artifact
+lands at the *resolved* target. In a world-shared temp an attacker could pre-plant
+`<tmp>/kaibo` → some dir and have kaibo drop a PNG there. It's a **write** nuisance, not the
+critical read-exfil (that's closed: read-back defaults off for the shared-temp fallback, see
+devlog 2026-06-26), and `unique_artifact_name` prevents overwriting an existing file — so the
+worst case is an unexpected file appearing in an attacker-chosen dir, not corruption or a
+leak. Hardening if it ever matters: refuse a symlinked out-dir component, or `O_NOFOLLOW` the
+final create. Low priority; the read side was the real hole.
+
 ### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
 `tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
 the handler infers it as the default root. It fails intermittently (~1 in 5 full

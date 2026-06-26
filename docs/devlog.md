@@ -82,6 +82,26 @@ Surfaced in `config.example.toml`, `kaibo://config`, and `docs/config.md` so it'
 adjustable and visible, per Amy. The boundary still only ever widens to the kaibo-owned
 out-dir (the consult-attach test pins that a *sibling* of the out-dir is still refused).
 
+**Safe default for the no-XDG/no-HOME case — a real exfil hole closed (Gemini + Amy).**
+A scenario-driven Gemini Pro batch (attachments via kaibo, asked to *play through* the
+code paths) confirmed Amy's instinct that the `temp_dir()/kaibo` fallback was a genuine
+hole, not just untidy: in a stripped container with no `$XDG_CACHE_HOME`/`$HOME`, kaibo
+landed in a *world-shared* temp and auto-mounted it read-only into kaish. An attacker who
+pre-plants `<tmp>/kaibo` as a symlink to `/etc` or `/home/<someone>` would have kaibo
+canonicalize it, mount the **target** read-only, add it to `allowed_set`, and a consult
+could exfiltrate it — the `out_dir = "/"` guard doesn't catch a symlink to a non-`/` tree.
+Fix (Amy's "no XDG ⇒ no automatic permission", Gemini's refined option b): classify the
+default out-dir (`DefaultOutDir::Cache` vs `SharedTemp` in `config.rs`), and when it's the
+shared-temp fallback default **read-back off** — kaibo still *writes* the artifact and
+returns the path (no frustrating hard failure in a container; the agent opens it with its
+own tools), but won't auto-mount a world-shared temp. An explicit `out_dir` is trusted
+(read-back on); an explicit `out_dir_readable` always wins. A startup warning in `main.rs`
+and primed `configure`-prompt prose (step 5, `server.rs`) tell the agent how to restore
+read-back by naming a kaibo-owned dir. The remaining write-side symlink (artifact dropped
+at a symlink's target) is a low-severity nuisance — unique names prevent overwrite —
+tracked in `docs/issues.md`, not the critical read path. Tested via injected-env
+classification (`default_out_dir_from`, all three branches incl. the empty-`$VAR` guard).
+
 ## 2026-06-26 — Stayed read-only: retired per-builtin timeouts *and* deferred general RW mounts
 
 Two linked decisions in one session, one posture: **kaibo stays read-only as the product;

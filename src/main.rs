@@ -247,6 +247,21 @@ async fn main() -> Result<()> {
                  adjacent secrets. Prefer a narrow kaibo-owned dir (default $XDG_CACHE_HOME/kaibo)."
             );
         }
+        // No XDG cache and no HOME → the out-dir fell back to a world-shared system temp,
+        // and config defaulted read-back OFF there (a planted symlink in a shared temp
+        // could redirect the read mount). Tell the operator how to restore read-back: name
+        // a kaibo-owned out_dir. (Detected by the forced-off readable on a temp-rooted dir;
+        // an explicit out_dir under temp with readable left on won't trip this.)
+        if !config.out_dir_readable && config.out_dir.starts_with(std::env::temp_dir()) {
+            tracing::warn!(
+                out_dir = %config.out_dir.display(),
+                "no XDG cache or HOME found — artifacts go to a shared system temp dir and \
+                 read-back into kaish is disabled (a shared temp isn't safe to auto-mount). \
+                 generate_image still works and returns the path; to enable consult read-back \
+                 / out-dir attach, set KAIBO_OUT_DIR (or [server] out_dir) to a kaibo-owned \
+                 directory."
+            );
+        }
         if let Err(e) = std::fs::create_dir_all(&config.out_dir) {
             tracing::warn!(
                 out_dir = %config.out_dir.display(),

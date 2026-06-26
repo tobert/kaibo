@@ -2443,15 +2443,21 @@ default.
 (`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
 the secret stays outside it. Tell me which env vars to set or files to write, and let \
 me put the keys in myself.
-5. (Optional) Read scope. By default kaibo reads only the project tree it's pointed at \
-(plus linked git worktrees), and it only ever *reads* — never writes. If a workflow \
-hands kaibo artifacts to read from a scratch space — a diff, a generated file, a log \
-dropped in a temp dir — name that space in `[server] allow_paths` so it's in bounds. \
-Prefer the host-portable form `allow_paths = [\"$TMPDIR\"]` or \
-`[\"$XDG_RUNTIME_DIR/scratch\"]` over a hardcoded `/tmp` — `$VAR` / `${VAR}` and a \
-leading `~` expand in these paths, resolving per machine. Ask me whether I want a scratch \
-space readable before adding one: it widens what the team can see (read-only, but still a \
-real boundary), so it's a deliberate opt-in, not a default.
+5. (Optional) Read scope & artifact storage. By default kaibo reads only the project \
+tree (plus linked git worktrees) and only ever *reads* — never writes. Two things widen \
+what the team can see, both deliberate opt-ins worth asking me about first: (a) a scratch \
+space kaibo should read from — a diff, a log, a generated file — name it in \
+`[server] allow_paths`; (b) the artifact out-dir, where capability tools (`generate_image`) \
+write and which kaibo mounts read-only so a later consult can read an artifact back. The \
+out-dir defaults to a kaibo-owned cache (`$XDG_CACHE_HOME/kaibo`). **If I'm in a stripped \
+environment with no `$XDG_CACHE_HOME` and no `$HOME` — a container, a CI runner — kaibo \
+falls back to a shared system temp and turns read-back OFF for safety: `generate_image` \
+still works and returns the file path, but a consult can't read it back (a world-shared \
+temp isn't safe to auto-mount).** To restore read-back there, set `[server] out_dir` to a \
+safe, kaibo-owned directory I name. Prefer the host-portable `out_dir = \"$XDG_RUNTIME_DIR/kaibo\"` \
+(or a path under my home) over a hardcoded `/tmp`; `$VAR` / `${VAR}` and a leading `~` \
+expand here, resolving per machine. `out_dir = \"/\"` is refused, and `$HOME` is warned — \
+these read-mount into kaish, a real boundary.
 6. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
 the config and keys — both load once at startup.";
 
