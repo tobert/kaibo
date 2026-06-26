@@ -51,13 +51,27 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 - **Media moves by VFS path; base64 only at the edges** (provider wire, MCP
   content). Scratch `MemoryFs` is the working bus — bounded now that kaish landed
   `ByteBudget` (kaish-vfs, 2026-06-10; kaibo pickup tracked in the P2 entry below).
-  **RW mounts — design settled 2026-06-25 (w/ Amy), supersedes the inline-only
-  `--out-dir` plan.** Instead of a special-case artifact dir, kaibo gains a *general*
-  set of writable mounts: `rw_paths` (CLI `--rw-path` / `KAIBO_RW_PATHS` /
-  `[server] rw_paths`, default none) — the read-only `allow_paths` shape with the
-  mount flag flipped, reusing the same `$VAR` expansion + canonicalize + contain
-  machinery (`config.rs` `expand_env_vars`/`resolve_var`, `server.rs` containment).
-  Decisions that fell out of the conversation:
+  **RW mounts — DEFERRED 2026-06-26 (w/ Amy).** *"We're going to defer this a while
+  and stay read-only by having only specific tool accesses write to the underlying
+  fs."* The direction flips: rather than a **general** writable-mount surface wired into
+  every kernel, kaibo **stays read-only as the product** and any future write is a
+  *specific capability tool* writing its own artifact to the fs (the `generate_image`
+  shape — handler-side, narrow, its own path), never a broad mount and never `consult`.
+  This **reverses the "uniform RW into every kernel, consult *does* get RW" sub-bullet
+  below** — that was the cost we're declining. It also moots the danger-surfacing design
+  (no broad mount to grade) and the consult-can-write prompt-injection exposure (consult
+  stays read-only). The general-RW sub-bullets below are kept only as the *if we ever
+  revisit a general mount* record; the live plan is artifact-out via a specific tool.
+  Pairs with the per-builtin-timeout retirement (devlog 2026-06-26) — same posture:
+  capabilities are handler-side tools, kaibo's kernels stay read-only.
+
+  *(Superseded general-RW design, settled 2026-06-25, kept for reference.)* Instead of a
+  special-case artifact dir, kaibo gains a *general* set of writable mounts: `rw_paths`
+  (CLI `--rw-path` / `KAIBO_RW_PATHS` / `[server] rw_paths`, default none) — the
+  read-only `allow_paths` shape with the mount flag flipped, reusing the same `$VAR`
+  expansion + canonicalize + contain machinery (`config.rs`
+  `expand_env_vars`/`resolve_var`, `server.rs` containment). Decisions that fell out of
+  the conversation:
   - **The invariant relocates, it doesn't weaken.** Not "kaibo is read-only" but
     *kaibo never writes to the project under analysis; writes are confined to RW
     mounts the user explicitly named (default none)*. The project mount stays ro
@@ -105,7 +119,8 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
     project, but it's a real new instruction-following exposure to document honestly
     when this lands.
 - **Delivery over MCP:** small images inline as `Content::image` (rmcp 0.16,
-  `model/content.rs:165`); large objects flush to a RW mount and return as
+  `model/content.rs:165`); large objects flush to a tool-specific out-dir (a narrow
+  per-capability path, not the deferred general RW mount) and return as
   `RawContent::ResourceLink` (`model/content.rs:140`) instead of base64 blobs.
 - **Capabilities are data on the `ModelShape` seam** — SHIPPED
   2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
@@ -126,16 +141,18 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 **Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
 SHIPPED 2026-06-11, path-only. (2) **image-out — SHIPPED 2026-06-13** as the
 `generate_image` capability tool (live-verified; see the top Last pass), inline
-`Content::image` only. **Next: (3)** the general **RW mounts** above (the design that
-supersedes the inline-only `--out-dir`): `rw_paths` wired uniformly into every kernel,
-then `ResourceLink` delivery for artifacts over the inline cap (flush to a RW mount),
-then the kaish-builtin/VFS surface for *composition* (image2image, feeding a generated
-artifact to another tool in a `run_kaish` script). The composition builtins need the
-per-builtin timeout (its own P1 entry) before a minutes-long model call; artifact
-delivery to a RW mount doesn't, so it can land first. Failing-first tests when RW
-lands: write outside a named RW mount refused, project ro even with RW set,
-canonicalize-before-route write-escape (symlink/`..` out of an RW subtree refused),
-ENOSPC surfaces loud. Additive after that.
+`Content::image` only. **Next:** stays narrow — the general **RW mounts** are DEFERRED
+(see the banner above): kaibo stays read-only, and any future write is a *specific
+capability tool* writing its own artifact (the `generate_image` shape), not a broad
+mount and not `consult`. So a larger-than-inline artifact would flush to a
+tool-specific path and return as `ResourceLink` — a narrow per-tool out-dir, decided
+when the first over-inline-cap capability needs it, **not** the general `rw_paths`
+surface. The kaish-builtin/VFS *composition* path (image2image piped in a `run_kaish`
+script) is the **only** thing that would run a minutes-long model call *under the script
+clock* and revive the per-builtin-timeout problem; as long as capabilities stay
+handler-side MCP tools, it never arises — so that work was retired, not built (devlog
+2026-06-26). If composition is ever revisited, the upstream timeout seam already exists
+(`ctx.patient(budget) -> PatientGuard`, kaish 0.8.2+).
 
 **Open design points (for the production builtins):** session history records
 `[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const
@@ -148,7 +165,8 @@ image-processing crate.
 **TTS/STT — PARKED pending rig provider coverage (decided 2026-06-13).** No sound
 devices in scope: file-in/file-out only (TTS writes an audio file, STT reads one and
 returns text — `stt` is the natural fit for a kaish builtin emitting text, no new
-delivery channel; TTS is the artifact path needing out-dir + per-builtin timeout).
+delivery channel; TTS is the artifact path needing out-dir, an MCP tool like
+`generate_image` so the provider call is handler-side, not under the script clock).
 The blocker is rig, not kaibo's design. rig 0.38 *has* the traits
 (`AudioGenerationModel` = TTS, `TranscriptionModel` = STT) but coverage is uneven:
 - **TTS** — openai-kind only (also xai/azure/openrouter); **no Gemini, no Anthropic,
@@ -166,38 +184,10 @@ non-rig wire path to maintain, against the one-primitive grain). Kept as ready s
 `config.example.toml` was scrubbed of the `tts` slot — the embedded template must not
 advertise a capability kaibo lacks; `docs/config.md`/`docs/casts.md` document the
 reserved roles honestly. **When this un-parks** (rig adds Gemini/Anthropic TTS, or
-openai-only TTS is judged enough): wire the `tts` builtin (needs the per-builtin
-timeout + out-dir below), add the `stt` role + builtin, restore the example slots.
-
-### Per-builtin timeouts: the 30s script timeout cannot serve model-backed builtins
-The kernel exec timeout is one global knob: `KAISH_EXEC_TIMEOUT` (30s,
-`sandbox.rs:103`) threaded via `with_request_timeout` (`sandbox.rs:184`),
-overridable only wholesale (`[sandbox].exec_timeout_secs` /
-`KAIBO_EXEC_TIMEOUT_SECS`, `config.rs`). 30s is *way* too small for complex
-pro-model calls — image gen and pro-tier completions routinely run minutes — so
-every production builtin (image2image, tts; P1 media-spine entry above) would be
-killed mid-flight with exit 124. But the fix is not raising the global: that one
-knob is doing two jobs — killing runaway scripts (30s is right) and bounding
-provider patience (30s is wrong) — and stretching it to minutes hands a
-`while true` loop the same minutes.
-
-Fix shape: split the jobs. Model-backed builtins get their own timeout budget
-(per-builtin or per-tool-class, config-overridable, generous default — minutes,
-not seconds), aligned with the per-backend `request_timeout` already governing
-rig's HTTP calls so the kernel never undercuts a legitimate in-flight provider
-call; plain script execution keeps the tight 30s. Mechanism question answered
-2026-06-11: enforcement is a kernel-side watchdog, strictly per-execute — a
-timer task sleeps the whole duration and fires the cancel token (kaish
-`kernel.rs:1511,1618-1625`); `ExecuteOptions.timeout` resizes per-script but
-nothing can suspend it mid-script, so this *does* need a kaish-kernel seam.
-The upstream seam **shipped** (kaish 0.8.2/0.8.3): `ctx.patient(budget) ->
-PatientGuard` on `ToolCtx` (kaish `watchdog.rs`, a `timeout` builtin), a movable
-deadline whose cancel surface stays live while suspended. So the blocker is
-cleared — but kaibo has no in-kernel model-backed builtin to wire it onto yet
-(production capabilities ship as MCP tools, not kaish builtins). kaibo's half
-lands *before or with* the first production builtin;
-failing-first test: a builtin that sleeps past 30s but under its own budget
-completes, while a pure-script spin still dies at 30s.
+openai-only TTS is judged enough): wire `tts` as a handler-side MCP capability (the
+`generate_image` shape — out-dir for the artifact, provider call bounded by the backend
+`request_timeout`, no script-clock involvement), add the `stt` role + builtin, restore
+the example slots.
 
 ---
 

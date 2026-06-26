@@ -14,6 +14,67 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-26 — Stayed read-only: retired per-builtin timeouts *and* deferred general RW mounts
+
+Two linked decisions in one session, one posture: **kaibo stays read-only as the product;
+any future write is a specific capability tool writing its own artifact, never a general
+mechanism and never `consult`.** Both retire/defer machinery built for a more general
+write surface we've decided we don't want.
+
+**Retired the per-builtin-timeout work (a seam for a customer we won't build).** Amy
+questioned the premise of the P1 "Per-builtin timeouts" entry directly: *if we never
+make model calls from inside kaish, do we still need to mess with timeouts?* We don't —
+so the entry is gone, not deferred-with-a-note.
+
+The whole entry existed for **one** scenario: a kaish builtin making a minutes-long model
+call *under the script clock*, which the 30s `KAISH_EXEC_TIMEOUT` watchdog would kill
+mid-flight. That's the only way a legitimately-slow operation lands under that clock. The
+30s budget governs *scripts* (runaway `grep`/`find`/loops) and for that it's correct.
+
+`generate_image` already proves the alternative is the real shape: a capability is a
+**handler-side MCP tool**, its provider call bounded by the backend `request_timeout`
+(rig's HTTP timeout), never touching the script watchdog. TTS/image2image-as-MCP-tools
+are identical. So the dependency chain is per-builtin timeout ⟵ in-kernel model builtins
+⟵ shell *composition* of model ops — and composition was always the deferred "later
+concern," with `generate_image` deliberately chosen as a direct tool because it was
+simpler. With composition looking like an idea that doesn't play out, the `ctx.patient`
+seam has no consumer. Building it now would be a mechanism for a customer we've decided
+not to build.
+
+What we kept: the *revival condition*, recorded in the media-spine entry. If a capability
+ever genuinely needs shell composition (a generated artifact fed to another model op
+within one `run_kaish` script), the slow op is back under the script clock and the problem
+returns — but the upstream seam already exists (`ctx.patient(budget) -> PatientGuard`,
+kaish 0.8.2+), so it's a pickup, not a research task. The `KAISH_EXEC_TIMEOUT` doc-comment
+in `sandbox.rs` already states the 30s-bounds-a-runaway-script rationale correctly and
+needed no change.
+
+**Deferred the general RW mounts; reversed "consult gets RW."** The day-earlier RW-mounts
+design (2026-06-25) gave kaibo a *general* writable-mount surface (`rw_paths`) wired
+*uniformly* into every kernel — explicitly including `consult` — as the substrate for
+future RW tasks. Amy's call: *"defer this a while and stay read-only by having only
+specific tool accesses write to the underlying fs."* That flips the key sub-bullet. The
+general mount is parked; when a capability needs to deliver an artifact larger than the
+inline cap, it gets a *narrow, tool-specific* out-dir and returns a `ResourceLink` —
+decided per tool when first needed, not a broad `rw_paths` surface. Knock-on: the
+danger-surfacing design is moot (no broad mount to grade), and the consult-can-write
+prompt-injection exposure evaporates (consult stays read-only). The carefully-reasoned
+general-RW sub-bullets stay in `issues.md` under a "superseded, kept for reference" banner
+— if we ever revisit a general mount the canonicalize-before-route safety work is still
+the right shape; we're declining the *cost/exposure*, not faulting the design.
+
+Why both, why now: the two share a root. The per-builtin timeout only mattered for model
+calls *inside kaish*; the general RW mount's headline justification was being the substrate
+for those same in-kernel tasks (image-gen → image2image → …). Pull on "capabilities are
+handler-side MCP tools, kaibo's kernels stay read-only" and both fall out together. The
+read-only invariant doesn't relocate after all — it holds.
+
+Process note: rode one small docs-only branch even though it's deletion/deferral — the
+visible trail is the point (`docs/issues.md` is open-work-only; the *why* of a not-doing
+lands here). Heads-up for a future reader: PR #26 ("Lighten the RW-mount danger policy")
+merged 2026-06-25 tuned the danger-surfacing for a feature now deferred — that tuning is
+dormant, not live behavior.
+
 ## 2026-06-24 — Async consult (`consult_submit`), unified collect verbs, and a 24h `list` trim
 
 The seed was a self-observation: Claude (the caller) was spawning throwaway sub-agents
