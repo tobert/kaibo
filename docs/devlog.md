@@ -14,9 +14,15 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
-## 2026-06-26 — Retired the per-builtin-timeout work (a seam for a customer we won't build)
+## 2026-06-26 — Stayed read-only: retired per-builtin timeouts *and* deferred general RW mounts
 
-Amy questioned the premise of the P1 "Per-builtin timeouts" entry directly: *if we never
+Two linked decisions in one session, one posture: **kaibo stays read-only as the product;
+any future write is a specific capability tool writing its own artifact, never a general
+mechanism and never `consult`.** Both retire/defer machinery built for a more general
+write surface we've decided we don't want.
+
+**Retired the per-builtin-timeout work (a seam for a customer we won't build).** Amy
+questioned the premise of the P1 "Per-builtin timeouts" entry directly: *if we never
 make model calls from inside kaish, do we still need to mess with timeouts?* We don't —
 so the entry is gone, not deferred-with-a-note.
 
@@ -43,9 +49,31 @@ kaish 0.8.2+), so it's a pickup, not a research task. The `KAISH_EXEC_TIMEOUT` d
 in `sandbox.rs` already states the 30s-bounds-a-runaway-script rationale correctly and
 needed no change.
 
-Process note: this rode its own small docs-only branch/PR even though it's pure deletion —
-the visible trail is the point (`docs/issues.md` is open-work-only; the *why* of a
-not-doing lands here).
+**Deferred the general RW mounts; reversed "consult gets RW."** The day-earlier RW-mounts
+design (2026-06-25) gave kaibo a *general* writable-mount surface (`rw_paths`) wired
+*uniformly* into every kernel — explicitly including `consult` — as the substrate for
+future RW tasks. Amy's call: *"defer this a while and stay read-only by having only
+specific tool accesses write to the underlying fs."* That flips the key sub-bullet. The
+general mount is parked; when a capability needs to deliver an artifact larger than the
+inline cap, it gets a *narrow, tool-specific* out-dir and returns a `ResourceLink` —
+decided per tool when first needed, not a broad `rw_paths` surface. Knock-on: the
+danger-surfacing design is moot (no broad mount to grade), and the consult-can-write
+prompt-injection exposure evaporates (consult stays read-only). The carefully-reasoned
+general-RW sub-bullets stay in `issues.md` under a "superseded, kept for reference" banner
+— if we ever revisit a general mount the canonicalize-before-route safety work is still
+the right shape; we're declining the *cost/exposure*, not faulting the design.
+
+Why both, why now: the two share a root. The per-builtin timeout only mattered for model
+calls *inside kaish*; the general RW mount's headline justification was being the substrate
+for those same in-kernel tasks (image-gen → image2image → …). Pull on "capabilities are
+handler-side MCP tools, kaibo's kernels stay read-only" and both fall out together. The
+read-only invariant doesn't relocate after all — it holds.
+
+Process note: rode one small docs-only branch even though it's deletion/deferral — the
+visible trail is the point (`docs/issues.md` is open-work-only; the *why* of a not-doing
+lands here). Heads-up for a future reader: PR #26 ("Lighten the RW-mount danger policy")
+merged 2026-06-25 tuned the danger-surfacing for a feature now deferred — that tuning is
+dormant, not live behavior.
 
 ## 2026-06-24 — Async consult (`consult_submit`), unified collect verbs, and a 24h `list` trim
 

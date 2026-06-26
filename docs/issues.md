@@ -51,13 +51,27 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 - **Media moves by VFS path; base64 only at the edges** (provider wire, MCP
   content). Scratch `MemoryFs` is the working bus — bounded now that kaish landed
   `ByteBudget` (kaish-vfs, 2026-06-10; kaibo pickup tracked in the P2 entry below).
-  **RW mounts — design settled 2026-06-25 (w/ Amy), supersedes the inline-only
-  `--out-dir` plan.** Instead of a special-case artifact dir, kaibo gains a *general*
-  set of writable mounts: `rw_paths` (CLI `--rw-path` / `KAIBO_RW_PATHS` /
-  `[server] rw_paths`, default none) — the read-only `allow_paths` shape with the
-  mount flag flipped, reusing the same `$VAR` expansion + canonicalize + contain
-  machinery (`config.rs` `expand_env_vars`/`resolve_var`, `server.rs` containment).
-  Decisions that fell out of the conversation:
+  **RW mounts — DEFERRED 2026-06-26 (w/ Amy).** *"We're going to defer this a while
+  and stay read-only by having only specific tool accesses write to the underlying
+  fs."* The direction flips: rather than a **general** writable-mount surface wired into
+  every kernel, kaibo **stays read-only as the product** and any future write is a
+  *specific capability tool* writing its own artifact to the fs (the `generate_image`
+  shape — handler-side, narrow, its own path), never a broad mount and never `consult`.
+  This **reverses the "uniform RW into every kernel, consult *does* get RW" sub-bullet
+  below** — that was the cost we're declining. It also moots the danger-surfacing design
+  (no broad mount to grade) and the consult-can-write prompt-injection exposure (consult
+  stays read-only). The general-RW sub-bullets below are kept only as the *if we ever
+  revisit a general mount* record; the live plan is artifact-out via a specific tool.
+  Pairs with the per-builtin-timeout retirement (devlog 2026-06-26) — same posture:
+  capabilities are handler-side tools, kaibo's kernels stay read-only.
+
+  *(Superseded general-RW design, settled 2026-06-25, kept for reference.)* Instead of a
+  special-case artifact dir, kaibo gains a *general* set of writable mounts: `rw_paths`
+  (CLI `--rw-path` / `KAIBO_RW_PATHS` / `[server] rw_paths`, default none) — the
+  read-only `allow_paths` shape with the mount flag flipped, reusing the same `$VAR`
+  expansion + canonicalize + contain machinery (`config.rs`
+  `expand_env_vars`/`resolve_var`, `server.rs` containment). Decisions that fell out of
+  the conversation:
   - **The invariant relocates, it doesn't weaken.** Not "kaibo is read-only" but
     *kaibo never writes to the project under analysis; writes are confined to RW
     mounts the user explicitly named (default none)*. The project mount stays ro
@@ -103,7 +117,8 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
     project, but it's a real new instruction-following exposure to document honestly
     when this lands.
 - **Delivery over MCP:** small images inline as `Content::image` (rmcp 0.16,
-  `model/content.rs:165`); large objects flush to a RW mount and return as
+  `model/content.rs:165`); large objects flush to a tool-specific out-dir (a narrow
+  per-capability path, not the deferred general RW mount) and return as
   `RawContent::ResourceLink` (`model/content.rs:140`) instead of base64 blobs.
 - **Capabilities are data on the `ModelShape` seam** — SHIPPED
   2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
@@ -124,20 +139,18 @@ is the workflow layer. Rationale recorded here so it survives the conversation.
 **Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
 SHIPPED 2026-06-11, path-only. (2) **image-out — SHIPPED 2026-06-13** as the
 `generate_image` capability tool (live-verified; see the top Last pass), inline
-`Content::image` only. **Next: (3)** the general **RW mounts** above (the design that
-supersedes the inline-only `--out-dir`): `rw_paths` wired uniformly into every kernel,
-then `ResourceLink` delivery for artifacts over the inline cap (flush to a RW mount),
-then *maybe someday* the kaish-builtin/VFS surface for *composition* (image2image,
-feeding a generated artifact to another tool in a `run_kaish` script). Composition is
-the **only** thing that would run a minutes-long model call *under the script clock*
-and thus revive the per-builtin-timeout problem; as long as capabilities stay
-handler-side MCP tools (the `generate_image` shape, bounded by the backend
-`request_timeout`), it never arises — so that work was retired, not built (devlog
-2026-06-26). If composition ever lands, the upstream seam already exists
-(`ctx.patient(budget) -> PatientGuard`, kaish 0.8.2+). Artifact delivery to a RW mount
-needs none of this. Failing-first tests when RW lands: write outside a named RW mount refused, project ro even with RW set,
-canonicalize-before-route write-escape (symlink/`..` out of an RW subtree refused),
-ENOSPC surfaces loud. Additive after that.
+`Content::image` only. **Next:** stays narrow — the general **RW mounts** are DEFERRED
+(see the banner above): kaibo stays read-only, and any future write is a *specific
+capability tool* writing its own artifact (the `generate_image` shape), not a broad
+mount and not `consult`. So a larger-than-inline artifact would flush to a
+tool-specific path and return as `ResourceLink` — a narrow per-tool out-dir, decided
+when the first over-inline-cap capability needs it, **not** the general `rw_paths`
+surface. The kaish-builtin/VFS *composition* path (image2image piped in a `run_kaish`
+script) is the **only** thing that would run a minutes-long model call *under the script
+clock* and revive the per-builtin-timeout problem; as long as capabilities stay
+handler-side MCP tools, it never arises — so that work was retired, not built (devlog
+2026-06-26). If composition is ever revisited, the upstream timeout seam already exists
+(`ctx.patient(budget) -> PatientGuard`, kaish 0.8.2+).
 
 **Open design points (for the production builtins):** session history records
 `[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const
