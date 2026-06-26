@@ -408,6 +408,20 @@ fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, tools: &[&str], casts
     }
 }
 
+/// The artifact out-dir's state for `consult` attachment resolution — the consult shell
+/// mounts exactly the project root + (when readable) the out-dir, so an out-of-root
+/// attachment is reachable only when it falls under a *readable* out-dir.
+enum OutDirAttach {
+    /// No out-dir on disk yet (nothing to attach).
+    None,
+    /// Mounted read-only into the consult shell at this canonical path — out-dir files
+    /// attach as absolute paths.
+    Readable(PathBuf),
+    /// Exists, but `out_dir_readable` is off: an out-dir attachment is refused with a
+    /// tailored hint, since neither the consult shell nor oneshot/batch can reach it.
+    Unreadable(PathBuf),
+}
+
 #[tool_router]
 impl KaiboHandler {
     /// Build the handler from a resolved [`Config`]. Snapshots the kernel's builtin
@@ -760,32 +774,33 @@ impl KaiboHandler {
         )
     }
 
-    /// Validate caller-named `consult` attachments and return them as **root-relative
-    /// paths the model reads itself** — no bytes are read here, unlike
-    /// [`resolve_attachments`](Self::resolve_attachments), which inlines for the tool-less
-    /// tools. Each path must canonicalize to a regular file *under the consult's `root`*,
-    /// because the consult reads it through a kaish worker rooted there; an out-of-root
-    /// path is refused with guidance. The returned relative paths are what the model opens
-    /// itself — a text file with `cat -n`, an image with `view_image` — and what
-    /// [`consult_user_prompt`](crate::consult::consult_user_prompt) names in the driver
-    /// prompt, deferring the byte-level IO to the model's own reads.
-    /// The canonical artifact out-dir *as kaish mounts it* — `Some` only when the out-dir
-    /// is readable (`config.sandbox.out_dir`, set iff `out_dir_readable`) and exists on
-    /// disk. This is the one tree besides the project root a consult's shell can read, so
-    /// it's what [`resolve_consult_attachments`](Self::resolve_consult_attachments) checks
-    /// an out-of-root attachment against. `None` when the out-dir isn't readable or hasn't
-    /// been created yet (no artifact to attach).
-    fn out_dir_mount(&self) -> Option<PathBuf> {
-        self.config
-            .sandbox
-            .out_dir
-            .as_ref()
-            .and_then(|p| std::fs::canonicalize(p).ok())
+    /// The artifact out-dir's state for `consult` attachment resolution, derived from the
+    /// real on-disk dir (see [`OutDirAttach`]). `Readable` carries the canonical path the
+    /// consult shell mounts; `Unreadable` means the dir exists but `out_dir_readable` is
+    /// off; `None` means no out-dir exists yet. Used by
+    /// [`resolve_consult_attachments`](Self::resolve_consult_attachments).
+    fn out_dir_attach_state(&self) -> OutDirAttach {
+        match std::fs::canonicalize(&self.config.out_dir) {
+            Ok(canon) if self.config.out_dir_readable => OutDirAttach::Readable(canon),
+            Ok(canon) => OutDirAttach::Unreadable(canon),
+            Err(_) => OutDirAttach::None,
+        }
     }
 
+    /// Validate caller-named `consult` attachments and return the path the model opens
+    /// itself — no bytes are read here, unlike
+    /// [`resolve_attachments`](Self::resolve_attachments), which inlines for the tool-less
+    /// tools. Each path must canonicalize to a regular file the consult shell can reach:
+    /// *under the consult's `root`* (returned root-relative, `cat`'d from cwd) or *under a
+    /// readable out-dir* (returned absolute — the out-dir mounts at its own path). An
+    /// out-dir file with read-back off, or any other out-of-reach path, is refused with
+    /// guidance. The returned paths are what the model opens — a text file with `cat -n`,
+    /// an image with `view_image` — and what
+    /// [`consult_user_prompt`](crate::consult::consult_user_prompt) names in the driver
+    /// prompt, deferring the byte-level IO to the model's own reads.
     fn resolve_consult_attachments(
         root: &std::path::Path,
-        out_dir_mount: Option<&std::path::Path>,
+        out_dir: &OutDirAttach,
         attach: &[String],
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         let mut out = Vec::with_capacity(attach.len());
@@ -816,23 +831,37 @@ impl KaiboHandler {
                 ));
             }
             // The consult model reads attachments through its shell, which mounts exactly
-            // two real trees: the project root and (when readable) the artifact out-dir.
-            // A path under root is passed root-relative (the model `cat`s it from cwd); a
-            // path under the out-dir is passed absolute (the out-dir mounts at its own
-            // absolute path, so the model opens it directly). Anything else the shell
-            // can't reach — refuse, naming both reachable trees.
+            // two real trees: the project root and (when readable) the artifact out-dir. A
+            // path under root is passed root-relative (the model `cat`s it from cwd); a
+            // path under a *readable* out-dir is passed absolute (the out-dir mounts at its
+            // own absolute path). An out-dir file with read-back OFF gets a tailored
+            // refusal — oneshot/batch can't reach it either, so don't suggest them.
+            // Anything else out of reach gets the generic refusal naming the reachable
+            // trees.
             let display_path = if let Ok(rel) = canon.strip_prefix(root) {
                 rel.display().to_string()
-            } else if out_dir_mount.is_some_and(|o| canon.starts_with(o)) {
+            } else if matches!(out_dir, OutDirAttach::Readable(o) if canon.starts_with(o)) {
                 canon.display().to_string()
+            } else if matches!(out_dir, OutDirAttach::Unreadable(o) if canon.starts_with(o)) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attached file {} is in the artifact out-dir, but read-back is off \
+                         (out_dir_readable = false), so kaibo can't read it back — neither \
+                         consult nor oneshot/batch can reach it. Enable read-back \
+                         (out_dir_readable = true, or drop --no-out-dir-read), or open the \
+                         file with your own tools.",
+                        raw.display(),
+                    ),
+                    None,
+                ));
             } else {
-                let where_ = match out_dir_mount {
-                    Some(o) => format!(
+                let where_ = match out_dir {
+                    OutDirAttach::Readable(o) => format!(
                         "the project root {} or the artifact out-dir {}",
                         root.display(),
                         o.display()
                     ),
-                    None => format!("the project root {}", root.display()),
+                    _ => format!("the project root {}", root.display()),
                 };
                 return Err(McpError::invalid_params(
                     format!(
@@ -1356,11 +1385,8 @@ impl KaiboHandler {
         // Resolve + classify attachments, then gate: an image needs a vision-capable synth
         // (consult views it with `view_image`, which only a vision synth carries). Refuse
         // here, before the loop, the same honest up-front refusal oneshot/batch give.
-        let attachments = Self::resolve_consult_attachments(
-            &root,
-            self.out_dir_mount().as_deref(),
-            &input.attach,
-        )?;
+        let attachments =
+            Self::resolve_consult_attachments(&root, &self.out_dir_attach_state(), &input.attach)?;
         Self::gate_consult_image_attachments(
             &attachments,
             synth.caps.vision,
@@ -1469,11 +1495,8 @@ impl KaiboHandler {
         let defaults = &self.config.defaults;
         // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
         // synth) is a clean synchronous refusal, not a job that fails on poll.
-        let attachments = Self::resolve_consult_attachments(
-            &root,
-            self.out_dir_mount().as_deref(),
-            &input.attach,
-        )?;
+        let attachments =
+            Self::resolve_consult_attachments(&root, &self.out_dir_attach_state(), &input.attach)?;
         Self::gate_consult_image_attachments(
             &attachments,
             synth.caps.vision,
@@ -3589,7 +3612,7 @@ mod tests {
         // A relative path resolves to its root-relative form (what the model `cat`s).
         let rel = KaiboHandler::resolve_consult_attachments(
             &root_canon,
-            None,
+            &OutDirAttach::None,
             &["src/jobs.rs".to_string()],
         )
         .expect("an in-tree file resolves");
@@ -3604,7 +3627,7 @@ mod tests {
         std::fs::write(&outside_file, b"diff").unwrap();
         let err = KaiboHandler::resolve_consult_attachments(
             &root_canon,
-            None,
+            &OutDirAttach::None,
             &[outside_file.display().to_string()],
         )
         .expect_err("an out-of-root file must be refused");
@@ -3637,7 +3660,7 @@ mod tests {
 
         let got = KaiboHandler::resolve_consult_attachments(
             &root_canon,
-            Some(out_canon.as_path()),
+            &OutDirAttach::Readable(out_canon.clone()),
             &[artifact.display().to_string()],
         )
         .expect("an out-dir artifact resolves");
@@ -3655,10 +3678,50 @@ mod tests {
         std::fs::write(&stray, b"x").unwrap();
         KaiboHandler::resolve_consult_attachments(
             &root_canon,
-            Some(out_canon.as_path()),
+            &OutDirAttach::Readable(out_canon.clone()),
             &[stray.display().to_string()],
         )
         .expect_err("a file outside both root and the out-dir must be refused");
+    }
+
+    /// An out-dir file attached with read-back OFF gets a *tailored* refusal that names
+    /// the `out_dir_readable` toggle and does NOT misdirect to oneshot/batch (which can't
+    /// reach it either, since the out-dir isn't in the allowed-set when read-back is off).
+    #[test]
+    fn consult_attach_out_dir_file_with_read_back_off_refuses_with_tailored_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        let out = tempfile::Builder::new()
+            .prefix("kaibo-out")
+            .tempdir()
+            .unwrap();
+        let out_canon = std::fs::canonicalize(out.path()).unwrap();
+        let artifact = out_canon.join("kaibo-image-9.png");
+        std::fs::write(
+            &artifact,
+            [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        )
+        .unwrap();
+
+        let err = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            &OutDirAttach::Unreadable(out_canon.clone()),
+            &[artifact.display().to_string()],
+        )
+        .expect_err("an out-dir file with read-back off must be refused");
+        // Names the real fix (the read-back toggle)...
+        assert!(
+            err.message.contains("out_dir_readable") && err.message.contains("read-back"),
+            "the refusal must name the read-back toggle: {}",
+            err.message
+        );
+        // ...and does NOT dangle the generic "use oneshot/batch" workaround (the old
+        // message's false promise — those can't reach an out-dir file with read-back off).
+        assert!(
+            !err.message.contains("anywhere in the allowed set"),
+            "must not misdirect to oneshot/batch as a workaround: {}",
+            err.message
+        );
     }
 
     /// consult `attach` sniffs each file's *content* (not its extension) so the driver
@@ -3678,7 +3741,7 @@ mod tests {
 
         let out = KaiboHandler::resolve_consult_attachments(
             &root_canon,
-            None,
+            &OutDirAttach::None,
             &["shot.txt".to_string(), "notes.png".to_string()],
         )
         .expect("both resolve");
