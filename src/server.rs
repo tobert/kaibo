@@ -517,6 +517,22 @@ impl KaiboHandler {
             }
         };
 
+        // The artifact out-dir joins the read allowed-set when readable, so an out-dir
+        // path can be `attach`ed (oneshot/batch) or targeted as a call `path` — keeping
+        // the attach/containment surface in step with the read-only kaish mount. Added
+        // *after* the default-root resolution above so it never becomes the inferred
+        // default root. Canonicalized (normally pre-created at startup); skipped silently
+        // when it doesn't exist yet (nothing to read until an artifact lands) or already
+        // falls under an allowed tree. Unlike `--root`/`--allow-path` a missing out-dir is
+        // not a loud error — it's auto-defaulted and lazily created, so absence is normal.
+        if config.out_dir_readable {
+            if let Ok(canon) = std::fs::canonicalize(&config.out_dir) {
+                if canon.is_dir() && !allowed.iter().any(|tree| canon.starts_with(tree)) {
+                    allowed.push(canon);
+                }
+            }
+        }
+
         // Stamp the live cast roster onto the consultation tools' `cast` param as a
         // JSON-Schema `enum`, so an agent choosing a team reads the menu off the tool
         // schema it already fills arguments from — not only the handshake prose, which
@@ -753,8 +769,23 @@ impl KaiboHandler {
     /// itself — a text file with `cat -n`, an image with `view_image` — and what
     /// [`consult_user_prompt`](crate::consult::consult_user_prompt) names in the driver
     /// prompt, deferring the byte-level IO to the model's own reads.
+    /// The canonical artifact out-dir *as kaish mounts it* — `Some` only when the out-dir
+    /// is readable (`config.sandbox.out_dir`, set iff `out_dir_readable`) and exists on
+    /// disk. This is the one tree besides the project root a consult's shell can read, so
+    /// it's what [`resolve_consult_attachments`](Self::resolve_consult_attachments) checks
+    /// an out-of-root attachment against. `None` when the out-dir isn't readable or hasn't
+    /// been created yet (no artifact to attach).
+    fn out_dir_mount(&self) -> Option<PathBuf> {
+        self.config
+            .sandbox
+            .out_dir
+            .as_ref()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+    }
+
     fn resolve_consult_attachments(
         root: &std::path::Path,
+        out_dir_mount: Option<&std::path::Path>,
         attach: &[String],
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         let mut out = Vec::with_capacity(attach.len());
@@ -784,22 +815,37 @@ impl KaiboHandler {
                     None,
                 ));
             }
-            // Must be under the consult's root — the tree its read-only shell is mounted
-            // at, so anything outside it the model simply can't `cat`. (oneshot/batch
-            // attach inline from anywhere in the allowed set; consult reads in situ.)
-            let rel = canon.strip_prefix(root).map_err(|_| {
-                McpError::invalid_params(
-                    format!(
-                        "attached file {} resolves outside the project root {} — consult \
-                         reads attachments through its shell, so they must live under the \
-                         project. Paste it into `context`, or use `oneshot`/`batch` attach \
-                         (which inline a file from anywhere in the allowed set).",
-                        raw.display(),
+            // The consult model reads attachments through its shell, which mounts exactly
+            // two real trees: the project root and (when readable) the artifact out-dir.
+            // A path under root is passed root-relative (the model `cat`s it from cwd); a
+            // path under the out-dir is passed absolute (the out-dir mounts at its own
+            // absolute path, so the model opens it directly). Anything else the shell
+            // can't reach — refuse, naming both reachable trees.
+            let display_path = if let Ok(rel) = canon.strip_prefix(root) {
+                rel.display().to_string()
+            } else if out_dir_mount.is_some_and(|o| canon.starts_with(o)) {
+                canon.display().to_string()
+            } else {
+                let where_ = match out_dir_mount {
+                    Some(o) => format!(
+                        "the project root {} or the artifact out-dir {}",
                         root.display(),
+                        o.display()
+                    ),
+                    None => format!("the project root {}", root.display()),
+                };
+                return Err(McpError::invalid_params(
+                    format!(
+                        "attached file {} resolves outside {} — consult reads attachments \
+                         through its shell, which only mounts those. Paste it into `context`, \
+                         or use `oneshot`/`batch` attach (which inline a file from anywhere in \
+                         the allowed set).",
+                        raw.display(),
+                        where_,
                     ),
                     None,
-                )
-            })?;
+                ));
+            };
             // Sniff the file's type so the driver prompt routes it to the right tool: a
             // text file the model reads with `cat -n`, an image it views with `view_image`
             // (which `cat` would refuse as binary). Classify by content, not extension — a
@@ -826,7 +872,7 @@ impl KaiboHandler {
                 crate::view_image::sniff_mime(&buf[..n]).is_some()
             };
             out.push(crate::consult::ConsultAttachment {
-                path: rel.display().to_string(),
+                path: display_path,
                 is_image,
             });
         }
@@ -1310,7 +1356,11 @@ impl KaiboHandler {
         // Resolve + classify attachments, then gate: an image needs a vision-capable synth
         // (consult views it with `view_image`, which only a vision synth carries). Refuse
         // here, before the loop, the same honest up-front refusal oneshot/batch give.
-        let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
+        let attachments = Self::resolve_consult_attachments(
+            &root,
+            self.out_dir_mount().as_deref(),
+            &input.attach,
+        )?;
         Self::gate_consult_image_attachments(
             &attachments,
             synth.caps.vision,
@@ -1419,7 +1469,11 @@ impl KaiboHandler {
         let defaults = &self.config.defaults;
         // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
         // synth) is a clean synchronous refusal, not a job that fails on poll.
-        let attachments = Self::resolve_consult_attachments(&root, &input.attach)?;
+        let attachments = Self::resolve_consult_attachments(
+            &root,
+            self.out_dir_mount().as_deref(),
+            &input.attach,
+        )?;
         Self::gate_consult_image_attachments(
             &attachments,
             synth.caps.vision,
@@ -2677,6 +2731,10 @@ fn render_config_resource(
         /// also mounted read-only into kaish so a consult can read an artifact back — so
         /// it's part of the read-scope, surfaced here for transparency.
         out_dir: String,
+        /// Whether the out-dir is readable: mounted into kaish and in the allowed-set
+        /// (so an out-dir path can be attached/targeted). `false` → kaibo writes there
+        /// but never reads it back. (When true, `out_dir` also appears in `allowed_paths`.)
+        out_dir_readable: bool,
         /// Runtime-derived state — computed at read time, not configured. Distinct
         /// from the static knobs above so a reader can tell "what kaibo discovered"
         /// from "what the operator set".
@@ -2987,6 +3045,7 @@ fn render_config_resource(
         default_root_inferred,
         default_cast: config.default_cast.clone(),
         out_dir: config.out_dir.display().to_string(),
+        out_dir_readable: config.out_dir_readable,
         runtime: RuntimeDoc {
             follow_worktrees: config.follow_worktrees,
             followed_worktrees: followed_worktrees
@@ -3522,9 +3581,12 @@ mod tests {
         std::fs::write(root_canon.join("src/jobs.rs"), b"// in tree").unwrap();
 
         // A relative path resolves to its root-relative form (what the model `cat`s).
-        let rel =
-            KaiboHandler::resolve_consult_attachments(&root_canon, &["src/jobs.rs".to_string()])
-                .expect("an in-tree file resolves");
+        let rel = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            None,
+            &["src/jobs.rs".to_string()],
+        )
+        .expect("an in-tree file resolves");
         assert_eq!(rel.len(), 1);
         assert_eq!(rel[0].path, "src/jobs.rs");
 
@@ -3536,6 +3598,7 @@ mod tests {
         std::fs::write(&outside_file, b"diff").unwrap();
         let err = KaiboHandler::resolve_consult_attachments(
             &root_canon,
+            None,
             &[outside_file.display().to_string()],
         )
         .expect_err("an out-of-root file must be refused");
@@ -3544,6 +3607,52 @@ mod tests {
             "the refusal names the boundary: {}",
             err.message
         );
+    }
+
+    /// A file under the readable artifact out-dir is accepted as an absolute path — the
+    /// re-attach path for a generated artifact. The out-dir mounts read-only into the
+    /// consult shell at its own absolute path, so unlike an in-root file (passed
+    /// root-relative) it's passed absolute. A sibling of the out-dir is still refused.
+    #[test]
+    fn consult_attach_accepts_out_dir_file_as_absolute() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        let out = tempfile::Builder::new()
+            .prefix("kaibo-out")
+            .tempdir()
+            .unwrap();
+        let out_canon = std::fs::canonicalize(out.path()).unwrap();
+        let artifact = out_canon.join("kaibo-image-1-2-3.png");
+        std::fs::write(
+            &artifact,
+            [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        )
+        .unwrap();
+
+        let got = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            Some(out_canon.as_path()),
+            &[artifact.display().to_string()],
+        )
+        .expect("an out-dir artifact resolves");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].path,
+            artifact.display().to_string(),
+            "an out-dir attachment is passed absolute (the mount lives at its own path)"
+        );
+        assert!(got[0].is_image, "the PNG signature classifies as an image");
+
+        // A sibling of the out-dir is not mounted — still refused even with a mount set.
+        let sibling = tempfile::tempdir().unwrap();
+        let stray = std::fs::canonicalize(sibling.path()).unwrap().join("x.png");
+        std::fs::write(&stray, b"x").unwrap();
+        KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            Some(out_canon.as_path()),
+            &[stray.display().to_string()],
+        )
+        .expect_err("a file outside both root and the out-dir must be refused");
     }
 
     /// consult `attach` sniffs each file's *content* (not its extension) so the driver
@@ -3563,6 +3672,7 @@ mod tests {
 
         let out = KaiboHandler::resolve_consult_attachments(
             &root_canon,
+            None,
             &["shot.txt".to_string(), "notes.png".to_string()],
         )
         .expect("both resolve");

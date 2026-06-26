@@ -70,6 +70,13 @@ struct Args {
     #[arg(long = "out-dir", value_name = "DIR")]
     out_dir: Option<PathBuf>,
 
+    /// Don't make the artifact out-dir readable: skip mounting it into kaish and keep it
+    /// out of the containment allowed-set. kaibo still writes artifacts there and returns
+    /// the path, but won't read them back (no consult read-back, no out-dir `attach`).
+    /// Also settable via KAIBO_NO_OUT_DIR_READABLE or [server] out_dir_readable = false.
+    #[arg(long = "no-out-dir-read")]
+    no_out_dir_read: bool,
+
     /// Default cast when a call omits it (a built-in name or a cast defined in
     /// config.toml). Built-ins: anthropic | deepseek | gemini | openai-local
     /// (plus aliases: claude, google, local, …) and the batch casts gemini-batch
@@ -151,6 +158,7 @@ async fn main() -> Result<()> {
         args.project_context_file.clone(),
         args.user_context_file.clone(),
         args.out_dir.clone(),
+        args.no_out_dir_read,
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
@@ -229,7 +237,9 @@ async fn main() -> Result<()> {
         // where the adjacent-secret files (`~/.ssh`, provider key files) live — the user
         // may have meant a narrow subdir. A warning, not a refusal: a deliberate broad
         // home cache is their call.
-        if std::env::var_os("HOME").is_some_and(|h| config.out_dir == PathBuf::from(h)) {
+        if std::env::var_os("HOME")
+            .is_some_and(|h| config.out_dir.as_path() == std::path::Path::new(&h))
+        {
             tracing::warn!(
                 out_dir = %config.out_dir.display(),
                 "out_dir is your home directory — it's mounted read-only into kaish, so a \

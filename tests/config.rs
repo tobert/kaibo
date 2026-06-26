@@ -876,6 +876,7 @@ fn cli_cast_wins_over_env_and_file() {
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
         None,   // no --out-dir
+        false,  // out-dir stays readable
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -904,6 +905,7 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         vec![],
         vec![],
         None,
+        false,
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1679,12 +1681,60 @@ fn out_dir_layers_default_file_env_and_cli() {
         vec![],
         vec![],
         Some("/cli/kaibo-art".into()),
+        false,
     );
     assert_eq!(c.out_dir, Path::new("/cli/kaibo-art"));
     assert_eq!(
         c.sandbox.out_dir.as_deref(),
         Some(Path::new("/cli/kaibo-art")),
         "CLI override updates the sandbox mirror so the mount tracks the final dir"
+    );
+}
+
+/// `out_dir_readable` (default true) gates the read-back mount mirror: off means the
+/// out-dir is not mounted into kaish, layering default < file < env < CLI like the rest.
+#[test]
+fn out_dir_readable_gates_the_mount_mirror() {
+    // Default on: the sandbox mirror is set so the kernel builder mounts it.
+    let c = Config::from_toml_str("").unwrap();
+    assert!(c.out_dir_readable);
+    assert_eq!(c.sandbox.out_dir.as_deref(), Some(c.out_dir.as_path()));
+
+    // File off: no mount mirror.
+    let c = Config::from_toml_str("[server]\nout_dir_readable = false\n").unwrap();
+    assert!(!c.out_dir_readable);
+    assert!(
+        c.sandbox.out_dir.is_none(),
+        "an unreadable out-dir is not mounted"
+    );
+
+    // Env off (KAIBO_NO_OUT_DIR_READABLE).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_NO_OUT_DIR_READABLE", "1")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert!(!c.out_dir_readable, "env disables readability");
+    assert!(c.sandbox.out_dir.is_none());
+
+    // CLI --no-out-dir-read disables it and clears the mirror.
+    let mut c = Config::builtin();
+    assert!(c.sandbox.out_dir.is_some(), "builtin default is readable");
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        vec![],
+        vec![],
+        None,
+        true,
+    );
+    assert!(!c.out_dir_readable);
+    assert!(
+        c.sandbox.out_dir.is_none(),
+        "CLI --no-out-dir-read clears the mount mirror"
     );
 }
 

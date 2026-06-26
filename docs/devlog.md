@@ -64,6 +64,24 @@ The read-scope boundary moving — even narrowly to a kaibo-owned cache — is t
 this that deserved the careful look; it's why this PR wants a cross-family review on the
 mount + the out-dir read path specifically.
 
+**Follow-up from the reviews — out-dir is fully *readable*, with an off switch (Amy).**
+The Gemini review flagged that an artifact couldn't be re-`attach`ed to a follow-up
+consult/oneshot (the out-dir wasn't in the containment `allowed_set`, and consult-attach
+required a subpath of the project root). Amy's call: make the out-dir readable rather than
+leave the wart — *"add out-dir to allowed_set for read and have a way to disable that … I
+don't think this would be surprising."* So one knob, `out_dir_readable` (default true,
+`--no-out-dir-read` / `KAIBO_NO_OUT_DIR_READABLE` / `[server] out_dir_readable`), now gates
+**both** sides of out-dir readability together — the kaish read-back mount *and* the
+allowed-set membership — so "readable" stays one concept. When on: the out-dir joins
+`allowed_set` (so oneshot/batch `attach` and per-call `path` accept it), and
+`resolve_consult_attachments` accepts an out-dir file as an *absolute* path (the consult
+shell mounts root + out-dir, the only two trees it can read; an in-root file stays
+root-relative, an out-dir file is absolute, anything else refused). When off: no mount, not
+in the allowed-set — kaibo writes artifacts and returns paths but never reads them back.
+Surfaced in `config.example.toml`, `kaibo://config`, and `docs/config.md` so it's
+adjustable and visible, per Amy. The boundary still only ever widens to the kaibo-owned
+out-dir (the consult-attach test pins that a *sibling* of the out-dir is still refused).
+
 ## 2026-06-26 — Stayed read-only: retired per-builtin timeouts *and* deferred general RW mounts
 
 Two linked decisions in one session, one posture: **kaibo stays read-only as the product;

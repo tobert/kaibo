@@ -289,6 +289,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | default root | `server.root` | `KAIBO_ROOT` | `--root` |
 | additional allowed trees | `server.allow_paths` *(list)* | `KAIBO_ALLOW_PATHS` *(colon-separated)* | `--allow-path DIR` *(repeatable)* |
 | artifact out-dir | `server.out_dir` | `KAIBO_OUT_DIR` | `--out-dir DIR` |
+| out-dir readable | `server.out_dir_readable` | `KAIBO_NO_OUT_DIR_READABLE` | `--no-out-dir-read` |
 | default cast | `server.cast` | `KAIBO_CAST` | `--cast` |
 | disable a tool | `server.tools.<t> = false` | `KAIBO_NO_<T>` | `--no-<t>` |
 | log filter | `server.log` | `RUST_LOG` *(wins)* / `KAIBO_LOG` | — |
@@ -724,13 +725,21 @@ kaibo --out-dir /data/kaibo-art         # CLI (wins over env/file)
 Two properties make this safe with the read-only invariant. **kaibo writes the out-dir
 directly** (`std::fs`), never through kaish — the read-only sandbox levers are
 untouched, and kaish still cannot write anywhere. **The out-dir is mounted *read-only*
-into kaish**, so a later `consult`/`run_kaish` can read a generated artifact back. That
-read-back is a deliberate, narrow widening of read-scope to kaibo's own cache — which is
-why the default is a kaibo-owned subdir, not bare `/tmp`: mounting a shared temp would
-expose every other process's files to a consult (and a consult can ship what it reads to
-a model). Point `out_dir` at a kaibo-owned directory if you override it. It's durable (a
-cache, not auto-cleared) — artifacts accumulate; clear it yourself if it grows. The
-resolved path shows at `kaibo://config` as `out_dir`.
+into kaish** (and joined to the containment allowed-set), so a later `consult`/`run_kaish`
+can read a generated artifact back — and an out-dir path can be `attach`ed to a follow-up
+consult/oneshot/batch or targeted as a call `path`. That read-back is a deliberate, narrow
+widening of read-scope to kaibo's own cache — which is why the default is a kaibo-owned
+subdir, not bare `/tmp`: mounting a shared temp would expose every other process's files
+to a consult (and a consult can ship what it reads to a model). `out_dir = "/"` is refused
+outright for the same reason. Point `out_dir` at a kaibo-owned directory if you override
+it. It's durable (a cache, not auto-cleared) — artifacts accumulate; clear it yourself if
+it grows. The resolved path shows at `kaibo://config` as `out_dir`.
+
+**Turning read-back off.** `out_dir_readable = false` (or `--no-out-dir-read` /
+`KAIBO_NO_OUT_DIR_READABLE`) keeps the out-dir out of kaibo's read surface entirely — no
+kaish mount, not in the allowed-set. kaibo still writes artifacts and returns their paths
+(the calling agent opens them with its own tools), but kaibo itself never reads them back.
+The tightest boundary, for anyone who'd rather artifacts not re-enter kaibo's read scope.
 
 ## kaibo://config
 
@@ -741,6 +750,7 @@ operator) the full picture:
 - `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
 - `default_root` — the `--root` value, if set
 - `out_dir` — where capability tools write artifacts (also mounted read-only into kaish)
+- `out_dir_readable` — whether the out-dir is in the read surface (mount + allowed-set)
 - `default_cast` — which cast is used when a call omits `cast`
 - `runtime` — state *computed at read time*, kept distinct from the configured
   knobs above so a reader can tell "what kaibo discovered" from "what the operator

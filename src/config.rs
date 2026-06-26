@@ -544,6 +544,15 @@ pub struct Config {
     /// untouched. It *is* mounted read-only into kaish (see [`SandboxConfig::out_dir`])
     /// so a later consult can read a generated artifact back.
     pub out_dir: PathBuf,
+    /// Whether the out-dir is part of kaibo's *read* surface: mounted read-only into
+    /// kaish (so a consult can read an artifact back) **and** joined to the containment
+    /// allowed-set (so an out-dir path can be `attach`ed or targeted as a call `path`).
+    /// Default `true` — kaibo wrote the artifact, so reading it back is the unsurprising
+    /// default. Set `false` (`[server] out_dir_readable = false`,
+    /// `KAIBO_NO_OUT_DIR_READABLE`, `--no-out-dir-read`) for the tightest boundary: kaibo
+    /// still writes the artifact and returns its path, but never reads it back itself.
+    /// Gates both surfaces together so "readable" stays one concept.
+    pub out_dir_readable: bool,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -1090,13 +1099,16 @@ impl Config {
         // it reads to a model). Never a real artifact dir — a loud load error, not a
         // silent host-wide exposure. ($HOME is the softer case — warned at startup in
         // `main`, not refused, since a deliberately-broad home cache is the user's call.)
-        if out_dir == PathBuf::from("/") {
+        if out_dir.as_path() == std::path::Path::new("/") {
             bail!(
                 "[server] out_dir resolves to `/` — refusing: the out-dir is mounted \
                  read-only into kaish, so `/` would expose the whole host filesystem to a \
                  consult. Point it at a kaibo-owned directory (default $XDG_CACHE_HOME/kaibo)."
             );
         }
+        // Whether the out-dir is part of the read surface (mount + allowed-set), default
+        // on. Gates both surfaces, so they can't drift apart.
+        let out_dir_readable = server.out_dir_readable.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
@@ -1106,9 +1118,10 @@ impl Config {
         // safety), but resolves onto the same struct the kernel builder consumes.
         sandbox.ignore = merge_kaish(raw.kaish.unwrap_or_default())?;
         // Mirror the artifact out-dir onto the sandbox so the kernel builder mounts it
-        // read-only (the read-back seam — see `build_readonly_kernel_and_vfs`). The
-        // handler writes it via `std::fs`; this mount only lets kaish *read* it back.
-        sandbox.out_dir = Some(out_dir.clone());
+        // read-only (the read-back seam — see `build_readonly_kernel_and_vfs`), but only
+        // when it's readable. The handler writes it via `std::fs` regardless; this mount
+        // only lets kaish *read* it back, so it's gated by `out_dir_readable`.
+        sandbox.out_dir = out_dir_readable.then(|| out_dir.clone());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
         // real intent (there's no "unbounded" escape hatch by design: an unbounded
@@ -1127,6 +1140,7 @@ impl Config {
             allow_paths,
             follow_worktrees,
             out_dir,
+            out_dir_readable,
             default_cast,
             log,
             tools,
@@ -1170,16 +1184,22 @@ impl Config {
         project_context_files: Vec<String>,
         user_context_files: Vec<PathBuf>,
         out_dir: Option<PathBuf>,
+        disable_out_dir_read: bool,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
         }
-        // CLI out-dir wins. Mirror it onto the sandbox too, so the read-back mount
-        // tracks the final resolved dir (the merge set both; keep them in lockstep).
+        // CLI out-dir / readability win. Like `--no-<tool>`, the CLI can only turn the
+        // read surface OFF, never force it on over a `[server] out_dir_readable = false`.
         if let Some(out_dir) = out_dir {
-            self.sandbox.out_dir = Some(out_dir.clone());
             self.out_dir = out_dir;
         }
+        if disable_out_dir_read {
+            self.out_dir_readable = false;
+        }
+        // Re-derive the sandbox read-back mount mirror from the final out-dir + readability
+        // (the merge set it; a CLI override of either must keep them in lockstep).
+        self.sandbox.out_dir = self.out_dir_readable.then(|| self.out_dir.clone());
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
         // never force it on over a `[server] follow_worktrees = false` in the file.
         if disable_follow_worktrees {
@@ -1532,6 +1552,9 @@ struct RawServer {
     /// Where capability tools write artifacts. Default `$XDG_CACHE_HOME/kaibo` (see
     /// [`default_out_dir`]). Env: `KAIBO_OUT_DIR`. CLI: `--out-dir`. Expands `$VAR`/`~`.
     out_dir: Option<String>,
+    /// Whether the out-dir joins kaibo's read surface (mount + allowed-set). Default
+    /// true. Env: `KAIBO_NO_OUT_DIR_READABLE`. CLI: `--no-out-dir-read`.
+    out_dir_readable: Option<bool>,
     /// The default cast (was `provider` before the backends/casts split; the old
     /// key is now an unknown-field load error via `deny_unknown_fields`).
     cast: Option<String>,
@@ -1958,6 +1981,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_OUT_DIR") {
         server.out_dir = Some(v);
+    }
+    if env_flag(get, "KAIBO_NO_OUT_DIR_READABLE") {
+        server.out_dir_readable = Some(false);
     }
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);

@@ -195,23 +195,6 @@ the example slots.
 
 ## P2 — Focused fixes & hardening
 
-### Re-`attach` a generated artifact to a follow-up consult/oneshot/batch
-Surfaced by the Gemini cross-family review of the out-dir PR (2026-06-26). A consult
-*inside* its loop can already read a generated artifact (kaish `view_image` over the
-read-only out-dir mount), but the **calling agent can't pass the out-dir path into a
-later tool's `attach`** arg: `out_dir` isn't in the handler's `allowed_set`, so
-`oneshot`/`batch_submit`'s `containing_tree` rejects it, and `consult`'s
-`resolve_consult_attachments` requires a subpath of the project `root`. So "generate an
-image, then ask a vision cast about it via `attach`" fails with an out-of-bounds error
-(workaround: put the image under the project, or the consult model reads it via kaish).
-Not a correctness bug and no doc claims otherwise (the AGENTS.md "consult can ship its
-own artifacts" line is about the read-back *mount*, which works) — but a real coherence
-wart: the dir kaish may read should plausibly be attachable. Fix is security-sensitive
-(it widens the containment `allowed_set` / attach acceptance to a non-project tree), so
-it wants its own deliberate pass: append `config.out_dir` to `allowed_set` at startup
-and teach `resolve_consult_attachments` to pass an out-dir-prefixed path through as
-absolute. Decide with Amy whether re-attach is wanted before widening the boundary.
-
 ### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
 `tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
 the handler infers it as the default root. It fails intermittently (~1 in 5 full

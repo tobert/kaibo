@@ -66,8 +66,13 @@ the git log. Each later release appends a new section at the top.
 - **Artifact out-dir** — capability tools write their outputs to a kaibo-owned
   directory (`server.out_dir` / `KAIBO_OUT_DIR` / `--out-dir`, default
   `$XDG_CACHE_HOME/kaibo`, else `~/.cache/kaibo`). kaibo writes there directly (never
-  through kaish — the read-only sandbox is unchanged) and mounts it read-only into kaish
-  so consultations can read a generated artifact back. Visible at `kaibo://config`.
+  through kaish — the read-only sandbox is unchanged) and, when readable, mounts it
+  read-only into kaish *and* adds it to the containment allowed-set: a consultation can
+  read a generated artifact back, and an out-dir path can be `attach`ed to a follow-up
+  `consult`/`oneshot`/`batch` or targeted as a call `path`. Set `out_dir_readable = false`
+  (`--no-out-dir-read` / `KAIBO_NO_OUT_DIR_READABLE`) to keep the out-dir out of kaibo's
+  read surface entirely — artifacts are still written and their paths returned, but kaibo
+  never reads them back. `out_dir = "/"` is refused. Visible at `kaibo://config`.
 - **Batch (`batch_submit`)** — the *offline, async sibling* of `oneshot`: submit a list
   of tool-less prompts, get a handle, then collect it with the shared `get`/`cancel`/
   `list` verbs (see below) — read every answer when the provider's batch lane finishes,
