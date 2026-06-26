@@ -215,6 +215,25 @@ async fn main() -> Result<()> {
     // build — a typo must crash here, not silently leave the builtin enabled.
     config.validate_against_builtins(&kaibo::sandbox::builtin_names()?)?;
 
+    // Pre-create the artifact out-dir so the read-only read-back mount is present for
+    // every kaish kernel from the first call. The mount is decided at kernel-build time
+    // and skipped when the dir doesn't exist yet; a `consult` session built *before* the
+    // first `generate_image` keeps a long-lived `run_kaish` worker, so without this its
+    // model couldn't `cat` an artifact created mid-session. Only when a capability can
+    // actually write there. Not fatal — `write_artifact` does its own `create_dir_all`
+    // and surfaces the hard error loudly at call time — but a warning lets the operator
+    // catch an unwritable cache dir early.
+    if config.tools.generate_image {
+        if let Err(e) = std::fs::create_dir_all(&config.out_dir) {
+            tracing::warn!(
+                out_dir = %config.out_dir.display(),
+                error = %e,
+                "could not pre-create the artifact out-dir; generate_image will retry at \
+                 call time and fail loudly there if it still can't write"
+            );
+        }
+    }
+
     tracing::info!(
         cast = %config.default_cast,
         root = ?config.root.as_ref().map(|p| p.display().to_string()),

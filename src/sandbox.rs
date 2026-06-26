@@ -159,8 +159,9 @@ pub struct SandboxConfig {
     /// artifact back. This widens read-*scope* to the kaibo-owned cache only — it is
     /// **not** a write path (the handler writes via `std::fs`; kaish never does), so the
     /// read-only invariant is untouched. `None` (the default) mounts nothing; the mount
-    /// is also skipped until the dir exists (created lazily on the first artifact write)
-    /// and when it already falls under the project mount. See
+    /// is also skipped when the dir doesn't exist (normally pre-created at startup in
+    /// `main`, so this is the defensive fallback for a gated-off or uncreatable dir) and
+    /// when it already falls under the project mount. See
     /// [`build_readonly_kernel_and_vfs`].
     pub out_dir: Option<PathBuf>,
 }
@@ -248,10 +249,11 @@ fn build_readonly_kernel_and_vfs(
     // read a generated artifact back (the `generate_image` output, etc.). It's the same
     // `LocalFs::read_only` the project rides, so this only adds read-*scope* to the
     // kaibo-owned cache — never a write path (the handler writes via `std::fs`; kaish
-    // can't). Skipped when (a) unset, (b) the dir doesn't exist yet (created lazily on
-    // the first write — nothing to read until then), or (c) it already falls under the
-    // project mount (the project's read-only `LocalFs` already serves it; a second mount
-    // would just shadow it identically). Canonicalize first so the mount point matches
+    // can't). Skipped when (a) unset, (b) the dir doesn't exist (normally pre-created at
+    // startup in `main` when generate_image is enabled, so this guards the gated-off /
+    // uncreatable case — nothing to read until an artifact lands anyway), or (c) it
+    // already falls under the project mount (the project's read-only `LocalFs` already
+    // serves it; a second mount would just shadow it identically). Canonicalize first so the mount point matches
     // how kaish resolves an absolute path (symlinks/`..` resolved), and so the
     // under-root check can't be fooled by a symlink — the same canonicalize-then-decide
     // discipline as `resolve_root`.
