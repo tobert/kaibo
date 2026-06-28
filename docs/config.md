@@ -24,12 +24,12 @@ The fix was to split the enum: a *kind* is the wire protocol, a *profile* a name
 instance of one.
 
 **Pass two** found the same disease one floor up. A profile still fused two
-selectors — *which connection* and *which model serves which role*. An anthropic
-profile could never have a voice (Anthropic serves no tts model); a chimera
-(deepseek explorer, claude synth, local image gen, gemini tts) was inexpressible;
-and "profile" meant *connection* in one position and *team* in another. So the
-profile split too — into **backends** and **casts** — and `[profiles]` is deleted,
-not deprecated. The full rationale is `docs/casts.md`.
+selectors — *which connection* and *which model serves which role*. A profile is
+one `kind`, so a team was locked to one family: a chimera (a cheap local deepseek
+explorer feeding a claude synth) was inexpressible, and "profile" meant
+*connection* in one position and *team* in another. So the profile split too —
+into **backends** and **casts** — and `[profiles]` is deleted, not deprecated. The
+full rationale is `docs/casts.md`.
 
 ## The model: backends, roles, casts
 
@@ -45,9 +45,10 @@ Three concepts, each owning exactly one idea:
 - **backend** — a *connection*: `kind` (the closed `ProviderKind` enum — the one
   place "provider" still means something; it picks the rig client and the request
   shape), `base_url`, key source, `request_timeout`. "How do I reach Gemini."
-- **role** — a *job* a model serves: `explorer`, `synth` (the agent phases),
-  `image`, `tts` (the production roles backing media builtins as they land; see
-  the media-spine entry in `docs/issues.md`).
+- **role** — a *job* a model serves: `explorer` and `synth`, the two agent
+  phases (there are no output/production roles — kaibo reasons over code and
+  renders nothing). A slot that reads images carries a `vision` pin; perception
+  is a slot capability, not a role.
 - **cast** — a *composition*: a named assignment of models to roles. This is what
   the `cast` call param selects.
 
@@ -67,7 +68,7 @@ Connection knobs only — models never live here:
   connection's protocol by re-declaring it.
 - **`base_url`** is meaningful for `kind = "openai"` (the generic OpenAI-compatible
   path) — this is what lets any number of openai-kind backends (hosted GPT, two
-  local llama.cpp servers, an image server) be live at once, each its own name.
+  local llama.cpp servers, an Ollama box) be live at once, each its own name.
   A *new* openai-kind backend must set it: the `OPENAI_BASE_URL`/local-default
   fallback belongs to the built-in `openai-local` backend alone, so a forgotten
   `base_url` is a load error, not a silent dial of the wrong server. For the
@@ -117,27 +118,23 @@ or a table when the slot needs pins or tunables:
 
 ```toml
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
-synth    = "claude/claude-sonnet-4-6"       # the voice that answers
-image    = "sd/sdxl-turbo"                  # image gen stays local
-# tts    = "gemini/gemini-2.5-flash-tts"    # RESERVED — parses but unconsumed (see below)
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — local/cheap family
+synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
 
 # table form: id + capability pins + per-slot tunables
 # synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }  # per-model prompt
 ```
 
-- **Known roles:** `explorer`, `synth`, `image`, `tts`. A typo'd role (or a typo'd
-  per-slot knob) is a loud load error, not a silent no-op. A cast may omit roles —
-  the four interactive built-ins carry explorer+synth, the batch built-ins carry
-  synth only; a user cast that omits a role is valid
-  config, and the tool that needs the missing role fails loudly *at call time*,
-  naming the gap ("cast `tts-box` has no synth slot"). Absent = capability absent.
-  (Nothing consumes `image`/`tts` yet; they land with the production builtins.
-  `tts` — and a future `stt` — is parked pending rig provider coverage: rig 0.38
-  drives TTS only for openai-kind backends, not Gemini/Anthropic. Kept as the
-  adoption seam; the shipped `config.example.toml` deliberately omits it rather
-  than advertise a capability that doesn't exist. See `docs/issues.md`.)
+- **Known roles:** `explorer`, `synth`. A typo'd role (or a typo'd per-slot knob)
+  is a loud load error, not a silent no-op. A cast may omit roles — the four
+  interactive built-ins carry explorer+synth, the batch built-ins carry synth
+  only; a user cast that omits a role is valid config, and the tool that needs the
+  missing role fails loudly *at call time*, naming the gap ("cast `lite` has no
+  synth slot"). Absent = capability absent. (There are no output/production roles:
+  kaibo reasons over a codebase and renders nothing, so image/tts-style "make an
+  artifact" roles don't exist. Perception — image input, audio-in later — is a
+  slot's `vision`/`ModelCaps` capability, below, not a role.)
 - **An unknown backend in a slot is a load error** naming the known backends; an
   empty model id is rejected at load (it would surface as a baffling provider 404
   mid-call otherwise).
@@ -159,8 +156,8 @@ source, `base_url`, `request_timeout_secs` — they describe the wire).
 **Model-tracking knobs ride the slot** (`max_tokens`, `thinking_budget`,
 `temperature`, `effort`, `thinking_style`, the `vision` pin, and `preamble` — they
 describe the model), each falling back to its per-role `[defaults]` value when
-omitted (`explorer` slots inherit the `explorer_*` defaults; `synth` and the media
-roles inherit the `synth_*` side). A profile-level `max_tokens` awkwardly shared by
+omitted (`explorer` slots inherit the `explorer_*` defaults; `synth` inherits the
+`synth_*` side). A profile-level `max_tokens` awkwardly shared by
 two models no longer exists. The `preamble` knob is the per-model system prompt —
 its own fallback chain (it has no `[defaults]` entry) is documented under
 [System prompts](#system-prompts-prompts) below.
@@ -288,8 +285,6 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | config file location | — | `KAIBO_CONFIG` | `--config <path>` |
 | default root | `server.root` | `KAIBO_ROOT` | `--root` |
 | additional allowed trees | `server.allow_paths` *(list)* | `KAIBO_ALLOW_PATHS` *(colon-separated)* | `--allow-path DIR` *(repeatable)* |
-| artifact out-dir | `server.out_dir` | `KAIBO_OUT_DIR` | `--out-dir DIR` |
-| out-dir readable | `server.out_dir_readable` | `KAIBO_NO_OUT_DIR_READABLE` | `--no-out-dir-read` |
 | default cast | `server.cast` | `KAIBO_CAST` | `--cast` |
 | disable a tool | `server.tools.<t> = false` | `KAIBO_NO_<T>` | `--no-<t>` |
 | log filter | `server.log` | `RUST_LOG` *(wins)* / `KAIBO_LOG` | — |
@@ -705,52 +700,6 @@ The worktrees currently followed are listed at `kaibo://config` under `[runtime]
 (see below), recomputed on each read so a mid-session worktree shows up without a
 reconnect.
 
-## Artifact out-dir: `server.out_dir`
-
-Capability tools (today, `generate_image`) write their output to a **kaibo-owned
-out-dir** and hand back the path — no inline blob, so a large artifact costs the
-caller's context nothing until it opens the file. Default `$XDG_CACHE_HOME/kaibo`
-(else `~/.cache/kaibo`, else `<temp>/kaibo`); set it explicitly with any of:
-
-```toml
-[server]
-out_dir = "~/kaibo-artifacts"   # expands ~ / $VAR like root/allow_paths
-```
-
-```sh
-KAIBO_OUT_DIR=/data/kaibo-art kaibo     # env
-kaibo --out-dir /data/kaibo-art         # CLI (wins over env/file)
-```
-
-Two properties make this safe with the read-only invariant. **kaibo writes the out-dir
-directly** (`std::fs`), never through kaish — the read-only sandbox levers are
-untouched, and kaish still cannot write anywhere. **The out-dir is mounted *read-only*
-into kaish** (and joined to the containment allowed-set), so a later `consult`/`run_kaish`
-can read a generated artifact back — and an out-dir path can be `attach`ed to a follow-up
-consult/oneshot/batch or targeted as a call `path`. That read-back is a deliberate, narrow
-widening of read-scope to kaibo's own cache — which is why the default is a kaibo-owned
-subdir, not bare `/tmp`: mounting a shared temp would expose every other process's files
-to a consult (and a consult can ship what it reads to a model). `out_dir = "/"` is refused
-outright for the same reason. Point `out_dir` at a kaibo-owned directory if you override
-it. It's durable (a cache, not auto-cleared) — artifacts accumulate; clear it yourself if
-it grows. The resolved path shows at `kaibo://config` as `out_dir`.
-
-**Turning read-back off.** `out_dir_readable = false` (or `--no-out-dir-read` /
-`KAIBO_NO_OUT_DIR_READABLE`) keeps the out-dir out of kaibo's read surface entirely — no
-kaish mount, not in the allowed-set. kaibo still writes artifacts and returns their paths
-(the calling agent opens them with its own tools), but kaibo itself never reads them back.
-The tightest boundary, for anyone who'd rather artifacts not re-enter kaibo's read scope.
-
-**No XDG cache, no `$HOME` (containers).** When neither `$XDG_CACHE_HOME` nor `$HOME` is
-set, the default out-dir falls back to a subdir of the system temp dir — a *world-shared*
-location. kaibo will still write artifacts there, but **read-back defaults off** in that
-case: it won't auto-mount a shared temp into kaish, because a symlink planted in a
-world-writable temp could redirect the read mount onto an attacker-chosen tree (which a
-consult could then ship to a model). `generate_image` keeps working and returns the path;
-to enable read-back, set `out_dir` to a kaibo-owned directory you name (an explicit
-`out_dir` is trusted, so read-back defaults on for it). An explicit `out_dir_readable`
-always wins, either way.
-
 ## kaibo://config
 
 An MCP resource at the URI `kaibo://config` (`application/toml`) exposes the server's
@@ -759,8 +708,6 @@ operator) the full picture:
 
 - `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
 - `default_root` — the `--root` value, if set
-- `out_dir` — where capability tools write artifacts (also mounted read-only into kaish)
-- `out_dir_readable` — whether the out-dir is in the read surface (mount + allowed-set)
 - `default_cast` — which cast is used when a call omits `cast`
 - `runtime` — state *computed at read time*, kept distinct from the configured
   knobs above so a reader can tell "what kaibo discovered" from "what the operator
@@ -769,7 +716,7 @@ operator) the full picture:
   now; recomputed each read, so a worktree added mid-session appears without a
   reconnect)
 - `tools` — which tools are currently advertised (`consult`, `oneshot`,
-  `run_kaish`, `generate_image`)
+  `run_kaish`)
 - `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins
 - `kaish.ignore` — the resolved ignore policy the file-walking builtins honor:
   `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope`

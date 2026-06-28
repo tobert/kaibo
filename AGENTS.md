@@ -1,10 +1,13 @@
 # AGENTS.md — kaibo (解剖)
 
-Kaibo is a stdio MCP server that provides assistant agent **for other agents**.
-It augments a calling agent (Claude, etc.) with a team of models, lending two
-kinds of help — *consultation* (grounded, cited, read-only answers about a codebase) and
-*capabilities* (things the team can *do* and hand back as artifacts; image generation
-today, more as `rig` grows coverage).
+Kaibo is a stdio MCP server that provides an assistant agent **for other agents**.
+It augments a calling agent (Claude, etc.) with a team of models, lending one kind of
+help — *consultation*: grounded, cited, read-only answers about a codebase. The team
+*perceives* what fuses into its reasoning (image input today — `view_image` and image
+attachments on the model-driven tools; more modalities as the models gain them), but
+kaibo produces **no output artifacts** — it reasons over code, it doesn't render or
+emit. (If it ever needs to *record* something, that's a specific mediated tool, not a
+general write path; see the read-only invariant.)
 
 **Consultation: one primitive, three tools.** The primitive is `run_phase`
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
@@ -24,27 +27,16 @@ loop. Each consultation tool is that loop wearing different clothes:
 Both model-driven tools name their cast + answering model(s) in a provenance footer
 (`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
 
-**Capabilities** are a distinct, growing tool *class* — not `run_phase` loops. The
-direction is the tell: consultation and perception (`view_image`) run images and
-context *into* kaibo's own models so they can reason; a capability runs a model and
-hands the **artifact back to the calling agent** — kaibo is the producer, the caller
-is the consumer.
-
-- **`generate_image`** — prompt → image, returned inline as MCP `Content::image`
-  (`generate_image.rs`, `image_gen.rs`). A single provider call behind the `ImageGen`
-  seam; no shell, no model loop. Resolves the cast's `image` slot, openai-kind only
-  (rig 0.38 has no image path for the keyed protocols — refused honestly otherwise).
-
 Each tool is independently gated by a `--no-<tool>` flag (all on by default; the
 all-off server is refused at startup). Multi-provider over `rig-core`: a
 **`ProviderKind`** is the wire protocol (keyed Anthropic / DeepSeek / Gemini, plus
 **`openai`** for any OpenAI-compatible endpoint). A **`[backends.<name>]`**
 (`config.rs`) is a *named connection* of a kind with its own base URL and key source —
 so two `openai` backends (hosted GPT and a local Gemma/llama.cpp server, say) can be
-live at once. A **`[casts.<name>]`** is a model team mapping each role (explorer /
-synth / image / …) to a `"backend/model-id"`, freely cross-backend, so one cast can
-pair a cheap local explorer with a hosted synth; a call picks its team with the `cast`
-arg. Backends and casts come from a built-in registry merged under an XDG
+live at once. A **`[casts.<name>]`** is a model team mapping each reasoning role
+(`explorer` / `synth`, with a `vision` pin where a slot reads images) to a
+`"backend/model-id"`, freely cross-backend, so one cast can pair a cheap local explorer
+with a hosted synth; a call picks its team with the `cast` arg. Backends and casts come from a built-in registry merged under an XDG
 `config.toml`, `KAIBO_*` env, then CLI flags (precedence: per-call > CLI > env > file >
 built-in); a missing config file is a non-error. See `docs/config.md`, and
 `docs/casts.md` for the backends/casts design rationale. kaibo never modifies the
@@ -61,25 +53,15 @@ project and cannot run external commands.
   disk), and (3) external commands disabled. The `Blocked` wrapper survives only for
   the config-driven `[sandbox].disable_builtins`, which can make the box *stricter* —
   see the module doc-comment. Any change here keeps `tests/sandbox.rs` green and adds
-  a test that can fail. The one *write* path is a **capability tool writing its own
-  artifact**, handler-side via `std::fs`, only to the kaibo-owned **out-dir**
-  (`config.out_dir`, default `$XDG_CACHE_HOME/kaibo`) — never through kaish, so all four
-  levers above are untouched: kaish still cannot write anywhere. (`generate_image` is
-  the only such tool today.) Read-*scope* is also bounded: every call's path must
-  canonicalize (symlinks, `..` resolved) into the allowed set (`--root` /
-  `--allow-path`, launch cwd when unset) **plus the out-dir** when `out_dir_readable`
-  (default on): the out-dir is mounted *read-only* into kaish **and** joined to the
-  allowed-set, so a consult can read a generated artifact back and an out-dir path can be
-  `attach`ed/targeted — a deliberate, narrow widening to kaibo's own cache (a consult
-  *can* ship those own-generated artifacts to a model; that's expected, not a leak).
-  `out_dir_readable = false` removes both; `out_dir = "/"` is refused at load; and when the
-  out-dir falls back to a **world-shared system temp** (no XDG cache, no `$HOME`) read-back
-  *defaults off* — kaibo writes artifacts there but won't auto-mount a shared temp (a
-  planted symlink could redirect the read mount). Enforced in
-  `server.rs::resolve_root` and the out-dir mount in
-  `sandbox.rs::build_readonly_kernel_and_vfs`, with tests in `tests/containment.rs` and
-  the `out_dir_*` battery in `tests/sandbox.rs` (artifact readable, out-dir read-only to
-  kaish, siblings of the out-dir *not* exposed).
+  a test that can fail. **kaibo writes nothing, anywhere** — there is no write path
+  through kaish and no handler-side write either; read-only is unconditional. The door
+  this leaves open is deliberate and narrow: if kaibo ever needs to *record* or *emit*
+  something, that is a specific, individually-gated **mediated tool** with its own small
+  surface (provider call → result handed back), granted on purpose — never a general
+  filesystem escape hatch and never a loosening of the four levers. No such tool exists
+  today. Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
+  `..` resolved) into the allowed set (`--root` / `--allow-path`, launch cwd when
+  unset). Enforced in `server.rs::resolve_root`, with tests in `tests/containment.rs`.
 - **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.

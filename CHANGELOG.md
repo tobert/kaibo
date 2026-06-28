@@ -52,32 +52,6 @@ the git log. Each later release appends a new section at the top.
   So "call Opus once with these files, no tools, no waiting" is a single call.
 - **`run_kaish`** — drive the read-only kaish shell yourself, no model in the loop:
   exit code + stdout + stderr.
-- **`generate_image`** — kaibo's first *capability* (an artifact handed back to the
-  caller, not reasoning run into kaibo's own models): prompt → image, **written to a
-  file**, with the path returned (open it to view). No inline blob, so a multi-MiB
-  picture costs your context nothing until you read it. Files land in kaibo's artifact
-  out-dir (`server.out_dir` / `KAIBO_OUT_DIR` / `--out-dir`, default
-  `$XDG_CACHE_HOME/kaibo`); that dir is also mounted read-only into kaish, so a later
-  `consult`/`run_kaish` can read a generated artifact back. OpenAI-compatible image
-  backends only (hosted `gpt-image` / DALL·E, or a local Stable-Diffusion server). Its
-  `cast` parameter advertises the casts that actually carry a usable image slot as a
-  schema enum, so a host agent picks one off the schema — as discoverable as the
-  consultation tools.
-- **Artifact out-dir** — capability tools write their outputs to a kaibo-owned
-  directory (`server.out_dir` / `KAIBO_OUT_DIR` / `--out-dir`, default
-  `$XDG_CACHE_HOME/kaibo`, else `~/.cache/kaibo`). kaibo writes there directly (never
-  through kaish — the read-only sandbox is unchanged) and, when readable, mounts it
-  read-only into kaish *and* adds it to the containment allowed-set: a consultation can
-  read a generated artifact back, and an out-dir path can be `attach`ed to a follow-up
-  `consult`/`oneshot`/`batch` or targeted as a call `path`. Set `out_dir_readable = false`
-  (`--no-out-dir-read` / `KAIBO_NO_OUT_DIR_READABLE`) to keep the out-dir out of kaibo's
-  read surface entirely — artifacts are still written and their paths returned, but kaibo
-  never reads them back. `out_dir = "/"` is refused. In a stripped environment with no
-  `$XDG_CACHE_HOME` and no `$HOME` (a container), the out-dir falls back to a world-shared
-  system temp and read-back **defaults off** for safety — kaibo won't auto-mount a shared
-  temp into kaish (a planted symlink could redirect the read mount); `generate_image` still
-  works and returns the path, and you can opt back in by naming a kaibo-owned `out_dir`.
-  Visible at `kaibo://config`.
 - **Batch (`batch_submit`)** — the *offline, async sibling* of `oneshot`: submit a list
   of tool-less prompts, get a handle, then collect it with the shared `get`/`cancel`/
   `list` verbs (see below) — read every answer when the provider's batch lane finishes,
@@ -145,8 +119,9 @@ the git log. Each later release appends a new section at the top.
 - **Multi-provider model teams.** Anthropic, DeepSeek, and Gemini natively, plus a
   generic `openai` kind for any OpenAI-compatible endpoint (hosted GPT, local
   llama.cpp / Ollama / Gemma). Configured as **backends** (connections), **casts**
-  (named teams), and **roles** (explorer / synth / image); a cast can mix families
-  across roles — a cheap local explorer with a hosted synth. Built-in casts ship so
+  (named teams), and **roles** (explorer / synth, plus a `vision` capability pin on a
+  slot that reads images); a cast can mix families across roles — a cheap local explorer
+  with a hosted synth. Built-in casts ship so
   kaibo runs with zero config; `config.toml` merges over them. Precedence:
   per-call > CLI > env > file > built-in, and a missing config file is not an error.
 - **Guided setup.** A built-in `configure` MCP prompt walks your host agent through

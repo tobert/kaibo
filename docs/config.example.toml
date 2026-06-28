@@ -59,19 +59,6 @@
 # (also: --no-follow-worktrees, KAIBO_NO_FOLLOW_WORKTREES).
 # follow_worktrees = true
 
-# Where capability tools (generate_image) write their artifacts. A kaibo-owned dir,
-# default $XDG_CACHE_HOME/kaibo (else ~/.cache/kaibo). kaibo writes there directly
-# (never through kaish) and returns the file path. Also: --out-dir, KAIBO_OUT_DIR
-# (these expand ~ / $VAR). `/` is refused (it would read-mount the whole host).
-# out_dir = "~/.cache/kaibo"
-
-# Whether the out-dir is part of kaibo's *read* surface (default true): mounted
-# read-only into kaish so a consult can read an artifact back, and joined to the
-# allowed-set so an out-dir path can be `attach`ed or targeted as a call `path`. Set
-# false for the tightest boundary — kaibo still writes artifacts and returns the path
-# but never reads them back (also: --no-out-dir-read, KAIBO_NO_OUT_DIR_READABLE).
-# out_dir_readable = true
-
 # Default cast (by name or alias) when a call omits `cast`. The old `provider`
 # key is a load error (unknown field) — see docs/casts.md for the rename map.
 cast = "anthropic"
@@ -80,12 +67,11 @@ cast = "anthropic"
 log = "kaibo=info"
 
 # Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
-# A config with all four false is refused at startup, same as today.
+# A config with all three false is refused at startup, same as today.
 [server.tools]
 consult        = true
 oneshot        = true
 run_kaish      = true
-generate_image = true
 
 # ---------------------------------------------------------------------------
 # [defaults] — tunables every cast slot falls back to. The model-tracking knobs
@@ -248,20 +234,20 @@ base_url = "http://localhost:8080/v1"
 key_optional = true
 request_timeout_secs = 1800
 
-# A local image server — also just an openai-kind connection.
-[backends.sd]
+# A hosted OpenAI endpoint — another openai-kind connection alongside the local ones.
+[backends.gpt]
 kind = "openai"
-base_url = "http://localhost:7860/v1"
-key_optional = true
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
 
 # ---------------------------------------------------------------------------
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
 #
-# Roles: explorer, synth (the agent phases), image (the `generate_image` capability —
-# an openai-kind slot that genuinely produces a picture). A typo'd role is a loud load
+# Roles: explorer, synth (the agent phases). There are no output/production roles —
+# kaibo reasons over code and renders nothing. A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
-# naming the gap ("cast `notes` has no image slot"); absent = capability absent.
+# naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
 #
 # Slot forms:
 #   role = "backend/model-id"                                  # the common case
@@ -282,7 +268,6 @@ key_optional = true
 [casts.chimera]
 explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — DeepSeek family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude family
-image    = "sd/sdxl-turbo"                  # image gen stays local — Stable Diffusion
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
 #     the local-default `openai-local` backend. ---
@@ -290,7 +275,6 @@ image    = "sd/sdxl-turbo"                  # image gen stays local — Stable D
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
 synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
-image    = "sd/sdxl-turbo"
 
 # --- The table form, part 1: capability pins. `vision = true` overrides the
 #     built-in classifier (Anthropic/Gemini multimodal-in, DeepSeek text-only,
