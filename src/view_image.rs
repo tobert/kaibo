@@ -232,9 +232,9 @@ impl Tool for ViewImage {
 /// Identify an image by its leading magic bytes (png/jpeg/gif/webp) — content, not
 /// extension, since the model may name a path with the wrong suffix and we hand a
 /// `mimeType` straight to the provider. Returns the MIME string rig maps to its
-/// `ImageMediaType`, or `None` for anything we don't carry. Shared with the
-/// `generate_image` capability, which must label produced bytes the same way
-/// `view_image` labels read ones — one sniffer, one source of truth.
+/// `ImageMediaType`, or `None` for anything we don't carry. Also shared with the
+/// attachment sniffer (`attach.rs`), which labels image bytes the same way — one
+/// sniffer, one source of truth.
 pub(crate) fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if bytes.starts_with(PNG) {

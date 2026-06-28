@@ -213,7 +213,7 @@ pub fn classify(
     max_image: usize,
 ) -> Result<Attachment> {
     // Content decides the encoding. An image magic number wins — it can't be inlined
-    // as text, and the sniffer is the same one `view_image`/`generate_image` trust.
+    // as text, and the sniffer is the same one `view_image` trusts.
     if let Some(mime) = crate::view_image::sniff_mime(bytes) {
         if bytes.len() > max_image {
             bail!(

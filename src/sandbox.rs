@@ -154,12 +154,6 @@ pub struct SandboxConfig {
     /// `[kaish.ignore]`. Defaults to [`IgnoreConfig::agent`] (`.gitignore` + built-in
     /// defaults, enforced scope) so omitting the stanza preserves today's behavior.
     pub ignore: IgnoreConfig,
-    /// The readable artifact out-dir to mount **read-only** into the kernel for read-back
-    /// — `Some` iff `out_dir_readable` (see [`crate::config::Config::out_dir`] for the
-    /// policy and why this is a read mount, not a write path). `None` mounts nothing.
-    /// [`build_readonly_kernel_and_vfs`] also skips it when the dir doesn't exist yet or
-    /// already falls under the project mount.
-    pub out_dir: Option<PathBuf>,
 }
 
 impl Default for SandboxConfig {
@@ -170,7 +164,6 @@ impl Default for SandboxConfig {
             scratch_limit_bytes: DEFAULT_SCRATCH_LIMIT_BYTES,
             disable_builtins: Vec::new(),
             ignore: IgnoreConfig::agent(),
-            out_dir: None,
         }
     }
 }
@@ -240,23 +233,6 @@ fn build_readonly_kernel_and_vfs(
     vfs.mount("/", MemoryFs::with_budget(scratch_budget));
     // The project itself: real files, read-only.
     vfs.mount(&mount_point, LocalFs::read_only(&root));
-
-    // The readable artifact out-dir, mounted read-only for read-back (see
-    // [`crate::config::Config::out_dir`]). Same `LocalFs::read_only` as the project, so no
-    // write path is opened. Skipped when unset, when the dir doesn't exist yet (nothing to
-    // read until an artifact lands), or when it already falls under the project mount.
-    // Canonicalize first so the mount point matches how kaish resolves an absolute path
-    // and the under-root check can't be fooled by a symlink — the canonicalize-then-decide
-    // discipline `resolve_root` uses.
-    if let Some(out_dir) = sandbox.out_dir.as_ref() {
-        if let Ok(canon) = out_dir.canonicalize() {
-            let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if canon != root_canon && !canon.starts_with(&root_canon) {
-                let out_mount = canon.to_string_lossy().to_string();
-                vfs.mount(&out_mount, LocalFs::read_only(&canon));
-            }
-        }
-    }
 
     // Keep a handle to the project router before it disappears into the backend, so
     // the worker can read bytes through these mounts (the kernel's own `vfs()` won't

@@ -826,8 +826,7 @@ impl Arm {
 #[derive(Debug, Clone)]
 pub struct ConsultAttachment {
     /// The path the model passes to `cat -n` or `view_image`: root-relative for a file
-    /// under the project root, or *absolute* for one under the read-only artifact out-dir
-    /// (the other tree the consult shell mounts) — the server picks the form per file.
+    /// under the project root, the one real tree the consult shell mounts.
     pub path: String,
     /// True when the file sniffed as a known image type — route it to `view_image`, not
     /// the shell. A consult that carries an image attachment must run a vision-capable

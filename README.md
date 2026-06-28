@@ -74,7 +74,7 @@ config):
       //   "args": ["--root", "/path/to/project"]        // pin a fixed project root
       //   "args": ["--allow-path", "/extra/tree"]        // widen read scope (repeatable)
       //   "args": ["--cast", "deepseek"]                 // default cast when a call omits it
-      //   "args": ["--no-generate-image"]                // drop a tool from the surface
+      //   "args": ["--no-run-kaish"]                     // drop a tool from the surface
       //   "args": ["--config", "/path/to/config.toml"]   // use an explicit config file
       "args": [],
       "env": {
@@ -126,8 +126,8 @@ config has three concepts for configuring models:
 - **backend** — a *connection*: which wire protocol (`anthropic` | `deepseek` |
   `gemini` | `openai`), base URL, and where its key comes from. Secrets never live in
   the TOML — only the *name* of an env var or the path to a key file.
-- **role** — a *job* a model does: `explorer` (fast sweeps), `synth` (the voice that
-  answers), `image`.
+- **role** — a *job* a model does: `explorer` (fast sweeps) and `synth` (the voice that
+  answers). A slot that reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
   argument selects the ensemble.
 
@@ -212,14 +212,6 @@ Drive the read-only kaish shell yourself, no model in the loop: returns exit cod
 stdout + stderr. For a Claude Code user this offers little over the built-in Bash tool
 beyond *safety* — writes and external commands are refused, so exploration leaves
 nothing to review: there's no diff, because nothing it runs can change your tree.
-
-### `generate_image` — a capability, not a consultation
-
-The odd one out: where the tools above run code and context *into* kaibo's models to
-reason, this runs a model and hands an **artifact back** to your agent. Prompt → image,
-returned inline. The cast must carry an `image` slot on an OpenAI-compatible backend
-(hosted `gpt-image`/DALL·E, or a local Stable-Diffusion server). It's the first of
-kaibo's *capability* tools; the class grows as `rig` adds provider coverage.
 
 ---
 

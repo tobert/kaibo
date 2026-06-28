@@ -1,10 +1,9 @@
 # kaibo — Known Issues & Open Work
 
 解剖（かいぼう）'s punch list. kaibo is an assistant agent for other agents — a team
-of models offering *consultation* (read-only, cited codebase answers) and
-*capabilities* (image generation today, more later). This file is where we record
-what's missing, what's fragile, and what we'd improve. Evidence-first — name the
-file, the line, the *why*, and how it surfaced.
+of models offering *consultation* (read-only, cited codebase answers). This file is
+where we record what's missing, what's fragile, and what we'd improve. Evidence-first
+— name the file, the line, the *why*, and how it surfaced.
 
 Conventions:
 
@@ -23,188 +22,42 @@ kaish-kernel 0.9.0.
 
 ## P1 — High-leverage features & robustness
 
-### Media spine + pal merge: vision-in first, production tools as kaish builtins
-Direction settled 2026-06-10 (conversation w/ Amy): kaibo absorbs the pals' model
-tools over time — image gen/image2image, tts, eventually more — specialized via
-config the way models already are. The user asks for it all in one place; the shell
-is the workflow layer. Rationale recorded here so it survives the conversation.
+### Media spine — perception in, production removed
 
-**Architecture rules (the cheap decisions made now):**
+Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
+*unconditional* — no out-dir, no handler-side write, no write path of any kind. Image
+output used none of kaibo's differentiators (read-only sandbox, cross-model code
+reasoning). Dropping it closes the write path that compromised the unconditional claim.
+See devlog 2026-06-28.
 
-- **Perception vs production.** A tool whose output the model must *see*
-  (`view_image`) is a **rig tool** — the only channel that carries image parts into
-  model context is the rig tool-result envelope (`ToolResultContent::from_tool_output`
-  parses `{"response":…, "parts":[{"type":"image","data":…,"mimeType":…}]}` — the
-  part key is camelCase **`mimeType`**, confirmed against rig-core 0.34
-  `completion/message.rs:888` (the `mime_type` spelling in an earlier draft of this
-  note was wrong); the Anthropic and Gemini arms map image parts natively both
-  directions, `providers/gemini/completion.rs:455,1135`). A tool whose output is an
-  *artifact* is a **capability** — its own MCP tool, not a `run_phase` loop.
-  **Refined 2026-06-13 (image-out shipped):** the basic "agent asks kaibo to *make*
-  something" path is a direct capability tool (`generate_image`: resolve slot →
-  provider call → `Content::image`), simpler and the natural agent-facing surface.
-  The earlier plan to make these **kaish builtins** (async `Tool::execute` +
-  `register_arc`, like `Blocked` in `sandbox.rs`) was premised on *shell composition*
-  — `image2image <in> <out>` piped to another tool, artifacts on the scratch VFS. That
-  rationale is real but it's a *later* concern (media pipelines), re-homed to the
-  deferred follow-on below; don't reach for a builtin until composition is the point.
-- **Media moves by VFS path; base64 only at the edges** (provider wire, MCP
-  content). Scratch `MemoryFs` is the working bus — bounded now that kaish landed
-  `ByteBudget` (kaish-vfs, 2026-06-10; kaibo pickup tracked in the P2 entry below).
-  **RW mounts — DEFERRED 2026-06-26 (w/ Amy).** *"We're going to defer this a while
-  and stay read-only by having only specific tool accesses write to the underlying
-  fs."* The direction flips: rather than a **general** writable-mount surface wired into
-  every kernel, kaibo **stays read-only as the product** and any future write is a
-  *specific capability tool* writing its own artifact to the fs (the `generate_image`
-  shape — handler-side, narrow, its own path), never a broad mount and never `consult`.
-  This **reverses the "uniform RW into every kernel, consult *does* get RW" sub-bullet
-  below** — that was the cost we're declining. It also moots the danger-surfacing design
-  (no broad mount to grade) and the consult-can-write prompt-injection exposure (consult
-  stays read-only). The general-RW sub-bullets below are kept only as the *if we ever
-  revisit a general mount* record; the live plan is artifact-out via a specific tool.
-  Pairs with the per-builtin-timeout retirement (devlog 2026-06-26) — same posture:
-  capabilities are handler-side tools, kaibo's kernels stay read-only.
+**What stays (perception):**
+- `view_image` — rig tool in the consult toolset; the only channel carrying image
+  parts into model context (`ToolResultContent` image part; Anthropic + Gemini arms
+  map image parts natively, `rig-core providers/*/completion.rs`). Input size cap:
+  `DEFAULT_MAX_IMAGE_BYTES` (5 MiB, `consult.rs`) — promote to a `[sandbox]`/
+  `[defaults]` knob if it bites. Vision-blind synths get an honest refusal up front.
+- Image `attach` on `consult`/`oneshot`/`batch` — inlines as native image parts on a
+  vision-capable synth. Non-file (pasted) image input deferred (YAGNI).
+- Per-slot `vision` pin (`ModelCaps`, `consult.rs`) — drives the refusal gate and
+  `view_image` injection. Resolved caps visible at `kaibo://config`.
 
-  *(Superseded general-RW design, settled 2026-06-25, kept for reference.)* Instead of a
-  special-case artifact dir, kaibo gains a *general* set of writable mounts: `rw_paths`
-  (CLI `--rw-path` / `KAIBO_RW_PATHS` / `[server] rw_paths`, default none) — the
-  read-only `allow_paths` shape with the mount flag flipped, reusing the same `$VAR`
-  expansion + canonicalize + contain machinery (`config.rs`
-  `expand_env_vars`/`resolve_var`, `server.rs` containment). Decisions that fell out of
-  the conversation:
-  - **The invariant relocates, it doesn't weaken.** Not "kaibo is read-only" but
-    *kaibo never writes to the project under analysis; writes are confined to RW
-    mounts the user explicitly named (default none)*. The project mount stays ro
-    always — no flag, no per-tool exception. The CLAUDE.md "Read-only is the product"
-    invariant (lever 1) reworded to this when it lands; teeth-test unchanged (mount
-    the project writable, watch the denial tests fail).
-  - **Uniform, not staged per tool.** The RW mounts wire the *same* into every kaish
-    kernel — `run_kaish`, the `consult` driver, the `explore′` sub-agent — one
-    `build_sandbox`. Rejected a "consult stays read-only" carve-out: a user who
-    configures an RW space expects kaibo to use it, and per-tool RW rules are a
-    cognitive tax on both human and agent. consult *does* get RW — and this is the
-    substrate for future RW kaibo tasks (the arc image-gen → image2image → … already
-    traces it).
-  - **Longest-prefix routing makes nested RW-in-ro a feature**, not a footgun:
-    `~/src/$repo/scratch` RW inside the `~/src/$repo` ro project routes correctly —
-    the scratch subtree writable, the rest of the repo ro (it's already how
-    `VfsRouter` resolves `/` MemoryFs vs. the project mount). The hard safety
-    invariant is **canonicalize-before-route** (resolve `..`/symlinks *then*
-    longest-match): `scratch/../secret` and a symlink in `scratch/` → out-of-subtree
-    both canonicalize onto the ro project mount and the write is refused. Failing-first
-    write-escape test mirrors the read-escape battery; confirm kaish's VFS
-    canonicalizes-then-routes for *write* ops, not just reads.
-  - **No byte budget on real-FS mounts** — the filesystem is the backstop (its own
-    limits; tmpfs its own size); kaibo reimplementing quota would be worse (blind to
-    external/concurrent writers) and against the don't-fork-the-platform grain. ENOSPC
-    must surface as a *loud* kaish write error and we never deliver a truncated
-    artifact as valid (the delivery path sniffs MIME, so a half-written PNG fails
-    decode). The `/` `MemoryFs` scratch *keeps* its `ByteBudget` — RAM has no
-    filesystem to stop an OOM — so "RAM scratch bounded, real-FS mounts unbounded" is
-    a principled asymmetry; comment it in `sandbox.rs` so it isn't "unified" away.
-  - **Danger is surfaced, not policed — and lightly** (settled 2026-06-25 w/ Amy).
-    The consent is already in the *shape*: RW is off by default, every writable mount
-    is an explicitly-named path, and the user opted in by naming it. That's enough —
-    kaibo doesn't gate or grade breadth (no file-count heuristic, no graduated ack
-    flag, no refusal on a target choice; a broad mount like `~/src`, used to ask kaibo
-    to *code*, is the user's call). The only surfacing is a startup **warning** when a
-    resolved RW mount equals `/` (always) or `$HOME` (and even that lightly). Structural
-    load errors still stand — an empty `$VAR` segment refuses, since that's a malformed
-    path, not a target choice. `/configure` steers toward `$TMPDIR` /
-    `$XDG_CACHE_HOME/kaibo` as the good default without pushing back. Posture:
-    narrowly-scoped, tightly-controlled RW, surfaced not policed.
-  - **Prompt-injection note for the threat model:** consult-can-write means a consult
-    reading attacker-controlled repo content ("write X to /tmp/Y") can now *act* on
-    it — bounded to the named RW mount, can't escape or execute, can't touch the
-    project, but it's a real new instruction-following exposure to document honestly
-    when this lands.
-- **Delivery over MCP — DECIDED 2026-06-26 (w/ Amy):** a capability writes its
-  artifact to a kaibo-owned **out-dir** and returns the **absolute path as text** —
-  no inline base64 blob, no `ResourceLink`/resource-read channel. The resource path
-  was weighed and dropped: it'd add a `file://` `resources/read` surface that
-  bypasses project containment (its own hard-look review) for no win over a plain
-  path the calling agent opens with its own tools. The earlier "small inline,
-  large→`ResourceLink`" split retires with it.
-- **Capabilities are data on the `ModelShape` seam** — SHIPPED
-  2026-06-11: `ModelCaps` + the vision classifier (`consult.rs`), per-slot
-  `vision` pin in the role table, resolved caps at `kaibo://config`. The vision
-  half of the *consumption* shipped too (vision-in, see the Last pass): a vision
-  arm's toolset gains `view_image`. The `image` production role is now consumed too
-  (image-out, 2026-06-13): `generate_image` reads `slot(ModelRole::Image)` and is
-  refused honestly off an unconfigured cast — no kernel-conditional builtin needed,
-  since it's a direct tool, not a builtin.
-- **Roles outgrow explorer/synth** — SHIPPED 2026-06-11: the role table
-  (explorer, synth, image, tts; `ModelRole`/`ModelSlot` in `config.rs`),
-  spelled `[casts.<name>]` since the backends/casts split shipped. The `image` slot
-  is now consumed by `generate_image`; `tts` stays a reserved seam pending rig
-  coverage. `consult`/`oneshot` are the agent costumes over `run_phase` (the old
-  `explore`/`synthesize` tools folded into them — see the surface-collapse below);
-  capabilities are their own tool shapes, never new loops.
+**Future input modalities — audio-in / STT (perception):** speech→text *is* part of the
+reasoning input stream, so it extends a slot's `ModelCaps`/`vision`-style pin — a new
+capability field, not a production role. Adopt rig's `TranscriptionModel` when coverage is
+sufficient (rig 0.38: openai-kind + Gemini; no Anthropic/DeepSeek), don't hand-roll a
+second wire path; it rides a small second client on the same base_url/key (the openai
+audio methods hang off `openai::Client`, kaibo builds `openai::CompletionsClient`). No
+sound devices in scope — file-in only.
 
-**Sequencing:** (0) the backends/casts split — SHIPPED 2026-06-11. (1) vision-in —
-SHIPPED 2026-06-11, path-only. (2) **image-out — SHIPPED 2026-06-13** as the
-`generate_image` capability tool, **artifact out-dir SHIPPED 2026-06-26**: it now
-writes the image to the kaibo-owned out-dir (`server.out_dir`, default
-`$XDG_CACHE_HOME/kaibo`) and hands back the path — the narrow *specific-tool* write the
-RW-mount deferral pointed at, never the broad `rw_paths` surface and not `consult`. The
-out-dir is mounted read-only into kaish for read-back (see the devlog 2026-06-26 entry
-for the design + the read-scope tradeoff). **Next:** the kaish-builtin/VFS *composition*
-path (image2image piped in a `run_kaish` script) is the **only** thing that would run a
-minutes-long model call *under the script clock* and revive the per-builtin-timeout
-problem; as long as capabilities stay handler-side MCP tools, it never arises — so that
-work was retired, not built (devlog 2026-06-26). If composition is ever revisited, the
-upstream timeout seam already exists (`ctx.patient(budget) -> PatientGuard`, kaish
-0.8.2+).
-
-**Open design points (for the production builtins):** session history records
-`[image: path, mime]` markers, not blobs; the input size cap is a `view_image` const
-today (`DEFAULT_MAX_IMAGE_BYTES`, 5 MiB) — promote to a `[sandbox]`/`[defaults]` knob
-if it bites. **Explicitly deferred:** inline/attach (non-file) image *input* (YAGNI —
-add when a genuinely-never-a-file pasted image comes up), search/code-exec tools,
-file-store/context-cache plays, batch synth (its P3 entry stands), any
-image-processing crate.
-
-**TTS/STT — PARKED pending rig provider coverage (decided 2026-06-13).** No sound
-devices in scope: file-in/file-out only (TTS writes an audio file, STT reads one and
-returns text — `stt` is the natural fit for a kaish builtin emitting text, no new
-delivery channel; TTS is the artifact path needing out-dir, an MCP tool like
-`generate_image` so the provider call is handler-side, not under the script clock).
-The blocker is rig, not kaibo's design. rig 0.38 *has* the traits
-(`AudioGenerationModel` = TTS, `TranscriptionModel` = STT) but coverage is uneven:
-- **TTS** — openai-kind only (also xai/azure/openrouter); **no Gemini, no Anthropic,
-  no DeepSeek**. So the obvious chimera "voice on Gemini" can't be driven through rig.
-- **STT** — openai-kind **and Gemini** (also hf/mistral/groq/azure); no Anthropic/DeepSeek.
-- Feasibility note for the adopter: rig's openai audio/transcription methods hang off
-  `openai::Client`, but kaibo builds `openai::CompletionsClient` (`consult.rs:637`) —
-  a second small client on the same base_url/key, not a blocker.
-
-Decision: **wait for rig to broaden coverage and adopt its traits wholesale**, rather
-than hand-roll Gemini's AUDIO-modality `generateContent` over raw HTTP now (a second
-non-rig wire path to maintain, against the one-primitive grain). Kept as ready seams:
-`ModelRole::Tts` still parses/resolves into a cast slot (annotated reserved in
-`config.rs`); `stt` isn't a role yet (add with the consumer). The shipped
-`config.example.toml` was scrubbed of the `tts` slot — the embedded template must not
-advertise a capability kaibo lacks; `docs/config.md`/`docs/casts.md` document the
-reserved roles honestly. **When this un-parks** (rig adds Gemini/Anthropic TTS, or
-openai-only TTS is judged enough): wire `tts` as a handler-side MCP capability (the
-`generate_image` shape — out-dir for the artifact, provider call bounded by the backend
-`request_timeout`, no script-clock involvement), add the `stt` role + builtin, restore
-the example slots.
+**TTS and any record/emit are output, so they don't return as roles.** TTS (text→audio) is
+a render, not perception; it leaves with image gen rather than parking as a reserved seam.
+If kaibo ever needs to record or emit, that's a deliberately-mediated tool — individually
+gated, its own narrow surface — never a production role or a general write path. None
+planned.
 
 ---
 
 ## P2 — Focused fixes & hardening
-
-### `write_artifact` follows a symlinked out-dir (low-severity arbitrary file drop)
-Surfaced by the Gemini review of the out-dir PR (2026-06-26). `generate_image::write_artifact`
-canonicalizes the out-dir before writing, so if the out-dir path is a symlink the artifact
-lands at the *resolved* target. In a world-shared temp an attacker could pre-plant
-`<tmp>/kaibo` → some dir and have kaibo drop a PNG there. It's a **write** nuisance, not the
-critical read-exfil (that's closed: read-back defaults off for the shared-temp fallback, see
-devlog 2026-06-26), and `unique_artifact_name` prevents overwriting an existing file — so the
-worst case is an unexpected file appearing in an attacker-chosen dir, not corruption or a
-leak. Hardening if it ever matters: refuse a symlinked out-dir component, or `O_NOFOLLOW` the
-final create. Low priority; the read side was the real hole.
 
 ### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
 `tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
@@ -469,40 +322,17 @@ on cast slots and are overridable per cast in `config.toml` (shipped;
 ### rig provider gaps we route around (tracked upstream limitations)
 `rig-core` is the wire layer for every provider; where it's thin, kaibo inherits the
 gap. We adapt rather than fork, but the cost is real — record it so we don't keep
-rediscovering it. Two live ones beyond the TTS coverage matrix (see the media-spine
+rediscovering it. One live one beyond the TTS coverage matrix (see the media-spine
 P1 entry):
 
-- **openai image gen drops `additional_params` — no SD knobs reachable.** rig 0.38's
-  `providers/openai/image_generation.rs::image_generation` hardcodes the request body
-  to `model`/`prompt`/`size` (+`response_format` for non-gpt-image) and **never
-  serializes the request's `additional_params`** — the field exists on
-  `ImageGenerationRequest` and the builder sets it, but this impl ignores it (the
-  completion path *does* merge it; the image path doesn't). So every Stable-Diffusion
-  knob — steps, cfg_scale, sampler/scheduler, seed, negative_prompt, clip-skip,
-  **LoRA weights** — is dropped before it leaves the process. Confirmed not a server
-  limit: a direct POST to lemonade's `/api/v1/images/generations` with
-  `steps`/`cfg_scale`/`seed`/`negative_prompt` returned an image (2026-06-13 probe) —
-  the wire honors extras, rig won't send them. *Exception:* sd-cpp-style LoRA via
-  `<lora:name:weight>` rides in the `prompt` string, which rig **does** send, so that
-  subset may already work (unconfirmed — needs a differential probe). **Landmine:**
-  don't add a `params`/`negative_prompt` arg to `generate_image` until the wire
-  carries it — accepting a knob rig silently drops is exactly the silent fallback we
-  refuse. Fix path: upstream a one-spot merge of `additional_params` into the images
-  body (small, obviously-correct), then expose params as a per-call arg + per-slot
-  defaults (the `ModelShape`/tunables shape); **not** a hand-rolled images POST (a
-  second non-rig wire path, the TTS lesson). Until then, `generate_image` is
-  prompt-only by design, not omission.
 - **Gemini support is thin — text in, little else.** rig 0.38's gemini provider is
   `Completion` + `Embeddings` + `Transcription` (STT) + `ModelListing` only:
-  `client.rs` declares `type ImageGeneration = Nothing` and `type AudioGeneration =
-  Nothing` for *both* the standard and interactions-API clients. So Gemini — a richly
-  multimodal family — reaches kaibo as essentially a text/vision-in completion
-  backend; rig exposes none of its image gen (Imagen/"nano-banana"), TTS, context
-  caching, file stores, or search/code-exec grounding (all of which the `gpal` MCP
-  sibling drives directly). This is why the example casts carry commented-out
-  `gemini/...image` ids as TODOs that can't yet land, and why "voice on Gemini" parked
-  with TTS. Track rig's gemini coverage; adopt its traits when they broaden rather
-  than hand-rolling Gemini's `generateContent` media modalities over raw HTTP.
+  `client.rs` declares `type AudioGeneration = Nothing` for both clients, so Gemini
+  — a richly multimodal family — reaches kaibo as a text/vision-in completion backend;
+  rig exposes none of its TTS, context caching, file stores, or search/code-exec
+  grounding (all of which the `gpal` MCP sibling drives directly). This is why "voice
+  on Gemini" is parked with TTS. Track rig's gemini coverage; adopt its traits when
+  they broaden rather than hand-rolling media modalities over raw HTTP.
 
 ### Per-model request shaping (`ModelShape`): remaining knobs
 `ModelShape` (`consult.rs`) resolves request params per (kind, model), fit per

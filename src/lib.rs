@@ -1,20 +1,17 @@
 //! kaibo (解剖) — an assistant agent *for other agents*.
 //!
-//! kaibo augments a calling agent (Claude, etc.) with a team of models, lending two
-//! distinct kinds of help over MCP:
+//! kaibo augments a calling agent (Claude, etc.) with a team of models, lending one
+//! kind of help over MCP: **consultation** — grounded, cited answers about a codebase.
+//! A capable model reads precise spans and delegates broad sweeps to a cheap *explorer*
+//! sub-agent, all driving a read-only [`kaish`] kernel via `run_kaish(script)` (`cat`,
+//! `grep`, `find`, `jq`, pipelines, the lot). The `consult` and toolless `oneshot` tools
+//! are both costumes over one primitive, [`consult::run_phase`]. The team *perceives*
+//! what fuses into its reasoning (image input today, via `view_image`); it produces no
+//! output artifacts — kaibo reasons over code, it doesn't render or emit.
 //!
-//! - **Consultation** — grounded, cited answers about a codebase. A capable model
-//!   reads precise spans and delegates broad sweeps to a cheap *explorer* sub-agent,
-//!   all driving a read-only [`kaish`] kernel via `run_kaish(script)` (`cat`, `grep`,
-//!   `find`, `jq`, pipelines, the lot). The `consult` and toolless `oneshot`
-//!   tools are both costumes over one primitive, [`consult::run_phase`].
-//! - **Capabilities** — things the team can *do* and hand back as artifacts. The first
-//!   is image generation ([`image_gen`], the `generate_image` tool); more (TTS/STT, …)
-//!   follow as rig grows provider coverage. A capability is its own tool shape, not a
-//!   `run_phase` loop.
-//!
-//! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project
-//! but cannot mutate it, and cannot shell out to external commands.
+//! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project but
+//! cannot mutate it (read-only is *unconditional* — no write path of any kind), and
+//! cannot shell out to external commands.
 
 pub mod attach;
 pub mod batch;
@@ -23,8 +20,6 @@ pub mod consult;
 pub mod context;
 pub mod credentials;
 pub mod explorer;
-pub mod generate_image;
-pub mod image_gen;
 pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;

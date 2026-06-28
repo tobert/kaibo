@@ -27,14 +27,12 @@ async-trait = "0.1"
 anyhow = "1"
 
 # LLM providers + agent/tool loop. Native tools (no `rmcp` feature needed — kaibo
-# wraps kaish as an in-process rig Tool, not over MCP). The `image` feature
-# (zero extra deps) unlocks the openai-kind `ImageGenerationModel` behind the
-# `generate_image` capability tool; rig 0.38 has image gen for openai-kind only.
+# wraps kaish as an in-process rig Tool, not over MCP).
 # `default-features = false` drops rig's default `rustls` feature, which would
 # pull `reqwest/rustls` → the aws-lc-rs crypto provider (C + cmake, the one thing
 # that makes a static musl build painful). We re-add the other defaults rig needs
 # (`reqwest`, `derive`) and let TLS come from our own `rustls`+ring wiring below.
-rig-core = { version = "0.38", default-features = false, features = ["image", "reqwest", "derive"] }
+rig-core = { version = "0.38", default-features = false, features = ["reqwest", "derive"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider

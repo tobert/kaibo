@@ -14,6 +14,51 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-28 — Dropping image generation: kaibo perceives and reasons, it doesn't render
+
+A design conversation with Amy reversed the `generate_image` direction. The clean
+principle that fell out: **input modalities fuse into reasoning, output modalities are
+stateless transforms.** When a model takes an image (audio, later) as *input*, those
+bits land in the same context it reasons over — perception and cognition share one pass.
+That's `view_image` and image attachments on the consult tools, and it's core to what
+kaibo is. Image *generation* has no such fusion: prompt in, pixels out, no reasoning, no
+session — and `generate_image` as built used none of kaibo's differentiators (the
+read-only kaish sandbox, the cross-model code reasoning). It's a transform that happened
+to live in the same binary, a `gpal`/dedicated-MCP call away anyhow, and it billed every
+caller's context for its tool description every session.
+
+So the *capability class* itself — "run a model, hand a binary artifact back" — is the
+part that didn't fit. `generate_image` wasn't an unlucky first example; it was
+representative (TTS is the same shape). We're removing it and the whole binary-artifact
+**write path** it forced: the out-dir, `out_dir_readable`, the world-shared-temp fallback,
+the read-only out-dir mount, the allowed-set widening. The payoff is the invariant:
+**"read-only is the product" stops being a fenced exception and becomes unconditional** —
+kaibo writes *nothing*, anywhere, through kaish or handler-side.
+
+What we *kept open*, on Amy's framing: read-only is the floor, but a write isn't forbidden
+forever — it's just never a *general* path. If kaibo ever needs to record or emit
+something, that's a **specific, individually-mediated tool** with its own narrow surface,
+granted on purpose so we can mediate it. "We can give them as many tools as we want, and
+it's a safer, clearer surface for writes." None exists today. And future *input*
+modalities (audio-in) extend a slot's `ModelCaps`/`vision` pin — not a new production role.
+The cast role-model loses `image`/`tts` accordingly; `explorer`/`synth` + the `vision`
+capability stay.
+
+**Docs first, then the code — both in this PR.** The doc rewrite (AGENTS.md, README,
+`docs/config.md`, `docs/casts.md`, `config.example.toml`, sandbox-probes, CHANGELOG)
+recorded the direction first; the deletion followed in the same branch. Gone:
+`generate_image.rs`, `image_gen.rs` (the `ImageGen` seam), the out-dir machinery
+(`out_dir`/`out_dir_readable` config + parse + defaults + the `DefaultOutDir`
+shared-temp classifier, the sandbox mount, the allowed-set widening, the consult-attach
+`OutDirAttach` branches), the `ModelRole::Image`/`Tts` production roles, `image_capable_casts`,
+the `--out-dir`/`--no-out-dir-read`/`--no-generate-image` flags, and rig-core's `image`
+feature — ~1,200 lines net. The role model is now just `explorer`/`synth` + the `vision`
+pin. **The teeth:** `tests/no_write_path.rs` scans production `src/` and fails on any
+filesystem-mutating call outside `#[cfg(test)]` — it would have flagged the old
+`write_artifact` (`create_dir_all` + `fs::write`), and read-only is now *unconditional*.
+The 2026-06-26 out-dir entry and the 2026-06-13 `generate_image` entry below are now
+history — the feature they describe has been removed.
+
 ## 2026-06-26 — Artifact out-dir: `generate_image` writes a file, hands back the path
 
 The narrow *specific-tool* write the RW-mount deferral pointed at, now built.

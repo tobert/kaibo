@@ -5,8 +5,8 @@
 //! [`ProviderKind`] wire protocol plus base URL, key source, and request timeout)
 //! and a [`Cast`] (a *composition*: a named assignment of models to
 //! [`ModelRole`]s, freely spanning backends). Calls pick casts; backends are
-//! reachable only through a cast's slots. That indirection is what lets "deepseek
-//! explorer, claude synth, local image gen" be one named thing — the old fused
+//! reachable only through a cast's slots. That indirection is what lets "a cheap
+//! local deepseek explorer feeding a claude synth" be one named thing — the old fused
 //! `Profile` couldn't say it. See `docs/casts.md` (the contract for this split).
 //!
 //! ## Layering
@@ -125,42 +125,28 @@ impl Default for Defaults {
 
 // --- Roles ------------------------------------------------------------------
 
-/// The roles a cast's model slots can serve. Explorer and synth are the agent
-/// phases; the media roles (the pal-merge production models — see `docs/issues.md`
-/// "Media spine") are present only when configured: an absent slot means the
-/// capability is absent, not an error (the four interactive built-in casts carry
-/// explorer+synth; the batch built-ins carry synth only).
-///
-/// **`Tts` is a reserved, unwired seam.** It parses and resolves into a cast slot,
-/// but nothing consumes it — and won't until rig's provider coverage fills in: as
-/// of rig 0.38 `AudioGenerationModel` (TTS) exists only for openai-kind backends,
-/// not Gemini/Anthropic, so the natural chimera "voice on Gemini" can't be driven
-/// through rig today. `stt` (transcription) isn't even a role yet for the same
-/// reason — kept parked rather than hand-rolled, to be adopted wholesale when rig
-/// expands. (`Image` is in the same unconsumed state, tracked under the media
-/// spine.) See the "Media spine" entry in `docs/issues.md`.
+/// The roles a cast's model slots can serve: the two agent phases. Explorer does the
+/// fast sweeps; synth answers. There are no output/production roles — kaibo reasons
+/// over a codebase and renders nothing. Perception (image input, audio-in later) is a
+/// slot *capability* (`ModelCaps` / the `vision` pin), not a role. A cast may omit a
+/// role: an absent slot means the capability is absent, not an error (the four
+/// interactive built-in casts carry explorer+synth; the batch built-ins carry synth
+/// only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelRole {
     Explorer,
     Synth,
-    Image,
-    /// Reserved/unwired — no consumer until rig ships a usable TTS driver for the
-    /// backends a chimera wants (see the enum doc). Kept so a `tts = …` slot stays
-    /// valid config and the adoption seam is already in place.
-    Tts,
 }
 
 impl ModelRole {
     /// Every role, in table order — the source for "known roles" error text.
-    pub const ALL: [ModelRole; 4] = [Self::Explorer, Self::Synth, Self::Image, Self::Tts];
+    pub const ALL: [ModelRole; 2] = [Self::Explorer, Self::Synth];
 
     /// The role's config-table key (`[casts.<name>]`).
     pub fn key(self) -> &'static str {
         match self {
             Self::Explorer => "explorer",
             Self::Synth => "synth",
-            Self::Image => "image",
-            Self::Tts => "tts",
         }
     }
 }
@@ -537,33 +523,6 @@ pub struct Config {
     /// `--no-follow-worktrees`, `KAIBO_NO_FOLLOW_WORKTREES`, or
     /// `[server] follow_worktrees = false`) to keep the boundary strictly static.
     pub follow_worktrees: bool,
-    /// **The artifact out-dir — canonical reference for the whole feature.** Where
-    /// capability tools (`generate_image` today) write their output; default
-    /// `$XDG_CACHE_HOME/kaibo` (see [`DefaultOutDir`]), set via `--out-dir` /
-    /// `KAIBO_OUT_DIR` / `[server] out_dir`. The pieces elsewhere link here rather than
-    /// restate this:
-    ///
-    /// - **Write is handler-side `std::fs`, never through kaish** ([`crate::generate_image::write_artifact`]).
-    ///   So the four read-only sandbox levers are untouched — kaish still can't write
-    ///   anywhere; the out-dir is the *one* place kaibo writes, and only a capability tool
-    ///   does it.
-    /// - **Read-back is gated by [`out_dir_readable`](Self::out_dir_readable)** (default
-    ///   on). When on, the out-dir is mounted *read-only* into kaish
-    ///   ([`SandboxConfig::out_dir`], via `build_readonly_kernel_and_vfs`) **and** joined
-    ///   to the containment allowed-set (in [`crate::server`]), so a consult
-    ///   can read an artifact back and an out-dir path can be `attach`ed or targeted as a
-    ///   call `path`. This is the read-*scope* widening — bounded to the kaibo-owned dir,
-    ///   and a real exfil surface (a consult can ship what it reads to a model), which is
-    ///   why the dir is kaibo-owned and narrow, why `out_dir = "/"` is refused and `$HOME`
-    ///   warned, and why the untrusted shared-temp fallback defaults read-back *off* (see
-    ///   [`DefaultOutDir`]).
-    pub out_dir: PathBuf,
-    /// Gates the out-dir's whole *read* surface (mount + allowed-set) as one concept — see
-    /// [`out_dir`](Self::out_dir) for what that surface is and why. Default `true`
-    /// (`false` via `[server] out_dir_readable = false` / `KAIBO_NO_OUT_DIR_READABLE` /
-    /// `--no-out-dir-read`): kaibo still writes artifacts and returns their paths, but
-    /// never reads them back.
-    pub out_dir_readable: bool,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -739,41 +698,6 @@ impl Config {
                 CastUsability::Unconfigured => None,
                 usable => Some((name.clone(), usable)),
             })
-            .collect()
-    }
-
-    /// The casts that can actually serve `generate_image` *right now*: those carrying
-    /// an `image` slot on an OpenAI-compatible backend (the only kind rig 0.38 drives
-    /// for image generation) whose key resolves. This is the image-tool analogue of
-    /// [`usable_casts`](Self::usable_casts) — a deliberately *different* filter, because
-    /// `generate_image` selects the `image` slot, not explorer/synth: a cast with a
-    /// stranded explorer key but a working image slot belongs here (and a fully-keyed
-    /// cast with no image slot does not). Sorted by name (the `casts` `BTreeMap` order);
-    /// includes config.toml casts the static `cast` enum can't name. Env lookup injected
-    /// for testability, mirroring [`usable_casts`](Self::usable_casts).
-    pub fn image_capable_casts(&self, get_env: impl Fn(&str) -> Option<String>) -> Vec<String> {
-        self.casts
-            .iter()
-            .filter(|(_, cast)| {
-                // A batch cast is refused by `generate_image` (it staffs `batch_submit`
-                // only), so never advertise it here even if it carries an image slot —
-                // the menu must match the gate.
-                if cast.batch {
-                    return false;
-                }
-                let Some(slot) = cast.slot(ModelRole::Image) else {
-                    return false;
-                };
-                // Slot backend refs resolve at merge time; skip defensively rather than
-                // panic if that ever changes. Only openai-kind has a rig image path, and
-                // a Missing key means the slot can't reach a model — neither is usable.
-                let Ok(backend) = self.resolve_backend(&slot.backend) else {
-                    return false;
-                };
-                backend.kind == ProviderKind::Openai
-                    && !matches!(backend.key_status(&get_env), KeyStatus::Missing)
-            })
-            .map(|(name, _)| name.clone())
             .collect()
     }
 
@@ -1099,32 +1023,6 @@ impl Config {
             .map(|s| expand_path(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
-        // The artifact out-dir: expanded like root/allow_paths, else the default. An
-        // explicitly-named out_dir is the operator's call (trusted); the auto default is
-        // flagged when it fell back to a *world-shared* system temp (no XDG/HOME), so the
-        // read-back default below can withhold the mount there.
-        let (out_dir, default_shared_temp) = match server.out_dir.as_deref() {
-            Some(s) => (expand_path(s)?, false),
-            None => {
-                let d = default_out_dir_from(|k| std::env::var_os(k));
-                let shared = d.is_shared_temp();
-                (d.into_path(), shared)
-            }
-        };
-        // Refuse `/` outright: it would read-mount the whole host filesystem into kaish
-        // (the read-scope concern on `Config::out_dir`). Never a real artifact dir — a loud
-        // load error. ($HOME is the softer case, warned at startup in `main`, not refused.)
-        if out_dir.as_path() == std::path::Path::new("/") {
-            bail!(
-                "[server] out_dir resolves to `/` — refusing: the out-dir is mounted \
-                 read-only into kaish, so `/` would expose the whole host filesystem to a \
-                 consult. Point it at a kaibo-owned directory (default $XDG_CACHE_HOME/kaibo)."
-            );
-        }
-        // Read-back default: ON for a kaibo-owned dir, OFF for the untrusted shared-temp
-        // fallback (see [`DefaultOutDir::SharedTemp`] for why). An explicit
-        // `out_dir_readable` always wins.
-        let out_dir_readable = server.out_dir_readable.unwrap_or(!default_shared_temp);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
@@ -1133,11 +1031,6 @@ impl Config {
         // The ignore policy lives in its own `[kaish.ignore]` stanza (behavior, not
         // safety), but resolves onto the same struct the kernel builder consumes.
         sandbox.ignore = merge_kaish(raw.kaish.unwrap_or_default())?;
-        // Mirror the artifact out-dir onto the sandbox so the kernel builder mounts it
-        // read-only (the read-back seam — see `build_readonly_kernel_and_vfs`), but only
-        // when it's readable. The handler writes it via `std::fs` regardless; this mount
-        // only lets kaish *read* it back, so it's gated by `out_dir_readable`.
-        sandbox.out_dir = out_dir_readable.then(|| out_dir.clone());
         // A zero scratch budget rejects *every* write to the `/` MemoryFs — mktemp,
         // every redirect — which breaks normal explorer operation, so it's never a
         // real intent (there's no "unbounded" escape hatch by design: an unbounded
@@ -1155,8 +1048,6 @@ impl Config {
             root,
             allow_paths,
             follow_worktrees,
-            out_dir,
-            out_dir_readable,
             default_cast,
             log,
             tools,
@@ -1199,23 +1090,10 @@ impl Config {
         disable_follow_worktrees: bool,
         project_context_files: Vec<String>,
         user_context_files: Vec<PathBuf>,
-        out_dir: Option<PathBuf>,
-        disable_out_dir_read: bool,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
         }
-        // CLI out-dir / readability win. Like `--no-<tool>`, the CLI can only turn the
-        // read surface OFF, never force it on over a `[server] out_dir_readable = false`.
-        if let Some(out_dir) = out_dir {
-            self.out_dir = out_dir;
-        }
-        if disable_out_dir_read {
-            self.out_dir_readable = false;
-        }
-        // Re-derive the sandbox read-back mount mirror from the final out-dir + readability
-        // (the merge set it; a CLI override of either must keep them in lockstep).
-        self.sandbox.out_dir = self.out_dir_readable.then(|| self.out_dir.clone());
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
         // never force it on over a `[server] follow_worktrees = false` in the file.
         if disable_follow_worktrees {
@@ -1232,9 +1110,6 @@ impl Config {
         }
         if disable.run_kaish {
             self.tools.run_kaish = false;
-        }
-        if disable.generate_image {
-            self.tools.generate_image = false;
         }
         if disable.batch {
             self.tools.batch = false;
@@ -1264,7 +1139,6 @@ pub struct ToolDisables {
     pub consult: bool,
     pub oneshot: bool,
     pub run_kaish: bool,
-    pub generate_image: bool,
     pub batch: bool,
 }
 
@@ -1354,9 +1228,8 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
     ] {
         let name = kind.builtin_name().to_string();
         let (explorer, synth) = default_models(kind);
-        // Only the agent roles are seeded: a media role (image, tts) appears in
-        // the table only when a config asks for it — absent means the capability
-        // is absent, and nothing downstream errors on that.
+        // Both agent roles are seeded. A cast may omit one in config — absent means
+        // the capability is absent, and nothing downstream errors on that.
         let slots = BTreeMap::from([
             (ModelRole::Explorer, ModelSlot::bare(&name, explorer)),
             (ModelRole::Synth, ModelSlot::bare(&name, synth)),
@@ -1565,12 +1438,6 @@ struct RawServer {
     /// Follow git worktrees of an already-allowed repo. Default `true`. Env:
     /// `KAIBO_NO_FOLLOW_WORKTREES`. CLI: `--no-follow-worktrees`.
     follow_worktrees: Option<bool>,
-    /// Where capability tools write artifacts. Default `$XDG_CACHE_HOME/kaibo` (see
-    /// [`default_out_dir`]). Env: `KAIBO_OUT_DIR`. CLI: `--out-dir`. Expands `$VAR`/`~`.
-    out_dir: Option<String>,
-    /// Whether the out-dir joins kaibo's read surface (mount + allowed-set). Default
-    /// true. Env: `KAIBO_NO_OUT_DIR_READABLE`. CLI: `--no-out-dir-read`.
-    out_dir_readable: Option<bool>,
     /// The default cast (was `provider` before the backends/casts split; the old
     /// key is now an unknown-field load error via `deny_unknown_fields`).
     cast: Option<String>,
@@ -1584,7 +1451,6 @@ struct RawTools {
     consult: Option<bool>,
     oneshot: Option<bool>,
     run_kaish: Option<bool>,
-    generate_image: Option<bool>,
     batch: Option<bool>,
 }
 
@@ -1668,8 +1534,6 @@ struct RawCast {
     batch: Option<bool>,
     explorer: Option<RawSlot>,
     synth: Option<RawSlot>,
-    image: Option<RawSlot>,
-    tts: Option<RawSlot>,
 }
 
 impl RawCast {
@@ -1678,8 +1542,6 @@ impl RawCast {
         [
             (ModelRole::Explorer, &self.explorer),
             (ModelRole::Synth, &self.synth),
-            (ModelRole::Image, &self.image),
-            (ModelRole::Tts, &self.tts),
         ]
         .into_iter()
         .filter_map(|(role, slot)| slot.as_ref().map(|s| (role, s)))
@@ -1912,9 +1774,6 @@ fn merge_sandbox(raw: RawSandbox) -> SandboxConfig {
         disable_builtins: raw.disable_builtins.unwrap_or(d.disable_builtins),
         // Resolved separately from `[kaish.ignore]` and stitched in by `merge`.
         ignore: d.ignore,
-        // The artifact out-dir comes from `[server] out_dir` (not `[sandbox]`) and is
-        // mirrored on by `merge`; None here means "no read-back mount" until then.
-        out_dir: d.out_dir,
     }
 }
 
@@ -1950,7 +1809,6 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         consult: raw.consult.unwrap_or(d.consult),
         oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
-        generate_image: raw.generate_image.unwrap_or(d.generate_image),
         batch: raw.batch.unwrap_or(d.batch),
     }
 }
@@ -1995,12 +1853,6 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if env_flag(get, "KAIBO_NO_FOLLOW_WORKTREES") {
         server.follow_worktrees = Some(false);
     }
-    if let Some(v) = get("KAIBO_OUT_DIR") {
-        server.out_dir = Some(v);
-    }
-    if env_flag(get, "KAIBO_NO_OUT_DIR_READABLE") {
-        server.out_dir_readable = Some(false);
-    }
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);
     }
@@ -2016,9 +1868,6 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_RUN_KAISH") {
         tools.run_kaish = Some(false);
-    }
-    if env_flag(get, "KAIBO_NO_GENERATE_IMAGE") {
-        tools.generate_image = Some(false);
     }
     if env_flag(get, "KAIBO_NO_BATCH") {
         tools.batch = Some(false);
@@ -2159,58 +2008,6 @@ pub fn default_config_path() -> Option<PathBuf> {
             .join("kaibo")
             .join("config.toml")
     })
-}
-
-/// The default artifact out-dir, classified by how much kaibo can trust it — the
-/// distinction the read-back default keys off (see [`default_out_dir_from`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DefaultOutDir {
-    /// A kaibo-owned cache under `$XDG_CACHE_HOME` or `~/.cache` — a narrow, isolated dir
-    /// kaibo trusts enough to auto-mount read-only for read-back.
-    Cache(PathBuf),
-    /// A subdir of the shared system temp dir — the last resort when neither
-    /// `$XDG_CACHE_HOME` nor `$HOME` is set (a stripped container, a systemd unit). A
-    /// *world-shared* location: kaibo writes artifacts here but must **not** auto-grant
-    /// read-back (the kaish mount + allowed-set), because a pre-planted symlink in a
-    /// world-writable temp could redirect the read mount onto an attacker-chosen tree and
-    /// a consult could exfiltrate it. Read-back here is opt-in via an explicit `out_dir`.
-    SharedTemp(PathBuf),
-}
-
-impl DefaultOutDir {
-    /// The resolved path, regardless of trust class.
-    pub fn into_path(self) -> PathBuf {
-        match self {
-            Self::Cache(p) | Self::SharedTemp(p) => p,
-        }
-    }
-    /// True for the untrusted shared-temp fallback (no XDG/HOME).
-    pub fn is_shared_temp(&self) -> bool {
-        matches!(self, Self::SharedTemp(_))
-    }
-}
-
-/// Classify the default out-dir from an injected env getter — `$XDG_CACHE_HOME/kaibo`,
-/// else `~/.cache/kaibo`, else the shared-temp fallback `<temp>/kaibo`. The testable core
-/// of [`default_out_dir`]. *Always* resolves (unlike [`default_config_path`]) — a
-/// capability that writes an artifact must have a home even with `$HOME` unset — but the
-/// shared-temp last resort is tagged [`DefaultOutDir::SharedTemp`] so the caller can
-/// withhold read-back there (a kaibo-owned cache is safe to auto-mount; a world-shared
-/// temp is not). Durable (a cache, not auto-cleared) by design — artifacts persist.
-fn default_out_dir_from(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> DefaultOutDir {
-    if let Some(xdg) = get("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
-        return DefaultOutDir::Cache(PathBuf::from(xdg).join("kaibo"));
-    }
-    if let Some(home) = get("HOME").filter(|s| !s.is_empty()) {
-        return DefaultOutDir::Cache(PathBuf::from(home).join(".cache").join("kaibo"));
-    }
-    DefaultOutDir::SharedTemp(std::env::temp_dir().join("kaibo"))
-}
-
-/// The default artifact out-dir path (see [`default_out_dir_from`] for the trust
-/// classification the read-back default keys off).
-pub fn default_out_dir() -> PathBuf {
-    default_out_dir_from(|k| std::env::var_os(k)).into_path()
 }
 
 /// Expand a leading `~` or `~/...` to `$HOME`. Leaves every other path untouched —
@@ -2380,49 +2177,6 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- default_out_dir classification ---------------------------------------
-
-    /// The default out-dir is a trusted kaibo-owned cache when `$XDG_CACHE_HOME` or
-    /// `$HOME` is set, but the *untrusted shared-temp fallback* when neither is — the
-    /// distinction the read-back default keys off (no XDG/HOME ⇒ read-back defaults off,
-    /// so kaibo never auto-mounts a world-shared temp into kaish). Env is injected so the
-    /// no-HOME container case is deterministic without touching the real environment.
-    #[test]
-    fn default_out_dir_classifies_cache_vs_shared_temp() {
-        let xdg = default_out_dir_from(|k| (k == "XDG_CACHE_HOME").then(|| "/x/cache".into()));
-        assert_eq!(xdg, DefaultOutDir::Cache(PathBuf::from("/x/cache/kaibo")));
-        assert!(!xdg.is_shared_temp());
-
-        let home = default_out_dir_from(|k| (k == "HOME").then(|| "/home/me".into()));
-        assert_eq!(
-            home,
-            DefaultOutDir::Cache(PathBuf::from("/home/me/.cache/kaibo"))
-        );
-
-        // XDG wins over HOME when both are set.
-        let both = default_out_dir_from(|k| match k {
-            "XDG_CACHE_HOME" => Some("/x/cache".into()),
-            "HOME" => Some("/home/me".into()),
-            _ => None,
-        });
-        assert_eq!(both, DefaultOutDir::Cache(PathBuf::from("/x/cache/kaibo")));
-
-        // Neither set (a stripped container): the untrusted shared-temp fallback.
-        let none = default_out_dir_from(|_| None);
-        assert!(
-            none.is_shared_temp(),
-            "no XDG/HOME must classify as shared temp"
-        );
-        assert_eq!(none.into_path(), std::env::temp_dir().join("kaibo"));
-
-        // An empty value is treated as unset (no silent empty path segment).
-        let empty = default_out_dir_from(|k| (k == "XDG_CACHE_HOME").then(|| "".into()));
-        assert!(
-            empty.is_shared_temp(),
-            "an empty $XDG_CACHE_HOME is not a usable dir"
-        );
-    }
 
     // --- expand_tilde ---------------------------------------------------------
 
@@ -2898,44 +2652,6 @@ mod tests {
         );
     }
 
-    /// `image_capable_casts` is a *different* filter than `usable_casts`: it keeps only
-    /// casts whose `image` slot rides an openai backend with a resolvable key. A cast
-    /// with an openai image slot survives even with no env key (the local backend is
-    /// keyless); a cast whose image slot is on a non-openai backend is dropped (rig has
-    /// no image path there); a cast with no image slot at all never appears.
-    #[test]
-    fn image_capable_casts_keeps_only_openai_image_slots() {
-        let cfg = Config::from_toml_str(
-            r#"
-            [casts.art]
-            image = { backend = "openai-local", id = "sd-xl" }
-
-            [casts.wrongkind]
-            image = { backend = "anthropic", id = "imagen-ish" }
-
-            # A batch cast with an otherwise-valid openai image slot: `generate_image`
-            # refuses batch casts, so the menu must NOT advertise it.
-            [casts.batchart]
-            batch = true
-            synth = "gemini/gemini-pro-latest"
-            image = { backend = "openai-local", id = "sd-xl" }
-            "#,
-        )
-        .unwrap();
-        // No env key at all: the openai image cast still qualifies (keyless local),
-        // the anthropic-backed one is excluded by kind, the batch cast is excluded by
-        // lane (refused by the tool), and the built-in agent-only casts (no image slot)
-        // never appear.
-        assert_eq!(
-            cfg.image_capable_casts(|_| None),
-            vec!["art".to_string()],
-            "only the openai-backed, non-batch image cast is image-capable"
-        );
-        // An anthropic key in the env changes nothing — wrong kind stays excluded.
-        let with_key = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-test".to_string());
-        assert_eq!(cfg.image_capable_casts(with_key), vec!["art".to_string()]);
-    }
-
     /// The built-in aliases register at BOTH levels: `claude` resolves as a cast
     /// name AND as a backend ref inside a slot.
     #[test]
@@ -2975,35 +2691,25 @@ mod tests {
     fn a_chimera_cast_spans_backends_with_both_slot_forms() {
         let cfg = Config::from_toml_str(
             r#"
-            [backends.sd]
-            kind = "openai"
-            base_url = "http://localhost:7860/v1"
-            key_optional = true
-
             [casts.chimera]
             explorer = "deepseek/deepseek-v4-flash"
             synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
-            image = "sd/sdxl-turbo"
             "#,
         )
         .unwrap();
         let cast = cfg.resolve_cast("chimera").unwrap();
         let e = cast.require_slot(ModelRole::Explorer).unwrap();
         let s = cast.require_slot(ModelRole::Synth).unwrap();
-        let i = cast.require_slot(ModelRole::Image).unwrap();
         assert_eq!(e.qualified(), "deepseek/deepseek-v4-flash");
         assert_eq!(s.qualified(), "anthropic/claude-opus-4-8");
         assert_eq!(s.effort.as_deref(), Some("max"));
-        assert_eq!(i.qualified(), "sd/sdxl-turbo");
-        // No synth-less surprise: an omitted role is absent, not defaulted.
-        assert!(cast.slot(ModelRole::Tts).is_none());
         // Caps classify on the slot's backend kind: DeepSeek is blind, Anthropic sees.
         assert!(!cfg.slot_caps(e).unwrap().vision);
         assert!(cfg.slot_caps(s).unwrap().vision);
         // A vision pin on a generic openai slot overrides the classifier.
         let pinned = ModelSlot {
             vision: Some(true),
-            ..ModelSlot::bare("sd", "llava")
+            ..ModelSlot::bare("openai-local", "llava")
         };
         assert!(cfg.slot_caps(&pinned).unwrap().vision);
     }

@@ -10,15 +10,14 @@ its design record, updated where the implementation deliberately diverged.
 `Profile` fuses two selectors — *which wire/endpoint/key* and *which model
 serves which role*. That's the same enum-as-selector disease the original
 config work cured at the kind/profile level (`docs/config.md` "Why"), one
-floor up. Three symptoms surfaced it:
+floor up. Two symptoms surfaced it:
 
-1. **An anthropic profile can never have a voice.** Roles bind to a profile,
-   a profile is one `kind`, and Anthropic serves no tts/image model — so
-   "consult on Claude, speak via Gemini" had no spelling at all.
-2. **A chimera is inexpressible.** The real use case: deepseek explorer,
-   claude synth, local image gen, gemini tts — one composed thing selected by
-   one name. The fused profile can't say it.
-3. **The vocabulary confused its only user.** "Profile" meant *connection* in
+1. **A profile is one `kind`, so a team is locked to one family.** Roles bind to
+   a profile, and a profile is a single connection — so a *chimera* (a deepseek
+   explorer feeding a claude synth: cheap local sweeps, a hosted answer) had no
+   spelling at all. One composed team, two families, one name — the fused profile
+   can't say it.
+2. **The vocabulary confused its only user.** "Profile" meant *connection* in
    one position and *team* in another. When the words for a design make its
    author lose the thread, the design is wrong, not the author.
 
@@ -31,17 +30,15 @@ Three concepts, each owning exactly one idea:
 - **backend** — a connection: `kind` (the wire protocol — the closed
   `ProviderKind` enum, the one place "provider" still means something),
   `base_url`, key source, `request_timeout`. "How do I reach Gemini."
-- **role** — a job a model serves: `explorer`, `synth` (the agent phases),
-  `image`, `tts`, later `stt`/`video`/… (the production roles backing kaish
-  builtins). Perception is *not* a role — anything the agent must see
-  (img2txt, audio-in) is a capability (`ModelCaps`) of an agent slot, because
-  the only channel into model context is the rig tool-result envelope. See the
-  media-spine entry in `docs/issues.md` for the perception/production split.
-  **Status:** the production roles are reserved seams — nothing consumes
-  `image`/`tts` yet. `tts` (and `stt`) are parked pending rig provider coverage
-  (rig 0.38 has TTS for openai-kind only, no Gemini/Anthropic), to be adopted
-  when rig expands rather than hand-rolled. The Gemini-tts slot above is the
-  *motivating* example for why casts exist, not working config today.
+- **role** — a job a model serves: `explorer` and `synth`, the two agent
+  phases. There are no *output*/production roles — kaibo reasons over a codebase
+  and renders nothing, so image/tts-style "make an artifact" roles don't exist.
+  (Earlier drafts of this split reserved `image`/`tts` production seams; the
+  2026-06-28 decision to keep kaibo perception-and-reasoning-only removed them.)
+  Perception is *not* a role either — anything the agent must *see* (image input
+  today, audio-in later) is a capability (`ModelCaps`) of an agent slot, because
+  the only channel into model context is the rig request envelope. A slot carries
+  a `vision` pin where it reads images.
 - **cast** — a named assignment of models to roles, freely spanning backends.
   This is what the `cast` call param selects.
 
@@ -61,23 +58,20 @@ composition, compositions choose connections.
 #  Built-in alias names are reserved — `[backends.gemma]` would be a loud
 #  collision error, not a redefinition.)
 
-[backends.sd]                        # local image server, also openai-kind
+[backends.gpt]                       # a hosted OpenAI endpoint, alongside the local one
 kind = "openai"
-base_url = "http://localhost:7860/v1"
-key_optional = true
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
 
 # --- casts: role → "backend/model". `cast = "chimera"` selects the whole thing. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
-synth    = "claude/claude-sonnet-4-6"       # the voice that answers
-image    = "sd/sdxl-turbo"                  # image gen stays local
-# tts    = "gemini/gemini-2.5-flash-tts"    # the motivating role — RESERVED, see below
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — local/cheap family
+synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
 
 [casts.local-only]                          # privacy posture: nothing leaves the box
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
 synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
-image    = "sd/sdxl-turbo"
 
 # A slot needing capability pins or tunables takes the table form:
 # synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
@@ -96,9 +90,8 @@ Rules, in the loud-over-silent house style:
 - **Unknown backend in a slot → load error**, naming the known backends.
 - **A cast may omit roles.** Built-ins always carry explorer+synth; a user
   cast that omits one is valid config — the tool that needs the missing role
-  fails loudly *at call time*, naming the gap ("cast `tts-box` has no synth
-  slot"). Absent = capability absent, the same semantics media roles already
-  have.
+  fails loudly *at call time*, naming the gap ("cast `lite` has no synth
+  slot"). Absent = capability absent.
 - **`[profiles]` is deleted, not deprecated.** A config that still says
   `[profiles.x]` gets a load error pointing at this doc. Amy is the only
   user; git history is the record.
@@ -136,11 +129,9 @@ server.rs: resolve_cast("chimera")
 │    └─ Arm { client: rig(deepseek backend, lazy key), model,
 │             params: ModelShape(DeepSeek, model) + explorer effort/temp,
 │             caps: vision=false }
-├─ synth = "claude/claude-sonnet-4-6"
-│    └─ Arm { client: rig(anthropic backend), model, adaptive-thinking params,
-│             caps: vision=true → toolset gains view_image (when it lands) }
-├─ image = "sd/sdxl-turbo"      ─┐ not consult's business: production slots
-└─ tts   = "gemini/…-tts"       ─┘ become kaish builtins at kernel build
+└─ synth = "claude/claude-sonnet-4-6"
+     └─ Arm { client: rig(anthropic backend), model, adaptive-thinking params,
+              caps: vision=true → toolset gains view_image }
 
 consult(question, root, arms, cfg, session)
 └─ run_phase(synth_arm): loop over {run_kaish, explore′, view_image…}
@@ -149,14 +140,12 @@ consult(question, root, arms, cfg, session)
 ```
 
 `cast = "claude"` walks the identical pipeline with boring resolution: the
-built-in single-backend cast, both arms on one backend, no media builtins.
+built-in single-backend cast, both arms on one backend.
 
 - **`oneshot`**: one arm (the synth slot), no tools — trivially.
 - **`run_kaish`**: shipped *without* a `cast` arg (decided at implementation
-  time, overriding the draft here). It has no agent in the loop and no media
-  builtins exist yet for a cast's production slots to gate; the arg lands
-  with the media spine ("drive the tts with no model in the loop", the
-  pal-merge promise).
+  time, overriding the draft here). It has no agent in the loop, so there is no
+  slot to staff — a `cast` only matters when a model is being driven.
 - **Per-call overrides** (`explorer_model`/`synth_model`, with optional
   `explorer_backend`/`synth_backend` — `model`/`backend` on the single-arm
   tools): the model id rides *verbatim* and the backend is its own explicit
@@ -199,8 +188,9 @@ is provable with no network.
 ## What survives untouched
 
 `ModelRole`, `ModelSlot`, `ModelCaps`, `ModelShape`, `run_phase`, sessions,
-the sandbox, and path containment. The rewrite is the layer above them — the
-2026-06-11 media-spine foundations were built to carry over.
+the sandbox, and path containment. The rewrite is the layer above them. (`ModelRole`
+was later pruned of its production roles — `image`/`tts` — when image generation was
+dropped; see the devlog 2026-06-28 entry.)
 
 ## Build order / TDD seams
 

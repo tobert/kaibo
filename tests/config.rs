@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use kaibo::config::{
-    default_models, default_out_dir, parse_slot_ref, Backend, Config, ModelRole, ModelSlot,
-    ToolDisables,
+    default_models, parse_slot_ref, Backend, Config, ModelRole, ModelSlot, ToolDisables,
 };
 use kaibo::consult::ThinkingStyleOverride;
 use kaibo::credentials::{openai_base_url, ProviderKind, PLACEHOLDER_OPENAI_KEY};
@@ -184,43 +183,32 @@ fn file_declared_aliases_resolve_at_both_levels() {
 
 #[test]
 fn a_chimera_cast_spans_backends_with_both_slot_forms() {
-    // The use case the split exists for (docs/casts.md "Why"): deepseek explorer,
-    // claude synth, local image gen — one composed thing selected by one name.
+    // The use case the split exists for (docs/casts.md "Why"): a cheap local deepseek
+    // explorer feeding a claude synth — one composed thing selected by one name.
     let c = Config::from_toml_str(
         r#"
-        [backends.sd]
-        kind = "openai"
-        base_url = "http://localhost:7860/v1"
-        key_optional = true
-
         [casts.chimera]
         explorer = "deepseek/deepseek-v4-flash"
         synth = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
-        image = "sd/sdxl-turbo"
-        tts = "gemini/gemini-2.5-flash-tts"
         "#,
     )
     .unwrap();
     let cast = c.resolve_cast("chimera").unwrap();
     let e = cast.require_slot(ModelRole::Explorer).unwrap();
     let s = cast.require_slot(ModelRole::Synth).unwrap();
-    let i = cast.require_slot(ModelRole::Image).unwrap();
-    let t = cast.require_slot(ModelRole::Tts).unwrap();
 
     // String form parses as backend/id; table form carries its tunables.
     assert_eq!(e.qualified(), "deepseek/deepseek-v4-flash");
     assert_eq!(s.qualified(), "anthropic/claude-opus-4-8");
     assert_eq!(s.effort.as_deref(), Some("max"));
     assert_eq!(s.max_tokens, Some(32768));
-    assert_eq!(i.qualified(), "sd/sdxl-turbo");
-    assert_eq!(t.qualified(), "gemini/gemini-2.5-flash-tts");
 
-    // Four slots, four different backends — the fused profile could never say this.
-    let backends: std::collections::BTreeSet<&str> = [e, s, i, t]
+    // Two slots, two different backends — the fused profile could never say this.
+    let backends: std::collections::BTreeSet<&str> = [e, s]
         .iter()
         .map(|slot| slot.backend.as_str())
         .collect();
-    assert_eq!(backends.len(), 4, "every role on its own backend");
+    assert_eq!(backends.len(), 2, "each role on its own backend");
 }
 
 #[test]
@@ -275,16 +263,21 @@ fn a_file_cast_stanza_merges_role_wise_over_a_builtin() {
 }
 
 #[test]
-fn media_roles_are_absent_until_configured() {
-    // Absent = capability absent, not an error (docs/casts.md): built-in casts
-    // carry only the agent roles, and require_slot names the gap loudly.
-    let c = Config::builtin();
-    let cast = c.resolve_cast("anthropic").unwrap();
-    assert!(cast.slot(ModelRole::Image).is_none());
-    assert!(cast.slot(ModelRole::Tts).is_none());
-    let err = cast.require_slot(ModelRole::Tts).unwrap_err();
+fn an_omitted_role_is_absent_and_named_loudly() {
+    // Absent = capability absent, not an error (docs/casts.md): a cast may omit a
+    // role, and require_slot names the gap loudly at call time.
+    let c = Config::from_toml_str(
+        r#"
+        [casts.explore-only]
+        explorer = "deepseek/deepseek-v4-flash"
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("explore-only").unwrap();
+    assert!(cast.slot(ModelRole::Synth).is_none());
+    let err = cast.require_slot(ModelRole::Synth).unwrap_err();
     assert!(
-        format!("{err:#}").contains("has no tts slot"),
+        format!("{err:#}").contains("has no synth slot"),
         "got: {err:#}"
     );
 }
@@ -875,8 +868,6 @@ fn cli_cast_wins_over_env_and_file() {
         false,  // --no-follow-worktrees not passed
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
-        None,   // no --out-dir
-        false,  // out-dir stays readable
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -904,8 +895,6 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         false,
         vec![],
         vec![],
-        None,
-        false,
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1260,7 +1249,7 @@ fn the_shipped_example_config_parses() {
     let toml = include_str!("../docs/config.example.toml");
     let c = Config::from_toml_str(toml).expect("docs/config.example.toml must load");
     // Spot-check the headline example (docs/casts.md): the chimera cast spanning
-    // backends, with at least the agent roles plus a media role.
+    // backends with the two agent roles.
     let chimera = c
         .resolve_cast("chimera")
         .expect("the example defines [casts.chimera]");
@@ -1270,10 +1259,6 @@ fn the_shipped_example_config_parses() {
     assert_eq!(
         s.backend, "anthropic",
         "synth answers on anthropic (claude/… refs canonicalize)"
-    );
-    assert!(
-        chimera.slot(ModelRole::Image).is_some(),
-        "the example carries a media role"
     );
     assert_ne!(
         e.backend, s.backend,
@@ -1639,115 +1624,3 @@ fn a_zero_orientation_ceiling_is_a_loud_error() {
     );
 }
 
-/// The artifact out-dir layers like the rest of config — default < file < env < CLI —
-/// and the resolved value is mirrored onto the sandbox so the read-back mount tracks it.
-#[test]
-fn out_dir_layers_default_file_env_and_cli() {
-    use std::path::Path;
-
-    // Unset → the kaibo-owned XDG-cache default (same process, same env, so equal).
-    let c = Config::from_toml_str("").unwrap();
-    assert_eq!(
-        c.out_dir,
-        default_out_dir(),
-        "an unset out_dir falls back to the default, not empty"
-    );
-    assert_eq!(
-        c.sandbox.out_dir.as_deref(),
-        Some(c.out_dir.as_path()),
-        "the sandbox mirrors out_dir for the read-back mount"
-    );
-
-    // File: [server] out_dir wins over the default.
-    let c = Config::from_toml_str("[server]\nout_dir = \"/var/kaibo-art\"\n").unwrap();
-    assert_eq!(c.out_dir, Path::new("/var/kaibo-art"));
-
-    // Env: KAIBO_OUT_DIR beats the file.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, "[server]\nout_dir = \"/file/kaibo-art\"\n").unwrap();
-    let env: HashMap<&str, &str> = [("KAIBO_OUT_DIR", "/env/kaibo-art")].into_iter().collect();
-    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
-    assert_eq!(c.out_dir, Path::new("/env/kaibo-art"), "env beats file");
-
-    // CLI: --out-dir beats everything and updates the sandbox mirror too.
-    let mut c = Config::builtin();
-    c.apply_cli(
-        None,
-        None,
-        ToolDisables::default(),
-        vec![],
-        false,
-        vec![],
-        vec![],
-        Some("/cli/kaibo-art".into()),
-        false,
-    );
-    assert_eq!(c.out_dir, Path::new("/cli/kaibo-art"));
-    assert_eq!(
-        c.sandbox.out_dir.as_deref(),
-        Some(Path::new("/cli/kaibo-art")),
-        "CLI override updates the sandbox mirror so the mount tracks the final dir"
-    );
-}
-
-/// `out_dir_readable` (default true) gates the read-back mount mirror: off means the
-/// out-dir is not mounted into kaish, layering default < file < env < CLI like the rest.
-#[test]
-fn out_dir_readable_gates_the_mount_mirror() {
-    // Default on: the sandbox mirror is set so the kernel builder mounts it.
-    let c = Config::from_toml_str("").unwrap();
-    assert!(c.out_dir_readable);
-    assert_eq!(c.sandbox.out_dir.as_deref(), Some(c.out_dir.as_path()));
-
-    // File off: no mount mirror.
-    let c = Config::from_toml_str("[server]\nout_dir_readable = false\n").unwrap();
-    assert!(!c.out_dir_readable);
-    assert!(
-        c.sandbox.out_dir.is_none(),
-        "an unreadable out-dir is not mounted"
-    );
-
-    // Env off (KAIBO_NO_OUT_DIR_READABLE).
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, "").unwrap();
-    let env: HashMap<&str, &str> = [("KAIBO_NO_OUT_DIR_READABLE", "1")].into_iter().collect();
-    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
-    assert!(!c.out_dir_readable, "env disables readability");
-    assert!(c.sandbox.out_dir.is_none());
-
-    // CLI --no-out-dir-read disables it and clears the mirror.
-    let mut c = Config::builtin();
-    assert!(c.sandbox.out_dir.is_some(), "builtin default is readable");
-    c.apply_cli(
-        None,
-        None,
-        ToolDisables::default(),
-        vec![],
-        false,
-        vec![],
-        vec![],
-        None,
-        true,
-    );
-    assert!(!c.out_dir_readable);
-    assert!(
-        c.sandbox.out_dir.is_none(),
-        "CLI --no-out-dir-read clears the mount mirror"
-    );
-}
-
-/// `out_dir = "/"` is refused at load: the out-dir is mounted read-only into kaish, so
-/// `/` would expose the whole host filesystem to a consult. A loud error, not a silent
-/// host-wide read scope.
-#[test]
-fn out_dir_root_is_refused() {
-    let err = Config::from_toml_str("[server]\nout_dir = \"/\"\n")
-        .expect_err("out_dir = / must be a loud load error, not a host-wide read mount");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("out_dir") && msg.contains("/"),
-        "the refusal should name out_dir and `/`: {msg}"
-    );
-}
