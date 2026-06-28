@@ -234,12 +234,6 @@ base_url = "http://localhost:8080/v1"
 key_optional = true
 request_timeout_secs = 1800
 
-# A hosted OpenAI endpoint — another openai-kind connection alongside the local ones.
-[backends.gpt]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-
 # ---------------------------------------------------------------------------
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.

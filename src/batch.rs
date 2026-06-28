@@ -21,9 +21,8 @@
 //! model the hard question and waiting.
 //!
 //! **Per-provider HTTP seam.** rig-core has no batch path, so each provider is
-//! hand-rolled behind the [`BatchProvider`] trait — the same shape as the
-//! [`ImageGen`](crate::image_gen) seam (one trait, per-kind impls, honest refusal
-//! where absent). Two protocols ship: **Anthropic Message Batches** ([`AnthropicBatch`]),
+//! hand-rolled behind the [`BatchProvider`] trait (one trait, per-kind impls, honest
+//! refusal where absent). Two protocols ship: **Anthropic Message Batches** ([`AnthropicBatch`]),
 //! whose requests ride inline in one POST, and **Gemini batch** ([`GeminiBatch`]), whose
 //! inline requests nest under `input_config.requests` and whose results come back inline
 //! in the batch's long-running-operation object (no separate results URL). OpenAI batch
@@ -122,8 +121,7 @@ pub struct BatchListItem {
 
 /// A provider's batch lane: submit a fan-out, poll it, cancel it, list what's there.
 /// One method each, so the whole path is exercised offline against [`ScriptedBatch`]
-/// and the concrete provider is swappable as more batch backends land — the
-/// [`ImageGen`](crate::image_gen) discipline.
+/// and the concrete provider is swappable as more batch backends land.
 #[async_trait]
 pub trait BatchProvider: Send + Sync {
     /// Submit `items` (each answered under the shared `system` preamble) as one batch;
@@ -518,8 +516,7 @@ pub struct AnthropicBatch {
 impl AnthropicBatch {
     /// Refuse a non-Anthropic backend loudly: this slice has no batch path for the
     /// other protocols, so attaching one would only fail (or worse, no-op) at call
-    /// time. Honest absence beats a false promise — the [`ImageGen`](crate::image_gen)
-    /// posture.
+    /// time. Honest absence beats a false promise.
     fn require_anthropic(backend: &Backend) -> Result<()> {
         if backend.kind != ProviderKind::Anthropic {
             return Err(anyhow!(
@@ -1157,8 +1154,7 @@ fn unsupported(backend: &Backend) -> anyhow::Error {
 }
 
 /// Build a submit-capable provider from a resolved cast slot + backend, dispatching on the
-/// backend kind. An unsupported kind is refused honestly (the [`ImageGen`](crate::image_gen)
-/// posture).
+/// backend kind. An unsupported kind is refused honestly.
 pub fn submitter(
     backend: &Backend,
     slot: &ModelSlot,
@@ -1192,8 +1188,7 @@ mod test_double {
 
     /// A scripted [`BatchProvider`] for offline tests: records submits and replays a
     /// fixed sequence of poll outcomes (so a test can drive submit → pending → done
-    /// with no network) — the batch analogue of
-    /// [`ScriptedImageGen`](crate::image_gen::ScriptedImageGen).
+    /// with no network).
     pub struct ScriptedBatch {
         submit_id: String,
         polls: Mutex<std::collections::VecDeque<BatchPoll>>,
@@ -1585,7 +1580,7 @@ mod tests {
 
     /// The Anthropic provider refuses any non-Anthropic backend at construction — the
     /// belt-and-suspenders guard behind dispatch (which should never route one here).
-    /// Honest absence, the ImageGen posture. (Cross-kind *dispatch* refusal is covered by
+    /// Honest absence over a false promise. (Cross-kind *dispatch* refusal is covered by
     /// `dispatch_refuses_unsupported_kinds`.)
     #[test]
     fn anthropic_provider_refuses_non_anthropic() {

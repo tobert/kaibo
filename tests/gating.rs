@@ -12,12 +12,11 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// `batch` each carry a `*_submit` under their own flag; the collect verbs `get`/
 /// `cancel`/`list`/`wait` are *shared* — they manage both kinds of handle and stay
 /// advertised as long as either capability is on, so they belong to neither flag.
-const ALL_TOOLS: [&str; 10] = [
+const ALL_TOOLS: [&str; 9] = [
     "batch_submit",
     "cancel",
     "consult",
     "consult_submit",
-    "generate_image",
     "get",
     "list",
     "oneshot",
@@ -44,7 +43,7 @@ fn each_flag_removes_exactly_its_own_tools() {
     // `get`/`cancel`/`list` belong to neither flag alone — gating one capability leaves
     // them because the other still needs them — so they appear in no row's removed-set
     // and are covered by the "every other tool remains" check below.
-    let cases: [(&[&str], ToolGating); 5] = [
+    let cases: [(&[&str], ToolGating); 4] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
             // `get`/`cancel`/`list` stay (batch still uses them).
@@ -65,13 +64,6 @@ fn each_flag_removes_exactly_its_own_tools() {
             &["run_kaish"],
             ToolGating {
                 run_kaish: false,
-                ..Default::default()
-            },
-        ),
-        (
-            &["generate_image"],
-            ToolGating {
-                generate_image: false,
                 ..Default::default()
             },
         ),
@@ -155,7 +147,6 @@ fn all_disabled_is_detected() {
         consult: false,
         oneshot: false,
         run_kaish: false,
-        generate_image: false,
         batch: false,
     };
     assert!(none_on.all_disabled());
@@ -188,7 +179,6 @@ fn all_tools_disabled_refuses_to_start() {
             "--no-consult",
             "--no-oneshot",
             "--no-run-kaish",
-            "--no-generate-image",
             "--no-batch",
         ])
         .output()

@@ -59,22 +59,6 @@ planned.
 
 ## P2 — Focused fixes & hardening
 
-### Remove `generate_image` + out-dir CODE (docs landed on `drop-image-gen` first)
-CHANGELOG, sandbox-probes.md, issues.md, and AGENTS.md updated first on this branch.
-The code surface to remove:
-- `src/generate_image.rs`, `src/image_gen.rs`, `tests/image_gen_live.rs`
-- `server.rs`: `image_gen()` handler, `generate_image` tool registration, out-dir
-  allowed-set widening, `out_dir`/`out_dir_readable` on the server struct
-- `config.rs`: `out_dir`/`out_dir_readable` fields + parse + defaults + `KAIBO_OUT_DIR`
-  env; `ModelRole::Image` *and* `ModelRole::Tts` (both output/production roles — the
-  role model is now `explorer`/`synth` + the `vision` pin) + `image_capable_casts`
-- `main.rs`: `--out-dir`/`--no-out-dir-read`/`--no-generate-image` CLI flags
-- `sandbox.rs`: `out_dir_*` mount logic + allowed-set widening + `out_dir_readable` gate
-- `tests/sandbox.rs`: `out_dir_*` battery; `tests/containment.rs`: any out-dir tests
-
-Failing-first guard: a test proving no write path survives — confirm no
-`std::fs::write`/`create`/`File::create` is reachable from any MCP handler.
-
 ### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
 `tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
 the handler infers it as the default root. It fails intermittently (~1 in 5 full

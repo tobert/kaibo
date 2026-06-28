@@ -515,8 +515,6 @@ fn allow_paths_cli_replaces_env_and_file() {
         false,
         vec![],
         vec![],
-        None,
-        false,
     );
     assert_eq!(c.allow_paths.len(), 2);
     assert!(c
@@ -527,45 +525,6 @@ fn allow_paths_cli_replaces_env_and_file() {
         .allow_paths
         .iter()
         .any(|p| p == std::path::Path::new("/tmp/cli-b")));
-}
-
-/// A readable artifact out-dir joins the containment allowed-set, so an out-dir path can
-/// be `attach`ed (oneshot/batch) or targeted as a call `path` — matching the read-only
-/// kaish mount. Disabling readability keeps it out. The out-dir must already exist (it's
-/// pre-created at startup in `main`); here the tempdir stands in.
-#[test]
-fn readable_out_dir_joins_allowed_set() {
-    let root = tempdir().unwrap();
-    let out = tempfile::Builder::new()
-        .prefix("kaibo-out")
-        .tempdir()
-        .unwrap();
-    let out_canon = std::fs::canonicalize(out.path()).unwrap();
-
-    let mut config = Config::builtin();
-    config.root = Some(root.path().to_path_buf());
-    config.out_dir = out_canon.clone();
-    config.out_dir_readable = true;
-    config.sandbox.out_dir = Some(out_canon.clone());
-    let handler = KaiboHandler::new(config).expect("handler builds");
-    assert!(
-        handler.allowed_set().iter().any(|p| p == &out_canon),
-        "a readable out-dir must be in the allowed set: {:?}",
-        handler.allowed_set()
-    );
-
-    // Disabled: the out-dir stays out of the allowed set.
-    let mut config = Config::builtin();
-    config.root = Some(root.path().to_path_buf());
-    config.out_dir = out_canon.clone();
-    config.out_dir_readable = false;
-    config.sandbox.out_dir = None;
-    let handler = KaiboHandler::new(config).expect("handler builds");
-    assert!(
-        !handler.allowed_set().iter().any(|p| p == &out_canon),
-        "an unreadable out-dir must stay out of the allowed set: {:?}",
-        handler.allowed_set()
-    );
 }
 
 // --- worktree follow ----------------------------------------------------------

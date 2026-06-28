@@ -44,14 +44,20 @@ modalities (audio-in) extend a slot's `ModelCaps`/`vision` pin — not a new pro
 The cast role-model loses `image`/`tts` accordingly; `explorer`/`synth` + the `vision`
 capability stay.
 
-**Docs first, code to follow.** This entry lands with the doc rewrite (AGENTS.md, README,
-`docs/config.md`, `docs/casts.md`, `config.example.toml`, sandbox-probes, CHANGELOG) so the
-direction is recorded before the deletion. The ~850 lines of `generate_image`/out-dir code
-+ ~310 of scaffolding, the `ModelRole::Image`/`Tts` seams, and the gating flag come out
-next, behind a failing-first test that proves no write path survives (the handler does zero
-fs writes outside `#[cfg(test)]`). Tracked in `docs/issues.md`. The 2026-06-26 out-dir
-entry and the 2026-06-13 `generate_image` entry below are now history — the feature they
-describe is being removed.
+**Docs first, then the code — both in this PR.** The doc rewrite (AGENTS.md, README,
+`docs/config.md`, `docs/casts.md`, `config.example.toml`, sandbox-probes, CHANGELOG)
+recorded the direction first; the deletion followed in the same branch. Gone:
+`generate_image.rs`, `image_gen.rs` (the `ImageGen` seam), the out-dir machinery
+(`out_dir`/`out_dir_readable` config + parse + defaults + the `DefaultOutDir`
+shared-temp classifier, the sandbox mount, the allowed-set widening, the consult-attach
+`OutDirAttach` branches), the `ModelRole::Image`/`Tts` production roles, `image_capable_casts`,
+the `--out-dir`/`--no-out-dir-read`/`--no-generate-image` flags, and rig-core's `image`
+feature — ~1,200 lines net. The role model is now just `explorer`/`synth` + the `vision`
+pin. **The teeth:** `tests/no_write_path.rs` scans production `src/` and fails on any
+filesystem-mutating call outside `#[cfg(test)]` — it would have flagged the old
+`write_artifact` (`create_dir_all` + `fs::write`), and read-only is now *unconditional*.
+The 2026-06-26 out-dir entry and the 2026-06-13 `generate_image` entry below are now
+history — the feature they describe has been removed.
 
 ## 2026-06-26 — Artifact out-dir: `generate_image` writes a file, hands back the path
 
