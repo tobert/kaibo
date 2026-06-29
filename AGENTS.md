@@ -239,9 +239,10 @@ even for a one-line doc fix.
   `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
   re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
   `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
-- **kaish pin.** Currently `kaish-kernel = "0.9.0"`. The bump from `0.8.4` carried one
-  API break: the `mcp()` config constructors (`IgnoreConfig`/`OutputLimitConfig`/
-  `KernelConfig`) were renamed to `agent()` — same presets, just the embedder-facing
-  name. Adapted the three call sites in `sandbox.rs`; offline suite green, boundary
-  tests still have teeth. Keep this current per the **Working here** kaish-bump
-  discipline before cutting.
+- **kaish pin.** Currently `kaish-kernel = "0.10.0"`. The bump from `0.9.0` was
+  API-compatible — no kaibo call sites changed, identical builtin/tool set; under the
+  hood kaish gained bignum arithmetic (`num-bigint`) and a new regex engine
+  (`regex-bites`). Offline suite green (462 tests), boundary tests still have teeth.
+  The prior `0.8.4 → 0.9.0` step had renamed the `mcp()` config constructors
+  (`IgnoreConfig`/`OutputLimitConfig`/`KernelConfig`) to `agent()` in `sandbox.rs`.
+  Keep this current per the **Working here** kaish-bump discipline before cutting.
