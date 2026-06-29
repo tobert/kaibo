@@ -36,9 +36,8 @@ the git log. Each later release appends a new section at the top.
   as `consult`. Built for running several consults at once — a cross-model study submits
   one per `cast` and collects them all — or for not blocking on a long answer: submit, go
   do other work, collect later. Jobs are in-memory and live only for the server session
-  (no restart survival), evicted by capacity (LRU) — its own `[defaults] job_capacity` /
-  `KAIBO_JOB_CAPACITY` knob (default 64), separate from `session_capacity` because a held
-  job result is heavier than a session's Q&A pair. Replaces the pattern of
+  (no restart survival), evicted by capacity (LRU) via its own `[defaults] job_capacity` /
+  `KAIBO_JOB_CAPACITY` knob (default 64). Replaces the pattern of
   spawning a throwaway sub-agent just to hold a blocking `consult` open. On completion a
   job emits a soft notification on the MCP logging channel (a clue for a client watching
   the log stream) — advisory only, since no MCP primitive wakes the calling agent;

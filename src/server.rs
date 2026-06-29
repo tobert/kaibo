@@ -3626,6 +3626,56 @@ mod tests {
         assert!(empty.contains("Nothing new in 30s"), "clean empty: {empty}");
     }
 
+    #[test]
+    fn running_beat_renders_a_phrase_only_when_a_beat_exists() {
+        assert_eq!(running_beat(&None), "");
+        assert_eq!(
+            running_beat(&Some(("exploring: the sandbox".to_string(), 3))),
+            ", currently: exploring: the sandbox (step 3)"
+        );
+    }
+
+    #[test]
+    fn render_job_echoes_the_latest_beat_on_a_running_job() {
+        let text = |r: CallToolResult| {
+            r.content
+                .into_iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // A running job with a beat shows it inline; one without stays a bare status line.
+        let with_beat = render_job(
+            "job-1",
+            JobSnapshot {
+                state: JobState::Running,
+                label: "cast `x`".into(),
+                age: std::time::Duration::from_secs(12),
+                last_progress: Some(("exploring: where?".to_string(), 2)),
+            },
+        );
+        let out = text(with_beat);
+        assert!(out.contains("still running"), "status line: {out}");
+        assert!(
+            out.contains("currently: exploring: where? (step 2)"),
+            "echoes the latest beat: {out}"
+        );
+
+        let no_beat = render_job(
+            "job-2",
+            JobSnapshot {
+                state: JobState::Running,
+                label: "cast `x`".into(),
+                age: std::time::Duration::from_secs(1),
+                last_progress: None,
+            },
+        );
+        assert!(
+            !text(no_beat).contains("currently:"),
+            "no beat yet → no 'currently' phrase"
+        );
+    }
+
     fn batch_item(created_at: Option<&str>) -> crate::batch::BatchListItem {
         crate::batch::BatchListItem {
             provider_id: "id".into(),

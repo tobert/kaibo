@@ -112,17 +112,13 @@ impl ProgressSink for TracingSink {
     }
 }
 
-/// A [`ProgressSink`] that *remembers* the most recent beat while teeing each event on to
-/// an inner sink. Built for an async `consult` job: the job's progress streams to the
-/// caller through `wait` (the inner [`TracingSink`] → notification ring), but a caller who
-/// polls with `get` instead reads no stream — so the job also holds one of these and
-/// `get` echoes [`latest`](Self::latest), the same one-liner `wait` would show, inline in
-/// the "still running" line. A decorator, not a replacement: it records *and* forwards, so
-/// the `wait`/`mcp_log` view is unchanged.
-///
-/// The state is a tiny `Mutex` (last message + a beat count); `emit` is still sync and
-/// infallible — it computes the one-liner, stores it, and forwards — so it honors the
-/// "never block or fail on a progress hop" contract.
+/// A [`ProgressSink`] decorator that remembers the most recent beat while teeing each
+/// event to an inner sink. An async `consult` job streams its progress to the caller
+/// through `wait` (the inner [`TracingSink`] → notification ring); a caller polling with
+/// `get` reads no stream, so the job also holds one of these and `get` echoes
+/// [`latest`](Self::latest) inline. Records *and* forwards — the `wait`/`mcp_log` view is
+/// unchanged. State is a tiny `Mutex` (last message + beat count); `emit` stays sync and
+/// infallible per the [`ProgressSink`] contract.
 #[derive(Debug)]
 pub struct ProgressLog {
     inner: Arc<dyn ProgressSink>,
@@ -310,6 +306,26 @@ mod tests {
         assert_eq!(
             log.latest(),
             Some(("exploring: where is the sandbox?".to_string(), 2))
+        );
+    }
+
+    #[test]
+    fn progress_log_step_count_advances_on_a_repeated_event_kind() {
+        // The step count is the "forward motion" signal `get` shows, so it must advance on
+        // *every* beat — including two of the same kind in a row (two `KaishRun`s), where
+        // the message alone wouldn't tell a poller anything moved.
+        let log = ProgressLog::silent();
+        log.emit(PhaseEvent::KaishRun {
+            script: "cat -n a.rs".into(),
+        });
+        assert_eq!(log.latest(), Some(("running kaish: cat -n a.rs".to_string(), 1)));
+        log.emit(PhaseEvent::KaishRun {
+            script: "grep -rn foo .".into(),
+        });
+        assert_eq!(
+            log.latest(),
+            Some(("running kaish: grep -rn foo .".to_string(), 2)),
+            "a second beat of the same kind still advances the step count"
         );
     }
 
