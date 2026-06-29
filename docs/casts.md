@@ -41,10 +41,9 @@ Three concepts, each owning exactly one idea:
   a `vision` pin where it reads images.
 - **cast** — a named assignment of models to roles, freely spanning backends.
   This is what the `cast` call param selects. The name reaches the calling agent —
-  a usable cast is advertised both as a `cast`-param enum value and in the
-  consult/oneshot tool descriptions ("Casts ready now: …") — so a name like
-  `local-only` or `deep-dive` lets it route "have deepseek review this" off that
-  roster without reading the config.
+  a usable cast is advertised both as a `cast`-param enum value and in the tool
+  descriptions ("Casts ready now: …") — so a name like `local-only` or `deep-dive`
+  lets it route "have deepseek review this" off that roster without reading the config.
 
 **Selection rule:** calls pick casts; backends are reachable *only through* a
 cast's slots. That indirection is the whole cleanup — calls choose a

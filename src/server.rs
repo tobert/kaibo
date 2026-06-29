@@ -3876,6 +3876,85 @@ mod tests {
         );
     }
 
+    /// The roster split by lane lands in the prose too — the mirror of
+    /// `cast_enums_split_by_lane`: an interactive tool's description names the interactive
+    /// cast and never a batch cast, and `batch_submit`'s description names the batch cast
+    /// and never an interactive one, so the advertised prose can't tempt an agent toward a
+    /// cast that lane will refuse. Keyless local gemini backend so both lanes are usable
+    /// offline (without it the batch append hits the empty-guard and the split goes
+    /// untested).
+    #[test]
+    fn roster_splits_by_lane_in_descriptions() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.mybatch]
+            batch = true
+            synth = "gem/some-pro"
+
+            [casts.myinteractive]
+            explorer = "gem/some-lite"
+            synth = "gem/some-flash"
+            "#,
+        );
+        let desc_of = |tool: &str| -> String {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .description
+                .clone()
+                .unwrap_or_default()
+                .into_owned()
+        };
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let d = desc_of(tool);
+            assert!(
+                d.contains("myinteractive"),
+                "{tool} description should name the interactive cast, got:\n{d}"
+            );
+            assert!(
+                !d.contains("mybatch"),
+                "{tool} description must not name a batch cast, got:\n{d}"
+            );
+        }
+        let batch = desc_of("batch_submit");
+        assert!(
+            batch.contains("mybatch"),
+            "batch_submit description should name the batch cast, got:\n{batch}"
+        );
+        assert!(
+            !batch.contains("myinteractive"),
+            "batch_submit description must not name an interactive cast, got:\n{batch}"
+        );
+    }
+
+    /// `append_cast_roster` shares `inject_cast_enum`'s empty guard: an empty roster (no
+    /// cast can reach a model) leaves the description byte-for-byte untouched, so a
+    /// keyless-everything server never appends a vacuous "Casts ready now: ." to its tools.
+    #[test]
+    fn empty_roster_leaves_descriptions_unchanged() {
+        let mut router = KaiboHandler::tool_router();
+        let desc = |r: &ToolRouter<KaiboHandler>| -> String {
+            r.get("consult")
+                .expect("tool present")
+                .description
+                .clone()
+                .unwrap_or_default()
+                .into_owned()
+        };
+        let before = desc(&router);
+        append_cast_roster(&mut router, &["consult", "oneshot"], &[], "deepseek");
+        let after = desc(&router);
+        assert_eq!(before, after, "an empty roster must not alter the description");
+        assert!(
+            !after.contains("Casts ready now"),
+            "an empty roster must not append the roster line:\n{after}"
+        );
+    }
+
     /// A per-model slot `preamble` wins over the global `[prompts].<phase>`, and the
     /// synth slot feeds *both* capable-model phases (the `consult` driver and the
     /// toolless `oneshot`) — the "its own, even if a copy" shape: same value today,
