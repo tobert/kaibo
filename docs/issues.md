@@ -383,6 +383,26 @@ endpoint still surfaces as a mid-call error. A startup check (key presence + an
 teams up front — "cast `chimera` is degraded: backend `sd` unreachable" beats a
 mid-consult error. An MCP resource enumerating models could ride along.
 
+### `config.example.toml` clarity — illustrative stanzas read as required; `gpt` dual-name
+Surfaced by the cross-model review of the cast-roster change (an Anthropic `consult`
+cross-checking the example against `config.rs`, plus a deepseek/gemini/anthropic
+parse-back, 2026-06-29). Both are doc-clarity, not correctness — the example parses and
+all three families read it right otherwise — so they were left out of the roster PR:
+- **The four built-in backend stanzas are shown uncommented.** The
+  `[backends.anthropic/deepseek/gemini/openai-local]` block sits live even though the
+  preceding comment says they're illustrative and you only list a backend to *change*
+  something. An operator scanning the file may copy all four as if required — the
+  getting-started block and `[telemetry]` are commented-out for exactly this reason.
+  Comment them out (or collapse to one representative stanza). Care needed: the example's
+  casts resolve against these backends, so a wrong cut breaks
+  `tests/config.rs::the_shipped_example_config_parses` (which is the guard that makes the
+  pass safe).
+- **`gpt` names both `[backends.gpt]` and `[casts.gpt]`.** The namespaces are separate so
+  this is legal, but the file reserves *alias* names "at both levels" without saying a
+  *primary* name may be shared across the backend/cast namespaces — a reader can't tell the
+  co-naming is intentional vs. a latent collision. One clarifying clause near the
+  `[casts.<name>]` header settles it.
+
 ---
 
 ## P4 — Eventually

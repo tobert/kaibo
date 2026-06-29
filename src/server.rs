@@ -404,6 +404,43 @@ fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, tools: &[&str], casts
     }
 }
 
+/// Append the live cast roster to each named tool's `description` — the resident
+/// prose a host always shows, where `inject_cast_enum`'s param `enum` and the
+/// handshake list (which a host may truncate) don't reliably land. This is what
+/// lets an agent that hears "have deepseek review" index straight to a kaibo tool:
+/// the team names sit in the description text its tool-picker reads. The default
+/// cast is flagged so a bare call's team is legible. `casts` is the per-lane roster
+/// (same split as the enum), so the advertised menu matches what the tool accepts;
+/// skipped when empty, the same "no valid value" guard as the enum.
+fn append_cast_roster(
+    router: &mut ToolRouter<KaiboHandler>,
+    tools: &[&str],
+    casts: &[String],
+    default_cast: &str,
+) {
+    if casts.is_empty() {
+        return;
+    }
+    let menu = casts
+        .iter()
+        .map(|c| {
+            if c == default_cast {
+                format!("{c} (default)")
+            } else {
+                c.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    for name in tools {
+        let Some(route) = router.map.get_mut(*name) else {
+            continue;
+        };
+        let base = route.attr.description.as_deref().unwrap_or_default();
+        route.attr.description = Some(format!("{base} Casts ready now: {menu}.").into());
+    }
+}
+
 #[tool_router]
 impl KaiboHandler {
     /// Build the handler from a resolved [`Config`]. Snapshots the kernel's builtin
@@ -535,6 +572,21 @@ impl KaiboHandler {
             &interactive_usable,
         );
         inject_cast_enum(&mut tool_router, &["batch_submit"], &batch_usable);
+        // ...and name that same roster in the resident prose, so an agent that hears
+        // "have deepseek review" indexes to a kaibo tool from the description it always
+        // reads, not only the param enum the tool-picker may skim past.
+        append_cast_roster(
+            &mut tool_router,
+            &["consult", "consult_submit", "oneshot"],
+            &interactive_usable,
+            &config.default_cast,
+        );
+        append_cast_roster(
+            &mut tool_router,
+            &["batch_submit"],
+            &batch_usable,
+            &config.default_cast,
+        );
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
         // Async-consult jobs reuse the session capacity for now — both are diskless,
@@ -3648,6 +3700,46 @@ mod tests {
         }
     }
 
+    /// The live roster also lands in the *prose* description — the text a host always
+    /// shows and an agent's tool-picker actually skims — with the default cast flagged.
+    /// This is what lets "have deepseek review" index to a kaibo tool. Driven through a
+    /// keyless local gemini backend and an explicit default so the assertion holds
+    /// regardless of which API keys the test env carries.
+    #[test]
+    fn consultation_tools_name_the_live_roster_in_their_description() {
+        let h = handler_from_toml(
+            r#"
+            [server]
+            cast = "myinteractive"
+
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.myinteractive]
+            explorer = "gem/some-lite"
+            synth = "gem/some-flash"
+            "#,
+        );
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let desc = h
+                .tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .description
+                .clone()
+                .unwrap_or_default();
+            assert!(
+                desc.contains("Casts ready now:"),
+                "{tool}: description should carry the live roster, got:\n{desc}"
+            );
+            assert!(
+                desc.contains("myinteractive (default)"),
+                "{tool}: description should flag the default cast, got:\n{desc}"
+            );
+        }
+    }
+
     /// The cast roster splits by lane on the advertised `cast` enums: the interactive
     /// tools list non-batch casts, `batch_submit` lists batch casts — so an agent reading
     /// the schema never offers a cast the tool will refuse. Driven through a keyless local
@@ -3781,6 +3873,85 @@ mod tests {
                 .and_then(|c| c.get("enum"))
                 .is_none(),
             "an empty roster must not stamp an enum:\n{schema:#?}"
+        );
+    }
+
+    /// The roster split by lane lands in the prose too — the mirror of
+    /// `cast_enums_split_by_lane`: an interactive tool's description names the interactive
+    /// cast and never a batch cast, and `batch_submit`'s description names the batch cast
+    /// and never an interactive one, so the advertised prose can't tempt an agent toward a
+    /// cast that lane will refuse. Keyless local gemini backend so both lanes are usable
+    /// offline (without it the batch append hits the empty-guard and the split goes
+    /// untested).
+    #[test]
+    fn roster_splits_by_lane_in_descriptions() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.mybatch]
+            batch = true
+            synth = "gem/some-pro"
+
+            [casts.myinteractive]
+            explorer = "gem/some-lite"
+            synth = "gem/some-flash"
+            "#,
+        );
+        let desc_of = |tool: &str| -> String {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .description
+                .clone()
+                .unwrap_or_default()
+                .into_owned()
+        };
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let d = desc_of(tool);
+            assert!(
+                d.contains("myinteractive"),
+                "{tool} description should name the interactive cast, got:\n{d}"
+            );
+            assert!(
+                !d.contains("mybatch"),
+                "{tool} description must not name a batch cast, got:\n{d}"
+            );
+        }
+        let batch = desc_of("batch_submit");
+        assert!(
+            batch.contains("mybatch"),
+            "batch_submit description should name the batch cast, got:\n{batch}"
+        );
+        assert!(
+            !batch.contains("myinteractive"),
+            "batch_submit description must not name an interactive cast, got:\n{batch}"
+        );
+    }
+
+    /// `append_cast_roster` shares `inject_cast_enum`'s empty guard: an empty roster (no
+    /// cast can reach a model) leaves the description byte-for-byte untouched, so a
+    /// keyless-everything server never appends a vacuous "Casts ready now: ." to its tools.
+    #[test]
+    fn empty_roster_leaves_descriptions_unchanged() {
+        let mut router = KaiboHandler::tool_router();
+        let desc = |r: &ToolRouter<KaiboHandler>| -> String {
+            r.get("consult")
+                .expect("tool present")
+                .description
+                .clone()
+                .unwrap_or_default()
+                .into_owned()
+        };
+        let before = desc(&router);
+        append_cast_roster(&mut router, &["consult", "oneshot"], &[], "deepseek");
+        let after = desc(&router);
+        assert_eq!(before, after, "an empty roster must not alter the description");
+        assert!(
+            !after.contains("Casts ready now"),
+            "an empty roster must not append the roster line:\n{after}"
         );
     }
 
