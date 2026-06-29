@@ -404,6 +404,43 @@ fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, tools: &[&str], casts
     }
 }
 
+/// Append the live cast roster to each named tool's `description` — the resident
+/// prose a host always shows, where `inject_cast_enum`'s param `enum` and the
+/// handshake list (which a host may truncate) don't reliably land. This is what
+/// lets an agent that hears "have deepseek review" index straight to a kaibo tool:
+/// the team names sit in the description text its tool-picker reads. The default
+/// cast is flagged so a bare call's team is legible. `casts` is the per-lane roster
+/// (same split as the enum), so the advertised menu matches what the tool accepts;
+/// skipped when empty, the same "no valid value" guard as the enum.
+fn append_cast_roster(
+    router: &mut ToolRouter<KaiboHandler>,
+    tools: &[&str],
+    casts: &[String],
+    default_cast: &str,
+) {
+    if casts.is_empty() {
+        return;
+    }
+    let menu = casts
+        .iter()
+        .map(|c| {
+            if c == default_cast {
+                format!("{c} (default)")
+            } else {
+                c.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    for name in tools {
+        let Some(route) = router.map.get_mut(*name) else {
+            continue;
+        };
+        let base = route.attr.description.as_deref().unwrap_or_default();
+        route.attr.description = Some(format!("{base} Casts ready now: {menu}.").into());
+    }
+}
+
 #[tool_router]
 impl KaiboHandler {
     /// Build the handler from a resolved [`Config`]. Snapshots the kernel's builtin
@@ -535,6 +572,21 @@ impl KaiboHandler {
             &interactive_usable,
         );
         inject_cast_enum(&mut tool_router, &["batch_submit"], &batch_usable);
+        // ...and name that same roster in the resident prose, so an agent that hears
+        // "have deepseek review" indexes to a kaibo tool from the description it always
+        // reads, not only the param enum the tool-picker may skim past.
+        append_cast_roster(
+            &mut tool_router,
+            &["consult", "consult_submit", "oneshot"],
+            &interactive_usable,
+            &config.default_cast,
+        );
+        append_cast_roster(
+            &mut tool_router,
+            &["batch_submit"],
+            &batch_usable,
+            &config.default_cast,
+        );
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
         // Async-consult jobs reuse the session capacity for now — both are diskless,
@@ -3644,6 +3696,46 @@ mod tests {
             assert!(
                 variants.iter().any(|v| v == "openai-local"),
                 "{tool}: cast enum should list the always-usable local cast, got {variants:?}"
+            );
+        }
+    }
+
+    /// The live roster also lands in the *prose* description — the text a host always
+    /// shows and an agent's tool-picker actually skims — with the default cast flagged.
+    /// This is what lets "have deepseek review" index to a kaibo tool. Driven through a
+    /// keyless local gemini backend and an explicit default so the assertion holds
+    /// regardless of which API keys the test env carries.
+    #[test]
+    fn consultation_tools_name_the_live_roster_in_their_description() {
+        let h = handler_from_toml(
+            r#"
+            [server]
+            cast = "myinteractive"
+
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.myinteractive]
+            explorer = "gem/some-lite"
+            synth = "gem/some-flash"
+            "#,
+        );
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let desc = h
+                .tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .description
+                .clone()
+                .unwrap_or_default();
+            assert!(
+                desc.contains("Casts ready now:"),
+                "{tool}: description should carry the live roster, got:\n{desc}"
+            );
+            assert!(
+                desc.contains("myinteractive (default)"),
+                "{tool}: description should flag the default cast, got:\n{desc}"
             );
         }
     }

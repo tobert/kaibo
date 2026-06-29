@@ -129,7 +129,9 @@ config has three concepts for configuring models:
 - **role** — a *job* a model does: `explorer` (fast sweeps) and `synth` (the voice that
   answers). A slot that reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
-  argument selects the ensemble.
+  argument selects the ensemble. The name is advertised to the *calling* agent — on the
+  `cast` param and in the tool descriptions ("Casts ready now: …") — so a meaningful name
+  (`local-only`, `deep-dive`) lets it pick one by intent without reading your config.
 
 ```toml
 # ~/.config/kaibo/config.toml

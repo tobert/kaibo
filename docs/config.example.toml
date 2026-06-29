@@ -238,6 +238,12 @@ request_timeout_secs = 1800
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
 #
+# The name reaches the calling model: a usable cast is advertised on the `cast`
+# param (a schema enum) and in the consult/oneshot tool descriptions ("Casts ready
+# now: chimera, local-only, …", default flagged). So an agent told "have chimera
+# review this" picks it without reading the config — name for intent (`local-only`,
+# `deep-dive`), not `cast2`.
+#
 # Roles: explorer, synth (the agent phases). There are no output/production roles —
 # kaibo reasons over code and renders nothing. A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
