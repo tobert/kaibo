@@ -223,9 +223,15 @@ async fn omitted_path_zero_config_infers_cwd_as_default_root() {
     let config = Config::builtin(); // no root, no allow_paths -> cwd inferred
     let handler = KaiboHandler::new(config).expect("handler builds");
 
+    // Read a *single, known* file at the crate root rather than enumerating the
+    // directory: this proves the omitted path resolved to the inferred cwd without
+    // a full `ls`, whose per-entry stat hard-fails if any *sibling* vanishes mid-list
+    // (a `target/` build artifact under a parallel `cargo test`, say) — an upstream
+    // kaish-vfs `list` TOCTOU that made the old `ls` form flaky. `cat` of one path
+    // does no directory walk, so it's immune to that churn.
     let out = handler
         .run_kaish(Parameters(RunKaishInput {
-            script: "ls".to_string(),
+            script: "cat -n Cargo.toml".to_string(),
             path: None,
         }))
         .await
@@ -236,10 +242,11 @@ async fn omitted_path_zero_config_infers_cwd_as_default_root() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // `ls` at the crate root (the test process cwd) lists real files.
+    // The crate's own `Cargo.toml` names the package — a stable marker that the
+    // inferred root is *this* crate, not an empty mount.
     assert!(
-        out.contains("Cargo.toml"),
-        "inferred-cwd call should list the crate root, got: {out}"
+        out.contains("name = \"kaibo\""),
+        "inferred-cwd call should read the crate's Cargo.toml, got: {out}"
     );
 
     // The handler must expose the inferred default root, and mark it inferred.

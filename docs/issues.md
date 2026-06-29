@@ -59,14 +59,21 @@ planned.
 
 ## P2 — Focused fixes & hardening
 
-### Flaky: `omitted_path_zero_config_infers_cwd_as_default_root` (cwd race)
-`tests/containment.rs:222` reads the process-wide `std::env::current_dir()` and asserts
-the handler infers it as the default root. It fails intermittently (~1 in 5 full
-`cargo test` runs) and passes in isolation and on re-run — a parallel-execution race on
-the shared process cwd, not a logic bug (untouched by the async-consult work). Fix is to
-make the test not depend on the ambient cwd — drive it through an explicit root/config
-fixture, or serialize the cwd-reading tests. Low priority; it's a test-quality issue, the
-boundary itself is sound.
+### Upstream kaish-vfs: `LocalFs::list` hard-fails when an entry vanishes mid-walk
+`kaish-vfs` `LocalFs::list` (`src/local.rs`, 0.9.0) enumerates a directory with
+`read_dir`, then calls `symlink_metadata` on *each* entry and propagates any error with
+`?` — so if a single sibling is unlinked between the enumeration and its per-entry stat,
+the **whole** listing fails with `os error 2` (surfaced as `ls: .: not found`). This is a
+real product gap kaibo inherits: a `consult` that lists a *live* repo (a running build
+churning `target/`, `node_modules`, editor temp files) can spuriously fail an `ls`/`grep`/
+`find`. It's also what made `omitted_path_zero_config_infers_cwd_as_default_root` flaky
+(~1 in 5 full `cargo test` runs) — the test enumerated the crate root while a parallel
+`cargo test` churned `target/`. The kaibo-side symptom is **fixed**: that test now reads a
+single known file (`cat -n Cargo.toml`) instead of enumerating, so it does no directory
+walk (`tests/containment.rs`). The real fix is upstream — `list` should skip (or tolerate)
+an entry that disappears between `read_dir` and `symlink_metadata`, the way `ls(1)` does,
+rather than aborting the listing. Amy co-develops kaish, so this is a direct contribution,
+not a route-around; track it for the next `kaish-vfs` bump.
 
 
 ### Async consult (`consult_submit` + shared `get`/`cancel`/`list`) — follow-ups
@@ -423,14 +430,3 @@ Both reuse the same off-by-default `[telemetry]` gate and endpoint; the open
 question is whether the content/cost of a logs signal is worth it given traces
 already carry the prompts/completions. The session's `otlp-mcp` collector is the
 sink for a probe.
-
-
-### Flaky: `containment::omitted_path_zero_config_infers_cwd_as_default_root`
-Failed once under a full `cargo test`, passed in isolation and on the next full run.
-The test reads process-global `current_dir()`; containment.rs has two cwd-reading
-tests and the harness runs a binary's tests on parallel threads, so a cwd-sensitive
-assert can race. Not tied to any one feature (the batch-cast work that surfaced it
-touches no root logic). Fix candidates: serialize the cwd-reading tests (a shared
-mutex / `serial_test`), or have the test assert against an explicit root rather than
-the ambient cwd. Cross-reference [[tracing-callsite-interest-poisoning]] — same
-"global state shared across a binary's tests" failure class.

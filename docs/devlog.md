@@ -14,6 +14,36 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-29 — A "flaky test" was a real inherited robustness bug
+
+`omitted_path_zero_config_infers_cwd_as_default_root` failed ~1 in 5 full `cargo test`
+runs and the tracker had filed it twice (P2 + P4) as a "cwd race" — the hypothesis being
+that two cwd-reading containment tests race on the process-global `current_dir()`. That
+hypothesis was wrong, so I reproduced it (~10% under load) and instrumented the failure
+instead of trusting the note. The diagnostics killed the cwd theory outright: on a failing
+run `proc_cwd`, its canonical form, and `handler.default_root()` were *all* the correct
+crate root. The real symptom was `ls: .: not found: No such file or directory (os error
+2)` — a **real** ENOENT from a real syscall, not a logic error.
+
+Tracing it down through `KaishWorker` → `LocalBackend` → the `kaish-vfs` `LocalFs` mount
+landed on the contributing factor: `LocalFs::list` (`kaish-vfs/src/local.rs`, 0.9.0)
+`read_dir`s a directory, then calls `symlink_metadata` on *each* entry and `?`-propagates
+any error — so if a single sibling is unlinked between the enumeration and its per-entry
+stat, the **entire** listing fails. The test enumerated the *live* crate root while a
+parallel `cargo test` churned `target/`; one vanished artifact sank the whole `ls`. Only
+this test asserted `ls` *content* (others check exit status), so only it surfaced the
+flake.
+
+Contributing-factors, not root-cause: (a) the test enumerated a live, churning directory
+to prove cwd inference; (b) `kaish-vfs` `list` hard-fails on a vanished entry instead of
+skipping it the way `ls(1)` does. Fixed (a) in scope — the test now reads one known file
+(`cat -n Cargo.toml`, no directory walk) and asserts `name = "kaibo"`, still proving the
+omitted path resolved to *this* crate; 120/120 clean after. Recorded (b) as an upstream
+`kaish-vfs` item in `issues.md`: it's a genuine product gap (a `consult` listing a live
+repo with a running build / `node_modules` churn can spuriously fail), and since Amy
+co-develops kaish it's a direct contribution, not a route-around. Collapsed the duplicate
+tracker entries into that one upstream note.
+
 ## 2026-06-28 — Dropping image generation: kaibo perceives and reasons, it doesn't render
 
 A design conversation with Amy reversed the `generate_image` direction. The clean
