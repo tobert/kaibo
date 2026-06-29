@@ -16,7 +16,7 @@ Conventions:
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
 History of shipped work moved to `docs/devlog.md` (2026-06-18). Newest entry there:
-kaish-kernel 0.9.0.
+kaish-kernel 0.10.0.
 
 ---
 

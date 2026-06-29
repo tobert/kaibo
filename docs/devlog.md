@@ -14,6 +14,18 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-06-29 — kaish-kernel 0.10.0
+
+Bumped the published dep `0.9.0 → 0.10.0`. API-compatible this time — no kaibo call
+sites changed and the builtin/tool set is identical. Under the hood kaish gained bignum
+arithmetic (`num-bigint`) and swapped in a new regex engine (`regex-bites`); both are
+shell-engine internals that surface to a user only through `run_kaish`/`consult`, so
+there's no kaibo behavior we authored to record in the changelog (and 0.2.0 is the first
+tracked release anyway — no baseline to diff against). Offline suite green (462), TLS
+tree still C-free (`aws-lc-rs`/`aws-lc-sys`/`openssl-sys` all absent), boundary tests
+still have teeth. Per the kaish-bump discipline: adapt to the new shape, don't pin
+around it — nothing to adapt here.
+
 ## 2026-06-29 — A "flaky test" was a real inherited robustness bug
 
 `omitted_path_zero_config_infers_cwd_as_default_root` failed ~1 in 5 full `cargo test`
