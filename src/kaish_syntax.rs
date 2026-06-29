@@ -23,7 +23,7 @@ use kaish_kernel::help::{
 };
 use kaish_kernel::tools::ToolSchema;
 
-use crate::config::{CastUsability, Config};
+use crate::config::{CastUsability, Config, ModelRole};
 
 /// The kaibo-specific half of the core: the read-only boundary, the exit-code
 /// contract, the no-cwd rule, and the line-number idioms that make citations
@@ -208,17 +208,21 @@ fn setup_section(config: &Config) -> String {
 }
 
 /// The `## Casts` block: the casts that can reach a model *right now* (from
-/// [`Config::usable_casts`]), the default marked and a local/unverified one tagged.
-/// This is the handshake answering "what can I pass as `cast`?" truthfully — it
-/// names config.toml casts the static per-tool `cast` enum can't, and lists only
-/// what will actually work (an unconfigured cast is filtered upstream). It closes by
-/// pointing at `kaibo://config` as canonical for the full configured state, since
-/// this list is deliberately partial (usable-only) and read once at startup.
+/// [`Config::usable_casts`]), each line naming the cast's answering (synth) model —
+/// the team's voice, so an agent told "ask Gemini Pro" indexes the right cast — with
+/// the default marked, a local/unverified one tagged, and a batch-only cast tagged
+/// `batch` (it's the `batch_submit` lane). This is the handshake answering "what can I
+/// pass as `cast`?" truthfully — it names config.toml casts the static per-tool `cast`
+/// enum can't, and lists only what will actually work (an unconfigured cast is filtered
+/// upstream). It closes by pointing at `kaibo://config` as canonical for the full
+/// configured state, since this list is deliberately partial (usable-only) and read
+/// once at startup. The synth model lives on the resolved `Config` already (it's what
+/// `kaibo://config` prints) — this surfaces it where the calling agent first reads.
 ///
 /// Empty `usable` (no cast can reach a model) renders nothing — the `Unconfigured`
 /// setup banner already owns that case and would otherwise say it twice. Returns a
 /// trailing `\n\n` so the caller can splice it in unconditionally.
-fn casts_section(default_cast: &str, usable: &[(String, CastUsability)]) -> String {
+fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String {
     if usable.is_empty() {
         return String::new();
     }
@@ -226,16 +230,35 @@ fn casts_section(default_cast: &str, usable: &[(String, CastUsability)]) -> Stri
         .iter()
         .map(|(name, state)| {
             let mut tags = Vec::new();
-            if name == default_cast {
-                tags.push("default");
+            if name == &config.default_cast {
+                tags.push("default".to_string());
             }
             if matches!(state, CastUsability::LocalUnverified) {
-                tags.push("local, unverified");
+                tags.push("local, unverified".to_string());
             }
-            if tags.is_empty() {
-                format!("- `{name}`")
+            // A batch cast runs synth alone on the `batch_submit` lane (no explorer),
+            // so tag it: the agent learns which tool the cast belongs to, not just its
+            // name. `cast_is_batch` is the same predicate the per-lane enum split uses.
+            if config.cast_is_batch(name) {
+                tags.push("batch".to_string());
+            }
+            let suffix = if tags.is_empty() {
+                String::new()
             } else {
-                format!("- `{name}` ({})", tags.join(", "))
+                format!(" ({})", tags.join(", "))
+            };
+            // Name the answering (synth) model — the team's voice, the thing an agent
+            // told "ask Gemini Pro" indexes on. The data is already resolved on the
+            // Config (it's what `kaibo://config` prints); a cast with no synth slot
+            // (explorer-only) just renders its name. Resolution is structural, not
+            // key-gated, so it holds for every usable cast.
+            let synth = config.resolve_cast(name).ok().and_then(|cast| {
+                cast.slot(ModelRole::Synth)
+                    .map(|slot| format!("{}/{}", slot.backend, slot.id))
+            });
+            match synth {
+                Some(model) => format!("- `{name}`{suffix} → {model}"),
+                None => format!("- `{name}`{suffix}"),
             }
         })
         .collect::<Vec<_>>()
@@ -283,7 +306,7 @@ pub fn kaibo_instructions_with_scope(
     // roster, then the kaish onboarding spine. A caller's first decision is "which
     // team", so it precedes the syntax detail — and survives a host that truncates.
     let lead = kaibo_lead();
-    let casts = casts_section(&config.default_cast, usable_casts);
+    let casts = casts_section(config, usable_casts);
     let reference = kaish_reference(schemas);
 
     // Scope section: always accurate, never ambiguous. Report the *effective* default
@@ -576,6 +599,48 @@ mod tests {
         assert!(
             text.contains("canonical") && text.contains("kaibo://config"),
             "Casts section must point at kaibo://config as canonical:\n{text}"
+        );
+    }
+
+    /// Each roster line names the cast's **answering (synth) model**, so an agent told
+    /// "ask Gemini Pro" can index `gemini-batch → …/gemini-pro-latest` straight from the
+    /// handshake without re-reading `kaibo://config`. A batch cast (synth-only, a
+    /// different tool/lane) is tagged `batch` so the agent picks the right one. The data
+    /// is already on the resolved `Config` — this just renders it.
+    #[test]
+    fn casts_section_names_each_synth_model_and_tags_batch() {
+        let config = Config::builtin(); // built-in casts: anthropic, gemini-batch, …
+        let usable = vec![
+            ("anthropic".to_string(), CastUsability::Ready),
+            ("gemini-batch".to_string(), CastUsability::Ready),
+        ];
+        let text = kaibo_instructions_with_scope(
+            &[],
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::Ready,
+            &usable,
+        );
+        // The interactive cast names its synth (Claude Sonnet, the built-in anthropic synth).
+        assert!(
+            text.contains("anthropic/claude-sonnet-4-6"),
+            "roster must name the anthropic cast's synth model:\n{text}"
+        );
+        // The batch cast names Gemini Pro — the whole point: Pro is reachable only here.
+        assert!(
+            text.contains("gemini/gemini-pro-latest"),
+            "roster must name gemini-batch's synth (Gemini Pro):\n{text}"
+        );
+        // ...and the line is tagged `batch`, so the agent knows it's the batch_submit lane.
+        let pro_line = text
+            .lines()
+            .find(|l| l.contains("gemini-batch"))
+            .expect("gemini-batch has a roster line");
+        assert!(
+            pro_line.contains("batch"),
+            "the gemini-batch line must carry a batch tag:\n{pro_line}"
         );
     }
 

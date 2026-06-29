@@ -131,7 +131,10 @@ the git log. Each later release appends a new section at the top.
   param's enum and in the tool descriptions ("Casts ready now: …", with the default
   flagged) — so a host told "have deepseek review this" routes off the roster, and a
   meaningful name (`local-only`, `deep-dive`) reads as intent without the caller opening
-  your config.
+  your config. The startup handshake's `## Casts` roster goes further: each line names
+  the cast's **answering (synth) model** and tags a batch-only cast `batch`, so a host
+  told "ask Gemini Pro" indexes `gemini-batch → gemini/gemini-pro-latest (batch)` — and
+  knows it's the `batch_submit` lane — without reading `kaibo://config`.
 - **Guided setup.** A built-in `configure` MCP prompt walks your host agent through
   writing `config.toml`, alongside `kaibo://config` (resolved runtime state) and
   `kaibo://config/example` (annotated template) resources. Secrets are referenced by
