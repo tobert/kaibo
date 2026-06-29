@@ -210,6 +210,15 @@ the git log. Each later release appends a new section at the top.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
 
+### Fixed
+
+- **The advertised cast roster marks the default even when it's set by an alias.**
+  Setting `server.cast` (or `--cast` / `KAIBO_CAST`) to a cast *alias* — say `claude`
+  for `anthropic` — used to drop the `(default)` tag from the handshake's `## Casts`
+  roster and the tools' "Casts ready now" line, because the tag compared the raw string
+  against the canonical names kaibo advertises. The default is now resolved before
+  comparison, so the right cast is flagged however you named it.
+
 ### Security
 
 - **Read-only is structural, not best-effort.** kaibo compiles in only kaish's

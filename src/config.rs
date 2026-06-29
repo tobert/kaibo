@@ -641,6 +641,18 @@ impl Config {
         self.casts.get(name).is_some_and(|c| c.batch)
     }
 
+    /// Whether canonical cast `name` is the configured default — comparing against the
+    /// *resolved* default, so an alias default (`server.cast = "claude"`) still matches
+    /// its canonical cast (`anthropic`). The roster renderers (`casts_section`,
+    /// `append_cast_roster`) get canonical names from [`usable_casts`](Self::usable_casts),
+    /// so a bare `name == default_cast` string compare would silently drop the
+    /// `(default)` tag whenever the default was set by an alias. An unresolvable default
+    /// (can't happen post-load, validated there) reads as "nothing is default".
+    pub fn is_default_cast(&self, name: &str) -> bool {
+        self.resolve_cast(&self.default_cast)
+            .is_ok_and(|c| c.name == name)
+    }
+
     /// Resolve a backend by name or alias (the seam slot refs and per-call
     /// qualified overrides go through). An unknown name is a loud error naming
     /// the known backends.
@@ -2627,6 +2639,27 @@ mod tests {
         assert_eq!(
             cfg.cast_usability(cast, env),
             CastUsability::LocalUnverified
+        );
+    }
+
+    /// `is_default_cast` matches the canonical default *and* an alias default — the
+    /// roster's `(default)` tag depends on it, and an operator may set `server.cast` to
+    /// an alias. Compares against the resolved name, not the raw string.
+    #[test]
+    fn is_default_cast_matches_through_an_alias() {
+        let mut cfg = Config::builtin(); // `claude` is a built-in alias for `anthropic`
+        cfg.default_cast = "claude".to_string();
+        assert!(
+            cfg.is_default_cast("anthropic"),
+            "an alias default must match its canonical cast"
+        );
+        assert!(
+            !cfg.is_default_cast("claude"),
+            "the canonical name is what usable_casts yields and what we compare"
+        );
+        assert!(
+            !cfg.is_default_cast("deepseek"),
+            "a non-default cast must not be tagged default"
         );
     }
 

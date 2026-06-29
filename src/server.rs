@@ -416,7 +416,7 @@ fn append_cast_roster(
     router: &mut ToolRouter<KaiboHandler>,
     tools: &[&str],
     casts: &[String],
-    default_cast: &str,
+    config: &Config,
 ) {
     if casts.is_empty() {
         return;
@@ -424,7 +424,11 @@ fn append_cast_roster(
     let menu = casts
         .iter()
         .map(|c| {
-            if c == default_cast {
+            // Resolve before tagging: an alias default (`server.cast = "claude"`) must
+            // still flag its canonical cast — the same alias/default trap `casts_section`
+            // hit. `casts` holds canonical names, so `is_default_cast` compares like to
+            // like.
+            if config.is_default_cast(c) {
                 format!("{c} (default)")
             } else {
                 c.clone()
@@ -579,14 +583,9 @@ impl KaiboHandler {
             &mut tool_router,
             &["consult", "consult_submit", "oneshot"],
             &interactive_usable,
-            &config.default_cast,
+            &config,
         );
-        append_cast_roster(
-            &mut tool_router,
-            &["batch_submit"],
-            &batch_usable,
-            &config.default_cast,
-        );
+        append_cast_roster(&mut tool_router, &["batch_submit"], &batch_usable, &config);
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
         // Async-consult jobs get their own cap: a held job result (answer + optional
@@ -4017,7 +4016,7 @@ mod tests {
                 .into_owned()
         };
         let before = desc(&router);
-        append_cast_roster(&mut router, &["consult", "oneshot"], &[], "deepseek");
+        append_cast_roster(&mut router, &["consult", "oneshot"], &[], &Config::builtin());
         let after = desc(&router);
         assert_eq!(before, after, "an empty roster must not alter the description");
         assert!(

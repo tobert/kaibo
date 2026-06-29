@@ -230,7 +230,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
         .iter()
         .map(|(name, state)| {
             let mut tags = Vec::new();
-            if name == &config.default_cast {
+            if config.is_default_cast(name) {
                 tags.push("default".to_string());
             }
             if matches!(state, CastUsability::LocalUnverified) {
@@ -641,6 +641,64 @@ mod tests {
         assert!(
             pro_line.contains("batch"),
             "the gemini-batch line must carry a batch tag:\n{pro_line}"
+        );
+    }
+
+    /// The `(default)` tag survives a default cast set by *alias*. `usable_casts`
+    /// yields canonical names (`anthropic`), but an operator may write
+    /// `server.cast = "claude"` (an alias) — a raw `name == default_cast` would compare
+    /// `"anthropic" == "claude"`, miss, and silently drop the tag. The roster must
+    /// resolve the default before comparing. (Reviewer-found: the alias/default
+    /// equality bug, latent in the bare-string compare.)
+    #[test]
+    fn casts_section_marks_the_default_even_when_set_by_alias() {
+        let mut config = Config::builtin();
+        config.default_cast = "claude".to_string(); // alias → canonical `anthropic`
+        let usable = vec![("anthropic".to_string(), CastUsability::Ready)];
+        let text = kaibo_instructions_with_scope(
+            &[],
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::Ready,
+            &usable,
+        );
+        let line = text
+            .lines()
+            .find(|l| l.contains("anthropic"))
+            .expect("anthropic has a roster line");
+        assert!(
+            line.contains("(default)"),
+            "the canonical cast of an alias default must still be tagged default:\n{line}"
+        );
+    }
+
+    /// An explorer-only cast (no synth slot) renders its name with no `→ model` — the
+    /// handshake doesn't invent an answerer it can't name (the synth gap surfaces at
+    /// call time). Exercises the `None` arm DeepSeek flagged as uncovered.
+    #[test]
+    fn casts_section_renders_a_synthless_cast_as_name_only() {
+        let config = Config::builtin();
+        // A name absent from the registry resolves to no synth slot — the same render
+        // path a real explorer-only cast takes, without fabricating one in the config.
+        let usable = vec![("explorer-only".to_string(), CastUsability::Ready)];
+        let text = kaibo_instructions_with_scope(
+            &[],
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::Ready,
+            &usable,
+        );
+        let line = text
+            .lines()
+            .find(|l| l.contains("explorer-only"))
+            .expect("explorer-only has a roster line");
+        assert!(
+            !line.contains('→'),
+            "a cast with no synth slot must not render an arrow/model:\n{line}"
         );
     }
 
