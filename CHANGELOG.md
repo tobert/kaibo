@@ -36,7 +36,9 @@ the git log. Each later release appends a new section at the top.
   as `consult`. Built for running several consults at once — a cross-model study submits
   one per `cast` and collects them all — or for not blocking on a long answer: submit, go
   do other work, collect later. Jobs are in-memory and live only for the server session
-  (no restart survival), evicted by capacity like sessions. Replaces the pattern of
+  (no restart survival), evicted by capacity (LRU) — its own `[defaults] job_capacity` /
+  `KAIBO_JOB_CAPACITY` knob (default 64), separate from `session_capacity` because a held
+  job result is heavier than a session's Q&A pair. Replaces the pattern of
   spawning a throwaway sub-agent just to hold a blocking `consult` open. On completion a
   job emits a soft notification on the MCP logging channel (a clue for a client watching
   the log stream) — advisory only, since no MCP primitive wakes the calling agent;
@@ -105,7 +107,9 @@ the git log. Each later release appends a new section at the top.
 - **`get` / `cancel` / `list`** — one shared surface to collect, stop, and survey
   *both* kinds of async work, told apart by the handle: a batch handle is
   `backend/provider-id`, a consult job is `job-N`. `get <handle>` returns a progress/
-  status line while the work runs and the full result when it lands; `cancel <handle>`
+  status line while the work runs — for a consult job it echoes the latest investigation
+  beat (e.g. *currently: exploring …*) with a step count, the same one-liner `wait`
+  streams, so a poller sees forward motion — and the full result when it lands; `cancel <handle>`
   stops it; `list` shows everything in flight — your in-memory consult jobs plus the
   batches each backend still holds — each with a ready-to-use handle. One mental model
   for everything you submit. The verbs stay available as long as either `consult` or

@@ -1116,6 +1116,33 @@ fn zero_session_capacity_is_rejected_loudly() {
     );
 }
 
+#[test]
+fn job_capacity_defaults_overrides_from_file_and_env() {
+    use std::num::NonZeroUsize;
+    // Absent → the built-in 64 (its own knob, smaller than sessions' 128).
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.job_capacity, NonZeroUsize::new(64).unwrap());
+    // Set in [defaults] → honored, and independent of session_capacity.
+    let c = Config::from_toml_str("[defaults]\njob_capacity = 9\n").unwrap();
+    assert_eq!(c.defaults.job_capacity, NonZeroUsize::new(9).unwrap());
+    assert_eq!(c.defaults.session_capacity, NonZeroUsize::new(128).unwrap());
+    // Env wins over the file, like every other [defaults] knob.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[defaults]\njob_capacity = 9\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_JOB_CAPACITY", "5")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.defaults.job_capacity, NonZeroUsize::new(5).unwrap());
+}
+
+#[test]
+fn zero_job_capacity_is_rejected_loudly() {
+    // Same as sessions: a zero cap can't build an LruCache and would mean "hold no
+    // jobs", defeating `consult_submit`. Fail at load, not on the first submit.
+    let err = Config::from_toml_str("[defaults]\njob_capacity = 0\n").unwrap_err();
+    assert!(format!("{err:#}").contains("job_capacity"), "got: {err:#}");
+}
+
 // --- Key resolution (now a Backend concern) --------------------------------------
 
 fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {

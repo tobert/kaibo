@@ -79,15 +79,6 @@ not a route-around; track it for the next `kaish-vfs` bump.
 ### Async consult (`consult_submit` + shared `get`/`cancel`/`list`) — follow-ups
 The async-consult surface shipped (`src/jobs.rs` `JobStore`, `consult_submit` in
 `server.rs`, the unified handle-dispatched `get`/`cancel`/`list`). Open polish:
-- **Dedicated `job_capacity` knob.** Jobs currently reuse `defaults.session_capacity`
-  for their LRU cap (`server.rs`, `JobStore::new` call). Fine for a trial — both are
-  diskless client-keyed registries — but a job result is heavier than a `QaTurn`, so a
-  separate `[defaults] job_capacity` (+ `KAIBO_JOB_CAPACITY`) is the honest knob. Mirror
-  `session_capacity`'s plumbing in `config.rs`.
-- **Progress into the job.** `consult_submit` runs on a `NullSink`, so `get` reports only
-  "running, Ns" — not sweep/turn beats. A buffering `ProgressSink` stored on the job
-  (drained by `get`) would restore the visibility a synchronous `consult` streams. Cheap,
-  high-value; the reason the subagent-wrapper pattern felt opaque.
 - **Completion notification is log-only (by necessity).** A finished job emits an `info`
   `tracing` event onto the MCP `notifications/message` bridge (`mcp_log`). Confirmed live:
   Claude Code does *not* surface that into the agent's loop (it's a client log/debug

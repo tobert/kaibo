@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use tokio::task::AbortHandle;
 
+use crate::progress::ProgressLog;
+
 /// A completed consultation, ready to render back to the calling agent. `answer`
 /// already carries its provenance footer; `report` is the explorer's aggregated
 /// report when the submit asked for it (`include_report`), else `None`.
@@ -62,6 +64,11 @@ pub struct JobSnapshot {
     pub state: JobState,
     pub label: String,
     pub age: Duration,
+    /// The most recent progress beat — `(one-liner, beat count)` — for a still-running
+    /// job, or `None` if it hasn't emitted yet (or already finished). `get`/`list` echo
+    /// it so a poller sees forward motion without reaching for `wait`. See
+    /// [`crate::progress::ProgressLog`].
+    pub last_progress: Option<(String, u64)>,
 }
 
 /// What `cancel` did, so the tool layer can word the reply honestly.
@@ -84,6 +91,10 @@ struct Job {
     abort: AbortHandle,
     label: String,
     started: Instant,
+    /// The job's progress recorder — the same [`ProgressLog`] the spawned consult emits
+    /// through, so `get`/`list` can echo the latest beat. Shared (`Arc`) with the running
+    /// task's sink; reading `latest()` here never blocks the task (a tiny `Mutex`).
+    progress: Arc<ProgressLog>,
 }
 
 impl Drop for Job {
@@ -149,10 +160,17 @@ impl JobStore {
     }
 
     /// Spawn `fut` as a job and return its id immediately. `label` is the human-facing
-    /// cast/model summary a poll line shows. The future's `Ok`/`Err` becomes the job's
-    /// terminal `Done`/`Failed` state; an abort (via [`cancel`](Self::cancel)) leaves it
-    /// `Canceled` because the task never runs its tail.
-    pub fn submit<F>(&self, label: impl Into<String>, fut: F) -> String
+    /// cast/model summary a poll line shows; `progress` is the recorder the running phase
+    /// emits through, kept so `get`/`list` can echo the latest beat (pass it the *same*
+    /// `Arc` the consult's `ConsultConfig.progress` holds). The future's `Ok`/`Err`
+    /// becomes the job's terminal `Done`/`Failed` state; an abort (via
+    /// [`cancel`](Self::cancel)) leaves it `Canceled` because the task never runs its tail.
+    pub fn submit<F>(
+        &self,
+        label: impl Into<String>,
+        progress: Arc<ProgressLog>,
+        fut: F,
+    ) -> String
     where
         F: Future<Output = Result<JobResult, String>> + Send + 'static,
     {
@@ -207,6 +225,7 @@ impl JobStore {
             abort: handle.abort_handle(),
             label: label.into(),
             started: Instant::now(),
+            progress,
         });
         self.lock().put(id.clone(), job);
         id
@@ -216,12 +235,24 @@ impl JobStore {
     /// existed, or evicted). Touching the job promotes it to most-recently-used.
     pub fn get(&self, id: &str) -> Option<JobSnapshot> {
         let job = self.lock().get(id).cloned()?;
+        Some(Self::snapshot(&job))
+    }
+
+    /// Render one job to a snapshot: clone its terminal-or-running state and, while it's
+    /// still running, the latest progress beat. A finished job carries its answer, not a
+    /// beat — the recorder's last line is moot once `state` is terminal, so we only attach
+    /// it for `Running`.
+    fn snapshot(job: &Job) -> JobSnapshot {
         let state = job.state.lock().expect("job state mutex poisoned").clone();
-        Some(JobSnapshot {
+        let last_progress = matches!(state, JobState::Running)
+            .then(|| job.progress.latest())
+            .flatten();
+        JobSnapshot {
             state,
             label: job.label.clone(),
             age: job.started.elapsed(),
-        })
+            last_progress,
+        }
     }
 
     /// Abort a running job and mark it `Canceled`. Idempotent on an already-canceled
@@ -249,17 +280,7 @@ impl JobStore {
     pub fn list(&self) -> Vec<(String, JobSnapshot)> {
         self.lock()
             .iter()
-            .map(|(id, job)| {
-                let state = job.state.lock().expect("job state mutex poisoned").clone();
-                (
-                    id.clone(),
-                    JobSnapshot {
-                        state,
-                        label: job.label.clone(),
-                        age: job.started.elapsed(),
-                    },
-                )
-            })
+            .map(|(id, job)| (id.clone(), Self::snapshot(job)))
             .collect()
     }
 
@@ -296,6 +317,12 @@ mod tests {
         }
     }
 
+    /// A record-only progress log for tests that don't exercise the beat echo — the
+    /// store needs one per `submit`, but most lifecycle tests only care about state.
+    fn pl() -> Arc<ProgressLog> {
+        Arc::new(ProgressLog::silent())
+    }
+
     /// Poll `get` until the job leaves `Running`, or panic after a generous bound — the
     /// spawned task needs a runtime tick to land its result, so tests can't read it
     /// synchronously right after `submit`. Returns the terminal state.
@@ -320,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn a_ready_future_lands_as_done() {
         let store = JobStore::new(cap(4));
-        let id = store.submit("cast `x`", async { Ok(done("the answer")) });
+        let id = store.submit("cast `x`", pl(), async { Ok(done("the answer")) });
         assert_eq!(
             await_terminal(&store, &id).await,
             JobState::Done(done("the answer"))
@@ -330,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_future_lands_as_failed() {
         let store = JobStore::new(cap(4));
-        let id = store.submit("cast `x`", async { Err("provider exploded".to_string()) });
+        let id = store.submit("cast `x`", pl(), async { Err("provider exploded".to_string()) });
         assert_eq!(
             await_terminal(&store, &id).await,
             JobState::Failed("provider exploded".to_string())
@@ -343,7 +370,7 @@ mod tests {
         // Gate the future on a channel the test holds, so "Running" is observable
         // deterministically rather than by racing the scheduler.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let id = store.submit("cast `x`", async move {
+        let id = store.submit("cast `x`", pl(), async move {
             let _ = rx.await;
             Ok(done("eventually"))
         });
@@ -362,11 +389,11 @@ mod tests {
     #[tokio::test]
     async fn submitting_past_capacity_evicts_the_least_recently_used() {
         let store = JobStore::new(cap(2));
-        let a = store.submit("a", async { Ok(done("a")) });
-        let b = store.submit("b", async { Ok(done("b")) });
+        let a = store.submit("a", pl(), async { Ok(done("a")) });
+        let b = store.submit("b", pl(), async { Ok(done("b")) });
         // Touch `a` so `b` becomes the least-recently-used.
         let _ = store.get(&a);
-        let c = store.submit("c", async { Ok(done("c")) });
+        let c = store.submit("c", pl(), async { Ok(done("c")) });
 
         assert!(
             store.get(&b).is_none(),
@@ -385,7 +412,7 @@ mod tests {
         let store = JobStore::new(cap(4));
         // A future that would run forever if not aborted — its tail must never land.
         let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let id = store.submit("cast `x`", async move {
+        let id = store.submit("cast `x`", pl(), async move {
             let _ = rx.await;
             Ok(done("should never be seen"))
         });
@@ -405,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_on_a_finished_job_reports_already_finished() {
         let store = JobStore::new(cap(4));
-        let id = store.submit("cast `x`", async { Ok(done("fast")) });
+        let id = store.submit("cast `x`", pl(), async { Ok(done("fast")) });
         let _ = await_terminal(&store, &id).await;
         assert_eq!(store.cancel(&id), CancelOutcome::AlreadyFinished);
     }
@@ -419,13 +446,13 @@ mod tests {
         let ran_tail = Arc::new(AtomicBool::new(false));
         let flag = ran_tail.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let _evicted = store.submit("a", async move {
+        let _evicted = store.submit("a", pl(), async move {
             let _ = rx.await;
             flag.store(true, AOrd::SeqCst);
             Ok(done("a"))
         });
         // A second submit at cap 1 evicts the first → its `Job` drops → task aborts.
-        let _b = store.submit("b", async { Ok(done("b")) });
+        let _b = store.submit("b", pl(), async { Ok(done("b")) });
         // Release the gate; an aborted task must never run its tail.
         let _ = tx.send(());
         for _ in 0..200 {
@@ -443,7 +470,7 @@ mod tests {
         // the FinishGuard the state would sit at Running forever. The guard turns the
         // unwind into a terminal Failed, so `await_terminal` resolves instead of spinning.
         let store = JobStore::new(cap(4));
-        let id = store.submit("cast `x`", async { panic!("boom in the consult loop") });
+        let id = store.submit("cast `x`", pl(), async { panic!("boom in the consult loop") });
         assert!(
             matches!(await_terminal(&store, &id).await, JobState::Failed(_)),
             "a panicking task must land as Failed, not hang in Running forever"
@@ -451,10 +478,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_running_jobs_snapshot_echoes_the_latest_progress_beat() {
+        use crate::progress::{PhaseEvent, ProgressSink};
+        let store = JobStore::new(cap(4));
+        // Hold the progress log so the test can drive beats through it, the way the real
+        // consult loop emits into the `ConsultConfig.progress` clone the job shares.
+        let progress = Arc::new(ProgressLog::silent());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let id = store.submit("cast `x`", progress.clone(), async move {
+            let _ = rx.await;
+            Ok(done("eventually"))
+        });
+
+        // Before any beat, a running job has nothing to echo.
+        assert_eq!(store.get(&id).unwrap().last_progress, None);
+
+        // A beat fires → the snapshot surfaces it (message + count) while still Running.
+        progress.emit(PhaseEvent::SweepStarted {
+            question: "where is the sandbox?".into(),
+        });
+        assert_eq!(
+            store.get(&id).unwrap().last_progress,
+            Some(("exploring: where is the sandbox?".to_string(), 1))
+        );
+
+        // Once it finishes, the beat is moot — a Done snapshot carries the answer, not a
+        // stale "currently …" line.
+        tx.send(()).unwrap();
+        assert_eq!(
+            await_terminal(&store, &id).await,
+            JobState::Done(done("eventually"))
+        );
+        assert_eq!(store.get(&id).unwrap().last_progress, None);
+    }
+
+    #[tokio::test]
     async fn list_returns_every_live_job_newest_first() {
         let store = JobStore::new(cap(4));
-        let a = store.submit("cast `a`", async { Ok(done("a")) });
-        let b = store.submit("cast `b`", async { Ok(done("b")) });
+        let a = store.submit("cast `a`", pl(), async { Ok(done("a")) });
+        let b = store.submit("cast `b`", pl(), async { Ok(done("b")) });
         let listed: Vec<String> = store.list().into_iter().map(|(id, _)| id).collect();
         // Most-recently-submitted first: b before a.
         assert_eq!(listed, vec![b, a]);
@@ -463,8 +525,8 @@ mod tests {
     #[tokio::test]
     async fn ids_are_unique_and_monotonic() {
         let store = JobStore::new(cap(8));
-        let a = store.submit("a", async { Ok(done("a")) });
-        let b = store.submit("b", async { Ok(done("b")) });
+        let a = store.submit("a", pl(), async { Ok(done("a")) });
+        let b = store.submit("b", pl(), async { Ok(done("b")) });
         assert_ne!(a, b);
         assert_eq!(a, "job-1");
         assert_eq!(b, "job-2");

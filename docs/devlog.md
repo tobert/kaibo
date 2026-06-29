@@ -44,6 +44,39 @@ repo with a running build / `node_modules` churn can spuriously fail), and since
 co-develops kaish it's a direct contribution, not a route-around. Collapsed the duplicate
 tracker entries into that one upstream note.
 
+## 2026-06-29 — Async-job polish: a `job_capacity` knob and `get` that shows the work
+
+Two `docs/issues.md` follow-ups from the async-consult surface, landed together because
+both live on `JobStore`/`consult_submit`.
+
+**`job_capacity` is its own knob.** Jobs had been borrowing `defaults.session_capacity`
+for their LRU cap — fine for a trial, but a held job result (a full answer + optional
+explorer report) is heavier than a session's lean Q&A pair, so the honest cap is smaller.
+Now `[defaults] job_capacity` / `KAIBO_JOB_CAPACITY`, default **64** (vs sessions' 128),
+plumbed the same way as `session_capacity` (struct + default + raw + merge + env + a
+zero-is-rejected guard) and surfaced in `kaibo://config`. Independent tests pin the
+default, the file/env override, and the loud zero-rejection.
+
+**`get` now shows the work.** The issue note said `consult_submit` ran on a `NullSink` so
+`get` could only report "running, Ns" — but that premise had already gone stale: the async
+path moved to `TracingSink`, and a `wait` tool + notification ring shipped, so the live
+sweep/turn narrative *was* reachable, just through `wait`, not `get`. Confirmed that with
+Amy and took the residual: a caller who polls with `get` (the natural verb) still saw no
+motion. Fix is a small `ProgressLog` **decorator** in `progress.rs` — it records the latest
+beat's one-liner + a beat count while teeing every event on to the inner `TracingSink`, so
+the `wait`/`mcp_log` stream is untouched and the job *also* remembers its last beat. The
+job holds the same `Arc<ProgressLog>` the running consult emits through; `get`/`list` echo
+`currently: exploring … (step N)` on a still-running job (the step count advances even when
+two polls catch the same kind of beat), and a finished snapshot drops it — a Done job
+carries its answer, not a stale "currently" line. The decorator shape means no second
+emit path and the existing `wait` view is byte-for-byte unchanged.
+
+The model-driven progress events were already in `PhaseEvent`; this just adds a second,
+pull-side consumer beside the push-side `TracingSink`. Tests: `ProgressLog` starts empty /
+remembers the latest / tees to its inner sink (a counting sink proves forwarding), and a
+`JobStore` test drives a beat through the shared log and asserts the running snapshot
+echoes it while a finished one doesn't.
+
 ## 2026-06-28 — Dropping image generation: kaibo perceives and reasons, it doesn't render
 
 A design conversation with Amy reversed the `generate_image` direction. The clean

@@ -82,6 +82,12 @@ pub struct Defaults {
     /// is capacity-driven only (no TTL) — see [`crate::session`]. Server-wide (a
     /// session is a client thread, not a model trait).
     pub session_capacity: NonZeroUsize,
+    /// Max async-`consult` jobs (`consult_submit`) held in memory at once — running
+    /// plus finished-but-uncollected. Capacity-LRU like sessions, no TTL; evicting a
+    /// still-running job aborts it (see [`crate::jobs`]). Its own knob because a job
+    /// result (a full answer + optional explorer report) is heavier than a session's
+    /// lean Q&A pair, so the honest cap is smaller.
+    pub job_capacity: NonZeroUsize,
 }
 
 impl Default for Defaults {
@@ -119,6 +125,11 @@ impl Default for Defaults {
             // 128 lean Q&A threads is a few KB of strings — generous for a personal
             // server, and capacity (not time) is the only eviction pressure.
             session_capacity: NonZeroUsize::new(128).expect("128 is nonzero"),
+            // Fewer than sessions: a held job result (answer + maybe a report) is
+            // heavier, and a caller rarely has many async consults in flight at once.
+            // 64 is generous headroom before the LRU starts aborting the oldest
+            // still-running job to make room.
+            job_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
         }
     }
 }
@@ -1469,6 +1480,7 @@ struct RawDefaults {
     thinking_style: Option<String>,
     request_timeout_secs: Option<u64>,
     session_capacity: Option<usize>,
+    job_capacity: Option<usize>,
 }
 
 /// One `[backends.<name>]` stanza: connection knobs only — models live on casts.
@@ -1647,6 +1659,13 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
             .ok_or_else(|| anyhow!("[defaults] session_capacity must be > 0 (got 0)"))?,
         None => d.session_capacity,
     };
+    // Same zero-is-never-intent reasoning as session_capacity: a zero cap can't build
+    // an LruCache and would mean "hold no jobs", which defeats `consult_submit`.
+    let job_capacity = match raw.job_capacity {
+        Some(n) => NonZeroUsize::new(n)
+            .ok_or_else(|| anyhow!("[defaults] job_capacity must be > 0 (got 0)"))?,
+        None => d.job_capacity,
+    };
     Ok(Defaults {
         explorer_max_turns: raw.explorer_max_turns.unwrap_or(d.explorer_max_turns),
         synth_max_turns: raw.synth_max_turns.unwrap_or(d.synth_max_turns),
@@ -1666,6 +1685,7 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
             .map(Duration::from_secs)
             .unwrap_or(d.request_timeout),
         session_capacity,
+        job_capacity,
     })
 }
 
@@ -1911,6 +1931,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_SESSION_CAPACITY") {
         defaults.session_capacity = Some(parse_env_int("KAIBO_SESSION_CAPACITY", &v)?);
+    }
+    if let Some(v) = get("KAIBO_JOB_CAPACITY") {
+        defaults.job_capacity = Some(parse_env_int("KAIBO_JOB_CAPACITY", &v)?);
     }
 
     // Context files: colon-separated like PATH (and like KAIBO_ALLOW_PATHS), so a
