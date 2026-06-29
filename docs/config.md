@@ -195,6 +195,10 @@ The `[defaults]` knobs themselves:
   only (plus per-call): they bound the *loop*, not the model.
 - **`session_capacity`** (128, must be > 0): max multi-turn consult sessions held
   in memory (LRU, capacity-evicted, no TTL).
+- **`job_capacity`** (64, must be > 0): max async-`consult` jobs (`consult_submit`)
+  held in memory — running plus finished-but-uncollected (LRU, capacity-evicted, no
+  TTL; evicting a still-running job aborts it). Its own knob, smaller than
+  `session_capacity` because a held job result is heavier than a session's Q&A pair.
 
 ### Built-in registry (the defaults)
 
@@ -300,6 +304,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | thinking style | `defaults.thinking_style` *(per-slot override)* | `KAIBO_THINKING_STYLE` | — |
 | LLM request timeout (s) | `defaults.request_timeout_secs` *(per-backend override)* | `KAIBO_REQUEST_TIMEOUT_SECS` | — |
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
+| async job cache size | `defaults.job_capacity` *(must be > 0; default 64)* | `KAIBO_JOB_CAPACITY` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |

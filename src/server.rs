@@ -38,7 +38,7 @@ use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
 use crate::mcp_log;
-use crate::progress::{NullSink, PhaseEvent, ProgressSink, TracingSink};
+use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSink};
 use crate::sandbox::{KaishWorker, builtin_schemas};
 use crate::session::SessionStore;
 
@@ -589,10 +589,10 @@ impl KaiboHandler {
         );
 
         let sessions = SessionStore::new(config.defaults.session_capacity);
-        // Async-consult jobs reuse the session capacity for now — both are diskless,
-        // client-keyed, capacity-LRU registries. (docs/issues.md tracks giving jobs
-        // their own `job_capacity` knob.)
-        let jobs = JobStore::new(config.defaults.session_capacity);
+        // Async-consult jobs get their own cap: a held job result (answer + optional
+        // report) is heavier than a session's lean Q&A pair, so `job_capacity` is a
+        // separate, smaller knob (`[defaults] job_capacity` / `KAIBO_JOB_CAPACITY`).
+        let jobs = JobStore::new(config.defaults.job_capacity);
         Ok(Self {
             config: Arc::new(config),
             tool_router,
@@ -1455,17 +1455,21 @@ impl KaiboHandler {
             &synth.model,
             &cast.name,
         )?;
+        // An async job has no live MCP peer to push progress notifications to, so route
+        // its liveness onto the `tracing` stream: the `mcp_log` bridge mirrors it to a
+        // watching client (the live view sync `consult` had) and the notification buffer
+        // tees it for `wait`. The `ProgressLog` decorator wraps that `TracingSink` so the
+        // job *also* remembers the latest beat — `get`/`list` echo it inline, a second
+        // channel for a poller who isn't using `wait`. The job below keeps a clone of this
+        // exact handle, so what it reads is what the running phase emitted.
+        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
         let cfg = ConsultConfig {
             explorer_max_turns: input
                 .explorer_max_turns
                 .unwrap_or(defaults.explorer_max_turns),
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             sandbox: self.config.sandbox.clone(),
-            // An async job has no live MCP peer to push progress notifications to, so
-            // route its liveness onto the `tracing` stream: the `mcp_log` bridge mirrors
-            // it to a watching client (the live view sync `consult` had) and the
-            // notification buffer tees it for `wait`. See [`TracingSink`].
-            progress: Arc::new(TracingSink),
+            progress: progress_log.clone(),
             house_rules: self.house_rules(&root)?,
             prompts: self.resolved_prompts(&cast),
             orientation: self.orientation(&root).await?,
@@ -1486,7 +1490,7 @@ impl KaiboHandler {
         let label =
             format!("cast `{cast_name}` (explorer `{explorer_model}`, synth `{synth_model}`)");
 
-        let job_id = self.jobs.submit(label, async move {
+        let job_id = self.jobs.submit(label, progress_log, async move {
             let session = session_id.as_ref().map(|id| (&sessions, id.as_str()));
             match consult(
                 &question,
@@ -2720,6 +2724,7 @@ fn render_config_resource(
         thinking_style: String,
         request_timeout_secs: u64,
         session_capacity: usize,
+        job_capacity: usize,
     }
 
     /// Telemetry as resolved. SECRET-SAFETY: `header_names` lists the keys of any
@@ -2917,6 +2922,7 @@ fn render_config_resource(
         thinking_style,
         request_timeout,
         session_capacity,
+        job_capacity,
     } = &config.defaults;
     let crate::config::TelemetryConfig {
         enabled: telemetry_enabled,
@@ -2977,6 +2983,7 @@ fn render_config_resource(
             thinking_style: format!("{thinking_style:?}").to_lowercase(),
             request_timeout_secs: request_timeout.as_secs(),
             session_capacity: session_capacity.get(),
+            job_capacity: job_capacity.get(),
         },
         telemetry: TelemetryDoc {
             enabled: *telemetry_enabled,
@@ -3160,6 +3167,17 @@ fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> Stri
     format!("{tool} could not complete (cast `{cast}`): {detail}. {guidance}")
 }
 
+/// Render a still-running job's latest progress beat as an inline phrase, or `""` before
+/// the first beat lands. Echoes the same one-liner `wait` streams (e.g. "exploring: …"),
+/// so a caller polling with `get` sees forward motion — `step N` advances every beat even
+/// when two polls catch the same kind of event. See [`crate::progress::ProgressLog`].
+fn running_beat(last_progress: &Option<(String, u64)>) -> String {
+    match last_progress {
+        Some((msg, steps)) => format!(", currently: {msg} (step {steps})"),
+        None => String::new(),
+    }
+}
+
 /// Render an async consultation job for the unified `get`: a status line while it runs,
 /// the grounded answer (and optional report) when it's done, the stored failure text on
 /// error, or a canceled notice. Mirrors the synchronous `consult` result shape so an
@@ -3167,10 +3185,11 @@ fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> Stri
 fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
     match snap.state {
         JobState::Running => CallToolResult::success(vec![Content::text(format!(
-            "Consultation `{id}` is still running — {} ({}s elapsed). No need to wait: go \
+            "Consultation `{id}` is still running — {} ({}s elapsed){}. No need to wait: go \
              do other work and `get` it again later.",
             snap.label,
             snap.age.as_secs(),
+            running_beat(&snap.last_progress),
         ))]),
         JobState::Done(result) => {
             let include_report = result.report.is_some();
@@ -3330,7 +3349,9 @@ fn render_jobs_section(jobs: &[(String, JobSnapshot)]) -> String {
     let mut s = String::from("Consult jobs (this session), newest first:");
     for (id, snap) in jobs {
         let state = match &snap.state {
-            JobState::Running => format!("running, {}s", snap.age.as_secs()),
+            JobState::Running => {
+                format!("running, {}s{}", snap.age.as_secs(), running_beat(&snap.last_progress))
+            }
             JobState::Done(_) => "done — `get` it for the answer".to_string(),
             JobState::Failed(_) => "failed — `get` it for the reason".to_string(),
             JobState::Canceled => "canceled".to_string(),
@@ -3603,6 +3624,56 @@ mod tests {
         // No records, no batch lines → the clean empty line, naming the wait length.
         let empty = render_wait(&[], &[], &jobs, std::time::Duration::from_secs(30));
         assert!(empty.contains("Nothing new in 30s"), "clean empty: {empty}");
+    }
+
+    #[test]
+    fn running_beat_renders_a_phrase_only_when_a_beat_exists() {
+        assert_eq!(running_beat(&None), "");
+        assert_eq!(
+            running_beat(&Some(("exploring: the sandbox".to_string(), 3))),
+            ", currently: exploring: the sandbox (step 3)"
+        );
+    }
+
+    #[test]
+    fn render_job_echoes_the_latest_beat_on_a_running_job() {
+        let text = |r: CallToolResult| {
+            r.content
+                .into_iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // A running job with a beat shows it inline; one without stays a bare status line.
+        let with_beat = render_job(
+            "job-1",
+            JobSnapshot {
+                state: JobState::Running,
+                label: "cast `x`".into(),
+                age: std::time::Duration::from_secs(12),
+                last_progress: Some(("exploring: where?".to_string(), 2)),
+            },
+        );
+        let out = text(with_beat);
+        assert!(out.contains("still running"), "status line: {out}");
+        assert!(
+            out.contains("currently: exploring: where? (step 2)"),
+            "echoes the latest beat: {out}"
+        );
+
+        let no_beat = render_job(
+            "job-2",
+            JobSnapshot {
+                state: JobState::Running,
+                label: "cast `x`".into(),
+                age: std::time::Duration::from_secs(1),
+                last_progress: None,
+            },
+        );
+        assert!(
+            !text(no_beat).contains("currently:"),
+            "no beat yet → no 'currently' phrase"
+        );
     }
 
     fn batch_item(created_at: Option<&str>) -> crate::batch::BatchListItem {
@@ -4061,13 +4132,13 @@ mod tests {
 
         let h = handler();
         // Two finished jobs; we only collect the first.
-        let collected = h.jobs.submit("test", async {
+        let collected = h.jobs.submit("test", Arc::new(ProgressLog::silent()), async {
             Ok(JobResult {
                 answer: "answer".into(),
                 report: None,
             })
         });
-        let other = h.jobs.submit("test", async {
+        let other = h.jobs.submit("test", Arc::new(ProgressLog::silent()), async {
             Ok(JobResult {
                 answer: "answer".into(),
                 report: None,

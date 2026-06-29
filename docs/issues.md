@@ -79,15 +79,19 @@ not a route-around; track it for the next `kaish-vfs` bump.
 ### Async consult (`consult_submit` + shared `get`/`cancel`/`list`) — follow-ups
 The async-consult surface shipped (`src/jobs.rs` `JobStore`, `consult_submit` in
 `server.rs`, the unified handle-dispatched `get`/`cancel`/`list`). Open polish:
-- **Dedicated `job_capacity` knob.** Jobs currently reuse `defaults.session_capacity`
-  for their LRU cap (`server.rs`, `JobStore::new` call). Fine for a trial — both are
-  diskless client-keyed registries — but a job result is heavier than a `QaTurn`, so a
-  separate `[defaults] job_capacity` (+ `KAIBO_JOB_CAPACITY`) is the honest knob. Mirror
-  `session_capacity`'s plumbing in `config.rs`.
-- **Progress into the job.** `consult_submit` runs on a `NullSink`, so `get` reports only
-  "running, Ns" — not sweep/turn beats. A buffering `ProgressSink` stored on the job
-  (drained by `get`) would restore the visibility a synchronous `consult` streams. Cheap,
-  high-value; the reason the subagent-wrapper pattern felt opaque.
+- **Eviction silently aborts a still-running job — surface it on a burst.** The
+  `JobStore` LRU aborts the least-recently-used job when a new submit pushes past
+  `job_capacity` (`jobs.rs`, `Job::drop` → `abort`), intentionally (an unreachable job
+  shouldn't burn tokens). But the abort is silent on the *submit* side: a caller that
+  fires a burst of > `job_capacity` (default 64) `consult_submit`s in a tight cross-model
+  loop has its oldest in-flight consults killed mid-investigation, and only finds out when
+  `get` returns `Unknown`. Pre-existing (eviction always aborted running jobs); the 128→64
+  default made it more reachable. Surfaced by the gemini-batch cross-family review
+  (2026-06-29). Fix options: a `Warn` `tracing` event when eviction aborts a *running*
+  (not terminal) job so a `wait`-draining caller sees it, and/or document the cap as a
+  concurrency ceiling in the tool description. Backpressure (refuse a submit at capacity
+  instead of evicting) is a *different* contract — don't add it without deciding. Low
+  priority: 64 concurrent live consults hits provider rate limits first.
 - **Completion notification is log-only (by necessity).** A finished job emits an `info`
   `tracing` event onto the MCP `notifications/message` bridge (`mcp_log`). Confirmed live:
   Claude Code does *not* surface that into the agent's loop (it's a client log/debug

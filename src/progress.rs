@@ -14,6 +14,8 @@
 //! and never names a transport type. The translation to MCP lives at the edge.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// A semantic step in a running phase. The sink decides how (or whether) to surface
 /// it; the loop just announces what it's doing. Ordered roughly by when they fire,
@@ -107,6 +109,65 @@ impl ProgressSink for TracingSink {
         } else {
             tracing::info!(target: "kaibo::consult", "{msg}");
         }
+    }
+}
+
+/// A [`ProgressSink`] decorator that remembers the most recent beat while teeing each
+/// event to an inner sink. An async `consult` job streams its progress to the caller
+/// through `wait` (the inner [`TracingSink`] → notification ring); a caller polling with
+/// `get` reads no stream, so the job also holds one of these and `get` echoes
+/// [`latest`](Self::latest) inline. Records *and* forwards — the `wait`/`mcp_log` view is
+/// unchanged. State is a tiny `Mutex` (last message + beat count); `emit` stays sync and
+/// infallible per the [`ProgressSink`] contract.
+#[derive(Debug)]
+pub struct ProgressLog {
+    inner: Arc<dyn ProgressSink>,
+    state: Mutex<ProgressState>,
+}
+
+#[derive(Debug, Default)]
+struct ProgressState {
+    /// The most recent event's glanceable one-liner, or `None` before the first beat.
+    latest: Option<String>,
+    /// How many beats have fired — lets `get` show forward motion ("step 7") even when
+    /// two polls land on the same kind of beat.
+    steps: u64,
+}
+
+impl ProgressLog {
+    /// Wrap `inner`, recording each event before forwarding it. Pass [`NullSink`] for a
+    /// record-only log with nowhere to tee (what a test or a no-`wait` client uses).
+    pub fn new(inner: Arc<dyn ProgressSink>) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(ProgressState::default()),
+        }
+    }
+
+    /// A record-only log: nothing downstream, just the latest beat for `get` to echo.
+    pub fn silent() -> Self {
+        Self::new(Arc::new(NullSink))
+    }
+
+    /// The most recent beat's one-liner and the running beat count, or `None` if the
+    /// phase hasn't emitted yet. `get` renders this as the "currently …" tail on a
+    /// still-running job.
+    pub fn latest(&self) -> Option<(String, u64)> {
+        let s = self.state.lock().expect("progress log mutex poisoned");
+        s.latest.clone().map(|msg| (msg, s.steps))
+    }
+}
+
+impl ProgressSink for ProgressLog {
+    fn emit(&self, event: PhaseEvent) {
+        // One-liner first (it borrows `event`), then forward the owned event downstream.
+        let msg = event.message();
+        {
+            let mut s = self.state.lock().expect("progress log mutex poisoned");
+            s.latest = Some(msg);
+            s.steps += 1;
+        }
+        self.inner.emit(event);
     }
 }
 
@@ -227,6 +288,65 @@ mod tests {
         sink.emit(PhaseEvent::SweepFinished);
         sink.emit(PhaseEvent::TurnCapReached);
         sink.emit(PhaseEvent::PhaseFinished { phase: "consult" });
+    }
+
+    #[test]
+    fn progress_log_starts_empty_then_remembers_the_latest_beat() {
+        let log = ProgressLog::silent();
+        // Before any beat, there's nothing to echo.
+        assert_eq!(log.latest(), None);
+
+        log.emit(PhaseEvent::PhaseStarted { phase: "consult" });
+        assert_eq!(log.latest(), Some(("starting consult".to_string(), 1)));
+
+        // A second beat replaces the message and advances the count.
+        log.emit(PhaseEvent::SweepStarted {
+            question: "where is the sandbox?".into(),
+        });
+        assert_eq!(
+            log.latest(),
+            Some(("exploring: where is the sandbox?".to_string(), 2))
+        );
+    }
+
+    #[test]
+    fn progress_log_step_count_advances_on_a_repeated_event_kind() {
+        // The step count is the "forward motion" signal `get` shows, so it must advance on
+        // *every* beat — including two of the same kind in a row (two `KaishRun`s), where
+        // the message alone wouldn't tell a poller anything moved.
+        let log = ProgressLog::silent();
+        log.emit(PhaseEvent::KaishRun {
+            script: "cat -n a.rs".into(),
+        });
+        assert_eq!(log.latest(), Some(("running kaish: cat -n a.rs".to_string(), 1)));
+        log.emit(PhaseEvent::KaishRun {
+            script: "grep -rn foo .".into(),
+        });
+        assert_eq!(
+            log.latest(),
+            Some(("running kaish: grep -rn foo .".to_string(), 2)),
+            "a second beat of the same kind still advances the step count"
+        );
+    }
+
+    #[test]
+    fn progress_log_tees_every_event_to_its_inner_sink() {
+        // A counting sink proves the decorator forwards, so the `wait`/mcp_log stream is
+        // untouched when a job also records for `get`.
+        #[derive(Debug, Default)]
+        struct Counter(std::sync::atomic::AtomicUsize);
+        impl ProgressSink for Counter {
+            fn emit(&self, _event: PhaseEvent) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(Counter::default());
+        let log = ProgressLog::new(counter.clone());
+        log.emit(PhaseEvent::SweepFinished);
+        log.emit(PhaseEvent::PhaseFinished { phase: "consult" });
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // And it still recorded the last one for `get`.
+        assert_eq!(log.latest(), Some(("consult complete".to_string(), 2)));
     }
 
     /// `Arc<dyn ProgressSink>` must be `Debug` (it rides inside `ConsultConfig`,
