@@ -5,8 +5,9 @@
 #
 # EVERYTHING here is optional. With no config file at all, kaibo runs exactly as it
 # does today: four built-in BACKENDS (connections: anthropic/deepseek/gemini/openai-local)
-# and four same-named single-backend CASTS (compositions: role → "backend/model-id")
-# ship in code; this file only OVERRIDES fields or ADDS backends and casts.
+# and six built-in CASTS (compositions: role → "backend/model-id") — four same-named
+# interactive ones plus two batch casts (anthropic-batch, gemini-batch) — ship in code;
+# this file only OVERRIDES fields or ADDS backends and casts.
 # `[profiles]` is gone — a config that still carries it is a load error pointing at
 # docs/casts.md.
 #
@@ -67,11 +68,12 @@ cast = "anthropic"
 log = "kaibo=info"
 
 # Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
-# A config with all three false is refused at startup, same as today.
+# All four default true; a config that turns all four off is refused at startup.
 [server.tools]
 consult        = true
 oneshot        = true
 run_kaish      = true
+batch          = true
 
 # ---------------------------------------------------------------------------
 # [defaults] — tunables every cast slot falls back to. The model-tracking knobs
@@ -219,11 +221,13 @@ key_optional = true                          # keyless local default → placeho
 #     built-in `openai-local` backend alone — a forgotten base_url is a load error, not
 #     a silent dial of the wrong server). ---
 
-# Hosted OpenAI, keyed.
+# Hosted OpenAI, keyed. Backends take their own `aliases`, just like casts — a new
+# alias must not collide with a built-in or another name.
 [backends.gpt]
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
+aliases = ["oai"]                            # now `oai/gpt-5` resolves to this backend
 key_optional = false
 
 # A second local llama.cpp server on another port, keyless. A slow local model
@@ -238,9 +242,8 @@ request_timeout_secs = 1800
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
 #
-# Cast names reach the calling model: each usable cast appears on the `cast` param
-# (a JSON-Schema enum) and in the tool descriptions ("Casts ready now: chimera,
-# local-only, … (default)"). Name for intent (`local-only`, `deep-dive`), not `cast2`.
+# The calling agent sees your cast names — name them for intent (`local-only`,
+# `deep-dive`) so it can route by name without reading this file.
 #
 # Roles: explorer, synth (the agent phases). There are no output/production roles —
 # kaibo reasons over code and renders nothing. A typo'd role is a loud load
@@ -296,7 +299,7 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 [casts.deep-dive]
 aliases  = ["deep"]                          # casts (and backends) take aliases
-explorer = "deepseek/deepseek-v4-flash"
+explorer = { backend = "deepseek", id = "deepseek-v4-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
 synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
 
 # --- A per-model prompt: a local Gemma explorer wants different framing than a
@@ -312,6 +315,15 @@ synth    = "claude/claude-sonnet-4-6"        # no per-model prompt → [prompts]
 [casts.gpt]
 explorer = "gpt/gpt-5-mini"
 synth    = "gpt/gpt-5"
+
+# --- A custom batch cast: the offline `batch_submit` lane (max thinking). `batch = true`
+#     declares it; it needs a synth slot on a batch-capable backend (Anthropic or Gemini)
+#     and runs the synth alone (no explorer). The built-in anthropic-batch / gemini-batch
+#     casts are the same shape. ---
+
+[casts.pro-batch]
+batch    = true
+synth    = "gemini/gemini-pro-latest"        # synth must be batch-capable (Anthropic | Gemini)
 
 # ---------------------------------------------------------------------------
 # [context] — "house rules" files spliced into every consultation tool's preamble
@@ -340,12 +352,14 @@ synth    = "gpt/gpt-5"
 # Precedence per phase: slot `preamble` (per-model, above) > [prompts].<phase> >
 # built-in. The synth slot feeds both `consult` and `oneshot`, but each keeps
 # its own key, so they can diverge. Phases: `explorer` (the nested explore′ sweep),
-# `consult` (the driver), `oneshot` (the thin toolless answer).
+# `consult` (the driver), `oneshot` (the thin toolless answer), `batch` (the offline
+# max-thinking answer).
 # ---------------------------------------------------------------------------
 #
 # [prompts]
 # explorer = "You are a security auditor. Hunt injection sinks and unsafe deserialization."
 # oneshot  = "Answer concisely; you have no codebase access, so reason from what you're given."
+# batch    = "Answer concisely; you're offline at max thinking. Reason from what you're given."
 # consult  = """
 # You are a staff engineer reviewing this codebase.
 # Prefer architectural answers; name the file:line that carries each claim.
