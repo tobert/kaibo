@@ -319,11 +319,13 @@ synth    = "gpt/gpt-5"
 # --- A custom batch cast: the offline `batch_submit` lane (max thinking). `batch = true`
 #     declares it; it needs a synth slot on a batch-capable backend (Anthropic or Gemini)
 #     and runs the synth alone (no explorer). The built-in anthropic-batch / gemini-batch
-#     casts are the same shape. ---
+#     casts are the same shape. Gemini Pro especially earns this lane: interactively it's
+#     refusal-prone on security framing and 503s under load, but batch sidesteps both — so
+#     reach for Pro batch-only (the built-in `gemini-batch` cast, or a custom one like this). ---
 
 [casts.pro-batch]
 batch    = true
-synth    = "gemini/gemini-pro-latest"        # synth must be batch-capable (Anthropic | Gemini)
+synth    = "gemini/gemini-pro-latest"        # batch-capable synth (Anthropic | Gemini); Pro is batch-only
 
 # ---------------------------------------------------------------------------
 # [context] — "house rules" files spliced into every consultation tool's preamble
