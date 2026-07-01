@@ -117,18 +117,15 @@ pub fn kaibo_instructions(schemas: &[ToolSchema]) -> String {
 /// them — the menu of teams reads before the kaish syntax wall, where a host that
 /// truncates won't drop it.
 fn kaibo_lead() -> &'static str {
-    "kaibo (解剖) — ask a question about a codebase and get a grounded, cited \
-     answer. kaibo reads the project READ-ONLY through a kaish shell and never \
-     modifies files or runs external commands. It finds and reads the relevant, \
-     current code itself — point it at a project and say what you did or want to \
-     know (what you changed and why, the behavior in question); it locates the \
-     spans. You don't need to paste files or a diff: prose about your intent is \
-     worth more than a dump kaibo would just re-read from disk. Reach for \
-     `consult` first — a capable model investigates and hands back the answer, \
-     not the transcript. kaibo also exposes `oneshot` (a thin, toolless second \
-     opinion when you already own the context) and `run_kaish` (drive the \
-     read-only shell yourself), each gated independently and described in its \
-     own schema, so a given server may advertise only some."
+    "kaibo (解剖) — grounded, cited answers about a codebase from a model outside \
+     your own family. DeepSeek, Gemini, Anthropic, or a local model reads the \
+     project READ-ONLY and answers with file:line citations. Say in prose what you \
+     did or want to know — kaibo finds and reads the current code itself; no \
+     pasted files or diffs needed. `consult` is the front door. `oneshot` is a \
+     toolless second opinion when you own the context. `run_kaish` drives the \
+     read-only shell directly. Work you don't wait on: `consult_submit` and \
+     `batch_submit` return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` \
+     manage them."
 }
 
 /// The kaish onboarding spine — the mental model, operating contract, live builtin
@@ -266,12 +263,10 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 
     format!(
         "## Casts\n\
-         A cast is the model team that staffs a consultation; pass `cast=<name>` on a \
-         call to pick one. Usable right now (resolved at startup — reconnect after a \
-         config or key change):\n\
-         {lines}\n\n\
-         `kaibo://config` is canonical for what's configured — every cast and backend \
-         (with aliases), the gated tools, and sandbox limits.\n\n"
+         A cast is the model team that staffs a consultation; pass `cast=<name>`. \
+         Usable right now (resolved at startup — reconnect after a config or key \
+         change; `kaibo://config` lists every configured cast, not just these):\n\
+         {lines}\n\n"
     )
 }
 
@@ -288,8 +283,16 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 /// Used by `get_info` so every `initialize` handshake surfaces the server's
 /// containment posture. Unit-testable: pass your own `Config`, `allowed_set`, and
 /// `usability` rather than fabricating a `RequestContext` or reading the environment.
+///
+/// `_schemas` is unused here: Claude Code hard-truncates a server's `instructions`
+/// at exactly 2048 characters (measured live, per-server, hardcoded), and the huge
+/// kaish onboarding reference [`kaish_reference`] would compose from `schemas` blew
+/// that budget on its own — before `## Scope`, the containment/trust posture, ever
+/// got a chance to render. So the resident handshake no longer composes the
+/// reference at all; it stays reachable at `kaibo://kaish/*` and inside the shell
+/// via `help`. The parameter is kept (not removed) so call sites don't change.
 pub fn kaibo_instructions_with_scope(
-    schemas: &[ToolSchema],
+    _schemas: &[ToolSchema],
     config: &Config,
     allowed_set: &[PathBuf],
     default_root: Option<&Path>,
@@ -302,12 +305,12 @@ pub fn kaibo_instructions_with_scope(
         CastUsability::Unconfigured => format!("{}\n\n", setup_section(config)),
         CastUsability::Ready | CastUsability::LocalUnverified => String::new(),
     };
-    // Menu before reference: the lead (what kaibo is + tools), then the live cast
-    // roster, then the kaish onboarding spine. A caller's first decision is "which
-    // team", so it precedes the syntax detail — and survives a host that truncates.
+    // Lead, then the live cast roster, then Scope directly — no kaish reference in
+    // between. A caller's first decision is "which team"; Scope is the containment
+    // posture every handshake must carry, so it now sits right after Casts instead
+    // of below the reference wall a truncating host would drop it behind.
     let lead = kaibo_lead();
     let casts = casts_section(config, usable_casts);
-    let reference = kaish_reference(schemas);
 
     // Scope section: always accurate, never ambiguous. Report the *effective* default
     // root (an explicit `--root`, or the launch cwd kaibo inferred), and tag the
@@ -329,16 +332,15 @@ pub fn kaibo_instructions_with_scope(
     format!(
         "{setup}{lead}\n\n\
          {casts}\
-         {reference}\n\n\
          ## Scope\n\
-         This server's path containment is always on. A per-call `path` must \
-         canonicalize to at-or-under one of the allowed trees below.\n\n\
+         Read-only, always: kaibo never writes and cannot run external commands. A \
+         per-call `path` must canonicalize to at-or-under one of these allowed trees:\n\n\
          {root_line}\n\
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
-         Read `kaibo://config` for the full resolved runtime configuration — \
-         default cast, gated tools, sandbox limits, and every backend and cast \
-         (with their aliases)."
+         Go deeper without spending a turn: `kaibo://config` (full resolved config — \
+         casts, backends, gated tools, sandbox limits), `kaibo://tools` (attachments, \
+         overrides, the async workflow), `kaibo://kaish/*` (shell syntax and idioms)."
     )
 }
 
@@ -385,6 +387,7 @@ pub fn kaibo_sandbox_doc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Cast, ModelSlot};
 
     #[test]
     fn core_layers_the_canonical_contract_under_the_kaibo_addendum() {
@@ -437,14 +440,14 @@ mod tests {
             kaibo_lead()
         );
         assert!(
-            lead.contains("reads the relevant"),
+            lead.contains("finds and reads the current code"),
             "lead must say kaibo finds and reads the code itself:\n{}",
             kaibo_lead()
         );
-        // consult is the tool to reach for first; the others surface via schema.
+        // consult is the front door; the others surface via schema.
         assert!(
-            lead.contains("reach for `consult` first"),
-            "lead must foreground `consult` as the first reach:\n{}",
+            lead.contains("`consult` is the front door"),
+            "lead must foreground `consult` as the front door:\n{}",
             kaibo_lead()
         );
     }
@@ -595,10 +598,12 @@ mod tests {
             !text.contains("gemini"),
             "an unconfigured cast must not be advertised as usable:\n{text}"
         );
-        // Points at the config resource as canonical for what's configured.
+        // Points at the config resource for the full configured state — the roster
+        // lists usable casts only, and `kaibo://config` has every one (surfaced in
+        // the Casts aside and, authoritatively, in the Scope "go deeper" pointers).
         assert!(
-            text.contains("canonical") && text.contains("kaibo://config"),
-            "Casts section must point at kaibo://config as canonical:\n{text}"
+            text.contains("kaibo://config"),
+            "handshake must point at kaibo://config for the full configured state:\n{text}"
         );
     }
 
@@ -702,12 +707,13 @@ mod tests {
         );
     }
 
-    /// Menu before reference: the cast roster precedes the kaish onboarding spine, so
-    /// a caller reads "which team" before the syntax wall — and a host that truncates
-    /// the instructions keeps the menu. The lead still opens. Fails if the order is
-    /// reverted to onboarding-then-casts.
+    /// The resident handshake dropped the huge kaish onboarding reference entirely —
+    /// it blew Claude Code's 2048-char instructions budget and buried `## Scope`
+    /// below the truncation point. Order is now lead → casts → scope, and the old
+    /// reference marker must not appear at all. Fails while `kaish_reference` is
+    /// still composed into `kaibo_instructions_with_scope`.
     #[test]
-    fn casts_section_precedes_the_kaish_reference() {
+    fn scope_follows_casts_and_the_kaish_reference_is_gone() {
         let config = Config::builtin();
         let usable = vec![("anthropic".to_string(), CastUsability::Ready)];
         let text = kaibo_instructions_with_scope(
@@ -720,20 +726,89 @@ mod tests {
             &usable,
         );
         let casts_at = text.find("## Casts").expect("has a Casts section");
-        let kaish_at = text
-            .find("The shell is kaish")
-            .expect("has the kaish reference");
+        let scope_at = text.find("## Scope").expect("has a Scope section");
         let lead_at = text.find("kaibo (解剖)").expect("opens with the lead");
         assert!(
-            lead_at < casts_at && casts_at < kaish_at,
-            "order must be lead → casts → kaish reference (got lead={lead_at}, \
-             casts={casts_at}, kaish={kaish_at}):\n{text}"
+            lead_at < casts_at && casts_at < scope_at,
+            "order must be lead → casts → scope (got lead={lead_at}, casts={casts_at}, \
+             scope={scope_at}):\n{text}"
+        );
+        assert!(
+            !text.contains("The shell is kaish"),
+            "the resident handshake must drop the kaish onboarding reference \
+             entirely — it no longer fits the truncation budget:\n{text}"
         );
     }
 
     /// A couple of builtins so the onboarding spine renders in ordering tests.
     fn sample_schemas_for_ordering() -> Vec<ToolSchema> {
         vec![ToolSchema::new("cat", "Read a file")]
+    }
+
+    /// Claude Code truncates a server's MCP `instructions` at exactly 2048
+    /// characters — measured live against a running server; it's a per-server,
+    /// hardcoded client-side cap, not an MCP-spec limit and not configurable. Past
+    /// that boundary the calling model never sees the rest, which is exactly how
+    /// `## Scope` — the containment/trust posture — used to go missing behind the
+    /// huge kaish onboarding reference. This drives a *representative* roster (10
+    /// casts: the 6 built-ins plus 4 more spanning default/local-unverified/batch)
+    /// through the full resident handshake and asserts it fits. Fails against
+    /// today's layout (the resident kaish reference blows the budget on its own).
+    #[test]
+    fn instructions_fit_claude_code_budget() {
+        let mut config = Config::builtin(); // anthropic, deepseek, gemini,
+                                             // openai-local, gemini-batch, anthropic-batch
+        for (name, backend, id) in [
+            ("chimera", "anthropic", "claude-haiku-4-5"),
+            ("glm", "openai-local", "GLM-4.5-Air-UD-Q4K-XL-GGUF"),
+            ("qwen", "openai-local", "Qwen3-Coder-Next-GGUF"),
+            ("zorak", "openai-local", "gemma4-26b"),
+        ] {
+            config.casts.insert(
+                name.to_string(),
+                Cast {
+                    name: name.to_string(),
+                    slots: std::collections::BTreeMap::from([(
+                        ModelRole::Synth,
+                        ModelSlot::bare(backend, id),
+                    )]),
+                    batch: false,
+                },
+            );
+        }
+
+        // A realistic usable-casts mix: the interactive built-ins, both batch
+        // lanes (tagged `batch` off the config's own `batch` flag), and a spread
+        // of local/unverified entries — 10 lines total, not the 6-cast minimum.
+        let usable = vec![
+            ("anthropic".to_string(), CastUsability::Ready),
+            ("deepseek".to_string(), CastUsability::Ready),
+            ("gemini".to_string(), CastUsability::Ready),
+            ("gemini-batch".to_string(), CastUsability::Ready),
+            ("anthropic-batch".to_string(), CastUsability::Ready),
+            ("chimera".to_string(), CastUsability::Ready),
+            ("glm".to_string(), CastUsability::LocalUnverified),
+            ("qwen".to_string(), CastUsability::LocalUnverified),
+            ("zorak".to_string(), CastUsability::LocalUnverified),
+            ("openai-local".to_string(), CastUsability::LocalUnverified),
+        ];
+
+        let text = kaibo_instructions_with_scope(
+            &[],
+            &config,
+            &[PathBuf::from("/home/amy/src/some-project")],
+            Some(Path::new("/home/amy/src/some-project")),
+            true,
+            CastUsability::Ready,
+            &usable,
+        );
+
+        let len = text.chars().count();
+        assert!(
+            len < 2048,
+            "handshake must fit Claude Code's 2048-char instructions budget \
+             (measured live, per-server, hardcoded), got {len} chars:\n{text}"
+        );
     }
 
     #[test]

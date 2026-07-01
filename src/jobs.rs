@@ -1,8 +1,8 @@
 //! In-memory async-`consult` job registry — backs `consult_submit` and the shared
-//! `get` / `cancel` / `list` verbs (which also serve batch handles).
+//! `job_get` / `job_cancel` / `job_list` verbs (which also serve batch handles).
 //!
 //! The async counterpart to the synchronous `consult`: `consult_submit` returns a job
-//! id immediately, the consultation runs as a spawned task, and `get` collects the
+//! id immediately, the consultation runs as a spawned task, and `job_get` collects the
 //! answer when it lands. This is the *same* diskless, persistence-shaped state as
 //! [`crate::session::SessionStore`] — an `Arc<Mutex<LruCache>>`, capacity-LRU, no TTL,
 //! the mutex never held across an `.await` — only the value is a job's live status
@@ -15,10 +15,10 @@
 //! `server.rs` and this module stays offline-testable with trivial futures.
 //!
 //! **Eviction is capacity-LRU, like sessions** — a job is dropped only when a newer
-//! submit pushes it past the cap as the least-recently-used; touching it (`get`/
-//! `cancel`) promotes it. A still-*running* job that gets evicted is **aborted** (its
+//! submit pushes it past the cap as the least-recently-used; touching it (`job_get`/
+//! `job_cancel`) promotes it. A still-*running* job that gets evicted is **aborted** (its
 //! `Job` drop aborts the task): once the store drops a job its id is unreachable
-//! (`get`/`cancel` return not-found), so letting an orphaned consult run on would just
+//! (`job_get`/`job_cancel` return not-found), so letting an orphaned consult run on would just
 //! burn provider tokens against a cell nobody can read. The spawned task owns its own
 //! `Arc` of the status cell, so the cell stays valid until the task actually stops —
 //! no panic, no disk.
@@ -43,7 +43,7 @@ pub struct JobResult {
     pub report: Option<String>,
 }
 
-/// Where a job is in its lifecycle, as one `get` sees it.
+/// Where a job is in its lifecycle, as one `job_get` sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
     /// The spawned task is still working.
@@ -53,7 +53,7 @@ pub enum JobState {
     /// The consultation failed; the string is the already-rendered failure text
     /// (detail + guidance), so the tool layer wraps it without re-classifying.
     Failed(String),
-    /// `cancel` aborted the task before it finished.
+    /// `job_cancel` aborted the task before it finished.
     Canceled,
 }
 
@@ -65,13 +65,13 @@ pub struct JobSnapshot {
     pub label: String,
     pub age: Duration,
     /// The most recent progress beat — `(one-liner, beat count)` — for a still-running
-    /// job, or `None` if it hasn't emitted yet (or already finished). `get`/`list` echo
-    /// it so a poller sees forward motion without reaching for `wait`. See
+    /// job, or `None` if it hasn't emitted yet (or already finished). `job_get`/`job_list`
+    /// echo it so a poller sees forward motion without reaching for `job_wait`. See
     /// [`crate::progress::ProgressLog`].
     pub last_progress: Option<(String, u64)>,
 }
 
-/// What `cancel` did, so the tool layer can word the reply honestly.
+/// What `job_cancel` did, so the tool layer can word the reply honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelOutcome {
     /// The job was running and is now aborted + marked canceled.
@@ -92,7 +92,7 @@ struct Job {
     label: String,
     started: Instant,
     /// The job's progress recorder — the same [`ProgressLog`] the spawned consult emits
-    /// through, so `get`/`list` can echo the latest beat. Shared (`Arc`) with the running
+    /// through, so `job_get`/`job_list` can echo the latest beat. Shared (`Arc`) with the running
     /// task's sink; reading `latest()` here never blocks the task (a tiny `Mutex`).
     progress: Arc<ProgressLog>,
 }
@@ -102,8 +102,8 @@ impl Drop for Job {
     /// the whole store goes away. Dropping an `AbortHandle` does *not* abort the task on
     /// its own, so without this an evicted-but-still-running consult would run to
     /// completion against an unreachable cell, burning provider tokens for an answer no
-    /// `get` can ever return. A finished or already-canceled job's abort is a harmless
-    /// no-op. `get`/`cancel`/`list` only clone the `Arc<Job>` transiently under the store
+    /// `job_get` can ever return. A finished or already-canceled job's abort is a harmless
+    /// no-op. `job_get`/`job_cancel`/`job_list` only clone the `Arc<Job>` transiently under the store
     /// lock, so this fires on the *last* reference — true unreachability — not on a poll.
     fn drop(&mut self) {
         self.abort.abort();
@@ -113,7 +113,7 @@ impl Drop for Job {
 /// A drop guard for the spawned task: if the task's future ends *without* landing a
 /// result — a panic (we build `panic = unwind`, so tokio catches it and the state would
 /// otherwise sit at `Running` forever) or an abort that drops the future at its await
-/// point — record a terminal failure instead of leaving `get` to report "still running"
+/// point — record a terminal failure instead of leaving `job_get` to report "still running"
 /// with no end. The task disarms it on the normal path so it never overwrites a real
 /// outcome. On an *abort* the cell is usually unreachable anyway (canceled, or evicted),
 /// so the write is harmless; on a *panic* of a still-live job it's the difference between
@@ -161,7 +161,7 @@ impl JobStore {
 
     /// Spawn `fut` as a job and return its id immediately. `label` is the human-facing
     /// cast/model summary a poll line shows; `progress` is the recorder the running phase
-    /// emits through, kept so `get`/`list` can echo the latest beat (pass it the *same*
+    /// emits through, kept so `job_get`/`job_list` can echo the latest beat (pass it the *same*
     /// `Arc` the consult's `ConsultConfig.progress` holds). The future's `Ok`/`Err`
     /// becomes the job's terminal `Done`/`Failed` state; an abort (via
     /// [`cancel`](Self::cancel)) leaves it `Canceled` because the task never runs its tail.
@@ -191,7 +191,7 @@ impl JobStore {
             let outcome = fut.await;
             {
                 let mut s = task_state.lock().expect("job state mutex poisoned");
-                // Only land the result if a `cancel` didn't race in while we were
+                // Only land the result if a `job_cancel` didn't race in while we were
                 // finishing — a caller who asked to cancel gets `Canceled`, not a
                 // surprise late answer.
                 if matches!(*s, JobState::Running) {
@@ -204,14 +204,14 @@ impl JobStore {
 
                     // Completion signal at **Warn** — kaibo's "the calling model should
                     // see this" level (not severity): a finished/failed job is exactly
-                    // what a `wait` drains by default, and the `mcp_log` bridge also
+                    // what a `job_wait` drains by default, and the `mcp_log` bridge also
                     // mirrors it to a watching client. Still advisory — no MCP primitive
-                    // wakes the agent, so polling/`wait` stays the contract. (A canceled
+                    // wakes the agent, so polling/`job_wait` stays the contract. (A canceled
                     // job never reaches here — its task is aborted — no ping for it.)
                     if succeeded {
-                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job finished — collect it with `get`");
+                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job finished — collect it with `job_get`");
                     } else {
-                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job failed — `get` it for the reason");
+                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job failed — `job_get` it for the reason");
                     }
                 }
             }
@@ -275,7 +275,7 @@ impl JobStore {
     }
 
     /// Snapshot every live job, most-recently-touched first — the order the unified
-    /// `list` shows them. A read: it promotes nothing and takes no job's state lock for
+    /// `job_list` shows them. A read: it promotes nothing and takes no job's state lock for
     /// longer than the clone.
     pub fn list(&self) -> Vec<(String, JobSnapshot)> {
         self.lock()
@@ -323,7 +323,7 @@ mod tests {
         Arc::new(ProgressLog::silent())
     }
 
-    /// Poll `get` until the job leaves `Running`, or panic after a generous bound — the
+    /// Poll `job_get` until the job leaves `Running`, or panic after a generous bound — the
     /// spawned task needs a runtime tick to land its result, so tests can't read it
     /// synchronously right after `submit`. Returns the terminal state.
     async fn await_terminal(store: &JobStore, id: &str) -> JobState {
