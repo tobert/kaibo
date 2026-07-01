@@ -182,7 +182,11 @@ first-class tool that returns the **structured, cited report itself** rather tha
 answer — for mapping unfamiliar code, or for a caller that wants to inspect/refine
 the dossier before sending it onward. `deliberate` is then literally
 `explore → offline synth`; one machinery, two tools, and the composition is visible
-to the caller. Rounds out the ladder: `run_kaish` (no model) → `explore` (cheap
+to the caller. (Precision, from the cross-family review: today's `explore′` /
+`RunExplore` is a *sub-agent tool inside* the consult driver's loop — first-class
+`explore` runs `report_preamble` as the main preamble of its *own* `run_phase` with
+the kaish tool, a different composition point than the sub-agent pattern. The pieces
+are reusable; the wiring is new.) Rounds out the ladder: `run_kaish` (no model) → `explore` (cheap
 model, report) → `consult` (capable model, answer) → `deliberate` (heavyweight
 model, offline).
 
@@ -228,7 +232,12 @@ discipline the dossier enforces. Everything reuses an existing seam:
   return a `job-N` immediately, always; on the batch lane it *becomes* a durable
   `backend/provider-id` at submit (`job_wait`/`job_get` narrate the transition and
   hand back the durable handle so the caller can hold it across restarts). The local
-  lane stays `job-N` end-to-end.
+  lane stays `job-N` end-to-end. (Precision, from the cross-family review: `job-N`
+  and `backend/provider-id` are today two *disjoint* handle namespaces — `jobs.rs`
+  in-memory vs `batch.rs` provider-owned — and `job_get` dispatches by handle shape.
+  A handle that transitions namespaces mid-lifecycle is new territory for the
+  dispatcher, not just for the narration; give it a deliberate design, likely the
+  job record *carrying* its batch handle once submitted so either address works.)
 - **Cast/config shape.** Today batch-ness is a property of a whole cast
   (`cast_is_batch`); `deliberate` needs an *interactive* explorer slot paired with an
   *offline* synth slot, and the synth's lane is now **batch | direct** (e.g.
