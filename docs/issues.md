@@ -22,6 +22,19 @@ kaish-kernel 0.10.0.
 
 ## P1 — High-leverage features & robustness
 
+### Model-facing text pass + `deliberate` (Fable-batch consultation)
+
+Plan lives in **`docs/desc-and-schema-tuning.md`** (started 2026-07-01, w/ Amy). The
+caller's-seat audit found Claude Code truncates the handshake `instructions` at ~2.5 KB
+(the `## Scope` section never reaches the calling model) and defers tool schemas to
+names-only. The doc sequences: handshake restructure (scope above the kaish wall,
+byte-budget tests), lead rewrite (async lane is invisible today), renames of the generic
+async tools (`get`/`list`), schema hygiene (rustdoc cross-refs ship on the wire), and the
+big one — `deliberate`: an interactive Sonnet-class model builds a grounded dossier, then
+a frontier synth (Fable) deliberates on the batch lane at batch prices. Two Sonnet
+research passes pending (exact truncation caps; per-host instructions handling) — their
+numbers land in that doc. Delete this entry when the doc's sections have all shipped.
+
 ### Media spine — perception in, production removed
 
 Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
