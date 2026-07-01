@@ -2111,7 +2111,6 @@ impl rmcp::ServerHandler for KaiboHandler {
             // at initialize — the same point the rest of config is bound; reconnecting
             // is what re-reads a newly-set key.
             instructions: Some(kaibo_instructions_with_scope(
-                &self.tool_schemas,
                 &self.config,
                 &self.allowed_set,
                 self.default_root.as_deref(),
@@ -4541,26 +4540,6 @@ mod tests {
         assert_eq!(sc["report"], "", "an empty report is surfaced honestly");
     }
 
-    #[test]
-    fn instructions_compose_the_canonical_onboarding_and_point_at_resources() {
-        use crate::kaish_syntax::kaibo_instructions;
-        let text = kaibo_instructions(&sample_schemas());
-        assert!(
-            text.contains("kaibo"),
-            "instructions should introduce kaibo"
-        );
-        // The canonical onboarding spine from kaish-help.
-        assert!(
-            text.contains("How kaish works"),
-            "instructions should embed the kaish-help foundations:\n{text}"
-        );
-        // The progressive-learning pointer.
-        assert!(
-            text.contains("kaibo://kaish/"),
-            "instructions should point at the kaish resources"
-        );
-    }
-
     // --- kaibo://config/example resource tests -------------------------------
 
     /// The embedded config example is listed and readable, and — the drift guard —
@@ -4950,14 +4929,12 @@ mod tests {
     /// added and get_info wires it in.
     #[test]
     fn instructions_scope_section_names_allowed_paths() {
-        let schemas = sample_schemas();
         let allowed = vec![
             std::path::PathBuf::from("/projects/myapp"),
             std::path::PathBuf::from("/data/shared"),
         ];
         let config = Config::builtin();
         let text = kaibo_instructions_with_scope(
-            &schemas,
             &config,
             &allowed,
             None,
@@ -4985,12 +4962,10 @@ mod tests {
     /// must NOT tag it as inferred.
     #[test]
     fn instructions_scope_section_names_default_root() {
-        let schemas = sample_schemas();
         let config = Config::builtin();
         let root = std::path::PathBuf::from("/projects/myapp");
         let allowed = vec![root.clone()];
         let text = kaibo_instructions_with_scope(
-            &schemas,
             &config,
             &allowed,
             Some(&root),
@@ -5012,12 +4987,10 @@ mod tests {
     /// the caller can tell it wasn't configured by hand.
     #[test]
     fn instructions_scope_section_tags_inferred_default_root() {
-        let schemas = sample_schemas();
         let config = Config::builtin();
         let root = std::path::PathBuf::from("/work/space");
         let allowed = vec![root.clone()];
         let text = kaibo_instructions_with_scope(
-            &schemas,
             &config,
             &allowed,
             Some(&root),
@@ -5038,11 +5011,9 @@ mod tests {
     /// When no default root applies the scope section must be honest about it.
     #[test]
     fn instructions_scope_section_states_no_default_root_when_absent() {
-        let schemas = sample_schemas();
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp")];
         let text = kaibo_instructions_with_scope(
-            &schemas,
             &config,
             &allowed,
             None,

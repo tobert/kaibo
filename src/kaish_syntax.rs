@@ -101,21 +101,10 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
     list_topics()
 }
 
-/// kaibo's MCP `instructions:` — what a host hands a model before its first call.
-///
-/// Composes kaish-help's `agent_onboarding` recipe (the mental model, the operating
-/// contract, and the live builtin index from `schemas`) so the onboarding tracks
-/// kaish upstream, then frames it as kaibo: read-only, four tools, and where to
-/// learn more. The canonical block carries the "how kaish works" spine; we add only
-/// what's kaibo's.
-pub fn kaibo_instructions(schemas: &[ToolSchema]) -> String {
-    format!("{}\n\n{}", kaibo_lead(), kaish_reference(schemas))
-}
-
-/// The opening paragraph: what kaibo is and the tool menu. Split out from the kaish
-/// reference so the scope-aware handshake can slot the `## Casts` roster *between*
-/// them — the menu of teams reads before the kaish syntax wall, where a host that
-/// truncates won't drop it.
+/// The opening paragraph of the handshake: what kaibo is and the tool menu. Split out
+/// so [`kaibo_instructions_with_scope`] can slot the `## Casts` roster *between* it and
+/// `## Scope` — the menu of teams reads before scope, and both sit above the point a
+/// truncating host (Claude Code's 2048-char cap) would cut.
 fn kaibo_lead() -> &'static str {
     "kaibo (解剖) — grounded, cited answers about a codebase from a model outside \
      your own family. DeepSeek, Gemini, Anthropic, or a local model reads the \
@@ -126,24 +115,6 @@ fn kaibo_lead() -> &'static str {
      read-only shell directly. Work you don't wait on: `consult_submit` and \
      `batch_submit` return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` \
      manage them."
-}
-
-/// The kaish onboarding spine — the mental model, operating contract, live builtin
-/// index, and where to read more. Reference material: it follows the cast menu in
-/// the handshake because "what can I run" is reusable detail, not the first choice
-/// a caller makes.
-fn kaish_reference(schemas: &[ToolSchema]) -> String {
-    let onboarding = compose(&Recipe::agent_onboarding(), &SchemaContent::new(schemas));
-    format!(
-        "The shell is kaish. Here is how it works:\n\n\
-         {onboarding}\n\n\
-         ## Learn more kaish\n\
-         Read the `kaibo://kaish/*` resources to go deeper without spending a tool \
-         turn — `kaibo://kaish/syntax`, `kaibo://kaish/builtins`, `kaibo://kaish/vfs`, \
-         `kaibo://kaish/scatter`, and the rest — or `kaibo://kaish/builtin/<name>` for \
-         one builtin. `kaibo://kaish/sandbox` states kaibo's read-only contract and \
-         exit codes. It's all in the shell too: `help`, `help syntax`, `help <builtin>`."
-    )
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has
@@ -183,23 +154,17 @@ fn setup_section(config: &Config) -> String {
 
     format!(
         "## Setup needed — no model provider configured\n\
-         kaibo's default cast `{cast}` has no usable API key, so `consult` and \
-         `oneshot` can't reach a model yet. `run_kaish` works right now — it drives \
-         the read-only shell with no model in the loop — so you can browse the code while \
-         you set a key.\n\n\
-         Give the default cast a key. Prefer an **environment variable** or a **key file** \
-         — kaibo reads either at startup, so the key stays out of this conversation:\n\
+         kaibo's default cast `{cast}` has no usable API key, so `consult`/`oneshot` \
+         can't reach a model yet. `run_kaish` works now (read-only shell, no model), so \
+         you can browse the code meanwhile.\n\n\
+         Give the cast a key via an **environment variable** or **key file** — kaibo \
+         reads either at startup, so it stays out of the chat (set it in your shell; \
+         don't paste it to the model):\n\
          {backends}\n\n\
-         Keep the API key out of the chat: set the env var or key file yourself in your \
-         shell, don't paste it to the model (if you do, that's your call — kaibo doesn't \
-         need to see it). Then **reconnect the kaibo MCP server** so it re-reads the \
-         environment and config — they're read once at startup. In Claude Code: run `/mcp` \
-         and reconnect kaibo; other hosts have their own reload.\n\n\
-         Prefer a different provider? Pass `provider=\"<name>\"` on a call (a backend or \
-         cast — e.g. a local keyless endpoint), or set `cast` in config. The full annotated \
-         example is the `kaibo://config/example` resource; it belongs at \
-         `~/.config/kaibo/config.toml` (or `$XDG_CONFIG_HOME/kaibo/config.toml`). Read \
-         `kaibo://config` for the current resolved state.",
+         Then **reconnect the kaibo MCP server** so it re-reads the environment — in \
+         Claude Code run `/mcp`; other hosts have their own reload. Prefer another \
+         provider? The annotated `kaibo://config/example` resource (→ \
+         `~/.config/kaibo/config.toml`) shows every backend and cast.",
         cast = config.default_cast,
     )
 }
@@ -284,15 +249,13 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 /// containment posture. Unit-testable: pass your own `Config`, `allowed_set`, and
 /// `usability` rather than fabricating a `RequestContext` or reading the environment.
 ///
-/// `_schemas` is unused here: Claude Code hard-truncates a server's `instructions`
-/// at exactly 2048 characters (measured live, per-server, hardcoded), and the huge
-/// kaish onboarding reference [`kaish_reference`] would compose from `schemas` blew
-/// that budget on its own — before `## Scope`, the containment/trust posture, ever
-/// got a chance to render. So the resident handshake no longer composes the
-/// reference at all; it stays reachable at `kaibo://kaish/*` and inside the shell
-/// via `help`. The parameter is kept (not removed) so call sites don't change.
+/// The resident handshake carries no kaish onboarding reference: Claude Code
+/// hard-truncates a server's `instructions` at exactly 2048 characters (measured
+/// live, per-server, hardcoded), and the onboarding spine blew that budget on its own
+/// — before `## Scope`, the containment/trust posture, could render. The shell stays
+/// reachable through `run_kaish`'s own description, the `kaibo://kaish/*` resources,
+/// and `help` inside a script.
 pub fn kaibo_instructions_with_scope(
-    _schemas: &[ToolSchema],
     config: &Config,
     allowed_set: &[PathBuf],
     default_root: Option<&Path>,
@@ -495,7 +458,6 @@ mod tests {
     fn instructions_lead_with_setup_when_unconfigured() {
         let config = Config::builtin(); // default cast "anthropic"
         let text = kaibo_instructions_with_scope(
-            &[],
             &config,
             &[PathBuf::from("/tmp")],
             None,
@@ -539,7 +501,6 @@ mod tests {
         let config = Config::builtin();
         for usability in [CastUsability::Ready, CastUsability::LocalUnverified] {
             let text = kaibo_instructions_with_scope(
-                &[],
                 &config,
                 &[PathBuf::from("/tmp")],
                 None,
@@ -568,7 +529,6 @@ mod tests {
             ("mylocal".to_string(), CastUsability::LocalUnverified),
         ];
         let text = kaibo_instructions_with_scope(
-            &[],
             &config,
             &[PathBuf::from("/tmp")],
             None,
@@ -620,7 +580,6 @@ mod tests {
             ("gemini-batch".to_string(), CastUsability::Ready),
         ];
         let text = kaibo_instructions_with_scope(
-            &[],
             &config,
             &[PathBuf::from("/tmp")],
             None,
@@ -661,7 +620,6 @@ mod tests {
         config.default_cast = "claude".to_string(); // alias → canonical `anthropic`
         let usable = vec![("anthropic".to_string(), CastUsability::Ready)];
         let text = kaibo_instructions_with_scope(
-            &[],
             &config,
             &[PathBuf::from("/tmp")],
             None,
@@ -689,7 +647,6 @@ mod tests {
         // path a real explorer-only cast takes, without fabricating one in the config.
         let usable = vec![("explorer-only".to_string(), CastUsability::Ready)];
         let text = kaibo_instructions_with_scope(
-            &[],
             &config,
             &[PathBuf::from("/tmp")],
             None,
@@ -710,14 +667,12 @@ mod tests {
     /// The resident handshake dropped the huge kaish onboarding reference entirely —
     /// it blew Claude Code's 2048-char instructions budget and buried `## Scope`
     /// below the truncation point. Order is now lead → casts → scope, and the old
-    /// reference marker must not appear at all. Fails while `kaish_reference` is
-    /// still composed into `kaibo_instructions_with_scope`.
+    /// reference marker ("The shell is kaish") must not appear at all.
     #[test]
     fn scope_follows_casts_and_the_kaish_reference_is_gone() {
         let config = Config::builtin();
         let usable = vec![("anthropic".to_string(), CastUsability::Ready)];
         let text = kaibo_instructions_with_scope(
-            &sample_schemas_for_ordering(),
             &config,
             &[PathBuf::from("/tmp")],
             None,
@@ -738,11 +693,6 @@ mod tests {
             "the resident handshake must drop the kaish onboarding reference \
              entirely — it no longer fits the truncation budget:\n{text}"
         );
-    }
-
-    /// A couple of builtins so the onboarding spine renders in ordering tests.
-    fn sample_schemas_for_ordering() -> Vec<ToolSchema> {
-        vec![ToolSchema::new("cat", "Read a file")]
     }
 
     /// Claude Code truncates a server's MCP `instructions` at exactly 2048
@@ -794,7 +744,6 @@ mod tests {
         ];
 
         let text = kaibo_instructions_with_scope(
-            &[],
             &config,
             &[PathBuf::from("/home/amy/src/some-project")],
             Some(Path::new("/home/amy/src/some-project")),
@@ -808,6 +757,36 @@ mod tests {
             len < 2048,
             "handshake must fit Claude Code's 2048-char instructions budget \
              (measured live, per-server, hardcoded), got {len} chars:\n{text}"
+        );
+    }
+
+    /// The *unconfigured* (fresh-install) handshake must fit the same 2048-char budget:
+    /// it prepends [`setup_section`] (per-backend key instructions) and renders no cast
+    /// roster, so it's a different budget shape than the configured case above — and the
+    /// same failure mode (a truncating host drops `## Scope`) applies. Uses the built-in
+    /// default cast (`anthropic`, one backend), the real fresh-install scenario. A custom
+    /// default cast naming many backends could still overflow — that's an operator edge
+    /// we can't bound here — but the shipped default must fit.
+    #[test]
+    fn unconfigured_instructions_fit_claude_code_budget() {
+        let config = Config::builtin(); // default cast "anthropic", one backend
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &[PathBuf::from("/home/amy/src/some-project")],
+            Some(Path::new("/home/amy/src/some-project")),
+            true,
+            CastUsability::Unconfigured,
+            &[], // nothing usable yet — the setup banner owns this case
+        );
+        let len = text.chars().count();
+        assert!(
+            text.contains("Setup needed"),
+            "the unconfigured handshake must lead with the setup banner:\n{text}"
+        );
+        assert!(
+            len < 2048,
+            "the fresh-install handshake must fit the 2048-char budget too, got \
+             {len} chars:\n{text}"
         );
     }
 

@@ -643,8 +643,8 @@ impl Config {
 
     /// Whether canonical cast `name` is the configured default — comparing against the
     /// *resolved* default, so an alias default (`server.cast = "claude"`) still matches
-    /// its canonical cast (`anthropic`). The roster renderers (`casts_section`,
-    /// `append_cast_roster`) get canonical names from [`usable_casts`](Self::usable_casts),
+    /// its canonical cast (`anthropic`). The roster renderer (`casts_section`) gets
+    /// canonical names from [`usable_casts`](Self::usable_casts),
     /// so a bare `name == default_cast` string compare would silently drop the
     /// `(default)` tag whenever the default was set by an alias. An unresolvable default
     /// (can't happen post-load, validated there) reads as "nothing is default".
