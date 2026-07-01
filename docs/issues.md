@@ -43,12 +43,13 @@ job record should carry its batch handle after submit). Persistence stays out of
 `explore`/`deliberate` descriptions are already drafted in the plan doc; they ship with
 their tools. Delete this entry when arc 2 ships.
 
-Small arc-1 tidy-ups (not blockers): `kaibo_instructions_with_scope`'s `schemas` param
-is now vestigial (`_schemas`) — drop it and update call sites. And the composed
-`agent_onboarding` spine (`kaibo_instructions`/`kaish_reference`) is no longer resident
-and isn't served standalone; if a caller wants the single-doc kaish mental model, serve
-it at `kaibo://kaish/onboarding` (the `kaibo://kaish/*` topic resources already cover
-the reference piecemeal, so low priority).
+Note (arc-1 follow-on, low priority): the composed `agent_onboarding` mental-model view
+is no longer produced anywhere — arc 1 deleted `kaibo_instructions`/`kaish_reference`
+along with the resident kaish reference. The `kaibo://kaish/*` topic resources
+(`syntax`, `builtins`, `vfs`, `scatter`, `sandbox`) cover the reference piecemeal and
+`run_kaish`'s description carries the operating contract, so nothing is lost for a
+caller today; if a single-doc kaish onboarding is ever wanted, recompose
+`Recipe::agent_onboarding()` behind a `kaibo://kaish/onboarding` resource.
 
 ### Media spine — perception in, production removed
 
