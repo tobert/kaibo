@@ -22,18 +22,34 @@ kaish-kernel 0.10.0.
 
 ## P1 — High-leverage features & robustness
 
-### Model-facing text pass + `deliberate` (Fable-batch consultation)
+### Model-facing text pass + `deliberate`/`explore` (Fable-batch consultation)
 
-Plan lives in **`docs/desc-and-schema-tuning.md`** (started 2026-07-01, w/ Amy). The
-caller's-seat audit found Claude Code truncates the handshake `instructions` at ~2.5 KB
-(the `## Scope` section never reaches the calling model) and defers tool schemas to
-names-only. The doc sequences: handshake restructure (scope above the kaish wall,
-byte-budget tests), lead rewrite (async lane is invisible today), renames of the generic
-async tools (`get`/`list`), schema hygiene (rustdoc cross-refs ship on the wire), and the
-big one — `deliberate`: an interactive Sonnet-class model builds a grounded dossier, then
-a frontier synth (Fable) deliberates on the batch lane at batch prices. Two Sonnet
-research passes pending (exact truncation caps; per-host instructions handling) — their
-numbers land in that doc. Delete this entry when the doc's sections have all shipped.
+Plan lives in **`docs/desc-and-schema-tuning.md`** (started 2026-07-01, w/ Amy).
+**Arc 1 (the holistic surface PR) shipped** — handshake restructure (scope above the
+kaish wall, kaish reference off the resident text, 2048-char budget + Scope-ordering
+tests), lead rewrite, `get`/`list`/`wait`/`cancel` → `job_*` renames, all descriptions
+rewritten to the doc's target drafts, `consult` pinned resident via
+`_meta["anthropic/alwaysLoad"]`, the "Casts ready now" prose tails dropped (the `cast`
+enum is the sole roster home), rustdoc cross-refs stripped from shipped schemas, and
+the AGENTS.md client-facing budget guidance.
+
+**Arc 2 — still open (`explore` + `deliberate`):** the config lane reshape first
+(per-slot lane `batch | direct`; today's batch casts become the degenerate case), then
+`explore` (a new `run_phase` composition over `report_preamble` — not a re-mount of the
+RunExplore sub-agent), then `deliberate` (dossier → offline synth, two lanes; the
+two-stage handle crosses the disjoint `job-N` / `backend/provider-id` namespaces — the
+job record should carry its batch handle after submit). Persistence stays out of scope
+(local `deliberate` jobs are session-scoped `job-N`, said loudly in the schema). The
+`explore`/`deliberate` descriptions are already drafted in the plan doc; they ship with
+their tools. Delete this entry when arc 2 ships.
+
+Note (arc-1 follow-on, low priority): the composed `agent_onboarding` mental-model view
+is no longer produced anywhere — arc 1 deleted `kaibo_instructions`/`kaish_reference`
+along with the resident kaish reference. The `kaibo://kaish/*` topic resources
+(`syntax`, `builtins`, `vfs`, `scatter`, `sandbox`) cover the reference piecemeal and
+`run_kaish`'s description carries the operating contract, so nothing is lost for a
+caller today; if a single-doc kaish onboarding is ever wanted, recompose
+`Recipe::agent_onboarding()` behind a `kaibo://kaish/onboarding` resource.
 
 ### Media spine — perception in, production removed
 

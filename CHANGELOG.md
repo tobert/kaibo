@@ -54,8 +54,8 @@ the git log. Each later release appends a new section at the top.
 - **`run_kaish`** — drive the read-only kaish shell yourself, no model in the loop:
   exit code + stdout + stderr.
 - **Batch (`batch_submit`)** — the *offline, async sibling* of `oneshot`: submit a list
-  of tool-less prompts, get a handle, then collect it with the shared `get`/`cancel`/
-  `list` verbs (see below) — read every answer when the provider's batch lane finishes,
+  of tool-less prompts, get a handle, then collect it with the shared `job_get`/`job_cancel`/
+  `job_list` verbs (see below) — read every answer when the provider's batch lane finishes,
   no call held open per answer. Built for fanning many prompts (or one hard question you'll wait on) at a
   top-tier model: it maxes the knobs (forces high thinking effort + a generous token
   budget) regardless of how the cast was tuned for interactive use, and a per-call
@@ -75,8 +75,8 @@ the git log. Each later release appends a new section at the top.
   (one flag over every verb). Batch carries its
   own system preamble fit to the offline lane — one complete, self-contained response with
   no follow-up, told to spend on depth — overridable via `[prompts].batch` like the other
-  phases. While a batch runs, `get` reminds you to go do other work and check back
-  rather than wait on it. Lost a handle? `list` re-discovers the batches a backend
+  phases. While a batch runs, `job_get` reminds you to go do other work and check back
+  rather than wait on it. Lost a handle? `job_list` re-discovers the batches a backend
   still holds (newest first, each with its handle, status, and progress), so a batch is
   never orphaned — defaulting across every batch-capable backend, or scoped to one with
   `backend`. **`attach`** lets you name workspace files to inline as shared context for
@@ -86,8 +86,8 @@ the git log. Each later release appends a new section at the top.
   (with a vision-capable synth model). Paths obey the same workspace boundary as
   everything else (worktrees included); a file outside it, a directory, an oversized
   file, or a binary that isn't a known image is refused with a clear error.
-- **`wait`** — block briefly and productively for your async work instead of
-  blind-polling `get`. Fire off consults and batches, do your other work, then `wait`
+- **`job_wait`** — block briefly and productively for your async work instead of
+  blind-polling `job_get`. Fire off consults and batches, do your other work, then `job_wait`
   when you're ready to spend a minute on kaibo: it blocks up to `timeout_secs` (you
   choose — no clamp; interruptible) and returns as soon as something lands, or on a clean
   timeout. By default it hands back what kaibo flags as worth your attention (a job
@@ -95,24 +95,25 @@ the git log. Each later release appends a new section at the top.
   `level: "info"` to also pull the watchable narrative — each kaish command, sweep, and
   milestone the agents ran — into your context. Name batch handles in `handles` to fold a
   one-shot poll of them in too. Nothing wakes you (you choose when to block) and it isn't
-  the source of truth — `get`/`list` are; a clean empty return just means nothing new yet.
+  the source of truth — `job_get`/`job_list` are; a clean empty return just means nothing new yet.
   This pairs with launching work in parallel: submit several, do everything else, then
-  `wait` to merge the outputs.
+  `job_wait` to merge the outputs.
 - **Async consults are watchable again.** A `consult_submit` job now streams its liveness
   (each kaish command, sweep, and milestone) onto kaibo's logging channel — the live
   "watch it work" view a synchronous `consult` always had, restored for the async path.
   It rides kaibo's level convention (Info = the narrative; Warn = "the calling model
-  should see this"), so a watching client sees the show and `wait` pulls the salient bits.
-- **`get` / `cancel` / `list`** — one shared surface to collect, stop, and survey
-  *both* kinds of async work, told apart by the handle: a batch handle is
-  `backend/provider-id`, a consult job is `job-N`. `get <handle>` returns a progress/
+  should see this"), so a watching client sees the show and `job_wait` pulls the salient bits.
+- **`job_get` / `job_cancel` / `job_list`** — one shared surface to collect, stop, and survey
+  *both* kinds of async work (the `job_` prefix self-namespaces even in hosts that
+  flatten tool names into one list), told apart by the handle: a batch handle is
+  `backend/provider-id`, a consult job is `job-N`. `job_get <handle>` returns a progress/
   status line while the work runs — for a consult job it echoes the latest investigation
-  beat (e.g. *currently: exploring …*) with a step count, the same one-liner `wait`
-  streams, so a poller sees forward motion — and the full result when it lands; `cancel <handle>`
-  stops it; `list` shows everything in flight — your in-memory consult jobs plus the
+  beat (e.g. *currently: exploring …*) with a step count, the same one-liner `job_wait`
+  streams, so a poller sees forward motion — and the full result when it lands; `job_cancel <handle>`
+  stops it; `job_list` shows everything in flight — your in-memory consult jobs plus the
   batches each backend still holds — each with a ready-to-use handle. One mental model
   for everything you submit. The verbs stay available as long as either `consult` or
-  batch is enabled (gated off only when both are). `list` trims its batch section to the
+  batch is enabled (gated off only when both are). `job_list` trims its batch section to the
   **last 24 hours** by default — a provider keeps months of finished batches and dumping
   them all just burns tokens, while anything older is done and still collectible by its
   handle; it reports how many it hid and takes `all: true` for the full history (true
@@ -127,15 +128,23 @@ the git log. Each later release appends a new section at the top.
   with a hosted synth. Built-in casts ship so
   kaibo runs with zero config; `config.toml` merges over them. Precedence:
   per-call > CLI > env > file > built-in, and a missing config file is not an error.
-  Your usable casts' names are advertised to the *calling* agent — both as the `cast`
-  param's enum and in the tool descriptions ("Casts ready now: …", with the default
-  flagged) — so a host told "have deepseek review this" routes off the roster, and a
-  meaningful name (`local-only`, `deep-dive`) reads as intent without the caller opening
-  your config. The startup handshake's `## Casts` roster goes further: each line names
+  Your usable casts' names are advertised to the *calling* agent as the per-lane `cast`
+  param enum (the tool's schema, with the default flagged) — so a host told "have
+  deepseek review this" routes off the roster, and a meaningful name (`local-only`,
+  `deep-dive`) reads as intent without the caller opening your config. The startup
+  handshake's `## Casts` roster goes further: each line names
   the cast's **answering (synth) model** and tags a batch-only cast `batch`, so a host
   told "ask Gemini Pro" indexes `gemini-batch → gemini/gemini-pro-latest (batch)` — and
   knows it's the `batch_submit` lane — without reading `kaibo://config`.
-- **Guided setup.** A built-in `configure` MCP prompt walks your host agent through
+- **Handshake built to the host's real limits.** Claude Code truncates a server's MCP
+  `instructions` at 2048 characters (measured, per-server, hardcoded) — so the resident
+  handshake is budgeted to fit, with `## Scope` (the read-only/containment posture)
+  moved *above* that fold where a truncating host used to drop it. The kaish shell
+  reference leaves the resident text entirely — `run_kaish`'s own description and the
+  `kaibo://kaish/*` resources carry it — and each tool description now stands alone
+  (some hosts show the model no instructions at all) and opens with the words an agent
+  would search for. Under hosts that defer tool schemas to names-only, `consult` is
+  pinned resident (`_meta["anthropic/alwaysLoad"]`) so the front door is always legible.
   writing `config.toml`, alongside `kaibo://config` (resolved runtime state) and
   `kaibo://config/example` (annotated template) resources. Secrets are referenced by
   env-var name or key-file path, never inlined. `kaibo://config` flags any per-slot

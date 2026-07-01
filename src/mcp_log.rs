@@ -24,14 +24,14 @@
 //! **kaibo's level convention — audience, not severity.** Within the `kaibo` target
 //! tree, levels route a record to *who needs it*, not how dire it is:
 //! - **Error** — a real kaibo error: to the watching client, to the calling model's
-//!   `wait` drain, and to stderr.
+//!   `job_wait` drain, and to stderr.
 //! - **Warn = "the calling model should see this"** — salient/actionable (a job
 //!   finished or failed, the research budget ran out), *not* a dire warning. This is
-//!   the level `wait` returns to the model by default. Any kaibo code (and kaish, via
+//!   the level `job_wait` returns to the model by default. Any kaibo code (and kaish, via
 //!   a future hook) marks something for the model's attention by emitting it at Warn.
 //! - **Info** — the watchable narrative: each kaish command, sweep, and milestone (see
 //!   [`TracingSink`](crate::progress::TracingSink)). The user's live "watch it work"
-//!   view; the model only pulls it into `wait` on request.
+//!   view; the model only pulls it into `job_wait` on request.
 //! - **Debug** — the true firehose, off by default.
 //!
 //! The convention is safe to assert here because [`KAIBO_TARGET`] filtering means
@@ -124,12 +124,12 @@ impl LogRecord {
 
 /// A bounded, in-memory ring of recent [`LogRecord`]s — the pull side of the bridge.
 /// The same events the [`McpBridgeLayer`] streams to a watching client are teed here so
-/// the calling model can *drain* them on demand via the `wait` tool, filtered to the
+/// the calling model can *drain* them on demand via the `job_wait` tool, filtered to the
 /// level it cares about (Warn+ by default — kaibo's "the model should see this" bar).
 ///
 /// Capacity-bounded (oldest dropped), per session, deliver-once: a drained record is
-/// removed. It is **not** load-bearing — `get`/`list` stay the authoritative source of a
-/// job's state; a record that ages out just means the model uses `get`. `Clone` shares
+/// removed. It is **not** load-bearing — `job_get`/`job_list` stay the authoritative source of a
+/// job's state; a record that ages out just means the model uses `job_get`. `Clone` shares
 /// one `Arc<Mutex<_>>` + `Notify`, so the layer (which pushes) and the handler (which
 /// drains) hold the same ring. The mutex is only ever held for `VecDeque` ops, never
 /// across an `.await`.
@@ -154,7 +154,7 @@ impl NotificationBuffer {
 
     /// Append a record, dropping the oldest if at capacity, and wake one waiter. Called
     /// from the sync layer, so it never blocks or awaits. `notify_one` stores a permit if
-    /// no one is waiting yet, so a push that races a `wait`'s registration isn't missed.
+    /// no one is waiting yet, so a push that races a `job_wait`'s registration isn't missed.
     fn push(&self, record: LogRecord) {
         {
             let mut q = self.lock();
@@ -194,11 +194,11 @@ impl NotificationBuffer {
     }
 
     /// Drop any buffered record carrying `job = <id>` — the completion ping a finished
-    /// job pushed (`jobs.rs`, at **Warn**). Once that job is collected via `get`, the ping
-    /// is stale news: left in the ring it would make the *next* `wait` return instantly on
-    /// old activity instead of blocking for something new (the "`wait` returns too fast"
-    /// bug). Idempotent — a ping a live `wait` already drained leaves nothing to remove —
-    /// and scoped to the one id, so an *uncollected* job's ping still wakes a later `wait`.
+    /// job pushed (`jobs.rs`, at **Warn**). Once that job is collected via `job_get`, the ping
+    /// is stale news: left in the ring it would make the *next* `job_wait` return instantly on
+    /// old activity instead of blocking for something new (the "`job_wait` returns too fast"
+    /// bug). Idempotent — a ping a live `job_wait` already drained leaves nothing to remove —
+    /// and scoped to the one id, so an *uncollected* job's ping still wakes a later `job_wait`.
     pub fn discard_job_pings(&self, id: &str) {
         self.lock()
             .retain(|rec| rec.fields.get("job").and_then(Value::as_str) != Some(id));
@@ -219,10 +219,10 @@ impl NotificationBuffer {
     }
 
     /// The streaming core behind [`wait_drain`]: drain every record at or above
-    /// `drain_floor`, hand each to `on_drained` (the `wait` tool streams the Info-level
+    /// `drain_floor`, hand each to `on_drained` (the `job_wait` tool streams the Info-level
     /// narrative to the client's progress channel here), and *return* those at or above
     /// `return_floor` (capped at `limit`). It blocks until a returnable record lands or
-    /// the deadline passes — so a default `wait` streams the narrative the whole time and
+    /// the deadline passes — so a default `job_wait` streams the narrative the whole time and
     /// returns only when something the model should act on (a completion) arrives.
     ///
     /// `drain_floor` ≤ `return_floor`: the caller drains *down to* what it streams (Info)
@@ -269,7 +269,7 @@ impl NotificationBuffer {
         }
     }
 
-    /// Records currently buffered. For tests and the `wait` footer.
+    /// Records currently buffered. For tests and the `job_wait` footer.
     pub fn len(&self) -> usize {
         self.lock().len()
     }
@@ -337,7 +337,7 @@ impl Visit for FieldVisitor {
 pub struct McpBridgeLayer {
     tx: UnboundedSender<LogRecord>,
     /// The pull-side ring, teed alongside the push channel: the same record streamed to
-    /// the client is buffered for the `wait` tool to drain. `None` when no buffer is
+    /// the client is buffered for the `job_wait` tool to drain. `None` when no buffer is
     /// wired (e.g. a test subscriber).
     buffer: Option<NotificationBuffer>,
 }
@@ -348,7 +348,7 @@ impl McpBridgeLayer {
     }
 
     /// Tee each mirrored record into `buffer` as well as the client channel, so the
-    /// calling model can drain it via `wait`.
+    /// calling model can drain it via `job_wait`.
     pub fn with_buffer(mut self, buffer: NotificationBuffer) -> Self {
         self.buffer = Some(buffer);
         self
@@ -373,7 +373,7 @@ impl<S: Subscriber> Layer<S> for McpBridgeLayer {
             message: visitor.message.unwrap_or_default(),
             fields: visitor.fields,
         };
-        // Tee to the pull-side ring (for `wait`) before the push channel (for the
+        // Tee to the pull-side ring (for `job_wait`) before the push channel (for the
         // streaming client). Both are infallible/non-blocking — never panic in a log path.
         if let Some(buffer) = &self.buffer {
             buffer.push(record.clone());
@@ -522,7 +522,7 @@ mod tests {
 
     /// A finished job's completion ping (carrying `job=<id>`) is retired when that job is
     /// collected — but only that job's ping. The bug it guards: a stale ping left in the
-    /// ring makes the next `wait` return instantly instead of blocking for new work.
+    /// ring makes the next `job_wait` return instantly instead of blocking for new work.
     #[test]
     fn discard_job_pings_drops_only_the_named_jobs_ping() {
         fn ping(job: &str) -> LogRecord {
@@ -531,7 +531,7 @@ mod tests {
             LogRecord {
                 level: LoggingLevel::Warning,
                 target: "kaibo::jobs".into(),
-                message: format!("async job finished — collect it with `get` ({job})"),
+                message: format!("async job finished — collect it with `job_get` ({job})"),
                 fields,
             }
         }
@@ -552,7 +552,7 @@ mod tests {
         assert_eq!(
             left,
             vec![
-                "async job finished — collect it with `get` (job-2)".to_string(),
+                "async job finished — collect it with `job_get` (job-2)".to_string(),
                 "a jobless warn".to_string(),
             ]
         );

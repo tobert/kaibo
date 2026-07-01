@@ -88,14 +88,14 @@ impl ProgressSink for NullSink {
 /// the `kaibo::consult` target. An *async* phase has no live MCP peer to push progress
 /// notifications to, so this is how it stays legible: the `mcp_log` bridge mirrors these
 /// `tracing` events to a watching client (the live "watch it work" view sync `consult`
-/// gave), and the notification ring buffer tees them for `wait`.
+/// gave), and the notification ring buffer tees them for `job_wait`.
 ///
 /// Levels follow kaibo's convention — **Warn = "promote to the calling model"**, Info =
 /// the watchable narrative — *not* severity:
 /// - `KaishRun`, the sweep events, and phase start/finish → **Info**: each shell command
 ///   and milestone, the user's continuous view.
 /// - `TurnCapReached` → **Warn**: the caller should know the research budget ran out and
-///   the answer was written early, so it surfaces in the model's `wait` drain.
+///   the answer was written early, so it surfaces in the model's `job_wait` drain.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TracingSink;
 
@@ -114,9 +114,9 @@ impl ProgressSink for TracingSink {
 
 /// A [`ProgressSink`] decorator that remembers the most recent beat while teeing each
 /// event to an inner sink. An async `consult` job streams its progress to the caller
-/// through `wait` (the inner [`TracingSink`] → notification ring); a caller polling with
-/// `get` reads no stream, so the job also holds one of these and `get` echoes
-/// [`latest`](Self::latest) inline. Records *and* forwards — the `wait`/`mcp_log` view is
+/// through `job_wait` (the inner [`TracingSink`] → notification ring); a caller polling with
+/// `job_get` reads no stream, so the job also holds one of these and `job_get` echoes
+/// [`latest`](Self::latest) inline. Records *and* forwards — the `job_wait`/`mcp_log` view is
 /// unchanged. State is a tiny `Mutex` (last message + beat count); `emit` stays sync and
 /// infallible per the [`ProgressSink`] contract.
 #[derive(Debug)]
@@ -129,14 +129,14 @@ pub struct ProgressLog {
 struct ProgressState {
     /// The most recent event's glanceable one-liner, or `None` before the first beat.
     latest: Option<String>,
-    /// How many beats have fired — lets `get` show forward motion ("step 7") even when
+    /// How many beats have fired — lets `job_get` show forward motion ("step 7") even when
     /// two polls land on the same kind of beat.
     steps: u64,
 }
 
 impl ProgressLog {
     /// Wrap `inner`, recording each event before forwarding it. Pass [`NullSink`] for a
-    /// record-only log with nowhere to tee (what a test or a no-`wait` client uses).
+    /// record-only log with nowhere to tee (what a test or a no-`job_wait` client uses).
     pub fn new(inner: Arc<dyn ProgressSink>) -> Self {
         Self {
             inner,
@@ -144,13 +144,13 @@ impl ProgressLog {
         }
     }
 
-    /// A record-only log: nothing downstream, just the latest beat for `get` to echo.
+    /// A record-only log: nothing downstream, just the latest beat for `job_get` to echo.
     pub fn silent() -> Self {
         Self::new(Arc::new(NullSink))
     }
 
     /// The most recent beat's one-liner and the running beat count, or `None` if the
-    /// phase hasn't emitted yet. `get` renders this as the "currently …" tail on a
+    /// phase hasn't emitted yet. `job_get` renders this as the "currently …" tail on a
     /// still-running job.
     pub fn latest(&self) -> Option<(String, u64)> {
         let s = self.state.lock().expect("progress log mutex poisoned");
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn progress_log_step_count_advances_on_a_repeated_event_kind() {
-        // The step count is the "forward motion" signal `get` shows, so it must advance on
+        // The step count is the "forward motion" signal `job_get` shows, so it must advance on
         // *every* beat — including two of the same kind in a row (two `KaishRun`s), where
         // the message alone wouldn't tell a poller anything moved.
         let log = ProgressLog::silent();
@@ -331,8 +331,8 @@ mod tests {
 
     #[test]
     fn progress_log_tees_every_event_to_its_inner_sink() {
-        // A counting sink proves the decorator forwards, so the `wait`/mcp_log stream is
-        // untouched when a job also records for `get`.
+        // A counting sink proves the decorator forwards, so the `job_wait`/mcp_log stream is
+        // untouched when a job also records for `job_get`.
         #[derive(Debug, Default)]
         struct Counter(std::sync::atomic::AtomicUsize);
         impl ProgressSink for Counter {
@@ -345,7 +345,7 @@ mod tests {
         log.emit(PhaseEvent::SweepFinished);
         log.emit(PhaseEvent::PhaseFinished { phase: "consult" });
         assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-        // And it still recorded the last one for `get`.
+        // And it still recorded the last one for `job_get`.
         assert_eq!(log.latest(), Some(("consult complete".to_string(), 2)));
     }
 

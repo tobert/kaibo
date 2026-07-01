@@ -82,7 +82,7 @@ struct Args {
     #[arg(long)]
     no_run_kaish: bool,
 
-    /// Don't advertise `batch_submit`. The shared `get`/`cancel`/`list` verbs remain as
+    /// Don't advertise `batch_submit`. The shared `job_get`/`job_cancel`/`job_list` verbs remain as
     /// long as `consult` is on (they also collect consult jobs); they drop only when both
     /// `--no-batch` and `--no-consult` are set.
     #[arg(long)]
@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
     // before then — startup — buffer here and flush when draining begins, so the
     // client sees them too.
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
-    // The pull-side ring: the bridge layer tees kaibo-target records here so the `wait`
+    // The pull-side ring: the bridge layer tees kaibo-target records here so the `job_wait`
     // tool can drain them on demand (the same records it streams to the client). Created
     // before the subscriber so the layer and the handler share one ring. Bounded — old
     // records age out; it's a convenience, not the authoritative job state.

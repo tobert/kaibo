@@ -147,11 +147,21 @@ Two audiences are optimized differently:
 
 - **Client-facing text** — the MCP server instructions and each tool's `description`
   in `server.rs`, read by the *calling* agent. Density is existential here because it's
-  *resident* cost: the descriptions load into the caller's context every session
-  whether or not the tool is ever called — an unused tool still bills the user. We ask
-  people to spend a few tokens on kaibo in every session they connect us; each one has
-  to earn its place and be additive to their experience. Terse, concrete, no clause
-  that doesn't pay rent.
+  *resident* cost: an unused tool still bills the user every session. Hard numbers
+  (measured 2026-07-01): Claude Code truncates the instructions **and each tool
+  description at 2048 characters** (per server, hardcoded, silent). Claude Desktop
+  never shows instructions to the model at all, so **every description stands alone** —
+  a model that read nothing else still picks the right tool. In deferral hosts (Claude
+  Code, Codex) tool schemas default to names-only *and* the instructions double as the
+  tool-search **retrieval index** — the opening lines decide whether our tools get
+  *found* (front-load the words a working agent would search for: "codebase", "review",
+  "second opinion", "read-only", "batch"); pin a front-door tool resident with
+  `_meta["anthropic/alwaysLoad"]` (we pin `consult`). So: the first 2048 characters are
+  the whole resident pitch. Decisions above the line (what kaibo is, the casts, scope,
+  that an async lane exists); execution detail lives in schemas and resources *named
+  from above the line*. The `instructions_*` budget tests in `kaish_syntax.rs` enforce
+  the ceiling — a new clause must displace an old one. Terse, concrete, no clause that
+  doesn't pay rent.
 - **Agent-facing text** — preambles, the kaish cheatsheet, the casts' answering
   instructions, read by the commercial models *we* drive, with windows in the hundreds
   of thousands to millions of tokens. Here verbosity is *licensed where it shapes

@@ -434,7 +434,7 @@ fn parse_results_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
 pub fn render_poll(poll: &BatchPoll, label: &str) -> String {
     match poll {
         BatchPoll::Pending { completed, total } => {
-            format!("Batch in progress — {completed}/{total} requests done. No need to wait on it — go do other work and `get` this handle again later (it can take minutes to hours; the handle keeps).")
+            format!("Batch in progress — {completed}/{total} requests done. No need to wait on it — go do other work and `job_get` this handle again later (it can take minutes to hours; the handle keeps).")
         }
         BatchPoll::Cancelling => {
             "Batch is being canceled; poll again for the final per-item results.".to_string()
@@ -483,7 +483,7 @@ pub fn render_list(
         }
     }
     if !entries.is_empty() {
-        s.push_str("\n\nPoll one with `get <handle>`; cancel with `cancel <handle>`.");
+        s.push_str("\n\nPoll one with `job_get <handle>`; cancel with `job_cancel <handle>`.");
     }
     if !truncated.is_empty() {
         s.push_str(&format!(

@@ -9,19 +9,20 @@ use kaibo::config::Config;
 use kaibo::server::{KaiboHandler, ToolGating};
 
 /// Every advertised tool, sorted (the order `advertised_tools` returns). `consult` and
-/// `batch` each carry a `*_submit` under their own flag; the collect verbs `get`/
-/// `cancel`/`list`/`wait` are *shared* — they manage both kinds of handle and stay
-/// advertised as long as either capability is on, so they belong to neither flag.
+/// `batch` each carry a `*_submit` under their own flag; the collect verbs `job_get`/
+/// `job_cancel`/`job_list`/`job_wait` are *shared* — they manage both kinds of handle
+/// and stay advertised as long as either capability is on, so they belong to neither
+/// flag.
 const ALL_TOOLS: [&str; 9] = [
     "batch_submit",
-    "cancel",
     "consult",
     "consult_submit",
-    "get",
-    "list",
+    "job_cancel",
+    "job_get",
+    "job_list",
+    "job_wait",
     "oneshot",
     "run_kaish",
-    "wait",
 ];
 
 fn advertised(gating: ToolGating) -> Vec<String> {
@@ -40,13 +41,13 @@ fn default_advertises_all_tools() {
 #[test]
 fn each_flag_removes_exactly_its_own_tools() {
     // Each flag and the tool route(s) it drops *exclusively*. The shared collect verbs
-    // `get`/`cancel`/`list` belong to neither flag alone — gating one capability leaves
-    // them because the other still needs them — so they appear in no row's removed-set
-    // and are covered by the "every other tool remains" check below.
+    // `job_get`/`job_cancel`/`job_list` belong to neither flag alone — gating one
+    // capability leaves them because the other still needs them — so they appear in no
+    // row's removed-set and are covered by the "every other tool remains" check below.
     let cases: [(&[&str], ToolGating); 4] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
-            // `get`/`cancel`/`list` stay (batch still uses them).
+            // `job_get`/`job_cancel`/`job_list` stay (batch still uses them).
             &["consult", "consult_submit"],
             ToolGating {
                 consult: false,
@@ -68,8 +69,8 @@ fn each_flag_removes_exactly_its_own_tools() {
             },
         ),
         (
-            // `--no-batch` drops only `batch_submit`; `get`/`cancel`/`list` stay (consult
-            // still uses them).
+            // `--no-batch` drops only `batch_submit`; `job_get`/`job_cancel`/`job_list`
+            // stay (consult still uses them).
             &["batch_submit"],
             ToolGating {
                 batch: false,
@@ -95,12 +96,13 @@ fn each_flag_removes_exactly_its_own_tools() {
     }
 }
 
-/// The shared collect verbs (`get`/`cancel`/`list`) are gated by *either* capability:
-/// they stay while batch or consult is on, and drop only when both are off. A naive
-/// single-flag gate would fail the "stays with the other capability on" cases.
+/// The shared collect verbs (`job_get`/`job_cancel`/`job_list`) are gated by *either*
+/// capability: they stay while batch or consult is on, and drop only when both are
+/// off. A naive single-flag gate would fail the "stays with the other capability on"
+/// cases.
 #[test]
 fn shared_collect_verbs_track_both_capabilities() {
-    const VERBS: [&str; 4] = ["get", "cancel", "list", "wait"];
+    const VERBS: [&str; 4] = ["job_get", "job_cancel", "job_list", "job_wait"];
 
     // consult on, batch off — the verbs still serve consult jobs.
     let consult_only = advertised(ToolGating {
