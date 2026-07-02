@@ -39,6 +39,30 @@ No behavior measured (unlike #48's A/B), but the consult driver and cheatsheet n
 the same validated wide-span guidance, so a consult over big files should benefit from the
 same mechanism. The kaish `\|` grep habit is still routed upstream (kaish#60), untouched here.
 
+## 2026-07-02 — explorer reads big files in wide spans (A/B-validated)
+
+The explorer was chatty — many tiny reads. We instrumented it (PR #46's
+`kaish.exit_code`/`output_bytes` spans), traced two real deepseek sweeps, and found the
+cause: **the model slices big files into ~15-line reads by choice, not truncation** (the
+64 KiB cap never binds — 0–1 exit-3, every read well under it). `report_preamble`'s
+"most files are short / narrow-slice-after-truncation" gave a file too big to read whole
+no strategy, so the model defaulted to timid slicing.
+
+Fix (this change): give a big file a first-class **wide-span** strategy — `cat -n FILE |
+sed -n '1,400p'`, then `'401,800p'`, a few hundred lines a look. A/B (treatment binary
+swapped live, same questions, OTLP-measured): a broad sweep dropped **74 → 46** calls,
+reading `consult.rs` in **~13 wide spans (~100 lines each) instead of ~22 tiny ones**.
+Consistent across both test questions.
+
+Deliberately *not* included, though we tried them in the A/B: a `grep -E`-for-alternation
+steer and a `for f in …; do cat -n` batch idiom. The A/B showed the grep steer is
+**unreliable** — the model's GNU `grep 'a\|b'` reflex is too strong for one prose line
+(one run adopted `-E`, another ignored it and got *worse*, 12 failed greps). The real fix
+is upstream: **kaish#60** (support BRE `\|`), which also unlocks the multi-file batching
+the model reflexively attempts (`grep 'a\|b' f1 f2`). So this PR ships only the validated
+lever and leaves the grep line untouched. Ruled out entirely: a `slurp` tool / bigger read
+budget — the cap doesn't bind, so it would solve a problem we don't have.
+
 ## 2026-07-02 — run_kaish spans carry the script's exit code + size
 
 Chasing a real question — the explorer is chatty, doing many small reads where one

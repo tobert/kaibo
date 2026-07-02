@@ -270,6 +270,12 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- **The explorer reads big files in fewer, wider passes.** Its guidance now gives a
+  file too large to read whole a first-class strategy — a few wide `sed` spans (a few
+  hundred lines each) instead of many tiny slices — so a `consult`/`explore` over large
+  sources spends noticeably fewer tool calls gathering the same evidence (measured: a
+  broad sweep dropped from 74 read/search calls to 46, reading the same big file in ~13
+  wide spans instead of ~22 fifteen-line ones). No behavior change on short files.
 - **The `consult` driver and the shared kaish cheatsheet describe reading in wide
   passes**, matching the guidance the explorer got: a short file read whole, a big one
   in a few hundred-line spans. Several preambles also drop negative-example phrasing
