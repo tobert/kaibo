@@ -91,6 +91,60 @@ when the recorder is neutered (verified). This is groundwork for the explorer-pr
 A/Bs (for-loop multi-file reads, batched `cat|sed`) — measure the contributing factor
 before changing the prompt.
 
+## 2026-07-01 — the model-facing surface pass + the full consultation ladder (arc closeout)
+
+A two-arc effort (07-01 → 07-02, PRs #37–#47) planned in `docs/desc-and-schema-tuning.md`
+(now retired — the durable *rules* live in AGENTS.md's "Writing for models" and
+`docs/casts.md`; this is the *story*). It began by sitting in the caller's seat: we ran
+kaibo under Claude Code (07-01) and looked at what actually reaches the calling model.
+
+**The finding that drove it.** Claude Code truncates the MCP `instructions` **and each
+tool `description` at exactly 2048 characters, per server, hardcoded, silent** (binary
+v2.1.198, constant `hQ=2048`; no config knob, debug-log only). kaibo's `## Scope` section
+and kaish resource pointers were past the wall — the calling model never saw them. Two more
+host facts: MCP tool schemas default to **names-only** in deferral hosts (Claude Code,
+Codex) and there the `instructions` double as the tool-search **retrieval index** (the
+opening words decide whether our tools get *found*); Claude Desktop **never** shows
+`instructions` to the model at all, so each description must stand alone. These are now the
+budget rules in AGENTS.md.
+
+**Arc 1 — the holistic surface PR (#37).** One PR reworking the whole surface, reviewed
+whole because it's one composition read by one audience: handshake restructure (scope
+*above* the kaish wall, kaish reference off the resident text, a 2048-char budget test +
+Scope-ordering test written failing-first), lead rewrite, `get`/`list`/`wait`/`cancel` →
+`job_*`, every description rewritten to the drafted targets, `consult` pinned resident via
+`_meta["anthropic/alwaysLoad"]`, the cast roster single-homed in the `cast` enum, rustdoc
+cross-refs stripped from shipped schemas. Cross-family review (DeepSeek via kaibo's own
+`consult`, holistic — no diff handed to it) caught three real ones before merge: stray old
+tool names in `batch.rs`/`main.rs` narration, a dead `kaibo_instructions`/`kaish_reference`
+pair left behind, and an *unconfigured* handshake at 2451 chars (over the wall on a fresh
+install) — compressed to 1970, with a test to pin it.
+
+**Arc 2 — the ladder (#38–#40).** Per-slot lane reshape first (#38): `Lane` (`batch |
+direct`) moved onto `ModelSlot`, `Cast::batch` gone, `batch = true` normalized to sugar —
+which let a cast pair an interactive explorer with an offline synth (the `deliberate`
+shape). Then `explore` (#39): the evidence-gathering half of `consult` as its own tool, one
+explorer phase returning the cited report *verbatim*, sharing a `run_explore_phase` seam
+with the nested `explore′`. Then `deliberate` (#40): `explore → offline synth`, two lanes —
+provider batch (durable `backend/provider-id` handle) or local direct (session-scoped
+`job-N`). Its review caught a real gating gap (a 3rd async-handle producer that
+`--no-batch`/`--no-consult` could strand). The ladder now ships end to end:
+`run_kaish → explore → consult → deliberate`.
+
+**Health follow-ups (#41–#47).** We dogfooded a whole-`src/` health review — Fable-5 via
+`batch_submit` + `attach`, Gemini Pro via `deliberate`. Verdict: healthy, two swollen organs
+(`server.rs`, `consult.rs`), archaeological layers. Shipped from it: a `BatchProviderFactory`
+seam so the batch handlers are testable offline (#41, the thinnest coverage vs. blast
+radius); the lane→tool partition single-sourced through `CAST_ENUM_RULES` with a drift guard
+binding the shipped enum to each tool's gate (#42); `explore` widened to any cast with an
+explorer via `cast_can_explore` (#44); dead pre-backend OpenAI-key helpers removed (#45 —
+**verify-first paid off**: Fable's "vestiges" list overstated the dead code, so `load` and
+the `ProviderKind::FromStr` alias table stayed); `run_kaish` spans tagged with exit code +
+output size (#46); and the TLS client build folded to one site, `crate::tls::https_client`
+(#47), re-proving the C-free invariant. Left open in `issues.md`: the architecture-scale
+`consult.rs`/`server.rs`/`ConsultConfig` module splits, the `deliberate`-dossier-vs-caller-
+timeout mitigation, and the marginal `apply_raw_env` completeness guard.
+
 ## 2026-06-29 — kaish-kernel 0.10.0
 
 Bumped the published dep `0.9.0 → 0.10.0`. API-compatible this time — no kaibo call
