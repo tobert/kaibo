@@ -1356,10 +1356,11 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
     }
     // The offline batch lane's built-in casts (synth slot `lane = Batch`): staffed by
     // a single big, slow, capable synth — the model whose latency is *free* in batch
-    // but near-unusable interactively. They carry synth only: batch is a toolless
-    // oneshot (no explorer sweep), and the interactive tools that used an explorer now
-    // refuse an offline cast outright, so an explorer slot here would be dead weight
-    // advertising a consult-usability the lane no longer has.
+    // but near-unusable interactively. They carry synth only, because `batch_submit` is
+    // a toolless oneshot (no explorer sweep). A *user* cast may pair an interactive
+    // explorer with an offline synth — that's the `deliberate` shape, valid since the
+    // per-slot lane reshape — but these built-ins have no dossier phase to staff, so an
+    // explorer slot here would just be dead weight.
     //
     // gemini-batch synths Gemini Pro via the `gemini-pro-latest` *alias*, deliberately
     // not a pinned preview id: pinned Pro previews get retired out from under us (a live
