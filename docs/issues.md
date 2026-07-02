@@ -15,57 +15,12 @@ Conventions:
 - Priorities: **P1** high-leverage features & robustness · **P2** focused
   fixes & hardening · **P3** infra, perf, polish · **P4** eventually.
 
-History of shipped work moved to `docs/devlog.md` (2026-06-18). Newest entry there:
-kaish-kernel 0.10.0.
+History of shipped work moved to `docs/devlog.md` (2026-06-18). Newest entries there:
+the model-facing surface pass + the full consultation ladder (arc closeout, #37–#47).
 
 ---
 
 ## P1 — High-leverage features & robustness
-
-### Model-facing text pass + `deliberate`/`explore` (Fable-batch consultation)
-
-Plan lives in **`docs/desc-and-schema-tuning.md`** (started 2026-07-01, w/ Amy).
-**Arc 1 (the holistic surface PR) shipped** — handshake restructure (scope above the
-kaish wall, kaish reference off the resident text, 2048-char budget + Scope-ordering
-tests), lead rewrite, `get`/`list`/`wait`/`cancel` → `job_*` renames, all descriptions
-rewritten to the doc's target drafts, `consult` pinned resident via
-`_meta["anthropic/alwaysLoad"]`, the "Casts ready now" prose tails dropped (the `cast`
-enum is the sole roster home), rustdoc cross-refs stripped from shipped schemas, and
-the AGENTS.md client-facing budget guidance.
-
-**Arc 2 — in progress (`deliberate` remains):** the config lane reshape **shipped** —
-`Lane` (`batch | direct`) now lives on `ModelSlot`, not `Cast`; `Cast::batch` is gone;
-`batch = true` is backward-compat sugar normalized onto the synth slot's `lane` at load;
-today's built-in batch casts are the synth-only degenerate case, and a cast may now pair
-an interactive explorer with an offline synth (the `deliberate` shape). `direct` is
-validated, rendered (`kaibo://config`), and load-tested, but forward-declared — no tool
-routes to it yet, so a `direct` cast sits in neither the interactive nor the
-`batch_submit` `cast` enum, and is dropped from the handshake roster.
-
-`explore` **shipped** — the evidence-gathering half of `consult`, exposed as its own
-tool: a single explorer phase over the read-only project returning the cited report
-*verbatim* (no synth). It's a new `run_phase` composition — the inner `arm.run` was
-extracted to a shared `run_explore_phase` seam that both the nested `explore′`
-(`RunExplore::call`) and the top-level `explore_with` call, so the sweep bracket +
-reports-sink push stay with the sub-agent while `explore` is self-contained. Skips
-`reject_offline_cast` deliberately (it runs the *explorer* arm, which is interactive by
-construction — a lane on an explorer slot is a load error), gated by `--no-explore`,
-cross-family reviewed (DeepSeek + Gemini, both merge-ready).
-
-Still open: `deliberate` (dossier → offline synth, two lanes; the two-stage handle
-crosses the disjoint `job-N` / `backend/provider-id` namespaces — the job record should
-carry its batch handle after submit). Persistence stays out of scope (local `deliberate`
-jobs are session-scoped `job-N`, said loudly in the schema). The `deliberate` description
-is already drafted in the plan doc; it ships with the tool. Delete this entry when
-`deliberate` ships (arc 2 done).
-
-Note (arc-1 follow-on, low priority): the composed `agent_onboarding` mental-model view
-is no longer produced anywhere — arc 1 deleted `kaibo_instructions`/`kaish_reference`
-along with the resident kaish reference. The `kaibo://kaish/*` topic resources
-(`syntax`, `builtins`, `vfs`, `scatter`, `sandbox`) cover the reference piecemeal and
-`run_kaish`'s description carries the operating contract, so nothing is lost for a
-caller today; if a single-doc kaish onboarding is ever wanted, recompose
-`Recipe::agent_onboarding()` behind a `kaibo://kaish/onboarding` resource.
 
 ### Media spine — perception in, production removed
 
@@ -111,41 +66,13 @@ review by Gemini Pro (via `deliberate`). Verdict: healthy, with two swollen orga
 were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test pinning
 `deliberate`'s lane-capture-before-override). The rest, roughly in value order:
 
-- **Batch-provider injection seam + offline handler tests — IN FLIGHT** (`feat/batch-injection-seam`).
-  The batch handlers (`batch_submit`, `deliberate_batch`, the batch arms of `job_get`/
-  `job_list`/`job_cancel`) call `crate::batch::submitter`/`poller` directly, so — unlike the
-  consult side, fully offline-tested via `Arm::new` — they have no handler-level coverage.
-  Route them through a factory field on `KaiboHandler` (default = the real fns), inject
-  `ScriptedBatch`. Fable's "thinnest coverage relative to blast radius." Delete when it ships.
-- **Lane→tool partition unified — SHIPPED.** The enum injection now reads one
-  `CAST_ENUM_RULES` table (`server.rs`), and `cast_enum_never_advertises_a_gated_cast`
-  binds the *shipped* enum to each tool's call-time gate, so the advertised menu and the
-  gate can't drift. Residual (a discoverability nicety, not drift): `explore` has no lane
-  gate — it runs whatever cast's explorer — so it *accepts* an offline-synth cast with an
-  explorer (a `deliberate`/`direct` cast), but its `cast` enum only advertises interactive
-  casts (`cast_is_interactive`). The enum is a safe *subset* of what the gate accepts, so
-  nothing offered is refused; widening it to `has-explorer` (a `cast_can_explore` predicate)
-  would offer deliberate/direct casts for standalone `explore` too. Deferred to the tool-
-  surface-alignment discussion (w/ Amy) — it's a surface decision, not a bug.
-- **Vestiges cleanup — mostly done; Fable's list overstated the dead code (verified 2026-07-02).**
-  - `credentials.rs`: only `openai_key` + `resolve_openai_key` were truly dead (the pre-backend
-    OpenAI-key helpers, no callers) — **removed** with their tests. `load` is **kept**: it's used
-    by the `#[ignore]`d live-probe tests in `tests/consult.rs` to gate on key presence (not dead;
-    updated to stop referencing the removed `openai_key`). The live key path is `Backend::resolve_key`
-    + the pure `credentials::resolve`.
-  - `ProviderKind::FromStr`'s alias table is **not a vestige** — it's the live, tested `kind = "…"`
-    parser (accepts `claude`/`google`/`gemma`/`lemonade`/…), a *different* layer from
-    `config.rs::builtin_aliases` (backend/cast **names**). They overlap in spelling by design;
-    consolidating is a deliberate refactor, not dead-code removal. Left as-is.
-  - Finish the `batch_http_client` migration — **still open, its own PR:** `Arm::from_slot`
-    (`consult.rs`) hand-rolls the exact block `batch_http_client` already factors; route it through
-    a shared `crate::tls` helper. This touches the TLS client-build invariant, so it wants a
-    focused hard-look review (AGENTS.md). (`telemetry.rs` is *not* a duplicate — it builds the OTLP
-    exporter's own client; only the shared `ensure_crypto_provider()` is common, which it uses.)
-  - `merge_defaults` is **already exhaustive** (an explicit struct literal — a new `Defaults` field
-    fails to compile until wired). The real gap is `apply_raw_env` (mutation-based, no compile-time
-    forcing of a `KAIBO_` env var for a new field); a guard there is an artificial destructure —
-    marginal, deferred. `supported_kinds_list()`'s hand-maintained array is the same low-value shape.
+- **`apply_raw_env` has no compile-time completeness forcing (marginal).** `merge_defaults`
+  is exhaustive (an explicit struct literal — a new `Defaults` field fails to compile until
+  wired), but `apply_raw_env` is mutation-based, so a new `KAIBO_` env var for a new field can
+  be missed with no compiler nudge; `supported_kinds_list()`'s hand-maintained array is the same
+  shape. A guard there is an artificial destructure — low value, deferred. (The batch-provider
+  injection seam, the lane→tool partition unification, and the credentials/`batch_http_client`
+  vestige cleanups from this review all shipped — PRs #41/#42/#44/#45/#47.)
 - **Module splits (architecture-scale, own PRs, sequence deliberately).** `consult.rs` →
   `shaping` (`ModelShape`/`ModelCaps`/the id-classifiers/`default_models` — the provider-drift
   knowledge) + `engine` (`Arm`/`PhaseRunner`/`run_phase`/the view_image break-rewrite) +
@@ -521,6 +448,14 @@ all three families read it right otherwise — so they were left out of the rost
 ---
 
 ## P4 — Eventually
+
+### Recompose a single-doc kaish onboarding (if wanted)
+The composed `agent_onboarding` mental-model view is no longer produced anywhere — the
+surface pass (PR #37) deleted `kaibo_instructions`/`kaish_reference` along with the resident
+kaish reference. Nothing is lost for a caller today: the `kaibo://kaish/*` topic resources
+(`syntax`, `builtins`, `vfs`, `scatter`, `sandbox`) cover the reference piecemeal and
+`run_kaish`'s description carries the operating contract. If a single-doc kaish onboarding is
+ever wanted, recompose `Recipe::agent_onboarding()` behind a `kaibo://kaish/onboarding` resource.
 
 ### Config-overrideable system prompts — residual (the phase-preamble override shipped)
 The phase **preambles** are now config-overridable: `[prompts].<phase>` (`explorer` /
