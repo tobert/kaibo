@@ -110,7 +110,8 @@ fn kaibo_lead() -> &'static str {
      your own family. DeepSeek, Gemini, Anthropic, or a local model reads the \
      project READ-ONLY and answers with file:line citations. Say in prose what you \
      did or want to know — kaibo finds and reads the current code itself; no \
-     pasted files or diffs needed. `consult` is the front door. `oneshot` is a \
+     pasted files or diffs needed. `consult` is the front door. `explore` \
+     returns a cited survey report instead of an answer. `oneshot` is a \
      toolless second opinion when you own the context. `run_kaish` drives the \
      read-only shell directly. Work you don't wait on: `consult_submit` and \
      `batch_submit` return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` \

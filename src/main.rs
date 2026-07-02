@@ -74,6 +74,10 @@ struct Args {
     #[arg(long)]
     no_consult: bool,
 
+    /// Don't advertise the `explore` tool.
+    #[arg(long)]
+    no_explore: bool,
+
     /// Don't advertise the `oneshot` tool.
     #[arg(long)]
     no_oneshot: bool,
@@ -129,6 +133,7 @@ async fn main() -> Result<()> {
         args.cast.clone(),
         ToolDisables {
             consult: args.no_consult,
+            explore: args.no_explore,
             oneshot: args.no_oneshot,
             run_kaish: args.no_run_kaish,
             batch: args.no_batch,
