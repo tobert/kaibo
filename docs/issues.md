@@ -117,11 +117,16 @@ were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test
   consult side, fully offline-tested via `Arm::new` — they have no handler-level coverage.
   Route them through a factory field on `KaiboHandler` (default = the real fns), inject
   `ScriptedBatch`. Fable's "thinnest coverage relative to blast radius." Delete when it ships.
-- **Unify the lane→tool partition.** Which cast serves which tool is derived independently
-  in ~4 places (`inject_cast_enum`'s three rosters, the `reject_offline_cast`/
-  `require_batch_cast`/`require_deliberate_cast` gates, `casts_section`'s direct-filter). A
-  single `Config` source + a consistency test would stop them drifting; the `deliberate`
-  work made it a 3-way split.
+- **Lane→tool partition unified — SHIPPED.** The enum injection now reads one
+  `CAST_ENUM_RULES` table (`server.rs`), and `cast_enum_never_advertises_a_gated_cast`
+  binds the *shipped* enum to each tool's call-time gate, so the advertised menu and the
+  gate can't drift. Residual (a discoverability nicety, not drift): `explore` has no lane
+  gate — it runs whatever cast's explorer — so it *accepts* an offline-synth cast with an
+  explorer (a `deliberate`/`direct` cast), but its `cast` enum only advertises interactive
+  casts (`cast_is_interactive`). The enum is a safe *subset* of what the gate accepts, so
+  nothing offered is refused; widening it to `has-explorer` (a `cast_can_explore` predicate)
+  would offer deliberate/direct casts for standalone `explore` too. Deferred to the tool-
+  surface-alignment discussion (w/ Amy) — it's a surface decision, not a bug.
 - **Vestiges / finish-the-migration cleanups.** `credentials.rs` dead code (`load`,
   `openai_key`, `resolve_openai_key`) + the duplicate alias table in `ProviderKind::FromStr`
   (parallel to `config.rs::builtin_aliases`); finish the `batch_http_client` migration
