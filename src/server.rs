@@ -460,6 +460,12 @@ pub struct KaiboHandler {
     /// configured explicitly. Surfaced as "(inferred from launch cwd)" in the scope
     /// section and `kaibo://config` so the boundary stays legible.
     default_root_inferred: bool,
+    /// How the batch handlers build provider clients — the injection seam. `new` seeds
+    /// [`LiveBatchProviders`](crate::batch::LiveBatchProviders) (the real network
+    /// builders); tests swap in a scripted double via
+    /// [`with_batch_providers`](Self::with_batch_providers) to exercise the submit/poll
+    /// handler wiring offline. `Arc<dyn …>` so the derived `Clone` shares one factory.
+    batch_providers: Arc<dyn crate::batch::BatchProviderFactory>,
 }
 
 /// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
@@ -693,6 +699,8 @@ impl KaiboHandler {
             allowed_set: Arc::new(allowed),
             default_root: Arc::new(default_root),
             default_root_inferred,
+            // The real network-client builders; tests swap in a scripted double.
+            batch_providers: Arc::new(crate::batch::LiveBatchProviders),
         })
     }
 
@@ -701,6 +709,19 @@ impl KaiboHandler {
     /// keep `new(config)` unchanged for the many call sites and tests.
     pub fn with_notifications(mut self, buffer: crate::mcp_log::NotificationBuffer) -> Self {
         self.notifications = buffer;
+        self
+    }
+
+    /// Swap in a batch-provider factory — the seam that lets tests drive the batch
+    /// handlers (`batch_submit`, `deliberate`'s batch lane, the `job_*` batch arms) with a
+    /// scripted double instead of real network clients. A builder, like
+    /// [`with_notifications`](Self::with_notifications), so `new(config)` stays unchanged.
+    #[cfg(test)]
+    pub fn with_batch_providers(
+        mut self,
+        providers: Arc<dyn crate::batch::BatchProviderFactory>,
+    ) -> Self {
+        self.batch_providers = providers;
         self
     }
 
@@ -1862,7 +1883,7 @@ impl KaiboHandler {
         let (slot, backend, _caps) = self.batch_synth(cast)?;
         let backend_name = backend.name.clone();
         let model = slot.id.clone();
-        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
+        let provider = self.batch_providers.submitter(backend, slot, &self.config.defaults)
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let items = vec![crate::batch::BatchItem {
             custom_id: "0".to_string(),
@@ -2076,7 +2097,9 @@ impl KaiboHandler {
             .config
             .resolve_backend(backend_name)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        crate::batch::poller(backend).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
+        self.batch_providers
+            .poller(backend)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
     }
 
     /// The set of backend names `job_list` should query. An explicit `backend` scopes
@@ -2161,7 +2184,7 @@ impl KaiboHandler {
         self.gate_image_attachments(caps.vision, &attachments, &model, &cast.name)?;
         // Now build the network client (resolves the key); a batch-incapable backend is
         // refused honestly here.
-        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
+        let provider = self.batch_providers.submitter(backend, slot, &self.config.defaults)
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let items: Vec<crate::batch::BatchItem> = input
             .prompts
@@ -4193,6 +4216,34 @@ mod tests {
             .expect("handler builds")
     }
 
+    /// The joined text of a successful `CallToolResult` — for asserting on a handler's
+    /// reply message.
+    fn result_text(r: CallToolResult) -> String {
+        r.content
+            .into_iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A keyless config with both a synth-only batch cast (`mybatch`) and a
+    /// deliberate-shaped batch cast (`mydeliberate`, explorer + batch synth). Keyless so
+    /// the *real* provider build would need no key anyway; tests inject a scripted factory
+    /// so no network is touched regardless.
+    const BATCH_CASTS_TOML: &str = r#"
+        [backends.gem]
+        kind = "gemini"
+        key_optional = true
+
+        [casts.mybatch]
+        batch = true
+        synth = "gem/some-pro"
+
+        [casts.mydeliberate]
+        explorer = "gem/some-lite"
+        synth    = { backend = "gem", id = "some-pro", lane = "batch" }
+    "#;
+
     /// The live cast roster is stamped onto each consultation tool's `cast` param as
     /// a JSON-Schema `enum`, so an agent reads the menu off the schema it fills
     /// arguments from — the fix for casts being discoverable only in handshake prose
@@ -4531,6 +4582,160 @@ mod tests {
         assert!(
             format!("{err:?}").contains("not a batch cast"),
             "the handler must reject before building any provider client"
+        );
+    }
+
+    /// `batch_submit` end to end, offline through the injected factory: the handler
+    /// resolves the batch cast, mints the `backend/provider-id` handle, and hands each
+    /// prompt to the provider as its own indexed item. Closes the handler-level gap the
+    /// direct `batch::submitter` call left (the consult side already tests via `Arm::new`).
+    #[tokio::test]
+    async fn batch_submit_submits_through_the_injected_factory() {
+        let scripted = Arc::new(crate::batch::ScriptedBatch::new("msgbatch_x", vec![]));
+        let h = handler_from_toml(BATCH_CASTS_TOML).with_batch_providers(Arc::new(
+            crate::batch::ScriptedBatchProviders(scripted.clone()),
+        ));
+
+        let out = h
+            .batch_submit(Parameters(BatchSubmitInput {
+                prompts: vec!["first".into(), "second".into()],
+                attach: vec![],
+                cast: Some("mybatch".into()),
+                model: None,
+                backend: None,
+            }))
+            .await
+            .expect("scripted batch_submit succeeds");
+
+        assert!(
+            result_text(out).contains("gem/msgbatch_x"),
+            "the reply namespaces the scripted id under the cast's backend"
+        );
+        // Both prompts reached the provider, one item each, indexed 0..N.
+        let submits = scripted.submits();
+        assert_eq!(submits.len(), 1, "one batch submitted");
+        let items = &submits[0].2;
+        assert_eq!(
+            items.iter().map(|i| i.prompt.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            items.iter().map(|i| i.custom_id.as_str()).collect::<Vec<_>>(),
+            vec!["0", "1"],
+            "items carry their index as custom_id"
+        );
+    }
+
+    /// `deliberate`'s BATCH lane, tested directly — no explorer, no network. `deliberate_batch`
+    /// takes an already-built dossier and submits it as ONE item whose prompt is the
+    /// `deliberation_prompt` (question + dossier), passing the offline-synth system prompt
+    /// through and returning the durable handle. This is the batch-lane wiring `deliberate`
+    /// added, now covered offline.
+    #[tokio::test]
+    async fn deliberate_batch_lane_submits_the_dossier_as_one_item() {
+        let scripted = Arc::new(crate::batch::ScriptedBatch::new("msgbatch_d", vec![]));
+        let h = handler_from_toml(BATCH_CASTS_TOML).with_batch_providers(Arc::new(
+            crate::batch::ScriptedBatchProviders(scripted.clone()),
+        ));
+        let cast = h.config.resolve_cast("mydeliberate").unwrap().clone();
+
+        let out = h
+            .deliberate_batch(
+                &cast,
+                "gem/some-lite",
+                "Is the retry safe?",
+                "DOSSIER: src/x.rs:1 fn retry",
+                "offline-synth-system",
+            )
+            .await
+            .expect("scripted deliberate_batch succeeds");
+
+        assert!(
+            result_text(out).contains("gem/msgbatch_d"),
+            "the reply carries the durable batch handle"
+        );
+        let submits = scripted.submits();
+        assert_eq!(submits.len(), 1, "the dossier is one batch");
+        let (system, attach, items) = &submits[0];
+        assert_eq!(system, "offline-synth-system", "the system prompt passes through");
+        assert!(attach.is_empty(), "deliberate carries no attachments — the dossier is the prompt");
+        assert_eq!(items.len(), 1, "one item — the dossier, not fanned");
+        assert!(
+            items[0].prompt.contains("Is the retry safe?")
+                && items[0].prompt.contains("DOSSIER: src/x.rs:1 fn retry"),
+            "the one item is the deliberation_prompt — question AND dossier: {}",
+            items[0].prompt
+        );
+    }
+
+    /// `job_get`'s batch arm polls through the factory: a scripted `Done` renders the
+    /// item answers. Proves the collect path reaches the provider (not just the gate).
+    #[tokio::test]
+    async fn job_get_polls_a_batch_through_the_factory() {
+        let scripted = Arc::new(crate::batch::ScriptedBatch::new(
+            "msgbatch_x",
+            vec![crate::batch::BatchPoll::Done(vec![crate::batch::BatchAnswer {
+                custom_id: "0".into(),
+                text: Ok("THE DELIBERATION".into()),
+            }])],
+        ));
+        let h = handler_from_toml(BATCH_CASTS_TOML).with_batch_providers(Arc::new(
+            crate::batch::ScriptedBatchProviders(scripted.clone()),
+        ));
+
+        let out = h
+            .job_get(Parameters(HandleInput {
+                handle: "gem/msgbatch_x".into(),
+            }))
+            .await
+            .expect("scripted job_get succeeds");
+        assert!(
+            result_text(out).contains("THE DELIBERATION"),
+            "the batch's item answer is rendered"
+        );
+    }
+
+    /// `job_cancel` and `job_list`'s batch section also route through the factory — cancel
+    /// reaches the provider by id, and the listing renders the seeded batch.
+    #[tokio::test]
+    async fn job_cancel_and_list_reach_the_batch_through_the_factory() {
+        let scripted = Arc::new(
+            crate::batch::ScriptedBatch::new("msgbatch_x", vec![]).with_listing(
+                vec![crate::batch::BatchListItem {
+                    provider_id: "msgbatch_x".into(),
+                    status: "running".into(),
+                    completed: 0,
+                    total: 1,
+                    created_at: None,
+                }],
+                false,
+            ),
+        );
+        let h = handler_from_toml(BATCH_CASTS_TOML).with_batch_providers(Arc::new(
+            crate::batch::ScriptedBatchProviders(scripted.clone()),
+        ));
+
+        h.job_cancel(Parameters(HandleInput {
+            handle: "gem/msgbatch_x".into(),
+        }))
+        .await
+        .expect("scripted job_cancel succeeds");
+        assert_eq!(
+            scripted.canceled(),
+            vec!["msgbatch_x".to_string()],
+            "cancel reached the provider by id"
+        );
+
+        let out = h
+            .job_list(Parameters(ListInput {
+                all: false,
+                backend: Some("gem".into()),
+            }))
+            .await
+            .expect("scripted job_list succeeds");
+        assert!(
+            result_text(out).contains("msgbatch_x"),
+            "the seeded batch appears in the listing"
         );
     }
 
