@@ -242,15 +242,17 @@ pub fn report_preamble() -> String {
          answer — so your work is to gather grounded evidence and cite it exactly. \
          {core}\n\n\
          HOW TO READ. Read for the whole picture in as few looks as possible — the \
-         context window is yours to fill, so favor one wide look over many narrow \
-         ones. When a file is central, read it WHOLE with `cat -n FILE`: reach for \
-         this first; most files are short, one full read hands you its imports, its \
-         context, and exact line numbers together, and it surfaces what a surgical \
-         slice would miss. To locate something across files, take the surrounding \
-         context in the same call — `grep -rn -B4 -A8 PATTERN .` returns each match \
-         with the lines around it, ready to understand. If a whole-file read comes \
-         back truncated (exit 3, a head+tail sample), the file was too big for one \
-         look — narrow to the part you need with `cat -n FILE | sed -n 'A,Bp'`.\n\n\
+         context window is yours to fill, so favor wide looks over many narrow ones. \
+         A short file: read it WHOLE with `cat -n FILE` — one read hands you its \
+         imports, its context, and exact line numbers together, and surfaces what a \
+         surgical slice would miss. A big file (`wc -l FILE` if unsure): read it in a \
+         few WIDE spans — `cat -n FILE | sed -n '1,400p'`, then `'401,800p'` — a few \
+         hundred lines a look, not fifteen; stepping through in wide passes beats a \
+         dozen surgical slices, and a whole-file read that comes back truncated \
+         (exit 3, a head+tail sample) was simply too big, so step through it this way. \
+         To locate something across files, take the surrounding context in the same \
+         call — `grep -rn -B4 -A8 PATTERN .` returns each match with the lines around \
+         it, ready to understand.\n\n\
          HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
          each key symbol to where it is defined and where it is used; chase anything \
          that puzzles you until it is clear — a confusing spot usually hides the \
@@ -3750,11 +3752,15 @@ mod tests {
     #[test]
     fn report_preamble_keeps_the_reading_directive_and_report_shape() {
         let p = report_preamble();
-        // Reading strategy: read whole files, locate with a grep context buffer.
+        // Reading strategy: whole (short) files, wide spans for big ones, grep buffer.
         assert!(p.contains("cat -n FILE"), "whole-file read idiom: {p}");
         assert!(
             p.to_lowercase().contains("whole"),
             "the whole-file directive must survive: {p}"
+        );
+        assert!(
+            p.contains("sed -n '1,400p'"),
+            "big-file wide-span idiom: {p}"
         );
         assert!(
             p.contains("grep -rn -B4 -A8"),
