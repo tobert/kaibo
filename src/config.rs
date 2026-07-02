@@ -696,6 +696,19 @@ impl Config {
         self.cast_offline_lane(name) == Some(Lane::Batch)
     }
 
+    /// Whether canonical cast `name` can staff a `deliberate` call: an **offline
+    /// synth** (batch *or* direct lane) paired with an **explorer** slot to build the
+    /// dossier. A synth-only batch cast (no explorer — `gemini-batch`/`anthropic-batch`)
+    /// can't: it has no dossier phase. An interactive cast (no offline synth) belongs to
+    /// `consult`, not here. This is the third roster partition the per-slot lane reshape
+    /// enabled — and the one that finally routes a `Direct` synth (unreachable until
+    /// `deliberate` shipped).
+    pub fn cast_can_deliberate(&self, name: &str) -> bool {
+        self.casts.get(name).is_some_and(|c| {
+            c.synth_lane().is_some() && c.slot(ModelRole::Explorer).is_some()
+        })
+    }
+
     /// Whether canonical cast `name` is the configured default — comparing against the
     /// *resolved* default, so an alias default (`server.cast = "claude"`) still matches
     /// its canonical cast (`anthropic`). The roster renderer (`casts_section`) gets
@@ -1226,6 +1239,9 @@ impl Config {
         if disable.explore {
             self.tools.explore = false;
         }
+        if disable.deliberate {
+            self.tools.deliberate = false;
+        }
         if disable.oneshot {
             self.tools.oneshot = false;
         }
@@ -1259,6 +1275,7 @@ impl Config {
 pub struct ToolDisables {
     pub consult: bool,
     pub explore: bool,
+    pub deliberate: bool,
     pub oneshot: bool,
     pub run_kaish: bool,
     pub batch: bool,
@@ -1570,6 +1587,7 @@ struct RawServer {
 struct RawTools {
     consult: Option<bool>,
     explore: Option<bool>,
+    deliberate: Option<bool>,
     oneshot: Option<bool>,
     run_kaish: Option<bool>,
     batch: Option<bool>,
@@ -1946,6 +1964,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
     ToolGating {
         consult: raw.consult.unwrap_or(d.consult),
         explore: raw.explore.unwrap_or(d.explore),
+        deliberate: raw.deliberate.unwrap_or(d.deliberate),
         oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         batch: raw.batch.unwrap_or(d.batch),
@@ -2004,6 +2023,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_EXPLORE") {
         tools.explore = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_DELIBERATE") {
+        tools.deliberate = Some(false);
     }
     if env_flag(get, "KAIBO_NO_ONESHOT") {
         tools.oneshot = Some(false);

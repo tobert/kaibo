@@ -113,9 +113,10 @@ fn kaibo_lead() -> &'static str {
      pasted files or diffs needed. `consult` is the front door. `explore` \
      returns a cited survey report instead of an answer. `oneshot` is a \
      toolless second opinion when you own the context. `run_kaish` drives the \
-     read-only shell directly. Work you don't wait on: `consult_submit` and \
-     `batch_submit` return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` \
-     manage them."
+     read-only shell directly. Work you don't wait on: `deliberate` reasons \
+     offline over an investigated dossier (a frontier or big-local model); \
+     `consult_submit` and `batch_submit` return handles; \
+     `job_wait`/`job_get`/`job_list`/`job_cancel` manage them."
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has
@@ -156,14 +157,14 @@ fn setup_section(config: &Config) -> String {
     format!(
         "## Setup needed — no model provider configured\n\
          kaibo's default cast `{cast}` has no usable API key, so `consult`/`oneshot` \
-         can't reach a model yet. `run_kaish` works now (read-only shell, no model), so \
-         you can browse the code meanwhile.\n\n\
+         can't reach a model. `run_kaish` works now (read-only shell, no model) to \
+         browse the code meanwhile.\n\n\
          Give the cast a key via an **environment variable** or **key file** — kaibo \
-         reads either at startup, so it stays out of the chat (set it in your shell; \
-         don't paste it to the model):\n\
+         reads either at startup, kept out of the chat (set it in your shell, not \
+         pasted to the model):\n\
          {backends}\n\n\
-         Then **reconnect the kaibo MCP server** so it re-reads the environment — in \
-         Claude Code run `/mcp`; other hosts have their own reload. Prefer another \
+         Then **reconnect the kaibo MCP server** so it re-reads the environment \
+         (Claude Code: `/mcp`; other hosts: their own reload). Prefer another \
          provider? The annotated `kaibo://config/example` resource (→ \
          `~/.config/kaibo/config.toml`) shows every backend and cast.",
         cast = config.default_cast,
@@ -191,11 +192,11 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
     }
     let lines: String = usable
         .iter()
-        // A `direct`-lane cast is forward-declared (validated, rendered on
-        // `kaibo://config`) but no tool consumes it yet — the same reason it's absent
-        // from both `inject_cast_enum` partitions in `server.rs`. Advertising it here
-        // would name a cast every tool refuses, so drop it from the roster until a
-        // tool routes to it.
+        // A `direct`-lane cast is kept out of this *resident* roster to hold the 2048-char
+        // budget: `deliberate` now routes to it (its `cast` enum lists the deliberate-usable
+        // direct casts authoritatively, and `kaibo://config` renders every cast), so it's
+        // not unadvertised — just not in the always-billed handshake summary, which stays
+        // synth-voice-focused. The batch deliberate casts still appear here (tagged `batch`).
         .filter(|(name, _)| config.cast_offline_lane(name) != Some(Lane::Direct))
         .map(|(name, state)| {
             let mut tags = Vec::new();
@@ -235,9 +236,9 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 
     format!(
         "## Casts\n\
-         A cast is the model team that staffs a consultation; pass `cast=<name>`. \
-         Usable right now (resolved at startup — reconnect after a config or key \
-         change; `kaibo://config` lists every configured cast, not just these):\n\
+         A cast is the model team that answers; pass `cast=<name>`. Usable now \
+         (resolved at startup — reconnect after config/key changes; `kaibo://config` \
+         lists all configured, not just these):\n\
          {lines}\n\n"
     )
 }
@@ -308,9 +309,9 @@ pub fn kaibo_instructions_with_scope(
          {root_line}\n\
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
-         Go deeper without spending a turn: `kaibo://config` (full resolved config — \
-         casts, backends, gated tools, sandbox limits), `kaibo://tools` (attachments, \
-         overrides, the async workflow), `kaibo://kaish/*` (shell syntax and idioms)."
+         More without spending a turn: `kaibo://config` (full config — casts, backends, \
+         tools, limits), `kaibo://tools` (attachments, overrides, async), \
+         `kaibo://kaish/*` (shell idioms)."
     )
 }
 

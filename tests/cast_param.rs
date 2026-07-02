@@ -7,7 +7,7 @@
 //! silent drop into the default cast (serde drops unknown fields, a textbook silent
 //! fallback). These tests pin that end state.
 
-use kaibo::server::{ConsultInput, ExploreInput, OneshotInput, RunKaishInput};
+use kaibo::server::{ConsultInput, DeliberateInput, ExploreInput, OneshotInput, RunKaishInput};
 use serde_json::json;
 
 #[test]
@@ -23,6 +23,10 @@ fn cast_is_the_canonical_spelling_and_optional() {
     let e: ExploreInput = serde_json::from_value(json!({ "question": "q", "cast": "chimera" }))
         .expect("explore takes cast");
     assert_eq!(e.cast.as_deref(), Some("chimera"));
+
+    let b: DeliberateInput = serde_json::from_value(json!({ "question": "q", "cast": "fable" }))
+        .expect("deliberate takes cast");
+    assert_eq!(b.cast.as_deref(), Some("fable"));
 
     // Omitting it entirely falls through to the server's default cast.
     let d: ConsultInput =
@@ -69,6 +73,18 @@ fn a_typoed_argument_is_a_loud_error_not_a_silent_default_run() {
     // A synth-side arg has no home on explore (single-phase) — it must not vanish.
     serde_json::from_value::<ExploreInput>(json!({ "question": "q", "synth_model": "x" }))
         .expect_err("explore has no synth args — synth_model must not silently vanish");
+    // deliberate carries both explorer and synth overrides, but a session_id (it has no
+    // session) or a typo must still fault, not run on defaults.
+    serde_json::from_value::<DeliberateInput>(json!({ "question": "q", "session_id": "s" }))
+        .expect_err("deliberate has no session — session_id must not silently vanish");
+    let err = serde_json::from_value::<DeliberateInput>(
+        json!({ "question": "q", "synth_modle": "claude-fable-5" }),
+    )
+    .expect_err("a typo'd deliberate argument must be rejected");
+    assert!(
+        err.to_string().contains("synth_modle"),
+        "the error must name the unknown field, got: {err}"
+    );
 }
 
 /// The `provider` tombstone: with the transitional alias removed, a client still

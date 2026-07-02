@@ -52,6 +52,22 @@ the git log. Each later release appends a new section at the top.
   arguments; being single-phase, it has no synth args, `attach`, `context`, or `session_id`.
   The report carries the same provenance footer, naming the cast and the explorer that
   surveyed. Gated independently by `--no-explore`. For a synthesized answer, use `consult`.
+- **`deliberate`** — a top model's deepest reasoning on your codebase without holding a
+  session open: `explore → offline synth`. A fast model first investigates READ-ONLY and
+  builds a cited dossier (you wait for this — the same live sweep `explore` runs), then a
+  heavyweight synth reasons over that evidence *offline*. The synth's lane (a per-slot
+  property of its cast) picks the mechanism: **`batch`** — a frontier model on the
+  provider's batch lane (max thinking, half price), returning a durable `backend/provider-id`
+  handle the moment the dossier is submitted (collect it any time, even after a restart);
+  or **`direct`** — one long completion on a big *local* model, returning a session-scoped
+  `job-N` (`job_wait`/`job_get` it; a restart loses it). Needs a cast pairing an interactive
+  explorer with an offline synth (the example config's `fable`, `gemini-deliberate`, or
+  `local-direct`) — `deliberate`'s `cast` enum lists the usable ones and `kaibo://config`
+  shows each cast's lane. Reads the repo itself, so it takes `path` / `cast` /
+  `explorer_model` / `synth_model` (+ `_backend`s); the offline synth is a single turn, so
+  no `attach` / `context` / `session_id`. Gated independently by `--no-deliberate`. This is
+  the tool that finally routes the `direct` lane the per-slot lane reshape introduced. For
+  an answer this turn, use `consult`.
 - **`oneshot`** — a thin, direct second opinion from a model outside your family:
   prompt in, answer out, no codebase access and no tools, exactly one upstream
   request. The counterpart to `consult` for when you already own the context (you've

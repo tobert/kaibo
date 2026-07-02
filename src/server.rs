@@ -83,6 +83,10 @@ pub struct ToolGating {
     /// The single-phase `explore` sweep — its own gate, independent of `consult`
     /// (which carries its own explorer inside the driver loop).
     pub explore: bool,
+    /// The `deliberate` tool (explore → offline synth) — its own gate. The offline
+    /// deliberation rides the batch (or job) collect verbs, but the tool that *starts*
+    /// one is gated here, independent of `consult`/`batch`.
+    pub deliberate: bool,
     pub oneshot: bool,
     pub run_kaish: bool,
     /// The batch capability (submit/get/cancel/list) — one gate over all the verbs:
@@ -96,6 +100,7 @@ impl Default for ToolGating {
         Self {
             consult: true,
             explore: true,
+            deliberate: true,
             oneshot: true,
             run_kaish: true,
             batch: true,
@@ -106,7 +111,12 @@ impl Default for ToolGating {
 impl ToolGating {
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
-        !self.consult && !self.explore && !self.oneshot && !self.run_kaish && !self.batch
+        !self.consult
+            && !self.explore
+            && !self.deliberate
+            && !self.oneshot
+            && !self.run_kaish
+            && !self.batch
     }
 }
 
@@ -217,6 +227,54 @@ pub struct ExploreInput {
     pub explorer_backend: Option<String>,
 
     /// Max tool-loop turns for the explorer sweep (default 50).
+    #[serde(default)]
+    pub explorer_max_turns: Option<usize>,
+}
+
+/// Arguments to the `deliberate` tool: `explore → offline synth`. The explorer runs
+/// live to build a cited dossier (you wait for this — minutes), then the offline synth
+/// deliberates over it. No `session_id`/`attach`/`context`: deliberate reads the repo
+/// itself, and the synth is a single offline turn (so no `synth_max_turns`).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliberateInput {
+    /// The hard question to reason through. Say in prose what you want deliberated —
+    /// kaibo's explorer locates and reads the real, current code to build the dossier
+    /// the offline synth then reasons over.
+    pub question: String,
+
+    /// Absolute path to the project. Optional when the server has a default root; must
+    /// be at-or-under an allowed tree (`kaibo://config` shows the set).
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Which cast runs this call; omit for the server's default. A deliberate cast pairs
+    /// an interactive explorer with an OFFLINE synth (batch|direct lane) — pick from this
+    /// param's `enum`; `kaibo://config` lists every cast and its lane.
+    #[serde(default)]
+    pub cast: Option<String>,
+
+    /// Override the explorer (dossier-building) model id. See `kaibo://tools` for
+    /// override semantics; pair with `explorer_backend` to also retarget.
+    #[serde(default)]
+    pub explorer_model: Option<String>,
+
+    /// Run the explorer override on this backend (name or alias). Requires
+    /// `explorer_model`. See `kaibo://tools`.
+    #[serde(default)]
+    pub explorer_backend: Option<String>,
+
+    /// Override the synth (deliberating) model id. Its lane (batch|direct) still comes
+    /// from the cast's synth slot. Pair with `synth_backend` to also retarget.
+    #[serde(default)]
+    pub synth_model: Option<String>,
+
+    /// Run the synth override on this backend (name or alias). Requires `synth_model`.
+    /// See `kaibo://tools`.
+    #[serde(default)]
+    pub synth_backend: Option<String>,
+
+    /// Max tool-loop turns for the dossier-building explorer sweep (default 50).
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
 }
@@ -471,18 +529,22 @@ impl KaiboHandler {
             (gating.consult, "consult_submit"),
             // The single-phase explorer sweep — its own gate.
             (gating.explore, "explore"),
+            // `deliberate` starts an offline deliberation; its own gate. The collect
+            // verbs it hands off to (batch or job) live below, gated by their capability.
+            (gating.deliberate, "deliberate"),
             (gating.oneshot, "oneshot"),
             (gating.run_kaish, "run_kaish"),
             // `--no-batch` drops `batch_submit`; the shared collect verbs live below.
             (gating.batch, "batch_submit"),
             // `job_get`/`job_cancel`/`job_list`/`job_wait` manage *both* batch and
-            // consult handles, so they stay as long as *either* capability is on, and
-            // drop only when both are gated off. Routing by handle shape inside each
-            // verb refuses a handle whose own capability is disabled.
-            (gating.batch || gating.consult, "job_get"),
-            (gating.batch || gating.consult, "job_cancel"),
-            (gating.batch || gating.consult, "job_list"),
-            (gating.batch || gating.consult, "job_wait"),
+            // consult handles — and now `deliberate` handles too (batch on its batch
+            // lane, `job-N` on its direct lane) — so they stay as long as *any* of the
+            // three producers is on, and drop only when all are gated off. Routing by
+            // handle shape inside each verb refuses a handle whose producer is disabled.
+            (gating.batch || gating.consult || gating.deliberate, "job_get"),
+            (gating.batch || gating.consult || gating.deliberate, "job_cancel"),
+            (gating.batch || gating.consult || gating.deliberate, "job_list"),
+            (gating.batch || gating.consult || gating.deliberate, "job_wait"),
         ] {
             if !enabled {
                 assert!(
@@ -561,20 +623,27 @@ impl KaiboHandler {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        // A cast's synth lane (`Config::cast_offline_lane`, read off the synth slot)
-        // splits the roster three ways: interactive (no lane) → consult/consult_submit/
-        // oneshot; `Batch` → batch_submit; `Direct` → *neither* — it's forward-declared
-        // (validated, rendered) but no tool consumes an offline-direct synth yet, so it
-        // would silently pass either gate's schema without a route. A future PR adds its
-        // tool and this three-way split gains a third `inject_cast_enum` call. The gate
-        // enforces the same split at call time; this just keeps the advertised menu
-        // honest so an agent doesn't pick a cast its tool will refuse.
+        // A cast's synth lane (`Config::cast_offline_lane`, read off the synth slot) plus
+        // whether it carries an explorer splits the roster by which tools it can serve:
+        //   - interactive (no lane) → consult/consult_submit/explore/oneshot;
+        //   - `Batch` synth        → batch_submit (synth-only) AND, with an explorer, deliberate;
+        //   - `Direct` synth       → deliberate (with an explorer). No longer stranded —
+        //     `deliberate` is the tool the per-slot lane reshape promised for the direct lane.
+        // The batch and deliberate views OVERLAP (a deliberate-shaped batch cast like `fable`
+        // serves both), so they're filtered by ref, not a partition. The gate enforces the
+        // same split at call time; this keeps the advertised menu honest.
         let (interactive_usable, offline_usable): (Vec<String>, Vec<String>) = usable
             .into_iter()
             .partition(|n| config.cast_offline_lane(n).is_none());
         let batch_usable: Vec<String> = offline_usable
-            .into_iter()
+            .iter()
             .filter(|n| config.cast_is_batch(n))
+            .cloned()
+            .collect();
+        let deliberate_usable: Vec<String> = offline_usable
+            .iter()
+            .filter(|n| config.cast_can_deliberate(n))
+            .cloned()
             .collect();
         inject_cast_enum(
             &mut tool_router,
@@ -582,6 +651,7 @@ impl KaiboHandler {
             &interactive_usable,
         );
         inject_cast_enum(&mut tool_router, &["batch_submit"], &batch_usable);
+        inject_cast_enum(&mut tool_router, &["deliberate"], &deliberate_usable);
         // The `cast` enum (just above) is now the one authoritative per-lane roster —
         // the resident-prose roster this used to also append (`append_cast_roster`) was
         // redundant with it and has been dropped; see `docs/devlog.md`.
@@ -1231,6 +1301,29 @@ impl KaiboHandler {
         }
     }
 
+    /// Refuse `deliberate` on a cast without an **offline synth**. deliberate =
+    /// explore → offline synth, so the synth must run on the batch or direct lane
+    /// (an interactive synth belongs to `consult`). The other half — a *missing
+    /// explorer* — is caught when the explorer arm is resolved (`arm` errors, naming
+    /// the gap), the same way `explore` leans on it; here we only need the synth-lane
+    /// half. A synth-only batch cast (`anthropic-batch`) passes this but fails at the
+    /// explorer resolve, which is the honest error (no dossier phase to staff).
+    fn require_deliberate_cast(&self, cast: &Cast) -> Result<(), McpError> {
+        match cast.synth_lane() {
+            Some(_) => Ok(()),
+            None => Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` has no offline synth — `deliberate` needs a cast pairing an \
+                     interactive explorer with a synth on the `batch` or `direct` lane (the \
+                     example config's `fable`/`gemini-deliberate`/`local-direct`, or your \
+                     own). For an answer this turn, use `consult`.",
+                    cast.name
+                ),
+                None,
+            )),
+        }
+    }
+
     /// Apply a per-call model override to one of `cast`'s slots.
     ///
     /// The model id rides *verbatim* — an id containing `/` (HuggingFace-style
@@ -1632,6 +1725,202 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Put a top model's deepest reasoning on your codebase without holding \
+            a session open. A fast model first investigates the project READ-ONLY and \
+            assembles a cited dossier (you wait for this — minutes); a heavyweight synth \
+            then deliberates offline over that evidence — a frontier model on the \
+            provider's batch lane (max thinking, half price) or a big local model taking \
+            the time it takes. Returns a durable handle once the dossier is built; keep \
+            working, then `job_wait`/`job_get` it. Best for hard questions worth hours — a \
+            design review, a gnarly bug, \"is this abstraction right\". For an answer this \
+            turn, use `consult`."
+    )]
+    async fn deliberate(
+        &self,
+        Parameters(input): Parameters<DeliberateInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.resolve_root(input.path)?;
+        let mut cast = self.resolve_cast(input.cast)?;
+        // deliberate = explore → OFFLINE synth. Require the synth on an offline lane
+        // here; the other half — a present, interactive explorer — is enforced when the
+        // explorer arm resolves below (a synth-only batch cast has no explorer slot and
+        // `arm` errors clearly, the honest "no dossier phase to staff" refusal).
+        self.require_deliberate_cast(&cast)?;
+        // Capture the deliberation lane NOW, before any `synth_model` override: an
+        // override replaces the synth slot with a *bare* (laneless) one — it retargets the
+        // model, not the offline mechanism — so reading `synth_lane()` afterward would lose
+        // batch|direct. The lane is a property of the *cast* the caller chose; the override
+        // only swaps which model fills the slot.
+        let lane = cast
+            .synth_lane()
+            .expect("require_deliberate_cast guaranteed an offline synth");
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            input.explorer_model.as_deref(),
+            input.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            input.synth_model.as_deref(),
+            input.synth_backend.as_deref(),
+            "synth_model",
+            "synth_backend",
+        )?;
+        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        let explorer_model = explorer.model.clone();
+
+        // Stage 1 — build the dossier synchronously, on the live progress sink: the
+        // caller waits through this bounded (minutes) explorer sweep, exactly as `explore`
+        // does, so a thin/failed dossier is a clean error *before* any offline tokens are
+        // spent. Only the deliberation (Stage 2) is handed off async.
+        let progress = progress_sink(peer, &meta);
+        let defaults = &self.config.defaults;
+        let cfg = ConsultConfig {
+            explorer_max_turns: input
+                .explorer_max_turns
+                .unwrap_or(defaults.explorer_max_turns),
+            // The offline synth is a single turn (batch item / one direct completion), so
+            // synth_max_turns is inert — carried only to satisfy the shared config.
+            synth_max_turns: defaults.synth_max_turns,
+            sandbox: self.config.sandbox.clone(),
+            progress: progress.clone(),
+            house_rules: self.house_rules(&root)?,
+            prompts: self.resolved_prompts(&cast),
+            orientation: self.orientation(&root).await?,
+            // deliberate reads the repo itself — no caller attachments.
+            attachments: Vec::new(),
+        };
+        let span = tracing::info_span!("deliberate.dossier", cast = %cast.name, explorer_model = %explorer_model);
+        progress.emit(PhaseEvent::PhaseStarted { phase: "deliberate.dossier" });
+        let dossier = match explore_with(&input.question, root, &explorer, &cfg)
+            .instrument(span)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
+        };
+        progress.emit(PhaseEvent::PhaseFinished { phase: "deliberate.dossier" });
+
+        // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
+        // and the handle; both share the offline-synth preamble (`batch_system_prompt`,
+        // overridable via `[prompts].batch`).
+        let system = crate::consult::batch_system_prompt(self.config.prompts.batch.as_deref());
+        match lane {
+            Lane::Batch => {
+                self.deliberate_batch(&cast, &explorer_model, &input.question, &dossier, &system)
+                    .await
+            }
+            Lane::Direct => {
+                self.deliberate_direct_job(&cast, &explorer_model, &input.question, &dossier, &system)
+            }
+        }
+    }
+
+    /// Stage 2, batch lane: submit the dossier+question as a one-item provider batch
+    /// (max thinking, half price) and hand back the durable `backend/provider-id` handle.
+    /// The dossier phase already ran, so this is only the submit — reusing the same
+    /// `batch::submitter` + shaping `batch_submit` uses, minus the vision gate (deliberate
+    /// carries no attachments; the dossier is text in the item prompt).
+    async fn deliberate_batch(
+        &self,
+        cast: &Cast,
+        explorer_model: &str,
+        question: &str,
+        dossier: &str,
+        system: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let (slot, backend, _caps) = self.batch_synth(cast)?;
+        let backend_name = backend.name.clone();
+        let model = slot.id.clone();
+        let provider = crate::batch::submitter(backend, slot, &self.config.defaults)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+        let items = vec![crate::batch::BatchItem {
+            custom_id: "0".to_string(),
+            prompt: crate::consult::deliberation_prompt(question, dossier),
+        }];
+        let span = tracing::info_span!("deliberate.batch", cast = %cast.name, model = %model);
+        let provider_id = provider
+            .submit(system, &[], &items)
+            .instrument(span)
+            .await
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let handle = format!("{backend_name}/{provider_id}");
+        let msg = format!(
+            "Dossier built (explorer `{explorer_model}`) and handed to the batch lane as \
+             `{handle}` — cast `{}`, synth `{model}` at max thinking. It deliberates offline; \
+             collect it with `job_get {handle}` (durable — survives restart), or stop it with \
+             `job_cancel {handle}`. Nothing to wait on now.",
+            cast.name
+        );
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    /// Stage 2, direct lane: spawn a session-scoped `job-N` that runs the big LOCAL synth
+    /// as one long toolless completion over the dossier. No provider handle exists on this
+    /// lane, so the job stays `job-N` end to end (said loudly in the reply — a restart
+    /// loses it, matching the standing no-daemon decision). Mirrors `consult_submit`'s
+    /// spawn, but the background work is `deliberate_direct`, not the consult loop.
+    fn deliberate_direct_job(
+        &self,
+        cast: &Cast,
+        explorer_model: &str,
+        question: &str,
+        dossier: &str,
+        system: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let synth = self.arm(cast, ModelRole::Synth)?;
+        let synth_model = synth.model.clone();
+        // Same progress plumbing as consult_submit: a job has no live peer, so route
+        // liveness onto `tracing` and let the ProgressLog remember the latest beat for
+        // `job_get`/`job_list`. The sink handed to the phase is the same Arc the job
+        // snapshots, so what it reads is what the completion emitted.
+        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
+        let sink: Arc<dyn ProgressSink> = progress_log.clone();
+        let cast_name = cast.name.clone();
+        let explorer_model = explorer_model.to_string();
+        let question = question.to_string();
+        let dossier = dossier.to_string();
+        let system = system.to_string();
+        let label =
+            format!("cast `{cast_name}` deliberate (direct synth `{synth_model}`)");
+
+        let job_id = self.jobs.submit(label, progress_log, async move {
+            match crate::consult::deliberate_direct(&question, &dossier, &synth, &system, &sink)
+                .await
+            {
+                Ok(answer) => Ok(JobResult {
+                    answer: with_provenance(
+                        answer,
+                        &cast_name,
+                        &[
+                            ("explorer", explorer_model.as_str()),
+                            ("synth", synth_model.as_str()),
+                        ],
+                    ),
+                    report: None,
+                }),
+                Err(e) => Err(consultation_failure_text("deliberate", &cast_name, e)),
+            }
+        });
+
+        let msg = format!(
+            "Dossier built; the direct (local) synth is now deliberating offline as \
+             `{job_id}` — cast `{}`. This is one long local completion (it can take a \
+             while): `job_wait {job_id}` parks for it, `job_get {job_id}` collects, \
+             `job_cancel {job_id}` stops it. Session-scoped — the job lives for this \
+             server session only.",
+            cast.name
+        );
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
         description = "Ask a model outside your own family a direct question — prompt in, \
             answer out. No tools, no codebase access: the second-opinion primitive for \
             when you already own the context. Paste what's needed, or `attach` whole \
@@ -2000,8 +2289,9 @@ impl KaiboHandler {
     ) -> Result<CallToolResult, McpError> {
         let mut sections: Vec<String> = Vec::new();
 
-        // Consult jobs first — in-memory, this session, always shown when consult is on.
-        if self.config.tools.consult {
+        // In-memory jobs first — this session. `consult_submit` AND `deliberate`'s direct
+        // lane both land here, so show the section when either produces jobs.
+        if self.config.tools.consult || self.config.tools.deliberate {
             sections.push(render_jobs_section(&self.jobs.list()));
         }
 
@@ -2010,7 +2300,7 @@ impl KaiboHandler {
         // `backend`) becomes a *section note*, not a hard error — so it never sinks the
         // consult-jobs section above it. (A local-only setup with batch on but no
         // hosted backend is the common case here.)
-        if self.config.tools.batch {
+        if self.config.tools.batch || self.config.tools.deliberate {
             match self.batch_backends(input.backend.as_deref()) {
                 Ok(backends) => {
                     let mut entries: Vec<(String, crate::batch::BatchListItem)> = Vec::new();
@@ -2184,31 +2474,34 @@ impl KaiboHandler {
         ))]))
     }
 
-    /// Refuse a batch-shaped handle when batch is gated off — `job_get`/`job_cancel`
-    /// survive as long as *either* capability is on, so a handle can arrive for a
-    /// disabled one.
+    /// Refuse a batch-shaped handle only when *no tool that produces one* is enabled —
+    /// `job_get`/`job_cancel` survive as long as any producer is on, so a handle can
+    /// arrive for a producer that's off. A `backend/id` handle comes from `batch_submit`
+    /// OR `deliberate`'s batch lane, so either capability keeps it collectible.
     fn ensure_batch_enabled(&self, handle: &str) -> Result<(), McpError> {
-        if self.config.tools.batch {
+        if self.config.tools.batch || self.config.tools.deliberate {
             return Ok(());
         }
         Err(McpError::invalid_params(
             format!(
-                "`{handle}` looks like a batch handle (`backend/id`), but batch is \
-                 disabled on this server (--no-batch)."
+                "`{handle}` looks like a batch handle (`backend/id`), but nothing that \
+                 produces one is enabled on this server (--no-batch --no-deliberate)."
             ),
             None,
         ))
     }
 
-    /// Refuse a consult-job handle (`job-N`) when consult is gated off.
+    /// Refuse a `job-N` handle only when no tool that produces one is enabled. A `job-N`
+    /// comes from `consult_submit` OR `deliberate`'s direct lane, so either keeps it
+    /// collectible.
     fn ensure_consult_enabled(&self, handle: &str) -> Result<(), McpError> {
-        if self.config.tools.consult {
+        if self.config.tools.consult || self.config.tools.deliberate {
             return Ok(());
         }
         Err(McpError::invalid_params(
             format!(
-                "`{handle}` looks like a consult job (`job-N`), but consult is disabled \
-                 on this server (--no-consult)."
+                "`{handle}` looks like a background job (`job-N`), but nothing that \
+                 produces one is enabled on this server (--no-consult --no-deliberate)."
             ),
             None,
         ))
@@ -2607,6 +2900,30 @@ same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply; th
 `attach`, `context`, or `session_id` — those belong to the synthesizing tools. When you
 want the conclusion rather than the map, use `consult`.
 
+## Deepest reasoning, offline: `deliberate`
+
+`deliberate` is `explore → offline synth`: a fast model builds a cited dossier (you wait
+for this — the same live explorer sweep `explore` runs, minutes), then a heavyweight synth
+reasons over that evidence *offline*, so you don't hold a session open for the slow part.
+Reach for it on a hard question worth the wait — a design review, a gnarly bug, \"is this
+abstraction right\".
+
+The synth's **lane** (a per-slot property of the cast) picks the mechanism and the handle:
+
+- **`batch`** — a frontier model on the provider's batch lane (max thinking, half price).
+  `deliberate` returns a durable `backend/provider-id` handle the moment the dossier is
+  submitted; collect the deliberation with `job_get` any time, even after a restart.
+- **`direct`** — one long completion on a big *local* model (no batch API; it takes the
+  time it takes). Returns a session-scoped `job-N`; `job_wait`/`job_get` it. Session-scoped
+  means a server restart loses it — collect it in the same session.
+
+A deliberate cast pairs an interactive explorer with an offline synth (e.g. the example
+config's `fable`, `gemini-deliberate`, or `local-direct`); `kaibo://config` shows each
+cast's lane. Because the synth is toolless and can't come back for more, the dossier is
+built whole up front — deliberate reads the repo itself, so it takes `path` / `cast` /
+`explorer_model` / `synth_model` (+ their `*_backend`s), but no `attach` / `context` /
+`session_id`. For an answer this turn, use `consult`.
+
 ## Answer now, or hand off and collect later
 
 Each investigation/answer tool comes in a synchronous form and an async sibling. Use the
@@ -2762,6 +3079,7 @@ fn render_config_resource(
     struct ToolsDoc {
         consult: bool,
         explore: bool,
+        deliberate: bool,
         oneshot: bool,
         run_kaish: bool,
         batch: bool,
@@ -3003,6 +3321,7 @@ fn render_config_resource(
     let &ToolGating {
         consult,
         explore,
+        deliberate,
         oneshot,
         run_kaish,
         batch,
@@ -3054,6 +3373,7 @@ fn render_config_resource(
         tools: ToolsDoc {
             consult,
             explore,
+            deliberate,
             oneshot,
             run_kaish,
             batch,
@@ -3914,18 +4234,19 @@ mod tests {
         );
     }
 
-    /// The cast roster splits by lane on the advertised `cast` enums: the interactive
-    /// tools list non-batch casts, `batch_submit` lists batch casts — so an agent reading
-    /// the schema never offers a cast the tool will refuse. A `direct`-lane cast belongs
-    /// to neither enum yet — it's forward-declared (validated, rendered) but no tool
-    /// routes to it (see the roster-split comment in `KaiboHandler::new`). Driven through
-    /// a keyless local gemini backend so all three casts are usable regardless of which
-    /// API keys the test env carries.
+    /// The cast roster splits by lane AND by whether a cast carries an explorer, across
+    /// the advertised `cast` enums: interactive tools list non-offline casts;
+    /// `batch_submit` lists batch synths (explorer or not); `deliberate` lists offline
+    /// casts that ALSO have an explorer (its dossier phase). So a deliberate-shaped batch
+    /// cast (`mydeliberate`) rides both batch and deliberate; a synth-only batch cast
+    /// (`mybatch`) rides batch only; a synth-only `direct` cast (`mydirect`) rides none
+    /// (no explorer → nothing to build its dossier). Driven through a keyless local gemini
+    /// backend so every cast is usable regardless of the test env's API keys.
     #[test]
     fn cast_enums_split_by_lane() {
         let h = handler_from_toml(
             r#"
-            # A keyless (placeholder) batch-capable backend so all three casts are
+            # A keyless (placeholder) batch-capable backend so all casts are
             # "usable" offline — the partition is exercised with teeth, not trivially empty.
             [backends.gem]
             kind = "gemini"
@@ -3941,6 +4262,10 @@ mod tests {
 
             [casts.mydirect]
             synth = { backend = "gem", id = "some-big-local", lane = "direct" }
+
+            [casts.mydeliberate]
+            explorer = "gem/some-lite"
+            synth = { backend = "gem", id = "some-pro", lane = "batch" }
             "#,
         );
         let enum_of = |tool: &str| -> Vec<String> {
@@ -3959,35 +4284,44 @@ mod tests {
                 })
                 .unwrap_or_default()
         };
-        for tool in ["consult", "consult_submit", "oneshot"] {
+        for tool in ["consult", "consult_submit", "oneshot", "explore"] {
             let casts = enum_of(tool);
             assert!(
                 casts.iter().any(|c| c == "myinteractive"),
                 "{tool} enum should list the interactive cast, got {casts:?}"
             );
-            assert!(
-                !casts.iter().any(|c| c == "mybatch"),
-                "{tool} enum must not list a batch cast, got {casts:?}"
-            );
-            assert!(
-                !casts.iter().any(|c| c == "mydirect"),
-                "{tool} enum must not list a direct-lane cast (no tool routes to it \
-                 yet), got {casts:?}"
-            );
+            for offline in ["mybatch", "mydirect", "mydeliberate"] {
+                assert!(
+                    !casts.iter().any(|c| c == offline),
+                    "{tool} enum must not list the offline cast {offline}, got {casts:?}"
+                );
+            }
         }
         let batch = enum_of("batch_submit");
+        // Both batch synths (explorer or not) can be batch_submit'd — it's synth-only.
         assert!(
-            batch.iter().any(|c| c == "mybatch"),
-            "batch_submit enum should list the batch cast, got {batch:?}"
+            batch.iter().any(|c| c == "mybatch") && batch.iter().any(|c| c == "mydeliberate"),
+            "batch_submit enum should list both batch synths, got {batch:?}"
         );
+        for not_batch in ["myinteractive", "mydirect"] {
+            assert!(
+                !batch.iter().any(|c| c == not_batch),
+                "batch_submit enum must not list {not_batch}, got {batch:?}"
+            );
+        }
+        let deliberate = enum_of("deliberate");
+        // Only the offline-synth-WITH-explorer cast staffs a deliberation.
         assert!(
-            !batch.iter().any(|c| c == "myinteractive"),
-            "batch_submit enum must not list an interactive cast, got {batch:?}"
+            deliberate.iter().any(|c| c == "mydeliberate"),
+            "deliberate enum should list the explorer+offline-synth cast, got {deliberate:?}"
         );
-        assert!(
-            !batch.iter().any(|c| c == "mydirect"),
-            "batch_submit enum must not list a direct-lane cast, got {batch:?}"
-        );
+        for not_deliberate in ["mybatch", "mydirect", "myinteractive"] {
+            assert!(
+                !deliberate.iter().any(|c| c == not_deliberate),
+                "deliberate enum must not list {not_deliberate} (no explorer, or interactive \
+                 synth), got {deliberate:?}"
+            );
+        }
     }
 
     /// The lane gate's two halves, tested directly: an interactive tool refuses an
@@ -4046,6 +4380,69 @@ mod tests {
             "refusal should name the cast and explain it's direct, not batch, got: {msg}"
         );
         assert!(h.require_batch_cast(&batch).is_ok());
+
+        // `deliberate` needs an OFFLINE synth (batch OR direct). It only checks the synth
+        // lane here — the missing-explorer half is caught at the explorer arm resolve — so
+        // an interactive cast is refused (pointed at consult) while both offline lanes pass.
+        let err = h
+            .require_deliberate_cast(&interactive)
+            .expect_err("deliberate must refuse a cast with an interactive synth");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("anthropic") && msg.contains("consult"),
+            "refusal should name the cast and point at consult, got: {msg}"
+        );
+        assert!(
+            h.require_deliberate_cast(&batch).is_ok(),
+            "a batch synth is an offline synth — the explorer gap (if any) is the arm's job"
+        );
+        assert!(
+            h.require_deliberate_cast(&direct).is_ok(),
+            "a direct synth is an offline synth — deliberate's local lane"
+        );
+    }
+
+    /// `deliberate` is a third producer of async handles (a `backend/id` batch on its
+    /// batch lane, a `job-N` on its direct lane), so the runtime collect-guards must keep
+    /// its handles collectible even with `--no-consult --no-batch` — the per-handle mirror
+    /// of the advertisement test in tests/gating.rs. And with deliberate *also* off, no
+    /// producer remains, so both guards refuse.
+    #[test]
+    fn deliberate_keeps_its_handles_collectible() {
+        let deliberate_only = |deliberate: bool| {
+            let mut config = Config::builtin();
+            config.tools = ToolGating {
+                consult: false,
+                batch: false,
+                deliberate,
+                explore: true,
+                oneshot: true,
+                run_kaish: true,
+            };
+            KaiboHandler::new(config).expect("handler builds")
+        };
+
+        // deliberate on, consult+batch off: both handle shapes stay collectible.
+        let h = deliberate_only(true);
+        assert!(
+            h.ensure_batch_enabled("anthropic/msgbatch_x").is_ok(),
+            "a deliberate batch handle must stay collectible with --no-batch"
+        );
+        assert!(
+            h.ensure_consult_enabled("job-1").is_ok(),
+            "a deliberate direct `job-N` must stay collectible with --no-consult"
+        );
+
+        // deliberate off too: no producer remains, so each guard refuses its shape.
+        let off = deliberate_only(false);
+        assert!(
+            off.ensure_batch_enabled("anthropic/msgbatch_x").is_err(),
+            "with every batch producer off, a batch handle is refused"
+        );
+        assert!(
+            off.ensure_consult_enabled("job-1").is_err(),
+            "with every job producer off, a `job-N` is refused"
+        );
     }
 
     /// The gate is wired into the live `batch_submit` handler and fires *before* any

@@ -1811,6 +1811,53 @@ pub(crate) async fn explore_with(
     .await
 }
 
+/// Frame a built dossier + the original question into the offline synth's single
+/// user turn — the whole of what `deliberate`'s heavyweight synth reasons over, on
+/// either lane (a batch item's prompt, or the direct lane's one local completion).
+/// Pure, so the wire shape is pinned without a network.
+///
+/// The framing installs the deliberate posture: the dossier is *trusted* investigated
+/// evidence (a fast explorer read the real spans and cited them), so the synth spends
+/// its one offline turn reasoning the question all the way through, not re-verifying
+/// cites it can't cheaply re-derive — and names the edge of the evidence rather than
+/// guessing past it (the "thin dossier deliberating on air" failure the spec warns of).
+pub fn deliberation_prompt(question: &str, dossier: &str) -> String {
+    format!(
+        "A fast explorer investigated this codebase READ-ONLY and assembled the dossier \
+         below — spans it read from the real, current source, cited by `file:line`. Trust \
+         those citations as accurate and deliberate deeply over the question using this \
+         evidence: reason it all the way through, and say where the evidence runs out. If \
+         the dossier leaves a load-bearing detail open, reason under a stated assumption \
+         and flag what would change if it's wrong, rather than guessing silently.\n\n\
+         ## Question\n{question}\n\n## Dossier\n{dossier}"
+    )
+}
+
+/// Run `deliberate`'s offline synth on the **direct** lane: one long, toolless local
+/// completion over the dossier. Same shape as [`oneshot`] (empty toolset, a single
+/// turn — exactly one upstream request) but on the offline-synth preamble and framing
+/// the dossier as trusted evidence. The arm points at a big local model whose backend
+/// `request_timeout` is expected to stretch to hours; kaibo runs the one completion and
+/// waits — the provider (a llama.cpp-class server) queues, kaibo doesn't. `system` is
+/// the resolved offline-synth preamble (shared with batch via [`batch_system_prompt`]).
+pub async fn deliberate_direct(
+    question: &str,
+    dossier: &str,
+    synth: &Arm,
+    system: &str,
+    progress: &Arc<dyn ProgressSink>,
+) -> Result<String> {
+    synth
+        .run(
+            system,
+            Message::user(deliberation_prompt(question, dossier)),
+            1,
+            progress.as_ref(),
+            &|| Ok(Vec::new()),
+        )
+        .await
+}
+
 /// Run a `consult` over two resolved arms.
 ///
 /// One loop, two tools — no rigid explorer→synth hand-off. The capable model
@@ -2627,6 +2674,67 @@ mod tests {
             !events.contains(&PhaseEvent::SweepFinished),
             "explore is single-phase — no SweepFinished bracket belongs here: {events:?}"
         );
+    }
+
+    /// The deliberation prompt is the whole context the offline synth reasons over, so
+    /// pin its shape: both the question and the dossier survive, the question is read
+    /// before the evidence, and the trust-the-cites posture is installed (the guard
+    /// against a synth burning its one turn re-verifying, or deliberating on air).
+    #[test]
+    fn deliberation_prompt_carries_question_then_dossier_and_frames_trust() {
+        let p = deliberation_prompt("Is the retry path safe?", "src/retry.rs:12 fn retry()");
+        assert!(p.contains("Is the retry path safe?"), "question present: {p}");
+        assert!(p.contains("src/retry.rs:12 fn retry()"), "dossier present: {p}");
+        let q = p.find("## Question").expect("has a Question section");
+        let d = p.find("## Dossier").expect("has a Dossier section");
+        assert!(q < d, "the question is framed before the dossier evidence: {p}");
+        assert!(
+            p.contains("Trust") && p.contains("evidence"),
+            "installs the trusted-evidence posture: {p}"
+        );
+    }
+
+    /// The `direct` lane: `deliberate_direct` runs the offline synth as ONE toolless
+    /// turn over the dossier and returns its deliberation. Teeth: the synth must be
+    /// toolless (no `run_kaish`/`explore` — it reasons over the handed dossier, it
+    /// does not investigate), the dossier must reach it, and the result is the synth's
+    /// answer. This is the local-lane execution the `direct` cast finally routes to.
+    #[tokio::test]
+    async fn deliberate_direct_runs_one_toolless_turn_over_the_dossier() {
+        const SYNTH: &str = "big-local-synth";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                assert!(
+                    !has_tool(req, "run_kaish") && !has_tool(req, "explore"),
+                    "the direct synth deliberates toolless over the dossier"
+                );
+                let seen = transcript_text(req);
+                assert!(
+                    seen.contains("DOSSIER_MARKER"),
+                    "the built dossier must reach the synth: {seen}"
+                );
+                Ok(text_response("DELIBERATION: the retry path is safe because …"))
+            })
+            .build();
+
+        let cfg = ConsultConfig::default();
+        let out = deliberate_direct(
+            "Is the retry path safe?",
+            "src/retry.rs:12 DOSSIER_MARKER fn retry()",
+            &arm(&client, SYNTH),
+            "You are a capable model answering a hard question offline.",
+            &cfg.progress,
+        )
+        .await
+        .expect("scripted direct deliberation should succeed");
+
+        assert!(
+            out.contains("DELIBERATION"),
+            "returns the synth's deliberation verbatim: {out}"
+        );
+        // Exactly one upstream request — the single offline turn, no follow-up.
+        assert_eq!(client.requests_for(SYNTH).len(), 1, "one toolless completion");
     }
 
     /// Progress reaches the *deep* loop. The same delegate-then-read flow as the e2e
