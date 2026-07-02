@@ -468,6 +468,30 @@ pub struct KaiboHandler {
     batch_providers: Arc<dyn crate::batch::BatchProviderFactory>,
 }
 
+/// The single source mapping each cast-taking tool to the predicate that decides which
+/// *usable* casts its `cast` enum advertises — keyed on the cast's shape (synth lane +
+/// explorer, via the `Config::cast_is_*`/`cast_can_*` predicates). [`KaiboHandler::new`]
+/// injects the enums straight from this table, and
+/// `cast_enum_never_advertises_a_gated_cast` cross-checks the *shipped* enum against each
+/// tool's call-time gate — so the advertised menu and the gate that enforces it can't
+/// drift apart (the whole point of routing both through one place). A cast may match more
+/// than one rule (a deliberate-shaped batch cast like `fable` serves both `batch_submit`
+/// and `deliberate`); the rules are independent filters, not a partition. Keep this in
+/// step with the gates (`reject_offline_cast`/`require_batch_cast`/`require_deliberate_cast`)
+/// and the `advertised_tools()`/gating set — the consistency test is the guard.
+/// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, and the predicate
+/// (a `Config::cast_is_*`/`cast_can_*`) that decides which usable casts they advertise.
+type CastEnumRule = (&'static [&'static str], fn(&Config, &str) -> bool);
+
+const CAST_ENUM_RULES: &[CastEnumRule] = &[
+    (
+        &["consult", "consult_submit", "explore", "oneshot"],
+        Config::cast_is_interactive,
+    ),
+    (&["batch_submit"], Config::cast_is_batch),
+    (&["deliberate"], Config::cast_can_deliberate),
+];
+
 /// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
 /// consultation tool still in `router` (consult/oneshot — the tools whose `cast`
 /// selects the answering team). This surfaces the live roster
@@ -629,38 +653,22 @@ impl KaiboHandler {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        // A cast's synth lane (`Config::cast_offline_lane`, read off the synth slot) plus
-        // whether it carries an explorer splits the roster by which tools it can serve:
-        //   - interactive (no lane) → consult/consult_submit/explore/oneshot;
-        //   - `Batch` synth        → batch_submit (synth-only) AND, with an explorer, deliberate;
-        //   - `Direct` synth       → deliberate (with an explorer). No longer stranded —
-        //     `deliberate` is the tool the per-slot lane reshape promised for the direct lane.
-        // The batch and deliberate views OVERLAP (a deliberate-shaped batch cast like `fable`
-        // serves both), so they're filtered by ref, not a partition. The gate enforces the
-        // same split at call time; this keeps the advertised menu honest.
-        let (interactive_usable, offline_usable): (Vec<String>, Vec<String>) = usable
-            .into_iter()
-            .partition(|n| config.cast_offline_lane(n).is_none());
-        let batch_usable: Vec<String> = offline_usable
-            .iter()
-            .filter(|n| config.cast_is_batch(n))
-            .cloned()
-            .collect();
-        let deliberate_usable: Vec<String> = offline_usable
-            .iter()
-            .filter(|n| config.cast_can_deliberate(n))
-            .cloned()
-            .collect();
-        inject_cast_enum(
-            &mut tool_router,
-            &["consult", "consult_submit", "explore", "oneshot"],
-            &interactive_usable,
-        );
-        inject_cast_enum(&mut tool_router, &["batch_submit"], &batch_usable);
-        inject_cast_enum(&mut tool_router, &["deliberate"], &deliberate_usable);
-        // The `cast` enum (just above) is now the one authoritative per-lane roster —
-        // the resident-prose roster this used to also append (`append_cast_roster`) was
-        // redundant with it and has been dropped; see `docs/devlog.md`.
+        // Advertise each tool's `cast` enum from the one `CAST_ENUM_RULES` table: a cast's
+        // shape (synth lane + explorer) decides which tools it serves, and each rule is an
+        // independent filter (the batch and deliberate views OVERLAP — a deliberate-shaped
+        // batch cast like `fable` serves both). Routing every enum through this table (and
+        // cross-checking it against the gates in the consistency test) is what keeps the
+        // advertised menu and the call-time gate from drifting apart. The `cast` enum is the
+        // one authoritative per-lane roster — the resident-prose roster this used to also
+        // append (`append_cast_roster`) was dropped as redundant; see `docs/devlog.md`.
+        for (tools, eligible) in CAST_ENUM_RULES {
+            let casts: Vec<String> = usable
+                .iter()
+                .filter(|n| eligible(&config, n))
+                .cloned()
+                .collect();
+            inject_cast_enum(&mut tool_router, tools, &casts);
+        }
 
         // Pin `consult` resident under Claude Code's tool-schema deferral: a host may
         // defer every tool's schema to names-only until first use, but a `_meta`
@@ -4397,6 +4405,96 @@ mod tests {
                  synth), got {deliberate:?}"
             );
         }
+    }
+
+    /// The anti-drift guard for the lane partition: whatever `CAST_ENUM_RULES` advertises
+    /// on a tool's `cast` enum, that tool's call-time GATE must accept — so the menu the
+    /// model picks from never offers a cast the handler would refuse. Reads the *shipped*
+    /// enum (not the rules table) and runs each advertised cast through the real gate, over
+    /// a fixture with every cast shape. If a future edit points a tool's enum at the wrong
+    /// predicate, or a gate tightens without the enum following, this fails.
+    #[test]
+    fn cast_enum_never_advertises_a_gated_cast() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.inter]                                      # explorer + interactive synth
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+
+            [casts.oneshot_only]                               # synth-only, interactive
+            synth    = "gem/flash"
+
+            [casts.mybatch]                                    # synth-only batch
+            batch    = true
+            synth    = "gem/pro"
+
+            [casts.mydeliberate]                               # explorer + batch synth (both tools)
+            explorer = "gem/lite"
+            synth    = { backend = "gem", id = "pro", lane = "batch" }
+
+            [casts.mydirect]                                   # explorer + direct synth
+            explorer = "gem/lite"
+            synth    = { backend = "gem", id = "big", lane = "direct" }
+
+            [casts.mydirect_synthonly]                         # offline, no explorer → no tool
+            synth    = { backend = "gem", id = "big", lane = "direct" }
+            "#,
+        );
+        let enum_of = |tool: &str| -> Vec<String> {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Each cast-taking tool's call-time acceptance, in one place beside the enum rules.
+        let gate_accepts = |tool: &str, cast: &Cast| -> bool {
+            match tool {
+                "consult" | "consult_submit" | "oneshot" => {
+                    h.reject_offline_cast(cast, tool).is_ok()
+                }
+                // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
+                // is accepted (a missing explorer faults later at the arm resolve, not the gate).
+                "explore" => true,
+                "batch_submit" => h.require_batch_cast(cast).is_ok(),
+                "deliberate" => h.require_deliberate_cast(cast).is_ok(),
+                other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
+            }
+        };
+
+        let mut checked = 0;
+        for &(tools, _) in CAST_ENUM_RULES {
+            for &tool in tools {
+                let advertised = enum_of(tool);
+                assert!(
+                    !advertised.is_empty(),
+                    "the fixture must exercise `{tool}` — its enum is empty, so the guard is vacuous"
+                );
+                for name in advertised {
+                    let cast = h.config.resolve_cast(&name).expect("advertised cast resolves");
+                    assert!(
+                        gate_accepts(tool, cast),
+                        "tool `{tool}` advertises cast `{name}`, but its gate rejects it — \
+                         the enum and the gate have drifted"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "the guard checked nothing");
     }
 
     /// The lane gate's two halves, tested directly: an interactive tool refuses an
