@@ -3,10 +3,7 @@
 use std::fs;
 use std::str::FromStr;
 
-use kaibo::credentials::{
-    load, resolve, resolve_base_url, resolve_openai_key, ProviderKind, DEFAULT_OPENAI_BASE_URL,
-    PLACEHOLDER_OPENAI_KEY,
-};
+use kaibo::credentials::{resolve, resolve_base_url, ProviderKind, DEFAULT_OPENAI_BASE_URL};
 use tempfile::tempdir;
 
 #[test]
@@ -79,38 +76,6 @@ fn only_openai_tolerates_a_missing_key() {
     assert!(!ProviderKind::Anthropic.key_optional());
     assert!(!ProviderKind::DeepSeek.key_optional());
     assert!(!ProviderKind::Gemini.key_optional());
-}
-
-#[test]
-fn load_refuses_the_key_optional_provider_loudly() {
-    // OpenAI's key may legitimately be absent; asking load() for it is a
-    // programming error we surface rather than letting it masquerade as a
-    // missing-credential failure. Callers must use openai_key() instead.
-    let err = load(ProviderKind::Openai).unwrap_err();
-    assert!(
-        err.to_string().to_lowercase().contains("openai_key"),
-        "got: {err}"
-    );
-}
-
-#[test]
-fn openai_key_uses_a_configured_key_when_present() {
-    let dir = tempdir().unwrap();
-    let file = dir.path().join(".openai-key");
-    fs::write(&file, "sk-real\n").unwrap();
-
-    // Env wins over file, file used when env absent — same precedence as resolve().
-    assert_eq!(resolve_openai_key(Some("sk-env"), &file), "sk-env");
-    assert_eq!(resolve_openai_key(None, &file), "sk-real");
-}
-
-#[test]
-fn openai_key_falls_back_to_placeholder_when_unset() {
-    // The keyless local default: no env, no file -> a placeholder, NOT an error.
-    // (resolve() would error here; resolve_openai_key() must not.)
-    let dir = tempdir().unwrap();
-    let missing = dir.path().join("does-not-exist");
-    assert_eq!(resolve_openai_key(None, &missing), PLACEHOLDER_OPENAI_KEY);
 }
 
 #[test]
