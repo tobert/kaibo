@@ -5,6 +5,16 @@
 //! granularity the read-tool and orientation A/Bs both needed (the tool name alone
 //! couldn't separate a discovery `glob` from a `cat -n` read inside `run_kaish`).
 //!
+//! The `outcome` only says whether the tool *itself* worked — for `run_kaish` that's
+//! always `ok`, because a non-zero *script* exit is normal output handed to the model,
+//! not a tool failure (see `explorer.rs`). So the span carries two more optional fields
+//! a tool may fill about its result: `kaish.exit_code` (the script's exit — `3` is the
+//! head+tail truncation, `124` a timeout, `126` blocked) and `kaish.output_bytes` (the
+//! delivered stdout size). Recorded by `run_kaish` via [`record_kaish_result`]; left
+//! empty (and thus unexported) by every other tool. This is what lets a trace tell a
+//! `cat -n` that *truncated* and forced narrow re-reads from one the model chose to
+//! slice — the read-size question the explorer A/Bs turn on.
+//!
 //! It's *our* span on *our* tools, independent of what rig or a given provider
 //! instruments, so it lands the same on every backend. The wrapper sits at the
 //! `ToolDyn` seam (where `call` carries the raw JSON args) so it can summarize the
@@ -42,6 +52,11 @@ impl ToolDyn for Traced {
                 "gen_ai.tool.name" = %name,
                 "gen_ai.tool.arguments" = %summary,
                 outcome = field::Empty,
+                // Filled by `run_kaish` (via `record_kaish_result`) from inside the
+                // instrumented call — `Span::current()` is this span there. Every other
+                // tool leaves them empty, so they don't export.
+                "kaish.exit_code" = field::Empty,
+                "kaish.output_bytes" = field::Empty,
             );
             async {
                 let result = self.inner.call(args).await;
@@ -52,6 +67,19 @@ impl ToolDyn for Traced {
             .await
         })
     }
+}
+
+/// Record a `run_kaish` script's result onto the enclosing `tool` span — its exit
+/// code and delivered stdout size. Called from inside [`RunKaish::call`](crate::explorer),
+/// which runs under the [`Traced`] wrapper's span, so [`Span::current`] is that span
+/// and its pre-declared `kaish.*` fields fill in. Off the wrapped path (e.g. a direct
+/// worker call with no `tool` span current) this is a harmless no-op — best-effort
+/// observability, never load-bearing. The field names live *here*, with their
+/// declaration, so a caller can't silently mistype one.
+pub(crate) fn record_kaish_result(exit_code: i64, output_bytes: usize) {
+    let span = Span::current();
+    span.record("kaish.exit_code", exit_code);
+    span.record("kaish.output_bytes", output_bytes as u64);
 }
 
 /// Box a tool as a span-wrapped [`ToolDyn`] — the toolset-assembly drop-in for
@@ -197,8 +225,16 @@ mod tests {
         assert!(s.ends_with('…'), "marked truncated: {s}");
     }
 
-    /// One closed span as captured: (span name, tool name, arguments, outcome).
-    type CapturedSpan = (String, String, String, String);
+    /// One closed span as captured.
+    #[derive(Clone)]
+    struct CapturedSpan {
+        name: String,
+        tool: String,
+        args: String,
+        outcome: String,
+        kaish_exit: Option<i64>,
+        kaish_bytes: Option<u64>,
+    }
 
     /// Captures each [`CapturedSpan`] as its span closes.
     #[derive(Clone, Default)]
@@ -209,6 +245,8 @@ mod tests {
         tool: Option<String>,
         args: Option<String>,
         outcome: Option<String>,
+        kaish_exit: Option<i64>,
+        kaish_bytes: Option<u64>,
     }
     impl tracing::field::Visit for Grab {
         fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
@@ -217,6 +255,17 @@ mod tests {
                 "gen_ai.tool.arguments" => self.args = Some(v.to_string()),
                 "outcome" => self.outcome = Some(v.to_string()),
                 _ => {}
+            }
+        }
+        // `run_kaish`'s result fields arrive as native numbers, not strings.
+        fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+            if f.name() == "kaish.exit_code" {
+                self.kaish_exit = Some(v);
+            }
+        }
+        fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+            if f.name() == "kaish.output_bytes" {
+                self.kaish_bytes = Some(v);
             }
         }
         // `%summary`/`%name` record via Display, which arrives as a debug value.
@@ -231,10 +280,13 @@ mod tests {
             }
         }
     }
+    #[derive(Default)]
     struct Stored {
         tool: String,
         args: String,
         outcome: String,
+        kaish_exit: Option<i64>,
+        kaish_bytes: Option<u64>,
     }
 
     impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
@@ -250,6 +302,8 @@ mod tests {
                 tool: g.tool.unwrap_or_default(),
                 args: g.args.unwrap_or_default(),
                 outcome: g.outcome.unwrap_or_default(),
+                kaish_exit: g.kaish_exit,
+                kaish_bytes: g.kaish_bytes,
             });
         }
         fn on_record(
@@ -258,11 +312,21 @@ mod tests {
             values: &tracing::span::Record<'_>,
             ctx: Context<'_, S>,
         ) {
+            // `outcome` and the `kaish.*` result fields all land here (recorded after
+            // the span opens), so merge whichever this record carried.
             let mut g = Grab::default();
             values.record(&mut g);
-            if let (Some(span), Some(o)) = (ctx.span(id), g.outcome) {
+            if let Some(span) = ctx.span(id) {
                 if let Some(st) = span.extensions_mut().get_mut::<Stored>() {
-                    st.outcome = o;
+                    if let Some(o) = g.outcome {
+                        st.outcome = o;
+                    }
+                    if g.kaish_exit.is_some() {
+                        st.kaish_exit = g.kaish_exit;
+                    }
+                    if g.kaish_bytes.is_some() {
+                        st.kaish_bytes = g.kaish_bytes;
+                    }
                 }
             }
         }
@@ -270,10 +334,14 @@ mod tests {
             let span = ctx.span(&id).unwrap();
             let name = span.name().to_string();
             // Pull owned values out before the extensions borrow ends, then push.
-            let row = span
-                .extensions()
-                .get::<Stored>()
-                .map(|st| (name, st.tool.clone(), st.args.clone(), st.outcome.clone()));
+            let row = span.extensions().get::<Stored>().map(|st| CapturedSpan {
+                name,
+                tool: st.tool.clone(),
+                args: st.args.clone(),
+                outcome: st.outcome.clone(),
+                kaish_exit: st.kaish_exit,
+                kaish_bytes: st.kaish_bytes,
+            });
             if let Some(row) = row {
                 self.0.lock().unwrap().push(row);
             }
@@ -309,11 +377,18 @@ mod tests {
             drop(_g);
             let spans = cap.0.lock().unwrap().clone();
             assert!(
-                spans.iter().any(|(n, tool, args, oc)| n == "tool"
-                    && tool == "echo"
-                    && args.contains("hi")
-                    && oc == "ok"),
-                "a `tool` span with name/args/outcome: {spans:?}"
+                spans.iter().any(|s| s.name == "tool"
+                    && s.tool == "echo"
+                    && s.args.contains("hi")
+                    && s.outcome == "ok"),
+                "a `tool` span with name/args/outcome"
+            );
+            // A non-kaish tool never fills the kaish result fields.
+            assert!(
+                spans
+                    .iter()
+                    .all(|s| s.kaish_exit.is_none() && s.kaish_bytes.is_none()),
+                "echo must leave the kaish result fields empty"
             );
         });
     }
@@ -334,8 +409,109 @@ mod tests {
             assert!(
                 spans
                     .iter()
-                    .any(|(n, tool, _args, oc)| n == "tool" && tool == "echo" && oc == "error"),
-                "a `tool` span tagged outcome=error: {spans:?}"
+                    .any(|s| s.name == "tool" && s.tool == "echo" && s.outcome == "error"),
+                "a `tool` span tagged outcome=error"
+            );
+        });
+    }
+
+    /// `record_kaish_result`, called from inside a wrapped tool's `call`, tags the
+    /// enclosing `tool` span with the script's exit code and delivered size — the
+    /// half `outcome` can't carry (a non-zero script exit is normal output, not a
+    /// tool error). A truncated read is `exit_code = 3`.
+    #[test]
+    fn run_kaish_records_exit_code_and_output_bytes() {
+        /// A stand-in for `run_kaish`: reports a truncated read the way the real tool
+        /// does, then returns normally (a truncation is `Ok`, never a tool error).
+        struct TruncatedRead;
+        #[derive(Deserialize)]
+        struct NoArgs {}
+        #[derive(Debug)]
+        struct Never;
+        impl std::fmt::Display for Never {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "never")
+            }
+        }
+        impl std::error::Error for Never {}
+        impl Tool for TruncatedRead {
+            const NAME: &'static str = "run_kaish";
+            type Error = Never;
+            type Args = NoArgs;
+            type Output = String;
+            async fn definition(&self, _prompt: String) -> ToolDefinition {
+                ToolDefinition {
+                    name: "run_kaish".into(),
+                    description: "run_kaish".into(),
+                    parameters: json!({}),
+                }
+            }
+            async fn call(&self, _args: Self::Args) -> Result<String, Never> {
+                super::record_kaish_result(3, 4321);
+                Ok("exit: 3\n".into())
+            }
+        }
+
+        serialized_capture(async {
+            let cap = Capture::default();
+            let sub = tracing_subscriber::registry().with(cap.clone());
+            let _g = tracing::subscriber::set_default(sub);
+
+            let tool = traced(TruncatedRead);
+            tool.call("{}".to_string()).await.unwrap();
+
+            drop(_g);
+            let spans = cap.0.lock().unwrap().clone();
+            assert!(
+                spans.iter().any(|s| s.name == "tool"
+                    && s.kaish_exit == Some(3)
+                    && s.kaish_bytes == Some(4321)),
+                "the tool span must carry kaish.exit_code=3 and kaish.output_bytes=4321"
+            );
+        });
+    }
+
+    /// End-to-end teeth: a real `RunKaish` over a real worker whose output cap is
+    /// tiny, reading a file that overflows it, must surface `exit_code = 3` on the
+    /// span — the whole point is a trace can see a *truncated* read. Proves the
+    /// wiring from `RunKaish::call` through `record_kaish_result` to the span, not
+    /// just the recorder in isolation.
+    #[test]
+    fn a_truncated_read_surfaces_exit_3_end_to_end() {
+        use crate::explorer::RunKaish;
+        use crate::sandbox::{KaishWorker, SandboxConfig};
+
+        serialized_capture(async {
+            let dir = tempfile::tempdir().unwrap();
+            // Comfortably past the 64-byte cap below, so `cat -n` truncates.
+            std::fs::write(dir.path().join("big.txt"), "x\n".repeat(200)).unwrap();
+            let worker = KaishWorker::spawn_with(
+                dir.path(),
+                SandboxConfig {
+                    output_limit_bytes: 64,
+                    ..SandboxConfig::default()
+                },
+            )
+            .unwrap();
+
+            let cap = Capture::default();
+            let sub = tracing_subscriber::registry().with(cap.clone());
+            let _g = tracing::subscriber::set_default(sub);
+
+            let tool = traced(RunKaish::new(worker));
+            let out = tool
+                .call(r#"{"script":"cat -n big.txt"}"#.to_string())
+                .await
+                .unwrap();
+            assert!(out.contains("exit: 3"), "the read truncated: {out}");
+
+            drop(_g);
+            let spans = cap.0.lock().unwrap().clone();
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.name == "tool" && s.tool == "run_kaish" && s.kaish_exit == Some(3)),
+                "a truncated run_kaish read must record kaish.exit_code=3 on its span"
             );
         });
     }
