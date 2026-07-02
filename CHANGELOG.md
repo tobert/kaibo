@@ -268,6 +268,15 @@ the git log. Each later release appends a new section at the top.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
 
+### Changed
+
+- **The explorer reads big files in fewer, wider passes.** Its guidance now gives a
+  file too large to read whole a first-class strategy — a few wide `sed` spans (a few
+  hundred lines each) instead of many tiny slices — so a `consult`/`explore` over large
+  sources spends noticeably fewer tool calls gathering the same evidence (measured: a
+  broad sweep dropped from 74 read/search calls to 46, reading the same big file in ~13
+  wide spans instead of ~22 fifteen-line ones). No behavior change on short files.
+
 ### Fixed
 
 - **The advertised cast roster marks the default even when it's set by an alias.**
