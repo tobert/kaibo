@@ -689,12 +689,13 @@ impl Config {
         self.casts.get(name).and_then(Cast::synth_lane)
     }
 
-    /// Whether canonical cast `name` serves the **interactive** tools (`consult`,
-    /// `consult_submit`, `explore`, `oneshot`) — i.e. its synth runs interactively (or it
-    /// carries no synth at all). The mirror of `reject_offline_cast`'s acceptance: an
-    /// offline synth belongs to `batch_submit`/`deliberate`, not the interactive tools.
-    /// One of the per-tool cast predicates the enum roster and the gates share (see
-    /// `server.rs::CAST_ENUM_RULES`).
+    /// Whether canonical cast `name` serves the **interactive answer** tools (`consult`,
+    /// `consult_submit`, `oneshot`) — i.e. its synth runs interactively (or it carries no
+    /// synth at all). The mirror of `reject_offline_cast`'s acceptance: an offline synth
+    /// belongs to `batch_submit`/`deliberate`, not these. (`explore` is deliberately *not*
+    /// here — it runs only the explorer, so it takes any cast with one via
+    /// [`cast_can_explore`](Self::cast_can_explore), interactive or not.) One of the per-tool
+    /// cast predicates the enum roster and the gates share (see `server.rs::CAST_ENUM_RULES`).
     pub fn cast_is_interactive(&self, name: &str) -> bool {
         self.cast_offline_lane(name).is_none()
     }
