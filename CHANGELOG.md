@@ -191,10 +191,14 @@ the git log. Each later release appends a new section at the top.
   into the user turn. It's an audit surface (what is a model actually reading?) and the
   companion to tuning a preamble: override a phase's role framing globally with the
   `[prompts]` table or per cast with a slot's `preamble`, and the resource shows the
-  result. Relatedly, a **synth slot's `preamble` now frames the offline synth too** — a
-  per-cast voice set on a `batch`/`deliberate` cast reaches its `batch_submit` /
-  `deliberate` answers, not just the interactive `consult`/`oneshot` phases (previously
-  only the global `[prompts].batch` did).
+  result. **`kaibo://prompts/<cast>`** goes one step further — it resolves *that cast's*
+  framing, its per-slot `preamble`s folded in the way a live call layers them, and
+  attributes each phase to whichever set it (cast slot › global `[prompts]` › built-in) —
+  so you see precisely what one cast's models are told. Relatedly, a **synth slot's
+  `preamble` now frames the offline synth too** — a per-cast voice set on a
+  `batch`/`deliberate` cast reaches its `batch_submit` / `deliberate` answers, not just
+  the interactive `consult`/`oneshot` phases (previously only the global `[prompts].batch`
+  did).
 - **Zero-config workspace root.** When no `--root` is set, kaibo adopts its launch
   cwd as the inferred default root (it already scoped containment to that cwd, and
   MCP clients start stdio servers with cwd = workspace), so a call may omit `path`

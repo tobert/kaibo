@@ -192,6 +192,18 @@ impl Phase {
     pub fn reads_project(self) -> bool {
         matches!(self, Phase::Explorer | Phase::Consult)
     }
+
+    /// Which cast slot's `preamble` frames this phase: the **explorer** slot drives the
+    /// explorer sweep; the **synth** slot drives every synth phase (`consult`, `oneshot`,
+    /// and the offline `batch`/`deliberate` synth). Lets the `kaibo://prompts/{cast}`
+    /// resource attribute a phase's framing to the slot that set it — the same slot→phase
+    /// mapping [`crate::config::Cast::resolved_prompts`] applies.
+    pub fn slot_role(self) -> ModelRole {
+        match self {
+            Phase::Explorer => ModelRole::Explorer,
+            Phase::Consult | Phase::Oneshot | Phase::Batch => ModelRole::Synth,
+        }
+    }
 }
 
 /// Compose one phase's full system prompt through the single layering point. Picks the

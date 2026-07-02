@@ -72,6 +72,12 @@ const TOOLS_URI: &str = "kaibo://tools";
 /// tools use (with any active `[prompts]` override folded in), plus the dynamic user-turn
 /// framing. Read this to see, verbatim, what a call actually says to the model.
 const PROMPTS_URI: &str = "kaibo://prompts";
+/// Per-cast prompts: `kaibo://prompts/<cast>` renders that cast's *resolved* framing —
+/// its per-slot `preamble`s folded in the way a live call resolves them — so an operator
+/// sees exactly what one cast's models are told, not just the cast-independent base.
+const PROMPTS_CAST_PREFIX: &str = "kaibo://prompts/";
+/// The URI template advertised for the per-cast prompts resource.
+const PROMPTS_CAST_URI_TEMPLATE: &str = "kaibo://prompts/{cast}";
 /// `docs/config.example.toml`, embedded at compile time so it ships *inside* the
 /// binary — `cargo install kaibo` lays down no docs, so reading the file at runtime
 /// would 404 at exactly the fresh-install moment the example matters most.
@@ -1256,31 +1262,13 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
-    /// Resolve this call's per-phase system prompts for `cast`: the per-model slot
-    /// `preamble` (if set) wins over the global `[prompts].<phase>`, which wins over
-    /// the built-in (resolved downstream in `consult.rs`). The synth slot's preamble
-    /// feeds *every* synth phase — the interactive `consult` driver, the toolless
-    /// `oneshot`, AND the offline synth that `batch`/`deliberate` run — but through
-    /// their own keys, so they stay independently overridable (a copy today, free to
-    /// diverge). The offline key is load-bearing: a batch/deliberate cast's synth
-    /// *is* the offline synth, so its slot voice has to land on `p.batch` too, which
-    /// is what `batch_system_prompt` reads on both offline lanes. `cast` is the
-    /// post-override clone, so a per-call model override (a bare slot) correctly
+    /// Resolve this call's per-phase system prompts for `cast` — the per-slot `preamble`
+    /// over the global `[prompts]` table. Thin wrapper over [`Cast::resolved_prompts`]
+    /// (the shared layering the `kaibo://prompts/{cast}` resource also renders); `cast`
+    /// is the post-override clone, so a per-call model override (a bare slot) correctly
     /// carries no preamble.
     fn resolved_prompts(&self, cast: &Cast) -> PromptOverrides {
-        let mut p = self.config.prompts.clone();
-        if let Some(pre) = cast
-            .slot(ModelRole::Explorer)
-            .and_then(|s| s.preamble.clone())
-        {
-            p.explorer = Some(pre);
-        }
-        if let Some(pre) = cast.slot(ModelRole::Synth).and_then(|s| s.preamble.clone()) {
-            p.consult = Some(pre.clone());
-            p.oneshot = Some(pre.clone());
-            p.batch = Some(pre);
-        }
-        p
+        cast.resolved_prompts(&self.config.prompts)
     }
 
     /// Resolve a call's cast: the explicit name (looked up in the registry, by
@@ -2773,10 +2761,9 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
         markdown_resource(
             PROMPTS_URI,
             "kaibo: the prompts models get",
-            "The system preamble kaibo hands each phase (explorer, consult, oneshot, \
-             batch/deliberate synth), rendered through the same code the tools use — with \
-             any `[prompts]` override applied — plus the dynamic user-turn framing. Read \
-             this to audit or tune what a call actually says to the model.",
+            "The exact system preamble each phase gets (explorer, consult, oneshot, \
+             batch/deliberate synth), rendered by the same code the tools run. \
+             kaibo://prompts/<cast> shows one cast's resolved framing.",
         ),
     ];
     for (topic, description) in topics() {
@@ -2898,9 +2885,10 @@ fn configure_prompt_text(goal: Option<&str>) -> String {
     body
 }
 
-/// The URI templates kaibo advertises: per-builtin help, addressed by name.
+/// The URI templates kaibo advertises: per-builtin help and per-cast prompts, each
+/// addressed by name.
 fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
-    let template = RawResourceTemplate {
+    let builtin = RawResourceTemplate {
         uri_template: BUILTIN_URI_TEMPLATE.to_string(),
         name: "kaish builtin help".to_string(),
         title: None,
@@ -2912,7 +2900,19 @@ fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
         mime_type: Some("text/markdown".to_string()),
         icons: None,
     };
-    vec![template.no_annotation()]
+    let prompts = RawResourceTemplate {
+        uri_template: PROMPTS_CAST_URI_TEMPLATE.to_string(),
+        name: "kaibo: one cast's prompts".to_string(),
+        title: None,
+        description: Some(
+            "The system preamble each phase gets for a specific cast, its per-slot \
+             `preamble`s folded in as a live call resolves them. e.g. kaibo://prompts/deepseek"
+                .to_string(),
+        ),
+        mime_type: Some("text/markdown".to_string()),
+        icons: None,
+    };
+    vec![builtin.no_annotation(), prompts.no_annotation()]
 }
 
 /// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
@@ -3549,50 +3549,67 @@ fn render_config_resource(
     )
 }
 
-/// Read one kaibo resource by URI, with the runtime config and allowed set threaded
-/// in for `kaibo://config`. The pure path (kaish/*, sandbox) routes through
-/// `render_resource` (line below); the config arm renders via `render_config_resource`.
+/// Render the `kaibo://prompts` document — or `kaibo://prompts/{cast}` when `cast` is
+/// `Some`. Each phase's system preamble is produced by the *same*
+/// [`resolve_phase_preamble`](crate::consult::resolve_phase_preamble) the live tools call,
+/// so the text can't drift from a real call; the user-turn framing likewise renders through
+/// the real [`consult_user_prompt`](crate::consult::consult_user_prompt) /
+/// [`deliberation_prompt`](crate::consult::deliberation_prompt).
 ///
-/// This is the handler-level dispatch: call it from `read_resource` so the config
-/// resource gets its config.
-/// Render the `kaibo://prompts` document: the system preamble kaibo hands each
-/// model-driven phase, produced by the *same* [`resolve_phase_preamble`] the live tools
-/// call (so the text can't drift from a real call), plus the dynamic user-turn framing
-/// rendered by the real [`consult_user_prompt`](crate::consult::consult_user_prompt) /
-/// [`deliberation_prompt`](crate::consult::deliberation_prompt) with placeholder inputs.
-///
-/// Config-aware for one layer only — the global `[prompts]` role-framing override, which
-/// this folds in and flags. The two *path*-dependent layers ([`orientation`] map,
-/// `[context]` house rules) and the *cast*-dependent per-slot `preamble` are named, not
-/// rendered: they vary per call, so the doc shows the constant base and says what appends.
-fn render_prompts_resource(config: &Config) -> String {
+/// `cast = None` is the cast-independent view: built-in framing or a global `[prompts]`
+/// override. `cast = Some` folds in that cast's per-slot `preamble`s via
+/// [`Cast::resolved_prompts`] — the same layering a call runs — and attributes each phase
+/// to the slot that framed it. Either way the two *path*-dependent layers (`[orientation]`
+/// map, `[context]` house rules) are named, not rendered: they resolve per call against a
+/// path a static resource lacks.
+fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
     use crate::consult::{consult_user_prompt, deliberation_prompt, resolve_phase_preamble, Phase};
+
+    // The role-framing layer to render: a cast folds its per-slot preambles over the
+    // global table (exactly a live call's resolution); no cast shows the global table.
+    let prompts = match cast {
+        Some(c) => c.resolved_prompts(&config.prompts),
+        None => config.prompts.clone(),
+    };
+
     let mut out = String::new();
-    out.push_str(
-        "# The prompts kaibo's models get\n\n\
-         Every model kaibo drives receives a **system preamble** (its role framing) and a \
-         **user turn** (your question, wrapped with any context). Both are below, rendered \
-         by the same code a live call runs — so this is what the model actually reads, not \
-         a paraphrase.\n\n\
-         ## How the system preamble is layered\n\n\
-         For each phase, in order:\n\
-         1. **Role framing** — a cast's per-slot `preamble` if set, else the global \
-         `[prompts].<phase>` override, else kaibo's built-in. *This doc shows the \
-         global/built-in layer; a cast's per-slot `preamble` replaces it for that cast — \
-         `kaibo://config` shows which casts set one.*\n\
-         2. **`[orientation]` file map** — appended for the project-reading phases only.\n\
-         3. **`[context]` house rules** — your operator guidance, project-reading phases \
-         only.\n\n\
-         Layers 2–3 depend on the path and are added per call; the sections below are \
-         layer 1.\n",
-    );
+    match cast {
+        Some(c) => out.push_str(&format!(
+            "# The prompts cast `{}` gets\n\n\
+             The system preamble each phase receives for this cast, its per-slot \
+             `preamble`s folded in — rendered by the same code a live call runs. The \
+             `[orientation]` map and `[context]` house rules still append per call \
+             (project-reading phases, path-dependent). `kaibo://prompts` is the \
+             cast-independent view (and shows the user-turn framing).\n",
+            c.name
+        )),
+        None => out.push_str(
+            "# The prompts kaibo's models get\n\n\
+             The system preamble each phase receives, rendered by the same code a live call \
+             runs — so this is what the model reads, not a paraphrase. Cast-independent \
+             view: the built-in framing, or a global `[prompts]` override. For one cast's \
+             resolved framing (its per-slot `preamble`s folded in) read \
+             `kaibo://prompts/<cast>`. The `[orientation]` map and `[context]` house rules \
+             append per call for the project-reading phases (path-dependent).\n",
+        ),
+    }
 
     for phase in Phase::ALL {
-        let overridden = phase.override_in(&config.prompts).is_some();
-        let tag = if overridden {
-            "global `[prompts]` override active"
+        // Attribute the framing by precedence: a cast slot's `preamble` wins over a global
+        // `[prompts]` override wins over the built-in — the order `resolved_prompts` layers.
+        let slot_set = cast
+            .and_then(|c| c.slot(phase.slot_role()))
+            .and_then(|s| s.preamble.as_deref())
+            .is_some();
+        let tag = if slot_set {
+            format!(
+                "cast `{}` slot `preamble`",
+                cast.expect("slot_set ⇒ cast").name
+            )
+        } else if phase.override_in(&config.prompts).is_some() {
+            "global `[prompts]` override".to_string()
         } else {
-            "kaibo built-in"
+            "kaibo built-in".to_string()
         };
         let project = if phase.reads_project() {
             "Reads the project → the `[orientation]` map and `[context]` house rules append per call."
@@ -3601,7 +3618,7 @@ fn render_prompts_resource(config: &Config) -> String {
         };
         // The one seam the tools use. `None, None` for the path layers: this static doc
         // can't resolve a path, and we've named that above.
-        let body = resolve_phase_preamble(phase, &config.prompts, None, None);
+        let body = resolve_phase_preamble(phase, &prompts, None, None);
         out.push_str(&format!(
             "\n---\n\n## {}\n\n_{}_ · {}\n\n```text\n{}\n```\n",
             phase.label(),
@@ -3611,33 +3628,43 @@ fn render_prompts_resource(config: &Config) -> String {
         ));
     }
 
-    out.push_str(
-        "\n---\n\n## User-turn framing\n\n\
-         The system preamble sets the role; the **user turn** carries your question. kaibo \
-         wraps it — the renders below use placeholder inputs, but the wrapping is the real \
-         code:\n\n\
-         ### `consult` / `consult_submit`\n\n\
-         With a `context` (a session history and `attach`ed files add further blocks; a \
-         bare question with none of these is sent verbatim):\n\n```text\n",
-    );
-    out.push_str(&consult_user_prompt(
-        "<your question>",
-        Some("<a diff or change summary, a prior report, or pasted source>"),
-        &[],
-        &[],
-    ));
-    out.push_str(
-        "\n```\n\n### `deliberate` (offline synth over the explorer's dossier)\n\n```text\n",
-    );
-    out.push_str(&deliberation_prompt(
-        "<your question>",
-        "<the explorer's cited dossier — SummaryOfFindings, RelevantLocations with \
-         file:line snippets, ExplorationTrace>",
-    ));
-    out.push_str("\n```\n");
+    // The user-turn framing is cast-independent, so it lives on the base doc only; the
+    // per-cast view points back to it rather than repeating it.
+    if cast.is_none() {
+        out.push_str(
+            "\n---\n\n## User-turn framing\n\n\
+             The system preamble sets the role; the **user turn** carries your question. \
+             kaibo wraps it — the renders below use placeholder inputs, but the wrapping is \
+             the real code:\n\n\
+             ### `consult` / `consult_submit`\n\n\
+             With a `context` (a session history and `attach`ed files add further blocks; a \
+             bare question with none of these is sent verbatim):\n\n```text\n",
+        );
+        out.push_str(&consult_user_prompt(
+            "<your question>",
+            Some("<a diff or change summary, a prior report, or pasted source>"),
+            &[],
+            &[],
+        ));
+        out.push_str(
+            "\n```\n\n### `deliberate` (offline synth over the explorer's dossier)\n\n```text\n",
+        );
+        out.push_str(&deliberation_prompt(
+            "<your question>",
+            "<the explorer's cited dossier — SummaryOfFindings, RelevantLocations with \
+             file:line snippets, ExplorationTrace>",
+        ));
+        out.push_str("\n```\n");
+    }
     out
 }
 
+/// Read one kaibo resource by URI, with the runtime config and allowed set threaded
+/// in for `kaibo://config`. The pure path (kaish/*, sandbox) routes through
+/// `render_resource` (line below); the config arm renders via `render_config_resource`.
+///
+/// This is the handler-level dispatch: call it from `read_resource` so the config
+/// resource gets its config.
 fn read_kaibo_resource_with_config(
     uri: &str,
     schemas: &[ToolSchema],
@@ -3649,7 +3676,24 @@ fn read_kaibo_resource_with_config(
 ) -> Result<ReadResourceResult, McpError> {
     if uri == PROMPTS_URI {
         return Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(render_prompts_resource(config), uri)],
+            contents: vec![ResourceContents::text(
+                render_prompts_resource(config, None),
+                uri,
+            )],
+        });
+    }
+    if let Some(name) = uri.strip_prefix(PROMPTS_CAST_PREFIX) {
+        // `kaibo://prompts/<cast>` — the cast's resolved framing (name or alias). An
+        // unknown cast is a not-found whose message already names the known casts, so a
+        // caller sees the real roster, not a bare miss.
+        let cast = config
+            .resolve_cast(name)
+            .map_err(|e| McpError::resource_not_found(format!("{e:#} (in {uri})"), None))?;
+        return Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(
+                render_prompts_resource(config, Some(cast)),
+                uri,
+            )],
         });
     }
     if uri == CONFIG_URI {
@@ -5528,8 +5572,9 @@ mod tests {
             text.contains(&deliberation_prompt("<your question>", "")[..40]),
             "must show the deliberate user-turn framing:\n{text}"
         );
-        // The layering note names what a static doc can't render per call/per cast.
-        for needle in ["[orientation]", "[context]", "per-slot", "kaibo://config"] {
+        // The layering note names what a static doc can't render per call/per cast, and
+        // points at the per-cast resource for the resolved-per-slot view.
+        for needle in ["[orientation]", "[context]", "per-slot", "kaibo://prompts/<cast>"] {
             assert!(
                 text.contains(needle),
                 "prompts doc must name the {needle:?} layer:\n{text}"
@@ -5551,13 +5596,13 @@ mod tests {
             "#,
         )
         .expect("config parses");
-        let text = render_prompts_resource(&config);
+        let text = render_prompts_resource(&config, None);
         assert!(
             text.contains("MY CUSTOM CONSULT FRAME"),
             "overridden consult frame must render:\n{text}"
         );
         assert!(
-            text.contains("global `[prompts]` override active"),
+            text.contains("global `[prompts]` override"),
             "the overridden phase must be flagged:\n{text}"
         );
         // The un-overridden oneshot still shows its built-in, tagged as such.
@@ -5568,6 +5613,80 @@ mod tests {
         assert!(
             text.contains("kaibo built-in"),
             "an un-overridden phase must be tagged built-in:\n{text}"
+        );
+    }
+
+    /// `kaibo://prompts/<cast>` resolves *that cast's* framing: a synth slot's `preamble`
+    /// renders across all three synth phases (consult, oneshot, batch) and is attributed
+    /// to the slot; an explorer slot's `preamble` frames the explorer phase; and the
+    /// per-cast doc drops the (cast-independent) user-turn section, pointing back instead.
+    #[test]
+    fn per_cast_prompts_resource_folds_in_the_slot_preambles() {
+        let config = Config::from_toml_str(
+            r#"
+            [casts.team]
+            explorer = { backend = "anthropic", id = "claude-haiku-4-5", preamble = "EXPLORER SLOT VOICE" }
+            synth = { backend = "anthropic", id = "claude-opus-4-8", preamble = "SYNTH SLOT VOICE" }
+            "#,
+        )
+        .expect("config parses");
+        let cast = config.resolve_cast("team").expect("team cast exists");
+        let text = render_prompts_resource(&config, Some(cast));
+        // The synth slot's voice reaches all three synth phases...
+        assert_eq!(
+            text.matches("SYNTH SLOT VOICE").count(),
+            3,
+            "synth slot preamble must render in consult + oneshot + batch:\n{text}"
+        );
+        // ...and the explorer slot frames the explorer phase.
+        assert!(
+            text.contains("EXPLORER SLOT VOICE"),
+            "explorer slot preamble must render:\n{text}"
+        );
+        // Each is attributed to the slot that set it (not "global override" / "built-in").
+        assert!(
+            text.contains("cast `team` slot `preamble`"),
+            "a slot-framed phase must be tagged to the cast slot:\n{text}"
+        );
+        // The user-turn framing lives on the cast-independent doc only.
+        assert!(
+            !text.contains("## User-turn framing"),
+            "per-cast doc must not repeat the user-turn framing:\n{text}"
+        );
+        assert!(
+            text.contains("kaibo://prompts"),
+            "per-cast doc must point back to the base doc:\n{text}"
+        );
+    }
+
+    /// The per-cast template is advertised, and an unknown cast is a not-found whose
+    /// message names the known casts (so a caller recovers to a real cast name).
+    #[test]
+    fn per_cast_prompts_template_advertised_and_unknown_cast_is_not_found() {
+        let templates: Vec<String> = kaibo_resource_templates()
+            .into_iter()
+            .map(|t| t.raw.uri_template)
+            .collect();
+        assert!(
+            templates.iter().any(|t| t == PROMPTS_CAST_URI_TEMPLATE),
+            "must advertise the per-cast prompts template, got {templates:?}"
+        );
+        let config = Config::builtin();
+        let allowed: Vec<PathBuf> = Vec::new();
+        let err = read_kaibo_resource_with_config(
+            "kaibo://prompts/nope-not-a-cast",
+            &[],
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+        )
+        .expect_err("an unknown cast must be a not-found");
+        assert!(
+            err.message.contains("nope-not-a-cast") && err.message.contains("known casts"),
+            "not-found must name the bad cast and the roster, got: {}",
+            err.message
         );
     }
 
