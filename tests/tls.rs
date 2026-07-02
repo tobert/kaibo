@@ -24,11 +24,18 @@ fn reqwest_client_builds_once_the_ring_provider_is_installed() {
     kaibo::tls::ensure_crypto_provider();
 
     // A no-default-provider rustls connector resolves its provider from the process
-    // default during `build()`. This is the exact call consult.rs / image_gen.rs
-    // make; it succeeds only because ring is wired in and installed above.
+    // default during `build()`. This is the raw call under `tls::https_client`, the one
+    // build site consult + batch route through; it succeeds only because ring is wired in
+    // and installed above.
     reqwest::Client::builder()
         .build()
         .expect("reqwest client builds with the ring provider installed");
+
+    // The shared helper itself builds — it installs ring internally, so this holds even
+    // as the *sole* provider clients' build path. Guards the helper directly, not just the
+    // raw builder above.
+    kaibo::tls::https_client(std::time::Duration::from_secs(5))
+        .expect("tls::https_client builds a real reqwest client");
 
     // And the installed default really is a provider we put there (ring), not some
     // accidental fallback: a fresh ring provider must match the installed one.
