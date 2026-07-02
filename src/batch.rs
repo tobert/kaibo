@@ -1178,6 +1178,44 @@ pub fn poller(backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
     }
 }
 
+/// The seam that lets the batch *handlers* be tested offline. `KaiboHandler` holds one of
+/// these and builds every provider through it, so a test can swap the real
+/// network-client builders ([`submitter`]/[`poller`]) for a double returning a
+/// [`ScriptedBatch`] — closing the handler-level coverage gap that the free-function
+/// call sites left (the consult side already injects via `Arm::new`). The two methods
+/// mirror the free functions exactly; production is [`LiveBatchProviders`].
+pub trait BatchProviderFactory: Send + Sync {
+    /// A model-bearing provider for submitting a batch (mirrors [`submitter`]).
+    fn submitter(
+        &self,
+        backend: &Backend,
+        slot: &ModelSlot,
+        defaults: &Defaults,
+    ) -> Result<Arc<dyn BatchProvider>>;
+
+    /// A poll/cancel/list-only provider (mirrors [`poller`]).
+    fn poller(&self, backend: &Backend) -> Result<Arc<dyn BatchProvider>>;
+}
+
+/// The production factory: the real `submitter`/`poller`, building network clients. The
+/// default a server runs on; only tests substitute another.
+pub struct LiveBatchProviders;
+
+impl BatchProviderFactory for LiveBatchProviders {
+    fn submitter(
+        &self,
+        backend: &Backend,
+        slot: &ModelSlot,
+        defaults: &Defaults,
+    ) -> Result<Arc<dyn BatchProvider>> {
+        submitter(backend, slot, defaults)
+    }
+
+    fn poller(&self, backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
+        poller(backend)
+    }
+}
+
 #[cfg(test)]
 mod test_double {
     use super::*;
@@ -1267,10 +1305,31 @@ mod test_double {
             Ok(self.listing.clone())
         }
     }
+
+    /// A [`BatchProviderFactory`] that hands the *same* [`ScriptedBatch`] to every
+    /// submit and poll — so a handler test drives one double across a batch's whole
+    /// lifecycle (submit here, then `job_get`/`job_cancel`/`job_list` re-address it).
+    /// The backend/slot/defaults are ignored; the double is pre-scripted.
+    pub struct ScriptedBatchProviders(pub Arc<ScriptedBatch>);
+
+    impl BatchProviderFactory for ScriptedBatchProviders {
+        fn submitter(
+            &self,
+            _backend: &Backend,
+            _slot: &ModelSlot,
+            _defaults: &Defaults,
+        ) -> Result<Arc<dyn BatchProvider>> {
+            Ok(self.0.clone())
+        }
+
+        fn poller(&self, _backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
+            Ok(self.0.clone())
+        }
+    }
 }
 
 #[cfg(test)]
-pub use test_double::ScriptedBatch;
+pub use test_double::{ScriptedBatch, ScriptedBatchProviders};
 
 #[cfg(test)]
 mod tests {

@@ -104,6 +104,48 @@ planned.
 
 ## P2 — Focused fixes & hardening
 
+### Codebase health review (Fable-5 + Gemini Pro, dogfooded 2026-07-02)
+A whole-`src/` health review by Fable-5 (via `batch_submit` + `attach`) plus a lifecycle
+review by Gemini Pro (via `deliberate`). Verdict: healthy, with two swollen organs
+(`server.rs`, `consult.rs`) and archaeological layers from heavy refactoring. Two findings
+were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test pinning
+`deliberate`'s lane-capture-before-override). The rest, roughly in value order:
+
+- **Batch-provider injection seam + offline handler tests — IN FLIGHT** (`feat/batch-injection-seam`).
+  The batch handlers (`batch_submit`, `deliberate_batch`, the batch arms of `job_get`/
+  `job_list`/`job_cancel`) call `crate::batch::submitter`/`poller` directly, so — unlike the
+  consult side, fully offline-tested via `Arm::new` — they have no handler-level coverage.
+  Route them through a factory field on `KaiboHandler` (default = the real fns), inject
+  `ScriptedBatch`. Fable's "thinnest coverage relative to blast radius." Delete when it ships.
+- **Unify the lane→tool partition.** Which cast serves which tool is derived independently
+  in ~4 places (`inject_cast_enum`'s three rosters, the `reject_offline_cast`/
+  `require_batch_cast`/`require_deliberate_cast` gates, `casts_section`'s direct-filter). A
+  single `Config` source + a consistency test would stop them drifting; the `deliberate`
+  work made it a 3-way split.
+- **Vestiges / finish-the-migration cleanups.** `credentials.rs` dead code (`load`,
+  `openai_key`, `resolve_openai_key`) + the duplicate alias table in `ProviderKind::FromStr`
+  (parallel to `config.rs::builtin_aliases`); finish the `batch_http_client` migration
+  (`Arm::from_slot` and `telemetry.rs::init` still hand-roll the timeout+`ensure_crypto_provider`
+  block); exhaustive-destructure `apply_raw_env`/`merge_defaults` so a new `Defaults` field
+  can't silently miss its env/merge line (the `render_config_resource` discipline, applied to
+  the config layer); `supported_kinds_list()`'s hand-maintained `ProviderKind` array.
+- **Module splits (architecture-scale, own PRs, sequence deliberately).** `consult.rs` →
+  `shaping` (`ModelShape`/`ModelCaps`/the id-classifiers/`default_models` — the provider-drift
+  knowledge) + `engine` (`Arm`/`PhaseRunner`/`run_phase`/the view_image break-rewrite) +
+  `prompts` (the preambles/`phase_preamble`/`consult_user_prompt`/`deliberation_prompt`).
+  `server.rs` → extract the containment boundary (`resolve_root`/`contained`/attachment
+  resolvers) into its own doc-headed module, plus `render_config_resource` and the job/batch
+  renderers. Split the `ConsultConfig` grab-bag (its own comments admit fields ride it only
+  because it's "the one bundle already threaded everywhere"; `explore`/`deliberate` fill it
+  with fields their comments call inert).
+- **`deliberate` dossier vs. caller timeout (Gemini).** The dossier builds synchronously, so a
+  caller with a tight tool-call timeout can drop the connection before the durable handle
+  returns; the job still runs. Mitigation: echo the question into `job_list` so a timed-out
+  caller re-finds the handle (dovetails the "self-describing batch results" bullet under the
+  batch-hardening P3 entry). A more invasive option — async dossier returning `job-N`
+  immediately — trades away the batch lane's cross-restart durability; don't without the
+  persistence decision.
+
 ### Upstream kaish-vfs: `LocalFs::list` hard-fails when an entry vanishes mid-walk
 `kaish-vfs` `LocalFs::list` (`src/local.rs`, 0.9.0) enumerates a directory with
 `read_dir`, then calls `symlink_metadata` on *each* entry and propagates any error with
