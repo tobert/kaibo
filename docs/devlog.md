@@ -14,6 +14,34 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-02 — run_kaish spans carry the script's exit code + size
+
+Chasing a real question — the explorer is chatty, doing many small reads where one
+wide `cat -n` should do — we reached for a trace to tell *forced* narrow reads (a
+whole-file read truncated at the 64 KiB output cap) from *chosen* ones (the model
+slicing when it didn't need to). The trace couldn't answer it: `RunKaish::call`
+returns `Ok(format_output(&out))` for **every** kaish exit code (a non-zero *script*
+exit is normal output for the model, not a tool failure), so the `tool` span's
+`outcome` reads `ok` for a truncated read, a timeout, a blocked op — all of them. The
+exit code and size were buried in the output text, invisible to telemetry.
+
+Fixed at the source: `RunKaish::call` now calls `tool_span::record_kaish_result(out.code,
+out.stdout.len())`, tagging the enclosing `tool` span with `kaish.exit_code` and
+`kaish.output_bytes`. Everything needed was already in the `KaishOutput` snapshot
+(`code` + `stdout`) — no kaish-kernel change. The field *names* live in `tool_span.rs`
+beside their `field::Empty` declaration on the span (a caller can't silently mistype
+one); every non-kaish tool leaves them empty, so they don't export. We left the
+pre-truncation original size out of scope — kaish trails it in the output text, but
+`exit_code == 3` plus the follow-up reads in the trace already answer the read-size
+question, and pulling it out cleanly would be a kaish-dependent nice-to-have.
+
+TDD with teeth: a unit test drives the recorder through the real `Traced` wrapper, and
+an end-to-end test runs a real `RunKaish` over a worker with a 64-byte cap reading a
+file that overflows it, asserting `kaish.exit_code = 3` lands on the span. Both fail
+when the recorder is neutered (verified). This is groundwork for the explorer-prompt
+A/Bs (for-loop multi-file reads, batched `cat|sed`) — measure the contributing factor
+before changing the prompt.
+
 ## 2026-06-29 — kaish-kernel 0.10.0
 
 Bumped the published dep `0.9.0 → 0.10.0`. API-compatible this time — no kaibo call

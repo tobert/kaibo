@@ -250,7 +250,11 @@ the git log. Each later release appends a new section at the top.
   enhancement, so its absence just costs the model a few discovery turns it always
   could have taken.
 - **Multi-turn sessions** via `session_id`, and optional OTLP/HTTP trace export
-  (`[telemetry]`, off by default).
+  (`[telemetry]`, off by default). Each tool call emits a `tool` span naming the
+  tool and a short argument summary; a `run_kaish` span additionally carries
+  `kaish.exit_code` and `kaish.output_bytes`, so a trace can distinguish a read that
+  *truncated* (exit `3`) at the output cap — and forced narrow re-reads — from one the
+  model chose to slice, rather than every script reading as a plain success.
 - **A failed provider doesn't fail your turn.** When a model or its provider misbehaves
   (a 429/529 overload, a connection reset, a wedged backend that hits the
   `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the

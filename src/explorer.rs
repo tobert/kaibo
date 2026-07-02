@@ -93,6 +93,10 @@ impl Tool for RunKaish {
             .run(args.script)
             .await
             .map_err(|e| RunKaishError(e.to_string()))?;
+        // Tag the enclosing `tool` span with the script's exit code and delivered
+        // size — the `outcome` field can't, since a non-zero script exit is a normal
+        // result, not a tool error. This is what lets a trace see a truncated read.
+        crate::tool_span::record_kaish_result(out.code, out.stdout.len());
         Ok(format_output(&out))
     }
 }
