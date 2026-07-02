@@ -3590,7 +3590,12 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
              view: the built-in framing, or a global `[prompts]` override. For one cast's \
              resolved framing (its per-slot `preamble`s folded in) read \
              `kaibo://prompts/<cast>`. The `[orientation]` map and `[context]` house rules \
-             append per call for the project-reading phases (path-dependent).\n",
+             append per call for the project-reading phases (path-dependent).\n\n\
+             A phase is a role, not one tool — several tools share a preamble. The \
+             **explorer** framing drives standalone `explore`, the delegated sweep inside \
+             `consult`, and `deliberate`'s dossier-building pass; the **offline-synth** \
+             framing serves both `batch_submit` and `deliberate`'s synth. So tuning one \
+             phase moves every tool that wears it.\n",
         ),
     }
 
@@ -5580,6 +5585,12 @@ mod tests {
                 "prompts doc must name the {needle:?} layer:\n{text}"
             );
         }
+        // A phase is a role several tools share — the doc says so explicitly, so a reader
+        // knows tuning the explorer phase moves `deliberate`'s dossier pass too.
+        assert!(
+            text.contains("dossier-building pass") && text.contains("`batch_submit`"),
+            "the doc must spell out which tools each shared phase drives:\n{text}"
+        );
     }
 
     /// A global `[prompts]` override must show through the resource — its text rendered
