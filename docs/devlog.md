@@ -14,6 +14,31 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-02 — positive-framing sweep across the model-facing prompts
+
+Follow-on to the explorer wide-span change (PR #48). Amy's principle: if something's
+worth a negative example, double up on complementary *positive* ones instead — a "not X"
+names the very pathway we're trying to suppress (the CLAUDE.md positive-framing rule). We
+swept the sibling model-facing blocks for the same "not X / rather than X / beats X"
+phrasing and, where they carried explorer-like reading guidance, extended the wide-span
+framing:
+
+- **`consult_preamble`** (the driver reads code directly too): "pull a whole file rather
+  than a narrow slice … what a surgical read would miss" → read generously in wide passes,
+  a short file whole or a big one in a few hundred-line spans (`sed -n '1,400p'`, then
+  `'401,800p'`).
+- **`KAISH_SANDBOX_ADDENDUM`** (the shared cheatsheet every tool-driving preamble embeds)
+  and **`kaibo_sandbox_doc`** (the `kaibo://kaish/sandbox` resource): same wide-span,
+  positive rewrite; the old narrow `sed -n '40,80p'` example became a wide `'1,400p'` walk.
+- **`oneshot_preamble`** / **`deliberation_prompt`**: dropped "rather than guessing" — the
+  wanted behavior (name the gap so the caller can supply it / reason under a stated
+  assumption) is already said positively; `batch_preamble` had already been fixed this way,
+  these were the stragglers.
+
+No behavior measured (unlike #48's A/B), but the consult driver and cheatsheet now carry
+the same validated wide-span guidance, so a consult over big files should benefit from the
+same mechanism. The kaish `\|` grep habit is still routed upstream (kaish#60), untouched here.
+
 ## 2026-07-02 — explorer reads big files in wide spans (A/B-validated)
 
 The explorer was chatty — many tiny reads. We instrumented it (PR #46's

@@ -1598,8 +1598,8 @@ pub fn oneshot_preamble() -> String {
      the question it sends from the material it provides and your own knowledge — \
      this call has no codebase access and no tools, so the caller owns the context. \
      Be precise and useful: reason over exactly what you were handed, and name \
-     explicitly anything you'd need that wasn't given rather than guessing it. Keep \
-     your claims grounded in the material and say where its edge is."
+     explicitly anything you'd need that wasn't given, so the caller can supply it \
+     next turn. Keep your claims grounded in the material and say where its edge is."
         .to_string()
 }
 
@@ -1825,10 +1825,10 @@ pub fn consult_preamble() -> String {
          curated report — RelevantLocations carrying `file:line`, key symbols, and \
          snippets. Reach for `explore` to cover breadth — find where a \
          thing lives, gather the relevant files — and use `run_kaish` to read the \
-         code yourself. When you read directly, read generously: pull a whole file \
-         with `cat -n FILE` rather than a narrow slice — the window is yours to \
-         fill, and one wide look often surfaces what a surgical read would miss. \
-         Build your answer from what \
+         code yourself. When you read directly, read generously in wide passes — a \
+         short file whole with `cat -n FILE`, a big one in spans of a few hundred \
+         lines (`cat -n FILE | sed -n '1,400p'`, then `'401,800p'`) — so each look \
+         lands the code in its context. Build your answer from what \
          they return: quote the key snippet, name its `file:line`, and let the \
          evidence carry the claim. Where the evidence settles the question, answer \
          it fully; where it reaches its edge, say so and name what would close the gap.\n\n\
@@ -1938,7 +1938,7 @@ pub fn deliberation_prompt(question: &str, dossier: &str) -> String {
          those citations as accurate and deliberate deeply over the question using this \
          evidence: reason it all the way through, and say where the evidence runs out. If \
          the dossier leaves a load-bearing detail open, reason under a stated assumption \
-         and flag what would change if it's wrong, rather than guessing silently.\n\n\
+         and flag what would change if it's wrong.\n\n\
          ## Question\n{question}\n\n## Dossier\n{dossier}"
     )
 }

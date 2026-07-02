@@ -35,13 +35,13 @@ pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so just read. Browse with line \
 numbers so every citation is exact, and read generously — the context window is \
-yours to fill, so favor one wide look over many narrow ones; reading a whole file \
-often surfaces what a surgical slice would hide. `cat -n FILE` reads a file whole \
-with its line numbers — reach for it first; most files are short (`wc -l FILE` \
-confirms). To locate something across files, `grep -rn -B3 -A6 PATTERN .` returns \
-each match with the lines around it. A whole-file read that comes back truncated \
-(exit 3, a head+tail sample) was simply too big — re-read just the part you need \
-with a narrow span, `cat -n FILE | sed -n '40,80p'`. Each call starts at the project root; \
+yours to fill, so read in wide passes: `cat -n FILE` takes a short file whole with \
+its line numbers (`wc -l FILE` sizes it), and a big file goes in wide spans of a few \
+hundred lines, `cat -n FILE | sed -n '1,400p'` then `'401,800p'`. To locate \
+something across files, `grep -rn -B3 -A6 PATTERN .` returns each match with the \
+lines around it. A whole-file read that comes back truncated (exit 3, a head+tail \
+sample) was simply too big for one look — cover it in those wide spans. Each call \
+starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
@@ -325,12 +325,12 @@ pub fn kaibo_sandbox_doc() -> String {
          {KAISH_SANDBOX_ADDENDUM}\n\n\
          ## Browsing for exact citations\n\
          Lead with line numbers so every claim cites `file:line`, and read \
-         generously — favor a whole file over a narrow slice:\n\
-         - `cat -n FILE` — a whole file with line numbers; reach for it first\n\
+         generously in wide passes:\n\
+         - `cat -n FILE` — a short file whole, with line numbers; reach for it first\n\
          - `grep -rn PATTERN [PATH]` — matches with line numbers, across files\n\
          - `grep -rn -B3 -A6 PATTERN .` — matches with the lines around them\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
-         - `cat -n FILE | sed -n '40,80p'` — a numbered span of a large file\n\n\
+         - `cat -n FILE | sed -n '1,400p'` — a wide span of a big file (walk it: then `'401,800p'`)\n\n\
          ## Read-only boundary\n\
          The project is mounted read-only and external commands are off, by \
          construction. Writes, `git`, `touch`, `spawn`/`exec`, and any external \
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn instructions_fit_claude_code_budget() {
         let mut config = Config::builtin(); // anthropic, deepseek, gemini,
-                                             // openai-local, gemini-batch, anthropic-batch
+                                            // openai-local, gemini-batch, anthropic-batch
         for (name, backend, id) in [
             ("chimera", "anthropic", "claude-haiku-4-5"),
             ("glm", "openai-local", "GLM-4.5-Air-UD-Q4K-XL-GGUF"),

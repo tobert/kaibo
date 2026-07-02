@@ -276,6 +276,12 @@ the git log. Each later release appends a new section at the top.
   sources spends noticeably fewer tool calls gathering the same evidence (measured: a
   broad sweep dropped from 74 read/search calls to 46, reading the same big file in ~13
   wide spans instead of ~22 fifteen-line ones). No behavior change on short files.
+- **The `consult` driver and the shared kaish cheatsheet describe reading in wide
+  passes**, matching the guidance the explorer got: a short file read whole, a big one
+  in a few hundred-line spans. Several preambles also drop negative-example phrasing
+  in favor of stating the wanted behavior directly. A `consult` over large sources
+  should spend fewer tool calls gathering the same evidence (same mechanism the
+  explorer change measured).
 
 ### Fixed
 
