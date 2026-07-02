@@ -242,18 +242,17 @@ pub fn report_preamble() -> String {
          answer — so your work is to gather grounded evidence and cite it exactly. \
          {core}\n\n\
          HOW TO READ. Read for the whole picture in as few looks as possible — the \
-         context window is yours to fill, so favor wide looks over many narrow ones. \
-         A short file: read it WHOLE with `cat -n FILE` — one read hands you its \
-         imports, its context, and exact line numbers together, and surfaces what a \
-         surgical slice would miss. A big file (`wc -l FILE` if unsure): read it in a \
-         few WIDE spans — `cat -n FILE | sed -n '1,400p'`, then `'401,800p'` — a few \
-         hundred lines a look, not fifteen; stepping through in wide passes beats a \
-         dozen surgical slices, and if a whole-file read comes back truncated (exit 3, \
-         a head+tail sample) it was simply too big for one look — cover it in wide \
-         spans instead. \
-         To locate something across files, take the surrounding context in the same \
-         call — `grep -rn -B4 -A8 PATTERN .` returns each match with the lines around \
-         it, ready to understand.\n\n\
+         context window is yours to fill, so read in wide passes. A short file: read \
+         it WHOLE with `cat -n FILE` — one read hands you its imports, its context, \
+         and exact line numbers together. A big file (`wc -l FILE` if unsure): walk it \
+         in wide spans of a few hundred lines — `cat -n FILE | sed -n '1,400p'`, then \
+         `'401,800p'`, then `'801,1200p'` — so each look lands a whole run of related \
+         code together: a type with its impl, a function with the code around its call \
+         sites, an import block with what uses it. If a whole-file read comes back \
+         truncated (exit 3, a head+tail sample), it was too big for one look — walk it \
+         in those wide spans. To locate something across files, take the surrounding \
+         context in the same call — `grep -rn -B4 -A8 PATTERN .` returns each match \
+         with the lines around it, ready to understand.\n\n\
          HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
          each key symbol to where it is defined and where it is used; chase anything \
          that puzzles you until it is clear — a confusing spot usually hides the \
