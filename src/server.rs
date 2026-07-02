@@ -173,11 +173,11 @@ pub struct ConsultInput {
     #[serde(default)]
     pub session_id: Option<String>,
 
-    /// Max tool-loop turns for each delegated `explore′` sweep (default 50).
+    /// Max tool-loop turns for each delegated `explore′` sweep (default 100).
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
 
-    /// Max tool-loop turns for the consult driver loop itself (default 100).
+    /// Max tool-loop turns for the consult driver loop itself (default 200).
     #[serde(default)]
     pub synth_max_turns: Option<usize>,
 
@@ -226,7 +226,7 @@ pub struct ExploreInput {
     #[serde(default)]
     pub explorer_backend: Option<String>,
 
-    /// Max tool-loop turns for the explorer sweep (default 50).
+    /// Max tool-loop turns for the explorer sweep (default 100).
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
 }
@@ -274,7 +274,7 @@ pub struct DeliberateInput {
     #[serde(default)]
     pub synth_backend: Option<String>,
 
-    /// Max tool-loop turns for the dossier-building explorer sweep (default 50).
+    /// Max tool-loop turns for the dossier-building explorer sweep (default 100).
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
 }
