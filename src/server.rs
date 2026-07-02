@@ -500,9 +500,13 @@ type CastEnumRule = (&'static [&'static str], fn(&Config, &str) -> bool);
 /// from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
-        &["consult", "consult_submit", "explore", "oneshot"],
+        &["consult", "consult_submit", "oneshot"],
         Config::cast_is_interactive,
     ),
+    // `explore` runs only the explorer, so it advertises *any* cast with one — including
+    // `deliberate`/`direct` casts, whose (often smarter) explorers are useful standalone.
+    // Its own rule, broader than the interactive tools' (which also need an interactive synth).
+    (&["explore"], Config::cast_can_explore),
     (&["batch_submit"], Config::cast_is_batch),
     (&["deliberate"], Config::cast_can_deliberate),
 ];
@@ -2993,8 +2997,11 @@ own, so you get the structured cited report — a summary of findings, the relev
 Reach for `explore` to map unfamiliar code, or to assemble a grounded survey you'll reason
 over yourself (or hand to another model). It reads the repo itself, like `consult`, so the
 same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply; there's no
-`attach`, `context`, or `session_id` — those belong to the synthesizing tools. When you
-want the conclusion rather than the map, use `consult`.
+`attach`, `context`, or `session_id` — those belong to the synthesizing tools. Since it runs
+*only* the explorer, its `cast` accepts any cast with an explorer — including `deliberate`/
+`direct` casts: point it at one to run that team's (often smarter, slower) explorer
+standalone, when you want a stronger sweep than your own fast one, or to size the explorer up.
+When you want the conclusion rather than the map, use `consult`.
 
 ## Deepest reasoning, offline: `deliberate`
 
@@ -4557,7 +4564,8 @@ mod tests {
                 })
                 .unwrap_or_default()
         };
-        for tool in ["consult", "consult_submit", "oneshot", "explore"] {
+        // The interactive tools need an interactive synth: only `myinteractive`.
+        for tool in ["consult", "consult_submit", "oneshot"] {
             let casts = enum_of(tool);
             assert!(
                 casts.iter().any(|c| c == "myinteractive"),
@@ -4569,6 +4577,23 @@ mod tests {
                     "{tool} enum must not list the offline cast {offline}, got {casts:?}"
                 );
             }
+        }
+        // `explore` runs only the explorer, so it advertises *every* cast with one —
+        // interactive AND offline-synth casts (`mydeliberate`) — but not the synth-only
+        // casts (`mybatch`, `mydirect`), which have no explorer to run.
+        let explore = enum_of("explore");
+        for with_explorer in ["myinteractive", "mydeliberate"] {
+            assert!(
+                explore.iter().any(|c| c == with_explorer),
+                "explore enum should list the explorer-bearing cast {with_explorer}, got {explore:?}"
+            );
+        }
+        for no_explorer in ["mybatch", "mydirect"] {
+            assert!(
+                !explore.iter().any(|c| c == no_explorer),
+                "explore enum must not list the synth-only cast {no_explorer} (no explorer), \
+                 got {explore:?}"
+            );
         }
         let batch = enum_of("batch_submit");
         // Both batch synths (explorer or not) can be batch_submit'd — it's synth-only.
