@@ -124,6 +124,114 @@ fn phase_preamble(
     with_house_rules(base, house_rules)
 }
 
+/// The model-driven phases whose system prompt kaibo composes. One enum so the three
+/// per-phase decisions — *which* built-in default, *which* `[prompts]` override key,
+/// and *whether* the phase reads the project (so the `[orientation]` map + `[context]`
+/// house rules splice) — live in exactly one place, [`resolve_phase_preamble`]. Every
+/// live tool routes through it, and so does the `kaibo://prompts` resource, so what the
+/// resource shows can never drift from what a call actually sends the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The explorer sweep: `explore`, the nested `explore′` inside `consult`, and
+    /// `deliberate`'s dossier phase all share this one.
+    Explorer,
+    /// The `consult` driver.
+    Consult,
+    /// The thin, toolless `oneshot`.
+    Oneshot,
+    /// The offline synth: `batch_submit` and `deliberate`'s synth, on either lane.
+    Batch,
+}
+
+impl Phase {
+    /// The four phases, for callers that enumerate every prompt (the resource).
+    pub const ALL: [Phase; 4] = [
+        Phase::Explorer,
+        Phase::Consult,
+        Phase::Oneshot,
+        Phase::Batch,
+    ];
+
+    /// A short, stable label for a phase — the resource header and the tools it drives.
+    pub fn label(self) -> &'static str {
+        match self {
+            Phase::Explorer => "explorer (explore · consult sweep · deliberate dossier)",
+            Phase::Consult => "consult driver",
+            Phase::Oneshot => "oneshot",
+            Phase::Batch => "batch / deliberate synth (offline)",
+        }
+    }
+
+    /// The built-in default preamble for this phase.
+    fn default_preamble(self) -> fn() -> String {
+        match self {
+            Phase::Explorer => report_preamble,
+            Phase::Consult => consult_preamble,
+            Phase::Oneshot => oneshot_preamble,
+            Phase::Batch => batch_preamble,
+        }
+    }
+
+    /// This phase's `[prompts]` override key (per-slot preamble already folded in
+    /// upstream). Public so the `kaibo://prompts` resource can report which phases carry
+    /// an active override without re-encoding the phase→key mapping.
+    pub fn override_in(self, p: &PromptOverrides) -> Option<&str> {
+        match self {
+            Phase::Explorer => p.explorer.as_deref(),
+            Phase::Consult => p.consult.as_deref(),
+            Phase::Oneshot => p.oneshot.as_deref(),
+            Phase::Batch => p.batch.as_deref(),
+        }
+    }
+
+    /// Does this phase read the project? The explorer sweep and the `consult` driver
+    /// do — so they get the `[orientation]` map and `[context]` house rules spliced.
+    /// `oneshot` and the offline `batch` synth own their context (the caller supplies
+    /// it), so neither project layer reaches them — the seam that used to sit as a bare
+    /// `None, None` at each of those call sites now lives here, in one place.
+    pub fn reads_project(self) -> bool {
+        matches!(self, Phase::Explorer | Phase::Consult)
+    }
+
+    /// Which cast slot's `preamble` frames this phase: the **explorer** slot drives the
+    /// explorer sweep; the **synth** slot drives every synth phase (`consult`, `oneshot`,
+    /// and the offline `batch`/`deliberate` synth). Lets the `kaibo://prompts/{cast}`
+    /// resource attribute a phase's framing to the slot that set it — the same slot→phase
+    /// mapping [`crate::config::Cast::resolved_prompts`] applies.
+    pub fn slot_role(self) -> ModelRole {
+        match self {
+            Phase::Explorer => ModelRole::Explorer,
+            Phase::Consult | Phase::Oneshot | Phase::Batch => ModelRole::Synth,
+        }
+    }
+}
+
+/// Compose one phase's full system prompt through the single layering point. Picks the
+/// operator override (else the built-in) for `phase`, then — for the project-reading
+/// phases only — splices the `[orientation]` map and `[context]` house rules. This is
+/// what every live tool builds and what the `kaibo://prompts` resource renders, so the
+/// resource is exactly the code path, not a restatement of it.
+pub fn resolve_phase_preamble(
+    phase: Phase,
+    prompts: &PromptOverrides,
+    orientation: Option<&str>,
+    house_rules: Option<&str>,
+) -> String {
+    // The phase decides whether the project layers apply — pass them unconditionally
+    // and let `reads_project` gate, so no call site re-encodes that rule.
+    let (orientation, house_rules) = if phase.reads_project() {
+        (orientation, house_rules)
+    } else {
+        (None, None)
+    };
+    phase_preamble(
+        phase.override_in(prompts),
+        phase.default_preamble(),
+        orientation,
+        house_rules,
+    )
+}
+
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
@@ -1545,7 +1653,15 @@ pub fn batch_preamble() -> String {
 /// `oneshot` gets, exposed as a public seam because the batch path lives outside the
 /// `ConsultConfig`-driven loop (it runs on the provider's batch lane, not [`Arm::run`]).
 pub fn batch_system_prompt(override_: Option<&str>) -> String {
-    phase_preamble(override_, batch_preamble, None, None)
+    // Route through the shared `Phase` seam so the `Batch` framing (built-in vs
+    // override, project layers off) is decided in exactly one place — the same one the
+    // resource renders. This path carries a bare override rather than a full
+    // `PromptOverrides`, so wrap it in the one key `Phase::Batch` reads.
+    let prompts = PromptOverrides {
+        batch: override_.map(str::to_string),
+        ..Default::default()
+    };
+    resolve_phase_preamble(Phase::Batch, &prompts, None, None)
 }
 
 /// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
@@ -1603,7 +1719,12 @@ pub async fn oneshot(
         }
     };
     arm.run(
-        &phase_preamble(cfg.prompts.oneshot.as_deref(), oneshot_preamble, None, None),
+        &resolve_phase_preamble(
+            Phase::Oneshot,
+            &cfg.prompts,
+            cfg.orientation.as_deref(),
+            cfg.house_rules.as_deref(),
+        ),
         initial_prompt,
         1,
         cfg.progress.as_ref(),
@@ -1676,9 +1797,7 @@ pub fn consult_user_prompt(
              your answer:\n",
         );
         if !texts.is_empty() {
-            prompt.push_str(
-                "\nText files — read each in full with the shell (`cat -n PATH`):\n",
-            );
+            prompt.push_str("\nText files — read each in full with the shell (`cat -n PATH`):\n");
             for a in &texts {
                 prompt.push_str(&format!("- {}\n", a.path));
             }
@@ -1750,9 +1869,9 @@ fn consult_tools(
     // explorer_max_turns per sweep; no cap on how many times consult may delegate
     // (Amy's call — watch real behavior). Its system prompt is the explorer
     // override-or-default + house rules, built once here rather than per sweep.
-    let explorer_preamble: Arc<str> = Arc::from(phase_preamble(
-        cfg.prompts.explorer.as_deref(),
-        report_preamble,
+    let explorer_preamble: Arc<str> = Arc::from(resolve_phase_preamble(
+        Phase::Explorer,
+        &cfg.prompts,
         cfg.orientation.as_deref(),
         cfg.house_rules.as_deref(),
     ));
@@ -1793,9 +1912,9 @@ pub(crate) async fn explore_with(
     explorer: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<String> {
-    let preamble = phase_preamble(
-        cfg.prompts.explorer.as_deref(),
-        report_preamble,
+    let preamble = resolve_phase_preamble(
+        Phase::Explorer,
+        &cfg.prompts,
         cfg.orientation.as_deref(),
         cfg.house_rules.as_deref(),
     );
@@ -1877,9 +1996,9 @@ pub(crate) async fn consult_with(
 
     let answer = synth
         .run(
-            &phase_preamble(
-                cfg.prompts.consult.as_deref(),
-                consult_preamble,
+            &resolve_phase_preamble(
+                Phase::Consult,
+                &cfg.prompts,
                 cfg.orientation.as_deref(),
                 cfg.house_rules.as_deref(),
             ),
@@ -2683,11 +2802,20 @@ mod tests {
     #[test]
     fn deliberation_prompt_carries_question_then_dossier_and_frames_trust() {
         let p = deliberation_prompt("Is the retry path safe?", "src/retry.rs:12 fn retry()");
-        assert!(p.contains("Is the retry path safe?"), "question present: {p}");
-        assert!(p.contains("src/retry.rs:12 fn retry()"), "dossier present: {p}");
+        assert!(
+            p.contains("Is the retry path safe?"),
+            "question present: {p}"
+        );
+        assert!(
+            p.contains("src/retry.rs:12 fn retry()"),
+            "dossier present: {p}"
+        );
         let q = p.find("## Question").expect("has a Question section");
         let d = p.find("## Dossier").expect("has a Dossier section");
-        assert!(q < d, "the question is framed before the dossier evidence: {p}");
+        assert!(
+            q < d,
+            "the question is framed before the dossier evidence: {p}"
+        );
         assert!(
             p.contains("Trust") && p.contains("evidence"),
             "installs the trusted-evidence posture: {p}"
@@ -2714,7 +2842,9 @@ mod tests {
                     seen.contains("DOSSIER_MARKER"),
                     "the built dossier must reach the synth: {seen}"
                 );
-                Ok(text_response("DELIBERATION: the retry path is safe because …"))
+                Ok(text_response(
+                    "DELIBERATION: the retry path is safe because …",
+                ))
             })
             .build();
 
@@ -2734,7 +2864,11 @@ mod tests {
             "returns the synth's deliberation verbatim: {out}"
         );
         // Exactly one upstream request — the single offline turn, no follow-up.
-        assert_eq!(client.requests_for(SYNTH).len(), 1, "one toolless completion");
+        assert_eq!(
+            client.requests_for(SYNTH).len(),
+            1,
+            "one toolless completion"
+        );
     }
 
     /// Progress reaches the *deep* loop. The same delegate-then-read flow as the e2e
@@ -3685,6 +3819,70 @@ mod tests {
         assert_eq!(
             batch_system_prompt(Some("custom batch frame")),
             "custom batch frame"
+        );
+    }
+
+    /// The single `Phase` seam both the tools and the `kaibo://prompts` resource go
+    /// through: each phase resolves to its own built-in default, an override wins per
+    /// key, and the `[orientation]`/`[context]` project layers splice *only* for the
+    /// project-reading phases (explorer + consult) — never for the caller-owns-context
+    /// phases (oneshot + the offline batch synth), even when the layers are passed.
+    #[test]
+    fn resolve_phase_preamble_routes_each_phase_and_gates_project_layers() {
+        let base = PromptOverrides::default();
+        assert_eq!(
+            resolve_phase_preamble(Phase::Explorer, &base, None, None),
+            report_preamble()
+        );
+        assert_eq!(
+            resolve_phase_preamble(Phase::Consult, &base, None, None),
+            consult_preamble()
+        );
+        assert_eq!(
+            resolve_phase_preamble(Phase::Oneshot, &base, None, None),
+            oneshot_preamble()
+        );
+        assert_eq!(
+            resolve_phase_preamble(Phase::Batch, &base, None, None),
+            batch_preamble()
+        );
+
+        let map = "PROJECT FILES.\nsrc/lib.rs";
+        let rules = "operator house rule";
+        // The reading phases splice both project layers.
+        for phase in [Phase::Explorer, Phase::Consult] {
+            let p = resolve_phase_preamble(phase, &base, Some(map), Some(rules));
+            assert!(
+                p.contains(map) && p.contains(rules),
+                "{} must splice the project layers",
+                phase.label()
+            );
+            assert!(phase.reads_project());
+        }
+        // The context-owning phases drop them even when passed.
+        for phase in [Phase::Oneshot, Phase::Batch] {
+            assert_eq!(
+                resolve_phase_preamble(phase, &base, Some(map), Some(rules)),
+                resolve_phase_preamble(phase, &base, None, None),
+                "{} must ignore the project layers",
+                phase.label()
+            );
+            assert!(!phase.reads_project());
+        }
+
+        // An override wins over the built-in, per key.
+        let ov = PromptOverrides {
+            consult: Some("CUSTOM DRIVER".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_phase_preamble(Phase::Consult, &ov, None, None),
+            "CUSTOM DRIVER"
+        );
+        // ...and doesn't bleed into a sibling phase.
+        assert_eq!(
+            resolve_phase_preamble(Phase::Oneshot, &ov, None, None),
+            oneshot_preamble()
         );
     }
 

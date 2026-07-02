@@ -507,6 +507,30 @@ impl Cast {
     pub fn synth_lane(&self) -> Option<Lane> {
         self.slot(ModelRole::Synth).and_then(|s| s.lane)
     }
+
+    /// Layer this cast's per-slot `preamble`s over the `global` `[prompts]` table into
+    /// the per-phase overrides a call resolves. Precedence: per-slot `preamble` > global
+    /// `[prompts].<phase>` > built-in (the last resolved downstream in `consult.rs`). The
+    /// **explorer** slot feeds the `explorer` phase; the **synth** slot feeds *every*
+    /// synth phase — the interactive `consult`/`oneshot` and the offline `batch`/
+    /// `deliberate` synth — each under its own key so they stay independently overridable
+    /// (a copy today, free to diverge). The offline key is load-bearing: a batch/
+    /// deliberate cast's synth *is* the offline synth, so its slot voice has to reach
+    /// `batch` too. One place, shared by the live call path (`resolved_prompts`) and the
+    /// `kaibo://prompts/{cast}` resource, so what a call sends and what the doc shows
+    /// can't drift.
+    pub fn resolved_prompts(&self, global: &PromptOverrides) -> PromptOverrides {
+        let mut p = global.clone();
+        if let Some(pre) = self.slot(ModelRole::Explorer).and_then(|s| s.preamble.clone()) {
+            p.explorer = Some(pre);
+        }
+        if let Some(pre) = self.slot(ModelRole::Synth).and_then(|s| s.preamble.clone()) {
+            p.consult = Some(pre.clone());
+            p.oneshot = Some(pre.clone());
+            p.batch = Some(pre);
+        }
+        p
+    }
 }
 
 /// Whether a cast can actually serve its model-backed tools, judged offline (no

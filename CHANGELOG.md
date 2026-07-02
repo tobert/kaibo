@@ -184,6 +184,21 @@ the git log. Each later release appends a new section at the top.
   `bash` habits that don't carry over. The tool schemas themselves are now terse and
   point here, so the depth a calling model needs loads on demand instead of riding in
   every agent's startup context (~40% lighter tool descriptions at connect time).
+- **`kaibo://prompts` resource — see (and tune) exactly what the models are told.** The
+  system preamble each phase receives — the explorer sweep, the `consult` driver,
+  `oneshot`, and the offline `batch`/`deliberate` synth — rendered by the *same* code a
+  live call runs (any `[prompts]` override folded in), plus how your question is wrapped
+  into the user turn. It's an audit surface (what is a model actually reading?) and the
+  companion to tuning a preamble: override a phase's role framing globally with the
+  `[prompts]` table or per cast with a slot's `preamble`, and the resource shows the
+  result. **`kaibo://prompts/<cast>`** goes one step further — it resolves *that cast's*
+  framing, its per-slot `preamble`s folded in the way a live call layers them, and
+  attributes each phase to whichever set it (cast slot › global `[prompts]` › built-in) —
+  so you see precisely what one cast's models are told. Relatedly, a **synth slot's
+  `preamble` now frames the offline synth too** — a per-cast voice set on a
+  `batch`/`deliberate` cast reaches its `batch_submit` / `deliberate` answers, not just
+  the interactive `consult`/`oneshot` phases (previously only the global `[prompts].batch`
+  did).
 - **Zero-config workspace root.** When no `--root` is set, kaibo adopts its launch
   cwd as the inferred default root (it already scoped containment to that cwd, and
   MCP clients start stdio servers with cwd = workspace), so a call may omit `path`
