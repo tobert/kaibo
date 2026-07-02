@@ -874,6 +874,7 @@ fn cli_cast_wins_over_env_and_file() {
     // Only oneshot is dropped; the rest stay enabled.
     assert!(c.tools.consult);
     assert!(c.tools.explore);
+    assert!(c.tools.deliberate);
     assert!(!c.tools.oneshot);
     assert!(c.tools.run_kaish);
 }

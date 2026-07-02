@@ -78,6 +78,10 @@ struct Args {
     #[arg(long)]
     no_explore: bool,
 
+    /// Don't advertise the `deliberate` tool.
+    #[arg(long)]
+    no_deliberate: bool,
+
     /// Don't advertise the `oneshot` tool.
     #[arg(long)]
     no_oneshot: bool,
@@ -134,6 +138,7 @@ async fn main() -> Result<()> {
         ToolDisables {
             consult: args.no_consult,
             explore: args.no_explore,
+            deliberate: args.no_deliberate,
             oneshot: args.no_oneshot,
             run_kaish: args.no_run_kaish,
             batch: args.no_batch,

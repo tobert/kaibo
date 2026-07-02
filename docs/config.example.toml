@@ -334,14 +334,33 @@ synth    = "gemini/gemini-pro-latest"        # batch-capable synth (Anthropic | 
 # Equivalent, spelled directly on the slot (no cast-level sugar):
 #   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
 
+# --- DELIBERATE casts: an interactive explorer PLUS an offline synth. `deliberate` runs
+#     the explorer live to build a cited dossier, then hands dossier+question to the offline
+#     synth to reason over — a frontier model's deepest pass without holding a session open.
+#     The synth's lane picks the offline mechanism: `batch` (a provider batch, half price,
+#     durable handle) below, or `direct` (one long LOCAL completion) further down. Unlike the
+#     synth-only batch casts above, these carry BOTH slots — the explorer is what makes it a
+#     deliberate cast rather than a plain batch one. ---
+
+# Fable on the batch lane, with a Sonnet explorer building the dossier.
+[casts.fable]
+explorer = "anthropic/claude-sonnet-4-6"
+synth    = { backend = "anthropic", id = "claude-fable-5", lane = "batch" }
+
+# Gemini Pro deliberating on the batch lane, with a cheap Flash-Lite explorer.
+[casts.gemini-deliberate]
+explorer = "gemini/gemini-flash-lite-latest"
+synth    = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+
 # --- The other offline lane, `lane = "direct"`: one long completion kaibo runs itself
 #     against a big LOCAL model (no async provider API, no `batch = true` sugar for this
-#     one — spell it on the slot). Reserved for offline deliberation over a big model that's
-#     too slow to run inside a live tool loop but has no batch endpoint; no tool consumes a
-#     `direct` synth yet, so this cast is forward-declared, not yet callable. ---
+#     one — spell it on the slot). For offline deliberation over a big model that's too slow
+#     to run inside a live tool loop and has no batch endpoint. `deliberate` consumes it: it
+#     builds the dossier with the interactive explorer, then runs the direct synth as one
+#     long local completion under a session-scoped `job-N` handle. ---
 
 [casts.local-direct]
-explorer = "gemma/Gemma-4-E4B-it-GGUF"       # an interactive explorer may sit beside an offline synth
+explorer = "gemma/Gemma-4-E4B-it-GGUF"       # an interactive explorer beside an offline synth
 synth    = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 
 # ---------------------------------------------------------------------------
