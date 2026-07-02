@@ -4624,6 +4624,12 @@ mod tests {
             vec!["0", "1"],
             "items carry their index as custom_id"
         );
+        // The offline-synth (batch) system prompt is submitted — not oneshot/consult's.
+        assert_eq!(
+            submits[0].0,
+            crate::consult::batch_system_prompt(None),
+            "the batch system prompt is passed through"
+        );
     }
 
     /// `deliberate`'s BATCH lane, tested directly — no explorer, no network. `deliberate_batch`
@@ -4660,6 +4666,7 @@ mod tests {
         assert_eq!(system, "offline-synth-system", "the system prompt passes through");
         assert!(attach.is_empty(), "deliberate carries no attachments — the dossier is the prompt");
         assert_eq!(items.len(), 1, "one item — the dossier, not fanned");
+        assert_eq!(items[0].custom_id, "0", "the single dossier item is custom_id 0");
         assert!(
             items[0].prompt.contains("Is the retry safe?")
                 && items[0].prompt.contains("DOSSIER: src/x.rs:1 fn retry"),
@@ -4738,6 +4745,11 @@ mod tests {
             "the seeded batch appears in the listing"
         );
     }
+
+    // (`job_wait`'s batch arm uses the same `batch_poller` choke-point these tests cover,
+    // but the handler takes a live `Peer<RoleServer>` for its notification drain, so a full
+    // offline handler test would need a fabricated peer — out of scope; the provider path
+    // itself is proven above.)
 
     /// An empty roster (no cast can reach a model) leaves `cast` enum-free: an empty
     /// `enum` would read as "no valid value" and wrongly forbid the optional field.
