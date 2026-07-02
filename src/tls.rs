@@ -14,6 +14,9 @@
 //! exists because Cargo.toml enables rustls's `ring` feature (and not `aws_lc_rs`).
 
 use std::sync::Once;
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 
 /// Install ring as the process-wide default rustls [`CryptoProvider`], exactly once.
 ///
@@ -34,4 +37,26 @@ pub fn ensure_crypto_provider() {
             .install_default()
             .expect("install ring as the default rustls crypto provider");
     });
+}
+
+/// Build a reqwest HTTPS client carrying a per-request deadline — the **one**
+/// construction site for every provider client (rig completions and provider batches
+/// alike), so the `rustls-no-provider` + ring contract lives in exactly one place
+/// instead of being hand-rolled at each call site. Installs the ring provider first
+/// (idempotent; reqwest panics on a missing default rather than falling back to
+/// plaintext), then builds off the process-default rustls provider — no `native-tls`,
+/// no OpenSSL, no C.
+///
+/// The client is bounded because rig exposes no native timeout and its prompt loop is
+/// non-streaming: a backend that connects but never answers would otherwise hang the
+/// whole call with no brake (the 2026-06-06 ~29-min wedge; `docs/issues.md`).
+/// `timeout` caps a single completion; `connect_timeout` fails a dead endpoint fast,
+/// capped at the deadline so a sub-10s backend timeout still dominates.
+pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {
+    ensure_crypto_provider();
+    reqwest::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(request_timeout.min(Duration::from_secs(10)))
+        .build()
+        .map_err(|e| anyhow!("http client init: {e}"))
 }

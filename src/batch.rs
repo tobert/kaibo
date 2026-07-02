@@ -35,7 +35,6 @@
 //! commits to.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -700,16 +699,11 @@ impl BatchProvider for AnthropicBatch {
 /// endpoint), so batch addresses the service directly, as Anthropic does.
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-/// A reqwest client carrying the backend's per-request deadline, with ring installed
-/// before `.build()` (the TLS invariant — every client build site does this). Shared by
-/// both batch providers.
+/// A reqwest client carrying the backend's per-request deadline — the shared
+/// [`crate::tls::https_client`] is the one build site (ring installed, `rustls-no-provider`,
+/// no OpenSSL/C); this just supplies the backend's timeout. Used by both batch providers.
 fn batch_http_client(backend: &Backend) -> Result<reqwest::Client> {
-    crate::tls::ensure_crypto_provider();
-    reqwest::Client::builder()
-        .timeout(backend.request_timeout)
-        .connect_timeout(backend.request_timeout.min(Duration::from_secs(10)))
-        .build()
-        .map_err(|e| anyhow!("http client init: {e}"))
+    crate::tls::https_client(backend.request_timeout)
 }
 
 /// Read a (possibly string-encoded) count field. Gemini's `batchStats` numbers arrive as
@@ -1334,6 +1328,8 @@ pub use test_double::{ScriptedBatch, ScriptedBatchProviders};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::config::{Defaults, ModelSlot};
 
     #[test]

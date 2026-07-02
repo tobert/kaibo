@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rig_core::agent::{HookAction, PromptHook};
@@ -826,22 +825,11 @@ impl Arm {
         );
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
-        // One HTTP backend carrying the per-request deadline. rig exposes no
-        // native timeout and its prompt loop is non-streaming, so a provider that
-        // connects but never responds would hang the whole call with no other
-        // brake — the 2026-06-06 wedge (~29 min; docs/issues.md). `timeout`
-        // bounds a single completion; `connect_timeout` fails a dead endpoint
-        // fast (capped at the deadline so a sub-10s backend timeout still
-        // dominates). Injected via rig's `.http_client(..)`.
-        //
-        // reqwest is built `rustls-no-provider`, so `.build()` below panics unless a
-        // process-default crypto provider is installed; do it now (idempotent).
-        crate::tls::ensure_crypto_provider();
-        let http = reqwest::Client::builder()
-            .timeout(backend.request_timeout)
-            .connect_timeout(backend.request_timeout.min(Duration::from_secs(10)))
-            .build()
-            .map_err(|e| anyhow!("http client init: {e}"))?;
+        // One HTTP backend carrying the per-request deadline, built by the shared
+        // `crate::tls::https_client` (ring installed, `rustls-no-provider`, no OpenSSL/C —
+        // the one client-build site). It bounds the otherwise-brakeless non-streaming call
+        // (the 2026-06-06 wedge; see the helper's doc). Injected via rig's `.http_client(..)`.
+        let http = crate::tls::https_client(backend.request_timeout)?;
 
         match backend.kind {
             ProviderKind::Anthropic => {
@@ -2080,6 +2068,8 @@ pub async fn consult(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::session::SessionStore;
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
