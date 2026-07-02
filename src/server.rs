@@ -468,21 +468,24 @@ pub struct KaiboHandler {
     batch_providers: Arc<dyn crate::batch::BatchProviderFactory>,
 }
 
-/// The single source mapping each cast-taking tool to the predicate that decides which
-/// *usable* casts its `cast` enum advertises — keyed on the cast's shape (synth lane +
-/// explorer, via the `Config::cast_is_*`/`cast_can_*` predicates). [`KaiboHandler::new`]
-/// injects the enums straight from this table, and
-/// `cast_enum_never_advertises_a_gated_cast` cross-checks the *shipped* enum against each
-/// tool's call-time gate — so the advertised menu and the gate that enforces it can't
-/// drift apart (the whole point of routing both through one place). A cast may match more
-/// than one rule (a deliberate-shaped batch cast like `fable` serves both `batch_submit`
-/// and `deliberate`); the rules are independent filters, not a partition. Keep this in
-/// step with the gates (`reject_offline_cast`/`require_batch_cast`/`require_deliberate_cast`)
-/// and the `advertised_tools()`/gating set — the consistency test is the guard.
 /// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, and the predicate
 /// (a `Config::cast_is_*`/`cast_can_*`) that decides which usable casts they advertise.
 type CastEnumRule = (&'static [&'static str], fn(&Config, &str) -> bool);
 
+/// The single source mapping each cast-taking tool to the predicate that decides which
+/// *usable* casts its `cast` enum advertises — keyed on the cast's shape (synth lane +
+/// explorer, via the `Config::cast_is_*`/`cast_can_*` predicates). [`KaiboHandler::new`]
+/// injects the enums straight from this table. A cast may match more than one rule (a
+/// deliberate-shaped batch cast like `fable` serves both `batch_submit` and `deliberate`);
+/// the rules are independent filters, not a partition.
+///
+/// Two tests guard it: `cast_enum_never_advertises_a_gated_cast` (no enum offers a cast its
+/// tool's gate — `reject_offline_cast`/`require_batch_cast`/`require_deliberate_cast` —
+/// would reject) and `every_cast_taking_tool_has_an_enum_rule` (no cast-taking tool ships
+/// without a rule, i.e. a silently-empty enum). `casts_section` (the handshake roster) is a
+/// *consumer* of the same `Config` predicates, not bound to this table: it renders a
+/// budget-limited display subset (it hides `Direct` casts) — a presentation choice distinct
+/// from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["consult", "consult_submit", "explore", "oneshot"],
@@ -4495,6 +4498,39 @@ mod tests {
             }
         }
         assert!(checked > 0, "the guard checked nothing");
+    }
+
+    /// The completeness half of the single source: every advertised tool that TAKES a
+    /// `cast` argument must be covered by a `CAST_ENUM_RULES` entry — otherwise a future
+    /// cast-taking tool would ship with a silently-empty `cast` enum (never advertising its
+    /// roster, since `inject_cast_enum` is only called for tools named in the table). Reads
+    /// the shipped schemas (a `cast` *property* is present whether or not the enum is
+    /// populated), so adding a `cast` param without a rule fails here.
+    #[test]
+    fn every_cast_taking_tool_has_an_enum_rule() {
+        let h = handler();
+        let ruled: std::collections::HashSet<&str> = CAST_ENUM_RULES
+            .iter()
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .collect();
+        let mut cast_taking = 0;
+        for tool in h.advertised_tools() {
+            let takes_cast = h
+                .tool_router
+                .get(&tool)
+                .and_then(|t| t.input_schema.get("properties"))
+                .and_then(|p| p.get("cast"))
+                .is_some();
+            if takes_cast {
+                cast_taking += 1;
+                assert!(
+                    ruled.contains(tool.as_str()),
+                    "tool `{tool}` takes a `cast` arg but no CAST_ENUM_RULES entry advertises \
+                     its roster — its enum would ship empty"
+                );
+            }
+        }
+        assert!(cast_taking > 0, "no cast-taking tool found — the guard is vacuous");
     }
 
     /// The lane gate's two halves, tested directly: an interactive tool refuses an
