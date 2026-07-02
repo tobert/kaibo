@@ -30,7 +30,7 @@ use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
-    Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides, consult, oneshot,
+    Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides, consult, explore_with, oneshot,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobSnapshot, JobState, JobStore};
@@ -80,6 +80,9 @@ const CONFIG_EXAMPLE_TOML: &str = include_str!("../docs/config.example.toml");
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolGating {
     pub consult: bool,
+    /// The single-phase `explore` sweep — its own gate, independent of `consult`
+    /// (which carries its own explorer inside the driver loop).
+    pub explore: bool,
     pub oneshot: bool,
     pub run_kaish: bool,
     /// The batch capability (submit/get/cancel/list) — one gate over all the verbs:
@@ -92,6 +95,7 @@ impl Default for ToolGating {
     fn default() -> Self {
         Self {
             consult: true,
+            explore: true,
             oneshot: true,
             run_kaish: true,
             batch: true,
@@ -102,7 +106,7 @@ impl Default for ToolGating {
 impl ToolGating {
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
-        !self.consult && !self.oneshot && !self.run_kaish && !self.batch
+        !self.consult && !self.explore && !self.oneshot && !self.run_kaish && !self.batch
     }
 }
 
@@ -180,6 +184,41 @@ pub struct ConsultInput {
     /// whole files a change touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
+}
+
+/// Arguments to the `explore` tool: a single-phase explorer sweep. Explorer-only —
+/// no synth, session, context, or attachments (explore reads the repo itself and
+/// returns the cited report, not a synthesized answer).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExploreInput {
+    /// What to survey or map. Say in prose what you want charted — kaibo's explorer
+    /// locates and reads the real, current code itself and reports back with citations.
+    pub question: String,
+
+    /// Absolute path to the project to explore. Optional when the server has a default
+    /// root; must be at-or-under an allowed tree (`kaibo://config` shows the set).
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Which cast (model team) runs this call; omit for the server's default. Pick from
+    /// this param's `enum`; `kaibo://config` lists every cast and backend.
+    #[serde(default)]
+    pub cast: Option<String>,
+
+    /// Override the explorer (investigation) model id. See `kaibo://tools` for override
+    /// semantics (ids are verbatim; pair with `explorer_backend` to also retarget).
+    #[serde(default)]
+    pub explorer_model: Option<String>,
+
+    /// Run the explorer override on this backend (name or alias). Requires
+    /// `explorer_model`. See `kaibo://tools`.
+    #[serde(default)]
+    pub explorer_backend: Option<String>,
+
+    /// Max tool-loop turns for the explorer sweep (default 50).
+    #[serde(default)]
+    pub explorer_max_turns: Option<usize>,
 }
 
 /// The handle addressing one piece of async work — a durable batch or a
@@ -430,6 +469,8 @@ impl KaiboHandler {
             // only one shape.) The verbs that *collect* its handles (`job_get`/
             // `job_cancel`/`job_list`) are shared with batch and gated below.
             (gating.consult, "consult_submit"),
+            // The single-phase explorer sweep — its own gate.
+            (gating.explore, "explore"),
             (gating.oneshot, "oneshot"),
             (gating.run_kaish, "run_kaish"),
             // `--no-batch` drops `batch_submit`; the shared collect verbs live below.
@@ -537,7 +578,7 @@ impl KaiboHandler {
             .collect();
         inject_cast_enum(
             &mut tool_router,
-            &["consult", "consult_submit", "oneshot"],
+            &["consult", "consult_submit", "explore", "oneshot"],
             &interactive_usable,
         );
         inject_cast_enum(&mut tool_router, &["batch_submit"], &batch_usable);
@@ -1526,6 +1567,71 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Survey a codebase and get back a structured, cited report — not an \
+            answer. A fast, cheap model sweeps the project READ-ONLY (grep, whole-file \
+            reads) and returns a summary of findings, the relevant locations with \
+            `file:line`, and the trail it followed. The evidence-gathering half of \
+            `consult`, exposed directly: map unfamiliar code, or assemble a cited survey \
+            to reason over yourself. For a synthesized answer instead, use `consult`."
+    )]
+    async fn explore(
+        &self,
+        Parameters(input): Parameters<ExploreInput>,
+        peer: Peer<RoleServer>,
+        meta: Meta,
+    ) -> Result<CallToolResult, McpError> {
+        let root = self.resolve_root(input.path)?;
+        // Resolve the cast, then layer a per-call explorer override onto the clone.
+        // Deliberately NO `reject_offline_cast`: explore runs the *explorer* arm
+        // interactively, so a deliberate/direct cast's explorer is perfectly valid —
+        // explore only needs an explorer slot, resolved next (a synth-only batch cast
+        // has none and `arm` errors clearly).
+        let mut cast = self.resolve_cast(input.cast)?;
+        self.apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            input.explorer_model.as_deref(),
+            input.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )?;
+        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        let progress = progress_sink(peer, &meta);
+        let defaults = &self.config.defaults;
+        let cfg = ConsultConfig {
+            explorer_max_turns: input
+                .explorer_max_turns
+                .unwrap_or(defaults.explorer_max_turns),
+            // Single-phase: no synth runs, so `synth_max_turns` is inert here.
+            synth_max_turns: defaults.synth_max_turns,
+            sandbox: self.config.sandbox.clone(),
+            progress: progress.clone(),
+            house_rules: self.house_rules(&root)?,
+            prompts: self.resolved_prompts(&cast),
+            orientation: self.orientation(&root).await?,
+            // explore reads the repo itself — no caller attachments.
+            attachments: Vec::new(),
+        };
+
+        let span = tracing::info_span!("explore", cast = %cast.name, explorer_model = %explorer.model);
+        progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
+        let report = match explore_with(&input.question, root, &explorer, &cfg)
+            .instrument(span)
+            .await
+        {
+            Ok(report) => report,
+            // A provider/model-loop failure is a clean tool-result error, same as `consult`.
+            Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
+        };
+        progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
+
+        // The report IS the text (no structured_content). Provenance names the one arm
+        // that produced it, so a cross-model study sees which explorer surveyed.
+        let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)]);
+        Ok(CallToolResult::success(vec![Content::text(report)]))
+    }
+
+    #[tool(
         description = "Ask a model outside your own family a direct question — prompt in, \
             answer out. No tools, no codebase access: the second-opinion primitive for \
             when you already own the context. Paste what's needed, or `attach` whole \
@@ -2489,6 +2595,18 @@ configured backend; pair it with the matching `*_backend` (`synth_backend`, `bac
 to retarget the slot to a different connection wholesale — which also lets you fill a role
 the cast doesn't otherwise carry.
 
+## Survey the code, or get an answer: `explore` vs `consult`
+
+`consult` hands back an *answer* — a capable model investigates and concludes. `explore`
+hands back the *evidence*: it's the fast, cheap explorer half of `consult`, run on its
+own, so you get the structured cited report — a summary of findings, the relevant
+`file:line` locations, and the trail the explorer followed — with no synthesis on top.
+Reach for `explore` to map unfamiliar code, or to assemble a grounded survey you'll reason
+over yourself (or hand to another model). It reads the repo itself, like `consult`, so the
+same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply; there's no
+`attach`, `context`, or `session_id` — those belong to the synthesizing tools. When you
+want the conclusion rather than the map, use `consult`.
+
 ## Answer now, or hand off and collect later
 
 Each investigation/answer tool comes in a synchronous form and an async sibling. Use the
@@ -2643,6 +2761,7 @@ fn render_config_resource(
     #[derive(Serialize)]
     struct ToolsDoc {
         consult: bool,
+        explore: bool,
         oneshot: bool,
         run_kaish: bool,
         batch: bool,
@@ -2883,6 +3002,7 @@ fn render_config_resource(
     // render-or-skip decision instead of silently vanishing from the resource.
     let &ToolGating {
         consult,
+        explore,
         oneshot,
         run_kaish,
         batch,
@@ -2933,6 +3053,7 @@ fn render_config_resource(
         },
         tools: ToolsDoc {
             consult,
+            explore,
             oneshot,
             run_kaish,
             batch,

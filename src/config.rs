@@ -1223,6 +1223,9 @@ impl Config {
         if disable.consult {
             self.tools.consult = false;
         }
+        if disable.explore {
+            self.tools.explore = false;
+        }
         if disable.oneshot {
             self.tools.oneshot = false;
         }
@@ -1255,6 +1258,7 @@ impl Config {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolDisables {
     pub consult: bool,
+    pub explore: bool,
     pub oneshot: bool,
     pub run_kaish: bool,
     pub batch: bool,
@@ -1565,6 +1569,7 @@ struct RawServer {
 #[serde(deny_unknown_fields)]
 struct RawTools {
     consult: Option<bool>,
+    explore: Option<bool>,
     oneshot: Option<bool>,
     run_kaish: Option<bool>,
     batch: Option<bool>,
@@ -1940,6 +1945,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
     let d = ToolGating::default();
     ToolGating {
         consult: raw.consult.unwrap_or(d.consult),
+        explore: raw.explore.unwrap_or(d.explore),
         oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         batch: raw.batch.unwrap_or(d.batch),
@@ -1995,6 +2001,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     let tools = server.tools.get_or_insert_with(Default::default);
     if env_flag(get, "KAIBO_NO_CONSULT") {
         tools.consult = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_EXPLORE") {
+        tools.explore = Some(false);
     }
     if env_flag(get, "KAIBO_NO_ONESHOT") {
         tools.oneshot = Some(false);

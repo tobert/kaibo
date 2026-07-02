@@ -33,21 +33,31 @@ rewritten to the doc's target drafts, `consult` pinned resident via
 enum is the sole roster home), rustdoc cross-refs stripped from shipped schemas, and
 the AGENTS.md client-facing budget guidance.
 
-**Arc 2 — in progress (`explore` + `deliberate`):** the config lane reshape **shipped**
-— `Lane` (`batch | direct`) now lives on `ModelSlot`, not `Cast`; `Cast::batch` is gone;
+**Arc 2 — in progress (`deliberate` remains):** the config lane reshape **shipped** —
+`Lane` (`batch | direct`) now lives on `ModelSlot`, not `Cast`; `Cast::batch` is gone;
 `batch = true` is backward-compat sugar normalized onto the synth slot's `lane` at load;
 today's built-in batch casts are the synth-only degenerate case, and a cast may now pair
 an interactive explorer with an offline synth (the `deliberate` shape). `direct` is
 validated, rendered (`kaibo://config`), and load-tested, but forward-declared — no tool
 routes to it yet, so a `direct` cast sits in neither the interactive nor the
-`batch_submit` `cast` enum, and is dropped from the handshake roster. Still open: then
-`explore` (a new `run_phase` composition over `report_preamble` — not a re-mount of the
-RunExplore sub-agent), then `deliberate` (dossier → offline synth, two lanes; the
-two-stage handle crosses the disjoint `job-N` / `backend/provider-id` namespaces — the
-job record should carry its batch handle after submit). Persistence stays out of scope
-(local `deliberate` jobs are session-scoped `job-N`, said loudly in the schema). The
-`explore`/`deliberate` descriptions are already drafted in the plan doc; they ship with
-their tools. Delete this entry when arc 2 ships.
+`batch_submit` `cast` enum, and is dropped from the handshake roster.
+
+`explore` **shipped** — the evidence-gathering half of `consult`, exposed as its own
+tool: a single explorer phase over the read-only project returning the cited report
+*verbatim* (no synth). It's a new `run_phase` composition — the inner `arm.run` was
+extracted to a shared `run_explore_phase` seam that both the nested `explore′`
+(`RunExplore::call`) and the top-level `explore_with` call, so the sweep bracket +
+reports-sink push stay with the sub-agent while `explore` is self-contained. Skips
+`reject_offline_cast` deliberately (it runs the *explorer* arm, which is interactive by
+construction — a lane on an explorer slot is a load error), gated by `--no-explore`,
+cross-family reviewed (DeepSeek + Gemini, both merge-ready).
+
+Still open: `deliberate` (dossier → offline synth, two lanes; the two-stage handle
+crosses the disjoint `job-N` / `backend/provider-id` namespaces — the job record should
+carry its batch handle after submit). Persistence stays out of scope (local `deliberate`
+jobs are session-scoped `job-N`, said loudly in the schema). The `deliberate` description
+is already drafted in the plan doc; it ships with the tool. Delete this entry when
+`deliberate` ships (arc 2 done).
 
 Note (arc-1 follow-on, low priority): the composed `agent_onboarding` mental-model view
 is no longer produced anywhere — arc 1 deleted `kaibo_instructions`/`kaish_reference`

@@ -42,6 +42,16 @@ the git log. Each later release appends a new section at the top.
   job emits a soft notification on the MCP logging channel (a clue for a client watching
   the log stream) — advisory only, since no MCP primitive wakes the calling agent;
   collecting by handle stays the contract.
+- **`explore`** — the evidence-gathering half of `consult`, exposed on its own: a fast,
+  cheap explorer model sweeps the project READ-ONLY and hands back the *cited report
+  itself* — a summary of findings, the relevant `file:line` locations, and the trail it
+  followed — with no synthesis on top. Reach for it to map unfamiliar code, or to build a
+  grounded survey you'll reason over yourself (or feed to another model), when you want the
+  map rather than the conclusion. It reads the repo itself like `consult`, so it takes the
+  same `path` / `cast` / `explorer_model` (+ `explorer_backend`) / `explorer_max_turns`
+  arguments; being single-phase, it has no synth args, `attach`, `context`, or `session_id`.
+  The report carries the same provenance footer, naming the cast and the explorer that
+  surveyed. Gated independently by `--no-explore`. For a synthesized answer, use `consult`.
 - **`oneshot`** — a thin, direct second opinion from a model outside your family:
   prompt in, answer out, no codebase access and no tools, exactly one upstream
   request. The counterpart to `consult` for when you already own the context (you've

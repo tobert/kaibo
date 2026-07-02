@@ -13,10 +13,11 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// `job_cancel`/`job_list`/`job_wait` are *shared* — they manage both kinds of handle
 /// and stay advertised as long as either capability is on, so they belong to neither
 /// flag.
-const ALL_TOOLS: [&str; 9] = [
+const ALL_TOOLS: [&str; 10] = [
     "batch_submit",
     "consult",
     "consult_submit",
+    "explore",
     "job_cancel",
     "job_get",
     "job_list",
@@ -44,13 +45,22 @@ fn each_flag_removes_exactly_its_own_tools() {
     // `job_get`/`job_cancel`/`job_list` belong to neither flag alone — gating one
     // capability leaves them because the other still needs them — so they appear in no
     // row's removed-set and are covered by the "every other tool remains" check below.
-    let cases: [(&[&str], ToolGating); 4] = [
+    let cases: [(&[&str], ToolGating); 5] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
             // `job_get`/`job_cancel`/`job_list` stay (batch still uses them).
             &["consult", "consult_submit"],
             ToolGating {
                 consult: false,
+                ..Default::default()
+            },
+        ),
+        (
+            // `--no-explore` drops the single-phase `explore` sweep and nothing else —
+            // it's its own gate, independent of consult's driver+explorer loop.
+            &["explore"],
+            ToolGating {
+                explore: false,
                 ..Default::default()
             },
         ),
@@ -147,6 +157,7 @@ fn shared_collect_verbs_track_both_capabilities() {
 fn all_disabled_is_detected() {
     let none_on = ToolGating {
         consult: false,
+        explore: false,
         oneshot: false,
         run_kaish: false,
         batch: false,
@@ -179,6 +190,7 @@ fn all_tools_disabled_refuses_to_start() {
         .env("XDG_CONFIG_HOME", empty_config.path())
         .args([
             "--no-consult",
+            "--no-explore",
             "--no-oneshot",
             "--no-run-kaish",
             "--no-batch",

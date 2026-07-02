@@ -1318,6 +1318,44 @@ where
         })
 }
 
+/// Run the explorer phase once and return its cited report. The explorer [`Arm`]
+/// drives a fresh `{run_kaish}` toolset over a spawned kernel, bounded by
+/// `max_turns`, and hands back the curated report the [`report_preamble`] shape
+/// asks for. This is the one seam both callers of the explorer share: the nested
+/// `explore′` sub-agent inside [`consult_with`] (via [`RunExplore::call`]) and the
+/// top-level `explore` tool (via [`explore_with`]).
+///
+/// `preamble` is already resolved (the report shape + `[orientation]` + house
+/// rules) — this fn is just the inner `arm.run`, so preamble composition and the
+/// progress bracket stay with each caller. A fresh kernel per tool build ([`run_phase`]
+/// may build a second for the turn-cap recovery turn); the shared `progress` sink is
+/// handed to `run_kaish` so the sweep's own reads surface too. `!Send` care (an
+/// invariant): the kernel stays on its `KaishWorker` thread and never crosses the
+/// `.await`.
+pub(crate) async fn run_explore_phase(
+    arm: &Arm,
+    preamble: &str,
+    question: &str,
+    root: PathBuf,
+    sandbox: &SandboxConfig,
+    max_turns: usize,
+    progress: &Arc<dyn ProgressSink>,
+) -> Result<String> {
+    arm.run(
+        preamble,
+        Message::user(question.to_string()),
+        max_turns,
+        progress.as_ref(),
+        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
+            Ok(vec![traced(RunKaish::with_progress(
+                KaishWorker::spawn_with(&root, sandbox.clone())?,
+                progress.clone(),
+            ))])
+        },
+    )
+    .await
+}
+
 /// `explore′` — the explorer unit wrapped as a rig [`Tool`] the consult loop can
 /// call. Its `call` runs a *nested* agent: the explorer [`Arm`] (a cheap model,
 /// possibly on a different backend than the driver) driving `{run_kaish}` over a
@@ -1426,25 +1464,20 @@ impl Tool for RunExplore {
         self.progress.emit(PhaseEvent::SweepStarted {
             question: args.question.clone(),
         });
-        // Reuse the one loop — explore′ is just the explorer arm's run_phase.
-        // A fresh kernel per worker build (the §2.1 cost note: a KaishWorker per
-        // explore′; run_phase may build a second for the turn-cap recovery turn).
-        // The sub-agent's `run_kaish` carries the same sink, so its reads surface too.
-        let result = self
-            .arm
-            .run(
-                &self.preamble,
-                Message::user(args.question),
-                self.max_turns,
-                self.progress.as_ref(),
-                &|| -> Result<Vec<Box<dyn ToolDyn>>> {
-                    Ok(vec![traced(RunKaish::with_progress(
-                        KaishWorker::spawn_with(&self.root, self.sandbox.clone())?,
-                        self.progress.clone(),
-                    ))])
-                },
-            )
-            .await;
+        // Reuse the one seam — explore′ is just the shared explorer phase, run on the
+        // sub-agent's arm with its resolved preamble. The sweep bracket
+        // (started/finished) and the reports-sink push stay here (consult-loop
+        // specific); `run_explore_phase` is only the inner `arm.run`.
+        let result = run_explore_phase(
+            &self.arm,
+            &self.preamble,
+            &args.question,
+            self.root.clone(),
+            &self.sandbox,
+            self.max_turns,
+            &self.progress,
+        )
+        .await;
         self.progress.emit(PhaseEvent::SweepFinished);
         let report = result.map_err(|e| RunExploreError(format!("{e:#}")))?;
         // Lock poisoning means another delegation panicked — surface it, don't mask.
@@ -1746,6 +1779,36 @@ fn consult_tools(
         tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     Ok(tools)
+}
+
+/// Run the `explore` tool: the evidence-gathering half of `consult`, surfaced on
+/// its own. One explorer arm sweeps `root` read-only over `{run_kaish}` and returns
+/// its cited report *verbatim* — no synth, no session, no attachments (explore reads
+/// the repo itself). The report shape is [`report_preamble`], resolved through the
+/// same [`phase_preamble`] layering `consult_tools` gives the nested `explore′`, so
+/// a `[prompts].explorer` override, `[orientation]`, and house rules all reach it.
+pub(crate) async fn explore_with(
+    question: &str,
+    root: PathBuf,
+    explorer: &Arm,
+    cfg: &ConsultConfig,
+) -> Result<String> {
+    let preamble = phase_preamble(
+        cfg.prompts.explorer.as_deref(),
+        report_preamble,
+        cfg.orientation.as_deref(),
+        cfg.house_rules.as_deref(),
+    );
+    run_explore_phase(
+        explorer,
+        &preamble,
+        question,
+        root,
+        &cfg.sandbox,
+        cfg.explorer_max_turns,
+        &cfg.progress,
+    )
+    .await
 }
 
 /// Run a `consult` over two resolved arms.
@@ -2432,6 +2495,137 @@ mod tests {
                 .contains("second tool, `explore`"),
             "driver got the consult preamble: {:?}",
             synth_reqs[0].preamble
+        );
+    }
+
+    /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
+    /// explorer arm over `{run_kaish}` against the real repo and returns the
+    /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
+    /// consult e2e above but for the exposed evidence-gathering half. If the phase
+    /// ever synthesized an answer instead of surfacing the report, the marker
+    /// wouldn't survive; and the explorer must run on the report (explorer-role)
+    /// preamble, not a driver preamble.
+    #[tokio::test]
+    async fn explore_with_runs_the_single_explorer_phase_and_returns_the_report() {
+        const EXPLORER: &str = "cheap-explorer";
+        const REPORT: &str = "EXPLORER_REPORT: src/foo.rs:1 fn target_marker";
+
+        let client = ScriptedClient::builder()
+            // A single-phase sweep: grep once against real kaish, then write the report.
+            .on_model(EXPLORER, |req| {
+                // Explorer-only — `run_kaish`, and no nested `explore′` (explore is one phase).
+                assert!(has_tool(req, "run_kaish"), "explorer must have run_kaish");
+                assert!(
+                    !has_tool(req, "explore"),
+                    "explore is single-phase — no nested explore′"
+                );
+                let seen = transcript_text(req);
+                if !seen.contains("target_marker() {}") {
+                    Ok(tool_call_response(
+                        "t-grep",
+                        "run_kaish",
+                        json!({ "script": "grep -rn target_marker src" }),
+                    ))
+                } else {
+                    Ok(text_response(REPORT))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        let report = explore_with(
+            "Where is target_marker defined?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+        )
+        .await
+        .expect("scripted explore should succeed");
+
+        // The teeth: the result IS the explorer's report, surfaced verbatim — not a
+        // synthesized answer. A synth phase would have replaced the marker.
+        assert!(
+            report.contains("EXPLORER_REPORT"),
+            "explore must return the explorer's report itself, got: {report:?}"
+        );
+
+        // Routing: the one arm ran on the report (explorer-role) preamble.
+        let reqs = client.requests_for(EXPLORER);
+        assert!(!reqs.is_empty(), "explorer model was actually invoked");
+        assert!(
+            reqs[0]
+                .preamble
+                .as_deref()
+                .unwrap_or("")
+                .contains("code explorer"),
+            "explorer got the report preamble: {:?}",
+            reqs[0].preamble
+        );
+    }
+
+    /// The `explore` phase is a *single* sweep, not a nested delegation — so its
+    /// progress shape is the explorer's own reads reaching the sink directly, with
+    /// **no** `SweepStarted`/`SweepFinished` bracket (that bracket is `RunExplore`'s,
+    /// emitted only when the consult driver delegates a sub-agent). This is the teeth
+    /// for the seam split: if the bracket ever migrated from `RunExplore::call` into
+    /// the shared `run_explore_phase`, a `SweepStarted` would appear here and this
+    /// test fails; and if the sink weren't threaded through, the explorer's `run_kaish`
+    /// read would be missing.
+    #[tokio::test]
+    async fn explore_progress_surfaces_the_read_with_no_sweep_bracket() {
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("exit:") {
+                    Ok(tool_call_response(
+                        "t-grep",
+                        "run_kaish",
+                        json!({ "script": "grep -rn target_marker src" }),
+                    ))
+                } else {
+                    Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig {
+            progress: sink.clone(),
+            ..ConsultConfig::default()
+        };
+
+        explore_with(
+            "Where is target_marker defined?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+        )
+        .await
+        .expect("scripted explore should succeed");
+
+        let events = sink.events();
+        // The explorer's own read reached the sink (single-phase threading works).
+        assert!(
+            events.contains(&PhaseEvent::KaishRun {
+                script: "grep -rn target_marker src".into()
+            }),
+            "the explorer's read must surface through the single phase: {events:?}"
+        );
+        // No sweep bracket: explore is not a sub-agent delegation. A migrated bracket
+        // would light these up.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PhaseEvent::SweepStarted { .. })),
+            "explore is single-phase — no SweepStarted bracket belongs here: {events:?}"
+        );
+        assert!(
+            !events.contains(&PhaseEvent::SweepFinished),
+            "explore is single-phase — no SweepFinished bracket belongs here: {events:?}"
         );
     }
 
