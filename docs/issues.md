@@ -127,13 +127,25 @@ were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test
   nothing offered is refused; widening it to `has-explorer` (a `cast_can_explore` predicate)
   would offer deliberate/direct casts for standalone `explore` too. Deferred to the tool-
   surface-alignment discussion (w/ Amy) — it's a surface decision, not a bug.
-- **Vestiges / finish-the-migration cleanups.** `credentials.rs` dead code (`load`,
-  `openai_key`, `resolve_openai_key`) + the duplicate alias table in `ProviderKind::FromStr`
-  (parallel to `config.rs::builtin_aliases`); finish the `batch_http_client` migration
-  (`Arm::from_slot` and `telemetry.rs::init` still hand-roll the timeout+`ensure_crypto_provider`
-  block); exhaustive-destructure `apply_raw_env`/`merge_defaults` so a new `Defaults` field
-  can't silently miss its env/merge line (the `render_config_resource` discipline, applied to
-  the config layer); `supported_kinds_list()`'s hand-maintained `ProviderKind` array.
+- **Vestiges cleanup — mostly done; Fable's list overstated the dead code (verified 2026-07-02).**
+  - `credentials.rs`: only `openai_key` + `resolve_openai_key` were truly dead (the pre-backend
+    OpenAI-key helpers, no callers) — **removed** with their tests. `load` is **kept**: it's used
+    by the `#[ignore]`d live-probe tests in `tests/consult.rs` to gate on key presence (not dead;
+    updated to stop referencing the removed `openai_key`). The live key path is `Backend::resolve_key`
+    + the pure `credentials::resolve`.
+  - `ProviderKind::FromStr`'s alias table is **not a vestige** — it's the live, tested `kind = "…"`
+    parser (accepts `claude`/`google`/`gemma`/`lemonade`/…), a *different* layer from
+    `config.rs::builtin_aliases` (backend/cast **names**). They overlap in spelling by design;
+    consolidating is a deliberate refactor, not dead-code removal. Left as-is.
+  - Finish the `batch_http_client` migration — **still open, its own PR:** `Arm::from_slot`
+    (`consult.rs`) hand-rolls the exact block `batch_http_client` already factors; route it through
+    a shared `crate::tls` helper. This touches the TLS client-build invariant, so it wants a
+    focused hard-look review (AGENTS.md). (`telemetry.rs` is *not* a duplicate — it builds the OTLP
+    exporter's own client; only the shared `ensure_crypto_provider()` is common, which it uses.)
+  - `merge_defaults` is **already exhaustive** (an explicit struct literal — a new `Defaults` field
+    fails to compile until wired). The real gap is `apply_raw_env` (mutation-based, no compile-time
+    forcing of a `KAIBO_` env var for a new field); a guard there is an artificial destructure —
+    marginal, deferred. `supported_kinds_list()`'s hand-maintained array is the same low-value shape.
 - **Module splits (architecture-scale, own PRs, sequence deliberately).** `consult.rs` →
   `shaping` (`ModelShape`/`ModelCaps`/the id-classifiers/`default_models` — the provider-drift
   knowledge) + `engine` (`Arm`/`PhaseRunner`/`run_phase`/the view_image break-rewrite) +

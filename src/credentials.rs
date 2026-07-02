@@ -12,7 +12,9 @@
 //! wire protocol, addressed by [`openai_base_url`] (`OPENAI_BASE_URL`, default a
 //! local keyless server) rather than tied to a hosted service. Its key is
 //! *optional* — `OPENAI_API_KEY` / `~/.openai-key` when talking to a keyed
-//! endpoint, or a placeholder for the keyless local default (see [`openai_key`]).
+//! endpoint, or a placeholder ([`PLACEHOLDER_OPENAI_KEY`]) for the keyless local
+//! default. Per-backend resolution (env → key-file → placeholder) lives on
+//! `Backend::resolve_key` (`config.rs`); this module is the pure key/base-url core.
 
 use std::path::{Path, PathBuf};
 
@@ -41,8 +43,8 @@ pub enum ProviderKind {
 impl ProviderKind {
     /// Whether a missing credential is tolerated rather than a hard error. Only
     /// the OpenAI-compatible provider is: its default endpoint is a local keyless
-    /// server, so an absent key falls back to a placeholder bearer token (see
-    /// [`openai_key`]). The keyed providers must fail loudly on a missing key.
+    /// server, so an absent key falls back to a placeholder bearer token
+    /// ([`PLACEHOLDER_OPENAI_KEY`]). The keyed providers must fail loudly on a missing key.
     pub fn key_optional(self) -> bool {
         matches!(self, ProviderKind::Openai)
     }
@@ -139,25 +141,6 @@ pub fn openai_base_url() -> String {
 /// builder rejects an empty key, but a local server ignores the value entirely.
 pub const PLACEHOLDER_OPENAI_KEY: &str = "no-auth";
 
-/// Resolve the OpenAI bearer token: the configured key when present (env over
-/// file), else the placeholder. Pure for testing. Unlike [`resolve`], a missing
-/// credential is NOT an error — the default endpoint is a local keyless server,
-/// so we fall back rather than refuse.
-pub fn resolve_openai_key(env_value: Option<&str>, key_file: &Path) -> String {
-    resolve(env_value, key_file).unwrap_or_else(|_| PLACEHOLDER_OPENAI_KEY.to_string())
-}
-
-/// The OpenAI bearer token from `OPENAI_API_KEY` / `~/.openai-key`, or the
-/// placeholder when neither is set (the keyless local default).
-pub fn openai_key() -> String {
-    let key_file = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| ProviderKind::Openai.key_file(&home))
-        .unwrap_or_else(|| PathBuf::from("/nonexistent/.openai-key"));
-    let env_value = std::env::var(ProviderKind::Openai.env_var()).ok();
-    resolve_openai_key(env_value.as_deref(), &key_file)
-}
-
 /// Resolve a key from an explicit env value and a key-file, env winning.
 ///
 /// Pure so it can be tested without touching the real environment or `$HOME`.
@@ -187,15 +170,15 @@ pub fn resolve(env_value: Option<&str>, key_file: &Path) -> Result<String> {
     }
 }
 
-/// Load `provider`'s key from the real environment and `$HOME`.
-///
-/// The OpenAI provider's key is optional; calling this for it is a programming
-/// error — its key may legitimately be absent, so route through [`openai_key`],
-/// which falls back to a placeholder rather than refusing.
+/// Load a *keyed* `provider`'s key from the real environment and `$HOME` (env var
+/// over dotfile). The opt-in live-probe tests use it to gate on whether a real key
+/// is present. The key-optional (`Openai`) provider is refused: its key may
+/// legitimately be absent, so it has no single "the key" to load — resolve it through
+/// the backend (`Backend::resolve_key`), which falls back to a placeholder.
 pub fn load(provider: ProviderKind) -> Result<String> {
     if provider.key_optional() {
         return Err(anyhow!(
-            "{provider:?} tolerates a missing key — use openai_key(), not load()"
+            "{provider:?} tolerates a missing key — load() is for keyed providers only"
         ));
     }
     let home = std::env::var_os("HOME")
