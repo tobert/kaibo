@@ -248,8 +248,9 @@ pub fn report_preamble() -> String {
          surgical slice would miss. A big file (`wc -l FILE` if unsure): read it in a \
          few WIDE spans — `cat -n FILE | sed -n '1,400p'`, then `'401,800p'` — a few \
          hundred lines a look, not fifteen; stepping through in wide passes beats a \
-         dozen surgical slices, and a whole-file read that comes back truncated \
-         (exit 3, a head+tail sample) was simply too big, so step through it this way. \
+         dozen surgical slices, and if a whole-file read comes back truncated (exit 3, \
+         a head+tail sample) it was simply too big for one look — cover it in wide \
+         spans instead. \
          To locate something across files, take the surrounding context in the same \
          call — `grep -rn -B4 -A8 PATTERN .` returns each match with the lines around \
          it, ready to understand.\n\n\
