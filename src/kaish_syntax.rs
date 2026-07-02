@@ -23,7 +23,7 @@ use kaish_kernel::help::{
 };
 use kaish_kernel::tools::ToolSchema;
 
-use crate::config::{CastUsability, Config, ModelRole};
+use crate::config::{CastUsability, Config, Lane, ModelRole};
 
 /// The kaibo-specific half of the core: the read-only boundary, the exit-code
 /// contract, the no-cwd rule, and the line-number idioms that make citations
@@ -190,6 +190,12 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
     }
     let lines: String = usable
         .iter()
+        // A `direct`-lane cast is forward-declared (validated, rendered on
+        // `kaibo://config`) but no tool consumes it yet — the same reason it's absent
+        // from both `inject_cast_enum` partitions in `server.rs`. Advertising it here
+        // would name a cast every tool refuses, so drop it from the roster until a
+        // tool routes to it.
+        .filter(|(name, _)| config.cast_offline_lane(name) != Some(Lane::Direct))
         .map(|(name, state)| {
             let mut tags = Vec::new();
             if config.is_default_cast(name) {
@@ -608,6 +614,43 @@ mod tests {
         );
     }
 
+    /// A `direct`-lane cast is forward-declared (validated, rendered on
+    /// `kaibo://config`) but no tool routes to it yet, so the handshake roster must not
+    /// advertise it — an agent reading `## Casts` should never see a cast every tool
+    /// refuses. Mirrors the `direct`-lane exclusion from both `inject_cast_enum`
+    /// partitions in `server.rs`.
+    #[test]
+    fn casts_section_excludes_a_direct_lane_cast() {
+        let config = Config::from_toml_str(
+            r#"
+            [casts.mydirect]
+            synth = { backend = "openai-local", id = "big-local-model", lane = "direct" }
+            "#,
+        )
+        .unwrap();
+        let usable = vec![
+            ("anthropic".to_string(), CastUsability::Ready),
+            ("mydirect".to_string(), CastUsability::LocalUnverified),
+        ];
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::Ready,
+            &usable,
+        );
+        assert!(
+            text.contains("anthropic"),
+            "the interactive cast must still render:\n{text}"
+        );
+        assert!(
+            !text.contains("mydirect"),
+            "a direct-lane cast must not appear in the roster (no tool routes to it \
+             yet):\n{text}"
+        );
+    }
+
     /// The `(default)` tag survives a default cast set by *alias*. `usable_casts`
     /// yields canonical names (`anthropic`), but an operator may write
     /// `server.cast = "claude"` (an alias) — a raw `name == default_cast` would compare
@@ -722,7 +765,6 @@ mod tests {
                         ModelRole::Synth,
                         ModelSlot::bare(backend, id),
                     )]),
-                    batch: false,
                 },
             );
         }

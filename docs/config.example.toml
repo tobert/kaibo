@@ -316,16 +316,33 @@ synth    = "claude/claude-sonnet-4-6"        # no per-model prompt → [prompts]
 explorer = "gpt/gpt-5-mini"
 synth    = "gpt/gpt-5"
 
-# --- A custom batch cast: the offline `batch_submit` lane (max thinking). `batch = true`
-#     declares it; it needs a synth slot on a batch-capable backend (Anthropic or Gemini)
-#     and runs the synth alone (no explorer). The built-in anthropic-batch / gemini-batch
-#     casts are the same shape. Gemini Pro especially earns this lane: interactively it's
-#     refusal-prone on security framing and 503s under load, but batch sidesteps both — so
-#     reach for Pro batch-only (the built-in `gemini-batch` cast, or a custom one like this). ---
+# --- A custom batch cast: the offline `batch_submit` lane (max thinking). `lane = "batch"`
+#     on the SYNTH SLOT declares it (lane is a per-slot property, not a cast-level one —
+#     it needs a synth slot on a batch-capable backend, Anthropic or Gemini). The built-in
+#     `batch = true` spelling below is backward-compat sugar for exactly this: it sets the
+#     synth slot's lane, nothing more. The built-in anthropic-batch / gemini-batch casts are
+#     the same shape and, like this one, run the synth alone (no explorer) — but that's a
+#     choice, not a rule: a cast MAY pair an interactive explorer with an offline synth (the
+#     `deliberate` shape), since the lane lives on the slot, not the whole cast. Gemini Pro
+#     especially earns this lane: interactively it's refusal-prone on security framing and
+#     503s under load, but batch sidesteps both — so reach for Pro batch-only (the built-in
+#     `gemini-batch` cast, or a custom one like this). ---
 
 [casts.pro-batch]
 batch    = true
 synth    = "gemini/gemini-pro-latest"        # batch-capable synth (Anthropic | Gemini); Pro is batch-only
+# Equivalent, spelled directly on the slot (no cast-level sugar):
+#   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+
+# --- The other offline lane, `lane = "direct"`: one long completion kaibo runs itself
+#     against a big LOCAL model (no async provider API, no `batch = true` sugar for this
+#     one — spell it on the slot). Reserved for offline deliberation over a big model that's
+#     too slow to run inside a live tool loop but has no batch endpoint; no tool consumes a
+#     `direct` synth yet, so this cast is forward-declared, not yet callable. ---
+
+[casts.local-direct]
+explorer = "gemma/Gemma-4-E4B-it-GGUF"       # an interactive explorer may sit beside an offline synth
+synth    = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 
 # ---------------------------------------------------------------------------
 # [context] — "house rules" files spliced into every consultation tool's preamble

@@ -205,19 +205,33 @@ The `[defaults]` knobs themselves:
 Four backends and four same-named single-backend casts ship **in code** and
 reproduce kaibo's historical behavior exactly, so a **missing config file is not
 an error**. Two extra built-in casts ship for the offline batch lane —
-`gemini-batch` (synth Gemini Pro) and `anthropic-batch` (synth Claude Opus). Both
-declare `batch = true`, which staffs `batch_submit` *only*: the interactive tools
-(`consult`/`oneshot`) refuse a batch cast, and `batch_submit` refuses a non-batch
-cast, so a big offline-tuned model is never run interactively by accident (and vice
-versa). A batch cast carries **synth only** (batch is toolless) and its synth must
-sit on a batch-capable backend (Anthropic or Gemini) — declaring `batch = true`
-elsewhere is a loud load error. The TOML *merges over* this registry by name: set
-one field on a built-in to retarget it (the `batch` flag is sticky — retuning
-`gemini-batch`'s model leaves it batch), or add brand-new backends and casts. The
+`gemini-batch` (synth Gemini Pro) and `anthropic-batch` (synth Claude Opus). Lane is
+a **per-slot** property, not a cast-level one: each carries a synth slot whose
+`lane = "batch"`, which staffs `batch_submit` *only*: the interactive tools
+(`consult`/`oneshot`) refuse a cast whose synth is on an offline lane, and
+`batch_submit` refuses a cast whose synth isn't specifically `lane = "batch"`, so a
+big offline-tuned model is never run interactively by accident (and vice versa). A
+`batch`-lane synth must sit on a batch-capable backend (Anthropic or Gemini) —
+declaring `lane = "batch"` on a slot elsewhere is a loud load error, and so is a
+lane on an *explorer* slot (the explorer always runs interactively). Because lane
+lives on the slot, a cast MAY pair an interactive explorer with an offline synth —
+the built-in batch casts stay synth-only by choice (batch is toolless, so an
+explorer would be dead weight), not by a rule. `batch = true` at the cast level is
+backward-compat sugar: it sets the synth slot's `lane = "batch"`, nothing more —
+there's exactly one internal representation of lane (the slot field). The TOML
+*merges over* this registry by name: set one field on a built-in to retarget it (a
+slot's `lane` is sticky across a bare re-declaration of its model — retuning
+`gemini-batch`'s id leaves it batch), or add brand-new backends and casts. The
 built-in alias names register at **both** levels — as cast aliases (so
 `cast = "claude"` resolves) and backend aliases (so a slot ref `claude/<id>`
 resolves) — and are reserved: naming a new backend or cast after one is a loud
 collision error.
+
+A second offline lane, `lane = "direct"`, is also validated and rendered: one long
+completion kaibo drives itself against a big *local* model — no async provider API,
+just a slower plain call. It's reserved for offline deliberation over a model too
+slow for a live tool loop; no tool routes to a `direct` synth yet, so declaring one
+today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submit`.
 
 | backend | kind | base_url | key env / file | aliases |
 |---|---|---|---|---|
@@ -226,14 +240,14 @@ collision error.
 | `gemini` | gemini | — | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
 
-| cast | explorer | synth | batch |
+| cast | explorer | synth | synth lane |
 |---|---|---|---|
 | `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
 | `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` | |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
-| `gemini-batch` | — | `gemini/gemini-pro-latest` | ✓ |
-| `anthropic-batch` | — | `anthropic/claude-opus-4-8` | ✓ |
+| `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
+| `anthropic-batch` | — | `anthropic/claude-opus-4-8` | `batch` |
 
 ### The chimera payoff
 

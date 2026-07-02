@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::consult::{ModelCaps, PromptOverrides, ThinkingStyleOverride};
 use crate::context::ContextConfig;
@@ -177,6 +177,48 @@ impl std::str::FromStr for ModelRole {
 
 // --- Slots ------------------------------------------------------------------
 
+/// How a model slot runs. `None` on a slot means interactive (the default — the
+/// synth answers inside a live tool loop). An offline lane returns a handle the
+/// caller collects later:
+/// - `Batch`  — the provider's async batch API (durable `backend/provider-id` handle).
+/// - `Direct` — one long completion kaibo runs itself (a big local model taking the
+///   time it takes); session-scoped `job-N` handle.
+///
+/// Lane lives on the **slot**, not the cast: a `deliberate` cast can pair an
+/// interactive explorer with an offline synth, and the synth slot's lane is what
+/// classifies the whole cast for the batch/interactive tool split (see
+/// [`Config::cast_offline_lane`]). `Direct` is forward-declared here — validated,
+/// parsed, and rendered — but no tool routes to it yet (see `server.rs`
+/// `reject_offline_cast`/the roster split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lane {
+    Batch,
+    Direct,
+}
+
+impl std::str::FromStr for Lane {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "batch" => Ok(Self::Batch),
+            "direct" => Ok(Self::Direct),
+            other => Err(anyhow!("lane {other:?} is not one of batch|direct")),
+        }
+    }
+}
+
+impl Lane {
+    /// The TOML spelling (`lane = "…"`), used in load-error messages and the
+    /// `kaibo://config` render.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 /// One entry in a cast's role table: which backend serves it, the model id, plus
 /// per-slot capability pins and tunables. In TOML a slot is a `"backend/model-id"`
 /// string (the common case) or a table (`{ backend = "…", id = "…", vision = true,
@@ -208,6 +250,11 @@ pub struct ModelSlot {
     /// server, winning over the per-phase `[prompts]` and the built-in. `None` →
     /// fall back to those. A per-call model override (a `bare` slot) carries none.
     pub preamble: Option<String>,
+    /// How this slot runs: `None` is interactive (the default), `Some(Lane::Batch)`
+    /// or `Some(Lane::Direct)` is offline — see [`Lane`]. Load validation
+    /// (`Config::merge`) requires a lane to sit on a synth slot; an explorer with a
+    /// lane is a loud error (the explorer always runs interactively).
+    pub lane: Option<Lane>,
 }
 
 impl ModelSlot {
@@ -225,6 +272,7 @@ impl ModelSlot {
             effort: None,
             thinking_style: None,
             preamble: None,
+            lane: None,
         }
     }
 
@@ -438,13 +486,6 @@ pub struct Cast {
     pub name: String,
     /// The role table: which slot serves each [`ModelRole`].
     pub slots: BTreeMap<ModelRole, ModelSlot>,
-    /// Positively declares this cast for the offline batch lane: `batch = true`
-    /// staffs `batch_submit` *only*. Its synth is a big, slow, expensive model tuned
-    /// for free batch latency (Gemini Pro, Claude Opus), so running it through an
-    /// interactive tool loop (`consult`/`oneshot`) is the wrong-and-costly mistake —
-    /// the gate refuses the mix in both directions (`server.rs`). Default `false`
-    /// (interactive); the batch-capable-synth requirement is checked at config load.
-    pub batch: bool,
 }
 
 impl Cast {
@@ -458,6 +499,13 @@ impl Cast {
     pub fn require_slot(&self, role: ModelRole) -> Result<&ModelSlot> {
         self.slot(role)
             .ok_or_else(|| anyhow!("cast {:?} has no {} slot", self.name, role.key()))
+    }
+
+    /// This cast's offline lane, read off its **synth** slot — the synth slot
+    /// classifies the whole cast (an explorer always runs interactively, so its
+    /// lane is never the question). `None` means no synth, or an interactive synth.
+    pub fn synth_lane(&self) -> Option<Lane> {
+        self.slot(ModelRole::Synth).and_then(|s| s.lane)
     }
 }
 
@@ -633,12 +681,19 @@ impl Config {
         ))
     }
 
-    /// Whether `name` (a canonical cast name) is declared for the batch lane. Used to
-    /// partition the live roster onto the right tools' `cast` enums — batch casts to
-    /// `batch_submit`, the rest to the interactive tools. A name not in the registry
-    /// reads as non-batch (the caller already worked from canonical keys).
+    /// The offline lane `name` (a canonical cast name) runs on, read off its synth
+    /// slot (see [`Cast::synth_lane`]). `None` means no synth, or an interactive
+    /// synth. A name not in the registry reads as `None` (the caller already worked
+    /// from canonical keys).
+    pub fn cast_offline_lane(&self, name: &str) -> Option<Lane> {
+        self.casts.get(name).and_then(Cast::synth_lane)
+    }
+
+    /// Whether `name` is declared for the batch lane specifically. Used to partition
+    /// the live roster onto the right tools' `cast` enums — batch casts to
+    /// `batch_submit`, the rest to the interactive tools.
     pub fn cast_is_batch(&self, name: &str) -> bool {
-        self.casts.get(name).is_some_and(|c| c.batch)
+        self.cast_offline_lane(name) == Some(Lane::Batch)
     }
 
     /// Whether canonical cast `name` is the configured default — comparing against the
@@ -919,20 +974,47 @@ impl Config {
             let cast = casts.entry(name.clone()).or_insert_with(|| Cast {
                 name: name.clone(),
                 slots: BTreeMap::new(),
-                batch: false,
             });
-            // `batch` is sticky: omitting it leaves a built-in batch cast batch (so a
-            // file can retune `gemini-batch`'s model without un-batching it); set it
-            // explicitly to declare or clear the lane.
-            if let Some(b) = rc.batch {
-                cast.batch = b;
-            }
             for (role, raw_slot) in rc.slots() {
-                let slot = raw_slot
+                let mut slot = raw_slot
                     .clone()
                     .into_slot()
                     .with_context(|| format!("cast {name:?} {} slot", role.key()))?;
+                // A slot's `lane` is sticky across a bare re-declaration of its model:
+                // retuning `gemini-batch`'s synth id without repeating `lane = "batch"`
+                // must not silently revert it to interactive — mirrors the old
+                // cast-level `batch` flag's stickiness, now scoped to the slot that
+                // actually carries the lane. An explicit `lane` on the new declaration
+                // (or no prior slot at this role) always wins outright.
+                if slot.lane.is_none() {
+                    if let Some(prev) = cast.slots.get(&role) {
+                        slot.lane = prev.lane;
+                    }
+                }
                 cast.slots.insert(role, slot);
+            }
+            // Backward-compat sugar: `batch = true` at cast level normalizes onto the
+            // synth slot's `lane` — there is exactly ONE internal representation of
+            // lane (the slot field); this just translates the old spelling into it.
+            // Applied after the slot merge above so it sees this stanza's synth slot.
+            // `batch = false` (or omitting the key) is a no-op, not a clear — there's no
+            // "un-batch" flag, only the slot's own `lane`.
+            if let Some(true) = rc.batch {
+                let synth = cast.slots.get_mut(&ModelRole::Synth).ok_or_else(|| {
+                    anyhow!(
+                        "cast {name:?}: batch = true needs a synth slot \
+                         (batch_submit runs the synth model)"
+                    )
+                })?;
+                match synth.lane {
+                    None => synth.lane = Some(Lane::Batch),
+                    Some(Lane::Batch) => {} // idempotent
+                    Some(other) => bail!(
+                        "cast {name:?}: `batch = true` conflicts with the synth slot's \
+                         `lane = {:?}`",
+                        other.as_str()
+                    ),
+                }
             }
             for alias in rc.aliases.into_iter().flatten() {
                 cast_file_aliases.push((alias, name.clone()));
@@ -942,7 +1024,7 @@ impl Config {
         // Resolve every slot's backend ref through the alias map (stored canonical),
         // and validate the slot. Unknown backend → loud error naming the known set.
         for cast in casts.values_mut() {
-            let Cast { name, slots, batch } = cast;
+            let Cast { name, slots } = cast;
             for (role, slot) in slots.iter_mut() {
                 if !backends.contains_key(&slot.backend) {
                     match backend_aliases.get(&slot.backend) {
@@ -990,27 +1072,40 @@ impl Config {
                         t.max_tokens
                     );
                 }
-            }
-            // A batch cast is staffed by `batch_submit` — a toolless oneshot on the synth
-            // slot — so it MUST carry a synth slot whose backend actually has a batch API.
-            // Catch the misdeclaration loudly at load (a `batch = true` deepseek cast, say),
-            // not as a baffling refusal or a 400 at submit time.
-            if *batch {
-                let synth = slots.get(&ModelRole::Synth).ok_or_else(|| {
-                    anyhow!(
-                        "cast {name:?}: batch = true needs a synth slot \
-                         (batch_submit runs the synth model)"
-                    )
-                })?;
-                let kind = backends[&synth.backend].kind;
-                if !crate::batch::batch_supported(kind) {
-                    bail!(
-                        "cast {name:?}: batch = true but the synth backend {:?} ({}) has no \
-                         batch API — batch casts must synth a batch-capable backend ({})",
-                        synth.backend,
-                        kind.canonical_name(),
-                        crate::batch::supported_kinds_list(),
-                    );
+                // A slot's lane needs a fitting role and backend, caught here rather
+                // than as a baffling refusal or a 400 at submit/deliberate time. The
+                // explorer always runs interactively (a `deliberate` cast pairs it with
+                // an *offline* synth, never the other way round), so a lane on an
+                // explorer slot is a loud error regardless of kind. `Batch` needs the
+                // provider's own async batch API; `Direct` (kaibo running one long
+                // completion itself) accepts any backend that resolves at all — no
+                // "batch cast must be synth-only" constraint here, so an interactive
+                // explorer may freely sit beside an offline synth (the `deliberate`
+                // shape); the built-in batch casts stay synth-only by construction, not
+                // by a rule enforced here.
+                if let Some(lane) = slot.lane {
+                    if *role != ModelRole::Synth {
+                        bail!(
+                            "cast {name:?}: the {} slot declares lane = {:?}, but only a \
+                             synth slot may run offline — the explorer always runs \
+                             interactively",
+                            role.key(),
+                            lane.as_str()
+                        );
+                    }
+                    if lane == Lane::Batch && !crate::batch::batch_supported(kind) {
+                        bail!(
+                            "cast {name:?}: synth lane = \"batch\" but the synth backend \
+                             {:?} ({}) has no batch API — a batch synth must sit on a \
+                             batch-capable backend ({})",
+                            slot.backend,
+                            kind.canonical_name(),
+                            crate::batch::supported_kinds_list(),
+                        );
+                    }
+                    // `Direct` needs nothing further: the backend already resolved above,
+                    // and a direct completion has no provider-side capability to check —
+                    // it's kaibo driving one ordinary call itself, just slower.
                 }
             }
         }
@@ -1257,21 +1352,15 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             (ModelRole::Explorer, ModelSlot::bare(&name, explorer)),
             (ModelRole::Synth, ModelSlot::bare(&name, synth)),
         ]);
-        m.insert(
-            name.clone(),
-            Cast {
-                name,
-                slots,
-                batch: false,
-            },
-        );
+        m.insert(name.clone(), Cast { name, slots });
     }
-    // The offline batch lane's built-in casts (`batch = true`): staffed by a single
-    // big, slow, capable synth — the model whose latency is *free* in batch but
-    // near-unusable interactively. They carry synth only: batch is a toolless oneshot
-    // (no explorer sweep), and the interactive tools that used an explorer now refuse a
-    // batch cast outright, so an explorer slot here would be dead weight advertising a
-    // consult-usability the lane no longer has.
+    // The offline batch lane's built-in casts (synth slot `lane = Batch`): staffed by
+    // a single big, slow, capable synth — the model whose latency is *free* in batch
+    // but near-unusable interactively. They carry synth only, because `batch_submit` is
+    // a toolless oneshot (no explorer sweep). A *user* cast may pair an interactive
+    // explorer with an offline synth — that's the `deliberate` shape, valid since the
+    // per-slot lane reshape — but these built-ins have no dossier phase to staff, so an
+    // explorer slot here would just be dead weight.
     //
     // gemini-batch synths Gemini Pro via the `gemini-pro-latest` *alias*, deliberately
     // not a pinned preview id: pinned Pro previews get retired out from under us (a live
@@ -1284,9 +1373,11 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             name: gemini_batch,
             slots: BTreeMap::from([(
                 ModelRole::Synth,
-                ModelSlot::bare("gemini", "gemini-pro-latest"),
+                ModelSlot {
+                    lane: Some(Lane::Batch),
+                    ..ModelSlot::bare("gemini", "gemini-pro-latest")
+                },
             )]),
-            batch: true,
         },
     );
     // anthropic-batch synths Claude Opus — the Anthropic analogue of Gemini Pro, the big
@@ -1300,9 +1391,11 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             name: anthropic_batch,
             slots: BTreeMap::from([(
                 ModelRole::Synth,
-                ModelSlot::bare("anthropic", "claude-opus-4-8"),
+                ModelSlot {
+                    lane: Some(Lane::Batch),
+                    ..ModelSlot::bare("anthropic", "claude-opus-4-8")
+                },
             )]),
-            batch: true,
         },
     );
     m
@@ -1552,9 +1645,12 @@ impl RawBackend {
 #[serde(deny_unknown_fields)]
 struct RawCast {
     aliases: Option<Vec<String>>,
-    /// Declares the cast for the offline batch lane (`batch_submit` only). Absent
-    /// reads as `false` for a fresh cast; on a built-in batch cast it's omitted to
-    /// keep the existing flag, set explicitly to flip it. See [`Cast::batch`].
+    /// Backward-compat sugar for the synth slot's `lane = "batch"` (`batch_submit`
+    /// only). `Some(true)` normalizes onto the synth slot's [`Lane`] at merge time —
+    /// see the cast-merge loop in [`Config::merge`]; there is exactly one internal
+    /// representation of lane (the slot field), this is purely an input spelling.
+    /// `Some(false)` and absent are both no-ops — there is no "un-batch" flag, only
+    /// the slot's own `lane`.
     batch: Option<bool>,
     explorer: Option<RawSlot>,
     synth: Option<RawSlot>,
@@ -1619,6 +1715,10 @@ struct RawSlotTable {
     effort: Option<String>,
     thinking_style: Option<String>,
     preamble: Option<String>,
+    /// How this slot runs — `"batch"` or `"direct"`; absent means interactive. See
+    /// [`Lane`]. Only meaningful on a synth slot; an explorer slot with a lane is a
+    /// loud load error (checked in `Config::merge`, after backend resolution).
+    lane: Option<String>,
 }
 
 impl RawSlot {
@@ -1646,6 +1746,7 @@ impl RawSlot {
                     .map(str::parse)
                     .transpose()
                     .context("thinking_style")?,
+                lane: t.lane.as_deref().map(str::parse).transpose().context("lane")?,
                 // Same loud-on-empty rule as `[prompts]`: a blank per-model prompt
                 // is never intended, and silently running it would strip the role
                 // framing with no signal. Drop the key to fall back.
@@ -2433,15 +2534,16 @@ mod tests {
     }
 
     /// All four interactive built-in casts exist, each single-backend with
-    /// explorer+synth, and none is flagged for the batch lane.
+    /// explorer+synth, and none has a synth on an offline lane.
     #[test]
     fn all_four_builtin_casts_resolve() {
         let cfg = Config::builtin();
         for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
             let cast = cfg.resolve_cast(name).unwrap();
-            assert!(
-                !cast.batch,
-                "interactive built-in {name:?} must not be a batch cast"
+            assert_eq!(
+                cast.synth_lane(),
+                None,
+                "interactive built-in {name:?} must have an interactive synth"
             );
             for role in [ModelRole::Explorer, ModelRole::Synth] {
                 let slot = cast.require_slot(role).unwrap();
@@ -2450,16 +2552,20 @@ mod tests {
         }
     }
 
-    /// The built-in batch casts positively declare `batch = true`, carry **synth only**
-    /// (batch is a toolless oneshot — an explorer slot would be dead weight), and synth a
-    /// batch-capable backend. Pins the lane's shape so an accidental explorer slot or a
-    /// dropped flag fails here.
+    /// The built-in batch casts' synth slots positively declare `lane = Batch`, carry
+    /// **synth only** (batch is a toolless oneshot — an explorer slot would be dead
+    /// weight), and synth a batch-capable backend. Pins the lane's shape so an
+    /// accidental explorer slot or a dropped lane fails here.
     #[test]
     fn builtin_batch_casts_are_synth_only_and_flagged() {
         let cfg = Config::builtin();
         for (name, backend) in [("gemini-batch", "gemini"), ("anthropic-batch", "anthropic")] {
             let cast = cfg.resolve_cast(name).unwrap();
-            assert!(cast.batch, "{name:?} must declare batch = true");
+            assert_eq!(
+                cast.synth_lane(),
+                Some(Lane::Batch),
+                "{name:?} must declare its synth slot's lane = batch"
+            );
             assert!(
                 cast.slot(ModelRole::Explorer).is_none(),
                 "{name:?} is a batch cast — toolless, so it carries no explorer slot"
@@ -2511,9 +2617,10 @@ mod tests {
         );
     }
 
-    /// `batch` round-trips from `[casts.<name>]`: a fresh cast defaults non-batch, an
-    /// explicit `batch = true` (on a batch-capable synth) declares the lane, and the flag
-    /// is sticky over a built-in — retuning `gemini-batch`'s model leaves it batch.
+    /// `batch` round-trips from `[casts.<name>]`: a fresh cast defaults interactive, an
+    /// explicit `batch = true` (on a batch-capable synth) sets the synth slot's
+    /// `lane = Batch`, and it's sticky over a built-in — retuning `gemini-batch`'s model
+    /// (a bare re-declaration, no `lane` repeated) leaves the synth slot batch.
     #[test]
     fn batch_flag_parses_defaults_false_and_is_sticky() {
         let cfg = Config::from_toml_str(
@@ -2530,23 +2637,134 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(
-            !cfg.resolve_cast("fresh").unwrap().batch,
-            "absent batch ⇒ false"
+        assert_eq!(
+            cfg.resolve_cast("fresh").unwrap().synth_lane(),
+            None,
+            "absent batch ⇒ interactive synth"
         );
-        assert!(
-            cfg.resolve_cast("declared").unwrap().batch,
-            "batch = true ⇒ true"
+        assert_eq!(
+            cfg.resolve_cast("declared").unwrap().synth_lane(),
+            Some(Lane::Batch),
+            "batch = true ⇒ synth lane = batch"
         );
         let gb = cfg.resolve_cast("gemini-batch").unwrap();
-        assert!(
-            gb.batch,
-            "retuning a built-in batch cast leaves it batch (sticky)"
+        assert_eq!(
+            gb.synth_lane(),
+            Some(Lane::Batch),
+            "retuning a built-in batch cast's synth id leaves its lane batch (sticky)"
         );
         assert_eq!(
             gb.require_slot(ModelRole::Synth).unwrap().id,
             "gemini-3-pro-preview",
             "the file override reached the synth slot"
+        );
+    }
+
+    /// A slot table's `lane = "direct"` parses to `Some(Lane::Direct)` — the offline,
+    /// non-batch lane for a big local model kaibo runs itself.
+    #[test]
+    fn slot_lane_direct_parses() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.mydirect]
+            synth = { backend = "openai-local", id = "big-local-model", lane = "direct" }
+            "#,
+        )
+        .unwrap();
+        let cast = cfg.resolve_cast("mydirect").unwrap();
+        assert_eq!(cast.synth_lane(), Some(Lane::Direct));
+    }
+
+    /// A slot table's `lane = "batch"` parses and validates cleanly on a batch-capable
+    /// backend — the table-form spelling of the same lane the `batch = true` sugar sets.
+    #[test]
+    fn slot_lane_batch_parses_and_validates() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.mybatch]
+            synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_cast("mybatch").unwrap().synth_lane(),
+            Some(Lane::Batch)
+        );
+    }
+
+    /// `batch = true` conflicting with an explicit, different synth `lane` is a loud
+    /// load error naming the cast and both lanes — silently picking one would run the
+    /// wrong lane's tool against the operator's actual intent.
+    #[test]
+    fn batch_sugar_conflicting_with_explicit_direct_lane_is_a_load_error() {
+        let err = Config::from_toml_str(
+            r#"
+            [casts.bad]
+            batch = true
+            synth = { backend = "openai-local", id = "m", lane = "direct" }
+            "#,
+        )
+        .expect_err("batch = true conflicting with an explicit lane = direct must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bad") && msg.contains("batch") && msg.contains("direct"),
+            "load error must name the cast and both conflicting lanes, got: {msg}"
+        );
+    }
+
+    /// A cast may pair an interactive explorer with an offline (`batch`) synth — the
+    /// `deliberate` shape this reshape exists to enable. Dropped the old "batch casts
+    /// are synth-only" constraint at validation: the built-in batch casts stay
+    /// synth-only by construction, but a custom cast may add an explorer.
+    #[test]
+    fn interactive_explorer_with_batch_synth_is_legal() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.mydeliberate]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+            "#,
+        )
+        .unwrap();
+        let cast = cfg.resolve_cast("mydeliberate").unwrap();
+        assert_eq!(cast.synth_lane(), Some(Lane::Batch));
+        assert!(cast.slot(ModelRole::Explorer).is_some());
+    }
+
+    /// A `lane` on an EXPLORER slot is a loud load error: the explorer always runs
+    /// interactively, so declaring it offline is a misdeclaration, not a valid shape.
+    #[test]
+    fn lane_on_explorer_slot_is_a_load_error() {
+        let err = Config::from_toml_str(
+            r#"
+            [casts.bad]
+            explorer = { backend = "gemini", id = "m", lane = "batch" }
+            synth = "gemini/gemini-pro-latest"
+            "#,
+        )
+        .expect_err("a lane on the explorer slot must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bad") && msg.contains("explorer"),
+            "load error must name the cast and the explorer slot, got: {msg}"
+        );
+    }
+
+    /// A bad `lane` value is a clear parse error naming the valid spellings —
+    /// same discipline as `thinking_style`.
+    #[test]
+    fn bad_lane_value_is_a_clear_parse_error() {
+        let err = Config::from_toml_str(
+            r#"
+            [casts.bad]
+            synth = { backend = "gemini", id = "m", lane = "sideways" }
+            "#,
+        )
+        .expect_err("an unknown lane value must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sideways") && msg.contains("batch") && msg.contains("direct"),
+            "parse error must name the bad value and the valid ones, got: {msg}"
         );
     }
 
