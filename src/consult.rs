@@ -256,7 +256,8 @@ pub fn report_preamble() -> String {
          HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
          each key symbol to where it is defined and where it is used; chase anything \
          that puzzles you until it is clear — a confusing spot usually hides the \
-         thing you need. One thorough pass beats many shallow ones.\n\n\
+         thing you need. Follow each thread while you are already in the code, so one \
+         thorough pass leaves you the complete picture.\n\n\
          WHAT TO PRODUCE. A curated report for the synthesizer, in these sections:\n\
          - SummaryOfFindings: what you concluded, in a few sentences.\n\
          - RelevantLocations: for each location that matters — the concrete \
