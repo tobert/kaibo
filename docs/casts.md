@@ -193,7 +193,10 @@ is provable with no network.
 `ModelRole`, `ModelSlot`, `ModelCaps`, `ModelShape`, `run_phase`, sessions,
 the sandbox, and path containment. The rewrite is the layer above them. (`ModelRole`
 was later pruned of its production roles — `image`/`tts` — when image generation was
-dropped; see the devlog 2026-06-28 entry.)
+dropped; see the devlog 2026-06-28 entry. `ModelSlot` later gained a `lane` field —
+`Cast` lost its whole-cast `batch: bool` when batch-ness moved to a per-slot
+property, so a cast can pair an interactive explorer with an offline synth; the
+synth slot's lane now classifies the cast, per `docs/config.md`.)
 
 ## Build order / TDD seams
 

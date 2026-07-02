@@ -33,8 +33,14 @@ rewritten to the doc's target drafts, `consult` pinned resident via
 enum is the sole roster home), rustdoc cross-refs stripped from shipped schemas, and
 the AGENTS.md client-facing budget guidance.
 
-**Arc 2 — still open (`explore` + `deliberate`):** the config lane reshape first
-(per-slot lane `batch | direct`; today's batch casts become the degenerate case), then
+**Arc 2 — in progress (`explore` + `deliberate`):** the config lane reshape **shipped**
+— `Lane` (`batch | direct`) now lives on `ModelSlot`, not `Cast`; `Cast::batch` is gone;
+`batch = true` is backward-compat sugar normalized onto the synth slot's `lane` at load;
+today's built-in batch casts are the synth-only degenerate case, and a cast may now pair
+an interactive explorer with an offline synth (the `deliberate` shape). `direct` is
+validated, rendered (`kaibo://config`), and load-tested, but forward-declared — no tool
+routes to it yet, so a `direct` cast sits in neither the interactive nor the
+`batch_submit` `cast` enum, and is dropped from the handshake roster. Still open: then
 `explore` (a new `run_phase` composition over `report_preamble` — not a re-mount of the
 RunExplore sub-agent), then `deliberate` (dossier → offline synth, two lanes; the
 two-stage handle crosses the disjoint `job-N` / `backend/provider-id` namespaces — the

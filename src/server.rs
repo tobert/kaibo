@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::Instrument;
 
-use crate::config::{Backend, Cast, Config, ModelRole, ModelSlot};
+use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
     Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides, consult, oneshot,
 };
@@ -520,13 +520,21 @@ impl KaiboHandler {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        // A batch cast (`batch = true`) staffs `batch_submit` *only*, so the rosters split
-        // by lane: the interactive tools advertise the non-batch casts, `batch_submit`
-        // advertises the batch ones. The gate enforces the same split at call time; this
-        // just keeps the advertised menu honest so an agent doesn't pick a cast its tool
-        // will refuse.
-        let (batch_usable, interactive_usable): (Vec<String>, Vec<String>) =
-            usable.into_iter().partition(|n| config.cast_is_batch(n));
+        // A cast's synth lane (`Config::cast_offline_lane`, read off the synth slot)
+        // splits the roster three ways: interactive (no lane) → consult/consult_submit/
+        // oneshot; `Batch` → batch_submit; `Direct` → *neither* — it's forward-declared
+        // (validated, rendered) but no tool consumes an offline-direct synth yet, so it
+        // would silently pass either gate's schema without a route. A future PR adds its
+        // tool and this three-way split gains a third `inject_cast_enum` call. The gate
+        // enforces the same split at call time; this just keeps the advertised menu
+        // honest so an agent doesn't pick a cast its tool will refuse.
+        let (interactive_usable, offline_usable): (Vec<String>, Vec<String>) = usable
+            .into_iter()
+            .partition(|n| config.cast_offline_lane(n).is_none());
+        let batch_usable: Vec<String> = offline_usable
+            .into_iter()
+            .filter(|n| config.cast_is_batch(n))
+            .collect();
         inject_cast_enum(
             &mut tool_router,
             &["consult", "consult_submit", "oneshot"],
@@ -1121,44 +1129,65 @@ impl KaiboHandler {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))
     }
 
-    /// Refuse an interactive tool (`consult`/`consult_submit`/`oneshot`) on a batch cast.
-    /// A `batch = true` cast's synth is a big, slow, expensive model
-    /// tuned for free offline batch latency (Gemini Pro, Claude Opus); driving it through
-    /// an interactive tool loop is the wrong-and-costly mistake this gate exists to stop.
-    /// Points the caller at the lane that fits.
-    fn reject_batch_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        if cast.batch {
-            return Err(McpError::invalid_params(
+    /// Refuse an interactive tool (`consult`/`consult_submit`/`oneshot`) on a cast whose
+    /// synth runs on an offline lane. A `Batch` synth is a big, slow, expensive model
+    /// tuned for free offline batch latency (Gemini Pro, Claude Opus); a `Direct` synth
+    /// is a big local model kaibo runs itself, taking the time it takes — either way,
+    /// driving it through an interactive tool loop is the wrong-and-costly mistake this
+    /// gate exists to stop. Points the caller at the lane that fits.
+    fn reject_offline_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        match cast.synth_lane() {
+            Some(Lane::Batch) => Err(McpError::invalid_params(
                 format!(
-                    "cast `{}` is a batch cast (batch = true) — submit it with `batch_submit`, \
-                     not `{tool}`. Its synth is a big, slow model tuned for free offline batch \
-                     latency; running it interactively would be slow and expensive. Pick a \
-                     non-batch cast for `{tool}`.",
+                    "cast `{}`'s synth runs on the `batch` lane — submit it with \
+                     `batch_submit`, not `{tool}`. It's a big, slow model tuned for free \
+                     offline batch latency; running it interactively would be slow and \
+                     expensive. Pick an interactive cast for `{tool}`.",
                     cast.name
                 ),
                 None,
-            ));
+            )),
+            Some(Lane::Direct) => Err(McpError::invalid_params(
+                format!(
+                    "cast `{}`'s synth runs offline (`lane = \"direct\"`) — interactive \
+                     tools need an interactive synth. Pick an interactive cast for `{tool}`.",
+                    cast.name
+                ),
+                None,
+            )),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// Refuse `batch_submit` on a non-batch cast — the other half of the lane split. A
-    /// batch cast must positively declare `batch = true`, so an ordinary interactive cast
-    /// is never silently batched (an accidental Opus/Pro batch is just as costly the other
-    /// way). Points the caller at the built-in batch casts.
+    /// Refuse `batch_submit` on a cast whose synth isn't on the `batch` lane
+    /// specifically — the other half of the lane split. A batch cast must positively
+    /// declare `lane = "batch"` on its synth slot, so an ordinary interactive cast is
+    /// never silently batched (an accidental Opus/Pro batch is just as costly the other
+    /// way), and a `direct` cast — offline, but not batch — gets its own honest
+    /// message rather than the generic "not a batch cast" one. Points the caller at
+    /// the built-in batch casts.
     fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
-        if !cast.batch {
-            return Err(McpError::invalid_params(
+        match cast.synth_lane() {
+            Some(Lane::Batch) => Ok(()),
+            Some(Lane::Direct) => Err(McpError::invalid_params(
                 format!(
-                    "cast `{}` is not a batch cast — `batch_submit` needs a cast that declares \
-                     `batch = true` (the built-ins `gemini-batch`, `anthropic-batch`, or your \
-                     own in config.toml). For an interactive answer, use `consult`/`oneshot`.",
+                    "cast `{}`'s synth runs on the `direct` lane, not `batch` — \
+                     `batch_submit` needs a synth slot with `lane = \"batch\"`.",
                     cast.name
                 ),
                 None,
-            ));
+            )),
+            None => Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` is not a batch cast — `batch_submit` needs a cast whose synth \
+                     slot declares `lane = \"batch\"` (the built-ins `gemini-batch`, \
+                     `anthropic-batch`, or your own in config.toml). For an interactive \
+                     answer, use `consult`/`oneshot`.",
+                    cast.name
+                ),
+                None,
+            )),
         }
-        Ok(())
     }
 
     /// Apply a per-call model override to one of `cast`'s slots.
@@ -1277,7 +1306,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_batch_cast(&cast, "consult")?;
+        self.reject_offline_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1389,7 +1418,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_batch_cast(&cast, "consult_submit")?;
+        self.reject_offline_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1512,7 +1541,7 @@ impl KaiboHandler {
         meta: Meta,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_batch_cast(&cast, "oneshot")?;
+        self.reject_offline_cast(&cast, "oneshot")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Synth,
@@ -2735,6 +2764,10 @@ fn render_config_resource(
         /// operator's own framing). Absent when unset.
         #[serde(skip_serializing_if = "Option::is_none")]
         preamble: Option<String>,
+        /// How this slot runs — `"batch"` or `"direct"`; absent (the common case)
+        /// means interactive. Only ever set on a synth slot (load-validated).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lane: Option<&'static str>,
         /// Per-slot tunables that *are* set here but this slot's resolved request shape
         /// will never send — the honest no-op flag. A `thinking_budget` on an
         /// effort-driven or toggle-less model, an `effort` on a budget model, a
@@ -2800,6 +2833,7 @@ fn render_config_resource(
                         effort,
                         thinking_style,
                         preamble,
+                        lane,
                     } = slot;
                     let caps = config
                         .slot_caps(slot)
@@ -2834,6 +2868,7 @@ fn render_config_resource(
                             effort: effort.clone(),
                             thinking_style: thinking_style.map(|s| format!("{s:?}").to_lowercase()),
                             preamble: preamble.clone(),
+                            lane: lane.map(Lane::as_str),
                             inert_tunables,
                         },
                     )
@@ -3760,15 +3795,17 @@ mod tests {
 
     /// The cast roster splits by lane on the advertised `cast` enums: the interactive
     /// tools list non-batch casts, `batch_submit` lists batch casts — so an agent reading
-    /// the schema never offers a cast the tool will refuse. Driven through a keyless local
-    /// gemini backend so both a batch and an interactive cast are usable regardless of
-    /// which API keys the test env carries.
+    /// the schema never offers a cast the tool will refuse. A `direct`-lane cast belongs
+    /// to neither enum yet — it's forward-declared (validated, rendered) but no tool
+    /// routes to it (see the roster-split comment in `KaiboHandler::new`). Driven through
+    /// a keyless local gemini backend so all three casts are usable regardless of which
+    /// API keys the test env carries.
     #[test]
     fn cast_enums_split_by_lane() {
         let h = handler_from_toml(
             r#"
-            # A keyless (placeholder) batch-capable backend so both casts are "usable"
-            # offline — the partition is exercised with teeth, not trivially empty.
+            # A keyless (placeholder) batch-capable backend so all three casts are
+            # "usable" offline — the partition is exercised with teeth, not trivially empty.
             [backends.gem]
             kind = "gemini"
             key_optional = true
@@ -3780,6 +3817,9 @@ mod tests {
             [casts.myinteractive]
             explorer = "gem/some-lite"
             synth = "gem/some-flash"
+
+            [casts.mydirect]
+            synth = { backend = "gem", id = "some-big-local", lane = "direct" }
             "#,
         );
         let enum_of = |tool: &str| -> Vec<String> {
@@ -3808,6 +3848,11 @@ mod tests {
                 !casts.iter().any(|c| c == "mybatch"),
                 "{tool} enum must not list a batch cast, got {casts:?}"
             );
+            assert!(
+                !casts.iter().any(|c| c == "mydirect"),
+                "{tool} enum must not list a direct-lane cast (no tool routes to it \
+                 yet), got {casts:?}"
+            );
         }
         let batch = enum_of("batch_submit");
         assert!(
@@ -3818,26 +3863,50 @@ mod tests {
             !batch.iter().any(|c| c == "myinteractive"),
             "batch_submit enum must not list an interactive cast, got {batch:?}"
         );
+        assert!(
+            !batch.iter().any(|c| c == "mydirect"),
+            "batch_submit enum must not list a direct-lane cast, got {batch:?}"
+        );
     }
 
-    /// The lane gate's two halves, tested directly: an interactive tool refuses a batch
-    /// cast (naming the cast and `batch_submit`), and `batch_submit` refuses a non-batch
-    /// cast — while each accepts the cast that fits its lane.
+    /// The lane gate's two halves, tested directly: an interactive tool refuses an
+    /// offline cast (batch OR direct, naming the cast and the right route), and
+    /// `batch_submit` refuses both a non-batch (interactive) cast and a `direct` cast
+    /// with a distinct honest message — while each accepts the cast that fits its lane.
     #[test]
     fn lane_gate_refuses_the_wrong_lane() {
-        let h = handler();
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.mydirect]
+            synth = { backend = "gem", id = "some-big-local", lane = "direct" }
+            "#,
+        );
         let batch = h.config.resolve_cast("gemini-batch").unwrap().clone();
+        let direct = h.config.resolve_cast("mydirect").unwrap().clone();
         let interactive = h.config.resolve_cast("anthropic").unwrap().clone();
 
         let err = h
-            .reject_batch_cast(&batch, "consult")
+            .reject_offline_cast(&batch, "consult")
             .expect_err("an interactive tool must refuse a batch cast");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("gemini-batch") && msg.contains("batch_submit"),
             "refusal should name the cast and point at batch_submit, got: {msg}"
         );
-        assert!(h.reject_batch_cast(&interactive, "consult").is_ok());
+
+        let err = h
+            .reject_offline_cast(&direct, "consult")
+            .expect_err("an interactive tool must refuse a direct cast too");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("mydirect") && msg.contains("direct"),
+            "refusal should name the cast and its lane, got: {msg}"
+        );
+        assert!(h.reject_offline_cast(&interactive, "consult").is_ok());
 
         let err = h
             .require_batch_cast(&interactive)
@@ -3845,6 +3914,15 @@ mod tests {
         assert!(
             format!("{err:?}").contains("not a batch cast"),
             "refusal should explain the cast isn't a batch cast"
+        );
+
+        let err = h
+            .require_batch_cast(&direct)
+            .expect_err("batch_submit must refuse a direct-lane cast, not treat it as batch");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("mydirect") && msg.contains("direct") && msg.contains("batch"),
+            "refusal should name the cast and explain it's direct, not batch, got: {msg}"
         );
         assert!(h.require_batch_cast(&batch).is_ok());
     }

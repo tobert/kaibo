@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 
 use kaibo::attach::Attachment;
-use kaibo::config::{Cast, Config, ModelRole, ModelSlot};
+use kaibo::config::{Cast, Config, Lane, ModelRole, ModelSlot};
 use kaibo::server::{BatchSubmitInput, KaiboHandler};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::tempdir;
@@ -227,17 +227,17 @@ async fn image_attachment_to_blind_synth_is_refused() {
     config.root = Some(root.path().to_path_buf());
     let mut slot = ModelSlot::bare("anthropic", "claude-sonnet-4-6");
     slot.vision = Some(false);
+    // `lane = Some(Batch)`: this exercises `batch_submit`, which now refuses a
+    // non-batch cast before the vision gate. Anthropic is batch-capable, so the cast
+    // is valid; the vision pin is what we're actually testing here.
+    slot.lane = Some(Lane::Batch);
     let mut slots = BTreeMap::new();
     slots.insert(ModelRole::Synth, slot);
     config.casts.insert(
         "blindcast".to_string(),
-        // `batch = true`: this exercises `batch_submit`, which now refuses a non-batch
-        // cast before the vision gate. Anthropic is batch-capable, so the cast is valid;
-        // the vision pin is what we're actually testing here.
         Cast {
             name: "blindcast".to_string(),
             slots,
-            batch: true,
         },
     );
     let handler = KaiboHandler::new(config).expect("handler builds");
