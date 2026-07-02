@@ -1324,6 +1324,44 @@ impl KaiboHandler {
         }
     }
 
+    /// Resolve `deliberate`'s offline lane and apply the per-call model overrides, in the
+    /// one order that's correct. The lane is captured from the *chosen cast* **before** the
+    /// overrides run, because `apply_model_override` replaces a slot with a *bare* (laneless)
+    /// one — an override retargets the model, never the offline mechanism — so reading
+    /// `synth_lane()` afterward would silently lose batch|direct (and hit the `.expect`).
+    /// Assumes [`require_deliberate_cast`](Self::require_deliberate_cast) already passed, so
+    /// the synth lane is `Some`; the sole caller enforces that first. Returns the captured
+    /// lane; `cast` carries the overrides on return.
+    fn deliberation_lane_with_overrides(
+        &self,
+        cast: &mut Cast,
+        explorer_model: Option<&str>,
+        explorer_backend: Option<&str>,
+        synth_model: Option<&str>,
+        synth_backend: Option<&str>,
+    ) -> Result<Lane, McpError> {
+        let lane = cast
+            .synth_lane()
+            .expect("require_deliberate_cast guaranteed an offline synth");
+        self.apply_model_override(
+            cast,
+            ModelRole::Explorer,
+            explorer_model,
+            explorer_backend,
+            "explorer_model",
+            "explorer_backend",
+        )?;
+        self.apply_model_override(
+            cast,
+            ModelRole::Synth,
+            synth_model,
+            synth_backend,
+            "synth_model",
+            "synth_backend",
+        )?;
+        Ok(lane)
+    }
+
     /// Apply a per-call model override to one of `cast`'s slots.
     ///
     /// The model id rides *verbatim* — an id containing `/` (HuggingFace-style
@@ -1748,29 +1786,15 @@ impl KaiboHandler {
         // explorer arm resolves below (a synth-only batch cast has no explorer slot and
         // `arm` errors clearly, the honest "no dossier phase to staff" refusal).
         self.require_deliberate_cast(&cast)?;
-        // Capture the deliberation lane NOW, before any `synth_model` override: an
-        // override replaces the synth slot with a *bare* (laneless) one — it retargets the
-        // model, not the offline mechanism — so reading `synth_lane()` afterward would lose
-        // batch|direct. The lane is a property of the *cast* the caller chose; the override
-        // only swaps which model fills the slot.
-        let lane = cast
-            .synth_lane()
-            .expect("require_deliberate_cast guaranteed an offline synth");
-        self.apply_model_override(
+        // Capture the lane and apply per-call overrides in the one correct order (the
+        // capture must precede the overrides — see the helper). Extracted so a test can
+        // pin that a `synth_model` override never drops batch|direct.
+        let lane = self.deliberation_lane_with_overrides(
             &mut cast,
-            ModelRole::Explorer,
             input.explorer_model.as_deref(),
             input.explorer_backend.as_deref(),
-            "explorer_model",
-            "explorer_backend",
-        )?;
-        self.apply_model_override(
-            &mut cast,
-            ModelRole::Synth,
             input.synth_model.as_deref(),
             input.synth_backend.as_deref(),
-            "synth_model",
-            "synth_backend",
         )?;
         let explorer = self.arm(&cast, ModelRole::Explorer)?;
         let explorer_model = explorer.model.clone();
@@ -4442,6 +4466,49 @@ mod tests {
         assert!(
             off.ensure_consult_enabled("job-1").is_err(),
             "with every job producer off, a `job-N` is refused"
+        );
+    }
+
+    /// The lane-capture invariant, pinned: a per-call `synth_model` override retargets the
+    /// model but must NOT change deliberate's offline lane. `apply_model_override` replaces
+    /// the synth slot with a bare (laneless) one, so `deliberation_lane_with_overrides`
+    /// captures the lane *before* overriding — this test fails (wrong lane, or a panic on
+    /// the `.expect`) if that order is ever reversed. Also proves the capture is load-bearing:
+    /// the slot really does go laneless, and the override really does take effect.
+    #[test]
+    fn deliberate_lane_survives_a_synth_model_override() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.mydeliberate]
+            explorer = "gem/some-lite"
+            synth    = { backend = "gem", id = "some-pro", lane = "batch" }
+            "#,
+        );
+        let mut cast = h.config.resolve_cast("mydeliberate").unwrap().clone();
+        // A synth_model override — this is what replaces the slot with a bare, laneless one.
+        let lane = h
+            .deliberation_lane_with_overrides(&mut cast, None, None, Some("some-other-pro"), None)
+            .expect("override applies cleanly");
+        assert_eq!(
+            lane,
+            Lane::Batch,
+            "a synth_model override must not drop the batch lane"
+        );
+        // The capture was load-bearing: the override left the synth slot laneless...
+        assert_eq!(
+            cast.synth_lane(),
+            None,
+            "the override replaced the synth slot with a bare (laneless) one"
+        );
+        // ...and it did retarget the model.
+        assert_eq!(
+            cast.slot(ModelRole::Synth).map(|s| s.id.as_str()),
+            Some("some-other-pro"),
+            "the synth_model override took effect"
         );
     }
 
