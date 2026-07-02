@@ -268,6 +268,15 @@ the git log. Each later release appends a new section at the top.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
 
+### Changed
+
+- **The `consult` driver and the shared kaish cheatsheet describe reading in wide
+  passes**, matching the guidance the explorer got: a short file read whole, a big one
+  in a few hundred-line spans. Several preambles also drop negative-example phrasing
+  in favor of stating the wanted behavior directly. A `consult` over large sources
+  should spend fewer tool calls gathering the same evidence (same mechanism the
+  explorer change measured).
+
 ### Fixed
 
 - **The advertised cast roster marks the default even when it's set by an alias.**
