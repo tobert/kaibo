@@ -50,8 +50,12 @@ the git log. Each later release appends a new section at the top.
   map rather than the conclusion. It reads the repo itself like `consult`, so it takes the
   same `path` / `cast` / `explorer_model` (+ `explorer_backend`) / `explorer_max_turns`
   arguments; being single-phase, it has no synth args, `attach`, `context`, or `session_id`.
-  The report carries the same provenance footer, naming the cast and the explorer that
-  surveyed. Gated independently by `--no-explore`. For a synthesized answer, use `consult`.
+  Because it runs *only* the explorer, its `cast` accepts **any cast with an explorer** —
+  not just interactive ones, but `deliberate`/`direct` casts too: point it at one to run
+  that team's (often smarter) explorer standalone, handy for sizing up an explorer or for a
+  stronger sweep than your own fast one. The report carries the same provenance footer,
+  naming the cast and the explorer that surveyed. Gated independently by `--no-explore`. For
+  a synthesized answer, use `consult`.
 - **`deliberate`** — a top model's deepest reasoning on your codebase without holding a
   session open: `explore → offline synth`. A fast model first investigates READ-ONLY and
   builds a cited dossier (you wait for this — the same live sweep `explore` runs), then a

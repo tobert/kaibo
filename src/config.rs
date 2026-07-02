@@ -719,6 +719,21 @@ impl Config {
         })
     }
 
+    /// Whether canonical cast `name` can staff an `explore` call: it carries an **explorer**
+    /// slot — the *only* thing `explore` runs. Independent of the synth lane, because
+    /// `explore` never touches the synth: a `deliberate`/`direct` cast's explorer is as valid
+    /// as an interactive cast's (an explorer always runs interactively by construction). So
+    /// `explore` advertises *more* casts than the interactive tools — pointing it at a
+    /// deliberate cast runs that team's (often smarter) explorer standalone, handy for
+    /// evaluating the explorer or for a stronger sweep than the caller's own. A synth-only
+    /// cast (no explorer — `gemini-batch`/`oneshot`-only casts) can't, and is correctly
+    /// left out (it would fault at the explorer-arm resolve).
+    pub fn cast_can_explore(&self, name: &str) -> bool {
+        self.casts
+            .get(name)
+            .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())
+    }
+
     /// Whether canonical cast `name` is the configured default — comparing against the
     /// *resolved* default, so an alias default (`server.cast = "claude"`) still matches
     /// its canonical cast (`anthropic`). The roster renderer (`casts_section`) gets
