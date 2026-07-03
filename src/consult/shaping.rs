@@ -551,4 +551,30 @@ mod tests {
             "non-OpenRouter params pass through untouched — no max_completion_tokens added"
         );
     }
+
+    /// Canary tying `inject_output_budget` to the rig 0.38 pin. The workaround
+    /// exists because rig's `OpenrouterCompletionRequest` has no `max_tokens`
+    /// field; the day a rig bump adds one, `AgentBuilder::max_tokens` starts
+    /// arriving natively and the injected `max_completion_tokens` rides alongside
+    /// it — redundant at best, a provider 400 at worst, and silent either way.
+    /// This failing test is the tripwire: on a rig bump, re-read rig's
+    /// `openrouter/completion.rs`, retire (or deliberately keep) the injection,
+    /// then advance the version prefix here.
+    #[test]
+    fn rig_bump_reaudits_the_openrouter_budget_workaround() {
+        let lock = include_str!("../../Cargo.lock");
+        let entry = lock
+            .find("name = \"rig-core\"")
+            .expect("rig-core pinned in Cargo.lock");
+        let version = lock[entry..]
+            .lines()
+            .nth(1)
+            .expect("version line follows the name line");
+        assert!(
+            version.contains("version = \"0.38."),
+            "rig-core moved past 0.38 ({version}): re-audit the \
+             OpenrouterCompletionRequest max_tokens defect before shipping — \
+             see inject_output_budget"
+        );
+    }
 }

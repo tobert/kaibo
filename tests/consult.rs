@@ -549,6 +549,25 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     // per slot rather than guessed from an arbitrary id.
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true)).vision);
+    // OpenRouter is the same shape: the gateway fronts blind and sighted models
+    // alike, so vision is the pinned model's property — opt-in per slot (the
+    // built-in cast pins it on its multimodal defaults).
+    assert!(
+        !ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "~anthropic/claude-sonnet-latest",
+            None
+        )
+        .vision
+    );
+    assert!(
+        ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "~anthropic/claude-sonnet-latest",
+            Some(true)
+        )
+        .vision
+    );
     // The override pins in both directions.
     assert!(!ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", Some(false)).vision);
 
@@ -567,6 +586,18 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     );
     // The vision override never flips the transport channel — it's the wire's property.
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "anything", Some(true)).tool_result_images);
+    // OpenRouter's transport is *worse* than a 400: rig's converter silently rewrites
+    // a tool-result image to placeholder text, so the channel must stay closed — a
+    // seeing OpenRouter model gets its image on the user turn instead.
+    assert!(
+        !ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "~google/gemini-flash-latest",
+            Some(true)
+        )
+        .tool_result_images,
+        "an OpenRouter VLM sees, but rig's tool-result converter would drop the bytes"
+    );
 }
 
 #[test]

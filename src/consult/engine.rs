@@ -2847,6 +2847,47 @@ mod tests {
         );
     }
 
+    /// The OpenRouter arm's full params assembly — `to_params` chained through
+    /// `inject_output_budget` at the single live construction point. The reasoning
+    /// object (thinking on by default), the rig-defect budget workaround, and the
+    /// slot's sampling must coexist in the one blob the arm sends; any of them
+    /// silently missing starves or blinds the call. Keyed via a key file so the
+    /// test never touches process env.
+    #[test]
+    fn openrouter_arm_carries_reasoning_budget_and_sampling_together() {
+        let defaults = crate::config::Defaults::default();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("openrouter-key");
+        std::fs::write(&key_file, "sk-or-test").unwrap();
+        let backend = crate::config::Backend {
+            name: "openrouter".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: Some(key_file.to_str().unwrap().to_string()),
+            key_optional: false,
+            request_timeout: Duration::from_secs(30),
+        };
+        let slot = ModelSlot {
+            temperature: Some(0.3),
+            ..ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyed openrouter arm builds from a key file");
+        assert_eq!(arm.model, "~anthropic/claude-sonnet-latest");
+        let params = arm.params.expect("the openrouter arm always sends params");
+        assert_eq!(
+            params["reasoning"]["effort"],
+            defaults.synth_effort.as_str(),
+            "reasoning rides on by default at the synth-role effort"
+        );
+        assert_eq!(
+            params["max_completion_tokens"], defaults.max_tokens,
+            "the output budget must reach the body rig won't carry natively"
+        );
+        assert_eq!(params["temperature"], 0.3, "slot sampling coexists");
+    }
+
     /// `Arm::from_slot` is the single live construction point, and per-call
     /// overrides build slots that never saw config load's budget validation —
     /// so the thinking_budget < max_tokens rule must hold here too, as the same

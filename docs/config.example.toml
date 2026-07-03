@@ -331,7 +331,9 @@ synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tok
 #     it needs only slots. `~author/family-latest` aliases (see the built-in `openrouter`
 #     cast) track the newest release instead of rotting; `effort = "xhigh"` here pushes
 #     the synth slot past [defaults] synth_effort ("high") into a rung only OpenRouter's
-#     unified reasoning param reaches. ---
+#     unified reasoning param reaches. The same knob is the opt-out: reasoning is on by
+#     default for everything kaibo calls, and `effort = "none"` on a slot turns it off
+#     when the cost/latency isn't wanted (reasoning bills as output tokens). ---
 
 [casts.or-deep]
 explorer = "openrouter/~google/gemini-flash-latest"
