@@ -1424,13 +1424,14 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
     }
 }
 
-/// The four built-in backends, named after their kind.
+/// The built-in backends, named after their kind.
 fn builtin_backends(defaults: &Defaults) -> BTreeMap<String, Backend> {
     let mut m = BTreeMap::new();
     for kind in [
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
         ProviderKind::Openai,
     ] {
         let mut b = backend_template(kind, defaults);
@@ -1449,15 +1450,27 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
         ProviderKind::Openai,
     ] {
         let name = kind.builtin_name().to_string();
         let (explorer, synth) = default_models(kind);
+        // OpenRouter's vision classifier defaults false (the gateway fronts blind and
+        // sighted models alike — it's a property of the pinned model, not the wire), so
+        // the built-in cast opts its slots in: both default ids (`~google/gemini-flash-latest`,
+        // `~anthropic/claude-sonnet-latest`) advertise `image` in `architecture.input_modalities`
+        // in OpenRouter's catalog (verified 2026-07-03). Every other built-in kind is
+        // classified correctly by default, so it needs no pin.
+        let vision = matches!(kind, ProviderKind::OpenRouter).then_some(true);
+        let slot = |id| ModelSlot {
+            vision,
+            ..ModelSlot::bare(&name, id)
+        };
         // Both agent roles are seeded. A cast may omit one in config — absent means
         // the capability is absent, and nothing downstream errors on that.
         let slots = BTreeMap::from([
-            (ModelRole::Explorer, ModelSlot::bare(&name, explorer)),
-            (ModelRole::Synth, ModelSlot::bare(&name, synth)),
+            (ModelRole::Explorer, slot(explorer)),
+            (ModelRole::Synth, slot(synth)),
         ]);
         m.insert(name.clone(), Cast { name, slots });
     }
@@ -1516,6 +1529,12 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         ProviderKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
         ProviderKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
         ProviderKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
+        // OpenRouter serves `~author/family-latest` aliases as real catalog entries
+        // that track the newest family member, so these don't rot as ids retire.
+        ProviderKind::OpenRouter => (
+            "~google/gemini-flash-latest",
+            "~anthropic/claude-sonnet-latest",
+        ),
         ProviderKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
@@ -2712,12 +2731,18 @@ mod tests {
         assert!(!b.key_optional);
     }
 
-    /// All four interactive built-in casts exist, each single-backend with
+    /// Every interactive built-in cast exists, each single-backend with
     /// explorer+synth, and none has a synth on an offline lane.
     #[test]
-    fn all_four_builtin_casts_resolve() {
+    fn all_interactive_builtin_casts_resolve() {
         let cfg = Config::builtin();
-        for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
+        for name in [
+            "anthropic",
+            "deepseek",
+            "gemini",
+            "openrouter",
+            "openai-local",
+        ] {
             let cast = cfg.resolve_cast(name).unwrap();
             assert_eq!(
                 cast.synth_lane(),
@@ -2729,6 +2754,58 @@ mod tests {
                 assert_eq!(slot.backend, name, "built-in casts are single-backend");
             }
         }
+    }
+
+    /// The OpenRouter built-in: a keyed backend (OPENROUTER_API_KEY, no configurable
+    /// base URL) and a cast pinning the drift-resistant `~author/family-latest` aliases,
+    /// with `vision` opted in on both slots (OpenRouter's classifier defaults false, but
+    /// both default models are multimodal — see the cast comment). Pins the whole
+    /// built-in so a bad default fails here, not mid-call.
+    #[test]
+    fn builtin_openrouter_cast_and_backend() {
+        let cfg = Config::builtin();
+        let (explorer, synth) = default_models(ProviderKind::OpenRouter);
+        assert_eq!(explorer, "~google/gemini-flash-latest");
+        assert_eq!(synth, "~anthropic/claude-sonnet-latest");
+
+        let cast = cfg.resolve_cast("openrouter").unwrap();
+        let e = cast.require_slot(ModelRole::Explorer).unwrap();
+        let s = cast.require_slot(ModelRole::Synth).unwrap();
+        assert_eq!(
+            (e.backend.as_str(), e.id.as_str()),
+            ("openrouter", explorer)
+        );
+        assert_eq!((s.backend.as_str(), s.id.as_str()), ("openrouter", synth));
+        assert_eq!(e.vision, Some(true), "explorer model is multimodal-in");
+        assert_eq!(s.vision, Some(true), "synth model is multimodal-in");
+
+        let b = cfg.resolve_backend("openrouter").unwrap();
+        assert_eq!(b.kind, ProviderKind::OpenRouter);
+        assert_eq!(b.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+        assert!(!b.key_optional, "OpenRouter is a keyed gateway");
+        assert!(
+            b.base_url.is_none(),
+            "OpenRouter's endpoint is fixed by rig — no configurable base URL"
+        );
+    }
+
+    /// A base_url on the keyed OpenRouter kind is a config mistake (its endpoint is
+    /// pinned), rejected loudly at load like the other keyed kinds — not silently
+    /// ignored into a wrong endpoint.
+    #[test]
+    fn openrouter_backend_rejects_a_base_url() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.myrouter]
+            kind = "openrouter"
+            base_url = "https://example.com/v1"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("base_url"),
+            "a base_url on a keyed kind must be refused: {err}"
+        );
     }
 
     /// The built-in batch casts' synth slots positively declare `lane = Batch`, carry

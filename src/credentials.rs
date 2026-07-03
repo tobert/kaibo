@@ -4,9 +4,10 @@
 //! source of truth is a per-provider dotfile in `$HOME`; if the matching env var
 //! is set it wins (handy for CI / one-off overrides).
 //!
-//! - Anthropic: `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt`
-//! - DeepSeek:  `DEEPSEEK_API_KEY`  / `~/.deepseek-key`
-//! - Gemini:    `GEMINI_API_KEY`    / `~/.gemini-api-key`
+//! - Anthropic:  `ANTHROPIC_API_KEY`  / `~/.anthropic-key.txt`
+//! - DeepSeek:   `DEEPSEEK_API_KEY`   / `~/.deepseek-key`
+//! - Gemini:     `GEMINI_API_KEY`     / `~/.gemini-api-key`
+//! - OpenRouter: `OPENROUTER_API_KEY` / `~/.openrouter-key`
 //!
 //! [`ProviderKind::Openai`] is the general case: any endpoint speaking the OpenAI
 //! wire protocol, addressed by [`openai_base_url`] (`OPENAI_BASE_URL`, default a
@@ -26,15 +27,20 @@ use anyhow::{anyhow, Context, Result};
 /// `OPENAI_BASE_URL` env var (see [`openai_base_url`]).
 pub const DEFAULT_OPENAI_BASE_URL: &str = "http://localhost:13305/api/v1";
 
-/// A model provider. The keyed providers (Anthropic/DeepSeek/Gemini) each speak
-/// their own wire protocol and require an API key. [`ProviderKind::Openai`] is the
-/// generic OpenAI-compatible endpoint: any base URL speaking that protocol, with
+/// A model provider. The keyed providers (Anthropic/DeepSeek/Gemini/OpenRouter) each
+/// speak their own wire protocol and require an API key. [`ProviderKind::Openai`] is
+/// the generic OpenAI-compatible endpoint: any base URL speaking that protocol, with
 /// an *optional* key — keyless by default, since the default endpoint is local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
     DeepSeek,
     Gemini,
+    /// OpenRouter's unified gateway: one keyed endpoint (`OPENROUTER_API_KEY`, fixed
+    /// base URL) fronting every upstream model. It speaks the OpenAI wire but is a
+    /// *keyed* kind with a pinned endpoint (not a configurable base URL), and it
+    /// translates a unified `reasoning` param per underlying provider.
+    OpenRouter,
     /// Any OpenAI-compatible endpoint, addressed by base URL; key optional.
     /// Defaults to a local keyless server (Gemma via an OpenAI-compatible host).
     Openai,
@@ -59,6 +65,7 @@ impl ProviderKind {
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::DeepSeek => "deepseek",
             ProviderKind::Gemini => "gemini",
+            ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Openai => "openai",
         }
     }
@@ -83,6 +90,7 @@ impl ProviderKind {
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
+            ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
             ProviderKind::Openai => "OPENAI_API_KEY",
         }
     }
@@ -95,6 +103,7 @@ impl ProviderKind {
             ProviderKind::Anthropic => ".anthropic-key.txt",
             ProviderKind::DeepSeek => ".deepseek-key",
             ProviderKind::Gemini => ".gemini-api-key",
+            ProviderKind::OpenRouter => ".openrouter-key",
             ProviderKind::Openai => ".openai-key",
         }
     }
@@ -113,11 +122,12 @@ impl std::str::FromStr for ProviderKind {
             "anthropic" | "claude" => Ok(ProviderKind::Anthropic),
             "deepseek" => Ok(ProviderKind::DeepSeek),
             "gemini" | "google" => Ok(ProviderKind::Gemini),
+            "openrouter" => Ok(ProviderKind::OpenRouter),
             // The OpenAI-compatible endpoint. Also accept the names people reach
             // for when it points at the local keyless default (Gemma via Lemonade).
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
             other => Err(anyhow!(
-                "unknown provider {other:?} (expected anthropic, deepseek, gemini, or openai)"
+                "unknown provider {other:?} (expected anthropic, deepseek, gemini, openrouter, or openai)"
             )),
         }
     }

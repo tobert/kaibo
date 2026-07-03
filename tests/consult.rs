@@ -1424,6 +1424,60 @@ async fn two_phase_consult_answers_from_the_real_tree() {
 }
 
 #[tokio::test]
+#[ignore = "hits the OpenRouter API (keyed gateway); run with --ignored and OPENROUTER_API_KEY"]
+async fn openrouter_consult_round_trips() {
+    // The live proof of the OpenRouter arm: the unified `{reasoning:{effort}}` param,
+    // the `max_completion_tokens` workaround (rig drops native max_tokens for this
+    // provider — without the injection a thinking-on answer would starve), and the
+    // `with_app_identity` headers all have to be accepted end-to-end. Runs the built-in
+    // openrouter cast (the `~author/family-latest` aliases) so a regression in any of
+    // those surfaces as a live failure here, not in production.
+    if let Err(e) = load(ProviderKind::OpenRouter) {
+        panic!("no OpenRouter credential for live test: {e}");
+    }
+
+    let cfg = Config::builtin();
+    let backend = cfg
+        .resolve_backend("openrouter")
+        .expect("openrouter backend");
+    let explorer_slot = cfg
+        .resolve_cast("openrouter")
+        .unwrap()
+        .require_slot(ModelRole::Explorer)
+        .unwrap()
+        .clone();
+    let synth_slot = cfg
+        .resolve_cast("openrouter")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .clone();
+    let explorer = Arm::from_slot(backend, &explorer_slot, ModelRole::Explorer, &cfg.defaults)
+        .expect("explorer arm on openrouter");
+    let synth = Arm::from_slot(backend, &synth_slot, ModelRole::Synth, &cfg.defaults)
+        .expect("synth arm on openrouter");
+
+    let out = consult(
+        "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
+        env!("CARGO_MANIFEST_DIR"),
+        &explorer,
+        &synth,
+        &ConsultConfig::default(),
+        None,
+    )
+    .await
+    .expect("openrouter consult should succeed (reasoning + max_completion_tokens accepted)");
+
+    let lower = out.answer.to_lowercase();
+    assert!(
+        lower.contains("sandbox") || lower.contains("read-only") || lower.contains("read only"),
+        "answer should explain the read-only sandbox mechanism, got: {}",
+        out.answer
+    );
+}
+
+#[tokio::test]
 #[ignore = "hits the Anthropic API on Opus 4.8 (adaptive-only tier); run with --ignored and a key"]
 async fn adaptive_only_anthropic_model_round_trips() {
     // The real proof of the "fix anthropic" work: Opus 4.8 *rejects* the old

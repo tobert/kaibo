@@ -16,7 +16,7 @@ use rig_core::completion::message::{
     UserContent,
 };
 use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition};
-use rig_core::providers::{anthropic, deepseek, gemini, openai};
+use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
 use rig_core::tool::{Tool, ToolDyn};
 use rig_core::OneOrMany;
 use serde::Deserialize;
@@ -202,6 +202,10 @@ impl Arm {
             Some(t.top_p),
             &t.effort,
         );
+        // OpenRouter drops rig's native `max_tokens` (see `inject_output_budget`), so
+        // the budget must ride `additional_params` as `max_completion_tokens`. A no-op
+        // for every other kind, whose `max_tokens` rig sends itself.
+        let params = super::shaping::inject_output_budget(backend.kind, params, t.max_tokens);
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -236,6 +240,20 @@ impl Arm {
                     .http_client(http)
                     .build()
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
+                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+            }
+            ProviderKind::OpenRouter => {
+                // A keyed gateway with a *fixed* endpoint (rig pins the base URL), so —
+                // unlike the openai kind — there is no base_url to resolve. `with_app_identity`
+                // stamps the X-OpenRouter-Title / HTTP-Referer headers so kaibo's traffic is
+                // identifiable in the OpenRouter dashboard.
+                let key = backend.resolve_key()?;
+                let client = openrouter::Client::builder()
+                    .api_key(&key)
+                    .http_client(http)
+                    .with_app_identity("kaibo", "https://github.com/tobert/kaibo")
+                    .build()
+                    .map_err(|e| anyhow!("openrouter client init: {e}"))?;
                 Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
             }
             ProviderKind::Openai => {

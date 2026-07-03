@@ -96,6 +96,14 @@ fn transport_supports_tool_result_images(kind: ProviderKind) -> bool {
     match kind {
         ProviderKind::Anthropic | ProviderKind::Gemini => true,
         ProviderKind::Openai => false,
+        // OpenRouter speaks the OpenAI wire but is *more* dangerous than a 400: rig's
+        // converter silently rewrites a tool-result image to the placeholder text
+        // "[Image content not supported in tool results]" (openrouter/completion.rs,
+        // the `ToolResultContent::Image(_)` arm of the `role:tool` conversion) — a
+        // quiet drop, the exact silent loss kaibo refuses. `false` routes a seen image
+        // onto the user-turn channel (the break-rewrite-resume path) *before* it can
+        // reach that converter, so the bytes actually arrive.
+        ProviderKind::OpenRouter => false,
         // Vision-blind on the wire; the value is unreached (no view_image attaches),
         // but "no tool-result image channel" is the honest answer.
         ProviderKind::DeepSeek => false,
@@ -119,6 +127,11 @@ fn is_vision_capable(kind: ProviderKind, _model: &str) -> bool {
         // per slot (`vision = true` in the role table) rather than guessed from an
         // arbitrary id.
         ProviderKind::Openai => false,
+        // OpenRouter fronts every model — vision-capable and text-only alike — so the
+        // capability is a property of the pinned *model*, not the gateway. Opt in per
+        // slot (`vision = true`), like the generic OpenAI kind; the built-in openrouter
+        // cast pins it on both its (multimodal) default models.
+        ProviderKind::OpenRouter => false,
     }
 }
 
@@ -135,6 +148,11 @@ enum ThinkingStyle {
     GeminiBudget,
     /// DeepSeek V4 hybrids: `{thinking:{type:"enabled"}, reasoning_effort:<role>}`.
     DeepSeekEffort,
+    /// OpenRouter's unified reasoning param: `{reasoning:{effort:<role>}}`. The gateway
+    /// translates it per upstream provider (Anthropic budget, OpenAI effort, Gemini
+    /// thinkingLevel) and silently drops it for a model that has no reasoning knob, so
+    /// emitting it unconditionally is safe.
+    OpenRouterEffort,
     /// No request-time toggle (the generic OpenAI path).
     None,
 }
@@ -215,12 +233,17 @@ impl ModelShape {
                 }
             }
             ProviderKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
+            ProviderKind::OpenRouter => ThinkingStyle::OpenRouterEffort,
             ProviderKind::Openai => ThinkingStyle::None,
         };
         let (sampling_under_thinking, sampling_placement) = match kind {
             ProviderKind::Anthropic => (false, SamplingPlacement::TopLevel),
             ProviderKind::Gemini => (true, SamplingPlacement::GeminiGenerationConfig),
-            ProviderKind::DeepSeek | ProviderKind::Openai => (true, SamplingPlacement::TopLevel),
+            // OpenRouter takes OpenAI-shaped sampling top-level and, being tolerant of
+            // unsupported params (dropped per-model), keeps it under reasoning.
+            ProviderKind::DeepSeek | ProviderKind::OpenRouter | ProviderKind::Openai => {
+                (true, SamplingPlacement::TopLevel)
+            }
         };
         Self {
             thinking,
@@ -251,6 +274,7 @@ impl ModelShape {
             ThinkingStyle::AnthropicAdaptive
                 | ThinkingStyle::GeminiLevel
                 | ThinkingStyle::DeepSeekEffort
+                | ThinkingStyle::OpenRouterEffort
         )
     }
 
@@ -364,6 +388,15 @@ impl ModelShape {
                 obj.insert("thinking".into(), json!({ "type": "enabled" }));
                 obj.insert("reasoning_effort".into(), json!(effort));
             }
+            ThinkingStyle::OpenRouterEffort => {
+                // The unified reasoning knob. `effort` is the per-role depth lever, a
+                // passthrough string OpenRouter validates against its ladder
+                // (none|minimal|low|medium|high|xhigh|max) — so the default "high" maps
+                // to "high", and a slot's `effort = "xhigh"` reaches the deeper rungs
+                // without a code change. The gateway maps it onto each upstream model's
+                // native reasoning field, or drops it for a model that has none.
+                obj.insert("reasoning".into(), json!({ "effort": effort }));
+            }
             ThinkingStyle::None => {}
         }
     }
@@ -396,6 +429,32 @@ pub fn request_params(
     )
 }
 
+/// Fold this arm's output-token budget into `params` where the provider needs it
+/// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig
+/// 0.38's `OpenrouterCompletionRequest` (openrouter/completion.rs) has no `max_tokens`
+/// field and its `TryFrom` never reads `CompletionRequest.max_tokens`, so
+/// `AgentBuilder::max_tokens()` is silently a no-op for that provider — the answer
+/// would run on OpenRouter's own default budget, starving a thinking-on completion.
+/// `additional_params` *is* `#[serde(flatten)]`-merged into the body, so we inject the
+/// budget there under `max_completion_tokens` (OpenRouter's preferred spelling; the
+/// spec deprecates `max_tokens`). A no-op for every other kind — rig sends their
+/// `max_tokens` natively, so a second copy here would be redundant at best.
+pub fn inject_output_budget(
+    kind: ProviderKind,
+    params: Option<Value>,
+    max_tokens: u64,
+) -> Option<Value> {
+    if kind != ProviderKind::OpenRouter {
+        return params;
+    }
+    let mut obj = match params {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("max_completion_tokens".into(), json!(max_tokens));
+    Some(Value::Object(obj))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +480,75 @@ mod tests {
         assert_eq!(
             params["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
+        );
+    }
+
+    /// OpenRouter's unified reasoning knob: the per-role effort must land as
+    /// `{reasoning:{effort:<role>}}` — thinking-on by default, and a slot's `effort`
+    /// (including OpenRouter's deeper `xhigh`/`max` rungs, which pass through as any
+    /// other string) reaching the gateway, not silently dropped.
+    #[test]
+    fn openrouter_reasoning_carries_the_per_role_effort() {
+        let shape = ModelShape::resolve(
+            ProviderKind::OpenRouter,
+            "~anthropic/claude-sonnet-latest",
+            ThinkingStyleOverride::Auto,
+        );
+        let params = shape.to_params(8192, None, None, DEFAULT_EFFORT).unwrap();
+        assert_eq!(
+            params["reasoning"]["effort"], "high",
+            "the default effort rides the unified reasoning param"
+        );
+        // A deeper rung passes through verbatim — xhigh/max are reachable via slot config.
+        let params = shape.to_params(8192, None, None, "xhigh").unwrap();
+        assert_eq!(params["reasoning"]["effort"], "xhigh");
+        // Sampling stays top-level and survives alongside reasoning (OpenRouter drops
+        // it per-model if unsupported, so kaibo emits it).
+        let params = shape
+            .to_params(8192, Some(0.5), None, DEFAULT_EFFORT)
+            .unwrap();
+        assert_eq!(params["temperature"], 0.5);
+    }
+
+    /// OpenRouter drops rig's native `max_tokens`, so the budget must ride
+    /// `additional_params` as `max_completion_tokens` — the rig-defect workaround. The
+    /// value must actually land in the blob the arm sends; and it must be a no-op for
+    /// every other kind (rig sends their `max_tokens` natively).
+    #[test]
+    fn openrouter_output_budget_rides_max_completion_tokens() {
+        // Merges into an existing reasoning blob without clobbering it.
+        let params = ModelShape::resolve(
+            ProviderKind::OpenRouter,
+            "~google/gemini-flash-latest",
+            ThinkingStyleOverride::Auto,
+        )
+        .to_params(8192, None, None, DEFAULT_EFFORT);
+        let out = inject_output_budget(ProviderKind::OpenRouter, params, 16384).unwrap();
+        assert_eq!(
+            out["max_completion_tokens"], 16384,
+            "the output budget must reach the request body OpenRouter reads"
+        );
+        assert_eq!(
+            out["reasoning"]["effort"], "high",
+            "the injection preserves the reasoning param"
+        );
+
+        // Even with no other params (None), the budget still lands.
+        let out = inject_output_budget(ProviderKind::OpenRouter, None, 4096).unwrap();
+        assert_eq!(out["max_completion_tokens"], 4096);
+
+        // A no-op for every other kind — rig sends their max_tokens itself.
+        assert!(inject_output_budget(ProviderKind::Anthropic, None, 4096).is_none());
+        let anthropic = ModelShape::resolve(
+            ProviderKind::Anthropic,
+            "claude-sonnet-4-6",
+            ThinkingStyleOverride::Auto,
+        )
+        .to_params(8192, None, None, DEFAULT_EFFORT);
+        let passthrough = inject_output_budget(ProviderKind::Anthropic, anthropic.clone(), 16384);
+        assert_eq!(
+            passthrough, anthropic,
+            "non-OpenRouter params pass through untouched — no max_completion_tokens added"
         );
     }
 }
