@@ -56,6 +56,18 @@ Offline coverage: numbered-wrapper unit tests, budget partition (inline/demote/o
 budget-0), scripted-loop tests pinning the directive into the `explore′` sweep preamble
 and `explore_with`, config-ladder tests for the knob. 21 test binaries green.
 
+Cross-family review (Gemini Pro batch + DeepSeek agent, whole files, no diff) folded
+in before merge: path escaping extended to the demotion/image/sweep directive lists (a
+filename can legally hold `\n` and would have forged list entries — both reviewers);
+`deliberate` gained `attach` (both flagged the one-semantic-everywhere gap — dossier
+directives, so content reaches the offline synth through the dossier); the `explore`
+tool description now names `attach`; plus an end-to-end tempdir pipeline test and a
+non-circular escape assertion. Gemini's "critical wrapper breakout via `<\/file>`" was
+a misread — an attacker's literal `<\/file>` is already the escaped form and can't
+read as a bare terminator; the "exactly one bare `</file>`" invariant holds (now
+pinned by an impl-independent test). Its unbounded `read_file` stat→read growth race
+is real but preexisting and kaish-side — logged in issues.md.
+
 ## 2026-07-03 — whole-call wall-clock deadline (a consult can't hang overnight)
 
 A live consult (cast `lemonade`, a local server since decommissioned) parked a Claude

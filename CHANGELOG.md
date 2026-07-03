@@ -76,8 +76,10 @@ the git log. Each later release appends a new section at the top.
   explorer with an offline synth (the example config's `fable`, `gemini-deliberate`, or
   `local-direct`) — `deliberate`'s `cast` enum lists the usable ones and `kaibo://config`
   shows each cast's lane. Reads the repo itself, so it takes `path` / `cast` /
-  `explorer_model` / `synth_model` (+ `_backend`s); the offline synth is a single turn, so
-  no `attach` / `context` / `session_id`. Gated independently by `--no-deliberate`. This is
+  `explorer_model` / `synth_model` (+ `_backend`s), plus `attach` — text files the
+  dossier-building explorer is directed to read WHOLE, so their content reaches the
+  offline synth through the dossier; the synth itself is a single turn, so no `context` /
+  `session_id`. Gated independently by `--no-deliberate`. This is
   the tool that finally routes the `direct` lane the per-slot lane reshape introduced. For
   an answer this turn, use `consult`.
 - **`oneshot`** — a thin, direct second opinion from a model outside your family:

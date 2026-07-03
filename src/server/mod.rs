@@ -281,8 +281,10 @@ pub struct ExploreInput {
 
 /// Arguments to the `deliberate` tool: `explore → offline synth`. The explorer runs
 /// live to build a cited dossier (you wait for this — minutes), then the offline synth
-/// deliberates over it. No `session_id`/`attach`/`context`: deliberate reads the repo
-/// itself, and the synth is a single offline turn (so no `synth_max_turns`).
+/// deliberates over it. No `session_id`/`context`: deliberate reads the repo itself,
+/// and the synth is a single offline turn (so no `synth_max_turns`). `attach` reaches
+/// the dossier-building explorer as read-WHOLE directives — one attach semantic across
+/// the exploring tools.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeliberateInput {
@@ -290,6 +292,13 @@ pub struct DeliberateInput {
     /// kaibo's explorer locates and reads the real, current code to build the dossier
     /// the offline synth then reasons over.
     pub question: String,
+
+    /// Workspace files (under the project root) central to the question: the
+    /// dossier-building explorer is directed to read each one WHOLE, so their content
+    /// reaches the offline synth through the dossier. Text only — the explorer reads
+    /// through the shell, so attach images to `consult` with a vision cast instead.
+    #[serde(default)]
+    pub attach: Vec<String>,
 
     /// Absolute path to the project. Optional when the server has a default root; must
     /// be at-or-under an allowed tree (`kaibo://config` shows the set).
@@ -917,8 +926,11 @@ impl KaiboHandler {
         sandbox: &crate::sandbox::SandboxConfig,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         use crate::attach::{check_attachment_bounds, DEFAULT_MAX_ATTACHMENTS};
-        // Count cap first (total 0): a stray thousand-file glob is refused before any
-        // canonicalize/read work, same as the tool-less resolver.
+        // Count cap only (total pinned to 0, so the byte-budget arm never fires): a
+        // stray thousand-file glob is refused before any canonicalize/read work. There
+        // is deliberately NO cumulative byte cap on this path — `budget` bounds
+        // everything that's actually read (inlined), and a demoted file is never read
+        // here at all, so there's nothing left for a cumulative cap to protect.
         check_attachment_bounds(
             attach.len(),
             0,
@@ -1074,6 +1086,33 @@ impl KaiboHandler {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
+    /// stage): read-WHOLE directives, never inlined bytes — budget 0, so no file is
+    /// read here at all. Images are refused up front: the sweep toolset carries no
+    /// `view_image` (see `run_explore_phase`), so naming one would send the
+    /// investigator down a dead end (`cat` refuses binary).
+    async fn resolve_sweep_attachments(
+        &self,
+        root: &std::path::Path,
+        attach: &[String],
+        tool: &str,
+    ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
+        let attachments =
+            Self::resolve_consult_attachments(root, attach, 0, &self.config.sandbox).await?;
+        if let Some(img) = attachments.iter().find(|a| a.is_image()) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "attached file {} is an image, but {tool}'s investigator reads through \
+                     the shell and can't view images — attach it to `consult` with a \
+                     vision-capable cast instead",
+                    img.path()
+                ),
+                None,
+            ));
+        }
+        Ok(attachments)
     }
 
     /// Refuse an image attachment to a vision-blind consult synth — the consult analog of
@@ -1691,9 +1730,10 @@ impl KaiboHandler {
         description = "Survey a codebase and get back a structured, cited report — not an \
             answer. A fast, cheap model sweeps the project READ-ONLY (grep, whole-file \
             reads) and returns a summary of findings, the relevant locations with \
-            `file:line`, and the trail it followed. The evidence-gathering half of \
-            `consult`, exposed directly: map unfamiliar code, or assemble a cited survey \
-            to reason over yourself. For a synthesized answer instead, use `consult`."
+            `file:line`, and the trail it followed. `attach` names text files it must \
+            read whole during the sweep. The evidence-gathering half of `consult`, \
+            exposed directly: map unfamiliar code, or assemble a cited survey to reason \
+            over yourself. For a synthesized answer instead, use `consult`."
     )]
     async fn explore(
         &self,
@@ -1719,24 +1759,9 @@ impl KaiboHandler {
         let explorer = self.arm(&cast, ModelRole::Explorer)?;
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
-        // Attachments here are read-WHOLE directives, never inlined bytes (budget 0):
-        // the explorer reads through its shell, placing each read where it fits in the
-        // sweep. Images are refused — the sweep has no `view_image`, so naming one
-        // would be a dead end (attach images to `consult` with a vision cast).
-        let attachments =
-            Self::resolve_consult_attachments(&root, &input.attach, 0, &self.config.sandbox)
-                .await?;
-        if let Some(img) = attachments.iter().find(|a| a.is_image()) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "attached file {} is an image, but explore's investigator reads through \
-                     the shell and can't view images — attach it to `consult` with a \
-                     vision-capable cast instead",
-                    img.path()
-                ),
-                None,
-            ));
-        }
+        let attachments = self
+            .resolve_sweep_attachments(&root, &input.attach, "explore")
+            .await?;
         let cfg = ExploreConfig {
             phase: PhaseContext {
                 progress: progress.clone(),
@@ -1810,9 +1835,14 @@ impl KaiboHandler {
         // Stage 1 — build the dossier synchronously, on the live progress sink: the
         // caller waits through this bounded (minutes) explorer sweep, exactly as `explore`
         // does, so a thin/failed dossier is a clean error *before* any offline tokens are
-        // spent. Only the deliberation (Stage 2) is handed off async.
+        // spent. Only the deliberation (Stage 2) is handed off async. Attachments reach
+        // the dossier-builder as read-WHOLE directives (the sweep semantics), so their
+        // content flows to the offline synth through the dossier it writes.
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
+        let attachments = self
+            .resolve_sweep_attachments(&root, &input.attach, "deliberate")
+            .await?;
         let cfg = ExploreConfig {
             phase: PhaseContext {
                 progress: progress.clone(),
@@ -1830,7 +1860,7 @@ impl KaiboHandler {
         progress.emit(PhaseEvent::PhaseStarted {
             phase: "deliberate.dossier",
         });
-        let dossier = match explore_with(&input.question, root, &explorer, &cfg, &[])
+        let dossier = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
             .instrument(span)
             .await
         {
@@ -1864,8 +1894,9 @@ impl KaiboHandler {
     /// Stage 2, batch lane: submit the dossier+question as a one-item provider batch
     /// (max thinking, half price) and hand back the durable `backend/provider-id` handle.
     /// The dossier phase already ran, so this is only the submit — reusing the same
-    /// `batch::submitter` + shaping `batch_submit` uses, minus the vision gate (deliberate
-    /// carries no attachments; the dossier is text in the item prompt).
+    /// `batch::submitter` + shaping `batch_submit` uses, minus the vision gate (a
+    /// deliberate `attach` reaches the dossier stage as read-whole directives, so this
+    /// submit carries no attachment parts; the dossier is text in the item prompt).
     async fn deliberate_batch(
         &self,
         cast: &Cast,
@@ -3004,8 +3035,10 @@ A deliberate cast pairs an interactive explorer with an offline synth (e.g. the 
 config's `fable`, `gemini-deliberate`, or `local-direct`); `kaibo://config` shows each
 cast's lane. Because the synth is toolless and can't come back for more, the dossier is
 built whole up front — deliberate reads the repo itself, so it takes `path` / `cast` /
-`explorer_model` / `synth_model` (+ their `*_backend`s), but no `attach` / `context` /
-`session_id`. For an answer this turn, use `consult`.
+`explorer_model` / `synth_model` (+ their `*_backend`s) and `attach` (text files the
+dossier-builder is ordered to read whole, so their content reaches the offline synth
+through the dossier), but no `context` / `session_id`. For an answer this turn, use
+`consult`.
 
 ## Answer now, or hand off and collect later
 
@@ -3530,6 +3563,62 @@ mod tests {
             out.iter()
                 .all(|a| matches!(a, crate::consult::ConsultAttachment::TextOversize { .. })),
             "budget 0 demotes every text file: {out:?}"
+        );
+    }
+
+    /// The whole pipeline, raw paths to prompt: real files in a tempdir go through
+    /// `resolve_consult_attachments` (prefix sniff, VFS read, budget partition,
+    /// root-relative labeling) and the result feeds `consult_user_prompt` — asserting on
+    /// the final text a driver model would actually see. Catches seam mismatches the
+    /// per-piece tests can't (e.g. a resolver label the prompt renderer mangles).
+    #[tokio::test]
+    async fn consult_attach_pipeline_resolves_and_renders_end_to_end() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(root_canon.join("src")).unwrap();
+        std::fs::write(root_canon.join("src/small.rs"), b"fn a() {}\nfn b() {}").unwrap();
+        std::fs::write(root_canon.join("src/big.rs"), vec![b'x'; 128]).unwrap();
+        let png_sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(root_canon.join("shot.png"), png_sig).unwrap();
+
+        let attachments = KaiboHandler::resolve_consult_attachments(
+            &root_canon,
+            &[
+                "src/small.rs".to_string(),
+                "src/big.rs".to_string(),
+                "shot.png".to_string(),
+            ],
+            64, // small.rs (19 B) inlines; big.rs (128 B) demotes
+            &crate::sandbox::SandboxConfig::default(),
+        )
+        .await
+        .expect("all three resolve");
+        let prompt =
+            crate::consult::consult_user_prompt("Assess it.", None, &[], &attachments);
+
+        assert!(
+            prompt.contains("<file path=\"src/small.rs\">"),
+            "inlined file labeled root-relative:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("     1\tfn a() {}\n     2\tfn b() {}"),
+            "inlined body numbered like cat -n:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- src/big.rs (128 bytes)"),
+            "oversize file demoted with its size:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Read each one WHOLE"),
+            "command-voice directive present:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("view_image") && prompt.contains("- shot.png"),
+            "image routed to view_image:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("xxxx"),
+            "demoted bytes never reach the prompt:\n{prompt}"
         );
     }
 
@@ -4185,7 +4274,8 @@ mod tests {
         );
         assert!(
             attach.is_empty(),
-            "deliberate carries no attachments — the dossier is the prompt"
+            "the offline submit carries no attachment parts — a deliberate `attach` \
+             reaches the dossier stage as directives; the dossier is the prompt"
         );
         assert_eq!(items.len(), 1, "one item — the dossier, not fanned");
         assert_eq!(

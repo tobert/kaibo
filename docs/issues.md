@@ -212,6 +212,16 @@ in-process and reliable); the classification covers the user-facing symptom toda
 
 ## P3 — Infra, perf, polish
 
+### `KaishWorker::read_file` is unbounded — stat-then-read growth race
+`sandbox.rs` `Job::Read` slurps the whole file through the VFS with no size cap.
+Both attachment resolvers check `metadata().len()` against their cap/budget *before*
+reading, so a file that grows huge in the stat→read window gets slurped into memory
+before the post-read length check demotes/refuses it (Gemini cross-family review,
+2026-07-03). kaibo's stated adversary (the model) can't drive filesystem timing, so
+this is robustness, not an escape — but a fast-growing log file could spike memory.
+Fix shape: a capped read op on the worker (`read_file_capped(max)`) that refuses past
+the cap at the VFS layer; both resolvers pass their real ceiling.
+
 ### Attach-inline follow-ons: per-call budget, observed cost
 `inline_attach_budget` (2026-07-03, `[defaults]`/env) is server-wide only. Two
 things to watch in real sessions before adding surface: (1) whether a **per-call
