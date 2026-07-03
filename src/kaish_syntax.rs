@@ -33,17 +33,10 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// prohibitions): "just read", not a wall of "never".
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
-`git`, `touch`, and external commands are refused, so just read. Read files WHOLE \
-by default: `cat -n FILE` is the first move on any file that matters — one read \
-hands you the imports, the context, and exact line numbers for every citation, and \
-nearly every source file fits in one look. `grep -rn PATTERN .` finds WHICH files \
-matter (add `-B3 -A6` to preview matches in context; alternation takes `-E`: \
-`grep -rnE 'foo|bar' .`); once it hits, open the file whole rather than reading \
-around the match. When a whole read comes back truncated \
-(exit 3), the sample hands you the file's head and tail — stage the rest as \
-targeted reads: `grep -n SYMBOL FILE` pins the lines you need, then a wide span \
-around them, `cat -n FILE | sed -n '1200,2400p'` (~1,200 lines fits one look). \
-Each call starts at the project root; \
+`git`, `touch`, and external commands are refused, so just read — files WHOLE by \
+default, `cat -n FILE`. Two grep notes: alternation takes `-E` \
+(`grep -rnE 'foo|bar' .`), and `-r` wants a directory (for one file, \
+`grep -n PATTERN FILE`). Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
@@ -60,7 +53,24 @@ pub fn kaish_operating_contract() -> &'static str {
     CONTRACT.get_or_init(|| compose(&Recipe::tool_description(), &SchemaContent::new(&[])))
 }
 
-/// The compact, model-facing cheatsheet: the canonical kaish contract plus kaibo's
+/// Strip the canonical contract's write-side paragraphs before it fronts kaibo's
+/// read-only sandbox. The contract is shared upstream text (`kaish-help`) written
+/// for kaish embedders in general; its "Overlay mode" paragraph teaches a virtual
+/// *write* layer and `kaish-vfs commit` — dead weight in every kaibo preamble, and
+/// an active mixed signal one paragraph before "writes are refused". Paragraph-
+/// boundary surgery keyed on the bold heading: if upstream renames it, the
+/// `core_carries_no_write_side_modes` test fails loudly rather than the paragraph
+/// sliding back in silently.
+fn strip_write_side_paragraphs(contract: &str) -> String {
+    contract
+        .split("\n\n")
+        .filter(|p| !p.trim_start().starts_with("**Overlay mode**"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The compact, model-facing cheatsheet: the canonical kaish contract (minus its
+/// write-side paragraphs — see [`strip_write_side_paragraphs`]) plus kaibo's
 /// sandbox addendum. Every internal preamble and the internal `run_kaish` tool
 /// definition embed this, so there is exactly one place the model-facing framing
 /// lives. Composed once.
@@ -69,7 +79,7 @@ pub fn kaish_syntax_core() -> &'static str {
     CORE.get_or_init(|| {
         format!(
             "{}\n\n{}",
-            kaish_operating_contract(),
+            strip_write_side_paragraphs(kaish_operating_contract()),
             KAISH_SANDBOX_ADDENDUM
         )
     })
@@ -367,22 +377,48 @@ mod tests {
     fn core_layers_the_canonical_contract_under_the_kaibo_addendum() {
         let core = kaish_syntax_core();
         // The canonical half is sourced from kaish-help, not hand-rolled here — so
-        // it must appear verbatim. This fails the moment the compose recipe breaks
-        // or the layering drops it.
+        // its load-bearing rules must survive the write-side filter. This fails the
+        // moment the compose recipe breaks, the layering drops it, or the filter
+        // over-strips.
         let contract = kaish_operating_contract();
         assert!(
             !contract.is_empty(),
             "the canonical contract must compose to something"
         );
-        assert!(
-            core.contains(contract),
-            "core must embed the canonical kaish contract verbatim"
-        );
+        for rule in ["No word splitting", "Strict globs", "Pre-validation"] {
+            assert!(
+                contract.contains(rule) && core.contains(rule),
+                "canonical rule {rule:?} must reach the core"
+            );
+        }
         // The kaibo half must be there too.
         assert!(
             core.contains(KAISH_SANDBOX_ADDENDUM),
             "core must embed the kaibo sandbox addendum verbatim"
         );
+    }
+
+    /// kaibo's core is a READ-ONLY surface, so the canonical contract's write-side
+    /// paragraphs must not reach it: upstream `kaish-help` teaches "Overlay mode"
+    /// (a virtual write layer, `kaish-vfs commit`) to embedders in general, and in
+    /// a kaibo preamble that's dead weight contradicting "writes are refused" one
+    /// paragraph later. The filter keys on the bold heading — if upstream renames
+    /// it, this fails loudly instead of the paragraph sliding back in silently.
+    #[test]
+    fn core_carries_no_write_side_modes() {
+        // The raw upstream contract DOES carry it (otherwise the filter tests
+        // nothing and should be retired along with this assertion).
+        assert!(
+            kaish_operating_contract().contains("Overlay mode"),
+            "upstream contract no longer mentions Overlay mode — retire the filter?"
+        );
+        let core = kaish_syntax_core();
+        for needle in ["Overlay mode", "kaish-vfs commit"] {
+            assert!(
+                !core.contains(needle),
+                "write-side teaching {needle:?} must not reach kaibo's core:\n{core}"
+            );
+        }
     }
 
     #[test]
