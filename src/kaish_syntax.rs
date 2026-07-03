@@ -119,7 +119,7 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 /// truncating host (Claude Code's 2048-char cap) would cut.
 fn kaibo_lead() -> &'static str {
     "kaibo (解剖) — grounded, cited answers about a codebase from a model outside \
-     your own family. DeepSeek, Gemini, Anthropic, or a local model reads the \
+     your own family. DeepSeek, Gemini, Anthropic, OpenRouter, or a local model reads the \
      project READ-ONLY and answers with file:line citations. Say in prose what you \
      did or want to know — kaibo finds and reads the current code itself; no \
      pasted files or diffs needed. `consult` is the front door. `explore` \
@@ -172,8 +172,8 @@ fn setup_section(config: &Config) -> String {
          can't reach a model. `run_kaish` works now (read-only shell, no model) to \
          browse the code meanwhile.\n\n\
          Give the cast a key via an **environment variable** or **key file** — kaibo \
-         reads either at startup, kept out of the chat (set it in your shell, not \
-         pasted to the model):\n\
+         reads either at startup, kept out of the chat (set in your shell, never \
+         pasted here):\n\
          {backends}\n\n\
          Then **reconnect the kaibo MCP server** so it re-reads the environment \
          (Claude Code: `/mcp`; other hosts: their own reload). Prefer another \

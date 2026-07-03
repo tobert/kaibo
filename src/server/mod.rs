@@ -1468,7 +1468,7 @@ impl KaiboHandler {
         description = "Ask a model outside your own family about a codebase — code review, \
             debugging, architecture, \"what does this change break\" — and get a grounded \
             answer with `file:line` citations. A capable model (DeepSeek, Gemini, \
-            Anthropic, or local — pick with `cast`) drives a READ-ONLY shell over the \
+            Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over the \
             project: it reads the real, current source, delegates broad sweeps to a fast \
             explorer, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
