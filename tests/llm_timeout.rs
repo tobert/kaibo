@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use kaibo::config::{Config, ModelRole};
-use kaibo::consult::{oneshot, Arm, ConsultConfig};
+use kaibo::consult::{oneshot, Arm, PhaseContext};
 use tokio::net::TcpListener;
 
 /// Bind an ephemeral port and accept connections forever without ever replying —
@@ -66,7 +66,7 @@ async fn oneshot_aborts_when_the_provider_never_responds() {
             "What does the sandbox prevent?",
             &[],
             &arm,
-            &ConsultConfig::default(),
+            &PhaseContext::default(),
         ),
     )
     .await;

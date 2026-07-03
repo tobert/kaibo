@@ -29,7 +29,8 @@ use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
-    consult, explore_with, oneshot, Arm, ConsultConfig, ModelCaps, PromptOverrides,
+    consult, explore_with, oneshot, Arm, ConsultConfig, ExploreConfig, ModelCaps, PhaseContext,
+    PromptOverrides,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
@@ -1368,15 +1369,19 @@ impl KaiboHandler {
             &cast.name,
         )?;
         let cfg = ConsultConfig {
-            explorer_max_turns: input
-                .explorer_max_turns
-                .unwrap_or(defaults.explorer_max_turns),
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: progress.clone(),
+                    house_rules: self.house_rules(&root)?,
+                    prompts: self.resolved_prompts(&cast),
+                    orientation: self.orientation(&root).await?,
+                },
+                explorer_max_turns: input
+                    .explorer_max_turns
+                    .unwrap_or(defaults.explorer_max_turns),
+                sandbox: self.config.sandbox.clone(),
+            },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
-            sandbox: self.config.sandbox.clone(),
-            progress: progress.clone(),
-            house_rules: self.house_rules(&root)?,
-            prompts: self.resolved_prompts(&cast),
-            orientation: self.orientation(&root).await?,
             attachments,
         };
 
@@ -1483,15 +1488,19 @@ impl KaiboHandler {
         // clone of this exact handle, so what it reads is what the running phase emitted.
         let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
         let cfg = ConsultConfig {
-            explorer_max_turns: input
-                .explorer_max_turns
-                .unwrap_or(defaults.explorer_max_turns),
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: progress_log.clone(),
+                    house_rules: self.house_rules(&root)?,
+                    prompts: self.resolved_prompts(&cast),
+                    orientation: self.orientation(&root).await?,
+                },
+                explorer_max_turns: input
+                    .explorer_max_turns
+                    .unwrap_or(defaults.explorer_max_turns),
+                sandbox: self.config.sandbox.clone(),
+            },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
-            sandbox: self.config.sandbox.clone(),
-            progress: progress_log.clone(),
-            house_rules: self.house_rules(&root)?,
-            prompts: self.resolved_prompts(&cast),
-            orientation: self.orientation(&root).await?,
             attachments,
         };
 
@@ -1583,19 +1592,17 @@ impl KaiboHandler {
         let explorer = self.arm(&cast, ModelRole::Explorer)?;
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
-        let cfg = ConsultConfig {
+        let cfg = ExploreConfig {
+            phase: PhaseContext {
+                progress: progress.clone(),
+                house_rules: self.house_rules(&root)?,
+                prompts: self.resolved_prompts(&cast),
+                orientation: self.orientation(&root).await?,
+            },
             explorer_max_turns: input
                 .explorer_max_turns
                 .unwrap_or(defaults.explorer_max_turns),
-            // Single-phase: no synth runs, so `synth_max_turns` is inert here.
-            synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
-            progress: progress.clone(),
-            house_rules: self.house_rules(&root)?,
-            prompts: self.resolved_prompts(&cast),
-            orientation: self.orientation(&root).await?,
-            // explore reads the repo itself — no caller attachments.
-            attachments: Vec::new(),
         };
 
         let span =
@@ -1660,20 +1667,17 @@ impl KaiboHandler {
         // spent. Only the deliberation (Stage 2) is handed off async.
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
-        let cfg = ConsultConfig {
+        let cfg = ExploreConfig {
+            phase: PhaseContext {
+                progress: progress.clone(),
+                house_rules: self.house_rules(&root)?,
+                prompts: self.resolved_prompts(&cast),
+                orientation: self.orientation(&root).await?,
+            },
             explorer_max_turns: input
                 .explorer_max_turns
                 .unwrap_or(defaults.explorer_max_turns),
-            // The offline synth is a single turn (batch item / one direct completion), so
-            // synth_max_turns is inert — carried only to satisfy the shared config.
-            synth_max_turns: defaults.synth_max_turns,
             sandbox: self.config.sandbox.clone(),
-            progress: progress.clone(),
-            house_rules: self.house_rules(&root)?,
-            prompts: self.resolved_prompts(&cast),
-            orientation: self.orientation(&root).await?,
-            // deliberate reads the repo itself — no caller attachments.
-            attachments: Vec::new(),
         };
         let span = tracing::info_span!("deliberate.dossier", cast = %cast.name, explorer_model = %explorer_model);
         progress.emit(PhaseEvent::PhaseStarted {
@@ -1693,8 +1697,8 @@ impl KaiboHandler {
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
         // and the handle; both share the offline-synth preamble (`batch_system_prompt`,
         // overridable via `[prompts].batch` OR the synth slot's own `preamble` — the
-        // resolved `cfg.prompts` already layered both, same as the dossier phase above).
-        let system = crate::consult::batch_system_prompt(cfg.prompts.batch.as_deref());
+        // resolved `cfg.phase.prompts` already layered both, same as the dossier phase above).
+        let system = crate::consult::batch_system_prompt(cfg.phase.prompts.batch.as_deref());
         match lane {
             Lane::Batch => {
                 self.deliberate_batch(&cast, &explorer_model, &input.question, &dossier, &system)
@@ -1841,18 +1845,12 @@ impl KaiboHandler {
         // Gate image attachments on the model's vision capability (shared with batch).
         self.gate_image_attachments(arm.caps.vision, &attachments, &arm.model, &cast.name)?;
         let progress = progress_sink(peer, &meta);
-        let defaults = &self.config.defaults;
-        let cfg = ConsultConfig {
-            explorer_max_turns: defaults.explorer_max_turns,
-            synth_max_turns: defaults.synth_max_turns,
-            sandbox: self.config.sandbox.clone(),
+        let cfg = PhaseContext {
             progress: progress.clone(),
-            // oneshot reads no project: no house rules, no repo map, no shell — and no
-            // consult-style attachments (it inlines its `attach` files via `oneshot()`).
+            // oneshot reads no project: no house rules, no repo map, no shell.
             house_rules: None,
             prompts: self.resolved_prompts(&cast),
             orientation: None,
-            attachments: Vec::new(),
         };
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
