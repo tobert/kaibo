@@ -8,6 +8,7 @@
 //! `consult`'s type, and `oneshot` filled four).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::progress::{NullSink, ProgressSink};
 use crate::sandbox::SandboxConfig;
@@ -41,6 +42,18 @@ pub struct PhaseContext {
     /// asked for them; otherwise it's [`NullSink`], a no-op — so a stateless
     /// one-shot is byte-for-byte its old self.
     pub progress: Arc<dyn ProgressSink>,
+    /// Wall-clock ceiling on this call's model work — the transport-agnostic backstop
+    /// the per-request `request_timeout` isn't. That deadline lives in reqwest, injected
+    /// through rig; when it fails to fire (a wedged local server holding a pooled
+    /// keep-alive; rig's split send/body read), nothing else bounds the otherwise-
+    /// brakeless prompt loop and a call can hang indefinitely (observed 2026-07-02: a
+    /// stopped local backend parked a consult ~17h). This is a kaibo-owned `tokio::time`
+    /// timer that doesn't trust the transport: a call past it aborts loudly rather than
+    /// hanging a caller's session. Every model-driven phase carries it — that's why it
+    /// rides the base rung. It bounds `consult`/`explore`/`oneshot` and the async
+    /// `consult_submit`; `deliberate`'s direct lane sets it to its synth backend's own
+    /// `request_timeout` (one completion), and the batch lane holds no in-process wait.
+    pub call_deadline: Duration,
 }
 
 impl Default for PhaseContext {
@@ -50,6 +63,7 @@ impl Default for PhaseContext {
             orientation: None,
             house_rules: None,
             progress: Arc::new(NullSink),
+            call_deadline: crate::config::Defaults::default().call_deadline,
         }
     }
 }

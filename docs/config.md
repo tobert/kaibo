@@ -191,6 +191,19 @@ The `[defaults]` knobs themselves:
   Haiku 4.5; set `adaptive` or `budget` when a new or misclassified model ships. A
   no-op for non-Anthropic kinds. An unknown value is a loud load error.
 - **`request_timeout_secs`** seeds every backend (see above).
+- **`call_deadline_secs`** (default 3600 = 1 h, must be > 0) is the whole-*call*
+  wall-clock ceiling on an interactive `consult`/`explore`/`oneshot` — the backstop
+  for when the per-request `request_timeout` doesn't fire (a stalled response body, a
+  pooled keep-alive to a wedged backend). Past it the call aborts with a clean
+  tool-result error instead of hanging your session. Keep it **above the largest
+  `request_timeout` a call can reach** so it never cuts a legitimately slow single
+  completion — operators running a >30-min local model should raise it. It bounds the
+  interactive loop tools — `consult`/`explore`/`oneshot` and async `consult_submit`.
+  Two in-process paths sit outside it *by nature*: `deliberate`'s direct lane is one
+  long completion bounded instead by its synth backend's `request_timeout` (+ a small
+  margin) — so a slow local `deliberate` gets its full patience *without* forcing this
+  interactive ceiling up to hours; and the **batch** lane holds no in-process wait at
+  all (the work runs on the provider's queue, collected by polling `job_get`).
 - **`explorer_max_turns` / `synth_max_turns`** (100 / 200) stay in `[defaults]`
   only (plus per-call): they bound the *loop*, not the model.
 - **`session_capacity`** (128, must be > 0): max multi-turn consult sessions held
@@ -317,6 +330,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | synth effort | `defaults.synth_effort` *(per-slot `effort`)* | `KAIBO_SYNTH_EFFORT` | — |
 | thinking style | `defaults.thinking_style` *(per-slot override)* | `KAIBO_THINKING_STYLE` | — |
 | LLM request timeout (s) | `defaults.request_timeout_secs` *(per-backend override)* | `KAIBO_REQUEST_TIMEOUT_SECS` | — |
+| whole-call deadline (s) | `defaults.call_deadline_secs` *(must be > 0; default 3600)* | `KAIBO_CALL_DEADLINE_SECS` | — |
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | async job cache size | `defaults.job_capacity` *(must be > 0; default 64)* | `KAIBO_JOB_CAPACITY` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |

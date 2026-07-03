@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rig_core::agent::{HookAction, PromptHook};
@@ -937,17 +938,21 @@ pub async fn oneshot(
             content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
         }
     };
-    arm.run(
-        &resolve_phase_preamble(
-            Phase::Oneshot,
-            &cfg.prompts,
-            cfg.orientation.as_deref(),
-            cfg.house_rules.as_deref(),
+    with_call_deadline(
+        cfg.call_deadline,
+        "oneshot",
+        arm.run(
+            &resolve_phase_preamble(
+                Phase::Oneshot,
+                &cfg.prompts,
+                cfg.orientation.as_deref(),
+                cfg.house_rules.as_deref(),
+            ),
+            initial_prompt,
+            1,
+            cfg.progress.as_ref(),
+            &|| Ok(Vec::new()),
         ),
-        initial_prompt,
-        1,
-        cfg.progress.as_ref(),
-        &|| Ok(Vec::new()),
     )
     .await
 }
@@ -1020,41 +1025,87 @@ pub(crate) async fn explore_with(
         cfg.phase.orientation.as_deref(),
         cfg.phase.house_rules.as_deref(),
     );
-    run_explore_phase(
-        explorer,
-        &preamble,
-        question,
-        root,
-        &cfg.sandbox,
-        cfg.explorer_max_turns,
-        &cfg.phase.progress,
+    with_call_deadline(
+        cfg.phase.call_deadline,
+        "explore",
+        run_explore_phase(
+            explorer,
+            &preamble,
+            question,
+            root,
+            &cfg.sandbox,
+            cfg.explorer_max_turns,
+            &cfg.phase.progress,
+        ),
     )
     .await
+}
+
+/// Run one call's model work under a wall-clock ceiling.
+///
+/// The per-request `request_timeout` (down in reqwest, injected through rig) is the
+/// *first* brake on a stalled backend; this is the transport-agnostic backstop for
+/// when it doesn't fire — a wedged local server holding a pooled keep-alive, rig's
+/// split send-then-body read. On elapse the call aborts loudly instead of hanging the
+/// caller's session indefinitely (the 2026-07-02 ~17h park a stopped local backend
+/// caused). The interactive loop tools pass `call_deadline` here (`consult`/`explore`/
+/// `oneshot` and the async `consult_submit`); `deliberate`'s direct lane passes a
+/// deadline sized to its synth backend's `request_timeout` instead (one completion, so
+/// `request_timeout` is its natural bound). The batch lane calls this not at all — kaibo
+/// holds no wait there, the deliberation runs on the provider's queue.
+async fn with_call_deadline<T>(
+    deadline: Duration,
+    label: &str,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow!(
+            "{label} exceeded its {}s wall-clock deadline — a backend or model stopped \
+             responding. Raise `call_deadline_secs` (or `KAIBO_CALL_DEADLINE_SECS`) if this \
+             was a legitimately long run.",
+            deadline.as_secs()
+        )),
+    }
 }
 
 /// Run `deliberate`'s offline synth on the **direct** lane: one long, toolless local
 /// completion over the dossier. Same shape as [`oneshot`] (empty toolset, a single
 /// turn — exactly one upstream request) but on the offline-synth preamble and framing
 /// the dossier as trusted evidence. The arm points at a big local model whose backend
-/// `request_timeout` is expected to stretch to hours; kaibo runs the one completion and
-/// waits — the provider (a llama.cpp-class server) queues, kaibo doesn't. `system` is
-/// the resolved offline-synth preamble (shared with batch via [`batch_system_prompt`]).
+/// `request_timeout` may stretch long; kaibo holds the one completion open in a
+/// background job. `system` is the resolved offline-synth preamble (shared with batch
+/// via [`batch_system_prompt`]).
+///
+/// It's async (the caller collects a `job-N` handle, never blocks) but *not* unbounded:
+/// this is an in-process completion kaibo holds, so it wears a `call_deadline`-style
+/// wall-clock backstop — a wedged local server can't leave a job running forever, and
+/// `job_wait`/`job_get` resolve within the deadline. Because it's exactly *one*
+/// completion (unlike a multi-turn `consult` loop), the caller sizes `deadline` to the
+/// synth backend's own `request_timeout` (+ a margin), not the interactive-loop
+/// `call_deadline` — a slow local model gets its full patience without forcing the
+/// interactive ceiling high. The **batch** lane, by contrast, holds no in-process wait
+/// at all — its deliberation runs on the *provider's* queue.
 pub async fn deliberate_direct(
     question: &str,
     dossier: &str,
     synth: &Arm,
     system: &str,
+    deadline: Duration,
     progress: &Arc<dyn ProgressSink>,
 ) -> Result<String> {
-    synth
-        .run(
+    with_call_deadline(
+        deadline,
+        "deliberate",
+        synth.run(
             system,
             Message::user(deliberation_prompt(question, dossier)),
             1,
             progress.as_ref(),
             &|| Ok(Vec::new()),
-        )
-        .await
+        ),
+    )
+    .await
 }
 
 /// Run a `consult` over two resolved arms.
@@ -1074,8 +1125,10 @@ pub(crate) async fn consult_with(
 ) -> Result<ConsultOutput> {
     let reports = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    let answer = synth
-        .run(
+    let answer = with_call_deadline(
+        cfg.explore.phase.call_deadline,
+        "consult",
+        synth.run(
             &resolve_phase_preamble(
                 Phase::Consult,
                 &cfg.explore.phase.prompts,
@@ -1089,9 +1142,10 @@ pub(crate) async fn consult_with(
             // turn); every build shares the one `reports` sink so all explore′
             // sweeps aggregate.
             &|| consult_tools(explorer, root, cfg, reports.clone(), synth.caps.vision),
-        )
-        .await
-        .context("consult loop")?;
+        ),
+    )
+    .await
+    .context("consult loop")?;
 
     let report = reports
         .lock()
@@ -1931,6 +1985,7 @@ mod tests {
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
             &arm(&client, SYNTH),
             "You are a capable model answering a hard question offline.",
+            cfg.call_deadline,
             &cfg.progress,
         )
         .await
@@ -1945,6 +2000,110 @@ mod tests {
             client.requests_for(SYNTH).len(),
             1,
             "one toolless completion"
+        );
+    }
+
+    /// The wall-clock backstop: a wedged provider (a stopped/hung backend whose
+    /// completion never returns — the 2026-07-02 failure mode) must abort a `consult`
+    /// by `call_deadline`, not hang the caller forever. The synth model hangs; a tiny
+    /// deadline should turn that into a prompt error. The outer guard is the teeth: it
+    /// fails the test *fast* if the deadline isn't enforced (an unbounded `consult_with`
+    /// would otherwise hang this test until CI's own timeout).
+    #[tokio::test]
+    async fn consult_aborts_when_a_backend_wedges() {
+        const SYNTH: &str = "wedged-synth";
+        const EXPLORER: &str = "cheap-explorer";
+        let dir = tempdir().unwrap();
+
+        // The synth's very first completion never returns; the explorer is never reached.
+        let client = ScriptedClient::builder().hang_model(SYNTH).build();
+        let mut cfg = ConsultConfig::default();
+        cfg.explore.phase.call_deadline = Duration::from_millis(50);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            consult_with(
+                "q",
+                dir.path(),
+                &arm(&client, EXPLORER),
+                &arm(&client, SYNTH),
+                &cfg,
+            ),
+        )
+        .await
+        .expect("consult_with did not honor call_deadline — it hung past 5s (no backstop)");
+
+        let err = outcome.expect_err("a wedged backend must abort the consult, not answer");
+        // Render the whole chain, exactly as the server's `consultation_failure_text`
+        // does (`{err:#}`) — so this asserts what the *client* actually sees.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deadline"),
+            "the abort must name the wall-clock deadline, got: {msg}"
+        );
+
+        // The request did go out — the deadline aborted a real in-flight call, and the
+        // wedge is exactly one completion that never returned (not a loop, not a no-op).
+        assert_eq!(
+            client.requests_for(SYNTH).len(),
+            1,
+            "the synth completion should have been dispatched once and then hung"
+        );
+    }
+
+    /// The same wall-clock backstop guards `explore`, not just `consult`: a wedged
+    /// explorer must abort by `call_deadline`. Guards against a refactor dropping the
+    /// wrap from `explore_with` specifically (it shares `with_call_deadline`, but the
+    /// call site is its own). Same outer-guard teeth as the consult version.
+    #[tokio::test]
+    async fn explore_aborts_when_the_explorer_wedges() {
+        const EXPLORER: &str = "wedged-explorer";
+        let dir = tempdir().unwrap();
+        let client = ScriptedClient::builder().hang_model(EXPLORER).build();
+        let mut cfg = ExploreConfig::default();
+        cfg.phase.call_deadline = Duration::from_millis(50);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            explore_with("q", dir.path().to_path_buf(), &arm(&client, EXPLORER), &cfg),
+        )
+        .await
+        .expect("explore_with did not honor call_deadline — it hung past 5s (no backstop)");
+
+        let err = outcome.expect_err("a wedged explorer must abort the explore, not answer");
+        assert!(
+            format!("{err:#}").contains("deadline"),
+            "the abort must name the wall-clock deadline, got: {err:#}"
+        );
+    }
+
+    /// `deliberate`'s direct lane is async but NOT unbounded: it's an in-process
+    /// completion kaibo holds, so a wedged local synth must abort by its deadline
+    /// rather than leave the `job-N` running forever (so `job_wait`/`job_get` resolve
+    /// within it). Only the batch lane — where kaibo holds no wait — escapes.
+    #[tokio::test]
+    async fn deliberate_direct_aborts_when_the_local_synth_wedges() {
+        const SYNTH: &str = "wedged-local-synth";
+        let client = ScriptedClient::builder().hang_model(SYNTH).build();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            deliberate_direct(
+                "q",
+                "src/x.rs:1 DOSSIER",
+                &arm(&client, SYNTH),
+                "offline synth preamble",
+                Duration::from_millis(50),
+                &(Arc::new(crate::progress::NullSink) as Arc<dyn ProgressSink>),
+            ),
+        )
+        .await
+        .expect("deliberate_direct did not honor its deadline — it hung past 5s (no backstop)");
+
+        let err = outcome.expect_err("a wedged local synth must abort the deliberation, not answer");
+        assert!(
+            format!("{err:#}").contains("deadline"),
+            "the abort must name the wall-clock deadline, got: {err:#}"
         );
     }
 

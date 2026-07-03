@@ -52,6 +52,14 @@ enum FailureKind {
 /// kaibo-side failure, not the provider's.
 fn classify_failure(err: &anyhow::Error) -> FailureKind {
     let s = format!("{err:#}").to_lowercase();
+    // Our own wall-clock backstop firing (`call_deadline`): the backend stalled past
+    // the ceiling and we aborted. Not a kaibo bug and not a model rejection — a
+    // transient "no response in time", steered like a provider timeout (retry, raise
+    // the deadline, or proceed). Detected before the model-loop gate because the abort
+    // happens *around* the loop, so it carries no "model loop failed" marker.
+    if s.contains("wall-clock deadline") {
+        return FailureKind::TransientProvider;
+    }
     let from_model_loop = s.contains("model loop failed") || s.contains("model used all");
     if !from_model_loop {
         return FailureKind::Internal;
@@ -596,6 +604,28 @@ mod tests {
         assert!(
             !lower.contains("provider failed") && !lower.contains("provider rejected"),
             "must not claim the provider failed: {text}"
+        );
+    }
+
+    /// The `call_deadline` backstop firing is a *transient* condition, not a kaibo bug:
+    /// a stalled backend the wall-clock timer aborted. The guidance must invite a retry
+    /// (or proceed) and must not blame kaibo — the failure mode that stranded a real
+    /// consult ~17h (2026-07-02) before this backstop existed.
+    #[test]
+    fn wall_clock_deadline_is_transient_not_a_kaibo_bug() {
+        let err = anyhow::anyhow!(
+            "consult loop: consult exceeded its 3600s wall-clock deadline — a backend or \
+             model stopped responding."
+        );
+        let text = answer_text(&consultation_failed("consult", "zorak", err));
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("retry"),
+            "a deadline abort should invite a manual retry / proceed: {text}"
+        );
+        assert!(
+            !lower.contains("kaibo-side error") && !lower.contains("please report it"),
+            "a stalled backend is not a kaibo bug to report: {text}"
         );
     }
 

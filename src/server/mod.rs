@@ -95,6 +95,22 @@ const PROMPTS_CAST_URI_TEMPLATE: &str = "kaibo://prompts/{cast}";
 /// would 404 at exactly the fresh-install moment the example matters most.
 const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.example.toml");
 
+/// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
+/// its wall-clock backstop: the per-request reqwest deadline should fire first (a
+/// cleaner error), leaving this tokio timer as the true backstop. Small on purpose —
+/// deliberate-direct is one completion, so `request_timeout` already sizes the wait.
+const DELIBERATE_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wall-clock backstop for a `deliberate`-direct job: its synth backend's own
+/// `request_timeout` plus [`DELIBERATE_DEADLINE_MARGIN`]. Sized to the *single*
+/// completion the direct lane runs — not the interactive-loop `call_deadline` — so a
+/// slow local model keeps its full configured patience without forcing the interactive
+/// ceiling high (a 3h local `deliberate` needs a 3h `request_timeout` set anyway, and
+/// inherits it here). Pure, so the sizing decision is pinned without spawning a job.
+fn deliberate_direct_deadline(synth_backend: &Backend) -> std::time::Duration {
+    synth_backend.request_timeout + DELIBERATE_DEADLINE_MARGIN
+}
+
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
 /// Composes to any posture: `{oneshot:false}` ≈ the codebase-only surface; only
@@ -1375,6 +1391,7 @@ impl KaiboHandler {
                     house_rules: self.house_rules(&root)?,
                     prompts: self.resolved_prompts(&cast),
                     orientation: self.orientation(&root).await?,
+                    call_deadline: defaults.call_deadline,
                 },
                 explorer_max_turns: input
                     .explorer_max_turns
@@ -1494,6 +1511,7 @@ impl KaiboHandler {
                     house_rules: self.house_rules(&root)?,
                     prompts: self.resolved_prompts(&cast),
                     orientation: self.orientation(&root).await?,
+                    call_deadline: defaults.call_deadline,
                 },
                 explorer_max_turns: input
                     .explorer_max_turns
@@ -1598,6 +1616,7 @@ impl KaiboHandler {
                 house_rules: self.house_rules(&root)?,
                 prompts: self.resolved_prompts(&cast),
                 orientation: self.orientation(&root).await?,
+                call_deadline: defaults.call_deadline,
             },
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1673,6 +1692,7 @@ impl KaiboHandler {
                 house_rules: self.house_rules(&root)?,
                 prompts: self.resolved_prompts(&cast),
                 orientation: self.orientation(&root).await?,
+                call_deadline: defaults.call_deadline,
             },
             explorer_max_turns: input
                 .explorer_max_turns
@@ -1770,6 +1790,20 @@ impl KaiboHandler {
     ) -> Result<CallToolResult, McpError> {
         let synth = self.arm(cast, ModelRole::Synth)?;
         let synth_model = synth.model.clone();
+        // deliberate-direct is exactly ONE long completion, so its wall-clock backstop
+        // tracks the *synth backend's* own `request_timeout` (which the operator already
+        // tunes for a slow local model) rather than the interactive `call_deadline` — a
+        // slow deliberate must not force the interactive-loop ceiling high. The margin
+        // above `request_timeout` lets the per-request reqwest deadline fire first (a
+        // cleaner error); this tokio timer is the backstop for when it doesn't.
+        let synth_slot = cast
+            .require_slot(ModelRole::Synth)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let synth_backend = self
+            .config
+            .resolve_backend(&synth_slot.backend)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let deadline = deliberate_direct_deadline(synth_backend);
         // Same progress plumbing as consult_submit: a job has no live peer, so route
         // liveness onto `tracing` and let the ProgressLog remember the latest beat for
         // `job_get`/`job_list`. The sink handed to the phase is the same Arc the job
@@ -1784,8 +1818,10 @@ impl KaiboHandler {
         let label = format!("cast `{cast_name}` deliberate (direct synth `{synth_model}`)");
 
         let job_id = self.jobs.submit(label, progress_log, async move {
-            match crate::consult::deliberate_direct(&question, &dossier, &synth, &system, &sink)
-                .await
+            match crate::consult::deliberate_direct(
+                &question, &dossier, &synth, &system, deadline, &sink,
+            )
+            .await
             {
                 Ok(answer) => Ok(JobResult {
                     answer: with_provenance(
@@ -1851,6 +1887,7 @@ impl KaiboHandler {
             house_rules: None,
             prompts: self.resolved_prompts(&cast),
             orientation: None,
+            call_deadline: self.config.defaults.call_deadline,
         };
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
@@ -3194,6 +3231,32 @@ mod tests {
     use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
     use serde_json::json;
+
+    /// deliberate-direct's wall-clock backstop tracks its synth backend's own
+    /// `request_timeout` (+ margin), NOT the interactive `call_deadline`. This is the
+    /// decision that keeps a slow local `deliberate` from forcing the interactive
+    /// ceiling high: give that model 3h of `request_timeout` and the direct job inherits
+    /// it, while `consult`/`explore`/`oneshot` stay bounded at the tight `call_deadline`.
+    #[test]
+    fn deliberate_direct_deadline_tracks_request_timeout_not_call_deadline() {
+        let cfg = crate::config::Config::builtin();
+        let mut backend = cfg
+            .resolve_backend("openai-local")
+            .expect("built-in openai backend")
+            .clone();
+        backend.request_timeout = std::time::Duration::from_secs(3 * 60 * 60); // a slow local model, 3h of patience
+        let deadline = deliberate_direct_deadline(&backend);
+        assert_eq!(
+            deadline,
+            std::time::Duration::from_secs(3 * 60 * 60) + DELIBERATE_DEADLINE_MARGIN,
+            "the direct-lane backstop is the synth request_timeout + margin"
+        );
+        assert!(
+            deadline > cfg.defaults.call_deadline,
+            "a 3h-patience local synth must outlast the interactive ceiling ({:?}), not be capped by it",
+            cfg.defaults.call_deadline
+        );
+    }
 
     /// consult `attach` validates files are under the consult root (so the model's shell
     /// can `cat` them) and returns them as relative paths; a file outside the root — even
