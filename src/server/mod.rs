@@ -3085,8 +3085,11 @@ by waiting — the handles keep.
 
 `run_kaish` runs a kaish (sh-like) script against the project and returns exit code +
 stdout + stderr. Lead with the idioms that produce accurate `file:line`s: `cat -n FILE`
-to read a whole file (reach for it first), `grep -rn PATTERN .` to locate across files,
-`cat -n FILE | sed -n '40,80p'` for a slice of a large one. Compose builtins with pipes
+to read a file WHOLE (the default move — nearly every file fits one look),
+`grep -rn PATTERN .` to find which files matter (alternation takes `-E`:
+`grep -rnE 'foo|bar' .`). A whole read that truncates (exit 3) hands back the head and
+tail; stage the rest as targeted wide spans (`grep -n SYMBOL FILE`, then
+`cat -n FILE | sed -n '1200,2400p'`). Compose builtins with pipes
 (`grep`/`jq`/`awk`/`find`/…). Each call starts fresh at the project root.
 
 A few habits from `bash` that *won't* carry over here — reach for the kaish form instead:

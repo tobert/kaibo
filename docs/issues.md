@@ -430,9 +430,9 @@ gated on a key/endpoint) and passed with thinking on — the probes above extend
 
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
-`ExplorationTrace`), the curiosity + completeness behaviors, and the assertive
-whole-file / `grep -B/-A` reading strategy now live in `report_preamble` (and the
-`grep`/`wc -l` idioms in the shared cheatsheet). Measured against a real review task,
+`ExplorationTrace`), the curiosity + completeness behaviors, and the whole-first /
+staged-targeted-read strategy now live in `report_preamble` (with the grep gotchas
+in the shared cheatsheet; the `wc -l` pre-probe was retired 2026-07-03). Measured against a real review task,
 a lite Gemini explorer dropped from 48 turns to ~21 with *better* citations — the
 built-in reproduces it with no per-cast config. Still open, lower value:
 - **A worked, filled-in example in the prompt.** We ship the section *template*, not a
