@@ -78,6 +78,19 @@ pub struct Defaults {
     /// overridable per backend (a slow local model wants more rope than a hosted
     /// API). See [`Backend::request_timeout`].
     pub request_timeout: Duration,
+    /// Wall-clock ceiling on one *whole* interactive call (`consult`/`explore`/
+    /// `oneshot`). Unlike `request_timeout` (one HTTP call, enforced down in reqwest
+    /// via rig), this is a kaibo-owned `tokio::time` backstop over the entire prompt
+    /// loop — the brake that fires when the per-request deadline doesn't (a wedged
+    /// local server on a pooled keep-alive; rig's split send/body read). It exists so
+    /// a stalled backend aborts a call loudly instead of hanging the caller's session
+    /// indefinitely. Keep it comfortably above the largest `request_timeout` a call
+    /// can reach, so it never cuts a legitimately slow single completion. It bounds the
+    /// interactive loop tools — `consult`/`explore`/`oneshot` and the async
+    /// `consult_submit`. `deliberate`'s direct lane (one completion) is bounded instead
+    /// by its synth backend's `request_timeout`, and the batch lane by nothing in-process
+    /// (provider queue). See [`crate::consult::PhaseContext::call_deadline`].
+    pub call_deadline: Duration,
     /// Max distinct multi-turn `consult` sessions held in memory at once. Eviction
     /// is capacity-driven only (no TTL) — see [`crate::session`]. Server-wide (a
     /// session is a client thread, not a model trait).
@@ -118,10 +131,17 @@ impl Default for Defaults {
             synth_effort: crate::consult::DEFAULT_EFFORT.to_string(),
             thinking_style: ThinkingStyleOverride::Auto,
             // 15 min. A single completion that takes longer is pathological for a
-            // hosted API and a generous ceiling for a slow local model; either way
-            // it bounds a wedged provider that would otherwise hang forever
-            // (non-streaming loop → no other brake). Tune per backend if needed.
+            // hosted API and a generous ceiling for a slow local model. It's the
+            // *first* brake on a wedged provider (per-HTTP-call, down in reqwest);
+            // `call_deadline` below is the whole-call backstop for when it doesn't
+            // fire. Tune per backend if needed.
             request_timeout: Duration::from_secs(900),
+            // 1 hour — the whole-interactive-call wall-clock backstop. Set well above
+            // `request_timeout` (and above the largest per-backend override a call can
+            // reach — e.g. a 30-min local model) so it never cuts a legitimately slow
+            // single completion, yet still turns an "overnight" hang into "you'd notice
+            // within the hour". Overridable via `call_deadline_secs` / env.
+            call_deadline: Duration::from_secs(3600),
             // 128 lean Q&A threads is a few KB of strings — generous for a personal
             // server, and capacity (not time) is the only eviction pressure.
             session_capacity: NonZeroUsize::new(128).expect("128 is nonzero"),
@@ -1657,6 +1677,7 @@ struct RawDefaults {
     synth_effort: Option<String>,
     thinking_style: Option<String>,
     request_timeout_secs: Option<u64>,
+    call_deadline_secs: Option<u64>,
     session_capacity: Option<usize>,
     job_capacity: Option<usize>,
 }
@@ -1852,6 +1873,12 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
             .ok_or_else(|| anyhow!("[defaults] job_capacity must be > 0 (got 0)"))?,
         None => d.job_capacity,
     };
+    // A zero call_deadline would abort every interactive call the instant it starts —
+    // never a real intent, and it would brick consult/explore/oneshot. Reject at load,
+    // same spirit as the backend request_timeout and telemetry timeout checks.
+    if raw.call_deadline_secs == Some(0) {
+        bail!("[defaults] call_deadline_secs must be > 0 — a zero deadline aborts every call instantly");
+    }
     Ok(Defaults {
         explorer_max_turns: raw.explorer_max_turns.unwrap_or(d.explorer_max_turns),
         synth_max_turns: raw.synth_max_turns.unwrap_or(d.synth_max_turns),
@@ -1870,6 +1897,10 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
             .request_timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(d.request_timeout),
+        call_deadline: raw
+            .call_deadline_secs
+            .map(Duration::from_secs)
+            .unwrap_or(d.call_deadline),
         session_capacity,
         job_capacity,
     })
@@ -2122,6 +2153,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_REQUEST_TIMEOUT_SECS") {
         defaults.request_timeout_secs = Some(parse_env_int("KAIBO_REQUEST_TIMEOUT_SECS", &v)?);
+    }
+    if let Some(v) = get("KAIBO_CALL_DEADLINE_SECS") {
+        defaults.call_deadline_secs = Some(parse_env_int("KAIBO_CALL_DEADLINE_SECS", &v)?);
     }
     if let Some(v) = get("KAIBO_SESSION_CAPACITY") {
         defaults.session_capacity = Some(parse_env_int("KAIBO_SESSION_CAPACITY", &v)?);

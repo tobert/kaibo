@@ -110,6 +110,20 @@ thinking_style = "auto"
 # tell wedged from slow. 0 is rejected at load.
 request_timeout_secs = 900
 
+# Whole-call deadline (seconds): the wall-clock ceiling on ONE interactive call
+# (consult / explore / oneshot), across all its completions. This is the backstop
+# for when the per-request timeout above doesn't fire — a wedged local server on a
+# pooled keep-alive, a stalled response body — so a stalled backend aborts loudly
+# instead of hanging your session (a real consult once parked ~17h). Keep it
+# comfortably ABOVE the largest request_timeout a call can reach, so it never cuts a
+# legitimately slow single completion. Bounds the interactive loop tools — consult /
+# explore / oneshot and async consult_submit. `deliberate`'s direct lane (one long
+# completion) is bounded instead by its synth backend's request_timeout, so a slow
+# local model keeps its full patience without forcing this ceiling high; the batch
+# lane holds no in-process wait (provider queue). 0 is rejected at load.
+# Env: KAIBO_CALL_DEADLINE_SECS.
+call_deadline_secs = 3600
+
 session_capacity = 128       # max multi-turn consult sessions held in memory (LRU,
                              # capacity-evicted, no TTL); must be > 0
 

@@ -14,6 +14,45 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-03 — whole-call wall-clock deadline (a consult can't hang overnight)
+
+A live consult (cast `lemonade`, a local server since decommissioned) parked a Claude
+Code session ~17 hours overnight until Amy interrupted it. Forensics on the still-alive
+process: kaibo idle, no in-flight work, all MCP socket queues empty — the tool call had
+*reached* kaibo (two `kaish` worker threads spawned the same second the transcript shows
+`consult` dispatched) and simply never returned. The `--cast lemonade` came from a stale
+`~/.claude.json` pointing at `:13305`, a server Amy retired 2026-06-26; that's the
+trigger (fixed out-of-tree), and the reason the real defect hid so long.
+
+The defect: the per-request `request_timeout` (down in reqwest, injected via rig) was the
+*only* brake. The 2026-06-06 fix (`tests/llm_timeout.rs`) proved it catches "no bytes
+ever", but not every wedge — a stalled response *body* across rig's split send/bytes read,
+or a pooled keep-alive to a wedged server — and with 900s configured it still ran 17h, so
+it plainly didn't fire. kaibo trusted the transport for liveness and had no backstop of
+its own. Fix: a kaibo-owned `tokio::time` ceiling — `call_deadline` on the base
+`PhaseContext` rung (config `call_deadline_secs` / `KAIBO_CALL_DEADLINE_SECS`, default 1h),
+wrapping the model work via a new `with_call_deadline`. Transport-agnostic, so it fires
+whatever the wedge shape.
+
+Where the ceiling *applies* took Amy's push-back to get right, twice. It bounds the
+interactive **loop** tools — `consult`/`explore`/`oneshot` and the async `consult_submit`
+(same multi-completion loop). `deliberate`'s direct lane is one long *in-process*
+completion kaibo holds, so it must be bounded too — but binding it to the same
+`call_deadline` would force a slow local `deliberate` to raise `call_deadline`, re-opening
+the interactive-hang window the fix just closed. So the bound keys off the *shape* of the
+work: deliberate-direct is exactly ONE completion, bounded by its synth backend's own
+`request_timeout` (+ a 60s margin) — the value the operator already tunes for a slow
+model, auto-scaling without touching the interactive ceiling. The batch lane holds no
+in-process wait at all (the deliberation runs on the provider's queue), so `call_deadline`
+structurally can't and doesn't bound it. Default set *above* the largest per-request
+timeout (even a 30-min local model) so it never cuts a legitimately slow completion — it
+turns "overnight" into "you'd notice within the hour". A deadline abort classifies as a
+transient/retryable condition (retry / raise the knob / proceed), not a kaibo bug. Tests:
+offline consult/explore/deliberate paths aborting a wedged (`hang_model`) scripted backend,
+a real black-hole-socket integration test proving `call_deadline` dominates a *generous*
+300s wire timeout, a pure test pinning that deliberate-direct's deadline tracks
+`request_timeout` and outlasts `call_deadline`, and the classification guidance.
+
 ## 2026-07-02 — positive-framing sweep across the model-facing prompts
 
 Follow-on to the explorer wide-span change (PR #48). Amy's principle: if something's

@@ -285,6 +285,21 @@ the git log. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A stalled backend can no longer hang a call overnight.** An interactive
+  `consult` / `explore` / `oneshot` now runs under a whole-call wall-clock deadline
+  (`call_deadline_secs`, default 1 hour; env `KAIBO_CALL_DEADLINE_SECS`), independent
+  of the per-request `request_timeout`. The per-request timeout catches a backend that
+  never answers, but not every wedge shape — a stalled response body, or a pooled
+  keep-alive to a server that stopped responding, once parked a real consult ~17 hours.
+  Past the deadline the call aborts with a clean tool-result error naming it (classed as
+  a transient/retryable condition, not a kaibo bug), so your session keeps moving instead
+  of waiting forever. Keep the value above your slowest legitimate single completion. It
+  bounds the interactive loop tools — `consult` / `explore` / `oneshot` and async
+  `consult_submit`. `deliberate`'s direct lane (one long local completion) is bounded
+  instead by its synth backend's `request_timeout`, so a slow local model keeps its full
+  patience without forcing this ceiling high; the batch lane holds no in-process wait
+  (the work runs on the provider's queue).
+
 - **The advertised cast roster marks the default even when it's set by an alias.**
   Setting `server.cast` (or `--cast` / `KAIBO_CAST`) to a cast *alias* — say `claude`
   for `anthropic` — used to drop the `(default)` tag from the handshake's `## Casts`

@@ -36,8 +36,9 @@
 
 #![allow(dead_code)] // shared across test binaries; each uses only a subset.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
@@ -103,6 +104,11 @@ impl RecordedRequest {
 #[derive(Clone)]
 pub struct ScriptedClient {
     responders: Arc<HashMap<String, Responder>>,
+    /// Model ids whose `completion()` never returns — a *wedged provider*: the call
+    /// parks on an effectively unbounded async sleep instead of answering. This is
+    /// the failure mode a stopped/hung local server produces (the request goes out,
+    /// no response ever comes), and it's what the call-deadline backstop must catch.
+    hangers: Arc<HashSet<String>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
@@ -110,6 +116,7 @@ impl ScriptedClient {
     pub fn builder() -> ScriptedBuilder {
         ScriptedBuilder {
             responders: HashMap::new(),
+            hangers: HashSet::new(),
         }
     }
 
@@ -129,6 +136,7 @@ impl ScriptedClient {
 
 pub struct ScriptedBuilder {
     responders: HashMap<String, Responder>,
+    hangers: HashSet<String>,
 }
 
 impl ScriptedBuilder {
@@ -145,9 +153,18 @@ impl ScriptedBuilder {
         self
     }
 
+    /// Make model `id` a *wedged provider*: its `completion()` records the request
+    /// then parks forever (an unbounded async sleep), never answering — the
+    /// stopped/hung-backend shape the call-deadline test drives. Needs no responder.
+    pub fn hang_model(mut self, id: impl Into<String>) -> Self {
+        self.hangers.insert(id.into());
+        self
+    }
+
     pub fn build(self) -> ScriptedClient {
         ScriptedClient {
             responders: Arc::new(self.responders),
+            hangers: Arc::new(self.hangers),
             log: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -159,6 +176,7 @@ impl ScriptedBuilder {
 pub struct ScriptedModel {
     id: String,
     responders: Arc<HashMap<String, Responder>>,
+    hangers: Arc<HashSet<String>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
@@ -186,6 +204,7 @@ impl CompletionModel for ScriptedModel {
         Self {
             id: model.into(),
             responders: client.responders.clone(),
+            hangers: client.hangers.clone(),
             log: client.log.clone(),
         }
     }
@@ -199,6 +218,12 @@ impl CompletionModel for ScriptedModel {
             .lock()
             .expect("request log poisoned")
             .push(RecordedRequest::capture(&self.id, &request));
+        // A wedged provider: the request went out (recorded above) and no answer ever
+        // comes. Park effectively forever — a real call-deadline fires long before this
+        // elapses, and the request is already observable in the log.
+        if self.hangers.contains(&self.id) {
+            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+        }
         let responder = self.responders.get(&self.id).unwrap_or_else(|| {
             panic!(
                 "scripted client has no responder for model {:?} (registered: {:?})",

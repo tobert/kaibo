@@ -141,6 +141,7 @@ pub(super) fn render_config_resource(
         synth_effort: String,
         thinking_style: String,
         request_timeout_secs: u64,
+        call_deadline_secs: u64,
         session_capacity: usize,
         job_capacity: usize,
     }
@@ -347,6 +348,7 @@ pub(super) fn render_config_resource(
         synth_effort,
         thinking_style,
         request_timeout,
+        call_deadline,
         session_capacity,
         job_capacity,
     } = &config.defaults;
@@ -410,6 +412,7 @@ pub(super) fn render_config_resource(
             synth_effort: synth_effort.clone(),
             thinking_style: format!("{thinking_style:?}").to_lowercase(),
             request_timeout_secs: request_timeout.as_secs(),
+            call_deadline_secs: call_deadline.as_secs(),
             session_capacity: session_capacity.get(),
             job_capacity: job_capacity.get(),
         },
