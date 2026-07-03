@@ -93,7 +93,8 @@ impl Default for ExploreConfig {
 
 /// The full two-phase `consult`: an investigation ([`ExploreConfig`]) plus what
 /// only the synth driver loop needs — how many turns its own loop gets, and the
-/// caller's attached files (named for the model to read itself, not inlined).
+/// caller's attached files (inlined within the budget, demoted to read-whole
+/// directives past it).
 #[derive(Debug, Clone)]
 pub struct ConsultConfig {
     /// The investigation half: preamble/liveness plus explorer sweep bounds and
@@ -102,13 +103,15 @@ pub struct ConsultConfig {
     /// Bounds the recomposed consult's *whole* driver loop (it delegates sweeps AND
     /// reads spans), so it must be generous — a multi-part question blew the old 8.
     pub synth_max_turns: usize,
-    /// Caller-attached files, as **root-relative paths the model reads itself** — *not*
-    /// inlined bytes. Unlike `oneshot`/`batch` attach (toolless, so kaibo inlines),
-    /// `consult` has tools, so attach just *names* each file in the driver's prompt and
-    /// lets the model open it when it's ready: a text file with `cat -n`, an image with
-    /// `view_image` (per [`ConsultAttachment::is_image`]) — no upfront IO, the model builds
-    /// its narrative its own way. The server validates each path lands under the consult's
-    /// root and sniffs its type before filling this. `Default` is empty.
+    /// Caller-attached files, resolved server-side: attach means *the model sees the
+    /// bytes*. A text file within the inline budget carries its full body (inlined
+    /// numbered into the driver prompt); one past the budget is demoted to a
+    /// read-it-WHOLE directive; an image routes to `view_image` (per
+    /// [`ConsultAttachment`]'s variants). Every text attachment also reaches the
+    /// delegated `explore′` sweeps as a preamble directive to read it whole — a sweep
+    /// is a fresh agent that never saw the driver prompt. The server validates each
+    /// path lands under the consult's root and classifies by content before filling
+    /// this. `Default` is empty.
     pub attachments: Vec<ConsultAttachment>,
 }
 

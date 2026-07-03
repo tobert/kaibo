@@ -101,6 +101,15 @@ pub struct Defaults {
     /// result (a full answer + optional explorer report) is heavier than a session's
     /// lean Q&A pair, so the honest cap is smaller.
     pub job_capacity: NonZeroUsize,
+    /// Cumulative byte budget for INLINING `consult` text attachments into the driver
+    /// prompt (caller order, greedy). A text attachment past the remaining budget is
+    /// demoted — named in the prompt with a read-it-WHOLE directive instead of its
+    /// bytes — loudly, never silently dropped. `0` is legal and means "inline
+    /// nothing": every text attachment becomes a directive, the escape hatch for a
+    /// small-context cast (a 4K-ctx local model chokes on inlined bytes that a hosted
+    /// model shrugs at). Inlined bytes ride every turn of the driver loop, so this
+    /// bounds resident prompt cost, not just one request.
+    pub inline_attach_budget: usize,
 }
 
 impl Default for Defaults {
@@ -150,6 +159,10 @@ impl Default for Defaults {
             // 64 is generous headroom before the LRU starts aborting the oldest
             // still-running job to make room.
             job_capacity: NonZeroUsize::new(64).expect("64 is nonzero"),
+            // 256 KiB — a healthy diff or several source files inline whole; a
+            // runaway attach batch demotes to read-WHOLE directives instead of
+            // ballooning every driver-loop turn.
+            inline_attach_budget: 1 << 18,
         }
     }
 }
@@ -541,7 +554,10 @@ impl Cast {
     /// can't drift.
     pub fn resolved_prompts(&self, global: &PromptOverrides) -> PromptOverrides {
         let mut p = global.clone();
-        if let Some(pre) = self.slot(ModelRole::Explorer).and_then(|s| s.preamble.clone()) {
+        if let Some(pre) = self
+            .slot(ModelRole::Explorer)
+            .and_then(|s| s.preamble.clone())
+        {
             p.explorer = Some(pre);
         }
         if let Some(pre) = self.slot(ModelRole::Synth).and_then(|s| s.preamble.clone()) {
@@ -759,9 +775,9 @@ impl Config {
     /// enabled — and the one that finally routes a `Direct` synth (unreachable until
     /// `deliberate` shipped).
     pub fn cast_can_deliberate(&self, name: &str) -> bool {
-        self.casts.get(name).is_some_and(|c| {
-            c.synth_lane().is_some() && c.slot(ModelRole::Explorer).is_some()
-        })
+        self.casts
+            .get(name)
+            .is_some_and(|c| c.synth_lane().is_some() && c.slot(ModelRole::Explorer).is_some())
     }
 
     /// Whether canonical cast `name` can staff an `explore` call: it carries an **explorer**
@@ -1680,6 +1696,7 @@ struct RawDefaults {
     call_deadline_secs: Option<u64>,
     session_capacity: Option<usize>,
     job_capacity: Option<usize>,
+    inline_attach_budget: Option<usize>,
 }
 
 /// One `[backends.<name>]` stanza: connection knobs only — models live on casts.
@@ -1840,7 +1857,12 @@ impl RawSlot {
                     .map(str::parse)
                     .transpose()
                     .context("thinking_style")?,
-                lane: t.lane.as_deref().map(str::parse).transpose().context("lane")?,
+                lane: t
+                    .lane
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .context("lane")?,
                 // Same loud-on-empty rule as `[prompts]`: a blank per-model prompt
                 // is never intended, and silently running it would strip the role
                 // framing with no signal. Drop the key to fall back.
@@ -1903,6 +1925,10 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
             .unwrap_or(d.call_deadline),
         session_capacity,
         job_capacity,
+        // 0 is legal here (unlike the capacities/deadlines): it means "inline
+        // nothing — demote every text attachment to a read-WHOLE directive", the
+        // deliberate escape hatch for small-context casts.
+        inline_attach_budget: raw.inline_attach_budget.unwrap_or(d.inline_attach_budget),
     })
 }
 
@@ -2163,6 +2189,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_JOB_CAPACITY") {
         defaults.job_capacity = Some(parse_env_int("KAIBO_JOB_CAPACITY", &v)?);
     }
+    if let Some(v) = get("KAIBO_INLINE_ATTACH_BUDGET") {
+        defaults.inline_attach_budget = Some(parse_env_int("KAIBO_INLINE_ATTACH_BUDGET", &v)?);
+    }
 
     // Context files: colon-separated like PATH (and like KAIBO_ALLOW_PATHS), so a
     // single path with no colon is one entry. An empty value sets an empty list —
@@ -2307,9 +2336,9 @@ fn expand_path(s: &str) -> anyhow::Result<PathBuf> {
 /// a silent corruption. Paths kept as `PathBuf` (`root`/`allow_paths`/`user_files`) don't
 /// need this; they carry the bytes intact.
 fn expanded_to_utf8(p: PathBuf, what: &str) -> anyhow::Result<String> {
-    p.into_os_string().into_string().map_err(|os| {
-        anyhow!("{what} expanded to a non-UTF-8 path ({os:?}); write it in UTF-8")
-    })
+    p.into_os_string()
+        .into_string()
+        .map_err(|os| anyhow!("{what} expanded to a non-UTF-8 path ({os:?}); write it in UTF-8"))
 }
 
 /// Resolve one variable lookup to its value, refusing the two set-but-unusable cases that
@@ -2321,7 +2350,11 @@ fn expanded_to_utf8(p: PathBuf, what: &str) -> anyhow::Result<String> {
 ///   error` doesn't catch this because an empty var *is* defined, so it's refused here.
 /// - **Set but non-UTF-8** (`Err(NotUnicode)`): reported accurately instead of as "not set"
 ///   (the variable *is* set), pointing at `~` which handles a non-UTF-8 home via `var_os`.
-fn resolve_var(name: &str, full: &str, value: Result<String, std::env::VarError>) -> anyhow::Result<String> {
+fn resolve_var(
+    name: &str,
+    full: &str,
+    value: Result<String, std::env::VarError>,
+) -> anyhow::Result<String> {
     use std::env::VarError;
     match value {
         Ok(v) if v.is_empty() => bail!(
@@ -2463,13 +2496,25 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME set in test env");
 
         assert_eq!(expand_env_vars("$HOME/src").unwrap(), format!("{home}/src"));
-        assert_eq!(expand_env_vars("${HOME}/src").unwrap(), format!("{home}/src"));
+        assert_eq!(
+            expand_env_vars("${HOME}/src").unwrap(),
+            format!("{home}/src")
+        );
         // A reference mid-path, and back-to-back text.
-        assert_eq!(expand_env_vars("/x/${HOME}y").unwrap(), format!("/x/{home}y"));
+        assert_eq!(
+            expand_env_vars("/x/${HOME}y").unwrap(),
+            format!("/x/{home}y")
+        );
         // Adjacent references concatenate; the second `$` ends the first name and starts
         // a new reference (`is_continue` ⊇ `is_start`, so the name loop is well-behaved).
-        assert_eq!(expand_env_vars("$HOME$HOME").unwrap(), format!("{home}{home}"));
-        assert_eq!(expand_env_vars("${HOME}${HOME}").unwrap(), format!("{home}{home}"));
+        assert_eq!(
+            expand_env_vars("$HOME$HOME").unwrap(),
+            format!("{home}{home}")
+        );
+        assert_eq!(
+            expand_env_vars("${HOME}${HOME}").unwrap(),
+            format!("{home}{home}")
+        );
     }
 
     /// An undefined variable is a loud error, not a silent empty segment — the property
@@ -2479,7 +2524,10 @@ mod tests {
     fn expand_env_vars_undefined_or_malformed_is_loud() {
         // A name we can be confident is unset in any sane test environment.
         let unset = "KAIBO_DEFINITELY_UNSET_VAR_9Q";
-        assert!(std::env::var(unset).is_err(), "test precondition: {unset} unset");
+        assert!(
+            std::env::var(unset).is_err(),
+            "test precondition: {unset} unset"
+        );
 
         for bad in [
             format!("${unset}"),       // bare form, undefined
@@ -2523,7 +2571,10 @@ mod tests {
         use std::env::VarError;
         use std::ffi::OsString;
 
-        assert_eq!(resolve_var("X", "$X", Ok("/tmp/scratch".into())).unwrap(), "/tmp/scratch");
+        assert_eq!(
+            resolve_var("X", "$X", Ok("/tmp/scratch".into())).unwrap(),
+            "/tmp/scratch"
+        );
         assert!(
             resolve_var("X", "$X", Ok(String::new())).is_err(),
             "a set-but-empty variable must be refused — an empty segment re-anchors the path"
@@ -2543,9 +2594,18 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME set in test env");
         let home = home.trim_end_matches('/');
 
-        assert_eq!(expand_path("~/src").unwrap(), PathBuf::from(format!("{home}/src")));
-        assert_eq!(expand_path("$HOME/src").unwrap(), PathBuf::from(format!("{home}/src")));
-        assert_eq!(expand_path("/data/fixtures").unwrap(), PathBuf::from("/data/fixtures"));
+        assert_eq!(
+            expand_path("~/src").unwrap(),
+            PathBuf::from(format!("{home}/src"))
+        );
+        assert_eq!(
+            expand_path("$HOME/src").unwrap(),
+            PathBuf::from(format!("{home}/src"))
+        );
+        assert_eq!(
+            expand_path("/data/fixtures").unwrap(),
+            PathBuf::from("/data/fixtures")
+        );
         // Undefined variable propagates as an error through expand_path, not a panic.
         assert!(expand_path("$KAIBO_DEFINITELY_UNSET_VAR_9Q/x").is_err());
     }
@@ -2602,7 +2662,10 @@ mod tests {
         let cfg =
             Config::from_toml_str("[backends.anthropic]\napi_key_file = \"$HOME/.akey\"").unwrap();
         let b = cfg.resolve_backend("anthropic").unwrap();
-        assert_eq!(b.api_key_file.as_deref(), Some(format!("{home}/.akey").as_str()));
+        assert_eq!(
+            b.api_key_file.as_deref(),
+            Some(format!("{home}/.akey").as_str())
+        );
     }
 
     /// An undefined variable in either path is a loud load error — never a silent gap
@@ -2610,12 +2673,13 @@ mod tests {
     #[test]
     fn undefined_var_in_user_files_or_api_key_file_is_loud_at_load() {
         let unset = "KAIBO_DEFINITELY_UNSET_VAR_9Q";
-        assert!(std::env::var(unset).is_err(), "test precondition: {unset} unset");
         assert!(
-            Config::from_toml_str(&format!(
-                "[context]\nuser_files = [\"${unset}/notes.md\"]"
-            ))
-            .is_err(),
+            std::env::var(unset).is_err(),
+            "test precondition: {unset} unset"
+        );
+        assert!(
+            Config::from_toml_str(&format!("[context]\nuser_files = [\"${unset}/notes.md\"]"))
+                .is_err(),
             "undefined var in user_files must fail at load"
         );
         assert!(

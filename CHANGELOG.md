@@ -22,14 +22,19 @@ the git log. Each later release appends a new section at the top.
   answer carries a provenance footer naming the cast and the models that produced it.
   Args: `question`, `context`, `path`, `cast`, `session_id`, `attach`, `include_report`,
   and per-call `explorer_model` / `synth_model` (+ `_backend`) overrides. **`attach`**
-  names workspace files (under the project root) to put in front of the investigation —
-  unlike the tool-less tools' attach, kaibo does *not* inline them; it names them in the
-  prompt and the consult model opens each itself when it's ready, in full, building its own
-  narrative: a text file with the shell (`cat -n`), an **image** with its `view_image` tool.
-  An attached image therefore needs a vision-capable cast — kaibo refuses one to a
-  vision-blind synth up front (the same honest refusal `oneshot`/`batch` give) rather than
-  name a file the model could never open. The files just have to live under the root the
-  consult reads (a worktree counts).
+  puts workspace files (under the project root) in front of the investigation — attach
+  means *the model sees the bytes*. Text files are **inlined whole** into the
+  investigation prompt, lines numbered like `cat -n` so the model cites them by exact
+  `file:line`; a file past the cumulative inline budget (`[defaults]
+  inline_attach_budget` / `KAIBO_INLINE_ATTACH_BUDGET`, default 256 KiB; `0` = inline
+  nothing, the escape hatch for small-context local casts) is instead ordered read WHOLE
+  through the model's shell — demoted loudly with its size, never silently dropped. Every
+  delegated explorer sweep also gets a read-them-WHOLE directive for the attached files,
+  so a sub-agent is never blind to what you flagged as central. An **image** opens via
+  the `view_image` tool and therefore needs a vision-capable cast — kaibo refuses one to
+  a vision-blind synth up front (the same honest refusal `oneshot`/`batch` give) rather
+  than name a file the model could never open. The files just have to live under the
+  root the consult reads (a worktree counts).
 - **`consult_submit`** — the *async sibling* of `consult` (as batch is to `oneshot`):
   start a consultation in the background and get back a handle (`job-N`) instead of
   holding your turn open while a deep investigation runs. Same investigation, same args
@@ -49,7 +54,10 @@ the git log. Each later release appends a new section at the top.
   grounded survey you'll reason over yourself (or feed to another model), when you want the
   map rather than the conclusion. It reads the repo itself like `consult`, so it takes the
   same `path` / `cast` / `explorer_model` (+ `explorer_backend`) / `explorer_max_turns`
-  arguments; being single-phase, it has no synth args, `attach`, `context`, or `session_id`.
+  arguments, plus `attach`: text files the investigator is directed to read WHOLE during
+  its sweep (it reads through the shell, so nothing inlines and images are refused —
+  attach those to `consult` with a vision cast). Being single-phase, it has no synth
+  args, `context`, or `session_id`.
   Because it runs *only* the explorer, its `cast` accepts **any cast with an explorer** —
   not just interactive ones, but `deliberate`/`direct` casts too: point it at one to run
   that team's (often smarter) explorer standalone, handy for sizing up an explorer or for a
@@ -68,8 +76,10 @@ the git log. Each later release appends a new section at the top.
   explorer with an offline synth (the example config's `fable`, `gemini-deliberate`, or
   `local-direct`) — `deliberate`'s `cast` enum lists the usable ones and `kaibo://config`
   shows each cast's lane. Reads the repo itself, so it takes `path` / `cast` /
-  `explorer_model` / `synth_model` (+ `_backend`s); the offline synth is a single turn, so
-  no `attach` / `context` / `session_id`. Gated independently by `--no-deliberate`. This is
+  `explorer_model` / `synth_model` (+ `_backend`s), plus `attach` — text files the
+  dossier-building explorer is directed to read WHOLE, so their content reaches the
+  offline synth through the dossier; the synth itself is a single turn, so no `context` /
+  `session_id`. Gated independently by `--no-deliberate`. This is
   the tool that finally routes the `direct` lane the per-slot lane reshape introduced. For
   an answer this turn, use `consult`.
 - **`oneshot`** — a thin, direct second opinion from a model outside your family:
@@ -270,18 +280,21 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
-- **The explorer reads big files in fewer, wider passes.** Its guidance now gives a
-  file too large to read whole a first-class strategy — a few wide `sed` spans (a few
-  hundred lines each) instead of many tiny slices — so a `consult`/`explore` over large
-  sources spends noticeably fewer tool calls gathering the same evidence (measured: a
-  broad sweep dropped from 74 read/search calls to 46, reading the same big file in ~13
-  wide spans instead of ~22 fifteen-line ones). No behavior change on short files.
-- **The `consult` driver and the shared kaish cheatsheet describe reading in wide
-  passes**, matching the guidance the explorer got: a short file read whole, a big one
-  in a few hundred-line spans. Several preambles also drop negative-example phrasing
-  in favor of stating the wanted behavior directly. A `consult` over large sources
-  should spend fewer tool calls gathering the same evidence (same mechanism the
-  explorer change measured).
+- **Models read files WHOLE by default, and a truncated giant stages into targeted
+  reads.** The explorer, the `consult` driver, and the shared kaish cheatsheet all
+  lead with whole-file reads: `cat -n FILE` is the stated first move on any file that
+  matters (the old "a *short* file: read it whole" made models classify before daring
+  a whole read, then nibble), `grep` is framed as the way to find *which* files
+  matter rather than a reading tool, and the `wc -l` pre-probe is gone. The output
+  cap stays 64 KiB — ~23K tokens, sized so the worst single turn stays small on a
+  128–250K-context explorer — because truncation is now *informative*, not a
+  dead end: exit 3 already returns the file's head and tail, and the guidance stages
+  the rest as targeted reads (`grep -n SYMBOL FILE`, then a ~1,200-line span around
+  it) instead of a mechanical full walk. Fewer, wider turns: every turn re-sends the
+  transcript, so one whole-file read beats five slices on both cost and wall-clock.
+  (Supersedes the earlier few-hundred-line span guidance, measured at 74→46 calls;
+  whole-first goes further. Attached files the caller flagged as central keep the
+  read-it-ALL directive — there the full cost is deliberate.)
 
 ### Fixed
 

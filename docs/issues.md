@@ -90,6 +90,13 @@ were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test
   immediately — trades away the batch lane's cross-restart durability; don't without the
   persistence decision.
 
+### Bump to kaish-kernel 0.11.0 as soon as it drops
+0.11.0 fixes grep BRE `\|` alternation silently matching nothing — measured live
+2026-07-03 costing a deepseek explorer ~10-15 retry turns in one sweep (mitigated
+meanwhile by the cheatsheet teaching `grep -rnE 'foo|bar'`, which stays valid after
+the bump). Usual bump discipline applies (adapt to any API shape change, boundary
+tests keep teeth).
+
 ### Upstream kaish-vfs: `LocalFs::list` hard-fails when an entry vanishes mid-walk
 `kaish-vfs` `LocalFs::list` (`src/local.rs`, 0.9.0) enumerates a directory with
 `read_dir`, then calls `symlink_metadata` on *each* entry and propagates any error with
@@ -211,6 +218,28 @@ to `McpError::internal_error`, matching `run_kaish`. Low priority (kernel build 
 in-process and reliable); the classification covers the user-facing symptom today.
 
 ## P3 — Infra, perf, polish
+
+### `KaishWorker::read_file` is unbounded — stat-then-read growth race
+`sandbox.rs` `Job::Read` slurps the whole file through the VFS with no size cap.
+Both attachment resolvers check `metadata().len()` against their cap/budget *before*
+reading, so a file that grows huge in the stat→read window gets slurped into memory
+before the post-read length check demotes/refuses it (Gemini cross-family review,
+2026-07-03). kaibo's stated adversary (the model) can't drive filesystem timing, so
+this is robustness, not an escape — but a fast-growing log file could spike memory.
+Fix shape: a capped read op on the worker (`read_file_capped(max)`) that refuses past
+the cap at the VFS layer; both resolvers pass their real ceiling.
+
+### Attach-inline follow-ons: per-call budget, observed cost
+`inline_attach_budget` (2026-07-03, `[defaults]`/env) is server-wide only. Two
+things to watch in real sessions before adding surface: (1) whether a **per-call
+override** earns its schema slot (a caller pairing one big attach batch with a
+hosted cast while the server default protects local casts would want it); (2) the
+**real token cost** of inlined attachments riding every driver-loop turn on hosted
+casts — the OpenRouter cost-calibration finding (cache reads 50× DeepSeek's) says
+transcript-resident bytes multiply fast at 200 turns. Also: `explore` refuses image
+attach because the sweep toolset has no `view_image` (`run_explore_phase` builds
+`{run_kaish}` only) — if a vision-capable explorer sweep ever earns `view_image`,
+revisit the refusal.
 
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read
@@ -401,9 +430,9 @@ gated on a key/endpoint) and passed with thinking on — the probes above extend
 
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
-`ExplorationTrace`), the curiosity + completeness behaviors, and the assertive
-whole-file / `grep -B/-A` reading strategy now live in `report_preamble` (and the
-`grep`/`wc -l` idioms in the shared cheatsheet). Measured against a real review task,
+`ExplorationTrace`), the curiosity + completeness behaviors, and the whole-first /
+staged-targeted-read strategy now live in `report_preamble` (with the grep gotchas
+in the shared cheatsheet; the `wc -l` pre-probe was retired 2026-07-03). Measured against a real review task,
 a lite Gemini explorer dropped from 48 turns to ~21 with *better* citations — the
 built-in reproduces it with no per-cast config. Still open, lower value:
 - **A worked, filled-in example in the prompt.** We ship the section *template*, not a

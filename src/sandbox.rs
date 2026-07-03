@@ -104,17 +104,17 @@ fn apply_disabled_builtins(registry: &mut ToolRegistry, disable: &[String]) {
 /// matches a patient MCP caller while still bounding a runaway.
 pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default per-script output cap: a single wide `cat`/`grep` can't flood the
-/// caller's context, but a *whole-file* read of typical source fits. We push
-/// models to read whole files (see the read idioms in `consult.rs`/`kaish_syntax.rs`),
-/// so the kernel's own `OutputLimitConfig::agent()` default of 8 KB is too tight —
-/// it truncates a ~300-line file, undercutting the very behavior we ask for. 64 KB
-/// (~18K tokens) lets every kaibo source file but the three giants load whole, and
-/// the exit-3 head+tail sample still backstops a genuinely huge read. Override via
-/// `[sandbox].output_limit_bytes`. Bytes, not tokens, on purpose: the cap is a
-/// flood backstop, not a context budget — a byte proxy is fine, and a token cap
-/// would mean embedding tiktoken (OpenAI's tokenizer, a proxy for our casts anyway)
-/// in a single-static binary. See the PR/commit for that reasoning.
+/// Default per-script output cap, sized for the *explorer's* context budget: the
+/// read idioms (`consult/prompts.rs`, `kaish_syntax.rs`) say read files WHOLE
+/// first, and 64 KiB (~23K tokens at the ~2.8 bytes/token we measured on our own
+/// Rust) fits nearly every real source file in one read while keeping the worst
+/// single turn small enough for a 128-250K-context explorer whose transcript
+/// re-sends every turn. A genuinely giant file truncates *informatively* — exit 3
+/// returns a head+tail sample, and the guidance stages the rest as targeted reads
+/// (grep the symbols, span the regions) rather than a mechanical full walk.
+/// Override via `[sandbox].output_limit_bytes`. Bytes, not tokens, on purpose:
+/// this is a flood backstop, not a context budget, and a token cap would mean
+/// embedding a tokenizer in a single-static binary.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 1 << 16; // 64 KiB
 
 /// Default cap on the `/` scratch `MemoryFs` (64 MB). Scratch is a feature — a

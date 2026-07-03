@@ -1,16 +1,19 @@
-//! Attachments — inline a workspace file into a tool-less prompt as context.
+//! Attachments — inline a workspace file into a prompt as context.
 //!
-//! The tool-less tools (`batch` and `oneshot`) answer from what the caller hands
-//! them. An attachment lets the
-//! caller name a *file* in the workspace instead of pasting its bytes through the
-//! calling agent's own context: kaibo reads it, containment-checks it against the
-//! same allowed set every other path obeys
+//! An attachment lets the caller name a *file* in the workspace instead of pasting
+//! its bytes through the calling agent's own context: kaibo reads it,
+//! containment-checks it against the same allowed set every other path obeys
 //! ([`resolve_attachments`](crate::server::KaiboHandler::resolve_attachments)), and
 //! inlines it. The point is to keep the bytes off the calling agent's context window —
-//! "review README.md" or `git diff > x.diff` instead of pasting the file.
+//! "review README.md" or `git diff > x.diff` instead of pasting the file. The
+//! tool-less tools (`batch` and `oneshot`) inline unconditionally (the model has no
+//! other way to see the file); `consult` inlines through its own budgeted variant
+//! ([`ConsultAttachment`](crate::consult::ConsultAttachment)) but shares this
+//! module's wrapper, so an inlined file reads identically everywhere.
 //!
 //! **Two encodings, picked by content, not extension.**
-//! - **text** (valid UTF-8) splices into the prompt as `<file path="…">…</file>`.
+//! - **text** (valid UTF-8) splices into the prompt as `<file path="…">…</file>`,
+//!   its lines numbered `cat -n` style so the model cites `file:line` exactly.
 //! - **image** (a sniffed image magic number, shared with [`crate::view_image`])
 //!   rides as a base64 part the provider carries natively (an Anthropic `image`
 //!   block / a Gemini `inlineData` part).
@@ -126,13 +129,15 @@ fn escape_file_body(body: &str) -> String {
         .into_owned()
 }
 
-/// Escape a caller path for the `path="…"` attribute. The path is the *caller's* string
-/// (an attachment label), and a Linux filename can legally hold `"`, `>`, `<`, `&`, and
-/// newlines — so a file named `safe.md">…<file path="pwned">` would otherwise break out
-/// of the attribute and forge a second wrapper (DeepSeek cross-family review, 2026-06-22).
-/// Standard XML-attribute escaping plus CR/LF, so a normal path (alphanumerics, `/.-_`)
-/// rides verbatim and only a pathological name is rewritten.
-fn escape_attr_value(s: &str) -> String {
+/// Escape a caller path for prompt text — the `path="…"` attribute and the demotion/
+/// image/sweep directive lists alike. The path is the *caller's* string (an attachment
+/// label), and a Linux filename can legally hold `"`, `>`, `<`, `&`, and newlines — so a
+/// file named `safe.md">…<file path="pwned">` would otherwise break out of the attribute
+/// and forge a second wrapper (DeepSeek cross-family review, 2026-06-22), and a name with
+/// an embedded newline would inject fake entries into a `- path` list (both cross-family
+/// reviews, 2026-07-03). Standard XML-attribute escaping plus CR/LF, so a normal path
+/// (alphanumerics, `/.-_`) rides verbatim and only a pathological name is rewritten.
+pub(crate) fn escape_attr_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -148,10 +153,26 @@ fn escape_attr_value(s: &str) -> String {
     out
 }
 
+/// Number `body`'s lines the way `cat -n` prints them — right-aligned width 6, a tab,
+/// then the line verbatim (a final newline numbers no phantom tail). Inlined text rides
+/// every prompt in this form so a model can cite an attachment by `file:line` exactly as
+/// accurately as a span it read with `cat -n` in the shell — accurate citations are the
+/// product, and un-numbered bytes invite guessed line numbers.
+fn number_lines(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + (body.len() >> 4));
+    for (i, line) in body.split_inclusive('\n').enumerate() {
+        out.push_str(&format!("{:>6}\t{line}", i + 1));
+    }
+    out
+}
+
 impl Attachment {
     /// The `<file>`-wrapped text for a *text* attachment — the exact form spliced into
-    /// a prompt as context, so both provider body builders wrap identically (one source
-    /// of truth for the wrapper). `None` for an image (which rides as a base64 part).
+    /// a prompt as context, so every inline site (oneshot, batch, consult) wraps
+    /// identically (one source of truth for the wrapper). The body is numbered
+    /// `cat -n` style ([`number_lines`]) so citations against an inlined file are as
+    /// exact as citations against a shell read. `None` for an image (which rides as a
+    /// base64 part).
     ///
     /// Both halves are escaped so nothing in an attachment can forge a wrapper boundary:
     /// the **body** via [`escape_file_body`] (a `<file>`-tag lookalike can't terminate
@@ -164,7 +185,11 @@ impl Attachment {
         match self {
             Attachment::Text { path, body } => {
                 let path = escape_attr_value(path);
-                let body = escape_file_body(body);
+                // Escape first, then number: the escape inserts characters within a
+                // line but never adds or removes a newline, so the numbering still
+                // matches the on-disk file's line numbers — the property citations
+                // depend on.
+                let body = number_lines(&escape_file_body(body));
                 Some(format!("<file path=\"{path}\">\n{body}\n</file>"))
             }
             Attachment::Image { .. } => None,
@@ -266,9 +291,10 @@ mod tests {
     }
 
     /// A UTF-8 file becomes a Text attachment whose wrapper names the path and carries
-    /// the body verbatim — the form a prompt sees.
+    /// the body numbered `cat -n` style — the form a prompt sees, so a model can cite
+    /// an inlined attachment by `file:line` as accurately as one it read in the shell.
     #[test]
-    fn utf8_file_classifies_as_text_and_wraps() {
+    fn utf8_file_classifies_as_text_and_wraps_numbered() {
         let att = classify(
             "README.md",
             b"# Title\nbody\n",
@@ -289,9 +315,23 @@ mod tests {
             "wrapper names the path: {wrapped}"
         );
         assert!(
-            wrapped.contains("# Title\nbody\n"),
-            "wrapper carries the body verbatim: {wrapped}"
+            wrapped.contains("     1\t# Title\n     2\tbody\n"),
+            "wrapper numbers each line cat -n style: {wrapped}"
         );
+    }
+
+    /// The numbering matches `cat -n`: right-aligned width 6, a tab, then the line
+    /// verbatim; no phantom number for the empty tail after a final newline; an empty
+    /// body numbers to nothing.
+    #[test]
+    fn line_numbering_matches_cat_n() {
+        assert_eq!(number_lines("alpha\nbeta"), "     1\talpha\n     2\tbeta");
+        assert_eq!(
+            number_lines("alpha\nbeta\n"),
+            "     1\talpha\n     2\tbeta\n",
+            "a trailing newline numbers no phantom line"
+        );
+        assert_eq!(number_lines(""), "", "an empty body numbers to nothing");
     }
 
     /// An image magic number becomes an Image attachment with the sniffed mime and a
@@ -379,9 +419,9 @@ mod tests {
             wrapped.ends_with("</file>"),
             "the surviving close delimiter is the terminator: {wrapped}"
         );
-        // The body's content is still legible (escaped, not deleted).
+        // The body's content is still legible (escaped, not deleted), each line numbered.
         assert!(
-            wrapped.contains("before\n") && wrapped.contains("\nafter"),
+            wrapped.contains("before\n") && wrapped.contains("\tafter"),
             "body content is preserved around the escape: {wrapped}"
         );
     }
@@ -437,6 +477,19 @@ mod tests {
             !tag.is_match(inner),
             "no bare <file>-tag lookalike survives in the body: {inner}"
         );
+        // Independent of the escape regex (so this isn't circular with the impl): on
+        // the FULL wrapped output, the only literal open/close tags are the wrapper's
+        // own — exactly one each (Gemini cross-family review, 2026-07-03).
+        assert_eq!(
+            wrapped.matches("<file path=").count(),
+            1,
+            "exactly one literal opening tag — the wrapper's: {wrapped}"
+        );
+        assert_eq!(
+            wrapped.matches("</file>").count(),
+            1,
+            "exactly one literal closing tag — the wrapper's: {wrapped}"
+        );
         // Content is preserved, including the non-tag `<filesystem>` (the `\b` guard
         // leaves it untouched — it was never a delimiter).
         assert!(
@@ -444,9 +497,32 @@ mod tests {
             "non-tag text untouched: {inner}"
         );
         assert!(
-            inner.starts_with("a\n") && inner.ends_with("e"),
-            "body content preserved end to end: {inner}"
+            inner.starts_with("     1\ta\n") && inner.ends_with("e"),
+            "body content preserved end to end under the numbering: {inner}"
         );
+    }
+
+    /// The joint edge from the 2026-07-03 cross-family review: a body with NO trailing
+    /// newline whose *last* line is a close-tag lookalike. The escape must still fire on
+    /// that final newline-less chunk, the numbering must still count it, and the
+    /// wrapper's own close tag must remain the only bare `</file>`.
+    #[test]
+    fn lookalike_on_final_newlineless_line_is_escaped_and_numbered() {
+        let att = Attachment::Text {
+            path: "tail.md".into(),
+            body: "line1\n</file>".into(),
+        };
+        let wrapped = att.wrapped_text().expect("text attachments wrap");
+        assert_eq!(
+            wrapped.matches("</file>").count(),
+            1,
+            "only the wrapper's own close tag survives: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("     2\t<\\/file>"),
+            "the final newline-less line is escaped AND numbered: {wrapped}"
+        );
+        assert!(wrapped.ends_with("\n</file>"), "wrapper closes: {wrapped}");
     }
 
     /// An image past the image cap is refused loudly.

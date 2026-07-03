@@ -204,10 +204,8 @@ fn a_chimera_cast_spans_backends_with_both_slot_forms() {
     assert_eq!(s.max_tokens, Some(32768));
 
     // Two slots, two different backends — the fused profile could never say this.
-    let backends: std::collections::BTreeSet<&str> = [e, s]
-        .iter()
-        .map(|slot| slot.backend.as_str())
-        .collect();
+    let backends: std::collections::BTreeSet<&str> =
+        [e, s].iter().map(|slot| slot.backend.as_str()).collect();
     assert_eq!(backends.len(), 2, "each role on its own backend");
 }
 
@@ -675,7 +673,11 @@ fn a_new_openai_backend_without_base_url_is_rejected_loudly() {
     // The built-in `openai-local` backend keeps the env/default fallback: overriding
     // it without base_url stays valid, and a config-less load is unchanged.
     let c = Config::from_toml_str("[backends.openai-local]\nkey_optional = false\n").unwrap();
-    assert!(c.resolve_backend("openai-local").unwrap().base_url.is_none());
+    assert!(c
+        .resolve_backend("openai-local")
+        .unwrap()
+        .base_url
+        .is_none());
 }
 
 #[test]
@@ -1143,6 +1145,29 @@ fn zero_job_capacity_is_rejected_loudly() {
     // jobs", defeating `consult_submit`. Fail at load, not on the first submit.
     let err = Config::from_toml_str("[defaults]\njob_capacity = 0\n").unwrap_err();
     assert!(format!("{err:#}").contains("job_capacity"), "got: {err:#}");
+}
+
+#[test]
+fn inline_attach_budget_defaults_overrides_and_zero_is_legal() {
+    // Absent → the built-in 256 KiB.
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.inline_attach_budget, 1 << 18);
+    // Set in [defaults] → honored.
+    let c = Config::from_toml_str("[defaults]\ninline_attach_budget = 4096\n").unwrap();
+    assert_eq!(c.defaults.inline_attach_budget, 4096);
+    // Zero is LEGAL (unlike the capacities): it means "inline nothing — demote every
+    // text attachment to a read-WHOLE directive", the small-context escape hatch.
+    let c = Config::from_toml_str("[defaults]\ninline_attach_budget = 0\n").unwrap();
+    assert_eq!(c.defaults.inline_attach_budget, 0);
+    // Env wins over the file, like every other [defaults] knob.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[defaults]\ninline_attach_budget = 4096\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_INLINE_ATTACH_BUDGET", "1024")]
+        .into_iter()
+        .collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.defaults.inline_attach_budget, 1024);
 }
 
 // --- Key resolution (now a Backend concern) --------------------------------------
