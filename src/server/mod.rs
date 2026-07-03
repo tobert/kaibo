@@ -25,15 +25,14 @@ use rmcp::service::{Peer, RequestContext};
 use rmcp::ErrorData as McpError;
 use rmcp::{tool, tool_handler, tool_router, RoleServer};
 use serde::Deserialize;
-use serde_json::json;
 use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
-    consult, explore_with, oneshot, Arm, ConsultConfig, ModelCaps, ModelShape, PromptOverrides,
+    consult, explore_with, oneshot, Arm, ConsultConfig, ModelCaps, PromptOverrides,
 };
 use crate::explorer::format_output;
-use crate::jobs::{CancelOutcome, JobResult, JobSnapshot, JobState, JobStore};
+use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
 use crate::kaish_syntax::{
     kaibo_instructions_with_scope, kaibo_sandbox_doc, render_builtin_help, render_topic, topics,
 };
@@ -41,6 +40,18 @@ use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::SessionStore;
+
+mod config_resource;
+mod containment;
+mod render;
+
+use config_resource::render_config_resource;
+use render::{
+    batch_poll_brief, batch_within_window, consult_result, consultation_failed,
+    consultation_failure_text, is_batch_handle, now_epoch_secs, parse_batch_handle, render_job,
+    render_jobs_section, render_wait, wait_level_floor, wait_level_label, with_provenance,
+    BATCH_RECENCY_WINDOW_SECS,
+};
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
 const KAISH_RES_PREFIX: &str = "kaibo://kaish/";
@@ -81,7 +92,7 @@ const PROMPTS_CAST_URI_TEMPLATE: &str = "kaibo://prompts/{cast}";
 /// `docs/config.example.toml`, embedded at compile time so it ships *inside* the
 /// binary — `cargo install kaibo` lays down no docs, so reading the file at runtime
 /// would 404 at exactly the fresh-install moment the example matters most.
-const CONFIG_EXAMPLE_TOML: &str = include_str!("../docs/config.example.toml");
+const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.example.toml");
 
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
@@ -810,78 +821,6 @@ impl KaiboHandler {
         self.default_root_inferred
     }
 
-    /// Resolve a call's project root with containment enforcement:
-    ///
-    /// 1. Select the raw path: the explicit `path` arg, else the effective default
-    ///    root (an explicit `--root`, or the launch cwd inferred when it falls inside
-    ///    the allowed set). An omitted `path` with no default root is a parameter
-    ///    error — not a silent default.
-    /// 2. Canonicalize the selected path (resolves symlinks and `..`). A path that
-    ///    doesn't exist is `invalid_params` with the canonicalize error.
-    /// 3. Require the canonicalized path to be at-or-under one of the allowed trees.
-    ///    A violation is `invalid_params` naming the allowed trees and the three
-    ///    widening knobs (`--allow-path`, `KAIBO_ALLOW_PATHS`, `[server] allow_paths`).
-    ///
-    /// Returns the CANONICALIZED path so the kaish mount target is always resolved.
-    fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
-        // Step 1: select the raw path. The default root is the explicit `--root` or
-        // the inferred launch cwd (already canonicalized and dir-checked at startup,
-        // and guaranteed inside the allowed set); the steps below re-validate it
-        // uniformly with an explicit `path`, so there is no special-casing here.
-        let raw = match path {
-            Some(p) => PathBuf::from(p),
-            None => (*self.default_root).clone().ok_or_else(|| {
-                McpError::invalid_params(
-                    "no `path` provided and the server has no default root \
-                     (configure one with --root, or launch kaibo with its cwd \
-                     inside the allowed set so the workspace is inferred)",
-                    None,
-                )
-            })?,
-        };
-
-        // Step 2: canonicalize — resolves symlinks and `..` so starts_with is sound.
-        let canon = std::fs::canonicalize(&raw).map_err(|e| {
-            McpError::invalid_params(
-                format!("path {} could not be resolved: {e}", raw.display()),
-                None,
-            )
-        })?;
-
-        // Step 2b: require a directory, symmetric with the construction-time check on
-        // --root and --allow-path entries. A file path passes canonicalization and
-        // containment but makes a degenerate session (cwd is a file); reject it here
-        // at the parameter boundary with a clear error rather than failing deep in kaish.
-        if !canon.is_dir() {
-            return Err(McpError::invalid_params(
-                format!("path {} is not a directory", canon.display()),
-                None,
-            ));
-        }
-
-        // Step 3: containment check — must be at-or-under an allowed tree (or a
-        // followed worktree of one). Shared with `resolve_attachments` so a file
-        // attachment obeys the exact same boundary as a session root, not a parallel
-        // check that could drift.
-        if self.contained(&canon) {
-            return Ok(canon);
-        }
-        Err(self.containment_error(&raw, &canon))
-    }
-
-    /// Is `canon` (already canonicalized) inside the allowed boundary? At-or-under a
-    /// static allowed tree, or — when `follow_worktrees` is on — inside a linked git
-    /// worktree that an already-allowed repo vouches for (a sibling branch checkout
-    /// reachable without an --allow-path). Worktree membership is resolved by reading
-    /// git's link files, never by running git (subprocess/git are compiled out — see
-    /// sandbox.rs), and trust flows only outward from the allowed repo (we enumerate
-    /// the worktrees its own common git dir names and never consult the candidate's
-    /// `.git`), so a foreign dir can't forge its way in. The single containment
-    /// predicate — `resolve_root` and `resolve_attachments` both defer to it.
-    fn contained(&self, canon: &std::path::Path) -> bool {
-        self.containing_tree(canon).is_some()
-    }
-
     /// The allowed tree (or followed-worktree root) that contains `canon`, or `None` when
     /// it's outside the boundary — the *which-tree* sibling of [`contained`](Self::contained)
     /// (which is just `is_some()` on this). A static `allow_path` wins over a followed
@@ -1080,136 +1019,6 @@ impl KaiboHandler {
             ));
         }
         Ok(())
-    }
-
-    /// Resolve caller-named attachment paths into [`Attachment`](crate::attach::Attachment)s,
-    /// read and encoded server-side so the bytes never transit the calling agent's
-    /// context. Each path obeys the *same* boundary as a session root — canonicalize
-    /// (symlinks + `..` resolved), require a regular file, then the shared
-    /// [`containing_tree`](Self::containing_tree) check (allowed set + followed worktrees)
-    /// — so attachments can't read outside the workspace any more than `run_kaish` can.
-    ///
-    /// Failures are loud and per-path: a missing file, a directory, an over-cap or
-    /// non-text/non-image file is a clear `invalid_params`, never a silent skip — an
-    /// attachment the caller named but we dropped would be a corrupt answer. An absolute
-    /// per-file size ceiling is enforced *before* reading (via the file's metadata) so a
-    /// giant file is refused without first slurping it into memory; a batch-level count cap
-    /// and cumulative-byte budget ([`check_attachment_bounds`](crate::attach::check_attachment_bounds))
-    /// bound the *whole call* the same way — a stray thousand-file glob, or many
-    /// individually-legal files summing to an OOM, is refused before the offending read.
-    ///
-    /// **The read goes through the read-only kaish VFS, not `std::fs::read`** — the same
-    /// mechanism `view_image` uses. The canonicalize + containment check above is the
-    /// *friendly early error*; the read itself is mounted on a [`KaishWorker`] rooted at
-    /// the attachment's containing tree, whose VFS re-resolves at read time and refuses to
-    /// follow a symlink out of that tree (proved by `tests/containment.rs`'s
-    /// `mount_layer_symlink_*` battery). That closes the check-then-open TOCTOU window the
-    /// old `std::fs::read` left open — a path swapped for an out-of-tree symlink after the
-    /// check is rejected at the mount layer regardless of timing, structurally rather than
-    /// by racing a re-check. One worker is spawned per *distinct* containing tree and
-    /// reused across attachments under it, so the common case (files under one project
-    /// root) builds a single worker.
-    pub async fn resolve_attachments(
-        &self,
-        paths: &[String],
-    ) -> Result<Vec<crate::attach::Attachment>, McpError> {
-        use crate::attach::{
-            check_attachment_bounds, classify, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_IMAGE_BYTES,
-            DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TOTAL_BYTES,
-        };
-        // The pre-read ceiling: whichever encoding cap is larger. `classify` applies the
-        // precise per-encoding cap after sniffing; this just bounds the read itself.
-        let read_ceiling = DEFAULT_MAX_TEXT_BYTES.max(DEFAULT_MAX_IMAGE_BYTES);
-        // Fail fast on count *before* canonicalizing the whole list (a stray glob could
-        // name thousands). The cumulative-byte budget is enforced per file below as the
-        // running total grows — before each read, so an oversized batch never slurps in.
-        check_attachment_bounds(
-            paths.len(),
-            0,
-            DEFAULT_MAX_ATTACHMENTS,
-            DEFAULT_MAX_TOTAL_BYTES,
-        )
-        .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
-        // One read-only worker per distinct containing tree, reused across attachments
-        // under it (a worker owns a thread + kernel build, so we don't want one per file).
-        let mut workers: std::collections::HashMap<PathBuf, KaishWorker> =
-            std::collections::HashMap::new();
-        let mut out = Vec::with_capacity(paths.len());
-        let mut total_bytes: u64 = 0;
-        for p in paths {
-            let raw = std::path::PathBuf::from(p);
-            let canon = std::fs::canonicalize(&raw).map_err(|e| {
-                McpError::invalid_params(
-                    format!("attachment {} could not be resolved: {e}", raw.display()),
-                    None,
-                )
-            })?;
-            // A regular file, not a directory — symmetric with resolve_root's dir
-            // check, the mirror image (we inline a file's bytes, not mount a tree).
-            let meta = std::fs::metadata(&canon).map_err(|e| {
-                McpError::invalid_params(
-                    format!("attachment {} could not be read: {e}", canon.display()),
-                    None,
-                )
-            })?;
-            if !meta.is_file() {
-                return Err(McpError::invalid_params(
-                    format!("attachment {} is not a regular file", canon.display()),
-                    None,
-                ));
-            }
-            // Same boundary as a session root — and the tree to root the VFS read at.
-            let tree = self
-                .containing_tree(&canon)
-                .ok_or_else(|| self.containment_error(&raw, &canon))?;
-            // Bound the read by the absolute ceiling before slurping.
-            if meta.len() > read_ceiling as u64 {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "attachment {} is {} bytes, over the {read_ceiling}-byte limit",
-                        canon.display(),
-                        meta.len()
-                    ),
-                    None,
-                ));
-            }
-            // Cumulative budget across the batch, checked *before* this file's read so a
-            // batch of individually-legal files can't sum to an out-of-memory read. The
-            // running total saturates so a crafted size can't wrap past the budget.
-            total_bytes = total_bytes.saturating_add(meta.len());
-            check_attachment_bounds(
-                out.len() + 1,
-                total_bytes,
-                DEFAULT_MAX_ATTACHMENTS,
-                DEFAULT_MAX_TOTAL_BYTES,
-            )
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
-            // Read *through the VFS* rooted at the containing tree — see the doc-comment.
-            // A swapped escaping symlink is refused at the mount, not read through.
-            if !workers.contains_key(&tree) {
-                let worker =
-                    KaishWorker::spawn_with(&tree, self.config.sandbox.clone()).map_err(|e| {
-                        McpError::internal_error(
-                            format!("attachment reader for {}: {e:#}", tree.display()),
-                            None,
-                        )
-                    })?;
-                workers.insert(tree.clone(), worker);
-            }
-            let bytes = workers[&tree].read_file(canon.clone()).await.map_err(|e| {
-                McpError::invalid_params(
-                    format!("attachment {} could not be read: {e:#}", canon.display()),
-                    None,
-                )
-            })?;
-            // Label the attachment with the caller's path (what they typed), not the
-            // canonical one — it's their reference and it's what the model should see.
-            out.push(
-                classify(p, &bytes, DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_IMAGE_BYTES)
-                    .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?,
-            );
-        }
-        Ok(out)
     }
 
     /// The worktrees the follow feature currently admits *beyond* the static allowed
@@ -1917,7 +1726,9 @@ impl KaiboHandler {
         let (slot, backend, _caps) = self.batch_synth(cast)?;
         let backend_name = backend.name.clone();
         let model = slot.id.clone();
-        let provider = self.batch_providers.submitter(backend, slot, &self.config.defaults)
+        let provider = self
+            .batch_providers
+            .submitter(backend, slot, &self.config.defaults)
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let items = vec![crate::batch::BatchItem {
             custom_id: "0".to_string(),
@@ -2217,7 +2028,9 @@ impl KaiboHandler {
         self.gate_image_attachments(caps.vision, &attachments, &model, &cast.name)?;
         // Now build the network client (resolves the key); a batch-incapable backend is
         // refused honestly here.
-        let provider = self.batch_providers.submitter(backend, slot, &self.config.defaults)
+        let provider = self
+            .batch_providers
+            .submitter(backend, slot, &self.config.defaults)
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let items: Vec<crate::batch::BatchItem> = input
             .prompts
@@ -3122,440 +2935,6 @@ fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     None
 }
 
-/// Render the `kaibo://config` TOML document. Shows the resolved runtime state —
-/// allowed trees, default cast, gated tools, sandbox limits, tunable defaults,
-/// each backend's kind/endpoint/key sources, and each cast's slots as
-/// `"backend/id"` with *resolved* caps — so a calling model or operator sees the
-/// server's current posture at a glance.
-///
-/// SECRET-SAFETY CONTRACT: this function renders key SOURCE metadata (env var names,
-/// key file paths — the operator-configured pointers) but NEVER the resolved key
-/// values. The backend struct stores sources, not secrets; this renderer reads only
-/// those source fields. If Config ever gains a resolved-key cache, do not read it here.
-/// Tests in this file assert the contract holds.
-fn render_config_resource(
-    config: &Config,
-    allowed_set: &[PathBuf],
-    default_root: Option<&Path>,
-    default_root_inferred: bool,
-    followed_worktrees: Vec<PathBuf>,
-) -> String {
-    use serde::Serialize;
-    use std::collections::BTreeMap;
-
-    // Dedicated render-only shapes — plain Serialize structs that carry exactly what
-    // the resource must expose and nothing more. Keeps the contract explicit.
-
-    #[derive(Serialize)]
-    struct ConfigDoc {
-        /// Allowed path trees: a per-call path must be at-or-under one of these.
-        allowed_paths: Vec<String>,
-        /// The effective default root a call uses when it omits `path` — an explicit
-        /// `--root`, or the launch cwd kaibo inferred. Absent when neither applies.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        default_root: Option<String>,
-        /// True when `default_root` was inferred from the launch cwd rather than
-        /// configured explicitly. Only meaningful when `default_root` is present.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        default_root_inferred: bool,
-        /// Default cast name (what a call omitting `cast` gets).
-        default_cast: String,
-        /// Runtime-derived state — computed at read time, not configured. Distinct
-        /// from the static knobs above so a reader can tell "what kaibo discovered"
-        /// from "what the operator set".
-        runtime: RuntimeDoc,
-        /// Which tools are currently advertised.
-        tools: ToolsDoc,
-        /// Read-only sandbox limits.
-        sandbox: SandboxDoc,
-        /// kaish kernel behavior tuning (the `[kaish]` stanza) — currently the
-        /// resolved ignore policy the file-walking builtins honor.
-        kaish: KaishDoc,
-        /// The [defaults] tunables every slot falls back to.
-        defaults: DefaultsDoc,
-        /// OpenTelemetry export state (off by default). Header *names* only — a
-        /// value could be a bearer token, so it's withheld like an API key.
-        telemetry: TelemetryDoc,
-        /// alias → canonical backend name. Aliases are valid slot-ref prefixes
-        /// and per-call backend overrides, so callers must be able to discover
-        /// them here — built-in and file-declared both.
-        backend_aliases: BTreeMap<String, String>,
-        /// Backends (connections): kind, endpoint, key sources (never key values).
-        backends: BTreeMap<String, BackendDoc>,
-        /// alias → canonical cast name (each a valid `cast` call-param value).
-        cast_aliases: BTreeMap<String, String>,
-        /// Casts (compositions): slots as "backend/id" with resolved caps.
-        casts: BTreeMap<String, CastDoc>,
-    }
-
-    #[derive(Serialize)]
-    struct ToolsDoc {
-        consult: bool,
-        explore: bool,
-        deliberate: bool,
-        oneshot: bool,
-        run_kaish: bool,
-        batch: bool,
-    }
-
-    /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
-    /// `followed_worktrees` is the live extra set the follow feature grants beyond
-    /// `allowed_paths` right now — git worktrees of an already-allowed repo,
-    /// resolved by reading git's link files. Recomputed on each read, so a worktree
-    /// added mid-session shows up here without a reconnect.
-    #[derive(Serialize)]
-    struct RuntimeDoc {
-        follow_worktrees: bool,
-        followed_worktrees: Vec<String>,
-    }
-
-    #[derive(Serialize)]
-    struct SandboxDoc {
-        exec_timeout_secs: u64,
-        output_limit_bytes: usize,
-        /// Cap on the `/` scratch MemoryFs in bytes; a write past it fails loudly.
-        scratch_limit_bytes: u64,
-        /// Builtins shadow-blocked beyond the structural read-only guards.
-        disable_builtins: Vec<String>,
-    }
-
-    #[derive(Serialize)]
-    struct KaishDoc {
-        ignore: IgnoreDoc,
-    }
-
-    /// The resolved `[kaish.ignore]` policy the file-walking builtins honor.
-    #[derive(Serialize)]
-    struct IgnoreDoc {
-        /// Ignore filenames loaded (root + ancestors), in precedence order.
-        files: Vec<String>,
-        /// Built-in defaults (`target/`, `node_modules/`, `.git`) applied.
-        defaults: bool,
-        /// Nested `.gitignore` files auto-loaded during the walk.
-        auto_gitignore: bool,
-        /// User's global gitignore (`core.excludesFile`) honored.
-        global_gitignore: bool,
-        /// `"enforced"` (all walkers incl. `find`) or `"advisory"` (polite tools only).
-        scope: &'static str,
-    }
-
-    #[derive(Serialize)]
-    struct DefaultsDoc {
-        explorer_max_turns: usize,
-        synth_max_turns: usize,
-        max_tokens: u64,
-        thinking_budget: u64,
-        explorer_temperature: f64,
-        synth_temperature: f64,
-        top_p: f64,
-        explorer_effort: String,
-        synth_effort: String,
-        thinking_style: String,
-        request_timeout_secs: u64,
-        session_capacity: usize,
-        job_capacity: usize,
-    }
-
-    /// Telemetry as resolved. SECRET-SAFETY: `header_names` lists the keys of any
-    /// configured export headers but never their values — an Authorization value is
-    /// a secret, same as an API key. The operator set the names; surfacing those is
-    /// the discoverability the resource promises.
-    #[derive(Serialize)]
-    struct TelemetryDoc {
-        enabled: bool,
-        endpoint: String,
-        timeout_secs: u64,
-        service_name: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        header_names: Vec<String>,
-    }
-
-    #[derive(Serialize)]
-    struct BackendDoc {
-        kind: String,
-        /// Resolved endpoint for openai-kind backends (explicit base_url, else
-        /// OPENAI_BASE_URL, else the built-in default) — the "resolved runtime
-        /// state" promise. Other kinds have fixed endpoints baked into rig.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        base_url: Option<String>,
-        /// Env var name whose value is the API key (checked first). The NAME, not
-        /// the value — the operator configured this pointer.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        api_key_env: Option<String>,
-        /// Key file path, resolved (`$VAR`/`~` expanded once at config load), so this
-        /// shows the absolute path kaibo actually reads — consistent with how
-        /// `allowed_paths`/`default_root` render resolved here. Used when the env var is
-        /// unset/blank. The PATH, not its contents.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        api_key_file: Option<String>,
-        /// True when a missing key falls back to a placeholder (keyless endpoint).
-        key_optional: bool,
-        request_timeout_secs: u64,
-    }
-
-    /// One cast slot: the `"backend/id"` ref plus its *resolved* capabilities
-    /// (slot pin applied, else the classifier on the slot's backend kind) and any
-    /// per-slot tunable overrides actually set — the effective runtime state.
-    #[derive(Serialize)]
-    struct SlotDoc {
-        model: String,
-        vision: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_tokens: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        thinking_budget: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        temperature: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        effort: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        thinking_style: Option<String>,
-        /// The per-model system-prompt override, verbatim (not a secret — it's the
-        /// operator's own framing). Absent when unset.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        preamble: Option<String>,
-        /// How this slot runs — `"batch"` or `"direct"`; absent (the common case)
-        /// means interactive. Only ever set on a synth slot (load-validated).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        lane: Option<&'static str>,
-        /// Per-slot tunables that *are* set here but this slot's resolved request shape
-        /// will never send — the honest no-op flag. A `thinking_budget` on an
-        /// effort-driven or toggle-less model, an `effort` on a budget model, a
-        /// `temperature` an Anthropic slot drops under thinking: each load-validates and
-        /// would otherwise render as if effective. Absent when every set knob has a sink.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        inert_tunables: Vec<&'static str>,
-    }
-
-    /// A cast's role table, keyed by role. Only configured roles appear.
-    type CastDoc = BTreeMap<&'static str, SlotDoc>;
-
-    let backends: BTreeMap<String, BackendDoc> = config
-        .backends
-        .iter()
-        .map(|(name, b)| {
-            // Exhaustive destructure — any new Backend field is a compile error
-            // here, forcing an explicit render-or-skip decision (including the
-            // secret-safety review for any field that might resolve a key value).
-            let crate::config::Backend {
-                name: _,
-                kind,
-                base_url,
-                api_key_env,
-                api_key_file,
-                key_optional,
-                request_timeout,
-            } = b;
-            let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
-                Some(b.resolved_base_url())
-            } else {
-                base_url.clone()
-            };
-            let doc = BackendDoc {
-                kind: format!("{:?}", kind).to_lowercase(),
-                base_url: rendered_base_url,
-                // KEY SOURCE ONLY — env var name or file path, never the value.
-                api_key_env: api_key_env.clone(),
-                api_key_file: api_key_file.clone(),
-                key_optional: *key_optional,
-                request_timeout_secs: request_timeout.as_secs(),
-            };
-            (name.clone(), doc)
-        })
-        .collect();
-
-    let casts: BTreeMap<String, CastDoc> = config
-        .casts
-        .iter()
-        .map(|(name, cast)| {
-            let slots: CastDoc = cast
-                .slots
-                .iter()
-                .map(|(role, slot)| {
-                    // Exhaustive destructure, same discipline as Backend above.
-                    let ModelSlot {
-                        backend: _,
-                        id: _,
-                        vision: _,
-                        max_tokens,
-                        thinking_budget,
-                        temperature,
-                        effort,
-                        thinking_style,
-                        preamble,
-                        lane,
-                    } = slot;
-                    let caps = config
-                        .slot_caps(slot)
-                        .expect("a loaded cast's slot backend resolves");
-                    // Resolve the slot's request shape so we can flag tunables it will
-                    // never send (e.g. a budget on an effort-driven model) — making the
-                    // invisible no-op visible rather than rendering it as if effective.
-                    let kind = config
-                        .resolve_backend(&slot.backend)
-                        .expect("a loaded cast's slot backend resolves")
-                        .kind;
-                    let shape =
-                        ModelShape::resolve(kind, &slot.id, thinking_style.unwrap_or_default());
-                    let mut inert_tunables = Vec::new();
-                    if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
-                        inert_tunables.push("thinking_budget");
-                    }
-                    if effort.is_some() && !shape.sinks_effort() {
-                        inert_tunables.push("effort");
-                    }
-                    if temperature.is_some() && !shape.sinks_sampling() {
-                        inert_tunables.push("temperature");
-                    }
-                    (
-                        role.key(),
-                        SlotDoc {
-                            model: slot.qualified(),
-                            vision: caps.vision,
-                            max_tokens: *max_tokens,
-                            thinking_budget: *thinking_budget,
-                            temperature: *temperature,
-                            effort: effort.clone(),
-                            thinking_style: thinking_style.map(|s| format!("{s:?}").to_lowercase()),
-                            preamble: preamble.clone(),
-                            lane: lane.map(Lane::as_str),
-                            inert_tunables,
-                        },
-                    )
-                })
-                .collect();
-            (name.clone(), slots)
-        })
-        .collect();
-
-    // Exhaustive destructures, same discipline as Backend/ModelSlot above: a new
-    // field on any of these is a compile error here, forcing an explicit
-    // render-or-skip decision instead of silently vanishing from the resource.
-    let &ToolGating {
-        consult,
-        explore,
-        deliberate,
-        oneshot,
-        run_kaish,
-        batch,
-    } = &config.tools;
-    let crate::sandbox::SandboxConfig {
-        exec_timeout,
-        output_limit_bytes,
-        scratch_limit_bytes,
-        disable_builtins,
-        ignore,
-    } = &config.sandbox;
-    let crate::config::Defaults {
-        explorer_max_turns,
-        synth_max_turns,
-        max_tokens,
-        thinking_budget,
-        explorer_temperature,
-        synth_temperature,
-        top_p,
-        explorer_effort,
-        synth_effort,
-        thinking_style,
-        request_timeout,
-        session_capacity,
-        job_capacity,
-    } = &config.defaults;
-    let crate::config::TelemetryConfig {
-        enabled: telemetry_enabled,
-        endpoint: telemetry_endpoint,
-        headers: telemetry_headers,
-        timeout: telemetry_timeout,
-        service_name: telemetry_service_name,
-    } = &config.telemetry;
-    let doc = ConfigDoc {
-        allowed_paths: allowed_set
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect(),
-        default_root: default_root.map(|p| p.display().to_string()),
-        default_root_inferred,
-        default_cast: config.default_cast.clone(),
-        runtime: RuntimeDoc {
-            follow_worktrees: config.follow_worktrees,
-            followed_worktrees: followed_worktrees
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
-        },
-        tools: ToolsDoc {
-            consult,
-            explore,
-            deliberate,
-            oneshot,
-            run_kaish,
-            batch,
-        },
-        sandbox: SandboxDoc {
-            exec_timeout_secs: exec_timeout.as_secs(),
-            output_limit_bytes: *output_limit_bytes,
-            scratch_limit_bytes: *scratch_limit_bytes,
-            disable_builtins: disable_builtins.clone(),
-        },
-        kaish: KaishDoc {
-            ignore: IgnoreDoc {
-                files: ignore.files().to_vec(),
-                defaults: ignore.use_defaults(),
-                auto_gitignore: ignore.auto_gitignore(),
-                global_gitignore: ignore.use_global_gitignore(),
-                scope: match ignore.scope() {
-                    kaish_kernel::IgnoreScope::Enforced => "enforced",
-                    kaish_kernel::IgnoreScope::Advisory => "advisory",
-                },
-            },
-        },
-        defaults: DefaultsDoc {
-            explorer_max_turns: *explorer_max_turns,
-            synth_max_turns: *synth_max_turns,
-            max_tokens: *max_tokens,
-            thinking_budget: *thinking_budget,
-            explorer_temperature: *explorer_temperature,
-            synth_temperature: *synth_temperature,
-            top_p: *top_p,
-            explorer_effort: explorer_effort.clone(),
-            synth_effort: synth_effort.clone(),
-            thinking_style: format!("{thinking_style:?}").to_lowercase(),
-            request_timeout_secs: request_timeout.as_secs(),
-            session_capacity: session_capacity.get(),
-            job_capacity: job_capacity.get(),
-        },
-        telemetry: TelemetryDoc {
-            enabled: *telemetry_enabled,
-            endpoint: telemetry_endpoint.clone(),
-            timeout_secs: telemetry_timeout.as_secs(),
-            service_name: telemetry_service_name.clone(),
-            header_names: telemetry_headers.keys().cloned().collect(),
-        },
-        backend_aliases: config.backend_aliases().clone(),
-        backends,
-        cast_aliases: config.cast_aliases().clone(),
-        casts,
-    };
-
-    // Serialize to TOML. If the TOML serializer rejects something (unlikely given
-    // all fields are primitive strings/ints/bools), crash loudly rather than return
-    // a silently truncated or misleading document — the caller would get a half-truth.
-    let body = toml::to_string_pretty(&doc).expect(
-        "config render structs are TOML-serializable; if this panics, a field type changed",
-    );
-    // Prepend a comment block that explains how to widen the allowed set — the tool
-    // descriptions promise kaibo://config tells a caller how to do this.
-    format!(
-        "# kaibo resolved runtime configuration\n\
-         # To widen the allowed path set:\n\
-         #   CLI:    --allow-path DIR  (repeatable)\n\
-         #   env:    KAIBO_ALLOW_PATHS=DIR:DIR2  (colon-separated)\n\
-         #   config: [server] allow_paths = [\"DIR\"] in config.toml\n\
-         # A non-empty --allow-path list replaces the env/file layer.\n\n\
-         {body}"
-    )
-}
-
 /// Render the `kaibo://prompts` document — or `kaibo://prompts/{cast}` when `cast` is
 /// `Some`. Each phase's system preamble is produced by the *same*
 /// [`resolve_phase_preamble`](crate::consult::resolve_phase_preamble) the live tools call,
@@ -3733,344 +3112,6 @@ fn read_kaibo_resource_with_config(
     })
 }
 
-/// Assemble the `consult` tool result. The answer is always the text content
-/// (unchanged from a bare consult). The explorer's aggregated report — the
-/// `explore′` sweeps the driver delegated — rides along as `structured_content`
-/// only when the caller set `include_report`, keeping a normal call lean. When
-/// requested it is surfaced even if empty: an empty report is the honest signal
-/// that the consult read every span itself and delegated no sweep, which is
-/// distinct from the caller not asking at all. Pure and offline-testable.
-fn consult_result(answer: String, report: String, include_report: bool) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(answer)]);
-    if include_report {
-        result.structured_content = Some(json!({ "report": report }));
-    }
-    result
-}
-
-/// How a runtime consultation failure should be framed to the calling agent — derived
-/// from the error chain by [`classify_failure`].
-#[derive(Debug, PartialEq, Eq)]
-enum FailureKind {
-    /// A transient provider condition (overload / rate-limit / timeout / reset). Worth a
-    /// caller-driven manual retry.
-    TransientProvider,
-    /// A non-transient model/provider error (auth, bad request). Retrying won't help.
-    Provider,
-    /// A kaibo-*side* failure (e.g. the synth's kaish kernel failed to build) — not the
-    /// provider's fault, so we must not say it was.
-    Internal,
-}
-
-/// Classify a consultation failure from its error chain. This is a **heuristic on the
-/// error text**, by necessity: rig collapses the HTTP status into the response *body*
-/// (`CompletionError::ProviderError(text)` carries Anthropic's `overloaded_error` JSON, a
-/// Gemini `RESOURCE_EXHAUSTED`, etc. — not the number `529`), so we match the providers'
-/// transient *vocabulary* rather than a status code. The model loop wraps its errors as
-/// `"model loop failed: …"` (`consult.rs`); an error chain lacking that marker came from
-/// *before* a model ran (a kaish kernel build inside the toolset factory), so it's a
-/// kaibo-side failure, not the provider's.
-fn classify_failure(err: &anyhow::Error) -> FailureKind {
-    let s = format!("{err:#}").to_lowercase();
-    let from_model_loop = s.contains("model loop failed") || s.contains("model used all");
-    if !from_model_loop {
-        return FailureKind::Internal;
-    }
-    // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
-    // transport layer (reqwest timeouts/resets from our own `request_timeout`).
-    const TRANSIENT: &[&str] = &[
-        "overload",   // Anthropic 529 overloaded_error, Gemini
-        "rate limit", // generic
-        "rate_limit", // OpenAI/DeepSeek/Anthropic error `type`s
-        "ratelimit",
-        "resource_exhausted", // Gemini 429
-        "too many requests",  // 429 reason phrase
-        "timed out",          // reqwest / gateway
-        "timeout",
-        "connection reset",
-        "reset by peer",
-        "connection closed",
-        "broken pipe",
-        "temporarily", // "temporarily unavailable"
-        "unavailable", // 503 / Gemini UNAVAILABLE
-        "try again",
-    ];
-    if TRANSIENT.iter().any(|t| s.contains(t)) {
-        FailureKind::TransientProvider
-    } else {
-        FailureKind::Provider
-    }
-}
-
-/// Surface a *runtime* consultation failure as a **tool-result error** (`is_error =
-/// true`) rather than a protocol-level `internal_error`. A consult is an *optional*
-/// augmentation: the calling agent should read a clear message and proceed *without* the
-/// second opinion — not have its own tool call fail at the JSON-RPC layer. The framing is
-/// tailored by [`classify_failure`] so the agent can drive the right next step: a
-/// transient overload/timeout invites a manual retry (kaibo does **not** retry on its own
-/// — one completion is bounded by the backend's `request_timeout`/`connect_timeout`; see
-/// the failure-policy FAQ and `docs/config.md`), a non-transient provider error doesn't,
-/// and a kaibo-side failure is named honestly rather than blamed on the provider. Setup
-/// errors *before* the model call — unknown cast, an attachment outside the boundary, a
-/// missing key — stay `McpError`, since those are the caller's to fix.
-fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(consultation_failure_text(
-        tool, cast, err,
-    ))])
-}
-
-/// The rendered failure text (detail + classified guidance) for a consultation that
-/// errored — the body of [`consultation_failed`], split out so the async path
-/// ([`consult_submit`]) can store a ready string in a [`JobState::Failed`] and the
-/// unified `job_get` wrap it without re-classifying.
-fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> String {
-    let detail = format!("{err:#}");
-    let guidance = match classify_failure(&err) {
-        FailureKind::TransientProvider => {
-            "This looks like a transient provider condition (overload, rate limit, or \
-             timeout). kaibo does not retry automatically — you may retry this call, or \
-             proceed without the consultation."
-        }
-        FailureKind::Provider => {
-            "The model or its provider rejected the request; retrying is unlikely to help \
-             — proceed without the consultation, or check the cast and config."
-        }
-        FailureKind::Internal => {
-            "This is a kaibo-side error (not the provider) — please report it; you can \
-             still proceed without the consultation."
-        }
-    };
-    format!("{tool} could not complete (cast `{cast}`): {detail}. {guidance}")
-}
-
-/// Render a still-running job's latest progress beat as an inline phrase, or `""` before
-/// the first beat lands. Echoes the same one-liner `job_wait` streams (e.g. "exploring: …"),
-/// so a caller polling with `job_get` sees forward motion — `step N` advances every beat even
-/// when two polls catch the same kind of event. See [`crate::progress::ProgressLog`].
-fn running_beat(last_progress: &Option<(String, u64)>) -> String {
-    match last_progress {
-        Some((msg, steps)) => format!(", currently: {msg} (step {steps})"),
-        None => String::new(),
-    }
-}
-
-/// Render an async consultation job for the unified `job_get`: a status line while it runs,
-/// the grounded answer (and optional report) when it's done, the stored failure text on
-/// error, or a canceled notice. Mirrors the synchronous `consult` result shape so an
-/// agent reads the same thing whether it asked synchronously or collected a job.
-fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
-    match snap.state {
-        JobState::Running => CallToolResult::success(vec![Content::text(format!(
-            "Consultation `{id}` is still running — {} ({}s elapsed){}. No need to wait: go \
-             do other work and `job_get` it again later.",
-            snap.label,
-            snap.age.as_secs(),
-            running_beat(&snap.last_progress),
-        ))]),
-        JobState::Done(result) => {
-            let include_report = result.report.is_some();
-            consult_result(
-                result.answer,
-                result.report.unwrap_or_default(),
-                include_report,
-            )
-        }
-        JobState::Failed(text) => CallToolResult::error(vec![Content::text(text)]),
-        JobState::Canceled => CallToolResult::success(vec![Content::text(format!(
-            "Consultation `{id}` was canceled."
-        ))]),
-    }
-}
-
-/// Append a one-line provenance footer naming the cast and the model(s) that
-/// produced `answer`. The point is legibility: a caller — a cross-model study most
-/// of all — should see *which* model answered without cross-referencing
-/// `kaibo://config`, since the answering model is the whole variable. `roles` is the
-/// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
-/// Pure and offline-testable.
-/// Which kind of async work a handle addresses. A batch handle carries a `/`
-/// (`backend/provider-id`); a consult job id (`job-N`) never does, and a backend name
-/// carries no `/` either (enforced at config load), so the presence of a `/` is an
-/// unambiguous batch-vs-consult discriminator for the unified `job_get`/`job_cancel` verbs.
-fn is_batch_handle(handle: &str) -> bool {
-    handle.contains('/')
-}
-
-/// Map a `job_wait` `level` string to a [`mcp_log::rank`] floor. `warn` (the default) is
-/// kaibo's "the calling model should see this" bar — salience, not severity.
-fn wait_level_floor(level: Option<&str>) -> Result<u8, McpError> {
-    let l = match level.unwrap_or("warn").to_ascii_lowercase().as_str() {
-        "debug" => LoggingLevel::Debug,
-        "info" => LoggingLevel::Info,
-        "warn" | "warning" => LoggingLevel::Warning,
-        "error" => LoggingLevel::Error,
-        other => {
-            return Err(McpError::invalid_params(
-                format!("level must be one of debug|info|warn|error, got {other:?}"),
-                None,
-            ));
-        }
-    };
-    Ok(crate::mcp_log::rank(l))
-}
-
-/// A short, readable tag for a record's level in `job_wait` output.
-fn wait_level_label(level: LoggingLevel) -> &'static str {
-    match level {
-        LoggingLevel::Debug => "debug",
-        LoggingLevel::Info => "info",
-        LoggingLevel::Notice => "note",
-        LoggingLevel::Warning => "warn",
-        LoggingLevel::Error
-        | LoggingLevel::Critical
-        | LoggingLevel::Alert
-        | LoggingLevel::Emergency => "error",
-    }
-}
-
-/// One-line status for a batch poll, for the `job_wait` footer — not the full results
-/// (`job_get` the handle for those).
-fn batch_poll_brief(poll: &crate::batch::BatchPoll) -> String {
-    match poll {
-        crate::batch::BatchPoll::Pending { completed, total } => {
-            format!("running, {completed}/{total} done")
-        }
-        crate::batch::BatchPoll::Cancelling => "canceling".to_string(),
-        crate::batch::BatchPoll::Done(answers) => {
-            format!("complete — {} result(s); `job_get` it", answers.len())
-        }
-        crate::batch::BatchPoll::Failed { state, .. } => format!("ended ({state})"),
-    }
-}
-
-/// Render a `job_wait` result: the drained activity records (each tagged by level), any
-/// gentle batch-poll lines, and a footer naming the consult jobs still running.
-fn render_wait(
-    records: &[crate::mcp_log::LogRecord],
-    batch_lines: &[String],
-    jobs: &JobStore,
-    timeout: std::time::Duration,
-) -> String {
-    let mut s = String::new();
-    if records.is_empty() && batch_lines.is_empty() {
-        s.push_str(&format!("Nothing new in {}s.", timeout.as_secs()));
-    } else {
-        for r in records {
-            s.push_str(&format!("[{}] {}\n", wait_level_label(r.level), r.message));
-        }
-        for b in batch_lines {
-            s.push_str(b);
-            s.push('\n');
-        }
-    }
-    let running: Vec<String> = jobs
-        .list()
-        .into_iter()
-        .filter(|(_, snap)| matches!(snap.state, JobState::Running))
-        .map(|(id, _)| id)
-        .collect();
-    s.push('\n');
-    if running.is_empty() {
-        s.push_str("No consult jobs still running.");
-    } else {
-        s.push_str(&format!("Still running: {}.", running.join(", ")));
-    }
-    s.push_str(
-        " `job_get <handle>` to collect a finished one, `job_list` for the full picture, or \
-         `job_wait` again to keep parking.",
-    );
-    s
-}
-
-/// The default `job_list` recency window: 24h. A provider's offline SLA is ≤24h, so an
-/// older batch is done and still collectible by its handle — trimming it saves the
-/// caller tokens without losing anything actionable.
-const BATCH_RECENCY_WINDOW_SECS: i64 = 24 * 3600;
-
-/// Unix epoch seconds now, for the `job_list` recency window — read once per `job_list` call and
-/// passed into [`batch_within_window`], not re-read per item. A pre-epoch system clock
-/// (impossible in practice) reads as 0, which keeps everything: fail-open, never hide a
-/// batch on a clock glitch. From `SystemTime`, so chrono's `clock` feature stays off.
-fn now_epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Is this batch within `window_secs` of `now_epoch`? The `job_list` recency filter, with
-/// `now` injected so the keep/drop boundary is testable without the clock and the clock
-/// is read once per call rather than per item. A batch kaibo can't date (no or
-/// unparseable `created_at`) is kept, not silently hidden — losing sight of a batch is
-/// worse than an extra line; a future timestamp (clock skew) yields a negative age, still
-/// within the window, so also kept.
-fn batch_within_window(it: &crate::batch::BatchListItem, now_epoch: i64, window_secs: i64) -> bool {
-    match it
-        .created_at
-        .as_deref()
-        .and_then(crate::batch::rfc3339_to_epoch)
-    {
-        Some(created) => now_epoch - created <= window_secs,
-        None => true,
-    }
-}
-
-/// Render the consult-jobs section of `job_list`: the in-memory async consultations this
-/// session, newest-first, each with its handle and a one-line state. Empty is itself
-/// informative ("none"), so the section always renders.
-fn render_jobs_section(jobs: &[(String, JobSnapshot)]) -> String {
-    if jobs.is_empty() {
-        return "Consult jobs (this session): none.".to_string();
-    }
-    let mut s = String::from("Consult jobs (this session), newest first:");
-    for (id, snap) in jobs {
-        let state = match &snap.state {
-            JobState::Running => {
-                format!(
-                    "running, {}s{}",
-                    snap.age.as_secs(),
-                    running_beat(&snap.last_progress)
-                )
-            }
-            JobState::Done(_) => "done — `job_get` it for the answer".to_string(),
-            JobState::Failed(_) => "failed — `job_get` it for the reason".to_string(),
-            JobState::Canceled => "canceled".to_string(),
-        };
-        s.push_str(&format!("\n  {id} — {} [{state}]", snap.label));
-    }
-    s.push_str("\n\nCollect one with `job_get <job-id>`; stop one with `job_cancel <job-id>`.");
-    s
-}
-
-/// Split a batch handle (`"backend/provider-id"`) the way `batch_submit` minted it.
-/// Splitting on the *first* `/` is unambiguous because a backend name carries no `/`
-/// (enforced at config load) — so the provider id keeps any slashes of its own (an
-/// Anthropic id is `msgbatch_…`; a Gemini id is `batches/<id>`). A malformed handle is a
-/// loud parameter error — the caller pasted something that wasn't a kaibo batch id.
-fn parse_batch_handle(handle: &str) -> Result<(&str, &str), McpError> {
-    handle
-        .split_once('/')
-        .filter(|(b, id)| !b.is_empty() && !id.is_empty())
-        .ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "batch id {handle:?} must be \"backend/provider-id\" — pass the handle \
-                     kaibo returned from batch_submit"
-                ),
-                None,
-            )
-        })
-}
-
-fn with_provenance(answer: String, cast: &str, roles: &[(&str, &str)]) -> String {
-    let models = roles
-        .iter()
-        .map(|(label, model)| format!("{label} `{model}`"))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    format!("{answer}\n\n———\nkaibo · cast `{cast}` · {models}")
-}
-
 /// The MCP token the client attached for progress, if any. Per the spec, progress
 /// notifications are sent *only* when the client opted in by putting a
 /// `progressToken` in the request `_meta`; absent one, we stay silent. Pure so the
@@ -4154,6 +3195,7 @@ mod tests {
     use super::*;
     use rmcp::model::{NumberOrString, PromptMessageContent};
     use rmcp::ServerHandler;
+    use serde_json::json;
 
     /// consult `attach` validates files are under the consult root (so the model's shell
     /// can `cat` them) and returns them as relative paths; a file outside the root — even
@@ -4254,154 +3296,6 @@ mod tests {
             .expect("a vision synth accepts an image");
         KaiboHandler::gate_consult_image_attachments(&txt, false, "deepseek-v4-pro", "deepseek")
             .expect("text-only needs no vision");
-    }
-
-    #[test]
-    fn wait_level_floor_parses_the_salience_words_and_rejects_junk() {
-        use crate::mcp_log::rank;
-        // Default is the Warn bar — "the calling model should see this".
-        assert_eq!(wait_level_floor(None).unwrap(), rank(LoggingLevel::Warning));
-        assert_eq!(
-            wait_level_floor(Some("info")).unwrap(),
-            rank(LoggingLevel::Info)
-        );
-        assert_eq!(
-            wait_level_floor(Some("WARN")).unwrap(),
-            rank(LoggingLevel::Warning)
-        );
-        assert_eq!(
-            wait_level_floor(Some("error")).unwrap(),
-            rank(LoggingLevel::Error)
-        );
-        assert!(
-            wait_level_floor(Some("loud")).is_err(),
-            "an unknown level is a loud error, not a silent default"
-        );
-    }
-
-    #[test]
-    fn render_wait_tags_records_and_footers_running_jobs() {
-        let jobs = JobStore::new(std::num::NonZeroUsize::new(4).unwrap());
-        let recs = vec![crate::mcp_log::LogRecord {
-            level: LoggingLevel::Warning,
-            target: "kaibo::jobs".into(),
-            message: "async job finished — collect it with `job_get`".into(),
-            fields: serde_json::Map::new(),
-        }];
-        let out = render_wait(&recs, &[], &jobs, std::time::Duration::from_secs(60));
-        assert!(out.contains("[warn]"), "tags the record's level: {out}");
-        assert!(
-            out.contains("async job finished"),
-            "carries the message: {out}"
-        );
-        assert!(
-            out.contains("No consult jobs still running"),
-            "footer reports none running: {out}"
-        );
-
-        // No records, no batch lines → the clean empty line, naming the wait length.
-        let empty = render_wait(&[], &[], &jobs, std::time::Duration::from_secs(30));
-        assert!(empty.contains("Nothing new in 30s"), "clean empty: {empty}");
-    }
-
-    #[test]
-    fn running_beat_renders_a_phrase_only_when_a_beat_exists() {
-        assert_eq!(running_beat(&None), "");
-        assert_eq!(
-            running_beat(&Some(("exploring: the sandbox".to_string(), 3))),
-            ", currently: exploring: the sandbox (step 3)"
-        );
-    }
-
-    #[test]
-    fn render_job_echoes_the_latest_beat_on_a_running_job() {
-        let text = |r: CallToolResult| {
-            r.content
-                .into_iter()
-                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        // A running job with a beat shows it inline; one without stays a bare status line.
-        let with_beat = render_job(
-            "job-1",
-            JobSnapshot {
-                state: JobState::Running,
-                label: "cast `x`".into(),
-                age: std::time::Duration::from_secs(12),
-                last_progress: Some(("exploring: where?".to_string(), 2)),
-            },
-        );
-        let out = text(with_beat);
-        assert!(out.contains("still running"), "status line: {out}");
-        assert!(
-            out.contains("currently: exploring: where? (step 2)"),
-            "echoes the latest beat: {out}"
-        );
-
-        let no_beat = render_job(
-            "job-2",
-            JobSnapshot {
-                state: JobState::Running,
-                label: "cast `x`".into(),
-                age: std::time::Duration::from_secs(1),
-                last_progress: None,
-            },
-        );
-        assert!(
-            !text(no_beat).contains("currently:"),
-            "no beat yet → no 'currently' phrase"
-        );
-    }
-
-    fn batch_item(created_at: Option<&str>) -> crate::batch::BatchListItem {
-        crate::batch::BatchListItem {
-            provider_id: "id".into(),
-            status: "ended".into(),
-            completed: 1,
-            total: 1,
-            created_at: created_at.map(str::to_string),
-        }
-    }
-
-    /// The `job_list` recency filter's keep/drop boundary, with `now` pinned so it doesn't
-    /// depend on the wall clock. `now` = 2026-06-24T18:00:00Z (epoch 1782756000).
-    #[test]
-    fn batch_recency_window_keeps_recent_and_undateable_drops_old() {
-        let now = crate::batch::rfc3339_to_epoch("2026-06-24T18:00:00Z").unwrap();
-        let window = 24 * 3600;
-
-        // 2h old → kept.
-        assert!(batch_within_window(
-            &batch_item(Some("2026-06-24T16:00:00Z")),
-            now,
-            window
-        ));
-        // 30h old → dropped.
-        assert!(!batch_within_window(
-            &batch_item(Some("2026-06-23T12:00:00Z")),
-            now,
-            window
-        ));
-        // Exactly at the 24h edge → kept (boundary is inclusive).
-        assert!(batch_within_window(
-            &batch_item(Some("2026-06-23T18:00:00Z")),
-            now,
-            window
-        ));
-        // Undateable (no timestamp, or garbage) → kept, never silently hidden.
-        assert!(batch_within_window(&batch_item(None), now, window));
-        assert!(batch_within_window(
-            &batch_item(Some("whenever")),
-            now,
-            window
-        ));
-        // Future timestamp (clock skew) → kept.
-        assert!(batch_within_window(
-            &batch_item(Some("2026-06-25T00:00:00Z")),
-            now,
-            window
-        ));
     }
 
     /// A small stand-in builtin set so resource rendering is offline-testable.
@@ -4699,7 +3593,10 @@ mod tests {
                     "the fixture must exercise `{tool}` — its enum is empty, so the guard is vacuous"
                 );
                 for name in advertised {
-                    let cast = h.config.resolve_cast(&name).expect("advertised cast resolves");
+                    let cast = h
+                        .config
+                        .resolve_cast(&name)
+                        .expect("advertised cast resolves");
                     assert!(
                         gate_accepts(tool, cast),
                         "tool `{tool}` advertises cast `{name}`, but its gate rejects it — \
@@ -4742,7 +3639,10 @@ mod tests {
                 );
             }
         }
-        assert!(cast_taking > 0, "no cast-taking tool found — the guard is vacuous");
+        assert!(
+            cast_taking > 0,
+            "no cast-taking tool found — the guard is vacuous"
+        );
     }
 
     /// The lane gate's two halves, tested directly: an interactive tool refuses an
@@ -4966,7 +3866,10 @@ mod tests {
             vec!["first", "second"]
         );
         assert_eq!(
-            items.iter().map(|i| i.custom_id.as_str()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|i| i.custom_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["0", "1"],
             "items carry their index as custom_id"
         );
@@ -5009,10 +3912,19 @@ mod tests {
         let submits = scripted.submits();
         assert_eq!(submits.len(), 1, "the dossier is one batch");
         let (system, attach, items) = &submits[0];
-        assert_eq!(system, "offline-synth-system", "the system prompt passes through");
-        assert!(attach.is_empty(), "deliberate carries no attachments — the dossier is the prompt");
+        assert_eq!(
+            system, "offline-synth-system",
+            "the system prompt passes through"
+        );
+        assert!(
+            attach.is_empty(),
+            "deliberate carries no attachments — the dossier is the prompt"
+        );
         assert_eq!(items.len(), 1, "one item — the dossier, not fanned");
-        assert_eq!(items[0].custom_id, "0", "the single dossier item is custom_id 0");
+        assert_eq!(
+            items[0].custom_id, "0",
+            "the single dossier item is custom_id 0"
+        );
         assert!(
             items[0].prompt.contains("Is the retry safe?")
                 && items[0].prompt.contains("DOSSIER: src/x.rs:1 fn retry"),
@@ -5027,10 +3939,12 @@ mod tests {
     async fn job_get_polls_a_batch_through_the_factory() {
         let scripted = Arc::new(crate::batch::ScriptedBatch::new(
             "msgbatch_x",
-            vec![crate::batch::BatchPoll::Done(vec![crate::batch::BatchAnswer {
-                custom_id: "0".into(),
-                text: Ok("THE DELIBERATION".into()),
-            }])],
+            vec![crate::batch::BatchPoll::Done(vec![
+                crate::batch::BatchAnswer {
+                    custom_id: "0".into(),
+                    text: Ok("THE DELIBERATION".into()),
+                },
+            ])],
         ));
         let h = handler_from_toml(BATCH_CASTS_TOML).with_batch_providers(Arc::new(
             crate::batch::ScriptedBatchProviders(scripted.clone()),
@@ -5604,7 +4518,12 @@ mod tests {
         );
         // The layering note names what a static doc can't render per call/per cast, and
         // points at the per-cast resource for the resolved-per-slot view.
-        for needle in ["[orientation]", "[context]", "per-slot", "kaibo://prompts/<cast>"] {
+        for needle in [
+            "[orientation]",
+            "[context]",
+            "per-slot",
+            "kaibo://prompts/<cast>",
+        ] {
             assert!(
                 text.contains(needle),
                 "prompts doc must name the {needle:?} layer:\n{text}"
@@ -5770,176 +4689,6 @@ mod tests {
         );
     }
 
-    /// The text channel of a result (the answer). Panics if it isn't a single
-    /// text block, which is the only shape `consult_result` produces.
-    fn answer_text(result: &CallToolResult) -> String {
-        assert_eq!(
-            result.content.len(),
-            1,
-            "consult result is a single text block"
-        );
-        result.content[0]
-            .as_text()
-            .expect("consult answer is text content")
-            .text
-            .clone()
-    }
-
-    /// A runtime consultation failure surfaces as a **tool-result error** (`is_error =
-    /// true`) carrying the detail — not a protocol-level `internal_error` — so the calling
-    /// agent reads "the consult failed, here's why" and proceeds without the second
-    /// opinion. The message names the tool and cast and preserves the underlying chain.
-    #[test]
-    fn consultation_failed_is_a_tool_error_carrying_the_detail() {
-        let err = anyhow::anyhow!("model loop failed: ProviderError: overloaded_error");
-        let result = consultation_failed("consult", "deepseek", err);
-        assert_eq!(
-            result.is_error,
-            Some(true),
-            "a provider failure is a tool-result error, not a success"
-        );
-        let text = answer_text(&result);
-        assert!(text.contains("consult"), "names the tool: {text}");
-        assert!(text.contains("deepseek"), "names the cast: {text}");
-        assert!(
-            text.contains("overloaded_error"),
-            "preserves the underlying detail so the host can decide: {text}"
-        );
-    }
-
-    /// A *transient* provider condition (overload / rate-limit / timeout / reset) is
-    /// classified as retryable, so the message invites the calling agent to drive a manual
-    /// retry. We match the providers' transient *vocabulary*, not a status number: rig
-    /// collapses the HTTP status into the response *body* (`ProviderError(text)`), so the
-    /// numeric code isn't reliably present.
-    #[test]
-    fn transient_provider_failure_suggests_a_manual_retry() {
-        for body in [
-            "model loop failed: ProviderError: {\"type\":\"overloaded_error\"}",
-            "model loop failed: ProviderError: rate_limit_error",
-            "model loop failed: HttpError: error sending request: operation timed out",
-            "model loop failed: HttpError: connection reset by peer",
-            "model loop failed: ProviderError: RESOURCE_EXHAUSTED",
-        ] {
-            let result = consultation_failed("consult", "gemini", anyhow::anyhow!(body));
-            let text = answer_text(&result).to_lowercase();
-            assert!(
-                text.contains("retry"),
-                "a transient failure should invite a manual retry: {body} -> {text}"
-            );
-        }
-    }
-
-    /// A *non-transient* provider error (auth / bad request) does not invite a retry —
-    /// retrying won't help — but is still a clean tool-result error.
-    #[test]
-    fn non_transient_provider_failure_does_not_suggest_retry() {
-        let err = anyhow::anyhow!("model loop failed: ProviderError: invalid_request_error");
-        let text = answer_text(&consultation_failed("consult", "anthropic", err));
-        assert!(
-            !text.to_lowercase().contains("you may retry")
-                && !text.to_lowercase().contains("retry this call"),
-            "a non-transient error must not invite a retry: {text}"
-        );
-    }
-
-    /// A kaibo-*side* failure (a kaish kernel build, not the model loop) must not be
-    /// blamed on the provider — the message names it as a kaibo internal error. (DeepSeek
-    /// review, 2026-06-23: the synth's kernel spawns inside the consult error shadow, so a
-    /// spawn failure would otherwise read as "the provider failed, proceed without it".)
-    #[test]
-    fn internal_failure_is_not_blamed_on_the_provider() {
-        let err = anyhow::anyhow!("failed to build read-only kaish kernel: out of memory");
-        let text = answer_text(&consultation_failed("consult", "deepseek", err));
-        let lower = text.to_lowercase();
-        assert!(
-            lower.contains("kaibo"),
-            "a kaibo-side failure is named as such, not the provider's fault: {text}"
-        );
-        assert!(
-            !lower.contains("provider failed") && !lower.contains("provider rejected"),
-            "must not claim the provider failed: {text}"
-        );
-    }
-
-    /// Provenance footer: the answer keeps its text, and the cast plus every labelled
-    /// model is appended so a caller (a cross-model study most of all) sees which model
-    /// produced the answer without cross-referencing `kaibo://config`.
-    #[test]
-    fn provenance_footer_names_the_cast_and_every_model() {
-        let out = with_provenance(
-            "the answer".into(),
-            "gemini",
-            &[
-                ("explorer", "gemini-flash-lite-latest"),
-                ("synth", "gemini-3.5-flash"),
-            ],
-        );
-        assert!(
-            out.starts_with("the answer"),
-            "the answer is preserved: {out}"
-        );
-        assert!(out.contains("cast `gemini`"), "names the cast: {out}");
-        assert!(
-            out.contains("explorer `gemini-flash-lite-latest`"),
-            "names the explorer model: {out}"
-        );
-        assert!(
-            out.contains("synth `gemini-3.5-flash`"),
-            "names the synth model: {out}"
-        );
-
-        // The oneshot shape: a single labelled model.
-        let one = with_provenance("x".into(), "deepseek", &[("model", "deepseek-v4-pro")]);
-        assert!(
-            one.contains("cast `deepseek` · model `deepseek-v4-pro`"),
-            "{one}"
-        );
-    }
-
-    /// Default path: no report requested ⇒ the answer is the whole result and no
-    /// structured content rides along (a lean call, byte-for-byte its pre-flag shape).
-    #[test]
-    fn consult_result_omits_report_unless_requested() {
-        let result = consult_result("the answer".into(), "FILE:1 evidence".into(), false);
-        assert_eq!(answer_text(&result), "the answer");
-        assert!(
-            result.structured_content.is_none(),
-            "report must not leak into a default call: {:?}",
-            result.structured_content
-        );
-    }
-
-    /// Opt-in: the report is surfaced as structured_content under `report`, while the
-    /// answer stays the text channel — the report rides *separately*, not duplicated
-    /// into the answer the model reads.
-    #[test]
-    fn consult_result_attaches_report_when_requested() {
-        let result = consult_result("ans".into(), "src/x.rs:1 the snippet".into(), true);
-        assert_eq!(answer_text(&result), "ans", "answer stays the text channel");
-        assert!(
-            !answer_text(&result).contains("the snippet"),
-            "report must not be folded into the answer text"
-        );
-        let sc = result.structured_content.expect("report was requested");
-        assert_eq!(
-            sc["report"], "src/x.rs:1 the snippet",
-            "report rides under `report`"
-        );
-    }
-
-    /// Opt-in with an empty report (the consult delegated no sweep): still surfaced.
-    /// Emptiness is the signal — present-but-empty means "asked, no sweep happened",
-    /// which a caller must be able to tell apart from "never asked" (None).
-    #[test]
-    fn consult_result_surfaces_empty_report_when_requested() {
-        let result = consult_result("ans".into(), String::new(), true);
-        let sc = result
-            .structured_content
-            .expect("requested even when empty");
-        assert_eq!(sc["report"], "", "an empty report is surfaced honestly");
-    }
-
     // --- kaibo://config/example resource tests -------------------------------
 
     /// The embedded config example is listed and readable, and — the drift guard —
@@ -6000,297 +4749,6 @@ mod tests {
         assert!(
             config_res.raw.description.is_some(),
             "kaibo://config resource must have a description"
-        );
-    }
-
-    /// The `[runtime]` section surfaces the live follow state: the knob, plus the
-    /// worktrees admitted *beyond* the static allowed set right now (passed in by
-    /// the handler, which computes them at read time). This keeps `kaibo://config`
-    /// honest about the real boundary — an auto-followed sibling isn't in
-    /// `allowed_paths` but is reachable, and a reader must be able to see that.
-    #[test]
-    fn config_resource_runtime_section_reports_followed_worktrees() {
-        let config = Config::builtin();
-        let allowed = vec![std::path::PathBuf::from("/tmp/the-repo")];
-        let followed = vec![std::path::PathBuf::from("/tmp/the-repo-feature")];
-        let body = render_config_resource(&config, &allowed, None, false, followed);
-        assert!(
-            body.contains("[runtime]") && body.contains("follow_worktrees = true"),
-            "runtime section must echo the follow knob:\n{body}"
-        );
-        assert!(
-            body.contains("/tmp/the-repo-feature"),
-            "runtime section must list the followed worktree:\n{body}"
-        );
-    }
-
-    /// A per-slot tunable that the slot's resolved request shape will never send is
-    /// flagged `inert_tunables` in the render, so the operator sees the no-op instead of
-    /// a knob that looks effective. The matrix: a budget on an effort-driven model
-    /// (Gemini 3-line, Anthropic adaptive) or the toggle-less openai path; an effort on
-    /// a budget model; a temperature an Anthropic slot drops under thinking. A knob that
-    /// *does* have a sink is never flagged.
-    #[test]
-    fn config_render_flags_inert_per_slot_tunables() {
-        let config = Config::from_toml_str(
-            r#"
-            # Gemini 3-line: takes thinkingLevel (effort), no budget.
-            [casts.gem]
-            explorer = { backend = "gemini", id = "gemini-3-pro", thinking_budget = 4096, effort = "low" }
-
-            # openai (toggle-less): sends neither effort nor budget; keeps sampling.
-            [casts.oai]
-            synth = { backend = "openai-local", id = "gemma-local", thinking_budget = 8192, effort = "high", temperature = 0.7 }
-
-            # Anthropic budget tier: takes budget_tokens, no effort; drops sampling under thinking.
-            [casts.ant_budget]
-            explorer = { backend = "anthropic", id = "claude-haiku-4-5", effort = "high", temperature = 0.5 }
-
-            # Anthropic adaptive: takes output_config.effort, no budget.
-            [casts.ant_adaptive]
-            synth = { backend = "anthropic", id = "claude-opus-4-8", effort = "high", thinking_budget = 2048 }
-            "#,
-        )
-        .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![]);
-        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
-        let inert = |cast: &str, role: &str| -> Vec<String> {
-            doc.get("casts")
-                .and_then(|c| c.get(cast))
-                .and_then(|c| c.get(role))
-                .and_then(|s| s.get("inert_tunables"))
-                .map(|a| {
-                    a.as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|v| v.as_str().unwrap().to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        assert_eq!(
-            inert("gem", "explorer"),
-            vec!["thinking_budget"],
-            "Gemini 3-line sinks effort (thinkingLevel) but not a budget"
-        );
-        assert_eq!(
-            inert("oai", "synth"),
-            vec!["thinking_budget", "effort"],
-            "openai sends neither thinking knob; temperature it does send"
-        );
-        assert_eq!(
-            inert("ant_budget", "explorer"),
-            vec!["effort", "temperature"],
-            "budget tier ignores effort; Anthropic drops sampling under thinking"
-        );
-        assert_eq!(
-            inert("ant_adaptive", "synth"),
-            vec!["thinking_budget"],
-            "adaptive sinks effort but rejects a budget"
-        );
-    }
-
-    /// The config resource body must contain the key structural fields a calling
-    /// model or operator expects: allowed paths, default_cast, gated tools,
-    /// sandbox limits, backends with kind and key sources, and casts with their
-    /// slots rendered as "backend/id" carrying resolved caps.
-    #[test]
-    fn config_resource_renders_expected_fields() {
-        let config = Config::builtin();
-        let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
-        let body = render_config_resource(&config, &allowed, None, false, vec![]);
-        // Structural presence checks — the resource is TOML or a document, not prose.
-        for needle in [
-            "allowed_paths",
-            "default_cast",
-            "[runtime]",
-            "follow_worktrees",
-            "tools",
-            "sandbox",
-            "defaults",
-            "backends",
-            "casts",
-        ] {
-            assert!(
-                body.contains(needle),
-                "config resource must contain {needle:?}:\n{body}"
-            );
-        }
-        // The allowed path we passed must appear.
-        assert!(
-            body.contains("/tmp/test-allowed"),
-            "config resource must show the allowed set:\n{body}"
-        );
-        // Backends and casts include the built-in four.
-        for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
-            assert!(
-                body.contains(&format!("[backends.{name}]")),
-                "config resource must list the {name} backend:\n{body}"
-            );
-            assert!(
-                body.contains(&format!("casts.{name}")),
-                "config resource must list the {name} cast:\n{body}"
-            );
-        }
-        // Slots render as "backend/id" with their RESOLVED caps (the classifier on
-        // the slot's backend kind: Anthropic sees, DeepSeek is blind).
-        assert!(
-            body.contains("anthropic/claude-sonnet-4-6"),
-            "slots render as backend/id:\n{body}"
-        );
-        let anthropic_synth = body
-            .find("anthropic/claude-sonnet-4-6")
-            .map(|i| &body[i..i + 120])
-            .unwrap();
-        assert!(
-            anthropic_synth.contains("vision = true"),
-            "anthropic slot carries resolved vision=true:\n{anthropic_synth}"
-        );
-        let deepseek_synth = body
-            .find("deepseek/deepseek-v4-pro")
-            .map(|i| &body[i..i + 120])
-            .unwrap();
-        assert!(
-            deepseek_synth.contains("vision = false"),
-            "deepseek slot carries resolved vision=false:\n{deepseek_synth}"
-        );
-        // Key SOURCES (env var name / file path) must appear — operators configured
-        // them and need to see them for diagnostics.
-        assert!(
-            body.contains("ANTHROPIC_API_KEY"),
-            "config resource must show key source env var names:\n{body}"
-        );
-        // Telemetry state is part of the resolved runtime: an operator must be able
-        // to see whether kaibo is shipping spans off-box and to where.
-        assert!(
-            body.contains("[telemetry]") && body.contains("enabled = false"),
-            "config resource must show telemetry state (off by default):\n{body}"
-        );
-    }
-
-    /// SECRET-SAFETY teeth: an export header *value* (e.g. a bearer token) must
-    /// never reach the rendered resource — only the header *name*, the pointer the
-    /// operator set, exactly as key sources render their env var name not the key.
-    #[test]
-    fn config_resource_withholds_telemetry_header_values() {
-        let config = Config::from_toml_str(
-            r#"
-            [telemetry]
-            enabled = true
-            headers = { authorization = "Bearer super-secret-token" }
-            "#,
-        )
-        .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![]);
-        // The header NAME is discoverable…
-        assert!(
-            body.contains("authorization"),
-            "header name must be visible for diagnostics:\n{body}"
-        );
-        // …but its VALUE is a secret and must not leak.
-        assert!(
-            !body.contains("super-secret-token") && !body.contains("Bearer"),
-            "a header value must never render — it can be a bearer token:\n{body}"
-        );
-    }
-
-    /// The alias registries are part of the resolved runtime state: an alias is a
-    /// valid `cast` value and slot-ref prefix, so a caller reading `kaibo://config`
-    /// must be able to discover them — built-ins and file-declared both.
-    #[test]
-    fn config_resource_renders_backend_and_cast_aliases() {
-        let config = Config::from_toml_str(
-            r#"
-            [backends.big]
-            kind = "openai"
-            base_url = "http://localhost:9001/v1"
-            aliases = ["heavy"]
-
-            [casts.team]
-            aliases = ["fast"]
-            synth = "heavy/qwen3-235b"
-            "#,
-        )
-        .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![]);
-        for needle in ["[backend_aliases]", "[cast_aliases]"] {
-            assert!(body.contains(needle), "must render {needle}:\n{body}");
-        }
-        // Built-in aliases at both levels, and the file-declared ones.
-        for needle in [
-            r#"claude = "anthropic""#,
-            r#"google = "gemini""#,
-            r#"heavy = "big""#,
-            r#"fast = "team""#,
-        ] {
-            assert!(body.contains(needle), "must render {needle}:\n{body}");
-        }
-    }
-
-    /// SECRET-SAFETY: the config resource must expose key SOURCE metadata (env var
-    /// names, file paths), but NEVER the resolved key values.  We set a sentinel in
-    /// the environment and in a temp file, render the resource, and assert the
-    /// sentinel appears nowhere in the output.
-    ///
-    /// `set_var`/`remove_var` are UB when other threads call `getenv` concurrently
-    /// (glibc). A mutex serializes the env-touching half against any sibling unit
-    /// test in this binary that touches env (there are none today, but the lock is
-    /// cheap and structural). The file half needs no mutex.
-    #[test]
-    fn config_resource_never_exposes_key_values() {
-        use std::io::Write;
-        use std::sync::Mutex;
-        const SENTINEL: &str = "SUPER_SECRET_KEY_VALUE_12345_CANARY";
-        // Module-level lock — serializes all set_var/remove_var in this test binary.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        let var_name = "KAIBO_TEST_SECRET_ENV_VAR_CANARY";
-        let allowed = vec![std::path::PathBuf::from("/tmp")];
-
-        // Build the config outside the lock (no env access yet).
-        let toml = format!("[backends.anthropic]\napi_key_env = \"{var_name}\"\n");
-        let config = Config::from_toml_str(&toml).expect("valid config");
-
-        // Set the sentinel in env and render inside the lock.
-        let body = {
-            let _guard = ENV_LOCK.lock().unwrap();
-            // SAFETY: holding the lock means no other test in this binary mutates env.
-            #[allow(deprecated)]
-            unsafe {
-                std::env::set_var(var_name, SENTINEL);
-            }
-            let b = render_config_resource(&config, &allowed, None, false, vec![]);
-            #[allow(deprecated)]
-            unsafe {
-                std::env::remove_var(var_name);
-            }
-            b
-        };
-
-        // The env var *name* must appear (operator needs to see what's configured).
-        assert!(
-            body.contains(var_name),
-            "config resource must show the env var name (not value):\n{body}"
-        );
-        // The sentinel value must NOT appear — this is the invariant.
-        assert!(
-            !body.contains(SENTINEL),
-            "config resource must NEVER expose the API key value; \
-             sentinel found in:\n{body}"
-        );
-
-        // The file half needs no env access — no lock needed.
-        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        write!(tmp, "{SENTINEL}").expect("write sentinel");
-        let file_path = tmp.path().to_string_lossy().to_string();
-        let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
-        let config2 = Config::from_toml_str(&toml2).expect("valid config");
-        let body2 = render_config_resource(&config2, &allowed, None, false, vec![]);
-        // The file path (source pointer) may appear, but not the file contents.
-        assert!(
-            !body2.contains(SENTINEL),
-            "config resource must NEVER expose key file contents; \
-             sentinel found in:\n{body2}"
         );
     }
 
