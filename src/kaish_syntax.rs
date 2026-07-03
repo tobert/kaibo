@@ -37,8 +37,9 @@ In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writ
 by default: `cat -n FILE` is the first move on any file that matters — one read \
 hands you the imports, the context, and exact line numbers for every citation, and \
 nearly every source file fits in one look. `grep -rn PATTERN .` finds WHICH files \
-matter (add `-B3 -A6` to preview matches in context); once it hits, open the file \
-whole rather than reading around the match. When a whole read comes back truncated \
+matter (add `-B3 -A6` to preview matches in context; alternation takes `-E`: \
+`grep -rnE 'foo|bar' .`); once it hits, open the file whole rather than reading \
+around the match. When a whole read comes back truncated \
 (exit 3), the sample hands you the file's head and tail — stage the rest as \
 targeted reads: `grep -n SYMBOL FILE` pins the lines you need, then a wide span \
 around them, `cat -n FILE | sed -n '1200,2400p'` (~1,200 lines fits one look). \
@@ -329,6 +330,7 @@ pub fn kaibo_sandbox_doc() -> String {
          whole:\n\
          - `cat -n FILE` — the whole file, numbered; the default move on any file that matters\n\
          - `grep -rn PATTERN [PATH]` — find which files matter, then open them whole\n\
+         - `grep -rnE 'foo|bar' .` — alternation (the `-E` is what enables `|`)\n\
          - `grep -rn -B3 -A6 PATTERN .` — preview matches in context across files\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
          - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim)\n\n\
