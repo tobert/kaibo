@@ -280,18 +280,21 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
-- **The explorer reads big files in fewer, wider passes.** Its guidance now gives a
-  file too large to read whole a first-class strategy — a few wide `sed` spans (a few
-  hundred lines each) instead of many tiny slices — so a `consult`/`explore` over large
-  sources spends noticeably fewer tool calls gathering the same evidence (measured: a
-  broad sweep dropped from 74 read/search calls to 46, reading the same big file in ~13
-  wide spans instead of ~22 fifteen-line ones). No behavior change on short files.
-- **The `consult` driver and the shared kaish cheatsheet describe reading in wide
-  passes**, matching the guidance the explorer got: a short file read whole, a big one
-  in a few hundred-line spans. Several preambles also drop negative-example phrasing
-  in favor of stating the wanted behavior directly. A `consult` over large sources
-  should spend fewer tool calls gathering the same evidence (same mechanism the
-  explorer change measured).
+- **Models read files WHOLE by default, and a truncated giant stages into targeted
+  reads.** The explorer, the `consult` driver, and the shared kaish cheatsheet all
+  lead with whole-file reads: `cat -n FILE` is the stated first move on any file that
+  matters (the old "a *short* file: read it whole" made models classify before daring
+  a whole read, then nibble), `grep` is framed as the way to find *which* files
+  matter rather than a reading tool, and the `wc -l` pre-probe is gone. The output
+  cap stays 64 KiB — ~23K tokens, sized so the worst single turn stays small on a
+  128–250K-context explorer — because truncation is now *informative*, not a
+  dead end: exit 3 already returns the file's head and tail, and the guidance stages
+  the rest as targeted reads (`grep -n SYMBOL FILE`, then a ~1,200-line span around
+  it) instead of a mechanical full walk. Fewer, wider turns: every turn re-sends the
+  transcript, so one whole-file read beats five slices on both cost and wall-clock.
+  (Supersedes the earlier few-hundred-line span guidance, measured at 74→46 calls;
+  whole-first goes further. Attached files the caller flagged as central keep the
+  read-it-ALL directive — there the full cost is deliberate.)
 
 ### Fixed
 

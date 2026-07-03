@@ -33,15 +33,16 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// prohibitions): "just read", not a wall of "never".
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
-`git`, `touch`, and external commands are refused, so just read. Browse with line \
-numbers so every citation is exact, and read generously — the context window is \
-yours to fill, so read in wide passes: `cat -n FILE` takes a short file whole with \
-its line numbers (`wc -l FILE` sizes it), and a big file goes in wide spans of a few \
-hundred lines, `cat -n FILE | sed -n '1,400p'` then `'401,800p'`. To locate \
-something across files, `grep -rn -B3 -A6 PATTERN .` returns each match with the \
-lines around it. A whole-file read that comes back truncated (exit 3, a head+tail \
-sample) was simply too big for one look — cover it in those wide spans. Each call \
-starts at the project root; \
+`git`, `touch`, and external commands are refused, so just read. Read files WHOLE \
+by default: `cat -n FILE` is the first move on any file that matters — one read \
+hands you the imports, the context, and exact line numbers for every citation, and \
+nearly every source file fits in one look. `grep -rn PATTERN .` finds WHICH files \
+matter (add `-B3 -A6` to preview matches in context); once it hits, open the file \
+whole rather than reading around the match. When a whole read comes back truncated \
+(exit 3), the sample hands you the file's head and tail — stage the rest as \
+targeted reads: `grep -n SYMBOL FILE` pins the lines you need, then a wide span \
+around them, `cat -n FILE | sed -n '1200,2400p'` (~1,200 lines fits one look). \
+Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
@@ -324,13 +325,13 @@ pub fn kaibo_sandbox_doc() -> String {
         "# kaibo — the read-only kaish sandbox\n\n\
          {KAISH_SANDBOX_ADDENDUM}\n\n\
          ## Browsing for exact citations\n\
-         Lead with line numbers so every claim cites `file:line`, and read \
-         generously in wide passes:\n\
-         - `cat -n FILE` — a short file whole, with line numbers; reach for it first\n\
-         - `grep -rn PATTERN [PATH]` — matches with line numbers, across files\n\
-         - `grep -rn -B3 -A6 PATTERN .` — matches with the lines around them\n\
+         Lead with line numbers so every claim cites `file:line`, and read files \
+         whole:\n\
+         - `cat -n FILE` — the whole file, numbered; the default move on any file that matters\n\
+         - `grep -rn PATTERN [PATH]` — find which files matter, then open them whole\n\
+         - `grep -rn -B3 -A6 PATTERN .` — preview matches in context across files\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
-         - `cat -n FILE | sed -n '1,400p'` — a wide span of a big file (walk it: then `'401,800p'`)\n\n\
+         - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim)\n\n\
          ## Read-only boundary\n\
          The project is mounted read-only and external commands are off, by \
          construction. Writes, `git`, `touch`, `spawn`/`exec`, and any external \

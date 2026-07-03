@@ -194,18 +194,18 @@ pub fn report_preamble() -> String {
          a question touches and hand it to a synthesizer who writes the final \
          answer — so your work is to gather grounded evidence and cite it exactly. \
          {core}\n\n\
-         HOW TO READ. Read for the whole picture in as few looks as possible — the \
-         context window is yours to fill, so read in wide passes. A short file: read \
-         it WHOLE with `cat -n FILE` — one read hands you its imports, its context, \
-         and exact line numbers together. A big file (`wc -l FILE` if unsure): walk it \
-         in wide spans of a few hundred lines — `cat -n FILE | sed -n '1,400p'`, then \
-         `'401,800p'`, then `'801,1200p'` — so each look lands a whole run of related \
-         code together: a type with its impl, a function with the code around its call \
-         sites, an import block with what uses it. If a whole-file read comes back \
-         truncated (exit 3, a head+tail sample), it was too big for one look — walk it \
-         in those wide spans. To locate something across files, take the surrounding \
-         context in the same call — `grep -rn -B4 -A8 PATTERN .` returns each match \
-         with the lines around it, ready to understand.\n\n\
+         HOW TO READ. Read files WHOLE. `cat -n FILE` is the default move on any \
+         file the question touches — one read hands you the imports, the types with \
+         their impls, the call sites, and exact line numbers together, and nearly \
+         every source file fits in one look. `grep -rn PATTERN .` is how you find \
+         WHICH files matter (`-B4 -A8` previews the matches); once it hits, open \
+         the file whole rather than reading around the match. When a whole read \
+         comes back truncated (exit 3), the sample already hands you the file's \
+         head and tail — stage the rest as targeted reads: `grep -n SYMBOL FILE` \
+         pins the line numbers the question needs, then take a wide span around \
+         each, `cat -n FILE | sed -n '1200,2400p'` (a span of ~1,200 lines fits one \
+         look). Walk a giant end-to-end only when the question truly needs all of \
+         it.\n\n\
          HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
          each key symbol to where it is defined and where it is used; chase anything \
          that puzzles you until it is clear — a confusing spot usually hides the \
@@ -429,8 +429,8 @@ pub fn consult_user_prompt(
             prompt.push_str(
                 "\nThese attached files are too large to inline. Read each one WHOLE \
                  with the shell before you answer: `cat -n PATH`, and when the output \
-                 truncates, continue in spans (`cat -n PATH | sed -n '1,400p'`, then \
-                 `'401,800p'`, …) until you reach the end of the file:\n",
+                 truncates, continue in spans (`cat -n PATH | sed -n '1,1200p'`, then \
+                 `'1201,2400p'`, …) until you reach the end of the file:\n",
             );
             for a in &oversize {
                 if let ConsultAttachment::TextOversize { path, size } = a {
@@ -492,8 +492,8 @@ pub fn explorer_attachment_directive(attached: &[ConsultAttachment]) -> Option<S
         "\n\nThe caller attached these files as central to the question — they live \
          under the project root, so each path opens directly. Read each one WHOLE with \
          `cat -n PATH` and weigh what you find in your report; when the output \
-         truncates, continue in spans (`cat -n PATH | sed -n '1,400p'`, then \
-         `'401,800p'`, …) until you reach the end of the file:\n{list}"
+         truncates, continue in spans (`cat -n PATH | sed -n '1,1200p'`, then \
+         `'1201,2400p'`, …) until you reach the end of the file:\n{list}"
     ))
 }
 
@@ -511,10 +511,11 @@ pub fn consult_preamble() -> String {
          curated report — RelevantLocations carrying `file:line`, key symbols, and \
          snippets. Reach for `explore` to cover breadth — find where a \
          thing lives, gather the relevant files — and use `run_kaish` to read the \
-         code yourself. When you read directly, read generously in wide passes — a \
-         short file whole with `cat -n FILE`, a big one in spans of a few hundred \
-         lines (`cat -n FILE | sed -n '1,400p'`, then `'401,800p'`) — so each look \
-         lands the code in its context. Build your answer from what \
+         code yourself. When you read directly, read files WHOLE with `cat -n FILE` \
+         — nearly every file fits one look. A truncated giant (exit 3) hands you \
+         its head and tail; stage the rest as targeted spans around what you need \
+         (`grep -n SYMBOL FILE`, then `cat -n FILE | sed -n '1200,2400p'`). Build \
+         your answer from what \
          they return: quote the key snippet, name its `file:line`, and let the \
          evidence carry the claim. Where the evidence settles the question, answer \
          it fully; where it reaches its edge, say so and name what would close the gap.\n\n\
@@ -581,26 +582,29 @@ mod tests {
     }
 
     /// The explorer preamble carries the behaviors we measured into it — the
-    /// whole-file reading directive (the lite-explorer win, 48→23 turns), the
-    /// context-buffer `grep` idiom, and the three report sections the synth side now
-    /// expects. Pure and offline; pins the prose so a future edit can't silently
-    /// drop any of it (the synth preambles are written against this shape).
+    /// whole-file-FIRST reading directive (the lite-explorer win, 48→23 turns;
+    /// sharpened 2026-07-03 after watching a live sweep graze in small slices),
+    /// grep framed as the locator rather than the reading tool, and the three
+    /// report sections the synth side now expects. Pure and offline; pins the
+    /// prose so a future edit can't silently drop any of it (the synth preambles
+    /// are written against this shape).
     #[test]
     fn report_preamble_keeps_the_reading_directive_and_report_shape() {
         let p = report_preamble();
-        // Reading strategy: whole (short) files, wide spans for big ones, grep buffer.
+        // Reading strategy: whole files by default, wide spans only for a
+        // truncated giant, grep to find which files matter.
         assert!(p.contains("cat -n FILE"), "whole-file read idiom: {p}");
         assert!(
-            p.to_lowercase().contains("whole"),
-            "the whole-file directive must survive: {p}"
+            p.contains("Read files WHOLE"),
+            "whole-first is the lead directive: {p}"
         );
         assert!(
-            p.contains("sed -n '1,400p'"),
-            "big-file wide-span idiom: {p}"
+            p.contains("grep -n SYMBOL FILE") && p.contains("sed -n '1200,2400p'"),
+            "truncation stages into targeted wide spans: {p}"
         );
         assert!(
-            p.contains("grep -rn -B4 -A8"),
-            "grep context-buffer idiom: {p}"
+            p.contains("WHICH files matter"),
+            "grep framed as the locator: {p}"
         );
         // The report template the consult driver preamble is written
         // against — keep the three section names in lockstep with those.
@@ -785,7 +789,7 @@ mod tests {
             "the demoted file is named with its size:\n{prompt}"
         );
         assert!(
-            prompt.contains("sed -n '1,400p'"),
+            prompt.contains("sed -n '1,1200p'"),
             "the paging idiom survives truncation:\n{prompt}"
         );
         assert!(
@@ -819,7 +823,7 @@ mod tests {
             "every text attachment is listed:\n{directive}"
         );
         assert!(
-            directive.contains("sed -n '1,400p'"),
+            directive.contains("sed -n '1,1200p'"),
             "paging idiom present:\n{directive}"
         );
         assert!(

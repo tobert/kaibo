@@ -56,6 +56,25 @@ Offline coverage: numbered-wrapper unit tests, budget partition (inline/demote/o
 budget-0), scripted-loop tests pinning the directive into the `explore′` sweep preamble
 and `explore_with`, config-ladder tests for the knob. 21 test binaries green.
 
+Live watch coda (same day): Amy watched a consult's progress notifications on the
+fresh binary and the explorer was still chatty — grep-grazing and small spans. The
+guidance was the culprit: "a *short* file: read it WHOLE" makes the model classify
+before daring a whole read, the prescribed spans (400 lines) were far smaller than
+the cap affords, and `grep -B4 -A8` was offered as a way to *understand* rather
+than to locate. First instinct was to also raise the output cap to 256 KiB;
+Amy's context-budget arithmetic killed that: measured on our own tree kaibo Rust
+runs **2.79 bytes/token** (cpal count over `server/mod.rs`), so a maxed 256 KiB
+read ≈ ~94K tokens — a third-plus of a common 250K *explorer* window, riding every
+subsequent turn of the sweep. (Synths are 1M-class and get attachments inlined
+under the separate `inline_attach_budget`; the cap protects the explorer.) The
+landed design is hers, staged: cap stays 64 KiB (~23K tokens; fits nearly every
+real file whole), whole-first wording everywhere ("Read files WHOLE… nearly every
+source file fits in one look"), grep reframed as the locator, `wc -l` pre-probe
+dropped — and a truncated giant is *informative*: exit 3 hands back head+tail, and
+the guidance stages the rest as targeted reads (`grep -n SYMBOL FILE`, then a
+~1,200-line span around it) instead of a mechanical end-to-end walk. Caller-flagged
+attachments keep their read-it-ALL directive; that cost is deliberate.
+
 Cross-family review (Gemini Pro batch + DeepSeek agent, whole files, no diff) folded
 in before merge: path escaping extended to the demotion/image/sweep directive lists (a
 filename can legally hold `\n` and would have forged list entries — both reviewers);
