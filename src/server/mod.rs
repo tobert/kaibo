@@ -2806,19 +2806,30 @@ Work through these steps:
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
 2. Ask me which providers I can actually reach before writing anything: which of \
-Anthropic / DeepSeek / Gemini I hold API keys for, and whether I run any \
+Anthropic / DeepSeek / Gemini / OpenRouter I hold API keys for, and whether I run any \
 OpenAI-compatible local servers (llama.cpp, Ollama, an image server) and at what base \
-URLs. Let me tell you my providers rather than guessing them.
+URLs. Let me tell you my providers rather than guessing them. OpenRouter is worth \
+naming on its own — one key there reaches every major model family through a single \
+gateway.
 3. Propose a roster built on a provider I actually named in step 2, then write it to \
 `$XDG_CONFIG_HOME/kaibo/config.toml` (default `~/.config/kaibo/config.toml`). The \
-default shape is a single outside family — DeepSeek, Gemini, Anthropic, or a local pair \
-— with explorer and synth both within it. That one family is already the whole win: it \
-augments my own lineage with a different house's eyes (a cheap, fast explorer and a \
-stronger synth, same family). kaibo's built-in casts are already within-family pairs, \
-so often this is just giving one of them a key rather than writing a new cast. Mixing \
-families across roles (a 'chimera' — say a DeepSeek explorer with a Claude synth) is an \
-advanced move for someone who holds several keys and asks for it; don't reach for it by \
-default.
+default shape is a single outside family — DeepSeek, Gemini, Anthropic, OpenRouter, or \
+a local pair — with explorer and synth both within it. That one family is already the \
+whole win: it augments my own lineage with a different house's eyes (a cheap, fast \
+explorer and a stronger synth, same family). kaibo's built-in casts are already \
+within-family pairs, so often this is just giving one of them a key rather than writing \
+a new cast. Mixing families across roles (a 'chimera' — say a DeepSeek explorer with a \
+Claude synth) is an advanced move for someone who holds several keys and asks for it; \
+don't reach for it by default. If OpenRouter is the family, ground the model picks in \
+its live catalog instead of guessing ids: `GET https://openrouter.ai/api/v1/models` is \
+public, no auth, and filters to what matters — \
+`?supported_parameters=tools&category=programming&sort=intelligence-high-to-low` finds \
+tool-capable coding models (a consult cast needs `tools` support); `q=` / `context=` / \
+`max_price=` narrow further; each entry carries live pricing, context length, and a \
+`reasoning` capability block. Favor the drift-proof `~author/family-latest` aliases \
+(e.g. `~anthropic/claude-sonnet-latest`) over a pinned slug, and know that `:free` / \
+`:nitro` / `:floor` suffixes pick a free, fastest, or cheapest variant of a concrete \
+slug where offered.
 4. Keep secrets in the environment or a key file. A backend names an env var \
 (`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
 the secret stays outside it. Tell me which env vars to set or files to write, and let \

@@ -277,6 +277,12 @@ the git log. Each later release appends a new section at the top.
   optional augmentation); the policy is documented in the README FAQ and `docs/config.md`.
 - **Single self-contained binary** per platform; Linux builds are fully static
   (musl). TLS is rustls + ring — no OpenSSL, no aws-lc, no C toolchain.
+- **OpenRouter as a first-class provider.** One `OPENROUTER_API_KEY` now reaches
+  every major model family through the built-in `openrouter` backend and cast, with
+  reasoning on by default (OpenRouter's unified `effort` param, forwarded verbatim so
+  a synth slot can reach past the usual `high` default into `xhigh`/`max`). The
+  built-in cast pins OpenRouter's `~author/family-latest` catalog aliases, so it stays
+  current as new models ship instead of rotting on a dated id.
 
 ### Changed
 
