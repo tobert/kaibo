@@ -90,17 +90,12 @@ were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test
   immediately — trades away the batch lane's cross-restart durability; don't without the
   persistence decision.
 
-### Upstream kaish grep: BRE `\|` alternation silently matches nothing
-Watched live (2026-07-03, deepseek explorer on the new binary): the model issued
-`grep -n 'resolve_attachments\|fn consult\|attach' FILE`-style locator greps — the
-universal GNU habit — and kaish returned empty with exit 0, so it retried
-near-identical variants for ~10-15 turns before falling back to single patterns. A
-silent-empty on a syntactically accepted pattern is a silent fallback in exactly the
-sense we don't tolerate: the honest behaviors are supporting `\|` in BRE mode or
-erroring loudly on it. Mitigated kaibo-side 2026-07-03 (cheatsheet now teaches
-`grep -rnE 'foo|bar'`); the real fix is upstream in kaish's regex engine
-(`regex-bites` as of 0.10.0). Related memory: `kaish-grep-gotchas` (also `-r` on a
-*file* silently returns nothing).
+### Bump to kaish-kernel 0.11.0 as soon as it drops
+0.11.0 fixes grep BRE `\|` alternation silently matching nothing — measured live
+2026-07-03 costing a deepseek explorer ~10-15 retry turns in one sweep (mitigated
+meanwhile by the cheatsheet teaching `grep -rnE 'foo|bar'`, which stays valid after
+the bump). Usual bump discipline applies (adapt to any API shape change, boundary
+tests keep teeth).
 
 ### Upstream kaish-vfs: `LocalFs::list` hard-fails when an entry vanishes mid-walk
 `kaish-vfs` `LocalFs::list` (`src/local.rs`, 0.9.0) enumerates a directory with
