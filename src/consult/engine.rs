@@ -975,13 +975,22 @@ fn consult_tools(
     // which may live on a different backend than the driver's. Bounded by
     // explorer_max_turns per sweep; no cap on how many times consult may delegate
     // (Amy's call — watch real behavior). Its system prompt is the explorer
-    // override-or-default + house rules, built once here rather than per sweep.
-    let explorer_preamble: Arc<str> = Arc::from(resolve_phase_preamble(
+    // override-or-default + house rules, built once here rather than per sweep —
+    // plus the caller's attachment directive: a sweep is a fresh agent that saw
+    // neither the driver prompt nor the inlined bytes, so without this a driver
+    // that delegates early sends a sweep blind to the very files the caller
+    // flagged as central. The directive orders whole `cat -n` reads (the explorer
+    // chooses when, not whether), keeping citation-exact line numbers for free.
+    let mut explorer_preamble_owned = resolve_phase_preamble(
         Phase::Explorer,
         &cfg.explore.phase.prompts,
         cfg.explore.phase.orientation.as_deref(),
         cfg.explore.phase.house_rules.as_deref(),
-    ));
+    );
+    if let Some(directive) = super::prompts::explorer_attachment_directive(&cfg.attachments) {
+        explorer_preamble_owned.push_str(&directive);
+    }
+    let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explore.explorer_max_turns,
@@ -1009,22 +1018,29 @@ fn consult_tools(
 
 /// Run the `explore` tool: the evidence-gathering half of `consult`, surfaced on
 /// its own. One explorer arm sweeps `root` read-only over `{run_kaish}` and returns
-/// its cited report *verbatim* — no synth, no session, no attachments (explore reads
-/// the repo itself). The report shape is [`report_preamble`], resolved through the
-/// same [`phase_preamble`] layering `consult_tools` gives the nested `explore′`, so
-/// a `[prompts].explorer` override, `[orientation]`, and house rules all reach it.
+/// its cited report *verbatim* — no synth, no session. `attached` files (the tool's
+/// `attach` arg; deliberate's dossier stage passes none) land as a preamble
+/// directive to read each WHOLE with `cat -n` — the explorer reads through its
+/// shell, so nothing is inlined here. The report shape is [`report_preamble`],
+/// resolved through the same [`phase_preamble`] layering `consult_tools` gives the
+/// nested `explore′`, so a `[prompts].explorer` override, `[orientation]`, and
+/// house rules all reach it.
 pub(crate) async fn explore_with(
     question: &str,
     root: PathBuf,
     explorer: &Arm,
     cfg: &ExploreConfig,
+    attached: &[super::prompts::ConsultAttachment],
 ) -> Result<String> {
-    let preamble = resolve_phase_preamble(
+    let mut preamble = resolve_phase_preamble(
         Phase::Explorer,
         &cfg.phase.prompts,
         cfg.phase.orientation.as_deref(),
         cfg.phase.house_rules.as_deref(),
     );
+    if let Some(directive) = super::prompts::explorer_attachment_directive(attached) {
+        preamble.push_str(&directive);
+    }
     with_call_deadline(
         cfg.phase.call_deadline,
         "explore",
@@ -1819,6 +1835,76 @@ mod tests {
         );
     }
 
+    /// Attachments reach the delegated sweep: a consult carrying attachments must
+    /// hand every `explore′` sub-agent the read-them-WHOLE directive in its
+    /// preamble — the sweep is a fresh agent that never saw the driver prompt, so
+    /// without this it's blind to the very files the caller flagged as central.
+    /// Inlined and oversize text attachments alike are listed; the directive is
+    /// command voice with the paging idiom.
+    #[tokio::test]
+    async fn consult_attachments_reach_the_delegated_sweep_preamble() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("EXPLORER_REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "survey the change" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done."))
+                }
+            })
+            .on_model(EXPLORER, |_req| {
+                Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            attachments: vec![
+                super::super::prompts::ConsultAttachment::Text {
+                    path: "changes.diff".into(),
+                    body: "-a\n+b".into(),
+                },
+                super::super::prompts::ConsultAttachment::TextOversize {
+                    path: "src/big.rs".into(),
+                    size: 900_000,
+                },
+            ],
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "Does the change hold up?",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let explorer_reqs = client.requests_for(EXPLORER);
+        assert!(!explorer_reqs.is_empty(), "the sweep actually ran");
+        let preamble = explorer_reqs[0].preamble.as_deref().unwrap_or("");
+        assert!(
+            preamble.contains("Read each one WHOLE"),
+            "the sweep preamble carries the command-voice directive: {preamble:?}"
+        );
+        assert!(
+            preamble.contains("- changes.diff") && preamble.contains("- src/big.rs"),
+            "inlined and oversize attachments are both listed for the sweep: {preamble:?}"
+        );
+        assert!(
+            !preamble.contains("-a\n+b"),
+            "the sweep gets paths to read, never inlined bytes: {preamble:?}"
+        );
+    }
+
     /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
     /// explorer arm over `{run_kaish}` against the real repo and returns the
     /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
@@ -1861,6 +1947,7 @@ mod tests {
             dir.path().to_path_buf(),
             &arm(&client, EXPLORER),
             &cfg,
+            &[],
         )
         .await
         .expect("scripted explore should succeed");
@@ -1883,6 +1970,42 @@ mod tests {
                 .contains("code explorer"),
             "explorer got the report preamble: {:?}",
             reqs[0].preamble
+        );
+    }
+
+    /// The top-level `explore` tool's attachments land the same way: a read-WHOLE
+    /// directive appended to the explorer preamble — never inlined bytes.
+    #[tokio::test]
+    async fn explore_with_appends_the_attachment_directive() {
+        const EXPLORER: &str = "cheap-explorer";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |_req| {
+                Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        explore_with(
+            "survey the parser",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[super::super::prompts::ConsultAttachment::TextOversize {
+                path: "src/parser_gen.rs".into(),
+                size: 900_000,
+            }],
+        )
+        .await
+        .expect("scripted explore should succeed");
+
+        let preamble = client.requests_for(EXPLORER)[0]
+            .preamble
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            preamble.contains("Read each one WHOLE") && preamble.contains("- src/parser_gen.rs"),
+            "explore's preamble carries the directive: {preamble:?}"
         );
     }
 
@@ -1927,6 +2050,7 @@ mod tests {
             dir.path().to_path_buf(),
             &arm(&client, EXPLORER),
             &cfg,
+            &[],
         )
         .await
         .expect("scripted explore should succeed");
@@ -2065,7 +2189,13 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            explore_with("q", dir.path().to_path_buf(), &arm(&client, EXPLORER), &cfg),
+            explore_with(
+                "q",
+                dir.path().to_path_buf(),
+                &arm(&client, EXPLORER),
+                &cfg,
+                &[],
+            ),
         )
         .await
         .expect("explore_with did not honor call_deadline — it hung past 5s (no backstop)");

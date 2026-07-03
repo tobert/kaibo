@@ -228,22 +228,44 @@ pub fn report_preamble() -> String {
 /// thinking budget, sampling) ride each [`Arm`] (they track the slot's model);
 /// what remains here are the loop bounds the caller may dial per request, the
 /// sandbox limits, and the progress sink.
-/// One caller-attached file, classified so the driver's prompt can route it to the
-/// right tool. `consult` never inlines an attachment's bytes — text files the model
-/// reads itself with `cat -n`, images it views with `view_image` (the image-analog of
-/// `cat`, present whenever the synth is vision-capable). The server sniffs each file's
-/// magic bytes to set `is_image`, so a `.png` named `.txt` (or vice versa) is routed by
-/// content, not extension — matching how `view_image` re-sniffs authoritatively at read.
+/// One caller-attached file, resolved and classified server-side so the driver's
+/// prompt can put it in front of the model. Attaching means *the model sees the
+/// bytes*: a text file within the inline budget rides the driver prompt whole,
+/// numbered `cat -n` style inside the shared `<file>` wrapper (so citations against
+/// it are exact); a text file past the budget is named with a read-it-WHOLE
+/// directive instead — demoted loudly, never silently dropped; an image is routed to
+/// `view_image` (the image-analog of `cat`, present whenever the synth is
+/// vision-capable — the server gates a blind synth up front). Classification is by
+/// content (magic bytes), not extension, matching how `view_image` re-sniffs
+/// authoritatively at read.
 #[derive(Debug, Clone)]
-pub struct ConsultAttachment {
-    /// The path the model passes to `cat -n` or `view_image`: root-relative for a file
-    /// under the project root, the one real tree the consult shell mounts.
-    pub path: String,
-    /// True when the file sniffed as a known image type — route it to `view_image`, not
-    /// the shell. A consult that carries an image attachment must run a vision-capable
-    /// synth (the server gates this up front, the same honest refusal `oneshot`/`batch`
-    /// give a blind model).
-    pub is_image: bool,
+pub enum ConsultAttachment {
+    /// A text file within the inline budget: `body` is its full UTF-8 content, read
+    /// server-side through the read-only VFS, spliced into the driver prompt.
+    Text { path: String, body: String },
+    /// A text file past the inline budget (`[defaults] inline_attach_budget`): the
+    /// prompt names it with its size and directs the model to read it whole through
+    /// the shell, paging past the output cap in spans.
+    TextOversize { path: String, size: u64 },
+    /// An image: never inlined here — the model opens it with `view_image`.
+    Image { path: String },
+}
+
+impl ConsultAttachment {
+    /// The path the model uses — root-relative under the project root, the one real
+    /// tree the consult shell mounts, so `cat -n`/`view_image` open it directly.
+    pub fn path(&self) -> &str {
+        match self {
+            ConsultAttachment::Text { path, .. }
+            | ConsultAttachment::TextOversize { path, .. }
+            | ConsultAttachment::Image { path } => path,
+        }
+    }
+
+    /// True for an image attachment — the vision gate keys on this.
+    pub fn is_image(&self) -> bool {
+        matches!(self, ConsultAttachment::Image { .. })
+    }
 }
 
 /// The `oneshot` preamble: a thin, direct second opinion with no tools and no
@@ -369,17 +391,51 @@ pub fn consult_user_prompt(
         ));
     }
     if !attached.is_empty() {
-        let (images, texts): (Vec<&ConsultAttachment>, Vec<&ConsultAttachment>) =
-            attached.iter().partition(|a| a.is_image);
-        prompt.push_str(
-            "The caller attached these files as central to the question. They live under \
-             the project root, so a relative path opens directly. Open each as you build \
-             your answer:\n",
-        );
-        if !texts.is_empty() {
-            prompt.push_str("\nText files — read each in full with the shell (`cat -n PATH`):\n");
-            for a in &texts {
-                prompt.push_str(&format!("- {}\n", a.path));
+        prompt.push_str("The caller attached these files as central to the question.\n");
+        let inlined: Vec<&ConsultAttachment> = attached
+            .iter()
+            .filter(|a| matches!(a, ConsultAttachment::Text { .. }))
+            .collect();
+        let oversize: Vec<&ConsultAttachment> = attached
+            .iter()
+            .filter(|a| matches!(a, ConsultAttachment::TextOversize { .. }))
+            .collect();
+        let images: Vec<&ConsultAttachment> = attached.iter().filter(|a| a.is_image()).collect();
+        if !inlined.is_empty() {
+            // The bytes are already in front of the model, numbered like `cat -n`, so
+            // an inlined attachment cites as exactly as a shell read — no turn spent
+            // re-fetching what the caller flagged as central.
+            prompt.push_str(
+                "\nTheir full contents follow, lines numbered like `cat -n` — they are \
+                 already in front of you, so work from them directly and cite them by \
+                 `file:line` like anything you read:\n\n",
+            );
+            for a in &inlined {
+                if let ConsultAttachment::Text { path, body } = a {
+                    let wrapped = crate::attach::Attachment::Text {
+                        path: path.clone(),
+                        body: body.clone(),
+                    }
+                    .wrapped_text()
+                    .expect("a text attachment wraps");
+                    prompt.push_str(&wrapped);
+                    prompt.push_str("\n\n");
+                }
+            }
+        }
+        if !oversize.is_empty() {
+            // Past the inline budget — demoted loudly, with a command-voice directive:
+            // the caller flagged these as central, so a skim is not an option.
+            prompt.push_str(
+                "\nThese attached files are too large to inline. Read each one WHOLE \
+                 with the shell before you answer: `cat -n PATH`, and when the output \
+                 truncates, continue in spans (`cat -n PATH | sed -n '1,400p'`, then \
+                 `'401,800p'`, …) until you reach the end of the file:\n",
+            );
+            for a in &oversize {
+                if let ConsultAttachment::TextOversize { path, size } = a {
+                    prompt.push_str(&format!("- {path} ({size} bytes)\n"));
+                }
             }
         }
         if !images.is_empty() {
@@ -391,13 +447,46 @@ pub fn consult_user_prompt(
                  hands you the picture itself; don't `cat` an image:\n",
             );
             for a in &images {
-                prompt.push_str(&format!("- {}\n", a.path));
+                prompt.push_str(&format!("- {}\n", a.path()));
             }
         }
         prompt.push('\n');
     }
     prompt.push_str(&format!("Now answer the current question:\n\n{question}"));
     prompt
+}
+
+/// The explorer's attachment directive: the block appended to an explorer preamble
+/// (the nested `explore′` sweep and the top-level `explore` tool alike) when the
+/// caller attached files. Command voice on purpose — the caller flagged these as
+/// central, so reading them whole is the sweep's floor, not a suggestion; the
+/// explorer keeps agency over *when* in its investigation the read happens, none
+/// over *whether*. The paging idiom is spelled out because kaish truncates output
+/// past its cap (64 KB default), and "whole" has to survive truncation. Text files
+/// only: an explorer reads through the shell, and an image attachment is the
+/// synth's business (`view_image`). `None` when nothing applies, so the
+/// no-attachment preamble is byte-for-byte unchanged.
+pub fn explorer_attachment_directive(attached: &[ConsultAttachment]) -> Option<String> {
+    let files: Vec<&str> = attached
+        .iter()
+        .filter(|a| !a.is_image())
+        .map(|a| a.path())
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let list = files
+        .iter()
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "\n\nThe caller attached these files as central to the question — they live \
+         under the project root, so each path opens directly. Read each one WHOLE with \
+         `cat -n PATH` and weigh what you find in your report; when the output \
+         truncates, continue in spans (`cat -n PATH | sed -n '1,400p'`, then \
+         `'401,800p'`, …) until you reach the end of the file:\n{list}"
+    ))
 }
 
 /// The recomposed `consult` driver: one capable model, two tools. Composes the
@@ -631,27 +720,31 @@ mod tests {
         );
     }
 
-    /// Text attachments are named in the prompt (for the model to `cat` itself) and
-    /// steered to read them in full — and they're listed before the question, like context.
+    /// Text attachments within the budget are INLINED into the driver prompt — the
+    /// numbered `<file>` wrapper, whole body, listed before the question like context —
+    /// so the model works from the bytes instead of spending turns fetching them.
     #[test]
-    fn attached_files_are_named_for_the_model_to_read() {
+    fn attached_text_is_inlined_numbered_before_the_question() {
         let prompt = consult_user_prompt(
             "Does the diff weaken the sandbox?",
             None,
             &[],
-            &[text_attach("changes.diff"), text_attach("src/sandbox.rs")],
+            &[
+                text_attach("changes.diff", "-old line\n+new line"),
+                text_attach("src/sandbox.rs", "fn read_only() {}"),
+            ],
         );
         assert!(
-            prompt.contains("changes.diff"),
-            "names each attached file:\n{prompt}"
+            prompt.contains("<file path=\"changes.diff\">"),
+            "each attachment rides the <file> wrapper:\n{prompt}"
         );
         assert!(
-            prompt.contains("src/sandbox.rs"),
-            "names each attached file:\n{prompt}"
+            prompt.contains("     1\t-old line\n     2\t+new line"),
+            "the body is inlined whole, numbered cat -n style:\n{prompt}"
         );
         assert!(
-            prompt.contains("cat -n"),
-            "steers the model to read them with the shell:\n{prompt}"
+            prompt.contains("     1\tfn read_only() {}"),
+            "every text attachment inlines:\n{prompt}"
         );
         let listed = prompt.find("changes.diff").unwrap();
         let question = prompt.find("Does the diff weaken").unwrap();
@@ -661,19 +754,94 @@ mod tests {
         );
     }
 
-    /// An image attachment must be routed to `view_image`, never to `cat` (which refuses
-    /// binary). With a mix, each file lands under the right instruction: text → `cat -n`,
-    /// image → `view_image`. This is the prompt half of the image-attach support; the
-    /// server gates a vision-blind synth before we ever get here.
+    /// A text attachment past the inline budget is demoted loudly: named with its size
+    /// under a command-voice directive to read it WHOLE through the shell (with the
+    /// paging idiom for the output cap) — its body is NOT inlined.
     #[test]
-    fn image_attachments_are_routed_to_view_image_not_cat() {
+    fn oversize_attachment_gets_a_read_whole_directive() {
+        let prompt = consult_user_prompt(
+            "Audit the generated parser.",
+            None,
+            &[],
+            &[
+                oversize_attach("src/parser_gen.rs", 900_000),
+                text_attach("src/lexer.rs", "struct Lexer;"),
+            ],
+        );
+        assert!(
+            prompt.contains("Read each one WHOLE"),
+            "command voice, whole-file:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- src/parser_gen.rs (900000 bytes)"),
+            "the demoted file is named with its size:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("sed -n '1,400p'"),
+            "the paging idiom survives truncation:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("<file path=\"src/parser_gen.rs\">"),
+            "an oversize body is never inlined:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("<file path=\"src/lexer.rs\">"),
+            "the under-budget sibling still inlines:\n{prompt}"
+        );
+    }
+
+    /// The explorer directive lists every text attachment (inlined-at-the-driver or
+    /// oversize alike — the sweep runs a fresh agent that saw neither) in command
+    /// voice with the paging idiom; images stay out (the shell can't read them);
+    /// no attachments ⇒ `None`, the preamble byte-for-byte unchanged.
+    #[test]
+    fn explorer_directive_orders_whole_reads_of_text_attachments() {
+        let directive = explorer_attachment_directive(&[
+            text_attach("changes.diff", "-a\n+b"),
+            oversize_attach("src/parser_gen.rs", 900_000),
+            image_attach("docs/banner.png"),
+        ])
+        .expect("text attachments produce a directive");
+        assert!(
+            directive.contains("Read each one WHOLE"),
+            "command voice:\n{directive}"
+        );
+        assert!(
+            directive.contains("- changes.diff") && directive.contains("- src/parser_gen.rs"),
+            "every text attachment is listed:\n{directive}"
+        );
+        assert!(
+            directive.contains("sed -n '1,400p'"),
+            "paging idiom present:\n{directive}"
+        );
+        assert!(
+            !directive.contains("banner.png"),
+            "images stay out of the shell directive:\n{directive}"
+        );
+        assert!(
+            explorer_attachment_directive(&[]).is_none(),
+            "no attachments, no directive"
+        );
+        assert!(
+            explorer_attachment_directive(&[image_attach("a.png")]).is_none(),
+            "images alone produce no shell directive"
+        );
+    }
+
+    /// An image attachment must be routed to `view_image`, never inlined or sent to
+    /// `cat` (which refuses binary). With a mix, each file lands right: text inlines
+    /// under the numbered-contents note, the image under the `view_image` instruction.
+    /// This is the prompt half of the image-attach support; the server gates a
+    /// vision-blind synth before we ever get here.
+    #[test]
+    fn image_attachments_are_routed_to_view_image_not_inlined() {
         let prompt = consult_user_prompt(
             "What does the banner show, and does it match the brand doc?",
             None,
             &[],
             &[
                 image_attach("docs/brand/banner-teal.png"),
-                text_attach("docs/brand/README.md"),
+                text_attach("docs/brand/README.md", "# Brand\nteal."),
             ],
         );
         // The image is steered to view_image and explicitly kept away from the shell.
@@ -683,33 +851,38 @@ mod tests {
         let img_at = prompt
             .find("banner-teal.png")
             .expect("image is named in the prompt");
-        // The image name sits under the view_image instruction, not the cat -n one.
-        let cat_at = prompt.find("cat -n").expect("text section names cat -n");
         assert!(
             view_at < img_at,
             "the image is listed under the view_image instruction:\n{prompt}"
         );
-        // The text file is under the cat -n section.
-        let readme_at = prompt
-            .find("README.md")
-            .expect("text file is named in the prompt");
+        // The text file inlines whole; the image contributes no <file> wrapper.
         assert!(
-            cat_at < readme_at,
-            "the text file is listed under the cat -n instruction:\n{prompt}"
+            prompt.contains("<file path=\"docs/brand/README.md\">"),
+            "the text sibling still inlines:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("<file path=\"docs/brand/banner-teal.png\">"),
+            "an image is never text-wrapped:\n{prompt}"
         );
     }
 
-    fn text_attach(path: &str) -> ConsultAttachment {
-        ConsultAttachment {
+    fn text_attach(path: &str, body: &str) -> ConsultAttachment {
+        ConsultAttachment::Text {
             path: path.to_string(),
-            is_image: false,
+            body: body.to_string(),
+        }
+    }
+
+    fn oversize_attach(path: &str, size: u64) -> ConsultAttachment {
+        ConsultAttachment::TextOversize {
+            path: path.to_string(),
+            size,
         }
     }
 
     fn image_attach(path: &str) -> ConsultAttachment {
-        ConsultAttachment {
+        ConsultAttachment::Image {
             path: path.to_string(),
-            is_image: true,
         }
     }
 

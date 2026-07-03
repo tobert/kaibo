@@ -212,6 +212,16 @@ The `[defaults]` knobs themselves:
   held in memory — running plus finished-but-uncollected (LRU, capacity-evicted, no
   TTL; evicting a still-running job aborts it). Its own knob, smaller than
   `session_capacity` because a held job result is heavier than a session's Q&A pair.
+- **`inline_attach_budget`** (262144 = 256 KiB; `0` is legal): cumulative byte budget
+  for inlining `consult` text attachments into the driver prompt (caller order,
+  greedy). A text attachment past the remaining budget is *demoted* — named in the
+  prompt with a read-it-WHOLE directive instead of its bytes — loudly, never dropped.
+  `0` inlines nothing (every text attachment becomes a directive): the escape hatch
+  for a small-context cast, e.g. a 4K-ctx local model that chokes on inlined bytes a
+  hosted model shrugs at. Inlined bytes ride every turn of the driver loop, so this
+  bounds resident prompt cost, not just one request. The tool-less tools
+  (`oneshot`/`batch_submit`) are unaffected — with no shell to fall back on, they
+  keep their own hard per-file/per-call caps.
 
 ### Built-in registry (the defaults)
 
@@ -333,6 +343,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | whole-call deadline (s) | `defaults.call_deadline_secs` *(must be > 0; default 3600)* | `KAIBO_CALL_DEADLINE_SECS` | — |
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | async job cache size | `defaults.job_capacity` *(must be > 0; default 64)* | `KAIBO_JOB_CAPACITY` | — |
+| attach inline budget (bytes) | `defaults.inline_attach_budget` *(0 = never inline; default 262144)* | `KAIBO_INLINE_ATTACH_BUDGET` | — |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |

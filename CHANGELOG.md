@@ -22,14 +22,19 @@ the git log. Each later release appends a new section at the top.
   answer carries a provenance footer naming the cast and the models that produced it.
   Args: `question`, `context`, `path`, `cast`, `session_id`, `attach`, `include_report`,
   and per-call `explorer_model` / `synth_model` (+ `_backend`) overrides. **`attach`**
-  names workspace files (under the project root) to put in front of the investigation —
-  unlike the tool-less tools' attach, kaibo does *not* inline them; it names them in the
-  prompt and the consult model opens each itself when it's ready, in full, building its own
-  narrative: a text file with the shell (`cat -n`), an **image** with its `view_image` tool.
-  An attached image therefore needs a vision-capable cast — kaibo refuses one to a
-  vision-blind synth up front (the same honest refusal `oneshot`/`batch` give) rather than
-  name a file the model could never open. The files just have to live under the root the
-  consult reads (a worktree counts).
+  puts workspace files (under the project root) in front of the investigation — attach
+  means *the model sees the bytes*. Text files are **inlined whole** into the
+  investigation prompt, lines numbered like `cat -n` so the model cites them by exact
+  `file:line`; a file past the cumulative inline budget (`[defaults]
+  inline_attach_budget` / `KAIBO_INLINE_ATTACH_BUDGET`, default 256 KiB; `0` = inline
+  nothing, the escape hatch for small-context local casts) is instead ordered read WHOLE
+  through the model's shell — demoted loudly with its size, never silently dropped. Every
+  delegated explorer sweep also gets a read-them-WHOLE directive for the attached files,
+  so a sub-agent is never blind to what you flagged as central. An **image** opens via
+  the `view_image` tool and therefore needs a vision-capable cast — kaibo refuses one to
+  a vision-blind synth up front (the same honest refusal `oneshot`/`batch` give) rather
+  than name a file the model could never open. The files just have to live under the
+  root the consult reads (a worktree counts).
 - **`consult_submit`** — the *async sibling* of `consult` (as batch is to `oneshot`):
   start a consultation in the background and get back a handle (`job-N`) instead of
   holding your turn open while a deep investigation runs. Same investigation, same args
@@ -49,7 +54,10 @@ the git log. Each later release appends a new section at the top.
   grounded survey you'll reason over yourself (or feed to another model), when you want the
   map rather than the conclusion. It reads the repo itself like `consult`, so it takes the
   same `path` / `cast` / `explorer_model` (+ `explorer_backend`) / `explorer_max_turns`
-  arguments; being single-phase, it has no synth args, `attach`, `context`, or `session_id`.
+  arguments, plus `attach`: text files the investigator is directed to read WHOLE during
+  its sweep (it reads through the shell, so nothing inlines and images are refused —
+  attach those to `consult` with a vision cast). Being single-phase, it has no synth
+  args, `context`, or `session_id`.
   Because it runs *only* the explorer, its `cast` accepts **any cast with an explorer** —
   not just interactive ones, but `deliberate`/`direct` casts too: point it at one to run
   that team's (often smarter) explorer standalone, handy for sizing up an explorer or for a

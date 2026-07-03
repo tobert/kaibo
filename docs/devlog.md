@@ -14,6 +14,48 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-03 — attach means the model sees the bytes (inline + sweep directives)
+
+Amy asked how attachments reach explorers, and the honest answer — "they don't" —
+exposed the gap: `consult` attach only *named* files in the driver prompt, the
+delegated `explore′` sweep never heard about them at all, and the kaish output cap
+(64 KB) meant "read it in full with `cat -n`" was physically impossible in one pass
+for a big file. The caller's strongest signal ("these files are central") was the one
+input we delivered weakest.
+
+The reframe, per Amy: **attach means the model sees the bytes, one semantic across
+tools.** How each tool delivers it:
+
+- **`consult`** — text attachments inline whole into the driver prompt inside the
+  shared `<file>` wrapper, now numbered `cat -n` style (`attach.rs::number_lines`) so
+  citations against inlined content are as exact as shell reads (raw un-numbered bytes
+  invite guessed line numbers — the numbering IS the citation contract). Numbering
+  applies to every inline site (oneshot/batch too) — one wrapper, one form.
+- **Inline budget** — `[defaults] inline_attach_budget` (256 KiB default, env/file
+  overridable, `0` legal = inline nothing): inlined bytes ride *every* turn of the
+  driver loop, so the budget bounds resident prompt cost, and it's the escape hatch
+  for small-context local casts (gemma4's 4K ctx). A file past the remaining budget
+  *demotes* — named with its size under a command-voice directive (Amy's wording call:
+  "Read each one WHOLE", not "read early") with the sed-span paging idiom so "whole"
+  survives the output cap. Demotion is loud, never a drop; caller order, greedy.
+- **Explorer sweeps** — `explore′` preambles (and the top-level `explore` tool, which
+  grew an `attach` arg) get the same command-voice read-WHOLE directive listing every
+  text attachment: a sweep is a fresh agent that saw neither the driver prompt nor the
+  inlined bytes, so without this a driver that delegates early sends sweeps blind to
+  the flagged files. Directives, not bytes, on purpose: the explorer keeps agency over
+  *when* the read happens (and pays it only in sweeps that run); images stay out
+  (shell can't read them; `explore` refuses image attach outright).
+- **Security posture preserved** — inlined consult bytes are read through the
+  read-only kaish VFS (`resolve_consult_attachments` now mirrors
+  `resolve_attachments`' TOCTOU-safe mount read); the 16-byte `std::fs` sniff remains
+  only as a routing *hint* for files never inlined. Non-UTF-8 non-image attach is now
+  refused loudly on consult too (it could neither inline nor be `cat`'d — naming it
+  would burn a turn on a dead end).
+
+Offline coverage: numbered-wrapper unit tests, budget partition (inline/demote/order,
+budget-0), scripted-loop tests pinning the directive into the `explore′` sweep preamble
+and `explore_with`, config-ladder tests for the knob. 21 test binaries green.
+
 ## 2026-07-03 — whole-call wall-clock deadline (a consult can't hang overnight)
 
 A live consult (cast `lemonade`, a local server since decommissioned) parked a Claude

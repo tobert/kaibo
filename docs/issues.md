@@ -212,6 +212,18 @@ in-process and reliable); the classification covers the user-facing symptom toda
 
 ## P3 — Infra, perf, polish
 
+### Attach-inline follow-ons: per-call budget, observed cost
+`inline_attach_budget` (2026-07-03, `[defaults]`/env) is server-wide only. Two
+things to watch in real sessions before adding surface: (1) whether a **per-call
+override** earns its schema slot (a caller pairing one big attach batch with a
+hosted cast while the server default protects local casts would want it); (2) the
+**real token cost** of inlined attachments riding every driver-loop turn on hosted
+casts — the OpenRouter cost-calibration finding (cache reads 50× DeepSeek's) says
+transcript-resident bytes multiply fast at 200 turns. Also: `explore` refuses image
+attach because the sweep toolset has no `view_image` (`run_explore_phase` builds
+`{run_kaish}` only) — if a vision-capable explorer sweep ever earns `view_image`,
+revisit the refusal.
+
 ### Expand the `kaibo://config` `[runtime]` section beyond followed worktrees
 The config resource grew a `[runtime]` table for state that's *computed at read
 time* rather than configured — currently `follow_worktrees` (the knob) and
