@@ -3007,8 +3007,9 @@ own, so you get the structured cited report — a summary of findings, the relev
 `file:line` locations, and the trail the explorer followed — with no synthesis on top.
 Reach for `explore` to map unfamiliar code, or to assemble a grounded survey you'll reason
 over yourself (or hand to another model). It reads the repo itself, like `consult`, so the
-same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply; there's no
-`attach`, `context`, or `session_id` — those belong to the synthesizing tools. Since it runs
+same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply, plus `attach`
+(text files the investigator is ordered to read whole during the sweep); no `context` or
+`session_id` — those belong to the synthesizing tools. Since it runs
 *only* the explorer, its `cast` accepts any cast with an explorer — including `deliberate`/
 `direct` casts: point it at one to run that team's (often smarter, slower) explorer
 standalone, when you want a stronger sweep than your own fast one, or to size the explorer up.
