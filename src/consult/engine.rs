@@ -2937,6 +2937,88 @@ mod tests {
         );
     }
 
+    /// The explicit `data_collection = "allow"` opt-in threads all the way to the
+    /// arm: the provider pin must be *absent* (kaibo steps aside for the account's
+    /// own settings — it never emits a restriction it was told to drop, and never
+    /// pushes toward collection with an explicit "allow"). Arm-level on purpose
+    /// (GLM review, 2026-07-03): a flipped condition in `inject_provider_prefs`
+    /// would slip past the function-level test alone.
+    #[test]
+    fn openrouter_arm_allow_omits_the_provider_pin() {
+        let defaults = crate::config::Defaults::default();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("openrouter-key");
+        std::fs::write(&key_file, "sk-or-test").unwrap();
+        let backend = crate::config::Backend {
+            name: "openrouter".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: Some(key_file.to_str().unwrap().to_string()),
+            key_optional: false,
+            request_timeout: Duration::from_secs(30),
+            data_collection: crate::config::DataCollection::Allow,
+        };
+        let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyed openrouter arm builds from a key file");
+        let params = arm.params.expect("the openrouter arm always sends params");
+        assert!(
+            params.get("provider").is_none(),
+            "the opt-in must reach the arm as an *absent* pin, got: {params}"
+        );
+        assert_eq!(
+            params["reasoning"]["effort"],
+            defaults.synth_effort.as_str(),
+            "everything else in the blob is unchanged by the opt-in"
+        );
+    }
+
+    /// `effort = "none"` on a slot threads to the arm as the structural reasoning
+    /// disable, coexisting with the budget workaround and the privacy pin — the
+    /// full injection chain, not just the `to_params` step it's pinned at in
+    /// shaping.rs (GLM review, 2026-07-03).
+    #[test]
+    fn openrouter_arm_effort_none_carries_the_structural_disable() {
+        let defaults = crate::config::Defaults::default();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("openrouter-key");
+        std::fs::write(&key_file, "sk-or-test").unwrap();
+        let backend = crate::config::Backend {
+            name: "openrouter".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: Some(key_file.to_str().unwrap().to_string()),
+            key_optional: false,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+        };
+        let slot = ModelSlot {
+            effort: Some("none".into()),
+            ..ModelSlot::bare("openrouter", "z-ai/glm-5.2")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyed openrouter arm builds from a key file");
+        let params = arm.params.expect("the openrouter arm always sends params");
+        assert_eq!(
+            params["reasoning"]["enabled"], false,
+            "the opt-out must arrive structurally, not as a passthrough string"
+        );
+        assert!(
+            params["reasoning"].get("effort").is_none(),
+            "no effort string rides beside the disable, got: {params}"
+        );
+        assert_eq!(
+            params["max_completion_tokens"], defaults.max_tokens,
+            "the budget workaround coexists with the disable"
+        );
+        assert_eq!(
+            params["provider"]["data_collection"], "deny",
+            "the privacy pin coexists with the disable"
+        );
+    }
+
     /// The OpenRouter arm rides with rig's explicit prompt caching ON: Anthropic-
     /// upstream slugs need `cache_control` breakpoints to bill cache-read rates
     /// (2026-07-03: a consult re-billed its full growing prefix every turn without

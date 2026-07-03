@@ -458,6 +458,11 @@ tunables — if a provider caps output low, cap that slot, not the global, per t
   fix wants model-aware shaping on the openai wire — e.g. emit `reasoning_effort`
   for OpenAI-compatible reasoners, OpenRouter's unified `reasoning` param when the
   backend is OpenRouter — landing with the first-class OpenRouter work.
+- **`thinking_style` is missing from the `inert_tunables` render** (GLM review,
+  2026-07-03): `kaibo://config` flags an inert `thinking_budget`/`effort`/
+  `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
+  slot whose kind ignores the override (anything non-Anthropic) renders as if
+  effective. Display accuracy only; add it to the inert check alongside the others.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
