@@ -182,6 +182,12 @@ pub(super) fn render_config_resource(
         /// True when a missing key falls back to a placeholder (keyless endpoint).
         key_optional: bool,
         request_timeout_secs: u64,
+        /// OpenRouter only: the upstream-host data policy this backend requests
+        /// (`"deny"` routes only to no-collection hosts — the default; `"allow"`
+        /// is the explicit opt-in). Rendered so the privacy posture is visible,
+        /// absent on every other kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data_collection: Option<&'static str>,
     }
 
     /// One cast slot: the `"backend/id"` ref plus its *resolved* capabilities
@@ -236,6 +242,7 @@ pub(super) fn render_config_resource(
                 api_key_file,
                 key_optional,
                 request_timeout,
+                data_collection,
             } = b;
             let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
                 Some(b.resolved_base_url())
@@ -250,6 +257,11 @@ pub(super) fn render_config_resource(
                 api_key_file: api_key_file.clone(),
                 key_optional: *key_optional,
                 request_timeout_secs: request_timeout.as_secs(),
+                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter)
+                    .then(|| match data_collection {
+                        crate::config::DataCollection::Deny => "deny",
+                        crate::config::DataCollection::Allow => "allow",
+                    }),
             };
             (name.clone(), doc)
         })

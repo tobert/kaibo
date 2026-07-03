@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+use crate::config::DataCollection;
 use crate::credentials::ProviderKind;
 
 /// Token budget for model "thinking"/reasoning, for the providers that expose a
@@ -391,11 +392,19 @@ impl ModelShape {
             ThinkingStyle::OpenRouterEffort => {
                 // The unified reasoning knob. `effort` is the per-role depth lever, a
                 // passthrough string OpenRouter validates against its ladder
-                // (none|minimal|low|medium|high|xhigh|max) — so the default "high" maps
+                // (minimal|low|medium|high|xhigh|max) — so the default "high" maps
                 // to "high", and a slot's `effort = "xhigh"` reaches the deeper rungs
                 // without a code change. The gateway maps it onto each upstream model's
                 // native reasoning field, or drops it for a model that has none.
-                obj.insert("reasoning".into(), json!({ "effort": effort }));
+                // `"none"` is the opt-out and gets the *structural* disable — the
+                // gateway's documented off-switch — rather than trusting the effort
+                // ladder to treat the literal string as off (a drift there would
+                // silently re-enable reasoning, billed as output tokens).
+                if effort == "none" {
+                    obj.insert("reasoning".into(), json!({ "enabled": false }));
+                } else {
+                    obj.insert("reasoning".into(), json!({ "effort": effort }));
+                }
             }
             ThinkingStyle::None => {}
         }
@@ -455,6 +464,30 @@ pub fn inject_output_budget(
     Some(Value::Object(obj))
 }
 
+/// Fold the backend's upstream-host data policy into `params`. **OpenRouter only**:
+/// one slug routes across competing hosts whose data policies differ, and kaibo's
+/// prompts carry source code — so under [`DataCollection::Deny`] (the default) every
+/// request pins `provider: {"data_collection": "deny"}` and OpenRouter routes only
+/// to no-collection hosts (a model with no compliant host fails loudly, which is
+/// the point). The explicit `Allow` opt-in emits nothing: kaibo never pushes
+/// *toward* collection, it just steps aside and lets the operator's own OpenRouter
+/// account settings govern. A no-op for every other kind.
+pub fn inject_provider_prefs(
+    kind: ProviderKind,
+    params: Option<Value>,
+    data_collection: DataCollection,
+) -> Option<Value> {
+    if kind != ProviderKind::OpenRouter || data_collection == DataCollection::Allow {
+        return params;
+    }
+    let mut obj = match params {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("provider".into(), json!({ "data_collection": "deny" }));
+    Some(Value::Object(obj))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +541,74 @@ mod tests {
             .to_params(8192, Some(0.5), None, DEFAULT_EFFORT)
             .unwrap();
         assert_eq!(params["temperature"], 0.5);
+    }
+
+    /// `effort = "none"` is the documented reasoning opt-out, and it must be the
+    /// *structural* disable (`{"reasoning": {"enabled": false}}`), not a passthrough
+    /// effort string — OpenRouter's explicit off-switch, independent of how the
+    /// gateway's effort ladder treats the literal "none" today. Any other rung
+    /// keeps riding as effort (pinned above).
+    #[test]
+    fn openrouter_effort_none_disables_reasoning_structurally() {
+        let shape = ModelShape::resolve(
+            ProviderKind::OpenRouter,
+            "~anthropic/claude-sonnet-latest",
+            ThinkingStyleOverride::Auto,
+        );
+        let params = shape.to_params(8192, None, None, "none").unwrap();
+        assert_eq!(
+            params["reasoning"]["enabled"], false,
+            "none must emit the explicit disable, not rely on ladder semantics"
+        );
+        assert!(
+            params["reasoning"].get("effort").is_none(),
+            "no effort string rides alongside the disable"
+        );
+    }
+
+    /// Kaibo's prompts carry source code, and one OpenRouter slug routes across
+    /// hosts with differing data policies — so every OpenRouter request must pin
+    /// `provider.data_collection = "deny"` unless the backend explicitly opted in.
+    /// The deny must merge into the existing params blob (reasoning, budget,
+    /// sampling) without clobbering it, and the Allow opt-in must emit *nothing* —
+    /// kaibo steps aside for the account's own settings, it never pushes toward
+    /// collection. Other kinds are untouched either way.
+    #[test]
+    fn openrouter_denies_data_collection_by_default() {
+        let params = ModelShape::resolve(
+            ProviderKind::OpenRouter,
+            "z-ai/glm-5.2",
+            ThinkingStyleOverride::Auto,
+        )
+        .to_params(8192, None, None, DEFAULT_EFFORT);
+        let out = inject_provider_prefs(ProviderKind::OpenRouter, params, DataCollection::Deny)
+            .expect("openrouter always sends params");
+        assert_eq!(
+            out["provider"]["data_collection"], "deny",
+            "the default must pin no-collection routing on every request"
+        );
+        assert_eq!(
+            out["reasoning"]["effort"], "high",
+            "the deny merges beside the reasoning blob, not over it"
+        );
+
+        // The explicit opt-in: no provider object at all.
+        let params = ModelShape::resolve(
+            ProviderKind::OpenRouter,
+            "z-ai/glm-5.2",
+            ThinkingStyleOverride::Auto,
+        )
+        .to_params(8192, None, None, DEFAULT_EFFORT);
+        let out = inject_provider_prefs(ProviderKind::OpenRouter, params, DataCollection::Allow)
+            .expect("openrouter always sends params");
+        assert!(
+            out.get("provider").is_none(),
+            "allow emits nothing — the account's own policy governs"
+        );
+
+        // Any other kind: passthrough both ways, including a None params.
+        let out = inject_provider_prefs(ProviderKind::Anthropic, None, DataCollection::Deny);
+        assert!(out.is_none(), "non-openrouter kinds are untouched");
     }
 
     /// OpenRouter drops rig's native `max_tokens`, so the budget must ride

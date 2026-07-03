@@ -227,10 +227,20 @@ api_key_file = "~/.gemini-api-key"
 # `{"reasoning":{"effort":…}}`, translated per upstream model and silently dropped
 # where a model has no such knob) — see [casts.or-deep] for pushing a slot past
 # [defaults] effort into OpenRouter's deeper `xhigh`/`max` rungs.
+#
+# One slug routes across COMPETING HOSTS whose data policies differ, and kaibo's
+# prompts carry your source — so every request pins no-collection routing
+# (`provider.data_collection = "deny"`) BY DEFAULT. A model whose only hosts
+# retain/train on prompts (most `:free` variants) then fails loudly instead of
+# leaking quietly. `data_collection = "allow"` is the explicit opt-in: kaibo
+# emits no restriction and your OpenRouter account settings govern. This knob
+# exists only on the openrouter kind — anywhere else it's a load error.
 [backends.openrouter]
 kind = "openrouter"
 api_key_env  = "OPENROUTER_API_KEY"
 api_key_file = "~/.openrouter-key"
+# kaibo always denies unless you uncomment this line:
+# data_collection = "allow"
 
 [backends.openai-local]                            # aliases: local, lemonade, gemma, gemma4
 kind = "openai"

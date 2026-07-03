@@ -1386,6 +1386,7 @@ mod tests {
             api_key_file: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
         }
     }
 

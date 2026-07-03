@@ -91,7 +91,16 @@ Connection knobs only — models never live here:
   has none, so emitting it unconditionally never breaks a non-reasoning model. The
   per-role `effort` (see [defaults] below) passes through verbatim, reaching
   OpenRouter-only rungs (`xhigh`, `max`) deeper than the other kinds expose. No
-  `batch` lane.
+  `batch` lane. One slug routes across competing upstream *hosts* whose data
+  policies differ, so every request pins **no-collection routing by default**
+  (`provider.data_collection = "deny"` — kaibo's prompts carry your source, and
+  shipping it to a host that retains or trains on prompts must be a choice, never
+  a default). A model whose only hosts collect (most `:free` variants) fails
+  loudly instead of leaking quietly. `data_collection = "allow"` on the backend
+  is the explicit opt-in — kaibo then emits no restriction and your OpenRouter
+  account settings govern. The knob exists only on this kind (a load error
+  elsewhere), and `kaibo://config` renders the active policy per openrouter
+  backend so the posture is always visible.
 - **`request_timeout_secs`** (default from `[defaults]`, 900 = 15 min) is the
   wall-clock ceiling on a *single* completion call. rig's prompt loop is
   non-streaming and has no native timeout, so a provider that connects but never

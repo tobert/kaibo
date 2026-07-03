@@ -462,6 +462,49 @@ tunables — if a provider caps output low, cap that slot, not the global, per t
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
 
+### OpenRouter cost + shaping follow-ups (measured $4 GLM consult, 2026-07-03)
+First live `or-glm` consult (GLM-5 explorer / GLM-5.2 synth, 8 whole files attached):
+203 chat turns in 21 min, 18.2M cumulative input tokens (16.4M cache reads) for ~40K
+output. Pricing was honored; the driver **never delegated a single explore′ sweep** —
+every one of the 203 spans carried the consult-driver preamble (classified from the
+OTLP traces' `gen_ai.system_instructions`), so the synth opened all 8 attachments and
+every span itself, re-billing the growing prefix each turn at GLM's $0.18/M cache-read
+rate (50× DeepSeek-pro's $0.0036/M). The delegation failure is being addressed by the
+explorer-prompt/attachment work (in flight, separate session). Turn caps stay a
+*runaway backstop*, not a cost throttle — the synth may burn what the question needs;
+the cure for crawling is delegation.
+
+Shipped since (2026-07-03): **prompt caching on every OpenRouter arm**
+(`Arm::openrouter_completion_model` routes through rig's `with_prompt_caching`;
+unit-pinned in `engine.rs`, live round-trip green — Anthropic-upstream slots now get
+the `cache_control` breakpoint; implicit-caching upstreams accept and ignore it) and
+**measured reasoning accounting** (`tests/consult.rs::openrouter_reasoning_accounting_live`
+posts kaibo's exact shaped params with OpenRouter usage accounting on: effort=high
+billed 932 reasoning tokens, the structural `effort="none"` disable billed 0).
+Remaining OpenRouter-specific forks:
+- **Cache the transcript, not just the system prompt.** rig's breakpoint marks only
+  the system prompt, so an Anthropic-upstream slot's *growing transcript* still
+  re-bills at full input price every turn — the preamble is the only cached prefix.
+  Upstream rig gap; the fix wants a trailing-message breakpoint like rig's native
+  Anthropic path carries.
+- **Per-slot output ceilings vary by pinned slug** (`top_provider.max_completion_tokens`:
+  glm-5.2 32768, kimi-k2.7-code 16384, gpt-5.5 128000) and reasoning bills into the
+  same completion budget — the `[defaults]` 16384 starved a real GLM oneshot answer
+  mid-sentence. Per-slot `max_tokens` already exists; the gap is doctrine: set a synth
+  slot's ceiling from the catalog when pinning a slug, and watch 16384-capped reasoners
+  (kimi) for starvation.
+- **Provider routing variance — data policy shipped, the rest open.** One slug routes
+  to multiple upstream hosts differing in cache support, quantization, pricing, and
+  parameter fidelity. `provider.data_collection = "deny"` now rides every request by
+  default (backend `data_collection = "allow"` is the explicit opt-in; openrouter-kind
+  only, load error elsewhere). Still unexposed: `require_parameters` (a host that
+  silently drops the reasoning param defeats thinking-on-by-default), `order`/`only`/
+  `ignore`, and quantization filters. Belongs with the rig-OpenRouter exit-strategy
+  thinking.
+- **Spend visibility.** Traces already carry `gen_ai.usage.*` per turn (this incident
+  was diagnosed entirely from them); consider surfacing a per-call token/cost total in
+  the provenance footer or job result so the calling agent sees cost before the bill does.
+
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
 `ExplorationTrace`), the curiosity + completeness behaviors, and the whole-first /

@@ -280,9 +280,23 @@ the git log. Each later release appends a new section at the top.
 - **OpenRouter as a first-class provider.** One `OPENROUTER_API_KEY` now reaches
   every major model family through the built-in `openrouter` backend and cast, with
   reasoning on by default (OpenRouter's unified `effort` param, forwarded verbatim so
-  a synth slot can reach past the usual `high` default into `xhigh`/`max`). The
-  built-in cast pins OpenRouter's `~author/family-latest` catalog aliases, so it stays
-  current as new models ship instead of rotting on a dated id.
+  a synth slot can reach past the usual `high` default into `xhigh`/`max` — measured
+  live: effort rides through the gateway and bills real reasoning tokens). Setting a
+  slot's `effort = "none"` sends OpenRouter's structural disable
+  (`{"reasoning": {"enabled": false}}`), so the opt-out doesn't depend on how the
+  gateway's effort ladder happens to read the string. The built-in cast pins
+  OpenRouter's `~author/family-latest` catalog aliases, so it stays current as new
+  models ship instead of rotting on a dated id. Every OpenRouter call carries an
+  explicit prompt-cache breakpoint, so Anthropic-family models behind the gateway
+  bill their (large, resident) system preamble at cache-read rates instead of full
+  input price every turn — providers whose caching is implicit simply ignore it.
+  **Data collection is denied by default**: one OpenRouter slug routes across
+  competing upstream hosts whose data policies differ, and kaibo's prompts carry
+  your source — so every request pins `provider.data_collection = "deny"` and a
+  model whose only hosts retain/train on prompts fails loudly instead of leaking
+  quietly. `data_collection = "allow"` on the backend is the explicit opt-in
+  (kaibo then emits no restriction; your account settings govern), and
+  `kaibo://config` renders the active policy so the posture is always visible.
 
 ### Changed
 

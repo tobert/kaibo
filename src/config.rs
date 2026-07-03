@@ -369,6 +369,37 @@ pub fn parse_slot_ref(s: &str) -> Result<(String, String)> {
 
 // --- Backends ---------------------------------------------------------------
 
+/// OpenRouter upstream-host data policy: whether requests may route to hosts
+/// that retain or train on prompts. kaibo ships source code in its prompts, so
+/// the default is [`DataCollection::Deny`] — OpenRouter then routes only to
+/// hosts whose policy is no-collection, and a model with no compliant host
+/// fails loudly instead of leaking quietly. `Allow` is the explicit opt-in:
+/// kaibo omits the restriction and the caller's OpenRouter account settings
+/// govern. Config: `data_collection = "deny" | "allow"` on an openrouter-kind
+/// backend (anywhere else is a load error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DataCollection {
+    /// Route only to upstream hosts that don't retain/train on prompts (default).
+    #[default]
+    Deny,
+    /// No routing restriction — the account's own OpenRouter settings apply.
+    Allow,
+}
+
+impl std::str::FromStr for DataCollection {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "deny" => Ok(Self::Deny),
+            "allow" => Ok(Self::Allow),
+            other => bail!(
+                "data_collection {other:?} is not a policy — use \"deny\" (route only \
+                 to no-collection hosts, the default) or \"allow\" (explicit opt-in)"
+            ),
+        }
+    }
+}
+
 /// A connection: how kaibo reaches one provider endpoint. The `kind` is the wire
 /// protocol (the closed [`ProviderKind`] enum — the one place "provider" still
 /// means something); everything else describes the wire: endpoint, key source,
@@ -397,6 +428,10 @@ pub struct Backend {
     /// the 2026-06-06 stall (see `consult.rs` / `docs/issues.md`). Seeded from
     /// [`Defaults::request_timeout`], overridable per backend.
     pub request_timeout: Duration,
+    /// OpenRouter only: upstream-host data policy (see [`DataCollection`]).
+    /// Deny by default on every kind; only an openrouter-kind backend may set it,
+    /// and only the openrouter arm reads it.
+    pub data_collection: DataCollection,
 }
 
 impl Backend {
@@ -1421,6 +1456,9 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         api_key_file: Some(format!("~/{}", kind.key_file_name())),
         key_optional: kind.key_optional(),
         request_timeout: defaults.request_timeout,
+        // Deny is the only safe default: kaibo's prompts carry source code, and
+        // routing them to a data-collecting host must be an explicit choice.
+        data_collection: DataCollection::Deny,
     }
 }
 
@@ -1729,6 +1767,7 @@ struct RawBackend {
     api_key_file: Option<String>,
     key_optional: Option<bool>,
     request_timeout_secs: Option<u64>,
+    data_collection: Option<String>,
 }
 
 impl RawBackend {
@@ -1763,6 +1802,23 @@ impl RawBackend {
         }
         if let Some(v) = self.request_timeout_secs {
             b.request_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = &self.data_collection {
+            // The policy only exists on the OpenRouter wire; naming it anywhere
+            // else is a config mistake worth a loud error, not a silent no-op the
+            // user believes is protecting them.
+            if b.kind != ProviderKind::OpenRouter {
+                bail!(
+                    "backend {:?} (kind {:?}) sets data_collection, but only the \
+                     `openrouter` kind routes across upstream hosts with differing \
+                     data policies",
+                    b.name,
+                    b.kind
+                );
+            }
+            b.data_collection = v.parse().with_context(|| {
+                format!("backend {:?} data_collection", b.name)
+            })?;
         }
         Ok(())
     }
@@ -2808,6 +2864,69 @@ mod tests {
         );
     }
 
+    /// The data policy defaults to deny on every backend and takes only the two
+    /// explicit values — the privacy default must hold with an empty config, and
+    /// an opt-in must be spelled exactly, never inferred.
+    #[test]
+    fn data_collection_defaults_deny_and_parses_explicit_allow() {
+        let cfg = Config::builtin();
+        let b = cfg.resolve_backend("openrouter").unwrap();
+        assert_eq!(
+            b.data_collection,
+            DataCollection::Deny,
+            "the built-in openrouter backend must deny data collection out of the box"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.openrouter]
+            data_collection = "allow"
+            "#,
+        )
+        .unwrap();
+        let b = cfg.resolve_backend("openrouter").unwrap();
+        assert_eq!(
+            b.data_collection,
+            DataCollection::Allow,
+            "the explicit opt-in must parse and stick"
+        );
+    }
+
+    /// A value outside the two-policy vocabulary is a loud load error naming both
+    /// legal spellings — a typo'd "denied" silently defaulting would betray the
+    /// user's intent in the worst direction.
+    #[test]
+    fn data_collection_rejects_an_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.openrouter]
+            data_collection = "denied"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("deny") && msg.contains("allow"), "got: {msg}");
+    }
+
+    /// The policy only exists on the OpenRouter wire; setting it elsewhere is a
+    /// config mistake refused at load — not a silent no-op the user believes is
+    /// protecting them.
+    #[test]
+    fn data_collection_is_openrouter_only() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.anthropic]
+            data_collection = "deny"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("data_collection") && msg.contains("openrouter"),
+            "got: {msg}"
+        );
+    }
+
     /// The built-in batch casts' synth slots positively declare `lane = Batch`, carry
     /// **synth only** (batch is a toolless oneshot — an explorer slot would be dead
     /// weight), and synth a batch-capable backend. Pins the lane's shape so an
@@ -3037,6 +3156,8 @@ mod tests {
         api_key_file = "/nonexistent-kaibo-test/deepseek"
         [backends.gemini]
         api_key_file = "/nonexistent-kaibo-test/gemini"
+        [backends.openrouter]
+        api_key_file = "/nonexistent-kaibo-test/openrouter"
         [backends.openai-local]
         api_key_file = "/nonexistent-kaibo-test/openai"
     "#;

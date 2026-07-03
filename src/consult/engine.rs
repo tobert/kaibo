@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rig_core::agent::{HookAction, PromptHook};
+use rig_core::agent::{AgentBuilder, HookAction, PromptHook};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
     AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
@@ -44,13 +44,13 @@ use super::shaping::{ModelCaps, ModelShape};
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
 type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<Box<dyn ToolDyn>>> + Send + Sync);
 
-/// The object-safe seam one [`Arm`] runs its loops through: a (client, model)
-/// pair erased behind a vtable. rig's provider clients are distinct concrete
-/// types; monomorphizing every phase combination would be a kinds² macro product
-/// (the decided plumbing fork, `docs/casts.md`) — the calls are network-bound,
-/// so dynamic dispatch here is free. The one implementation, [`ClientArm`],
-/// forwards to the generic [`run_phase`], which stays the offline-testable
-/// primitive.
+/// The object-safe seam one [`Arm`] runs its loops through: a pre-built
+/// completion model erased behind a vtable. rig's provider models are distinct
+/// concrete types; monomorphizing every phase combination would be a kinds² macro
+/// product (the decided plumbing fork, `docs/casts.md`) — the calls are
+/// network-bound, so dynamic dispatch here is free. The one implementation,
+/// [`ModelArm`], forwards to the generic [`run_phase`], which stays the
+/// offline-testable primitive.
 trait PhaseRunner: Send + Sync {
     #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
     fn run_phase<'a>(
@@ -66,16 +66,21 @@ trait PhaseRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 }
 
-/// The concrete (client, model) pair behind the [`PhaseRunner`] vtable.
-struct ClientArm<C> {
-    client: C,
-    model: String,
+/// The concrete pre-built completion model behind the [`PhaseRunner`] vtable.
+/// Holding the *model* (not a client + id) lets a provider-specific constructor
+/// ride along — the OpenRouter arm's explicit prompt caching is set once here and
+/// every loop turn inherits it.
+struct ModelArm<M> {
+    model: M,
+    /// The model id, for the `run_phase` span — the vtable erases the type, and
+    /// the telemetry must keep naming which model ran (it's how spend and
+    /// behavior get attributed per model when reading traces).
+    name: String,
 }
 
-impl<C> PhaseRunner for ClientArm<C>
+impl<M> PhaseRunner for ModelArm<M>
 where
-    C: CompletionClient + Clone + Send + Sync + 'static,
-    C::CompletionModel: 'static,
+    M: CompletionModel + 'static,
 {
     fn run_phase<'a>(
         &'a self,
@@ -89,8 +94,8 @@ where
         break_on_view_image: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(run_phase(
-            &self.client,
             &self.model,
+            &self.name,
             preamble,
             max_tokens,
             initial_prompt,
@@ -153,10 +158,32 @@ impl Arm {
         C::CompletionModel: 'static,
     {
         let model = model.into();
+        Self::from_model(
+            client.completion_model(&model),
+            model,
+            max_tokens,
+            params,
+            caps,
+        )
+    }
+
+    /// Wrap a pre-built completion model as an arm — the seam a provider-specific
+    /// model constructor (OpenRouter's prompt-caching flag) enters through.
+    fn from_model<M>(
+        model_impl: M,
+        model: impl Into<String>,
+        max_tokens: u64,
+        params: Option<Value>,
+        caps: ModelCaps,
+    ) -> Self
+    where
+        M: CompletionModel + 'static,
+    {
+        let model = model.into();
         Self {
-            runner: Arc::new(ClientArm {
-                client,
-                model: model.clone(),
+            runner: Arc::new(ModelArm {
+                model: model_impl,
+                name: model.clone(),
             }),
             model,
             max_tokens,
@@ -206,6 +233,11 @@ impl Arm {
         // the budget must ride `additional_params` as `max_completion_tokens`. A no-op
         // for every other kind, whose `max_tokens` rig sends itself.
         let params = super::shaping::inject_output_budget(backend.kind, params, t.max_tokens);
+        // OpenRouter routing honors the backend's data policy — deny by default, so
+        // source never reaches a data-collecting upstream host without an explicit
+        // config opt-in. A no-op for every other kind.
+        let params =
+            super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -254,7 +286,8 @@ impl Arm {
                     .with_app_identity("kaibo", "https://github.com/tobert/kaibo")
                     .build()
                     .map_err(|e| anyhow!("openrouter client init: {e}"))?;
-                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                let model = Self::openrouter_completion_model(&client, &slot.id);
+                Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
             }
             ProviderKind::Openai => {
                 // Any OpenAI-compatible endpoint, addressed by the backend's base
@@ -271,6 +304,22 @@ impl Arm {
                 Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
             }
         }
+    }
+
+    /// Build the OpenRouter arm's completion model: explicit prompt caching ON.
+    /// rig marks the system prompt with a `cache_control: ephemeral` breakpoint,
+    /// so Anthropic-upstream slugs bill the resident preamble at cache-read rates
+    /// instead of full input price every turn; implicit-caching upstreams
+    /// (DeepSeek/GLM/Kimi/Gemini/OpenAI) ignore the marker. The growing
+    /// transcript is not marked — an upstream rig limitation, tracked in
+    /// docs/issues.md. Kept as a named seam so the construction is unit-testable:
+    /// rig exposes the caching flag as a public field, and `from_slot` must
+    /// route through here.
+    fn openrouter_completion_model(
+        client: &openrouter::Client,
+        id: &str,
+    ) -> openrouter::CompletionModel {
+        client.completion_model(id).with_prompt_caching()
     }
 
     /// Does a `view_image` on this arm need the user-turn rewrite? True exactly when
@@ -579,10 +628,10 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 // span and nests under this one, so a phase's whole model loop (every `chat` turn,
 // every `tool` call) hangs off one `run_phase` span carrying the model. Inert
 // unless an exporter is attached (telemetry off → no subscriber records it).
-#[tracing::instrument(name = "run_phase", skip_all, fields(model = %model, max_turns = max_turns))]
-pub(crate) async fn run_phase<C, F>(
-    client: &C,
-    model: &str,
+#[tracing::instrument(name = "run_phase", skip_all, fields(model = %model_name, max_turns = max_turns))]
+pub(crate) async fn run_phase<M, F>(
+    model: &M,
+    model_name: &str,
     preamble: &str,
     max_tokens: u64,
     initial_prompt: Message,
@@ -593,8 +642,7 @@ pub(crate) async fn run_phase<C, F>(
     break_on_view_image: bool,
 ) -> Result<String>
 where
-    C: CompletionClient,
-    C::CompletionModel: 'static,
+    M: CompletionModel + 'static,
     F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
 {
     // Loop state across view_image-break resumes. The caller hands us the *assembled*
@@ -618,7 +666,6 @@ where
             let mut full = history;
             full.push(prompt);
             return finalize_after_max_turns(
-                client,
                 model,
                 preamble,
                 max_tokens,
@@ -630,8 +677,7 @@ where
             .await;
         }
 
-        let mut builder = client
-            .agent(model)
+        let mut builder = AgentBuilder::new(model.clone())
             .preamble(preamble)
             .max_tokens(max_tokens);
         // Thinking on (both phases) where the provider takes a request-time toggle.
@@ -658,7 +704,6 @@ where
                 // tell the caller, so a watching client sees "wrapping up" not silence.
                 progress.emit(PhaseEvent::TurnCapReached);
                 return finalize_after_max_turns(
-                    client,
                     model,
                     preamble,
                     max_tokens,
@@ -691,9 +736,8 @@ where
 /// history validates) but [`ToolChoice::None`] forbidding any further call. See
 /// [`run_phase`]'s recovery note and [`finalize_prompt`].
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-async fn finalize_after_max_turns<C>(
-    client: &C,
-    model: &str,
+async fn finalize_after_max_turns<M>(
+    model: &M,
     preamble: &str,
     max_tokens: u64,
     thinking: Option<&Value>,
@@ -702,12 +746,10 @@ async fn finalize_after_max_turns<C>(
     max_turns: usize,
 ) -> Result<String>
 where
-    C: CompletionClient,
-    C::CompletionModel: 'static,
+    M: CompletionModel + 'static,
 {
     let (history, prompt) = finalize_prompt(chat_history);
-    let mut builder = client
-        .agent(model)
+    let mut builder = AgentBuilder::new(model.clone())
         .preamble(preamble)
         .max_tokens(max_tokens)
         .tool_choice(ToolChoice::None);
@@ -2815,6 +2857,7 @@ mod tests {
             api_key_file: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
         };
         let slot = ModelSlot {
             vision: Some(true),
@@ -2867,6 +2910,7 @@ mod tests {
             api_key_file: Some(key_file.to_str().unwrap().to_string()),
             key_optional: false,
             request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
         };
         let slot = ModelSlot {
             temperature: Some(0.3),
@@ -2886,6 +2930,41 @@ mod tests {
             "the output budget must reach the body rig won't carry natively"
         );
         assert_eq!(params["temperature"], 0.3, "slot sampling coexists");
+        assert_eq!(
+            params["provider"]["data_collection"], "deny",
+            "no-collection routing rides every OpenRouter arm by default — source \
+             must not reach a data-collecting upstream host without an explicit opt-in"
+        );
+    }
+
+    /// The OpenRouter arm rides with rig's explicit prompt caching ON: Anthropic-
+    /// upstream slugs need `cache_control` breakpoints to bill cache-read rates
+    /// (2026-07-03: a consult re-billed its full growing prefix every turn without
+    /// them), and implicit-caching upstreams ignore the marker. rig exposes the
+    /// flag as a public field, and `from_slot` routes through this constructor —
+    /// so this pins the wiring, not an internal default.
+    #[test]
+    fn openrouter_arm_enables_prompt_caching() {
+        // Built through kaibo's one TLS client-build site (ring installed there) —
+        // a bare reqwest builder panics under `rustls-no-provider` unless another
+        // test happened to install the provider first.
+        let http = crate::tls::https_client(Duration::from_secs(30)).unwrap();
+        let client = openrouter::Client::builder()
+            .api_key("sk-or-test")
+            .http_client(http)
+            .build()
+            .expect("offline openrouter client construction");
+        let plain = client.completion_model("~anthropic/claude-sonnet-latest");
+        assert!(
+            !plain.prompt_caching,
+            "rig defaults the flag off — the arm constructor below is load-bearing"
+        );
+        let armed =
+            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest");
+        assert!(
+            armed.prompt_caching,
+            "the OpenRouter arm must build its model with prompt caching enabled"
+        );
     }
 
     /// `Arm::from_slot` is the single live construction point, and per-call
@@ -2908,6 +2987,7 @@ mod tests {
             api_key_file: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
         };
         let slot = ModelSlot::bare("anthropic", "claude-haiku-4-5");
         let err = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults)

@@ -1508,6 +1508,101 @@ async fn openrouter_consult_round_trips() {
     );
 }
 
+/// One minimal OpenRouter completion carrying kaibo's shaped params, with the
+/// gateway's usage accounting on. Returns the parsed response JSON.
+#[cfg(test)]
+async fn openrouter_probe_completion(key: &str, model: &str, params: &Value) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": "How many prime numbers are there between 10 and 50? \
+                        Work it out carefully, then answer with just the count.",
+        }],
+        "max_completion_tokens": 8192,
+        "usage": {"include": true},
+    });
+    for (k, v) in params.as_object().expect("shaped params are an object") {
+        body[k] = v.clone();
+    }
+    let http = kaibo::tls::https_client(std::time::Duration::from_secs(120)).unwrap();
+    let resp = http
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .expect("openrouter request");
+    let status = resp.status();
+    let json: Value = resp.json().await.expect("openrouter response json");
+    assert!(
+        status.is_success(),
+        "openrouter rejected kaibo's shaped params ({status}): {json}"
+    );
+    json
+}
+
+#[tokio::test]
+#[ignore = "hits the OpenRouter API (keyed gateway); run with --ignored and OPENROUTER_API_KEY"]
+async fn openrouter_reasoning_accounting_live() {
+    // "Reasoning on by default" is doctrine, so it gets *measured*, not assumed
+    // (2026-07-03: a live consult averaged ~150 output tokens per turn — thin
+    // enough to question whether effort was landing). This posts kaibo's exact
+    // shaped params — `ModelShape::to_params`, the seam every OpenRouter arm
+    // rides — with OpenRouter's usage accounting on, and reads what the gateway
+    // actually billed: effort-on must show reasoning tokens, and the structural
+    // disable (`effort = "none"` ⇒ `{"reasoning":{"enabled":false}}`) must not.
+    let key = match load(ProviderKind::OpenRouter) {
+        Ok(k) => k,
+        Err(e) => panic!("no OpenRouter credential for live test: {e}"),
+    };
+    // The built-in cast's explorer alias — the slot the doctrine most needs to
+    // hold on, since the explorer runs the most turns.
+    let model = "~google/gemini-flash-latest";
+    let shape = ModelShape::resolve(
+        ProviderKind::OpenRouter,
+        model,
+        ThinkingStyleOverride::Auto,
+    );
+
+    // Default posture: effort = high ⇒ the gateway bills reasoning tokens. The
+    // no-collection routing pin rides along exactly as every live arm sends it —
+    // so this also proves deny-routing still reaches the built-in cast's models.
+    let params = shape.to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT);
+    let params = kaibo::consult::inject_provider_prefs(
+        ProviderKind::OpenRouter,
+        params,
+        kaibo::config::DataCollection::Deny,
+    )
+    .expect("openrouter always sends params");
+    let resp = openrouter_probe_completion(&key, model, &params).await;
+    let reasoning = resp["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    eprintln!("=== effort={DEFAULT_EFFORT} usage: {}", resp["usage"]);
+    assert!(
+        reasoning > 0,
+        "effort={DEFAULT_EFFORT} must bill reasoning tokens — thinking-on-by-default \
+         isn't landing, got usage: {}",
+        resp["usage"]
+    );
+
+    // The opt-out: the structural disable really turns reasoning off.
+    let params = shape
+        .to_params(THINKING_BUDGET, None, None, "none")
+        .expect("openrouter always sends params");
+    let resp = openrouter_probe_completion(&key, model, &params).await;
+    let reasoning = resp["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    eprintln!("=== effort=none usage: {}", resp["usage"]);
+    assert_eq!(
+        reasoning, 0,
+        "effort=none must not bill reasoning tokens, got usage: {}",
+        resp["usage"]
+    );
+}
+
 #[tokio::test]
 #[ignore = "hits the Anthropic API on Opus 4.8 (adaptive-only tier); run with --ignored and a key"]
 async fn adaptive_only_anthropic_model_round_trips() {
