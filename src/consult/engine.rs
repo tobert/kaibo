@@ -25,16 +25,16 @@ use crate::attach::Attachment;
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
-use crate::progress::{NullSink, PhaseEvent, ProgressSink};
+use crate::progress::{PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, SessionStore};
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
-use super::prompts::{
-    consult_user_prompt, deliberation_prompt, resolve_phase_preamble, ConsultAttachment, Phase,
-    PromptOverrides,
-};
+use super::config::{ConsultConfig, ExploreConfig, PhaseContext};
+#[cfg(test)]
+use super::prompts::PromptOverrides;
+use super::prompts::{consult_user_prompt, deliberation_prompt, resolve_phase_preamble, Phase};
 use super::shaping::{ModelCaps, ModelShape};
 
 // --- The Arm seam ------------------------------------------------------------
@@ -284,64 +284,6 @@ impl Arm {
                 self.rewrites_view_image(),
             )
             .await
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConsultConfig {
-    /// Bounds each cheap `explore′` sweep — it's cheap, let it rip.
-    pub explorer_max_turns: usize,
-    /// Bounds the recomposed consult's *whole* driver loop (it delegates sweeps AND
-    /// reads spans), so it must be generous — a multi-part question blew the old 8.
-    pub synth_max_turns: usize,
-    /// Read-only sandbox limits applied to every kaish worker this phase spawns.
-    pub sandbox: SandboxConfig,
-    /// Where the phase's liveness goes: each delegated sweep and direct kaish read
-    /// emits a [`PhaseEvent`] here. The server installs an adapter that renders these
-    /// as MCP progress notifications when the caller asked for them; otherwise it's
-    /// [`NullSink`], a no-op — so a stateless one-shot is byte-for-byte its old self.
-    /// It rides on `ConsultConfig` because that's the one bundle already threaded into
-    /// every phase fn and the toolset builders.
-    pub progress: Arc<dyn ProgressSink>,
-    /// Operator house rules (assembled `AGENTS.md` / user files) to splice into
-    /// each top-level tool's preamble, or `None` for the historical bare preamble.
-    /// `Arc<str>` so cloning `ConsultConfig` per phase is cheap. Rides here for the
-    /// same reason as `progress`: it's the one bundle already threaded everywhere.
-    /// The server fills it per call (it needs the resolved root to read the files);
-    /// the `Default` is `None`, so every offline test runs the unchanged preamble.
-    pub house_rules: Option<Arc<str>>,
-    /// Per-phase system-prompt overrides (`[prompts]`). `Default` is empty, so the
-    /// built-in preambles run unchanged. Server-set per call from the resolved
-    /// config. See [`PromptOverrides`].
-    pub prompts: PromptOverrides,
-    /// The static repo-orientation block (assembled `[orientation]` map), or `None`.
-    /// `Arc<str>` so cloning per phase is cheap. Server-set per call from the
-    /// resolved root (only for the exploring tools — `explore`/`consult`); `Default`
-    /// is `None`, so offline tests run the unchanged preamble.
-    pub orientation: Option<Arc<str>>,
-    /// Caller-attached files, as **root-relative paths the model reads itself** — *not*
-    /// inlined bytes. Unlike `oneshot`/`batch` attach (toolless, so kaibo inlines),
-    /// `consult` has tools, so attach just *names* each file in the driver's prompt and
-    /// lets the model open it when it's ready: a text file with `cat -n`, an image with
-    /// `view_image` (per [`ConsultAttachment::is_image`]) — no upfront IO, the model builds
-    /// its narrative its own way. The server validates each path lands under the consult's
-    /// root and sniffs its type before filling this. `Default` is empty.
-    pub attachments: Vec<ConsultAttachment>,
-}
-
-impl Default for ConsultConfig {
-    fn default() -> Self {
-        let d = crate::config::Defaults::default();
-        Self {
-            explorer_max_turns: d.explorer_max_turns,
-            synth_max_turns: d.synth_max_turns,
-            sandbox: SandboxConfig::default(),
-            progress: Arc::new(NullSink),
-            house_rules: None,
-            prompts: PromptOverrides::default(),
-            orientation: None,
-            attachments: Vec::new(),
-        }
     }
 }
 
@@ -965,7 +907,7 @@ pub async fn oneshot(
     prompt: &str,
     attachments: &[Attachment],
     arm: &Arm,
-    cfg: &ConsultConfig,
+    cfg: &PhaseContext,
 ) -> Result<String> {
     let user_prompt = crate::attach::with_text_context(attachments, prompt);
     let image_parts: Vec<UserContent> = attachments
@@ -1022,7 +964,7 @@ fn consult_tools(
 ) -> Result<Vec<Box<dyn ToolDyn>>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
-    let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
+    let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
     // explore′ for delegated breadth: the same explore unit, wrapped as a tool,
     // pointed at the explorer arm — its own client, model, and request shape,
     // which may live on a different backend than the driver's. Bounded by
@@ -1031,23 +973,23 @@ fn consult_tools(
     // override-or-default + house rules, built once here rather than per sweep.
     let explorer_preamble: Arc<str> = Arc::from(resolve_phase_preamble(
         Phase::Explorer,
-        &cfg.prompts,
-        cfg.orientation.as_deref(),
-        cfg.house_rules.as_deref(),
+        &cfg.explore.phase.prompts,
+        cfg.explore.phase.orientation.as_deref(),
+        cfg.explore.phase.house_rules.as_deref(),
     ));
     let explore = RunExplore::new(
         explorer.clone(),
-        cfg.explorer_max_turns,
+        cfg.explore.explorer_max_turns,
         root,
-        cfg.sandbox.clone(),
+        cfg.explore.sandbox.clone(),
         reports,
-        cfg.progress.clone(),
+        cfg.explore.phase.progress.clone(),
         explorer_preamble,
     );
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
         traced(RunKaish::with_progress(
             worker.clone(),
-            cfg.progress.clone(),
+            cfg.explore.phase.progress.clone(),
         )),
         traced(explore),
     ];
@@ -1070,13 +1012,13 @@ pub(crate) async fn explore_with(
     question: &str,
     root: PathBuf,
     explorer: &Arm,
-    cfg: &ConsultConfig,
+    cfg: &ExploreConfig,
 ) -> Result<String> {
     let preamble = resolve_phase_preamble(
         Phase::Explorer,
-        &cfg.prompts,
-        cfg.orientation.as_deref(),
-        cfg.house_rules.as_deref(),
+        &cfg.phase.prompts,
+        cfg.phase.orientation.as_deref(),
+        cfg.phase.house_rules.as_deref(),
     );
     run_explore_phase(
         explorer,
@@ -1085,7 +1027,7 @@ pub(crate) async fn explore_with(
         root,
         &cfg.sandbox,
         cfg.explorer_max_turns,
-        &cfg.progress,
+        &cfg.phase.progress,
     )
     .await
 }
@@ -1136,13 +1078,13 @@ pub(crate) async fn consult_with(
         .run(
             &resolve_phase_preamble(
                 Phase::Consult,
-                &cfg.prompts,
-                cfg.orientation.as_deref(),
-                cfg.house_rules.as_deref(),
+                &cfg.explore.phase.prompts,
+                cfg.explore.phase.orientation.as_deref(),
+                cfg.explore.phase.house_rules.as_deref(),
             ),
             Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
-            cfg.progress.as_ref(),
+            cfg.explore.phase.progress.as_ref(),
             // Rebuilt per call (main loop, and again if run_phase forces a final
             // turn); every build shares the one `reports` sink so all explore′
             // sweeps aggregate.
@@ -1304,7 +1246,13 @@ mod tests {
             .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
         let cfg = ConsultConfig {
-            house_rules: Some(Arc::from(MARKER)),
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    house_rules: Some(Arc::from(MARKER)),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
             ..ConsultConfig::default()
         };
         consult_with(
@@ -1386,7 +1334,13 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig {
-            house_rules: Some(Arc::from(MARKER)),
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    house_rules: Some(Arc::from(MARKER)),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
             ..ConsultConfig::default()
         };
         consult_with(
@@ -1437,11 +1391,17 @@ mod tests {
             .build();
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig {
-            prompts: PromptOverrides {
-                consult: Some(CUSTOM.to_string()),
-                ..PromptOverrides::default()
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    prompts: PromptOverrides {
+                        consult: Some(CUSTOM.to_string()),
+                        ..PromptOverrides::default()
+                    },
+                    house_rules: Some(Arc::from(HOUSE)),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
             },
-            house_rules: Some(Arc::from(HOUSE)),
             ..ConsultConfig::default()
         };
         consult_with(
@@ -1479,12 +1439,12 @@ mod tests {
             .on_model(MODEL, |_req| Ok(text_response("done")))
             .build();
         // Only the explorer key is set; the oneshot phase must ignore it.
-        let cfg = ConsultConfig {
+        let cfg = PhaseContext {
             prompts: PromptOverrides {
                 explorer: Some(CUSTOM_EXPLORER.to_string()),
                 ..PromptOverrides::default()
             },
-            ..ConsultConfig::default()
+            ..PhaseContext::default()
         };
         oneshot("q", &[], &arm(&client, MODEL), &cfg).await.unwrap();
 
@@ -1517,7 +1477,7 @@ mod tests {
             "just answer this",
             &[],
             &arm(&client, MODEL),
-            &ConsultConfig::default(),
+            &PhaseContext::default(),
         )
         .await
         .unwrap();
@@ -1574,7 +1534,7 @@ mod tests {
             "review these",
             &attachments,
             &arm(&client, MODEL),
-            &ConsultConfig::default(),
+            &PhaseContext::default(),
         )
         .await
         .unwrap();
@@ -1629,7 +1589,7 @@ mod tests {
             "just ask",
             &[],
             &arm(&client, MODEL),
-            &ConsultConfig::default(),
+            &PhaseContext::default(),
         )
         .await
         .unwrap();
@@ -1679,7 +1639,7 @@ mod tests {
             mime: "image/png",
             data_b64: "QUJD".into(),
         };
-        oneshot("", &[img], &arm(&client, MODEL), &ConsultConfig::default())
+        oneshot("", &[img], &arm(&client, MODEL), &PhaseContext::default())
             .await
             .unwrap();
         assert_eq!(
@@ -1840,7 +1800,7 @@ mod tests {
             .build();
 
         let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
+        let cfg = ExploreConfig::default();
 
         let report = explore_with(
             "Where is target_marker defined?",
@@ -1900,9 +1860,12 @@ mod tests {
 
         let dir = project_with_marker();
         let sink = Arc::new(RecordingSink::default());
-        let cfg = ConsultConfig {
-            progress: sink.clone(),
-            ..ConsultConfig::default()
+        let cfg = ExploreConfig {
+            phase: PhaseContext {
+                progress: sink.clone(),
+                ..PhaseContext::default()
+            },
+            ..ExploreConfig::default()
         };
 
         explore_with(
@@ -1962,7 +1925,7 @@ mod tests {
             })
             .build();
 
-        let cfg = ConsultConfig::default();
+        let cfg = PhaseContext::default();
         let out = deliberate_direct(
             "Is the retry path safe?",
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
@@ -2034,7 +1997,13 @@ mod tests {
         let dir = project_with_marker();
         let sink = Arc::new(RecordingSink::default());
         let cfg = ConsultConfig {
-            progress: sink.clone(),
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: sink.clone(),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
             ..ConsultConfig::default()
         };
 
@@ -2085,7 +2054,7 @@ mod tests {
         );
     }
 
-    /// A stateless consult (default `ConsultConfig`) emits to the [`NullSink`] — no
+    /// A stateless consult (default `ConsultConfig`) emits to the `NullSink` — no
     /// panic, no observable effect. The opt-out path stays a true no-op.
     #[tokio::test]
     async fn the_default_sink_is_a_silent_no_op() {

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
 use kaibo::consult::{
     consult, consult_user_prompt, oneshot, request_params, thinking_params, Arm, ConsultConfig,
-    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
+    ModelCaps, ModelShape, PhaseContext, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
 use serde_json::{json, Value};
@@ -1262,7 +1262,7 @@ async fn secondary_local_cast_from_user_config_runs() {
          prevent?",
         &[],
         &arm,
-        &ConsultConfig::default(),
+        &PhaseContext::default(),
     )
     .await
     .expect("secondary-cast oneshot against Lemonade should succeed");
@@ -1323,7 +1323,7 @@ async fn oneshot_answers_from_pasted_context() {
          read-only sandbox?",
         &[],
         &arm,
-        &ConsultConfig::default(),
+        &PhaseContext::default(),
     )
     .await
     .expect("oneshot against local gemma should succeed");

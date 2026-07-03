@@ -19,14 +19,16 @@
 //! Each tool gets its own fresh [`KaishWorker`] (a kernel rooted at the
 //! project), and so does every `explore′` delegation.
 
+mod config;
 mod engine;
 mod prompts;
 mod shaping;
 
+pub use config::{ConsultConfig, ExploreConfig, PhaseContext};
 pub(crate) use engine::explore_with;
 pub use engine::{
-    consult, deliberate_direct, oneshot, Arm, ConsultConfig, ConsultOutput, RunExplore,
-    RunExploreArgs, RunExploreError, Session,
+    consult, deliberate_direct, oneshot, Arm, ConsultOutput, RunExplore, RunExploreArgs,
+    RunExploreError, Session,
 };
 // `run_phase` is the offline-testable loop primitive; re-exported at crate scope so
 // `crate::consult::run_phase` (referenced in module docs) resolves. No in-crate `use`
