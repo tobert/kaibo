@@ -128,16 +128,20 @@ the git log. Each later release appends a new section at the top.
   file, or a binary that isn't a known image is refused with a clear error.
 - **`job_wait`** — block briefly and productively for your async work instead of
   blind-polling `job_get`. Fire off consults and batches, do your other work, then `job_wait`
-  when you're ready to spend a minute on kaibo: it blocks up to `timeout_secs` (you
-  choose — no clamp; interruptible) and returns as soon as something lands, or on a clean
-  timeout. By default it hands back what kaibo flags as worth your attention (a job
-  finished/failed, a research-limit) plus which consult jobs are still running; pass
-  `level: "info"` to also pull the watchable narrative — each kaish command, sweep, and
-  milestone the agents ran — into your context. Name batch handles in `handles` to fold a
-  one-shot poll of them in too. Nothing wakes you (you choose when to block) and it isn't
-  the source of truth — `job_get`/`job_list` are; a clean empty return just means nothing new yet.
-  This pairs with launching work in parallel: submit several, do everything else, then
-  `job_wait` to merge the outputs.
+  when you're ready to spend a minute on kaibo: it parks up to `timeout_secs` (you
+  choose — no clamp; interruptible) and returns early only when a job finishes or fails (a
+  real event), else on a clean timeout — narrative alone never cuts the park short, so a
+  single `job_wait` watches a long job without turning into a poll storm. On return it hands
+  back a sample of what happened plus which consult jobs are still running. `level` sizes
+  that sample, not the timing: the default (`warn`) is the flagged milestones; `level:
+  "info"` folds in the watchable narrative too — each kaish command, sweep, and milestone
+  the agents ran, coalesced to the most recent `limit` — so a richer level fills the tail
+  without ever making the call return sooner (to check in more often, pass a shorter
+  `timeout_secs`). Name batch handles in `handles` to fold a one-shot poll of them in too.
+  Nothing wakes you (you choose when to block) and it isn't the source of truth —
+  `job_get`/`job_list` are; a clean empty return just means nothing new yet. This pairs with
+  launching work in parallel: submit several, do everything else, then `job_wait` to merge
+  the outputs.
 - **Async consults are watchable again.** A `consult_submit` job now streams its liveness
   (each kaish command, sweep, and milestone) onto kaibo's logging channel — the live
   "watch it work" view a synchronous `consult` always had, restored for the async path.

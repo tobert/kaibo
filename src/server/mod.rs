@@ -440,13 +440,17 @@ pub struct WaitInput {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
-    /// Max records to return (default 20, newest activity last).
+    /// Max records to sample into the result (default 20, newest activity last — when more
+    /// happened than this, you get the most recent tail).
     #[serde(default)]
     pub limit: Option<usize>,
 
-    /// Lowest level to return: `warn` (default — what kaibo flags for you: a job finished
-    /// or failed), `info` (also the watchable narrative — each kaish command, sweep,
-    /// milestone), `error`, or `debug`. A salience bar, not severity.
+    /// How much narrative rides back in the result — *not* when the call returns. It always
+    /// parks up to `timeout_secs` and returns early only when a job finishes or fails (a
+    /// real event), then hands back a sample of what happened. `warn` (default) is just the
+    /// flagged milestones; `info` folds in the watchable narrative (each kaish command,
+    /// sweep, milestone) so you can follow along; `debug` is everything; `error` trims to
+    /// failures. A richer level never makes the call return sooner — it only fills the tail.
     #[serde(default)]
     pub level: Option<String>,
 
@@ -2460,10 +2464,11 @@ impl KaiboHandler {
     }
 
     #[tool(description = "Park for async work to make progress: blocks up to \
-            `timeout_secs` and returns as soon as a job finishes or fails, or on a \
+            `timeout_secs`, returning early only when a job finishes or fails, else on a \
             clean timeout — the productive alternative to polling `job_get`. \
-            `level:\"info\"` adds the live narrative (each shell command, sweep, \
-            milestone); name batch `handles` to fold their status in.")]
+            `level:\"info\"` folds the live narrative (each shell command, sweep, \
+            milestone) into the result without changing when it returns; name batch \
+            `handles` to fold their status in.")]
     async fn job_wait(
         &self,
         Parameters(input): Parameters<WaitInput>,
@@ -2485,51 +2490,65 @@ impl KaiboHandler {
                 ));
             }
         }
-        let return_floor = wait_level_floor(input.level.as_deref())?;
+        // `level` sizes the *observability sample* — how much narrative rides back in the
+        // result — never *when* the call returns. Wake is always the Warn bar (a job
+        // finished/failed, or a real mid-flight warning); narrative below it rides along in
+        // the tail but never cuts the park short, so `level:"info"` parks-and-coalesces
+        // instead of returning on the first `running kaish: …` line. Cap the sample floor at
+        // Warn so the terminal ping is always in the tail even if a caller asks higher.
+        let wake_floor = crate::mcp_log::rank(LoggingLevel::Warning);
+        let sample_floor = wait_level_floor(input.level.as_deref())?.min(wake_floor);
         let limit = input.limit.unwrap_or(20);
         let timeout = std::time::Duration::from_secs(input.timeout_secs.unwrap_or(60));
 
         // The live view for the *human*: while this call is open, stream the Info-level
         // narrative (each kaish command, sweep, milestone) as `notifications/progress` on
         // this call's token, so the client renders it in real time — the channel sync
-        // `consult` used, reopened on demand. Independent of what we *return* to the model
-        // (Warn+ by default): the human watches the show, the model gets the salient bits.
+        // `consult` used, reopened on demand. Independent of what we *return* to the model:
+        // the human watches the show live, the model gets the coalesced tail at wake/timeout.
         let info_floor = crate::mcp_log::rank(LoggingLevel::Info);
         let token = progress_token(&meta);
         // Drain down to whichever is lower — Info (to stream) when a token is present,
-        // else just the return floor (don't consume narrative no one is watching).
+        // else just the sample floor (don't consume narrative no one is watching).
         let drain_floor = if token.is_some() {
-            info_floor.min(return_floor)
+            info_floor.min(sample_floor)
         } else {
-            return_floor
+            sample_floor
         };
         let seq = AtomicU64::new(0);
         let records = self
             .notifications
-            .wait_drain_with(timeout, drain_floor, return_floor, limit, |rec| {
-                // Stream Info+ to the human's progress channel; the model's return is the
-                // separate `return_floor` collection inside `wait_drain_with`.
-                if let Some(token) = &token {
-                    if crate::mcp_log::rank(rec.level) >= info_floor {
-                        let param = ProgressNotificationParam {
-                            progress_token: token.clone(),
-                            progress: seq.fetch_add(1, Ordering::Relaxed) as f64,
-                            total: None,
-                            message: Some(format!(
-                                "[{}] {}",
-                                wait_level_label(rec.level),
-                                rec.message
-                            )),
-                        };
-                        let peer = peer.clone();
-                        // Fire-and-forget, like `ProgressReporter`: don't make the drain
-                        // loop await a notification it doesn't depend on.
-                        tokio::spawn(async move {
-                            let _ = peer.notify_progress(param).await;
-                        });
+            .wait_drain_with(
+                timeout,
+                drain_floor,
+                sample_floor,
+                wake_floor,
+                limit,
+                |rec| {
+                    // Stream Info+ to the human's progress channel; the model's return is the
+                    // separate `sample_floor` tail collected inside `wait_drain_with`.
+                    if let Some(token) = &token {
+                        if crate::mcp_log::rank(rec.level) >= info_floor {
+                            let param = ProgressNotificationParam {
+                                progress_token: token.clone(),
+                                progress: seq.fetch_add(1, Ordering::Relaxed) as f64,
+                                total: None,
+                                message: Some(format!(
+                                    "[{}] {}",
+                                    wait_level_label(rec.level),
+                                    rec.message
+                                )),
+                            };
+                            let peer = peer.clone();
+                            // Fire-and-forget, like `ProgressReporter`: don't make the drain
+                            // loop await a notification it doesn't depend on.
+                            tokio::spawn(async move {
+                                let _ = peer.notify_progress(param).await;
+                            });
+                        }
                     }
-                }
-            })
+                },
+            )
             .await;
 
         // Gentle batch poll: a batch is provider-side with no push, so fold in a one-shot
@@ -3090,11 +3109,13 @@ One small surface drives both kinds:
   batches section shows the last 24h (anything older is done and still collectible by its
   handle); pass `all: true` for the full history.
 - **`job_wait`** is how you *productively park*: submit your async work, do your other
-  work, then call `job_wait` to block briefly (up to `timeout_secs` — your choice, to a
-  3600s ceiling) and return as soon
-  as something lands — or on a clean timeout. By default it hands back what kaibo flagged
-  for you (a job finished or failed); pass `level: \"info\"` to also pull in the watchable
-  narrative — each kaish command, sweep, and milestone the agents ran.
+  work, then call `job_wait` to block (up to `timeout_secs` — your choice, to a 3600s
+  ceiling). It parks the whole window and returns early only when a job finishes or fails
+  (a real event) — narrative alone never cuts it short — then hands back a sample of what
+  happened. By default that sample is what kaibo flagged for you (the milestones); pass
+  `level: \"info\"` to fold in the watchable narrative too — each kaish command, sweep, and
+  milestone the agents ran. `level` sizes the sample, never the timing; to check in more
+  often, pass a shorter `timeout_secs`, not a higher level.
 
 This is a fire-and-forget lane. Submit, then go do other work — don't sit in a tight
 poll/sleep loop holding your turn open. `job_wait` when you're ready to spend a minute;

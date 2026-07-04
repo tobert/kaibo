@@ -213,54 +213,72 @@ impl NotificationBuffer {
         floor: u8,
         limit: usize,
     ) -> Vec<LogRecord> {
-        // The simple form: drain and return at one floor, no side-channel.
-        self.wait_drain_with(timeout, floor, floor, limit, |_| {})
+        // The simple form: one floor is drain, sample, *and* wake — return as soon as a
+        // record at `floor` lands, sampling exactly those, no side-channel.
+        self.wait_drain_with(timeout, floor, floor, floor, limit, |_| {})
             .await
     }
 
-    /// The streaming core behind [`wait_drain`]: drain every record at or above
-    /// `drain_floor`, hand each to `on_drained` (the `job_wait` tool streams the Info-level
-    /// narrative to the client's progress channel here), and *return* those at or above
-    /// `return_floor` (capped at `limit`). It blocks until a returnable record lands or
-    /// the deadline passes — so a default `job_wait` streams the narrative the whole time and
-    /// returns only when something the model should act on (a completion) arrives.
+    /// The streaming core behind [`wait_drain`], with three independent floors so
+    /// observability and "park until something real happens" stop fighting each other:
     ///
-    /// `drain_floor` ≤ `return_floor`: the caller drains *down to* what it streams (Info)
-    /// while returning only the salient (Warn+). A drained-but-not-returned record is
-    /// consumed — it was delivered via `on_drained` — so the narrative isn't left to pile
-    /// up once it's been streamed.
+    /// - `drain_floor` — what to *consume* from the ring. Each drained record is handed to
+    ///   `on_drained` (the `job_wait` tool streams the Info-level narrative to the client's
+    ///   progress channel here).
+    /// - `sample_floor` — what to *include in the returned tail*. Records at or above it
+    ///   accumulate into a sliding last-`limit` window, so the caller gets the *newest*
+    ///   activity, not the first `limit` records then silence.
+    /// - `wake_floor` — what *ends the block early*. Only a record at or above it (Warn+ for
+    ///   `job_wait`: a job finished/failed, or a real mid-flight warning) returns before the
+    ///   deadline. Narrative below it never cuts the park short — it just rides along in the
+    ///   sample. Otherwise the call parks the whole window, then returns the coalesced tail.
+    ///
+    /// So `drain_floor` ≤ `sample_floor` ≤ `wake_floor` in the usual shape (drain Info,
+    /// sample Info, wake Warn). A drained-but-not-sampled record is still consumed — it was
+    /// delivered via `on_drained` — so streamed narrative isn't left to pile up.
     pub async fn wait_drain_with<F: FnMut(&LogRecord)>(
         &self,
         timeout: std::time::Duration,
         drain_floor: u8,
-        return_floor: u8,
+        sample_floor: u8,
+        wake_floor: u8,
         limit: usize,
         mut on_drained: F,
     ) -> Vec<LogRecord> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut collected: Vec<LogRecord> = Vec::new();
-        loop {
-            for rec in self.drain(drain_floor, usize::MAX) {
+        // Drain, stream, sample into the sliding tail, and report whether anything crossed
+        // the wake bar. Shared by the main loop and the final post-deadline sweep.
+        let mut absorb = |drained: Vec<LogRecord>,
+                          tail: &mut std::collections::VecDeque<LogRecord>|
+         -> bool {
+            let mut woke = false;
+            for rec in drained {
                 on_drained(&rec);
-                if rank(rec.level) >= return_floor && collected.len() < limit {
-                    collected.push(rec);
+                if rank(rec.level) >= wake_floor {
+                    woke = true;
+                }
+                if rank(rec.level) >= sample_floor {
+                    tail.push_back(rec);
+                    while tail.len() > limit {
+                        tail.pop_front();
+                    }
                 }
             }
-            if !collected.is_empty() {
-                return collected;
+            woke
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut tail: std::collections::VecDeque<LogRecord> = std::collections::VecDeque::new();
+        loop {
+            if absorb(self.drain(drain_floor, usize::MAX), &mut tail) {
+                return tail.into_iter().collect();
             }
             // Register the wake future *before* re-checking, so a push between the drain
             // above and the await below leaves a permit rather than being missed.
             let notified = self.notify.notified();
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                for rec in self.drain(drain_floor, usize::MAX) {
-                    on_drained(&rec);
-                    if rank(rec.level) >= return_floor && collected.len() < limit {
-                        collected.push(rec);
-                    }
-                }
-                return collected;
+                absorb(self.drain(drain_floor, usize::MAX), &mut tail);
+                return tail.into_iter().collect();
             }
             tokio::select! {
                 _ = notified => {}
@@ -504,8 +522,9 @@ mod tests {
         let returned = buf
             .wait_drain_with(
                 std::time::Duration::from_secs(5),
-                rank(LoggingLevel::Info), // drain down to Info (to stream)
-                rank(LoggingLevel::Warning), // return only the Warn-bar records
+                rank(LoggingLevel::Info),    // drain down to Info (to stream)
+                rank(LoggingLevel::Warning), // sample only the Warn-bar records
+                rank(LoggingLevel::Warning), // wake on the Warn-bar records
                 20,
                 |r| streamed.push(r.message.clone()),
             )
@@ -518,6 +537,97 @@ mod tests {
         assert_eq!(returned[0].message, "job done");
         // Everything drained is consumed — the streamed narrative isn't left to pile up.
         assert!(buf.is_empty());
+    }
+
+    /// The park-and-coalesce contract: below the wake bar, narrative alone must NOT end the
+    /// block. An info-only stream parks the *whole* window and hands back the coalesced
+    /// tail — instead of returning on "kaish a" (the busy-poll the old return-on-first-record
+    /// behavior caused when a caller asked for `level:"info"`). A short real timeout keeps
+    /// the test fast without tokio's test-util time control (as elsewhere in this module).
+    #[tokio::test]
+    async fn sub_wake_narrative_parks_to_timeout_then_returns_the_tail() {
+        let buf = NotificationBuffer::new(16);
+        buf.push(rec(LoggingLevel::Info, "kaish a"));
+        buf.push(rec(LoggingLevel::Info, "kaish b"));
+        buf.push(rec(LoggingLevel::Info, "kaish c"));
+
+        let start = std::time::Instant::now();
+        let returned = buf
+            .wait_drain_with(
+                std::time::Duration::from_millis(150),
+                rank(LoggingLevel::Info),    // drain the narrative
+                rank(LoggingLevel::Info),    // sample it into the tail
+                rank(LoggingLevel::Warning), // but only Warn+ wakes the park
+                20,
+                |_| {},
+            )
+            .await;
+
+        // No Warn+ ever arrived, so it parked to the deadline instead of returning at ~0ms
+        // on "kaish a" (the old bug). 100ms of the 150ms window is a comfortable floor.
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(100),
+            "info narrative must not wake the park"
+        );
+        // …and handed back the coalesced narrative tail, oldest activity first.
+        let msgs: Vec<_> = returned.iter().map(|r| r.message.clone()).collect();
+        assert_eq!(msgs, vec!["kaish a", "kaish b", "kaish c"]);
+    }
+
+    /// A Warn+ record wakes the park at once, and the returned tail carries the info
+    /// narrative that preceded it — the model gets both "something happened" and the story.
+    /// The generous timeout would dominate the runtime if the wake didn't fire.
+    #[tokio::test]
+    async fn a_warn_wakes_the_park_and_the_tail_carries_the_narrative() {
+        let buf = NotificationBuffer::new(16);
+        buf.push(rec(LoggingLevel::Info, "kaish a"));
+        buf.push(rec(LoggingLevel::Info, "kaish b"));
+        buf.push(rec(LoggingLevel::Warning, "job done"));
+
+        let start = std::time::Instant::now();
+        let returned = buf
+            .wait_drain_with(
+                std::time::Duration::from_secs(300),
+                rank(LoggingLevel::Info),
+                rank(LoggingLevel::Info),
+                rank(LoggingLevel::Warning),
+                20,
+                |_| {},
+            )
+            .await;
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "a Warn+ record ends the park at once, nowhere near the 300s window"
+        );
+        let msgs: Vec<_> = returned.iter().map(|r| r.message.clone()).collect();
+        assert_eq!(msgs, vec!["kaish a", "kaish b", "job done"]);
+    }
+
+    /// Over `limit`, the returned sample is the *tail* (newest activity), not the head — a
+    /// long narrative hands back its most recent lines, and the terminal ping rides along.
+    #[tokio::test]
+    async fn over_limit_returns_the_newest_tail_including_the_wake() {
+        let buf = NotificationBuffer::new(64);
+        for i in 0..6 {
+            buf.push(rec(LoggingLevel::Info, &format!("n{i}")));
+        }
+        buf.push(rec(LoggingLevel::Warning, "done"));
+
+        let returned = buf
+            .wait_drain_with(
+                std::time::Duration::from_secs(5),
+                rank(LoggingLevel::Info),
+                rank(LoggingLevel::Info),
+                rank(LoggingLevel::Warning),
+                3,
+                |_| {},
+            )
+            .await;
+
+        // Six info lines + a warn = seven sampled; a limit of 3 keeps the last three.
+        let msgs: Vec<_> = returned.iter().map(|r| r.message.clone()).collect();
+        assert_eq!(msgs, vec!["n4", "n5", "done"]);
     }
 
     /// A finished job's completion ping (carrying `job=<id>`) is retired when that job is

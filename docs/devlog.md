@@ -14,6 +14,43 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-04 — `job_wait` parks-and-coalesces instead of returning on the first line
+
+Running the kaish 0.11.0 pre-release review as one background consult, Amy parked with
+`job_wait(timeout_secs=300, level="info")` and watched ~130 back-to-back calls return in
+*seconds* each — never near the 300s window. The tell: if it actually blocked to timeout,
+130×5min is absurd; being able to fire 130 in quick succession meant it was returning on
+the first event, not the window.
+
+Contributing factor, found in the code: `level` was doing two jobs. `wait_level_floor`
+became `wait_drain_with`'s `return_floor`, and the drain loop returned the moment it
+collected *any* record at that floor. At `level:"info"` that's the first `running kaish: …`
+line — so observability ("watch the narrative") and "park until something real happens"
+were mutually exclusive: `warn` blocked nicely but returned no story, `info` told the story
+but degenerated into a poll storm. The tool description already promised the *right*
+behavior ("returns as soon as a job finishes or fails, or on a clean timeout") — the code
+was what had drifted.
+
+Amy's call (two forks, both settled before code): **reinterpret `level`** as the
+observability sample floor only — never the return trigger — and **wake on any Warn+**
+(a job finished/failed *or* a real mid-flight warning; narrative below Warn never cuts the
+park short). So `wait_drain_with` grew a third floor: `drain` (what to consume + stream to
+the human), `sample` (what rides back in the tail), and `wake` (what ends the block early,
+always Warn). The returned sample also went from first-`limit` (head) to a sliding
+last-`limit` **tail**, capped at Warn so the terminal ping is always present even if a
+caller asks for a higher floor. The default (`warn`) is unchanged — only sub-warn levels
+stop poll-storming. This matters because the live progress stream reaches the *human* only
+(see `[[mcp-notification-channels]]`): the returned tail is the model's sole window into
+the narrative, so coalesce-and-return-the-tail is the actual mechanism, not a nicety.
+
+TDD, with teeth proven by reverting the loop to the old behavior and watching two of the
+three new `mcp_log` tests fail: `sub_wake_…parks_to_timeout` (wake decoupled from sample)
+and `over_limit_…newest_tail` (tail, not head); `a_warn_wakes_…` is a behavior lock that
+passes both ways. Model-facing text re-read holistically: the `level` schema doc (was
+literally "Lowest level to return"), the tool description, and the `kaibo://tools` resource
+all now say *`level` sizes the sample, never the timing — for more frequent check-ins, pass
+a shorter `timeout_secs`*.
+
 ## 2026-07-03 — attach means the model sees the bytes (inline + sweep directives)
 
 Amy asked how attachments reach explorers, and the honest answer — "they don't" —
