@@ -482,14 +482,31 @@ mod tests {
             .strip_prefix("<file path=\"evil.md\">\n")
             .and_then(|s| s.strip_suffix("\n</file>"))
             .expect("wrapper brackets the body");
-        let tag = Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").unwrap();
+        // Teeth for the escape itself, one assertion per dimension: each injected
+        // lookalike must appear in the body in its *escaped* form (`<` → `<\`). We assert
+        // the escaped literal is *present* rather than that the impl's own regex no
+        // longer matches `inner` — the latter is a tautology, and two cross-family
+        // reviews (2026-07-03 and 2026-07-04) flagged the earlier `!tag.is_match(inner)`
+        // for exactly that: `replace_all` removes every match by construction, so a regex
+        // that stopped catching `< / FILE >` would leave it unescaped *and* fail to match
+        // it, and the assertion would pass blind. Checking the escaped literal fails loud
+        // if any dimension regresses — the close form, the *opening* form, and the
+        // whitespace+case variant that proves the `(?i)` and `\s*` handling.
         assert!(
-            !tag.is_match(inner),
-            "no bare <file>-tag lookalike survives in the body: {inner}"
+            inner.contains(r"<\/file>"),
+            "the bare close lookalike is escaped: {inner}"
         );
-        // Independent of the escape regex (so this isn't circular with the impl): on
-        // the FULL wrapped output, the only literal open/close tags are the wrapper's
-        // own — exactly one each (Gemini cross-family review, 2026-07-03).
+        assert!(
+            inner.contains(r#"<\file path="x">"#),
+            "the opening lookalike is escaped: {inner}"
+        );
+        assert!(
+            inner.contains(r"<\ / FILE >"),
+            "the whitespace+case variant is escaped (proves (?i) and \\s* tolerance): {inner}"
+        );
+        // And on the FULL wrapped output, the only literal open/close tags left are the
+        // wrapper's own — exactly one each. A bare delimiter that slipped the escape
+        // would push a count to 2.
         assert_eq!(
             wrapped.matches("<file path=").count(),
             1,
