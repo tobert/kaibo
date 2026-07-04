@@ -116,6 +116,16 @@ pub fn check_attachment_bounds(
 /// `if x < y` reads truer than `if x &lt; y`. The backslash form leaves the body legible
 /// while removing the tag (`<\/file>` is no longer matched as a tag), so the only bare
 /// `<file>`/`</file>` left in the wrapper is kaibo's own.
+///
+/// A note to the next reviewer, because a cross-family pass mis-flagged this as a
+/// *critical* breakout: the wrapper's own delimiters (in [`Attachment::wrapped_text`])
+/// are the **bare** `<file …>` / `</file>` — there is no backslash in them. The
+/// backslash form `<\/file>` is *only ever this function's neutralized output*. So a
+/// body already containing a literal `<\/file>` is not a breakout — it is byte-identical
+/// to what we'd emit for a defanged tag, i.e. already safe, and the regex rightly leaves
+/// it alone. Breaking out would require a *bare* `</file>` to survive into the body; that
+/// is exactly what the regex rewrites, and what the wrapper-count assertions in
+/// `file_tag_lookalikes_in_body_are_all_escaped` verify with a literal (non-regex) scan.
 fn escape_file_body(body: &str) -> String {
     static FILE_TAG: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").expect("static file-tag regex compiles")

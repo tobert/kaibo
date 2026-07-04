@@ -130,12 +130,20 @@ impl ViewImage {
     /// parser needs.
     async fn view(&self, path_arg: &str) -> Result<Value, ViewImageError> {
         let canon = self.resolve_in_workspace(path_arg)?;
-        let bytes = self.worker.read_file(&canon).await.map_err(|e| {
-            ViewImageError(format!(
-                "view_image: failed to read {}: {e}",
-                canon.display()
-            ))
-        })?;
+        // Read at most one byte past the limit: a file swapped to something enormous
+        // between the caller's view and this read stops at the cap instead of slurping
+        // to OOM, and a returned length past `max_bytes` is exactly the over-limit
+        // signal the size-check below refuses on.
+        let bytes = self
+            .worker
+            .read_file_capped(&canon, self.max_bytes as u64 + 1)
+            .await
+            .map_err(|e| {
+                ViewImageError(format!(
+                    "view_image: failed to read {}: {e}",
+                    canon.display()
+                ))
+            })?;
 
         if bytes.len() > self.max_bytes {
             return Err(ViewImageError(format!(

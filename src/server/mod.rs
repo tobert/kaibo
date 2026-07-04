@@ -1037,10 +1037,18 @@ impl KaiboHandler {
                     )?,
                 );
             }
+            // Read at most one byte past `remaining`. The `meta.len()` gate above is a
+            // stat, and stat-then-read is a TOCTOU: a file swapped to something enormous
+            // in that window would slurp whole into memory if the read were unbounded.
+            // Capping the read at `remaining + 1` bounds that window — a raced-huge file
+            // comes back as `remaining + 1` bytes, which the length check below reads as
+            // "over budget" and demotes to `TextOversize` (the model then `cat`s it
+            // itself), never an OOM. So the demotion path does double duty: it catches
+            // both an honest over-budget file and a raced swap, from the one length test.
             let bytes = worker
                 .as_ref()
                 .expect("worker was just spawned")
-                .read_file(canon.clone())
+                .read_file_capped(canon.clone(), remaining + 1)
                 .await
                 .map_err(|e| {
                     McpError::invalid_params(
@@ -1048,8 +1056,8 @@ impl KaiboHandler {
                         None,
                     )
                 })?;
-            // Re-sniff from the full bytes — authoritative for anything inlined. A file
-            // that grew past the remaining budget between stat and read demotes instead.
+            // Re-sniff from the (capped) bytes — authoritative for anything inlined; a
+            // magic number lives in the first few bytes, so the cap never blinds it.
             if crate::view_image::sniff_mime(&bytes).is_some() {
                 out.push(crate::consult::ConsultAttachment::Image { path: display_path });
                 continue;
@@ -3608,8 +3616,7 @@ mod tests {
         )
         .await
         .expect("all three resolve");
-        let prompt =
-            crate::consult::consult_user_prompt("Assess it.", None, &[], &attachments);
+        let prompt = crate::consult::consult_user_prompt("Assess it.", None, &[], &attachments);
 
         assert!(
             prompt.contains("<file path=\"src/small.rs\">"),
