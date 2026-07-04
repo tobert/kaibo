@@ -2526,7 +2526,7 @@ impl KaiboHandler {
                 limit,
                 |rec| {
                     // Stream Info+ to the human's progress channel; the model's return is the
-                    // separate `return_floor` collection inside `wait_drain_with`.
+                    // separate `sample_floor` tail collected inside `wait_drain_with`.
                     if let Some(token) = &token {
                         if crate::mcp_log::rank(rec.level) >= info_floor {
                             let param = ProgressNotificationParam {
