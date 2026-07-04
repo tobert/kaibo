@@ -1126,6 +1126,7 @@ pub fn supported_kinds_list() -> String {
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
         ProviderKind::Openai,
     ]
     .into_iter()
@@ -1385,6 +1386,7 @@ mod tests {
             api_key_file: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
         }
     }
 
@@ -2083,8 +2085,13 @@ mod tests {
         assert!(batch_supported(ProviderKind::Anthropic));
         assert!(batch_supported(ProviderKind::Gemini));
         assert!(!batch_supported(ProviderKind::DeepSeek));
+        assert!(!batch_supported(ProviderKind::OpenRouter));
         assert!(!batch_supported(ProviderKind::Openai));
-        for kind in [ProviderKind::DeepSeek, ProviderKind::Openai] {
+        for kind in [
+            ProviderKind::DeepSeek,
+            ProviderKind::OpenRouter,
+            ProviderKind::Openai,
+        ] {
             let mut b = anthropic_backend();
             b.kind = kind;
             b.name = format!("{kind:?}").to_lowercase();

@@ -4,10 +4,10 @@
 # or point at it with --config <path> / KAIBO_CONFIG.
 #
 # EVERYTHING here is optional. With no config file at all, kaibo runs exactly as it
-# does today: four built-in BACKENDS (connections: anthropic/deepseek/gemini/openai-local)
-# and six built-in CASTS (compositions: role → "backend/model-id") — four same-named
-# interactive ones plus two batch casts (anthropic-batch, gemini-batch) — ship in code;
-# this file only OVERRIDES fields or ADDS backends and casts.
+# does today: five built-in BACKENDS (connections: anthropic/deepseek/gemini/openrouter/
+# openai-local) and seven built-in CASTS (compositions: role → "backend/model-id") —
+# five same-named interactive ones plus two batch casts (anthropic-batch, gemini-batch)
+# — ship in code; this file only OVERRIDES fields or ADDS backends and casts.
 # `[profiles]` is gone — a config that still carries it is a load error pointing at
 # docs/casts.md.
 #
@@ -16,8 +16,8 @@
 #
 # Naming rule:  config key `foo_bar`  ⇄  env `KAIBO_FOO_BAR`  ⇄  CLI `--foo-bar`
 # Exceptions (kept native, on purpose): the provider key env vars
-# (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY) and
-# OPENAI_BASE_URL. RUST_LOG is also kept as-is.
+# (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY,
+# OPENAI_API_KEY) and OPENAI_BASE_URL. RUST_LOG is also kept as-is.
 
 # ---------------------------------------------------------------------------
 # Getting started — a fresh install has no key yet
@@ -26,7 +26,7 @@
 # the read-only shell needs no model. `consult` / `oneshot` need a
 # provider key on the default cast (`anthropic` out of the box). Give it one the
 # private way — kaibo reads the key at startup, so it never enters your chat:
-#   env:   export ANTHROPIC_API_KEY=sk-...     (or DEEPSEEK_/GEMINI_/OPENAI_…)
+#   env:   export ANTHROPIC_API_KEY=sk-...     (or DEEPSEEK_/GEMINI_/OPENROUTER_/OPENAI_…)
 #   file:  printf %s 'sk-...' > ~/.anthropic-key.txt   (env wins over file)
 # Don't paste the key to the model — set the env var or key file in your shell.
 # Then RECONNECT the kaibo MCP server so it re-reads the environment and this file
@@ -200,7 +200,7 @@ scratch_limit_bytes = 67108864
 # (rig fixes the keyed endpoints — a base_url there is a loud load error).
 # ---------------------------------------------------------------------------
 
-# --- The four built-ins, shown with their current defaults. You only need to
+# --- The five built-ins, shown with their current defaults. You only need to
 #     list a backend here to CHANGE something; these blocks are illustrative.
 #     Their alias names (claude, google, local, lemonade, gemma, gemma4) are
 #     reserved at both levels — naming a new backend or cast after one is a
@@ -220,6 +220,27 @@ api_key_file = "~/.deepseek-key"
 kind = "gemini"
 api_key_env  = "GEMINI_API_KEY"
 api_key_file = "~/.gemini-api-key"
+
+# OpenRouter: one key, every major model family, through a single gateway. Fixed
+# endpoint — rig owns it, so a base_url here is a loud load error, unlike the openai
+# kind below. Reasoning is on by default on every slot (OpenRouter's unified
+# `{"reasoning":{"effort":…}}`, translated per upstream model and silently dropped
+# where a model has no such knob) — see [casts.or-deep] for pushing a slot past
+# [defaults] effort into OpenRouter's deeper `xhigh`/`max` rungs.
+#
+# One slug routes across COMPETING HOSTS whose data policies differ, and kaibo's
+# prompts carry your source — so every request pins no-collection routing
+# (`provider.data_collection = "deny"`) BY DEFAULT. A model whose only hosts
+# retain/train on prompts (most `:free` variants) then fails loudly instead of
+# leaking quietly. `data_collection = "allow"` is the explicit opt-in: kaibo
+# emits no restriction and your OpenRouter account settings govern. This knob
+# exists only on the openrouter kind — anywhere else it's a load error.
+[backends.openrouter]
+kind = "openrouter"
+api_key_env  = "OPENROUTER_API_KEY"
+api_key_file = "~/.openrouter-key"
+# kaibo always denies unless you uncomment this line:
+# data_collection = "allow"
 
 [backends.openai-local]                            # aliases: local, lemonade, gemma, gemma4
 kind = "openai"
@@ -315,6 +336,18 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 aliases  = ["deep"]                          # casts (and backends) take aliases
 explorer = { backend = "deepseek", id = "deepseek-v4-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
 synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
+
+# --- The built-in `openrouter` backend already has a key source, so a custom cast on
+#     it needs only slots. `~author/family-latest` aliases (see the built-in `openrouter`
+#     cast) track the newest release instead of rotting; `effort = "xhigh"` here pushes
+#     the synth slot past [defaults] synth_effort ("high") into a rung only OpenRouter's
+#     unified reasoning param reaches. The same knob is the opt-out: reasoning is on by
+#     default for everything kaibo calls, and `effort = "none"` on a slot turns it off
+#     when the cost/latency isn't wanted (reasoning bills as output tokens). ---
+
+[casts.or-deep]
+explorer = "openrouter/~google/gemini-flash-latest"
+synth    = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", effort = "xhigh" }
 
 # --- A per-model prompt: a local Gemma explorer wants different framing than a
 #     hosted Claude would. `preamble` lives on the slot, beside the tunables, and

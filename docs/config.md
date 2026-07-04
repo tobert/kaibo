@@ -34,7 +34,7 @@ full rationale is `docs/casts.md`.
 ## The model: backends, roles, casts
 
 ```
-ProviderKind = anthropic | deepseek | gemini | openai      (the wire protocol)
+ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (the wire protocol)
 Backend      = { name, kind, base_url?, key source, request_timeout }
 Cast         = { name, role → ModelSlot }                  (freely spans backends)
 ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
@@ -82,6 +82,25 @@ Connection knobs only — models never live here:
   `false` otherwise. A key file that's *present but broken* (empty, unreadable) is
   a loud error even for a keyless backend — there-but-wrong is a mistake, not
   "keyless".
+- **`kind = "openrouter"`** is a keyed gateway, not a wire protocol of its own: one
+  `OPENROUTER_API_KEY` reaches every upstream model family through a fixed endpoint
+  (`base_url` there is the same loud load error as on the other keyed kinds).
+  Reasoning is **on by default on every slot** — OpenRouter's unified
+  `{"reasoning":{"effort":…}}` request field, which the gateway translates into
+  each upstream provider's native knob and drops silently where the pinned model
+  has none, so emitting it unconditionally never breaks a non-reasoning model. The
+  per-role `effort` (see [defaults] below) passes through verbatim, reaching
+  OpenRouter-only rungs (`xhigh`, `max`) deeper than the other kinds expose. No
+  `batch` lane. One slug routes across competing upstream *hosts* whose data
+  policies differ, so every request pins **no-collection routing by default**
+  (`provider.data_collection = "deny"` — kaibo's prompts carry your source, and
+  shipping it to a host that retains or trains on prompts must be a choice, never
+  a default). A model whose only hosts collect (most `:free` variants) fails
+  loudly instead of leaking quietly. `data_collection = "allow"` on the backend
+  is the explicit opt-in — kaibo then emits no restriction and your OpenRouter
+  account settings govern. The knob exists only on this kind (a load error
+  elsewhere), and `kaibo://config` renders the active policy per openrouter
+  backend so the posture is always visible.
 - **`request_timeout_secs`** (default from `[defaults]`, 900 = 15 min) is the
   wall-clock ceiling on a *single* completion call. rig's prompt loop is
   non-streaming and has no native timeout, so a provider that connects but never
@@ -180,11 +199,14 @@ The `[defaults]` knobs themselves:
   per slot, an out-of-range value is rejected at load, not clamped.
 - **`explorer_effort` / `synth_effort`** (`"high"` both): reasoning depth for the
   models that take an effort param — Anthropic's adaptive tier
-  (→ `output_config.effort`), DeepSeek (→ `reasoning_effort`), and the Gemini
-  3-line (→ `thinkingLevel`: the values align, `"high"`/`"low"`). A passthrough
-  string the provider validates (like a model id), so a new level lands without a
-  code change — set a synth slot's `effort = "max"`/`"xhigh"` for heavier runs.
-  Ignored by models with no effort sink (budget-tier Anthropic/Gemini, OpenAI).
+  (→ `output_config.effort`), DeepSeek (→ `reasoning_effort`), the Gemini
+  3-line (→ `thinkingLevel`: the values align, `"high"`/`"low"`), and OpenRouter
+  (→ its unified `{"reasoning":{"effort":…}}`, forwarded verbatim to whatever the
+  pinned model actually supports). A passthrough string the provider validates
+  (like a model id), so a new level lands without a code change — set a synth
+  slot's `effort = "max"`/`"xhigh"` for heavier runs; OpenRouter is where those
+  deeper rungs are actually reachable today. Ignored by models with no effort
+  sink (budget-tier Anthropic/Gemini, OpenAI).
 - **`thinking_style`** (`auto` | `adaptive` | `budget`, default `auto`) forces the
   Anthropic thinking shape instead of the built-in classifier. `auto` picks
   adaptive for Opus 4.6+/Sonnet 4.6/Fable 5 and enabled-budget for older models +
@@ -225,9 +247,15 @@ The `[defaults]` knobs themselves:
 
 ### Built-in registry (the defaults)
 
-Four backends and four same-named single-backend casts ship **in code** and
+Five backends and five same-named single-backend casts ship **in code** and
 reproduce kaibo's historical behavior exactly, so a **missing config file is not
-an error**. Two extra built-in casts ship for the offline batch lane —
+an error**. The `openrouter` built-in pins the drift-resistant `~author/family-latest`
+catalog aliases (explorer `~google/gemini-flash-latest`, synth
+`~anthropic/claude-sonnet-latest`) rather than a dated slug, and opts both slots into
+`vision` — the classifier defaults an `openrouter` slot to vision-off, since the
+gateway fronts blind and sighted models alike, but both default ids are
+multimodal-in per OpenRouter's own catalog. Two extra built-in casts ship for the
+offline batch lane —
 `gemini-batch` (synth Gemini Pro) and `anthropic-batch` (synth Claude Opus). Lane is
 a **per-slot** property, not a cast-level one: each carries a synth slot whose
 `lane = "batch"`, which staffs `batch_submit` *only*: the interactive tools
@@ -261,6 +289,7 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 | `anthropic` | anthropic | — | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
 | `deepseek` | deepseek | — | `DEEPSEEK_API_KEY` / `~/.deepseek-key` | — |
 | `gemini` | gemini | — | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
+| `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
 
 | cast | explorer | synth | synth lane |
@@ -268,6 +297,7 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 | `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
 | `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` | |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
+| `openrouter` | `openrouter/~google/gemini-flash-latest` | `openrouter/~anthropic/claude-sonnet-latest` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
 | `anthropic-batch` | — | `anthropic/claude-opus-4-8` | `batch` |
@@ -367,8 +397,9 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 **Two deliberate exceptions to the rule:**
 
 - **Provider key vars stay native.** `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
-  `GEMINI_API_KEY`, `OPENAI_API_KEY` are *not* renamed to `KAIBO_*` — people and
-  CI expect those names. A backend points at one via `api_key_env`.
+  `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` are *not* renamed to
+  `KAIBO_*` — people and CI expect those names. A backend points at one via
+  `api_key_env`.
 - **`OPENAI_BASE_URL` is kept** as a back-compat override for any openai-kind
   backend that doesn't set an explicit `base_url` (it's what's wired today). New
   backends use the `base_url` config key instead.

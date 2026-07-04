@@ -549,6 +549,25 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     // per slot rather than guessed from an arbitrary id.
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true)).vision);
+    // OpenRouter is the same shape: the gateway fronts blind and sighted models
+    // alike, so vision is the pinned model's property — opt-in per slot (the
+    // built-in cast pins it on its multimodal defaults).
+    assert!(
+        !ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "~anthropic/claude-sonnet-latest",
+            None
+        )
+        .vision
+    );
+    assert!(
+        ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "~anthropic/claude-sonnet-latest",
+            Some(true)
+        )
+        .vision
+    );
     // The override pins in both directions.
     assert!(!ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", Some(false)).vision);
 
@@ -567,6 +586,18 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     );
     // The vision override never flips the transport channel — it's the wire's property.
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "anything", Some(true)).tool_result_images);
+    // OpenRouter's transport is *worse* than a 400: rig's converter silently rewrites
+    // a tool-result image to placeholder text, so the channel must stay closed — a
+    // seeing OpenRouter model gets its image on the user turn instead.
+    assert!(
+        !ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "~google/gemini-flash-latest",
+            Some(true)
+        )
+        .tool_result_images,
+        "an OpenRouter VLM sees, but rig's tool-result converter would drop the bytes"
+    );
 }
 
 #[test]
@@ -1420,6 +1451,155 @@ async fn two_phase_consult_answers_from_the_real_tree() {
         lower.contains("sandbox") || lower.contains("read-only") || lower.contains("read only"),
         "answer should explain the read-only sandbox mechanism, got: {}",
         out.answer
+    );
+}
+
+#[tokio::test]
+#[ignore = "hits the OpenRouter API (keyed gateway); run with --ignored and OPENROUTER_API_KEY"]
+async fn openrouter_consult_round_trips() {
+    // The live proof of the OpenRouter arm: the unified `{reasoning:{effort}}` param,
+    // the `max_completion_tokens` workaround (rig drops native max_tokens for this
+    // provider — without the injection a thinking-on answer would starve), and the
+    // `with_app_identity` headers all have to be accepted end-to-end. Runs the built-in
+    // openrouter cast (the `~author/family-latest` aliases) so a regression in any of
+    // those surfaces as a live failure here, not in production.
+    if let Err(e) = load(ProviderKind::OpenRouter) {
+        panic!("no OpenRouter credential for live test: {e}");
+    }
+
+    let cfg = Config::builtin();
+    let backend = cfg
+        .resolve_backend("openrouter")
+        .expect("openrouter backend");
+    let explorer_slot = cfg
+        .resolve_cast("openrouter")
+        .unwrap()
+        .require_slot(ModelRole::Explorer)
+        .unwrap()
+        .clone();
+    let synth_slot = cfg
+        .resolve_cast("openrouter")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .clone();
+    let explorer = Arm::from_slot(backend, &explorer_slot, ModelRole::Explorer, &cfg.defaults)
+        .expect("explorer arm on openrouter");
+    let synth = Arm::from_slot(backend, &synth_slot, ModelRole::Synth, &cfg.defaults)
+        .expect("synth arm on openrouter");
+
+    let out = consult(
+        "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
+        None,
+        env!("CARGO_MANIFEST_DIR"),
+        &explorer,
+        &synth,
+        &ConsultConfig::default(),
+        None,
+    )
+    .await
+    .expect("openrouter consult should succeed (reasoning + max_completion_tokens accepted)");
+
+    let lower = out.answer.to_lowercase();
+    assert!(
+        lower.contains("sandbox") || lower.contains("read-only") || lower.contains("read only"),
+        "answer should explain the read-only sandbox mechanism, got: {}",
+        out.answer
+    );
+}
+
+/// One minimal OpenRouter completion carrying kaibo's shaped params, with the
+/// gateway's usage accounting on. Returns the parsed response JSON.
+#[cfg(test)]
+async fn openrouter_probe_completion(key: &str, model: &str, params: &Value) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": "How many prime numbers are there between 10 and 50? \
+                        Work it out carefully, then answer with just the count.",
+        }],
+        "max_completion_tokens": 8192,
+        "usage": {"include": true},
+    });
+    for (k, v) in params.as_object().expect("shaped params are an object") {
+        body[k] = v.clone();
+    }
+    let http = kaibo::tls::https_client(std::time::Duration::from_secs(120)).unwrap();
+    let resp = http
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .expect("openrouter request");
+    let status = resp.status();
+    let json: Value = resp.json().await.expect("openrouter response json");
+    assert!(
+        status.is_success(),
+        "openrouter rejected kaibo's shaped params ({status}): {json}"
+    );
+    json
+}
+
+#[tokio::test]
+#[ignore = "hits the OpenRouter API (keyed gateway); run with --ignored and OPENROUTER_API_KEY"]
+async fn openrouter_reasoning_accounting_live() {
+    // "Reasoning on by default" is doctrine, so it gets *measured*, not assumed
+    // (2026-07-03: a live consult averaged ~150 output tokens per turn — thin
+    // enough to question whether effort was landing). This posts kaibo's exact
+    // shaped params — `ModelShape::to_params`, the seam every OpenRouter arm
+    // rides — with OpenRouter's usage accounting on, and reads what the gateway
+    // actually billed: effort-on must show reasoning tokens, and the structural
+    // disable (`effort = "none"` ⇒ `{"reasoning":{"enabled":false}}`) must not.
+    let key = match load(ProviderKind::OpenRouter) {
+        Ok(k) => k,
+        Err(e) => panic!("no OpenRouter credential for live test: {e}"),
+    };
+    // The built-in cast's explorer alias — the slot the doctrine most needs to
+    // hold on, since the explorer runs the most turns.
+    let model = "~google/gemini-flash-latest";
+    let shape = ModelShape::resolve(
+        ProviderKind::OpenRouter,
+        model,
+        ThinkingStyleOverride::Auto,
+    );
+
+    // Default posture: effort = high ⇒ the gateway bills reasoning tokens. The
+    // no-collection routing pin rides along exactly as every live arm sends it —
+    // so this also proves deny-routing still reaches the built-in cast's models.
+    let params = shape.to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT);
+    let params = kaibo::consult::inject_provider_prefs(
+        ProviderKind::OpenRouter,
+        params,
+        kaibo::config::DataCollection::Deny,
+    )
+    .expect("openrouter always sends params");
+    let resp = openrouter_probe_completion(&key, model, &params).await;
+    let reasoning = resp["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    eprintln!("=== effort={DEFAULT_EFFORT} usage: {}", resp["usage"]);
+    assert!(
+        reasoning > 0,
+        "effort={DEFAULT_EFFORT} must bill reasoning tokens — thinking-on-by-default \
+         isn't landing, got usage: {}",
+        resp["usage"]
+    );
+
+    // The opt-out: the structural disable really turns reasoning off.
+    let params = shape
+        .to_params(THINKING_BUDGET, None, None, "none")
+        .expect("openrouter always sends params");
+    let resp = openrouter_probe_completion(&key, model, &params).await;
+    let reasoning = resp["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    eprintln!("=== effort=none usage: {}", resp["usage"]);
+    assert_eq!(
+        reasoning, 0,
+        "effort=none must not bill reasoning tokens, got usage: {}",
+        resp["usage"]
     );
 }
 

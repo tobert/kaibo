@@ -52,9 +52,9 @@ composition, compositions choose connections.
 ## Config surface
 
 ```toml
-# --- backends: connections only. The four built-ins (anthropic, deepseek,
-#     gemini, openai-local) ship in code with today's key sources; a stanza here
-#     retargets one or adds a new one. ---
+# --- backends: connections only. The five built-ins (anthropic, deepseek,
+#     gemini, openrouter, openai-local) ship in code with today's key sources; a
+#     stanza here retargets one or adds a new one. ---
 
 # (No stanza needed for the local llama.cpp default: `gemma` is a built-in
 #  alias of the `openai-local` backend, which already points at localhost:13305.
@@ -98,8 +98,11 @@ Rules, in the loud-over-silent house style:
 - **`[profiles]` is deleted, not deprecated.** A config that still says
   `[profiles.x]` gets a load error pointing at this doc. Amy is the only
   user; git history is the record.
-- **Built-in equivalence:** four built-in backends + four same-named
-  single-backend casts. Today's profile aliases — `claude`→`anthropic`,
+- **Built-in equivalence:** five built-in backends + five same-named
+  single-backend casts (the `openrouter` kind added as a keyed gateway
+  alongside anthropic/deepseek/gemini — one key reaching every upstream model
+  family through a fixed endpoint, reasoning on by default via its unified
+  `effort` param). Today's profile aliases — `claude`→`anthropic`,
   `google`→`gemini`, `local`/`lemonade`/`gemma`/`gemma4`→`openai-local` — register
   at *both* levels (cast aliases so `cast = "claude"` resolves, backend
   aliases so a slot ref `claude/<id>` resolves), and user stanzas can declare

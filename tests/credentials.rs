@@ -76,6 +76,49 @@ fn only_openai_tolerates_a_missing_key() {
     assert!(!ProviderKind::Anthropic.key_optional());
     assert!(!ProviderKind::DeepSeek.key_optional());
     assert!(!ProviderKind::Gemini.key_optional());
+    // OpenRouter is a *keyed* gateway — a missing key is a hard error, not tolerated.
+    assert!(!ProviderKind::OpenRouter.key_optional());
+}
+
+// --- OpenRouter: a keyed gateway (one key, fixed endpoint) fronting every model.
+
+#[test]
+fn openrouter_parses_and_carries_its_key_source() {
+    assert_eq!(
+        ProviderKind::from_str("openrouter").unwrap(),
+        ProviderKind::OpenRouter
+    );
+    assert_eq!(
+        ProviderKind::from_str("  OpenRouter ").unwrap(),
+        ProviderKind::OpenRouter
+    );
+    assert_eq!(ProviderKind::OpenRouter.canonical_name(), "openrouter");
+    assert_eq!(ProviderKind::OpenRouter.builtin_name(), "openrouter");
+    assert_eq!(ProviderKind::OpenRouter.env_var(), "OPENROUTER_API_KEY");
+    assert_eq!(
+        ProviderKind::OpenRouter.key_file(std::path::Path::new("/home/amy")),
+        std::path::Path::new("/home/amy/.openrouter-key")
+    );
+}
+
+#[test]
+fn openrouter_key_resolves_from_env_then_file() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join(ProviderKind::OpenRouter.key_file_name());
+    fs::write(&file, "sk-or-from-file\n").unwrap();
+    // Env wins...
+    assert_eq!(resolve(Some("sk-or-env"), &file).unwrap(), "sk-or-env");
+    // ...and the file is the fallback.
+    assert_eq!(resolve(None, &file).unwrap(), "sk-or-from-file");
+}
+
+#[test]
+fn unknown_provider_error_lists_openrouter() {
+    let err = ProviderKind::from_str("nope").unwrap_err();
+    assert!(
+        err.to_string().contains("openrouter"),
+        "the error should list openrouter among the expected kinds: {err}"
+    );
 }
 
 #[test]
@@ -101,5 +144,9 @@ fn provider_paths_match_amys_dotfiles() {
     );
     assert_eq!(ProviderKind::DeepSeek.key_file(home), home.join(".deepseek-key"));
     assert_eq!(ProviderKind::Gemini.key_file(home), home.join(".gemini-api-key"));
+    assert_eq!(
+        ProviderKind::OpenRouter.key_file(home),
+        home.join(".openrouter-key")
+    );
     assert_eq!(ProviderKind::Openai.key_file(home), home.join(".openai-key"));
 }

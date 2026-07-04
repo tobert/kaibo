@@ -41,6 +41,6 @@ pub use prompts::{
     ConsultAttachment, Phase, PromptOverrides,
 };
 pub use shaping::{
-    request_params, thinking_params, ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT,
-    THINKING_BUDGET,
+    inject_provider_prefs, request_params, thinking_params, ModelCaps, ModelShape,
+    ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
 };

@@ -369,6 +369,37 @@ pub fn parse_slot_ref(s: &str) -> Result<(String, String)> {
 
 // --- Backends ---------------------------------------------------------------
 
+/// OpenRouter upstream-host data policy: whether requests may route to hosts
+/// that retain or train on prompts. kaibo ships source code in its prompts, so
+/// the default is [`DataCollection::Deny`] — OpenRouter then routes only to
+/// hosts whose policy is no-collection, and a model with no compliant host
+/// fails loudly instead of leaking quietly. `Allow` is the explicit opt-in:
+/// kaibo omits the restriction and the caller's OpenRouter account settings
+/// govern. Config: `data_collection = "deny" | "allow"` on an openrouter-kind
+/// backend (anywhere else is a load error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DataCollection {
+    /// Route only to upstream hosts that don't retain/train on prompts (default).
+    #[default]
+    Deny,
+    /// No routing restriction — the account's own OpenRouter settings apply.
+    Allow,
+}
+
+impl std::str::FromStr for DataCollection {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "deny" => Ok(Self::Deny),
+            "allow" => Ok(Self::Allow),
+            other => bail!(
+                "data_collection {other:?} is not a policy — use \"deny\" (route only \
+                 to no-collection hosts, the default) or \"allow\" (explicit opt-in)"
+            ),
+        }
+    }
+}
+
 /// A connection: how kaibo reaches one provider endpoint. The `kind` is the wire
 /// protocol (the closed [`ProviderKind`] enum — the one place "provider" still
 /// means something); everything else describes the wire: endpoint, key source,
@@ -397,6 +428,10 @@ pub struct Backend {
     /// the 2026-06-06 stall (see `consult.rs` / `docs/issues.md`). Seeded from
     /// [`Defaults::request_timeout`], overridable per backend.
     pub request_timeout: Duration,
+    /// OpenRouter only: upstream-host data policy (see [`DataCollection`]).
+    /// Deny by default on every kind; only an openrouter-kind backend may set it,
+    /// and only the openrouter arm reads it.
+    pub data_collection: DataCollection,
 }
 
 impl Backend {
@@ -1421,16 +1456,20 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         api_key_file: Some(format!("~/{}", kind.key_file_name())),
         key_optional: kind.key_optional(),
         request_timeout: defaults.request_timeout,
+        // Deny is the only safe default: kaibo's prompts carry source code, and
+        // routing them to a data-collecting host must be an explicit choice.
+        data_collection: DataCollection::Deny,
     }
 }
 
-/// The four built-in backends, named after their kind.
+/// The built-in backends, named after their kind.
 fn builtin_backends(defaults: &Defaults) -> BTreeMap<String, Backend> {
     let mut m = BTreeMap::new();
     for kind in [
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
         ProviderKind::Openai,
     ] {
         let mut b = backend_template(kind, defaults);
@@ -1449,15 +1488,27 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
         ProviderKind::Openai,
     ] {
         let name = kind.builtin_name().to_string();
         let (explorer, synth) = default_models(kind);
+        // OpenRouter's vision classifier defaults false (the gateway fronts blind and
+        // sighted models alike — it's a property of the pinned model, not the wire), so
+        // the built-in cast opts its slots in: both default ids (`~google/gemini-flash-latest`,
+        // `~anthropic/claude-sonnet-latest`) advertise `image` in `architecture.input_modalities`
+        // in OpenRouter's catalog (verified 2026-07-03). Every other built-in kind is
+        // classified correctly by default, so it needs no pin.
+        let vision = matches!(kind, ProviderKind::OpenRouter).then_some(true);
+        let slot = |id| ModelSlot {
+            vision,
+            ..ModelSlot::bare(&name, id)
+        };
         // Both agent roles are seeded. A cast may omit one in config — absent means
         // the capability is absent, and nothing downstream errors on that.
         let slots = BTreeMap::from([
-            (ModelRole::Explorer, ModelSlot::bare(&name, explorer)),
-            (ModelRole::Synth, ModelSlot::bare(&name, synth)),
+            (ModelRole::Explorer, slot(explorer)),
+            (ModelRole::Synth, slot(synth)),
         ]);
         m.insert(name.clone(), Cast { name, slots });
     }
@@ -1516,6 +1567,12 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         ProviderKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
         ProviderKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
         ProviderKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
+        // OpenRouter serves `~author/family-latest` aliases as real catalog entries
+        // that track the newest family member, so these don't rot as ids retire.
+        ProviderKind::OpenRouter => (
+            "~google/gemini-flash-latest",
+            "~anthropic/claude-sonnet-latest",
+        ),
         ProviderKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
@@ -1710,6 +1767,7 @@ struct RawBackend {
     api_key_file: Option<String>,
     key_optional: Option<bool>,
     request_timeout_secs: Option<u64>,
+    data_collection: Option<String>,
 }
 
 impl RawBackend {
@@ -1744,6 +1802,23 @@ impl RawBackend {
         }
         if let Some(v) = self.request_timeout_secs {
             b.request_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = &self.data_collection {
+            // The policy only exists on the OpenRouter wire; naming it anywhere
+            // else is a config mistake worth a loud error, not a silent no-op the
+            // user believes is protecting them.
+            if b.kind != ProviderKind::OpenRouter {
+                bail!(
+                    "backend {:?} (kind {:?}) sets data_collection, but only the \
+                     `openrouter` kind routes across upstream hosts with differing \
+                     data policies",
+                    b.name,
+                    b.kind
+                );
+            }
+            b.data_collection = v.parse().with_context(|| {
+                format!("backend {:?} data_collection", b.name)
+            })?;
         }
         Ok(())
     }
@@ -2712,12 +2787,18 @@ mod tests {
         assert!(!b.key_optional);
     }
 
-    /// All four interactive built-in casts exist, each single-backend with
+    /// Every interactive built-in cast exists, each single-backend with
     /// explorer+synth, and none has a synth on an offline lane.
     #[test]
-    fn all_four_builtin_casts_resolve() {
+    fn all_interactive_builtin_casts_resolve() {
         let cfg = Config::builtin();
-        for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
+        for name in [
+            "anthropic",
+            "deepseek",
+            "gemini",
+            "openrouter",
+            "openai-local",
+        ] {
             let cast = cfg.resolve_cast(name).unwrap();
             assert_eq!(
                 cast.synth_lane(),
@@ -2729,6 +2810,121 @@ mod tests {
                 assert_eq!(slot.backend, name, "built-in casts are single-backend");
             }
         }
+    }
+
+    /// The OpenRouter built-in: a keyed backend (OPENROUTER_API_KEY, no configurable
+    /// base URL) and a cast pinning the drift-resistant `~author/family-latest` aliases,
+    /// with `vision` opted in on both slots (OpenRouter's classifier defaults false, but
+    /// both default models are multimodal — see the cast comment). Pins the whole
+    /// built-in so a bad default fails here, not mid-call.
+    #[test]
+    fn builtin_openrouter_cast_and_backend() {
+        let cfg = Config::builtin();
+        let (explorer, synth) = default_models(ProviderKind::OpenRouter);
+        assert_eq!(explorer, "~google/gemini-flash-latest");
+        assert_eq!(synth, "~anthropic/claude-sonnet-latest");
+
+        let cast = cfg.resolve_cast("openrouter").unwrap();
+        let e = cast.require_slot(ModelRole::Explorer).unwrap();
+        let s = cast.require_slot(ModelRole::Synth).unwrap();
+        assert_eq!(
+            (e.backend.as_str(), e.id.as_str()),
+            ("openrouter", explorer)
+        );
+        assert_eq!((s.backend.as_str(), s.id.as_str()), ("openrouter", synth));
+        assert_eq!(e.vision, Some(true), "explorer model is multimodal-in");
+        assert_eq!(s.vision, Some(true), "synth model is multimodal-in");
+
+        let b = cfg.resolve_backend("openrouter").unwrap();
+        assert_eq!(b.kind, ProviderKind::OpenRouter);
+        assert_eq!(b.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+        assert!(!b.key_optional, "OpenRouter is a keyed gateway");
+        assert!(
+            b.base_url.is_none(),
+            "OpenRouter's endpoint is fixed by rig — no configurable base URL"
+        );
+    }
+
+    /// A base_url on the keyed OpenRouter kind is a config mistake (its endpoint is
+    /// pinned), rejected loudly at load like the other keyed kinds — not silently
+    /// ignored into a wrong endpoint.
+    #[test]
+    fn openrouter_backend_rejects_a_base_url() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.myrouter]
+            kind = "openrouter"
+            base_url = "https://example.com/v1"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("base_url"),
+            "a base_url on a keyed kind must be refused: {err}"
+        );
+    }
+
+    /// The data policy defaults to deny on every backend and takes only the two
+    /// explicit values — the privacy default must hold with an empty config, and
+    /// an opt-in must be spelled exactly, never inferred.
+    #[test]
+    fn data_collection_defaults_deny_and_parses_explicit_allow() {
+        let cfg = Config::builtin();
+        let b = cfg.resolve_backend("openrouter").unwrap();
+        assert_eq!(
+            b.data_collection,
+            DataCollection::Deny,
+            "the built-in openrouter backend must deny data collection out of the box"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.openrouter]
+            data_collection = "allow"
+            "#,
+        )
+        .unwrap();
+        let b = cfg.resolve_backend("openrouter").unwrap();
+        assert_eq!(
+            b.data_collection,
+            DataCollection::Allow,
+            "the explicit opt-in must parse and stick"
+        );
+    }
+
+    /// A value outside the two-policy vocabulary is a loud load error naming both
+    /// legal spellings — a typo'd "denied" silently defaulting would betray the
+    /// user's intent in the worst direction.
+    #[test]
+    fn data_collection_rejects_an_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.openrouter]
+            data_collection = "denied"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("deny") && msg.contains("allow"), "got: {msg}");
+    }
+
+    /// The policy only exists on the OpenRouter wire; setting it elsewhere is a
+    /// config mistake refused at load — not a silent no-op the user believes is
+    /// protecting them.
+    #[test]
+    fn data_collection_is_openrouter_only() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.anthropic]
+            data_collection = "deny"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("data_collection") && msg.contains("openrouter"),
+            "got: {msg}"
+        );
     }
 
     /// The built-in batch casts' synth slots positively declare `lane = Batch`, carry
@@ -2960,6 +3156,8 @@ mod tests {
         api_key_file = "/nonexistent-kaibo-test/deepseek"
         [backends.gemini]
         api_key_file = "/nonexistent-kaibo-test/gemini"
+        [backends.openrouter]
+        api_key_file = "/nonexistent-kaibo-test/openrouter"
         [backends.openai-local]
         api_key_file = "/nonexistent-kaibo-test/openai"
     "#;

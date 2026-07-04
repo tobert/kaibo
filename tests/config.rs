@@ -1181,6 +1181,7 @@ fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {
         api_key_file,
         key_optional,
         request_timeout: Duration::from_secs(900),
+        data_collection: Default::default(),
     }
 }
 
@@ -1217,6 +1218,7 @@ fn required_key_with_no_source_is_an_error() {
         api_key_file: None,
         key_optional: false,
         request_timeout: Duration::from_secs(900),
+        data_collection: Default::default(),
     };
     let err = b.resolve_key().unwrap_err();
     assert!(

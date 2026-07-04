@@ -32,9 +32,10 @@ outside perspective into a code review, design session, or research: your agent 
 summary back.
 
 kaibo integrates as a stdio [MCP](https://modelcontextprotocol.io) server and supports
-Anthropic, Gemini, DeepSeek, and any OpenAI-compatible endpoint, including local
-services like llama.cpp. Each agent is set up to mix small models for exploration with
-larger models for synthesis, to help keep your API spend down.
+Anthropic, Gemini, DeepSeek, OpenRouter (one key reaching every major model family),
+and any OpenAI-compatible endpoint, including local services like llama.cpp. Each
+agent is set up to mix small models for exploration with larger models for synthesis,
+to help keep your API spend down.
 
 The agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
 shell. kaish has all of its commands built in and mounts your project through a
@@ -124,8 +125,10 @@ not an error. `$XDG_CONFIG_HOME/kaibo/config.toml` lets you wire your own roster
 config has three concepts for configuring models:
 
 - **backend** — a *connection*: which wire protocol (`anthropic` | `deepseek` |
-  `gemini` | `openai`), base URL, and where its key comes from. Secrets never live in
-  the TOML — only the *name* of an env var or the path to a key file.
+  `gemini` | `openrouter` | `openai`), base URL, and where its key comes from. Secrets
+  never live in the TOML — only the *name* of an env var or the path to a key file.
+  `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every major
+  model family, reasoning on by default via its unified `effort` param.
 - **role** — a *job* a model does: `explorer` (fast sweeps) and `synth` (the voice that
   answers). A slot that reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
@@ -162,6 +165,7 @@ merges over them by name. The built-ins are:
 | `anthropic` *(default)* | `claude-haiku-4-5` | `claude-sonnet-4-6` |
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-pro` |
 | `gemini` | `gemini-flash-lite-latest` | `gemini-3.5-flash` |
+| `openrouter` | `~google/gemini-flash-latest` | `~anthropic/claude-sonnet-latest` |
 | `openai` | local Gemma (small) | local Gemma (large) |
 
 Per-call overrides, env vars, and CLI flags all layer over the file
@@ -279,7 +283,9 @@ the explorer sweep and the consult driver stop at a turn limit (100 and 200 by
 default), so a confused model can't loop forever burning tokens. All of these are
 configurable in `config.toml`.
 
-**What providers are supported?** Anthropic, DeepSeek, and Gemini natively, plus a
+**What providers are supported?** Anthropic, DeepSeek, and Gemini natively; OpenRouter
+as a keyed gateway that reaches every major model family through one key (`~author/
+family-latest` aliases keep the built-in cast current as new models ship); and a
 generic `openai` kind for any OpenAI-compatible endpoint (hosted GPT, a local
 llama.cpp / Ollama / Gemma server, …). See [Backends, Roles, and Casts](#backends-roles-and-casts).
 

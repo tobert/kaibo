@@ -404,6 +404,31 @@ P1 entry):
   grounding (all of which the `gpal` MCP sibling drives directly). This is why "voice
   on Gemini" is parked with TTS. Track rig's gemini coverage; adopt its traits when
   they broaden rather than hand-rolling media modalities over raw HTTP.
+- **OpenRouter provider silently drops `max_tokens`.** rig 0.38.2's native
+  `providers::openrouter` request struct (`openrouter/completion.rs`,
+  `OpenrouterCompletionRequest`) has no `max_tokens` field and its `TryFrom` never
+  reads `CompletionRequest.max_tokens`, so `AgentBuilder::max_tokens()` — kaibo's
+  per-arm headroom mechanism — is a no-op there. Confirmed still present on rig
+  `main` (2026-07-03), untracked upstream. Collides with the `large-token-headroom`
+  doctrine (thinking eats the completion budget). Kaibo's workaround: inject
+  `max_completion_tokens` (OpenRouter's preferred name; their spec deprecates
+  `max_tokens`) via `additional_params`, guarded by a failing-first test. Watch
+  upstream; if it accretes — with rig's other thin spots and the missing universal
+  reasoning API (rig#951) — the exit is a **direct OpenRouter Rust SDK** for that
+  backend (per Amy, 2026-07-03: the kaijutsu precedent — break a provider out of
+  the framework when a good dedicated crate exists). Crate survey (2026-07-03):
+  **`openrouter-rs`** (realmorrisliu, MIT) is the pilot candidate — active (~weekly
+  releases), OpenAPI-drift CI against OpenRouter's spec, typed `ReasoningConfig` +
+  `reasoning_details` incl. the Anthropic `signature` field, streaming tool-call
+  accumulation, skips `: OPENROUTER PROCESSING` keepalives, `#[non_exhaustive]`
+  discipline; dep tree verified ring-only (no aws-lc/openssl), though TLS is
+  reqwest's default rather than a caller-pinned feature — our `src/tls.rs`
+  install-default covers that. Runner-up `openrouter_api` (staler, weaker error
+  typing, but caller-selectable TLS feature + MCP client). Switch triggers: rig
+  lags a feature we need (reasoning-details pass-through, provider routing),
+  openrouter-rs hits 1.0 / gains a second maintainer, or OpenRouter quirks get
+  awkward to special-case through rig's abstractions. Adapter cost: it's a direct
+  client, not a rig `CompletionModel` — the arm would hand-roll that seam.
 
 ### Per-model request shaping (`ModelShape`): remaining knobs
 `ModelShape` (`consult.rs`) resolves request params per (kind, model), fit per
@@ -424,9 +449,66 @@ tunables — if a provider caps output low, cap that slot, not the global, per t
   4.6+/Sonnet 4.6/Fable 5 to adaptive (the rest stay enabled-budget). Add ids as models
   ship, or set `thinking_style` on the slot to override; confirm a new id with the
   `#[ignore]`d Opus-4.8 probe rather than guessing.
+- **`openai`-kind emits no thinking at all** — `ProviderKind::Openai ⇒
+  ThinkingStyle::None` (`shaping.rs`), so a reasoning-capable model behind an
+  OpenAI-compatible endpoint (OpenRouter fronting Claude/Gemini/DeepSeek, a hosted
+  GPT, a local Qwen/GLM reasoner) is silently called with reasoning *off*. That
+  inverts our doctrine (per Amy, 2026-07-03): **anything kaibo calls should have
+  thinking maximized by default**, opt-*out* per slot, never silently absent. The
+  fix wants model-aware shaping on the openai wire — e.g. emit `reasoning_effort`
+  for OpenAI-compatible reasoners, OpenRouter's unified `reasoning` param when the
+  backend is OpenRouter — landing with the first-class OpenRouter work.
+- **`thinking_style` is missing from the `inert_tunables` render** (GLM review,
+  2026-07-03): `kaibo://config` flags an inert `thinking_budget`/`effort`/
+  `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
+  slot whose kind ignores the override (anything non-Anthropic) renders as if
+  effective. Display accuracy only; add it to the inert check alongside the others.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
+
+### OpenRouter cost + shaping follow-ups (measured $4 GLM consult, 2026-07-03)
+First live `or-glm` consult (GLM-5 explorer / GLM-5.2 synth, 8 whole files attached):
+203 chat turns in 21 min, 18.2M cumulative input tokens (16.4M cache reads) for ~40K
+output. Pricing was honored; the driver **never delegated a single explore′ sweep** —
+every one of the 203 spans carried the consult-driver preamble (classified from the
+OTLP traces' `gen_ai.system_instructions`), so the synth opened all 8 attachments and
+every span itself, re-billing the growing prefix each turn at GLM's $0.18/M cache-read
+rate (50× DeepSeek-pro's $0.0036/M). The delegation failure is being addressed by the
+explorer-prompt/attachment work (in flight, separate session). Turn caps stay a
+*runaway backstop*, not a cost throttle — the synth may burn what the question needs;
+the cure for crawling is delegation.
+
+Shipped since (2026-07-03): **prompt caching on every OpenRouter arm**
+(`Arm::openrouter_completion_model` routes through rig's `with_prompt_caching`;
+unit-pinned in `engine.rs`, live round-trip green — Anthropic-upstream slots now get
+the `cache_control` breakpoint; implicit-caching upstreams accept and ignore it) and
+**measured reasoning accounting** (`tests/consult.rs::openrouter_reasoning_accounting_live`
+posts kaibo's exact shaped params with OpenRouter usage accounting on: effort=high
+billed 932 reasoning tokens, the structural `effort="none"` disable billed 0).
+Remaining OpenRouter-specific forks:
+- **Cache the transcript, not just the system prompt.** rig's breakpoint marks only
+  the system prompt, so an Anthropic-upstream slot's *growing transcript* still
+  re-bills at full input price every turn — the preamble is the only cached prefix.
+  Upstream rig gap; the fix wants a trailing-message breakpoint like rig's native
+  Anthropic path carries.
+- **Per-slot output ceilings vary by pinned slug** (`top_provider.max_completion_tokens`:
+  glm-5.2 32768, kimi-k2.7-code 16384, gpt-5.5 128000) and reasoning bills into the
+  same completion budget — the `[defaults]` 16384 starved a real GLM oneshot answer
+  mid-sentence. Per-slot `max_tokens` already exists; the gap is doctrine: set a synth
+  slot's ceiling from the catalog when pinning a slug, and watch 16384-capped reasoners
+  (kimi) for starvation.
+- **Provider routing variance — data policy shipped, the rest open.** One slug routes
+  to multiple upstream hosts differing in cache support, quantization, pricing, and
+  parameter fidelity. `provider.data_collection = "deny"` now rides every request by
+  default (backend `data_collection = "allow"` is the explicit opt-in; openrouter-kind
+  only, load error elsewhere). Still unexposed: `require_parameters` (a host that
+  silently drops the reasoning param defeats thinking-on-by-default), `order`/`only`/
+  `ignore`, and quantization filters. Belongs with the rig-OpenRouter exit-strategy
+  thinking.
+- **Spend visibility.** Traces already carry `gen_ai.usage.*` per turn (this incident
+  was diagnosed entirely from them); consider surfacing a per-call token/cost total in
+  the provenance footer or job result so the calling agent sees cost before the bill does.
 
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/
