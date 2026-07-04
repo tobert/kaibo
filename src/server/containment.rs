@@ -202,12 +202,22 @@ impl super::KaiboHandler {
                     })?;
                 workers.insert(tree.clone(), worker);
             }
-            let bytes = workers[&tree].read_file(canon.clone()).await.map_err(|e| {
-                McpError::invalid_params(
-                    format!("attachment {} could not be read: {e:#}", canon.display()),
-                    None,
-                )
-            })?;
+            // Cap the read one byte past the largest a single file may legally be — the
+            // greater of the two per-encoding caps `classify` enforces. The stat above
+            // fed the *batch* budget; this bounds the *per-file* read so a stat-then-read
+            // swap can't slurp a raced-huge file into memory. An over-cap file comes back
+            // truncated at cap+1 and `classify` refuses it loudly by length, exactly as it
+            // would refuse an honest over-cap file — same outcome, no OOM window.
+            let read_cap = DEFAULT_MAX_TEXT_BYTES.max(DEFAULT_MAX_IMAGE_BYTES) as u64 + 1;
+            let bytes = workers[&tree]
+                .read_file_capped(canon.clone(), read_cap)
+                .await
+                .map_err(|e| {
+                    McpError::invalid_params(
+                        format!("attachment {} could not be read: {e:#}", canon.display()),
+                        None,
+                    )
+                })?;
             // Label the attachment with the caller's path (what they typed), not the
             // canonical one — it's their reference and it's what the model should see.
             out.push(

@@ -361,6 +361,13 @@ the git log. Each later release appends a new section at the top.
   The VFS refuses to follow a symlink out of the allowed tree at read time, so a path
   swapped for an out-of-tree symlink *after* the check is rejected structurally rather
   than by racing a re-check — the boundary holds regardless of timing.
+- **A raced file-swap can't OOM the reader.** Every attachment/image read now carries a
+  byte ceiling into the read itself (via the VFS `read_range`, honoured with a real
+  `File::take` — no whole-file slurp), sized one byte past the caller's budget. A file
+  swapped to something enormous between kaibo's size check and the read stops at that
+  ceiling and is refused or demoted by length, where before an unbounded read could pull
+  the swapped file whole into memory. Closes the size-swap sibling of the symlink-swap
+  above — the timing window is bounded, not raced.
 - **Attachment wrappers can't be confused by their own contents.** Neither an attached
   file's *body* nor its *name* can forge the `<file>` wrapper boundary anymore. A body
   holding a `<file>`-tag lookalike — a `</file>` close, a stray opening `<file …>`, or a

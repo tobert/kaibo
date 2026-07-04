@@ -43,7 +43,7 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{ByteBudget, Filesystem, LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{
-    IgnoreConfig, Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig,
+    IgnoreConfig, Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig, ReadRange,
 };
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
@@ -208,11 +208,13 @@ pub fn build_readonly_kernel_with(
 /// That router is the *only* handle that reads a file's bytes directly: under
 /// `Kernel::with_backend` the kernel's own [`Kernel::vfs`] is just its internal
 /// `/v/*` scratch — our project mounts live on the backend's router, reachable only
-/// through execution (capped, text) or this handle. [`KaishWorker::read_file`]
-/// (for `view_image`) needs the raw bytes uncapped, so the worker keeps this router
-/// and reads through it. It's the *same* router execution uses, so a read stays
-/// governed by the read-only project mount and the `/` scratch — containment and
-/// read-only stay structural, identical to `run_kaish`.
+/// through execution (capped, text) or this handle. [`KaishWorker::read_file_capped`]
+/// (for `view_image` and attachments) needs the raw bytes *outside* the script-output
+/// cap — but not unbounded: it reads through this router with its own per-call byte
+/// ceiling (`read_range`'s `File::take`), so a stat-then-read swap can't slurp to OOM.
+/// It's the *same* router execution uses, so a read stays governed by the read-only
+/// project mount and the `/` scratch — containment and read-only stay structural,
+/// identical to `run_kaish`.
 fn build_readonly_kernel_and_vfs(
     root: impl Into<PathBuf>,
     sandbox: &SandboxConfig,
@@ -383,14 +385,21 @@ enum Job {
         script: String,
         reply: tokio::sync::oneshot::Sender<KaishOutput>,
     },
-    /// Read a file's bytes through the kernel's VFS, *bypassing* the script-output
-    /// cap (an image is megabytes; `cat | base64` through `run`'s capped stdout
-    /// would truncate it). Same VFS as every read, so containment and read-only stay
-    /// structural — an out-of-mount path routes to the empty `/` scratch and 404s.
-    /// Reply carries the bytes or a rendered error string (`io::Error` is not `Send`
-    /// across the boundary cleanly, and the caller only needs the message).
+    /// Read at most `limit` bytes of a file through the kernel's VFS, *bypassing* the
+    /// script-output cap (an image is megabytes; `cat | base64` through `run`'s capped
+    /// stdout would truncate it) but never unbounded: `limit` is a hard ceiling on the
+    /// bytes pulled into memory, so a file swapped between the caller's `stat` and this
+    /// read cannot slurp a giant file and OOM the process — the read stops at `limit`
+    /// and the caller detects the overflow by length (see [`KaishWorker::read_file`]).
+    /// It rides through `read_range`, which `LocalFs` honours with `File::take(limit)`
+    /// (no whole-file slurp-then-slice), so the ceiling is real, not cosmetic. Same VFS
+    /// as every read, so containment and read-only stay structural — an out-of-mount
+    /// path routes to the empty `/` scratch and 404s. Reply carries the bytes or a
+    /// rendered error string (`io::Error` is not `Send` across the boundary cleanly,
+    /// and the caller only needs the message).
     Read {
         path: PathBuf,
+        limit: u64,
         reply: tokio::sync::oneshot::Sender<std::result::Result<Vec<u8>, String>>,
     },
 }
@@ -455,16 +464,25 @@ impl KaishWorker {
                                 // Receiver gone (caller cancelled) is fine — drop it.
                                 let _ = reply.send(out);
                             }
-                            Job::Read { path, reply } => {
+                            Job::Read { path, limit, reply } => {
                                 // Read straight through the *project* VFS router on
                                 // this thread. The read-only mount governs what
                                 // resolves: under `root` → real bytes; anywhere else →
-                                // the empty `/` scratch → NotFound. No output cap
-                                // applies — that's a script-execution guard, not a VFS
-                                // one. (The kernel's own `vfs()` carries only its
-                                // internal `/v/*` scratch under `with_backend`, not
-                                // these mounts — hence the retained handle.)
-                                let out = project_vfs.read(&path).await.map_err(|e| format!("{e}"));
+                                // the empty `/` scratch → NotFound. The script-output
+                                // cap doesn't apply here (that's a run-execution guard),
+                                // so this path carries its OWN ceiling: a byte-ranged
+                                // read of `[0, limit)`. `LocalFs::read_range` honours it
+                                // with `File::take(limit)`, so a raced swap to a huge
+                                // file stops at `limit` instead of slurping to OOM — the
+                                // caller sizes `limit` one byte past its budget and
+                                // detects the overflow by the returned length. (The
+                                // kernel's own `vfs()` carries only its internal `/v/*`
+                                // scratch under `with_backend`, not these mounts — hence
+                                // the retained handle.)
+                                let out = project_vfs
+                                    .read_range(&path, Some(ReadRange::bytes(0, limit)))
+                                    .await
+                                    .map_err(|e| format!("{e}"));
                                 let _ = reply.send(out);
                             }
                         }
@@ -493,22 +511,41 @@ impl KaishWorker {
             .map_err(|_| anyhow::anyhow!("kaish worker dropped the reply"))
     }
 
-    /// Read a file's raw bytes through the kernel's VFS. The returned future is
-    /// `Send`. This is the read path for binary content (`view_image`): it bypasses
+    /// Read up to `max_bytes` of a file's raw bytes through the kernel's VFS — never
+    /// more, even if the file is larger. The returned future is `Send`. This is the
+    /// read path for binary/whole-file content (`view_image`, attachments): it bypasses
     /// the script-output cap (which exists to keep a wide `cat` from flooding the
     /// model's context, not to bound a deliberate single-file read) while keeping the
     /// *same* read-only mount as every other read — so containment and read-only stay
     /// structural. A path that resolves outside the project mount lands in the empty
     /// `/` scratch and comes back `NotFound`.
     ///
+    /// **Why the cap is a parameter, not "read it all".** Every caller stats the file
+    /// first and reads only what fits its budget, but stat-then-read is a TOCTOU: a
+    /// file swapped to something enormous in that window would otherwise be slurped
+    /// whole into memory (OOM) before the caller's post-read size check could refuse
+    /// it. Passing the ceiling *down into the read* closes that window — the read stops
+    /// at `max_bytes`, never the swapped size. There is deliberately no uncapped read
+    /// method: an unbounded read of caller-swappable bytes is a footgun with no user.
+    ///
+    /// The convention every caller shares: pass `budget + 1` as `max_bytes`, then treat
+    /// a returned length `> budget` as "the file overflowed my budget" — refuse or
+    /// demote it. A returned length `<= budget` is the whole file, read intact. (The
+    /// `+ 1` is what distinguishes a file exactly at the budget from one past it.)
+    ///
     /// `path` should be absolute and already inside the workspace; the caller
-    /// (`view_image`) canonicalizes and boundary-checks host-side first so it can
-    /// give an actionable out-of-workspace error before ever reaching here.
-    pub async fn read_file(&self, path: impl Into<PathBuf>) -> Result<Vec<u8>> {
+    /// canonicalizes and boundary-checks host-side first so it can give an actionable
+    /// out-of-workspace error before ever reaching here.
+    pub async fn read_file_capped(
+        &self,
+        path: impl Into<PathBuf>,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.jobs
             .send(Job::Read {
                 path: path.into(),
+                limit: max_bytes,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("kaish worker thread is gone"))?;

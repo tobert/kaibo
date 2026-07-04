@@ -70,6 +70,60 @@ async fn worker_refuses_to_lossy_decode_binary_output() {
     );
 }
 
+/// The read path carries its own byte ceiling so a file swapped to something enormous
+/// between a caller's `stat` and the read can't be slurped whole into memory (OOM).
+/// Teeth: the file is 10× the cap, so an unbounded read (the old `project_vfs.read`)
+/// would return all 4096 bytes and fail the `== cap` assertion — only a real
+/// `read_range`/`File::take` ceiling returns exactly `cap`. The over-cap read must still
+/// stop at the ceiling *and* signal overflow: the caller convention is `budget + 1`, and
+/// a returned length past `budget` is the refuse/demote trigger.
+#[tokio::test]
+async fn read_file_capped_bounds_the_bytes_pulled() {
+    let dir = tempdir().unwrap();
+    let cap: u64 = 400;
+    fs::write(dir.path().join("big.bin"), vec![0xABu8; 4096]).unwrap();
+
+    let worker = KaishWorker::spawn(dir.path()).unwrap();
+    let big = dir.path().join("big.bin");
+
+    // A file far larger than the cap comes back truncated *at* the cap — never the
+    // whole 4096 bytes. This is the OOM guard: the read stops at `cap`.
+    let bytes = worker.read_file_capped(&big, cap).await.unwrap();
+    assert_eq!(
+        bytes.len() as u64,
+        cap,
+        "an over-cap file must read exactly `cap` bytes, not the whole file"
+    );
+
+    // The `budget + 1` convention: reading `budget + 1` past a `budget`-sized budget
+    // yields `budget + 1` bytes for an over-budget file, and the caller reads
+    // `len > budget` as overflow.
+    let budget: u64 = 400;
+    let probed = worker.read_file_capped(&big, budget + 1).await.unwrap();
+    assert!(
+        probed.len() as u64 > budget,
+        "a file past the budget must return more than `budget` bytes so the caller can refuse it"
+    );
+}
+
+/// A file at or under the cap reads whole — the ceiling only ever bounds an oversize
+/// read, it never truncates a legitimate one. Guards against a cap that clips honest
+/// files (the everyday attachment/image case).
+#[tokio::test]
+async fn read_file_capped_reads_small_files_whole() {
+    let dir = tempdir().unwrap();
+    let body = b"kai the crab\n";
+    fs::write(dir.path().join("small.txt"), body).unwrap();
+
+    let worker = KaishWorker::spawn(dir.path()).unwrap();
+    // Cap far larger than the file: the whole file comes back, byte for byte.
+    let bytes = worker
+        .read_file_capped(dir.path().join("small.txt"), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(bytes, body, "an under-cap file must read whole and intact");
+}
+
 #[tokio::test]
 async fn worker_denies_writes_to_real_files() {
     let dir = tempdir().unwrap();

@@ -116,6 +116,16 @@ pub fn check_attachment_bounds(
 /// `if x < y` reads truer than `if x &lt; y`. The backslash form leaves the body legible
 /// while removing the tag (`<\/file>` is no longer matched as a tag), so the only bare
 /// `<file>`/`</file>` left in the wrapper is kaibo's own.
+///
+/// A note to the next reviewer, because a cross-family pass mis-flagged this as a
+/// *critical* breakout: the wrapper's own delimiters (in [`Attachment::wrapped_text`])
+/// are the **bare** `<file …>` / `</file>` — there is no backslash in them. The
+/// backslash form `<\/file>` is *only ever this function's neutralized output*. So a
+/// body already containing a literal `<\/file>` is not a breakout — it is byte-identical
+/// to what we'd emit for a defanged tag, i.e. already safe, and the regex rightly leaves
+/// it alone. Breaking out would require a *bare* `</file>` to survive into the body; that
+/// is exactly what the regex rewrites, and what the wrapper-count assertions in
+/// `file_tag_lookalikes_in_body_are_all_escaped` verify with a literal (non-regex) scan.
 fn escape_file_body(body: &str) -> String {
     static FILE_TAG: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").expect("static file-tag regex compiles")
@@ -472,14 +482,31 @@ mod tests {
             .strip_prefix("<file path=\"evil.md\">\n")
             .and_then(|s| s.strip_suffix("\n</file>"))
             .expect("wrapper brackets the body");
-        let tag = Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").unwrap();
+        // Teeth for the escape itself, one assertion per dimension: each injected
+        // lookalike must appear in the body in its *escaped* form (`<` → `<\`). We assert
+        // the escaped literal is *present* rather than that the impl's own regex no
+        // longer matches `inner` — the latter is a tautology, and two cross-family
+        // reviews (2026-07-03 and 2026-07-04) flagged the earlier `!tag.is_match(inner)`
+        // for exactly that: `replace_all` removes every match by construction, so a regex
+        // that stopped catching `< / FILE >` would leave it unescaped *and* fail to match
+        // it, and the assertion would pass blind. Checking the escaped literal fails loud
+        // if any dimension regresses — the close form, the *opening* form, and the
+        // whitespace+case variant that proves the `(?i)` and `\s*` handling.
         assert!(
-            !tag.is_match(inner),
-            "no bare <file>-tag lookalike survives in the body: {inner}"
+            inner.contains(r"<\/file>"),
+            "the bare close lookalike is escaped: {inner}"
         );
-        // Independent of the escape regex (so this isn't circular with the impl): on
-        // the FULL wrapped output, the only literal open/close tags are the wrapper's
-        // own — exactly one each (Gemini cross-family review, 2026-07-03).
+        assert!(
+            inner.contains(r#"<\file path="x">"#),
+            "the opening lookalike is escaped: {inner}"
+        );
+        assert!(
+            inner.contains(r"<\ / FILE >"),
+            "the whitespace+case variant is escaped (proves (?i) and \\s* tolerance): {inner}"
+        );
+        // And on the FULL wrapped output, the only literal open/close tags left are the
+        // wrapper's own — exactly one each. A bare delimiter that slipped the escape
+        // would push a count to 2.
         assert_eq!(
             wrapped.matches("<file path=").count(),
             1,
