@@ -249,10 +249,19 @@ even for a one-line doc fix.
   `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
   re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
   `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
-- **kaish pin.** Currently `kaish-kernel = "0.10.0"`. The bump from `0.9.0` was
-  API-compatible — no kaibo call sites changed, identical builtin/tool set; under the
-  hood kaish gained bignum arithmetic (`num-bigint`) and a new regex engine
-  (`regex-bites`). Offline suite green (462 tests), boundary tests still have teeth.
-  The prior `0.8.4 → 0.9.0` step had renamed the `mcp()` config constructors
-  (`IgnoreConfig`/`OutputLimitConfig`/`KernelConfig`) to `agent()` in `sandbox.rs`.
-  Keep this current per the **Working here** kaish-bump discipline before cutting.
+- **kaish pin.** Currently `kaish-kernel = "0.11.0"`. The `0.10.0 → 0.11.0` bump was
+  API-compatible — **zero** kaibo call sites changed. It looks scary in the kaish
+  changelog (four **BREAKING** entries) but none reach kaibo: the new `ToolSchema.raw_argv`
+  and `ExecResult.latch` fields are additive (kaibo builds both via constructors, never
+  struct literals), the `kaish-help` `Fragment` `rank` field only bites code that
+  constructs `Fragment` literals (kaibo doesn't), the latched-`--json` envelope change
+  never fires (kaibo is read-only, so no destructive op ever latches), and the
+  scatter/gather + sed-BRE changes are runtime behavior kaibo has no hand-rolled docs for.
+  The whole agent-facing surface (native collections, `keys`/`values`/`typeof`, the `test`
+  builtin, `help regex`/`help collections`, JSON/JSONL bridges, importance-ranked
+  onboarding) flows in *for free* because kaibo single-sources it from `kaish_kernel::help`
+  — the bump updates the sourced text, no kaibo edits. Under the hood chumsky migrated
+  `1.0.0-alpha.8 → 0.13` (two stale regex crates dropped). Offline suite green (525 tests),
+  boundary tests still have teeth. Precedent that a bump *can* move call sites: `0.8.4 →
+  0.9.0` renamed the `mcp()` config constructors to `agent()` in `sandbox.rs`. Keep this
+  current per the **Working here** kaish-bump discipline before cutting.
