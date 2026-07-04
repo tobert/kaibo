@@ -304,6 +304,19 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- **The read-only shell under `consult` / `explore` / `run_kaish` speaks kaish 0.11.**
+  Native collections land in the toolbox the models drive: list/record literals
+  (`xs=[a b c]`, `{port: 8080}`), typed subscripts and slices (`${xs[0]}`, `${r[key]}`,
+  `${xs[0:2]}`), `keys` / `values` / `typeof` and `[[ -list ]]` / `[[ -record ]]` shape
+  guards, and typed membership (`[[ 443 in ${servers[web]} ]]`). A real `test` builtin
+  evaluates POSIX conditions *through the VFS* — where kaibo's no-subprocess sandbox
+  used to leave the old `/usr/bin/test` shell-out dead, `test -f path` now works.
+  `fromjson` / `tojson` / `fromjsonl` / `tojsonl` bridge JSON and JSONL, `jq -s` is real
+  slurp, and redirects work inside `$(...)`. The always-on onboarding now leads with its
+  most critical rules and points enumeration at `$(keys …)` / `$(values …)`; `help regex`
+  and `help collections` are new one-screen references. All of it arrives through kaibo's
+  single-sourced kaish guidance — no new resident cost.
+
 - **Models read files WHOLE by default, and a truncated giant stages into targeted
   reads.** The explorer, the `consult` driver, and the shared kaish cheatsheet all
   lead with whole-file reads: `cat -n FILE` is the stated first move on any file that
