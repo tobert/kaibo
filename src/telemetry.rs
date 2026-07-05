@@ -54,6 +54,10 @@ impl OtelGuard {
     }
 }
 
+/// The boxed tracing layer paired with the guard that flushes it on shutdown —
+/// what [`init`] returns once telemetry is enabled.
+type OtelLayer<S> = (Box<dyn Layer<S> + Send + Sync>, OtelGuard);
+
 /// Build the OTLP exporter and the tracing layer that feeds it, from config.
 ///
 /// Returns `Ok(None)` when telemetry is disabled — the caller adds nothing to the
@@ -61,9 +65,7 @@ impl OtelGuard {
 /// an [`OtelGuard`] the caller must hold until after the server loop and then
 /// [`shutdown`](OtelGuard::shutdown). Generic over the subscriber so the layer can
 /// be boxed against `main`'s concrete registry type.
-pub fn init<S>(
-    cfg: &TelemetryConfig,
-) -> Result<Option<(Box<dyn Layer<S> + Send + Sync>, OtelGuard)>>
+pub fn init<S>(cfg: &TelemetryConfig) -> Result<Option<OtelLayer<S>>>
 where
     S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
 {

@@ -1,0 +1,58 @@
+# The offline test suite, clippy as errors, and the rustls+ring TLS-invariant guard —
+# the fast correctness gate that runs on every pull request and every push to main.
+# release.yml is the cross-platform build/smoke story (tagged releases); this is quick
+# feedback on every change so nothing lands with a red suite, a new lint, or a C
+# crypto/TLS dependency that snuck back into the tree.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # stable branch, pinned 2026-07-05
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # TLS is rustls + ring, never a C crypto/TLS stack (see AGENTS.md's TLS
+      # invariant / src/tls.rs) — that's what lets the release builds link fully
+      # static. A stray reqwest/rig feature flag (or a dependency bump) can silently
+      # re-pull aws-lc or OpenSSL; this step is the tripwire. `cargo tree -i` on a
+      # package that isn't in the tree doesn't reliably exit non-zero, so the
+      # assertion is on the error text itself — "did not match any packages" IS the
+      # passing case here, not a failure to shrug off with `|| true`.
+      - name: TLS invariant (no C crypto/TLS in the tree)
+        shell: bash
+        run: |
+          for pkg in aws-lc-rs aws-lc-sys openssl-sys native-tls; do
+            out=$(cargo tree -i "$pkg" 2>&1 || true)
+            if ! grep -q "did not match any packages" <<<"$out"; then
+              echo "TLS invariant violated: $pkg is present in the dependency tree"
+              echo "$out"
+              exit 1
+            fi
+          done
