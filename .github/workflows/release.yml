@@ -63,11 +63,17 @@ jobs:
 
       # cargo-zigbuild + zig only for the musl cross-builds; native targets use plain
       # cargo (no zig needed) so we don't pay for it on macOS/Windows.
-      - name: Install cargo-zigbuild + zig
+      - name: Install zig
         if: endsWith(matrix.target, '-linux-musl')
-        run: |
-          pip install ziglang
-          cargo install --locked cargo-zigbuild
+        run: python3 -m pip install ziglang
+
+      # Prebuilt binary, not `cargo install` from source — that compiled from scratch
+      # on every run and made the arm64 leg's cold start painfully slow.
+      - name: Install cargo-zigbuild
+        if: endsWith(matrix.target, '-linux-musl')
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: cargo-zigbuild
 
       - name: Build (musl, static)
         if: endsWith(matrix.target, '-linux-musl')
@@ -104,21 +110,33 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
           bin="target/${{ matrix.target }}/release/kaibo"
           dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" README.md LICENSE "$dist"/ 2>/dev/null || cp "$bin" "$dist"/
-          tar czf "$dist.tar.gz" "$dist"
+          # macOS's bundled tar is bsdtar, which lacks --sort/--mtime; GitHub's macOS
+          # runners also ship GNU tar as `gtar`, so prefer that for a byte-stable archive.
+          tar=$(command -v gtar || command -v tar)
+          "$tar" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" -cf - "$dist" | gzip -n > "$dist.tar.gz"
           sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
           bin="target/${{ matrix.target }}/release/kaibo.exe"
           dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" "$dist"/
+          # Fix mtimes before zipping so the archive is byte-stable for this commit —
+          # including the directory itself (7z stores the dir entry's mtime too).
+          # Entry ORDER is the other determinism axis: 7z enumerates the filesystem
+          # (no --sort=name equivalent), which is only guaranteed stable here because
+          # the archive holds a single file. If this zip ever gains more files, feed
+          # 7z an explicitly sorted list.
+          touch -d "@$SOURCE_DATE_EPOCH" "$dist" "$dist"/*
           7z a "$dist.zip" "$dist" >/dev/null
           sha256sum "$dist.zip" > "$dist.zip.sha256"
 

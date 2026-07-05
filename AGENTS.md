@@ -119,8 +119,9 @@ project and cannot run external commands.
 
 kaibo ships as a single static-ish binary per platform, built by
 `.github/workflows/release.yml` on a `v*` tag (also `workflow_dispatch` to smoke the
-matrix). This is feasible *because* the TLS invariant above keeps the tree C-free:
-no aws-lc, no OpenSSL.
+matrix). This is feasible *because* the TLS invariant above keeps the tree free of
+cmake/autotools C (no aws-lc, no OpenSSL) — ring's small C/asm compiles with zig or
+the platform cc alone.
 
 - **Linux → fully static** via `x86_64`/`aarch64-unknown-linux-musl`, built with
   `cargo zigbuild` (zig is the cross C compiler/linker for ring's small C/asm). The
