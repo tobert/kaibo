@@ -380,8 +380,10 @@ pub(super) fn with_provenance(
 /// field can't quietly slip past this guard. We distinguish "cost this much" from
 /// "the backend told us nothing" rather than printing a misleading `0 in · 0 out`.
 /// Input and output always show; the cache splits and reasoning ride along only when
-/// non-zero, so the common (uncached, no-thinking-report) line stays lean.
-fn fmt_usage(usage: &Usage) -> Option<String> {
+/// non-zero, so the common (uncached, no-thinking-report) line stays lean. Shared by
+/// the answer footer ([`with_provenance`]) and the deliberate batch ack, which folds
+/// the synchronous dossier-build cost into its message.
+pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
     if *usage == Usage::new() {
         return None;
     }

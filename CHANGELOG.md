@@ -308,9 +308,11 @@ the git log. Each later release appends a new section at the top.
   loop *and* every delegated explorer sweep; the cache-read / cache-write / reasoning
   splits ride along only when a provider reports them, so the common line stays lean.
   When a backend reports no usage at all the line is simply omitted rather than
-  printing a misleading `0 in · 0 out`. (Counts are exact on the normal path; the rare
-  turn-cap and image-resume paths undercount, since the underlying loop yields no usage
-  on those exits — noted in `docs/issues.md`.)
+  printing a misleading `0 in · 0 out`. The batch `deliberate` lane, whose synth cost
+  lands later on the provider's result, notes the synchronous dossier-build cost in its
+  submit acknowledgement. (Counts are exact on the normal path; the rare turn-cap and
+  image-resume paths undercount, since the underlying loop yields no usage on those
+  exits — noted in `docs/issues.md`.)
 
 ### Changed
 
