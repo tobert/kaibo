@@ -1672,6 +1672,11 @@ struct RawContext {
     /// Absolute/tilde files read unconditionally (missing = error). Env:
     /// `KAIBO_USER_FILES` (colon-separated). Default: empty.
     user_files: Option<Vec<String>>,
+    /// Inline the sections with `cat -n`-style line numbers. Default: false —
+    /// house rules are guidance, not source; a model that needs to cite one
+    /// precisely re-reads it through the shell. File-only knob (no env/CLI),
+    /// like `[prompts]`.
+    numbered: Option<bool>,
 }
 
 /// The `[prompts]` stanza — per-phase system-prompt (preamble) overrides. Each
@@ -1816,9 +1821,9 @@ impl RawBackend {
                     b.kind
                 );
             }
-            b.data_collection = v.parse().with_context(|| {
-                format!("backend {:?} data_collection", b.name)
-            })?;
+            b.data_collection = v
+                .parse()
+                .with_context(|| format!("backend {:?} data_collection", b.name))?;
         }
         Ok(())
     }
@@ -2047,6 +2052,7 @@ fn merge_context(raw: RawContext) -> anyhow::Result<ContextConfig> {
             .iter()
             .map(|s| expand_path(s))
             .collect::<anyhow::Result<Vec<_>>>()?,
+        numbered: raw.numbered.unwrap_or(false),
     })
 }
 
@@ -2492,7 +2498,11 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
                     // give — and so both reference forms agree on what a name is. (The
                     // braced form *is* an explicit expansion request, so a bad name is an
                     // error here, unlike a bare `$1` which is simply not a reference.)
-                    let ok = if name.is_empty() { is_start(nc) } else { is_continue(nc) };
+                    let ok = if name.is_empty() {
+                        is_start(nc)
+                    } else {
+                        is_continue(nc)
+                    };
                     if !ok {
                         bail!(
                             "path {s:?} has an invalid character {nc:?} in a ${{...}} \
@@ -2605,19 +2615,19 @@ mod tests {
         );
 
         for bad in [
-            format!("${unset}"),       // bare form, undefined
-            format!("${{{unset}}}"),   // braced form, undefined
+            format!("${unset}"),     // bare form, undefined
+            format!("${{{unset}}}"), // braced form, undefined
             "${UNTERMINATED".to_string(),
             "${}".to_string(),
             // The braced form is an explicit expansion request, so an invalid name is a
             // loud parse error (not the misleading "not set" the env lookup would give).
-            "${1bad}".to_string(),     // can't start with a digit
-            "${A/B}".to_string(),      // `/` is not a name char
+            "${1bad}".to_string(), // can't start with a digit
+            "${A/B}".to_string(),  // `/` is not a name char
             // A stray `$` that begins no reference is a typo in a boundary path, refused
             // rather than kept as a silent literal. Write `$$` for a real literal `$`.
-            "/a/$ b".to_string(),      // `$` followed by a space
-            "/cost/$100".to_string(),  // `$` followed by a digit
-            "trailing$".to_string(),   // `$` at end of string
+            "/a/$ b".to_string(),     // `$` followed by a space
+            "/cost/$100".to_string(), // `$` followed by a digit
+            "trailing$".to_string(),  // `$` at end of string
         ] {
             assert!(
                 expand_env_vars(&bad).is_err(),

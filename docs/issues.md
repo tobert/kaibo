@@ -271,6 +271,18 @@ real config before adding the knob. Project-local `.kaibo.toml` layering (alread
 noted under "File location") would let a repo ship its own `[context]` without a
 global edit.
 
+### Provenance footer credits the explorer even when no sweep ran
+`consult`'s footer names both arms from cast *composition* (`server/mod.rs` —
+`("explorer", &explorer.model)` unconditionally at the `with_provenance` call), not
+from what answered: a narrow zorak consult (2026-07-05) delegated zero sweeps yet
+footed `explorer gemma4-e4b`, and the $4 or-glm consult (203 driver turns, zero
+sweeps) likewise. The handler already holds the evidence — `out.report` empty ⇒ no
+delegation (`include_report`'s own doc says so) — so name the explorer only when a
+sweep contributed. Cross-model studies read the footer as "which models answered
+this"; keep it honest. Delegation itself is not broken: a broad job-lane survey
+(same cast, same day) delegated an e4b sweep 15 s into the loop — a narrow question
+handled by the driver reading directly is the designed behavior, not a failure.
+
 ### Multi-turn session history is unbounded per session
 `SessionStore` (`session.rs`) caps the number of *sessions* (LRU, `session_capacity`)
 but keeps every `(question, answer)` pair in a session forever — matching dpal, which

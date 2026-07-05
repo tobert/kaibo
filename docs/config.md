@@ -510,6 +510,13 @@ project_files = ["AGENTS.md", "docs/CONVENTIONS.md"]
 # Absolute/tilde paths, read UNCONDITIONALLY (a missing one is a startup-visible
 # error — you declared it, so kaibo won't silently drop it). Default: none.
 user_files = ["~/.claude/CLAUDE.md"]
+
+# Inline the sections with cat -n-style line numbers (the form attachments take).
+# Default false: house rules are guidance, not source — the preamble tells the
+# model to re-read a guidance file through the shell if it needs to cite one
+# precisely, so the numbers would be clutter on prose. Opt in when your context
+# files are the kind a consult should cite by file:line directly.
+numbered = false
 ```
 
 Two lists, two deliberately different failure semantics:

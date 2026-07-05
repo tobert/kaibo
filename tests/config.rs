@@ -1444,12 +1444,28 @@ fn a_non_numeric_telemetry_timeout_is_a_loud_error() {
 // --- [context] house-rules files ----------------------------------------------
 
 /// With no `[context]` table, kaibo reads `AGENTS.md` by default (vendor-neutral,
-/// opt-out) and no user files — the behavior an operator gets for free.
+/// opt-out) and no user files — the behavior an operator gets for free. Sections
+/// splice as plain prose by default (house rules are guidance, not source).
 #[test]
 fn context_defaults_to_agents_md_only() {
     let c = Config::builtin();
     assert_eq!(c.context.project_files, vec!["AGENTS.md".to_string()]);
     assert!(c.context.user_files.is_empty());
+    assert!(!c.context.numbered, "numbering is opt-in");
+}
+
+/// `numbered = true` opts the spliced sections into `cat -n`-style line numbers,
+/// for operators whose context files are the kind a consult cites by `file:line`.
+#[test]
+fn context_numbered_is_an_opt_in_knob() {
+    let c = Config::from_toml_str(
+        r#"
+        [context]
+        numbered = true
+        "#,
+    )
+    .unwrap();
+    assert!(c.context.numbered);
 }
 
 /// An explicit `[context]` table replaces both lists — including the canonical
@@ -1679,4 +1695,3 @@ fn a_zero_orientation_ceiling_is_a_loud_error() {
         "names the knob: {err:#}"
     );
 }
-

@@ -424,10 +424,14 @@ synth    = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 #     error). Read in trusted server-side Rust; only the CONTENTS reach the model,
 #     never the path, so the read-only shell's scope is not widened. Env
 #     KAIBO_USER_FILES / CLI --user-context-file.
+#   numbered — inline the sections with cat -n-style line numbers (default false:
+#     house rules are guidance, not source, and a model that needs to cite one
+#     precisely re-reads it through the shell). File-only knob, like [prompts].
 #
 # [context]
 # project_files = ["AGENTS.md"]
 # user_files    = ["~/.claude/CLAUDE.md"]
+# numbered      = false
 
 # ---------------------------------------------------------------------------
 # [prompts] — per-PHASE system-prompt overrides. Where [context] ADDS project

@@ -357,6 +357,17 @@ the git log. Each later release appends a new section at the top.
   against the canonical names kaibo advertises. The default is now resolved before
   comparison, so the right cast is flagged however you named it.
 
+- **Models are steered away from inventing line numbers for the house-rules
+  context.** Observed live (2026-07-05): a local explorer answered by quoting the
+  inlined `AGENTS.md` verbatim under made-up line numbers — an answer that *looked*
+  grounded but wasn't checkable. The house-rules framing now tells the model to
+  ground every `file:line` it cites in a file it read through the shell, including
+  a guidance file it wants to cite precisely. For operators whose context files
+  *are* the kind a consult should cite directly, a new `[context] numbered = true`
+  knob inlines the sections with `cat -n`-style line numbers (the same form
+  attachments take); the default stays plain prose — house rules are guidance,
+  not source.
+
 ### Security
 
 - **Read-only is structural, not best-effort.** kaibo compiles in only kaish's

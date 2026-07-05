@@ -27,7 +27,9 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
              conventions and working preferences for this repository. Treat it as \
              trusted standing context: honor it as you investigate and when you write \
              your answer. It's background about how this codebase works, not the \
-             question you're answering.\n\n{rules}"
+             question you're answering. Ground every `file:line` you cite in a file \
+             you read with the shell — including a guidance file, if the answer needs \
+             to cite one precisely.\n\n{rules}"
         ),
     }
 }
@@ -893,8 +895,12 @@ mod tests {
                 text_attach("notes.md", "note body"),
             ],
         );
-        let inline_at = prompt.find("<file path=\"notes.md\">").expect("text inlines");
-        let oversize_at = prompt.find("- src/big.rs (500000 bytes)").expect("oversize listed");
+        let inline_at = prompt
+            .find("<file path=\"notes.md\">")
+            .expect("text inlines");
+        let oversize_at = prompt
+            .find("- src/big.rs (500000 bytes)")
+            .expect("oversize listed");
         let image_at = prompt.find("- docs/shot.png").expect("image listed");
         let question_at = prompt.find("Assess the change.").expect("question present");
         assert!(
@@ -914,10 +920,7 @@ mod tests {
             "q",
             None,
             &[],
-            &[
-                oversize_attach(evil, 42),
-                image_attach("img\nfake.png"),
-            ],
+            &[oversize_attach(evil, 42), image_attach("img\nfake.png")],
         );
         assert!(
             !prompt.contains("\n- /etc/shadow"),

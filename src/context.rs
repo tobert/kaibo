@@ -41,6 +41,13 @@ pub struct ContextConfig {
     /// Absolute files (`$VAR`/`~` already expanded) read unconditionally — a missing
     /// one is an error, since the operator declared it. Default empty.
     pub user_files: Vec<PathBuf>,
+    /// Inline the sections with `cat -n`-style line numbers (default **false**).
+    /// House rules are *guidance*, so by default they splice as plain prose — the
+    /// numbers would be citation bait on content that isn't source, and a model
+    /// that needs to cite a guidance file precisely re-reads it through the shell
+    /// (the preamble framing says so). Opt in when your context files are the kind
+    /// a consult should cite by `file:line` directly.
+    pub numbered: bool,
 }
 
 impl ContextConfig {
@@ -83,7 +90,7 @@ impl ContextConfig {
                 }
                 let body = std::fs::read_to_string(&canon)
                     .with_context(|| format!("reading project context file {}", canon.display()))?;
-                sections.push(section(&format!("project: {name}"), &body));
+                sections.push(section(&format!("project: {name}"), &body, self.numbered));
             }
         }
 
@@ -98,7 +105,11 @@ impl ContextConfig {
                     path.display()
                 )
             })?;
-            sections.push(section(&format!("user: {}", path.display()), &body));
+            sections.push(section(
+                &format!("user: {}", path.display()),
+                &body,
+                self.numbered,
+            ));
         }
 
         if sections.is_empty() {
@@ -110,9 +121,21 @@ impl ContextConfig {
 }
 
 /// One provenance-headed section. Trailing whitespace trimmed so concatenation
-/// stays tidy; the header names where the bytes came from.
-fn section(provenance: &str, body: &str) -> String {
-    format!("### {provenance}\n\n{}", body.trim_end())
+/// stays tidy; the header names where the bytes came from. With `numbered`, the
+/// body carries `cat -n`-style line numbers ([`crate::attach::number_lines`], the
+/// same form attachments are inlined in) — trimming only drops trailing
+/// whitespace, never interior newlines, so the numbers keep matching the on-disk
+/// file. Plain (the default) splices the prose verbatim; the preamble framing
+/// steers a model that wants to cite a guidance file to re-read it through the
+/// shell (a local explorer once quoted an inlined AGENTS.md under invented line
+/// numbers, 2026-07-05).
+fn section(provenance: &str, body: &str, numbered: bool) -> String {
+    let body = body.trim_end();
+    if numbered {
+        format!("### {provenance}\n\n{}", crate::attach::number_lines(body))
+    } else {
+        format!("### {provenance}\n\n{body}")
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +160,7 @@ mod tests {
         let ctx = ContextConfig {
             project_files: vec!["AGENTS.md".into()],
             user_files: vec![],
+            numbered: false,
         };
         let out = ctx.assemble(dir.path()).unwrap().expect("some context");
         assert!(
@@ -153,6 +177,7 @@ mod tests {
         let ctx = ContextConfig {
             project_files: vec!["AGENTS.md".into()],
             user_files: vec![],
+            numbered: false,
         };
         // No AGENTS.md on disk: assembles cleanly to None.
         assert_eq!(ctx.assemble(dir.path()).unwrap(), None);
@@ -166,6 +191,7 @@ mod tests {
         let ctx = ContextConfig {
             project_files: vec![],
             user_files: vec![dir.path().join("nope-not-here.md")],
+            numbered: false,
         };
         let err = ctx.assemble(dir.path()).unwrap_err();
         let msg = format!("{err:#}");
@@ -181,6 +207,7 @@ mod tests {
         let ctx = ContextConfig {
             project_files: vec![],
             user_files: vec![user.clone()],
+            numbered: false,
         };
         let out = ctx.assemble(dir.path()).unwrap().expect("some context");
         assert!(out.contains("### user:"), "header missing: {out}");
@@ -201,6 +228,7 @@ mod tests {
         let ctx = ContextConfig {
             project_files: vec!["../secret.md".into()],
             user_files: vec![],
+            numbered: false,
         };
         let err = ctx.assemble(&root).unwrap_err();
         let msg = format!("{err:#}");
@@ -209,6 +237,55 @@ mod tests {
             "wrong error: {msg}"
         );
         assert!(!msg.contains("exfiltrate me"), "leaked the body: {msg}");
+    }
+
+    /// By default the sections splice as plain prose — house rules are guidance,
+    /// not source, and line numbers on them would be citation bait (a model that
+    /// needs to cite a guidance file precisely re-reads it through the shell).
+    #[test]
+    fn sections_are_plain_prose_by_default() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "first rule\nsecond rule\n").unwrap();
+        let ctx = ContextConfig {
+            project_files: vec!["AGENTS.md".into()],
+            user_files: vec![],
+            numbered: false,
+        };
+        let out = ctx.assemble(dir.path()).unwrap().expect("some context");
+        assert!(
+            out.contains("first rule\nsecond rule"),
+            "body should be verbatim prose: {out}"
+        );
+        assert!(
+            !out.contains('\t'),
+            "no cat -n gutter unless `numbered` opts in: {out}"
+        );
+    }
+
+    /// `numbered = true` opts the sections into `cat -n`-style line numbers — for
+    /// operators whose context files are the kind a consult cites by `file:line`.
+    /// Observed live 2026-07-05 (why the knob exists at all): a local explorer
+    /// quoted the un-numbered inlined AGENTS.md verbatim under invented numbers.
+    #[test]
+    fn numbered_opts_sections_into_cat_n_style() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "first rule\nsecond rule\n").unwrap();
+        let user = dir.path().join("user.md");
+        fs::write(&user, "user rule\n").unwrap();
+        let ctx = ContextConfig {
+            project_files: vec!["AGENTS.md".into()],
+            user_files: vec![user],
+            numbered: true,
+        };
+        let out = ctx.assemble(dir.path()).unwrap().expect("some context");
+        assert!(
+            out.contains("     1\tfirst rule") && out.contains("     2\tsecond rule"),
+            "project section lines not numbered cat -n style: {out}"
+        );
+        assert!(
+            out.contains("     1\tuser rule"),
+            "user section lines not numbered cat -n style: {out}"
+        );
     }
 
     /// Project then user, in configured order, both present — sections concatenate
@@ -222,6 +299,7 @@ mod tests {
         let ctx = ContextConfig {
             project_files: vec!["AGENTS.md".into()],
             user_files: vec![user],
+            numbered: false,
         };
         let out = ctx.assemble(dir.path()).unwrap().unwrap();
         let proj = out.find("project rule").unwrap();

@@ -167,8 +167,9 @@ pub(crate) fn escape_attr_value(s: &str) -> String {
 /// then the line verbatim (a final newline numbers no phantom tail). Inlined text rides
 /// every prompt in this form so a model can cite an attachment by `file:line` exactly as
 /// accurately as a span it read with `cat -n` in the shell — accurate citations are the
-/// product, and un-numbered bytes invite guessed line numbers.
-fn number_lines(body: &str) -> String {
+/// product, and un-numbered bytes invite guessed line numbers. The one source of truth
+/// for the form: `context.rs` numbers its `[context]` house-rules sections with it too.
+pub(crate) fn number_lines(body: &str) -> String {
     let mut out = String::with_capacity(body.len() + (body.len() >> 4));
     for (i, line) in body.split_inclusive('\n').enumerate() {
         out.push_str(&format!("{:>6}\t{line}", i + 1));
