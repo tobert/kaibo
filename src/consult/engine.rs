@@ -15,7 +15,7 @@ use rig_core::completion::message::{
     AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
     UserContent,
 };
-use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition};
+use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
 use rig_core::tool::{Tool, ToolDyn};
 use rig_core::OneOrMany;
@@ -44,6 +44,12 @@ use super::shaping::{ModelCaps, ModelShape};
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
 type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<Box<dyn ToolDyn>>> + Send + Sync);
 
+/// The eventual `(answer, usage)` a phase loop yields, boxed `Send` for the
+/// [`PhaseRunner`] vtable: the model's answer paired with the token [`Usage`] the
+/// provider reported for the phase (zero-valued when unreported). A named alias so
+/// the vtable signature stays readable — and under clippy's `type_complexity` bar.
+type PhaseFuture<'a> = Pin<Box<dyn Future<Output = Result<(String, Usage)>> + Send + 'a>>;
+
 /// The object-safe seam one [`Arm`] runs its loops through: a pre-built
 /// completion model erased behind a vtable. rig's provider models are distinct
 /// concrete types; monomorphizing every phase combination would be a kinds² macro
@@ -63,7 +69,7 @@ trait PhaseRunner: Send + Sync {
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
         break_on_view_image: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+    ) -> PhaseFuture<'a>;
 }
 
 /// The concrete pre-built completion model behind the [`PhaseRunner`] vtable.
@@ -92,7 +98,7 @@ where
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
         break_on_view_image: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+    ) -> PhaseFuture<'a> {
         Box::pin(run_phase(
             &self.model,
             &self.name,
@@ -331,7 +337,10 @@ impl Arm {
     }
 
     /// Run one bounded tool loop on this arm: its client, model, params, and
-    /// `max_tokens`, with the caller's preamble/prompt/turn-cap/toolset.
+    /// `max_tokens`, with the caller's preamble/prompt/turn-cap/toolset. Returns the
+    /// model's answer paired with the token [`Usage`] the provider reported for this
+    /// phase (zero-valued when the provider reported none, or on the undercounted
+    /// exceptional paths — see [`run_phase`]).
     pub(crate) async fn run(
         &self,
         preamble: &str,
@@ -339,7 +348,7 @@ impl Arm {
         max_turns: usize,
         progress: &dyn ProgressSink,
         make_tools: ToolFactory<'_>,
-    ) -> Result<String> {
+    ) -> Result<(String, Usage)> {
         self.runner
             .run_phase(
                 preamble,
@@ -355,12 +364,17 @@ impl Arm {
     }
 }
 
-/// The result of a consult: the final answer plus the explorer's report (kept so
-/// callers can inspect/debug the hand-off, and for future session storage).
+/// The result of a consult: the final answer, the explorer's report (kept so
+/// callers can inspect/debug the hand-off, and for future session storage), and the
+/// token [`Usage`] the whole consult reported — the synth loop plus every delegated
+/// `explore′` sweep, summed. Zero-valued when no provider reported usage (the
+/// existing "unknown" sentinel), so a footer can tell "cost this much" from "the
+/// backend told us nothing".
 #[derive(Debug, Clone)]
 pub struct ConsultOutput {
     pub answer: String,
     pub report: String,
+    pub usage: Usage,
 }
 
 /// The forced-finish instruction we append when a phase exhausts its turn cap.
@@ -640,7 +654,7 @@ pub(crate) async fn run_phase<M, F>(
     progress: &dyn ProgressSink,
     make_tools: F,
     break_on_view_image: bool,
-) -> Result<String>
+) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
     F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
@@ -690,15 +704,25 @@ where
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
+        // `.extended_details()` swaps rig's plain-`String` result for a
+        // `PromptResponse` carrying the token `usage` the provider reported, summed
+        // across every turn of *this* run (rig aggregates `usage += resp.usage` per
+        // completion). The clean `Ok` path is the common case — one run, the full
+        // count. The two exceptional exits below (turn cap, view_image break) undercount:
+        // rig hands back no usage on `MaxTurnsError`/`PromptCancelled`, so the turns
+        // spent in a capped or broken run are lost and only the finalize/resumed run's
+        // usage survives. Deliberate — recovering it would mean summing per-completion
+        // through a hook; documented as a known undercount rather than silently exact.
         let result = agent
             .prompt(prompt.clone())
             .with_history(history.clone())
             .with_hook(ViewImageBreakHook::new(break_on_view_image))
             .max_turns(remaining)
+            .extended_details()
             .await;
 
         match result {
-            Ok(answer) => return Ok(answer),
+            Ok(resp) => return Ok((resp.output, resp.usage)),
             Err(PromptError::MaxTurnsError { chat_history, .. }) => {
                 // The loop hit its cap and is about to write a forced final answer —
                 // tell the caller, so a watching client sees "wrapping up" not silence.
@@ -744,7 +768,7 @@ async fn finalize_after_max_turns<M>(
     tools: Vec<Box<dyn ToolDyn>>,
     chat_history: Vec<Message>,
     max_turns: usize,
-) -> Result<String>
+) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
 {
@@ -764,7 +788,9 @@ where
         .prompt(prompt)
         .with_history(history)
         .max_turns(1)
+        .extended_details()
         .await
+        .map(|resp| (resp.output, resp.usage))
         .map_err(|e| {
             anyhow!(
                 "model used all {max_turns} turns, and the forced final-answer turn \
@@ -795,7 +821,7 @@ pub(crate) async fn run_explore_phase(
     sandbox: &SandboxConfig,
     max_turns: usize,
     progress: &Arc<dyn ProgressSink>,
-) -> Result<String> {
+) -> Result<(String, Usage)> {
     arm.run(
         preamble,
         Message::user(question.to_string()),
@@ -833,6 +859,11 @@ pub struct RunExplore {
     /// sweeps found (the recomposed `consult`'s `report`) and a test can observe
     /// that a delegation actually happened.
     reports: Arc<Mutex<Vec<String>>>,
+    /// Every sweep's token usage sums in here. The explorer runs *inside* the synth's
+    /// tool loop, so its tokens never reach the synth's own `PromptResponse.usage` —
+    /// this shared cell is how `consult_with` recovers them to fold into the consult
+    /// total. Parallel to `reports`: one sink, many sweeps.
+    usage_sink: Arc<Mutex<Usage>>,
     /// Liveness for the sweep: brackets each delegation with start/finish, and is
     /// handed to the nested kernel's `run_kaish` so the sub-agent's own reads show
     /// through too (a delegated sweep is where a long consult spends its silence).
@@ -852,6 +883,7 @@ impl RunExplore {
         root: impl Into<PathBuf>,
         sandbox: SandboxConfig,
         reports: Arc<Mutex<Vec<String>>>,
+        usage_sink: Arc<Mutex<Usage>>,
         progress: Arc<dyn ProgressSink>,
         preamble: Arc<str>,
     ) -> Self {
@@ -861,6 +893,7 @@ impl RunExplore {
             root: root.into(),
             sandbox,
             reports,
+            usage_sink,
             progress,
             preamble,
         }
@@ -934,8 +967,14 @@ impl Tool for RunExplore {
         )
         .await;
         self.progress.emit(PhaseEvent::SweepFinished);
-        let report = result.map_err(|e| RunExploreError(format!("{e:#}")))?;
+        let (report, usage) = result.map_err(|e| RunExploreError(format!("{e:#}")))?;
+        // Fold this sweep's tokens into the shared consult total before returning the
+        // report to the driver — the synth's own `PromptResponse` will never see them.
         // Lock poisoning means another delegation panicked — surface it, don't mask.
+        *self
+            .usage_sink
+            .lock()
+            .expect("explore usage sink poisoned") += usage;
         self.reports
             .lock()
             .expect("explore report sink poisoned")
@@ -969,7 +1008,7 @@ pub async fn oneshot(
     attachments: &[Attachment],
     arm: &Arm,
     cfg: &PhaseContext,
-) -> Result<String> {
+) -> Result<(String, Usage)> {
     let user_prompt = crate::attach::with_text_context(attachments, prompt);
     let image_parts: Vec<UserContent> = attachments
         .iter()
@@ -1020,11 +1059,13 @@ pub async fn oneshot(
 /// Build the recomposed `consult` toolset: `{run_kaish, explore′}`. Factored out so
 /// the wiring (both tools present, explore′ pointed at the explorer arm) is
 /// unit-testable without a live model. `reports` collects each `explore′` sweep.
+#[allow(clippy::too_many_arguments)] // the sinks and flags are each a distinct wiring input
 fn consult_tools(
     explorer: &Arm,
     root: &Path,
     cfg: &ConsultConfig,
     reports: Arc<Mutex<Vec<String>>>,
+    explore_usage: Arc<Mutex<Usage>>,
     synth_vision: bool,
 ) -> Result<Vec<Box<dyn ToolDyn>>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
@@ -1057,6 +1098,7 @@ fn consult_tools(
         root,
         cfg.explore.sandbox.clone(),
         reports,
+        explore_usage,
         cfg.explore.phase.progress.clone(),
         explorer_preamble,
     );
@@ -1091,7 +1133,7 @@ pub(crate) async fn explore_with(
     explorer: &Arm,
     cfg: &ExploreConfig,
     attached: &[super::prompts::ConsultAttachment],
-) -> Result<String> {
+) -> Result<(String, Usage)> {
     let mut preamble = resolve_phase_preamble(
         Phase::Explorer,
         &cfg.phase.prompts,
@@ -1169,7 +1211,7 @@ pub async fn deliberate_direct(
     system: &str,
     deadline: Duration,
     progress: &Arc<dyn ProgressSink>,
-) -> Result<String> {
+) -> Result<(String, Usage)> {
     with_call_deadline(
         deadline,
         "deliberate",
@@ -1200,8 +1242,12 @@ pub(crate) async fn consult_with(
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
     let reports = Arc::new(Mutex::new(Vec::<String>::new()));
+    // The delegated sweeps' tokens land here (they run inside the synth loop, so the
+    // synth's own `PromptResponse.usage` never counts them); summed with the synth's
+    // usage below into the consult total.
+    let explore_usage = Arc::new(Mutex::new(Usage::new()));
 
-    let answer = with_call_deadline(
+    let (answer, synth_usage) = with_call_deadline(
         cfg.explore.phase.call_deadline,
         "consult",
         synth.run(
@@ -1215,9 +1261,18 @@ pub(crate) async fn consult_with(
             cfg.synth_max_turns,
             cfg.explore.phase.progress.as_ref(),
             // Rebuilt per call (main loop, and again if run_phase forces a final
-            // turn); every build shares the one `reports` sink so all explore′
-            // sweeps aggregate.
-            &|| consult_tools(explorer, root, cfg, reports.clone(), synth.caps.vision),
+            // turn); every build shares the one `reports` + `explore_usage` sink so
+            // all explore′ sweeps aggregate.
+            &|| {
+                consult_tools(
+                    explorer,
+                    root,
+                    cfg,
+                    reports.clone(),
+                    explore_usage.clone(),
+                    synth.caps.vision,
+                )
+            },
         ),
     )
     .await
@@ -1227,7 +1282,13 @@ pub(crate) async fn consult_with(
         .lock()
         .expect("explore report sink poisoned")
         .join("\n\n---\n\n");
-    Ok(ConsultOutput { answer, report })
+    // Consult total: the synth's own loop plus every delegated sweep.
+    let usage = synth_usage + *explore_usage.lock().expect("explore usage sink poisoned");
+    Ok(ConsultOutput {
+        answer,
+        report,
+        usage,
+    })
 }
 
 /// A consult turn's session binding: the store and the session id. `None` is a
@@ -1296,7 +1357,7 @@ mod tests {
     use crate::session::SessionStore;
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, RecordingSink, ScriptedClient,
+        transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
     };
     use std::fs;
     use std::num::NonZeroUsize;
@@ -1779,6 +1840,24 @@ mod tests {
         );
     }
 
+    /// oneshot carries the provider's reported token usage back out — the thin
+    /// single-turn seam threads `PromptResponse.usage` the same as the loop does.
+    #[tokio::test]
+    async fn oneshot_returns_reported_usage() {
+        const MODEL: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| {
+                Ok(with_usage(text_response("done"), usage(321, 21)))
+            })
+            .build();
+        let (answer, reported) = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(reported.input_tokens, 321);
+        assert_eq!(reported.output_tokens, 21);
+    }
+
     /// The load-bearing e2e: a scripted consult that delegates a sweep to `explore′`,
     /// reads a span itself, and answers — driving the *real* loop end to end with no
     /// network. This proves what the offline wiring test below cannot: the driver's
@@ -1895,6 +1974,75 @@ mod tests {
         );
     }
 
+    /// A consult's reported `usage` must be the synth loop's tokens **plus** every
+    /// delegated `explore′` sweep's — the nested explorer runs inside the synth's tool
+    /// loop, so its tokens never reach the synth's own `PromptResponse.usage` and a
+    /// naive implementation would drop them. Each scripted completion "reports" a fixed
+    /// per-call usage; rig sums `usage += resp.usage` across a run, so the expected
+    /// total is (synth completions × synth-usage) + (explorer completions × explorer-usage),
+    /// computed from the request log so it can't drift with the loop's turn count. The
+    /// teeth: forget to fold the explorer sink in and the total comes back short by the
+    /// explorer's share, and this fails.
+    #[tokio::test]
+    async fn consult_usage_sums_synth_and_delegated_explorer_tokens() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+        const REPORT: &str = "EXPLORER_REPORT: src/foo.rs:1";
+        // Distinct per-call footprints so a missing addend is obvious in the total.
+        let synth_each = usage(100, 10);
+        let explorer_each = usage(50, 5);
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, move |req| {
+                let resp = if transcript_text(req).contains("EXPLORER_REPORT") {
+                    text_response("ANSWER: done.")
+                } else {
+                    tool_call_response("t-explore", "explore", json!({ "question": "sweep" }))
+                };
+                Ok(with_usage(resp, synth_each))
+            })
+            .on_model(EXPLORER, move |_req| {
+                Ok(with_usage(text_response(REPORT), explorer_each))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        let out = consult_with(
+            "Where is target_marker defined?",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        // Expected = per-call usage × how many completions each model actually made.
+        let ns = client.requests_for(SYNTH).len() as u64;
+        let ne = client.requests_for(EXPLORER).len() as u64;
+        assert!(ns >= 2, "driver should delegate then answer (≥2 turns), got {ns}");
+        assert!(ne >= 1, "explorer should have been delegated at least one sweep");
+
+        assert_eq!(
+            out.usage.input_tokens,
+            ns * 100 + ne * 50,
+            "input tokens must sum synth + explorer completions"
+        );
+        assert_eq!(
+            out.usage.output_tokens,
+            ns * 10 + ne * 5,
+            "output tokens must sum synth + explorer completions"
+        );
+        // And the explorer's share is genuinely included — the total strictly exceeds
+        // the synth's own tokens, so dropping the nested sink would fail here.
+        assert!(
+            out.usage.input_tokens > ns * 100,
+            "the delegated explorer's tokens must be folded into the consult total"
+        );
+    }
+
     /// Attachments reach the delegated sweep: a consult carrying attachments must
     /// hand every `explore′` sub-agent the read-them-WHOLE directive in its
     /// preamble — the sweep is a fresh agent that never saw the driver prompt, so
@@ -2002,7 +2150,7 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ExploreConfig::default();
 
-        let report = explore_with(
+        let (report, _usage) = explore_with(
             "Where is target_marker defined?",
             dir.path().to_path_buf(),
             &arm(&client, EXPLORER),
@@ -2164,7 +2312,7 @@ mod tests {
             .build();
 
         let cfg = PhaseContext::default();
-        let out = deliberate_direct(
+        let (out, _usage) = deliberate_direct(
             "Is the retry path safe?",
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
             &arm(&client, SYNTH),
@@ -3302,6 +3450,7 @@ mod tests {
             dir.path(),
             &cfg,
             reports,
+            Arc::new(Mutex::new(Usage::new())),
             false, // synth is not vision-capable
         )
         .expect("building the consult toolset should succeed");
@@ -3336,6 +3485,7 @@ mod tests {
             dir.path(),
             &cfg,
             reports,
+            Arc::new(Mutex::new(Usage::new())),
             true, // synth IS vision-capable
         )
         .expect("building the consult toolset should succeed");
@@ -3360,8 +3510,16 @@ mod tests {
         let explorer = arm(&client, "m");
         let reports = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        let blind = consult_tools(&explorer, dir.path(), &cfg, reports.clone(), false)
-            .expect("blind toolset builds");
+        let usage_sink = Arc::new(Mutex::new(Usage::new()));
+        let blind = consult_tools(
+            &explorer,
+            dir.path(),
+            &cfg,
+            reports.clone(),
+            usage_sink.clone(),
+            false,
+        )
+        .expect("blind toolset builds");
         let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
         assert!(blind_names.iter().any(|n| n == "run_kaish"));
         assert!(blind_names.iter().any(|n| n == "explore"));
@@ -3370,7 +3528,7 @@ mod tests {
             "no view_image without vision, got {blind_names:?}"
         );
 
-        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, true)
+        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, true)
             .expect("vision toolset builds");
         let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
         assert!(

@@ -1287,7 +1287,7 @@ async fn secondary_local_cast_from_user_config_runs() {
     let secondary = ModelSlot::bare(glm_synth.backend.clone(), "Gemma-4-E4B-it-GGUF");
     let arm = Arm::from_slot(backend, &secondary, ModelRole::Synth, &cfg.defaults)
         .expect("secondary arm builds");
-    let answer = oneshot(
+    let (answer, _usage) = oneshot(
         "Context: src/sandbox.rs builds a read-only kernel; writes and external \
          commands are refused.\n\nIn one sentence, what does kaibo's read-only sandbox \
          prevent?",
@@ -1348,7 +1348,7 @@ async fn recomposed_consult_runs_against_local_gemma() {
 async fn oneshot_answers_from_pasted_context() {
     let arm = builtin_arm("openai-local", ModelRole::Synth);
 
-    let answer = oneshot(
+    let (answer, _usage) = oneshot(
         "Context: src/sandbox.rs builds a read-only kernel; the LocalFs read-only \
          mount refuses every write.\n\nIn one sentence, which file enforces kaibo's \
          read-only sandbox?",

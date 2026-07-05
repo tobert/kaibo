@@ -3,6 +3,7 @@
 //! consult answers and their provenance footer, failure classification, and the
 //! job / batch / wait status views.
 
+use rig_core::completion::Usage;
 use rmcp::model::{CallToolResult, Content, LoggingLevel};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
@@ -354,13 +355,52 @@ pub(super) fn parse_batch_handle(handle: &str) -> Result<(&str, &str), McpError>
         })
 }
 
-pub(super) fn with_provenance(answer: String, cast: &str, roles: &[(&str, &str)]) -> String {
+pub(super) fn with_provenance(
+    answer: String,
+    cast: &str,
+    roles: &[(&str, &str)],
+    usage: &Usage,
+) -> String {
     let models = roles
         .iter()
         .map(|(label, model)| format!("{label} `{model}`"))
         .collect::<Vec<_>>()
         .join(" · ");
-    format!("{answer}\n\n———\nkaibo · cast `{cast}` · {models}")
+    let footer = format!("{answer}\n\n———\nkaibo · cast `{cast}` · {models}");
+    match fmt_usage(usage) {
+        Some(tokens) => format!("{footer}\n{tokens}"),
+        None => footer,
+    }
+}
+
+/// Render the reported token usage as one compact footer line, or `None` when the
+/// provider reported nothing. rig zeroes every field of [`Usage`] when a provider
+/// omits usage metrics, and uses that all-zero value as its own "unknown" sentinel
+/// (`reported_usage`); we mirror it exactly with `== Usage::new()`, so a new rig
+/// field can't quietly slip past this guard. We distinguish "cost this much" from
+/// "the backend told us nothing" rather than printing a misleading `0 in · 0 out`.
+/// Input and output always show; the cache splits and reasoning ride along only when
+/// non-zero, so the common (uncached, no-thinking-report) line stays lean. Shared by
+/// the answer footer ([`with_provenance`]) and the deliberate batch ack, which folds
+/// the synchronous dossier-build cost into its message.
+pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
+    if *usage == Usage::new() {
+        return None;
+    }
+    let mut line = format!(
+        "tokens · {} in · {} out",
+        usage.input_tokens, usage.output_tokens
+    );
+    if usage.reasoning_tokens > 0 {
+        line.push_str(&format!(" · {} reasoning", usage.reasoning_tokens));
+    }
+    if usage.cached_input_tokens > 0 {
+        line.push_str(&format!(" · {} cached", usage.cached_input_tokens));
+    }
+    if usage.cache_creation_input_tokens > 0 {
+        line.push_str(&format!(" · {} cache-write", usage.cache_creation_input_tokens));
+    }
+    Some(line)
 }
 
 #[cfg(test)]
@@ -641,6 +681,7 @@ mod tests {
                 ("explorer", "gemini-flash-lite-latest"),
                 ("synth", "gemini-3.5-flash"),
             ],
+            &Usage::new(),
         );
         assert!(
             out.starts_with("the answer"),
@@ -655,12 +696,65 @@ mod tests {
             out.contains("synth `gemini-3.5-flash`"),
             "names the synth model: {out}"
         );
+        // An all-zero usage (no provider reported any) adds no tokens line — the
+        // footer never claims a misleading `0 in · 0 out`.
+        assert!(
+            !out.contains("tokens"),
+            "unreported usage stays silent: {out}"
+        );
 
         // The oneshot shape: a single labelled model.
-        let one = with_provenance("x".into(), "deepseek", &[("model", "deepseek-v4-pro")]);
+        let one = with_provenance(
+            "x".into(),
+            "deepseek",
+            &[("model", "deepseek-v4-pro")],
+            &Usage::new(),
+        );
         assert!(
             one.contains("cast `deepseek` · model `deepseek-v4-pro`"),
             "{one}"
+        );
+    }
+
+    /// The tokens line: reported usage renders in-band, cache/reasoning splits show
+    /// only when non-zero, and an unreported (all-zero) usage renders nothing.
+    #[test]
+    fn usage_footer_renders_reported_tokens_and_stays_silent_when_unreported() {
+        // Unreported → no line at all (rig's all-zero sentinel).
+        assert_eq!(fmt_usage(&Usage::new()), None);
+
+        // A plain report: input + output, no cache/reasoning noise.
+        let plain = Usage {
+            input_tokens: 48170,
+            output_tokens: 3102,
+            ..Usage::new()
+        };
+        assert_eq!(
+            fmt_usage(&plain).unwrap(),
+            "tokens · 48170 in · 3102 out",
+            "plain report shows only in/out"
+        );
+
+        // Everything present: reasoning + cache read + cache write ride along.
+        let rich = Usage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            reasoning_tokens: 150,
+            cached_input_tokens: 800,
+            cache_creation_input_tokens: 64,
+            ..Usage::new()
+        };
+        let line = fmt_usage(&rich).unwrap();
+        assert!(line.contains("1000 in · 200 out"), "{line}");
+        assert!(line.contains("150 reasoning"), "{line}");
+        assert!(line.contains("800 cached"), "{line}");
+        assert!(line.contains("64 cache-write"), "{line}");
+
+        // And it reaches the footer through with_provenance.
+        let out = with_provenance("A".into(), "deepseek", &[("model", "m")], &plain);
+        assert!(
+            out.contains("tokens · 48170 in · 3102 out"),
+            "footer carries the tokens line: {out}"
         );
     }
 

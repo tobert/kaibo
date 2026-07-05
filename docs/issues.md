@@ -506,9 +506,22 @@ Remaining OpenRouter-specific forks:
   silently drops the reasoning param defeats thinking-on-by-default), `order`/`only`/
   `ignore`, and quantization filters. Belongs with the rig-OpenRouter exit-strategy
   thinking.
-- **Spend visibility.** Traces already carry `gen_ai.usage.*` per turn (this incident
-  was diagnosed entirely from them); consider surfacing a per-call token/cost total in
-  the provenance footer or job result so the calling agent sees cost before the bill does.
+- **Spend visibility — token total shipped, two residuals.** The provenance footer
+  now carries a `tokens · … in · … out` line (cache/reasoning splits when reported):
+  `consult` sums the synth loop plus every delegated explorer sweep, drawn from rig's
+  `PromptResponse.usage` via `.extended_details()` (see `render::fmt_usage`,
+  `engine::run_phase`). Still open:
+  - **Undercount on the exceptional exits.** rig hands back no usage on
+    `MaxTurnsError` / `PromptCancelled`, so a phase that hits its turn cap or breaks for
+    an image-resume (`run_phase`'s view_image path) loses the tokens of the capped/broken
+    run — only the finalize/resumed run's usage survives. The normal path is exact.
+    Recovering it means summing per-completion through a `PromptHook` rather than reading
+    the run's aggregate; deferred as low-value (both are rare paths) but real.
+  - **Dollars, not just tokens.** rig's normalized `Usage` carries token counts only —
+    even OpenRouter's response `usage.cost` is dropped in normalization. A per-call
+    *cost* needs a kaibo-side price table keyed by model (input/output/cache-read rates),
+    which drifts with the catalog (`provider-model-ids`). Tokens are the honest product;
+    price them caller-side, or add the table when the demand is real.
 
 ### Explorer prose — residual probes (the report shape + reading strategy shipped)
 The structured report sections (`SummaryOfFindings`/`RelevantLocations`/

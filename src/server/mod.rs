@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
+use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -49,9 +50,9 @@ mod render;
 use config_resource::render_config_resource;
 use render::{
     batch_poll_brief, batch_within_window, consult_result, consultation_failed,
-    consultation_failure_text, is_batch_handle, now_epoch_secs, parse_batch_handle, render_job,
-    render_jobs_section, render_wait, wait_level_floor, wait_level_label, with_provenance,
-    BATCH_RECENCY_WINDOW_SECS,
+    consultation_failure_text, fmt_usage, is_batch_handle, now_epoch_secs, parse_batch_handle,
+    render_job, render_jobs_section, render_wait, wait_level_floor, wait_level_label,
+    with_provenance, BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -1600,6 +1601,7 @@ impl KaiboHandler {
             out.answer,
             &cast.name,
             &[("explorer", &explorer.model), ("synth", &synth.model)],
+            &out.usage,
         );
         Ok(consult_result(answer, out.report, input.include_report))
     }
@@ -1717,6 +1719,7 @@ impl KaiboHandler {
                             ("explorer", explorer_model.as_str()),
                             ("synth", synth_model.as_str()),
                         ],
+                        &out.usage,
                     );
                     Ok(JobResult {
                         answer,
@@ -1791,11 +1794,11 @@ impl KaiboHandler {
         let span =
             tracing::info_span!("explore", cast = %cast.name, explorer_model = %explorer.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
-        let report = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
+        let (report, usage) = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
             .instrument(span)
             .await
         {
-            Ok(report) => report,
+            Ok(out) => out,
             // A provider/model-loop failure is a clean tool-result error, same as `consult`.
             Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
         };
@@ -1803,7 +1806,7 @@ impl KaiboHandler {
 
         // The report IS the text (no structured_content). Provenance names the one arm
         // that produced it, so a cross-model study sees which explorer surveyed.
-        let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)]);
+        let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)], &usage);
         Ok(CallToolResult::success(vec![Content::text(report)]))
     }
 
@@ -1872,13 +1875,14 @@ impl KaiboHandler {
         progress.emit(PhaseEvent::PhaseStarted {
             phase: "deliberate.dossier",
         });
-        let dossier = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
-            .instrument(span)
-            .await
-        {
-            Ok(d) => d,
-            Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
-        };
+        let (dossier, dossier_usage) =
+            match explore_with(&input.question, root, &explorer, &cfg, &attachments)
+                .instrument(span)
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
+            };
         progress.emit(PhaseEvent::PhaseFinished {
             phase: "deliberate.dossier",
         });
@@ -1890,8 +1894,15 @@ impl KaiboHandler {
         let system = crate::consult::batch_system_prompt(cfg.phase.prompts.batch.as_deref());
         match lane {
             Lane::Batch => {
-                self.deliberate_batch(&cast, &explorer_model, &input.question, &dossier, &system)
-                    .await
+                self.deliberate_batch(
+                    &cast,
+                    &explorer_model,
+                    &input.question,
+                    &dossier,
+                    &system,
+                    dossier_usage,
+                )
+                .await
             }
             Lane::Direct => self.deliberate_direct_job(
                 &cast,
@@ -1899,6 +1910,7 @@ impl KaiboHandler {
                 &input.question,
                 &dossier,
                 &system,
+                dossier_usage,
             ),
         }
     }
@@ -1916,6 +1928,11 @@ impl KaiboHandler {
         question: &str,
         dossier: &str,
         system: &str,
+        // The dossier stage's explorer tokens — real synchronous spend kaibo already
+        // paid to build the dossier. The offline synth's own cost lands later on the
+        // provider's batch result (not rendered here), but the caller should still see
+        // what the build cost rather than have it silently dropped on this lane.
+        dossier_usage: Usage,
     ) -> Result<CallToolResult, McpError> {
         let (slot, backend, _caps) = self.batch_synth(cast)?;
         let backend_name = backend.name.clone();
@@ -1935,11 +1952,16 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         let handle = format!("{backend_name}/{provider_id}");
+        // Fold the dossier build's real cost into the ack — the synth's own tokens land
+        // later on the provider's batch result, but the build spend is knowable now.
+        let dossier_cost = fmt_usage(&dossier_usage)
+            .map(|t| format!(", {t}"))
+            .unwrap_or_default();
         let msg = format!(
-            "Dossier built (explorer `{explorer_model}`) and handed to the batch lane as \
-             `{handle}` — cast `{}`, synth `{model}` at max thinking. It deliberates offline; \
-             collect it with `job_get {handle}` (durable — survives restart), or stop it with \
-             `job_cancel {handle}`. Nothing to wait on now.",
+            "Dossier built (explorer `{explorer_model}`{dossier_cost}) and handed to the batch \
+             lane as `{handle}` — cast `{}`, synth `{model}` at max thinking. It deliberates \
+             offline; collect it with `job_get {handle}` (durable — survives restart), or stop it \
+             with `job_cancel {handle}`. Nothing to wait on now.",
             cast.name
         );
         Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -1957,6 +1979,9 @@ impl KaiboHandler {
         question: &str,
         dossier: &str,
         system: &str,
+        // The dossier stage's explorer tokens, summed into the final footer with the
+        // synth's — the footer names both roles, so it counts both.
+        dossier_usage: Usage,
     ) -> Result<CallToolResult, McpError> {
         let synth = self.arm(cast, ModelRole::Synth)?;
         let synth_model = synth.model.clone();
@@ -1993,7 +2018,7 @@ impl KaiboHandler {
             )
             .await
             {
-                Ok(answer) => Ok(JobResult {
+                Ok((answer, synth_usage)) => Ok(JobResult {
                     answer: with_provenance(
                         answer,
                         &cast_name,
@@ -2001,6 +2026,7 @@ impl KaiboHandler {
                             ("explorer", explorer_model.as_str()),
                             ("synth", synth_model.as_str()),
                         ],
+                        &(dossier_usage + synth_usage),
                     ),
                     report: None,
                 }),
@@ -2062,17 +2088,17 @@ impl KaiboHandler {
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
-        let answer = match oneshot(&input.prompt, &attachments, &arm, &cfg)
+        let (answer, usage) = match oneshot(&input.prompt, &attachments, &arm, &cfg)
             .instrument(span)
             .await
         {
-            Ok(answer) => answer,
+            Ok(out) => out,
             // A provider failure is a clean tool-result error, same as `consult`.
             Err(e) => return Ok(consultation_failed("oneshot", &cast.name, e)),
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
-        let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)]);
+        let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)], &usage);
         Ok(CallToolResult::success(vec![Content::text(answer)]))
     }
 
@@ -4292,6 +4318,14 @@ mod tests {
         ));
         let cast = h.config.resolve_cast("mydeliberate").unwrap().clone();
 
+        // The dossier build's real explorer spend — the batch lane must surface it in
+        // the ack rather than drop it (its synth cost lands later on the batch result).
+        let dossier_usage = Usage {
+            input_tokens: 200,
+            output_tokens: 20,
+            total_tokens: 220,
+            ..Usage::new()
+        };
         let out = h
             .deliberate_batch(
                 &cast,
@@ -4299,13 +4333,19 @@ mod tests {
                 "Is the retry safe?",
                 "DOSSIER: src/x.rs:1 fn retry",
                 "offline-synth-system",
+                dossier_usage,
             )
             .await
             .expect("scripted deliberate_batch succeeds");
 
+        let ack = result_text(out);
         assert!(
-            result_text(out).contains("gem/msgbatch_d"),
+            ack.contains("gem/msgbatch_d"),
             "the reply carries the durable batch handle"
+        );
+        assert!(
+            ack.contains("tokens · 200 in · 20 out"),
+            "the ack surfaces the synchronous dossier-build cost: {ack}"
         );
         let submits = scripted.submits();
         assert_eq!(submits.len(), 1, "the dossier is one batch");
