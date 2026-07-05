@@ -165,3 +165,6 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # A semver prerelease tag (v0.2.0-rc.1) is a GitHub prerelease — the
+          # Releases page must not present an rc as the latest stable.
+          prerelease: ${{ contains(github.ref_name, '-') }}
