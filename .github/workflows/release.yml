@@ -130,8 +130,9 @@ jobs:
           dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" "$dist"/
-          # Fix mtimes before zipping so the archive is byte-stable for this commit.
-          touch -d "@$SOURCE_DATE_EPOCH" "$dist"/*
+          # Fix mtimes before zipping so the archive is byte-stable for this commit —
+          # including the directory itself (7z stores the dir entry's mtime too).
+          touch -d "@$SOURCE_DATE_EPOCH" "$dist" "$dist"/*
           7z a "$dist.zip" "$dist" >/dev/null
           sha256sum "$dist.zip" > "$dist.zip.sha256"
 
