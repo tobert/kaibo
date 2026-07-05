@@ -40,6 +40,20 @@ did **not** bite (macOS runners ship coreutils' `sha256sum`; bare `pip` exists) 
 prefer the portable forms (`shasum -a 256` isn't needed, but `python3 -m pip` is free)
 when touching those lines.
 
+**PR 2 realized — 2026-07-05, same day** (dial-in slices #60/#61/#62, each validated by
+a branch dispatch + cross-family reviewed): SHA-pinned actions (digests independently
+verified), least-privilege per-job permissions, branch-safe artifact names (the
+`ref_name` slash footgun fired on the first branch dispatch and was fixed in-slice),
+aarch64 leg on `ubuntu-24.04-arm` with per-leg `--version` smoke + musl `ldd` static
+assert, reproducible archives (`SOURCE_DATE_EPOCH`, gtar `--sort`/`--mtime` | `gzip -n`,
+pinned zip mtimes — teeth-tested byte-identical locally), prebuilt zigbuild. Also landed
+alongside: the repo's **first CI workflow** (#64 — offline suite, clippy `-D warnings`,
+a `cargo tree` TLS-invariant tripwire) and **`v0.2.0-rc.1`, the first-ever release**
+(#63 + tag): the publish job ran for the first time, produced a correctly-**prerelease**
+GitHub release with all 10 assets, and the end-to-end user path verified — download,
+checksum OK, fully static, binary reports `kaibo 0.2.0-rc.1`. The rc exists to prove the
+tag→release leg *before* PR 3, so the real v0.2.0 is born signed. **Next: PR 3.**
+
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
 a release (CHANGELOG retitle, kaish-kernel pin check, `docs/sandbox-probes.md` re-run,
 `cargo tree -i aws-lc-rs` empty, musl `not a dynamic executable`) lives in CLAUDE.md
