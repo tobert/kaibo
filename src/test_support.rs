@@ -282,6 +282,28 @@ fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<()> {
     }
 }
 
+/// A [`Usage`] a scripted provider "reports" for one completion, `input`/`output`
+/// tokens (with `total` filled to match, the way a real provider does). Lets a test
+/// prove kaibo threads and sums the token counts rig hands back — rig aggregates
+/// `usage += resp.usage` across a run, so this is the real accounting path, not a
+/// mocked-out one. Zero on both is indistinguishable from "provider reported nothing"
+/// (rig's sentinel), so pass a non-zero count when a test means to observe usage.
+pub fn usage(input: u64, output: u64) -> Usage {
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: input + output,
+        ..Usage::new()
+    }
+}
+
+/// Stamp a reported [`usage`] onto a scripted response. `text_response`/`tool_call_response`
+/// default to `Usage::new()` (nothing reported); wrap them here to drive the accounting.
+pub fn with_usage(mut resp: CompletionResponse<()>, usage: Usage) -> CompletionResponse<()> {
+    resp.usage = usage;
+    resp
+}
+
 /// A provider-side error — drives `run_phase`'s failure arm (the model loop fails
 /// before it concludes). Return `Err(provider_error(..))` from a responder.
 pub fn provider_error(msg: impl Into<String>) -> CompletionError {

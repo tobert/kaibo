@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use kaish_kernel::tools::ToolSchema;
+use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -1600,6 +1601,7 @@ impl KaiboHandler {
             out.answer,
             &cast.name,
             &[("explorer", &explorer.model), ("synth", &synth.model)],
+            &out.usage,
         );
         Ok(consult_result(answer, out.report, input.include_report))
     }
@@ -1717,6 +1719,7 @@ impl KaiboHandler {
                             ("explorer", explorer_model.as_str()),
                             ("synth", synth_model.as_str()),
                         ],
+                        &out.usage,
                     );
                     Ok(JobResult {
                         answer,
@@ -1791,11 +1794,11 @@ impl KaiboHandler {
         let span =
             tracing::info_span!("explore", cast = %cast.name, explorer_model = %explorer.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
-        let report = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
+        let (report, usage) = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
             .instrument(span)
             .await
         {
-            Ok(report) => report,
+            Ok(out) => out,
             // A provider/model-loop failure is a clean tool-result error, same as `consult`.
             Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
         };
@@ -1803,7 +1806,7 @@ impl KaiboHandler {
 
         // The report IS the text (no structured_content). Provenance names the one arm
         // that produced it, so a cross-model study sees which explorer surveyed.
-        let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)]);
+        let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)], &usage);
         Ok(CallToolResult::success(vec![Content::text(report)]))
     }
 
@@ -1872,13 +1875,14 @@ impl KaiboHandler {
         progress.emit(PhaseEvent::PhaseStarted {
             phase: "deliberate.dossier",
         });
-        let dossier = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
-            .instrument(span)
-            .await
-        {
-            Ok(d) => d,
-            Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
-        };
+        let (dossier, dossier_usage) =
+            match explore_with(&input.question, root, &explorer, &cfg, &attachments)
+                .instrument(span)
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
+            };
         progress.emit(PhaseEvent::PhaseFinished {
             phase: "deliberate.dossier",
         });
@@ -1899,6 +1903,7 @@ impl KaiboHandler {
                 &input.question,
                 &dossier,
                 &system,
+                dossier_usage,
             ),
         }
     }
@@ -1957,6 +1962,9 @@ impl KaiboHandler {
         question: &str,
         dossier: &str,
         system: &str,
+        // The dossier stage's explorer tokens, summed into the final footer with the
+        // synth's — the footer names both roles, so it counts both.
+        dossier_usage: Usage,
     ) -> Result<CallToolResult, McpError> {
         let synth = self.arm(cast, ModelRole::Synth)?;
         let synth_model = synth.model.clone();
@@ -1993,7 +2001,7 @@ impl KaiboHandler {
             )
             .await
             {
-                Ok(answer) => Ok(JobResult {
+                Ok((answer, synth_usage)) => Ok(JobResult {
                     answer: with_provenance(
                         answer,
                         &cast_name,
@@ -2001,6 +2009,7 @@ impl KaiboHandler {
                             ("explorer", explorer_model.as_str()),
                             ("synth", synth_model.as_str()),
                         ],
+                        &(dossier_usage + synth_usage),
                     ),
                     report: None,
                 }),
@@ -2062,17 +2071,17 @@ impl KaiboHandler {
 
         let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
-        let answer = match oneshot(&input.prompt, &attachments, &arm, &cfg)
+        let (answer, usage) = match oneshot(&input.prompt, &attachments, &arm, &cfg)
             .instrument(span)
             .await
         {
-            Ok(answer) => answer,
+            Ok(out) => out,
             // A provider failure is a clean tool-result error, same as `consult`.
             Err(e) => return Ok(consultation_failed("oneshot", &cast.name, e)),
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
-        let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)]);
+        let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)], &usage);
         Ok(CallToolResult::success(vec![Content::text(answer)]))
     }
 
