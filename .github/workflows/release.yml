@@ -33,8 +33,10 @@ jobs:
           # Linux: fully static via musl. zigbuild handles the cross C toolchain.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          # arm64 hardware (not cross-compiled from x86_64) so the smoke step below
+          # can execute this leg's binary natively, not just link it.
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
           # macOS: not "static" (Apple forbids static libSystem) but self-contained
           # — depends only on always-present system libs. Native build per arch.
           - target: x86_64-apple-darwin
@@ -74,6 +76,27 @@ jobs:
       - name: Build (native)
         if: ${{ !endsWith(matrix.target, '-linux-musl') }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Linking isn't running: a binary can link cleanly and still crash at startup,
+      # so every leg executes its own binary here. The aarch64 leg runs natively on
+      # ubuntu-24.04-arm; x86_64-apple-darwin runs under Rosetta 2 on the arm64
+      # macos-latest runner — expected, don't "fix" that leg back to an Intel runner.
+      - name: Smoke (run the binary)
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/kaibo"
+          [ -f "$bin" ] || bin="$bin.exe"
+          "$bin" --version
+
+      # musl legs only: ldd exits non-zero on a fully static binary, so that's the
+      # success case here — hence `|| true` plus a grep instead of a plain run.
+      - name: Smoke (assert fully static)
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        run: |
+          out=$(ldd "target/${{ matrix.target }}/release/kaibo" 2>&1 || true)
+          echo "$out"
+          grep -q "not a dynamic executable" <<<"$out"
 
       # Package: tar.gz on Unix, zip on Windows. Name carries version + target so a
       # release page lists one obvious artifact per platform.
