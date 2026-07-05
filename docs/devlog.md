@@ -14,6 +14,35 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-05 — the build bootstrap: never-fired workflow → verified first release, in a day
+
+The release plan (PR #25, `docs/releases.md`) had sat unmerged since 2026-06-25 with its
+central artifact — `release.yml` — never once executed. Amy's call: review the plan, update
+it, then *realize* it as quick small PRs, Sonnet subagents on the toil, short bootstrapping
+prose. The day's shape validated two of the plan's own bets and overturned two predictions:
+
+- **"Fire it first" beat speculative hardening.** The baseline `workflow_dispatch` went
+  all-five-legs green on the first run ever — the pre-flight cross-family review's
+  high-confidence prediction (macOS `sha256sum` missing) was wrong (runners ship coreutils),
+  so the dial-in list became warnings-driven, not failure-driven. Measure, then fix.
+- **The one prediction that fired, fired on *us*.** The `ref_name`-slash footgun (flagged
+  latent, slated for later) broke slice (a)'s own validation dispatch from `ci/…` — the
+  validation path *is* a slash-bearing branch. Moved into the slice that hit it.
+- **Every slice validated live before review** (dispatch from the branch), and cross-family
+  review earned its keep twice: DeepSeek's 7z-entry-order finding became a stated
+  single-file boundary comment, and its taiki-e/dtolnay pin semantics all checked out
+  against independently-verified digests.
+- **The rc smoke tag closed the loop.** `v0.2.0-rc.1` exists to prove the never-run publish
+  leg *before* signing lands, so the real v0.2.0 ships born signed (plan PR 3). Proven the
+  way a user would: release download → checksum → fully static → `kaibo 0.2.0-rc.1`.
+- **CI arrived the same day** (#64) because the release bones were already right — same
+  pins, same voice, plus the TLS invariant finally getting automated teeth (a `cargo tree`
+  tripwire asserting on error text; exit codes proved unreliable for absent packages).
+
+Ships: #60 pins+permissions, #61 arm leg+smoke, #62 reproducible archives, #63 rc bump,
+#64 first CI, tag `v0.2.0-rc.1`. PRs 3–5 of the plan (signing/provenance/SBOM, ghcr image,
+channels) remain, sequenced in `docs/releases.md`.
+
 ## 2026-07-04 — `job_wait` parks-and-coalesces instead of returning on the first line
 
 Running the kaish 0.11.0 pre-release review as one background consult, Amy parked with
