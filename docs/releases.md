@@ -20,14 +20,30 @@ can't reconstruct.
 
 ## Where we are now
 
-`.github/workflows/release.yml` already exists: a hand-rolled 6-target matrix that
+`.github/workflows/release.yml` already exists: a hand-rolled 5-target matrix that
 builds **natively per platform** — Linux `x86_64`/`aarch64` musl (fully static via
 `cargo-zigbuild`), macOS `x86_64`/`aarch64` (native `cargo build` on `macos-latest`),
 Windows `x86_64` MSVC (native, `+crt-static`) — then packages `tar.gz`/`zip`, writes
-sha256 sidecars, and publishes on a `v*` tag. **It has never fired.** It is a good
+sha256 sidecars, and publishes on a `v*` tag. It is a good
 baseline (the static-musl + ring/no-aws-lc groundwork is real), but it does no signing,
 no provenance, no container image, no package channels, and it pins its actions by
 floating tag.
+
+**Baseline run — 2026-07-05, the first fire ever** (`workflow_dispatch` from `main`,
+run 28745954560): **all five legs green first try**, ~8.5 min wall, artifacts + sha256
+sidecars for every target, publish job correctly skipped (tag-gated). The x86_64-musl
+artifact verified locally: checksum OK, `statically linked` / `not a dynamic
+executable`, `kaibo --version` runs. Observed for the dial-in PRs: Node 20 deprecation
+warnings on `checkout@v4`/`upload-artifact@v4` (bump majors while SHA-pinning) and a
+macos-latest → macOS 26 migration notice. The pre-flight review's portability worries
+did **not** bite (macOS runners ship coreutils' `sha256sum`; bare `pip` exists) — still
+prefer the portable forms (`shasum -a 256` isn't needed, but `python3 -m pip` is free)
+when touching those lines.
+
+This doc is the *pipeline* side only. The operator-side checklist for actually cutting
+a release (CHANGELOG retitle, kaish-kernel pin check, `docs/sandbox-probes.md` re-run,
+`cargo tree -i aws-lc-rs` empty, musl `not a dynamic executable`) lives in CLAUDE.md
+**Cutting a release** — the two reference each other so neither drifts.
 
 ## The decisions (settled 2026-06-25, with Amy)
 
@@ -159,12 +175,29 @@ decisions above. No pipeline change. *(You are reading the artifact.)*
 
 ### PR 2 — harden & extend the existing native matrix
 No framework, no ABI change — sharpen what's already there.
-- **SHA-pin every `uses:`** to a commit digest (the `tj-actions` lesson); confirm minimal
-  `permissions` and keep `tags: ["v*"]` + `workflow_dispatch`.
-- **Add a `--version` smoke run** per target on its native runner (linking ≠ running), and
-  **`mod_timestamp`** from the commit date for reproducible archives.
+- **Step 0 — DONE 2026-07-05: fired the workflow via `workflow_dispatch`.** All five
+  legs green on the first run; results + observed follow-ups in "Where we are now".
+  Since nothing broke, the rest of this PR lands as small dial-in slices: (a) SHA-pins +
+  per-job permissions, (b) arm leg + smoke runs, (c) packaging polish (reproducible
+  archives, `ref_name` slash sanitize, upload-glob cleanup, prebuilt zigbuild).
+- **SHA-pin every `uses:`** to a commit digest (the `tj-actions` lesson); minimal
+  `permissions` **per job** (build: `contents: read`; only the publish job keeps
+  `contents: write`) and keep `tags: ["v*"]` + `workflow_dispatch`.
+- **Move the `aarch64-unknown-linux-musl` leg to `ubuntu-24.04-arm`** (GitHub's arm64
+  runners, free for public repos since early 2025 — postdates this plan's first draft).
+  Still zigbuild→musl for the fully-static link; the point is the binary now smoke-runs
+  on real arm64 hardware, closing the one target the smoke gate couldn't cover.
+- **Add a `--version` smoke run** per target on its native runner (linking ≠ running;
+  `kaibo --version` exists — clap `version`, verified 2026-07-05), and
+  **`SOURCE_DATE_EPOCH`/`--mtime`** from the commit date for reproducible archives.
+  Note: `macos-latest` is arm64 (macos-14+), so the `x86_64-apple-darwin` smoke runs
+  under **Rosetta 2** — expected and fine; comment it in the workflow so nobody
+  "fixes" the leg later.
+- **Install `cargo-zigbuild` prebuilt** (a SHA-pinned installer action, e.g.
+  `taiki-e/install-action`) instead of `cargo install --locked` compiling it from
+  source on every run.
 - Tighten the **"C-free" wording** in the workflow comments (and CLAUDE.md if touched).
-- **Validation gate:** the matrix already builds all six natively; confirm the musl binary
+- **Validation gate:** the matrix already builds all five natively; confirm the musl binary
   is `not a dynamic executable` (`ldd`) and `cargo tree -i aws-lc-rs` is empty.
 - Cross-family review (release surface — a real look).
 
