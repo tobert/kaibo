@@ -132,6 +132,10 @@ jobs:
           cp "$bin" "$dist"/
           # Fix mtimes before zipping so the archive is byte-stable for this commit —
           # including the directory itself (7z stores the dir entry's mtime too).
+          # Entry ORDER is the other determinism axis: 7z enumerates the filesystem
+          # (no --sort=name equivalent), which is only guaranteed stable here because
+          # the archive holds a single file. If this zip ever gains more files, feed
+          # 7z an explicitly sorted list.
           touch -d "@$SOURCE_DATE_EPOCH" "$dist" "$dist"/*
           7z a "$dist.zip" "$dist" >/dev/null
           sha256sum "$dist.zip" > "$dist.zip.sha256"
