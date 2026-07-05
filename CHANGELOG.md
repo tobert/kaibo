@@ -316,6 +316,25 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- **The README earns its shop window.** A nine-model reader panel (personas played
+  by DeepSeek, GLM, GPT, Kimi, Qwen, Gemini, Claude — full study in the PR) read the
+  page cold and told us where it lost them, so it changed: a real worked example up
+  front — a genuine measured consult of this repo (~4 minutes, **$0.02**, quoted
+  with its citations); release-binary download + checksum instructions now that
+  v0.2.0-rc.1 artifacts exist (and the unpublished `cargo install kaibo` claim
+  replaced with the honest source build); registration rewritten client-generic
+  (Codex CLI, Cline, OpenCode — `claude mcp add` is the same stanza's shorthand);
+  the async lane (`explore`, `consult_submit` + `job_*`, `batch_submit`,
+  `deliberate`) finally documented; pick-a-cast-outside-your-family guidance under
+  the casts table; the stale `openai` cast row corrected to `openai-local` ("you run
+  the model server; kaibo ships no inference") plus the batch-cast rows; the
+  `.mcp.json` example now ships an empty `env` with keys-stay-in-your-shell
+  guidance instead of three inline key placeholders; Moonshot/Kimi and Zhipu/GLM
+  named as `openai`-kind citizens; the `~author/family-latest` alias claim
+  qualified (they exist only for major authors); the network story merged into the
+  read-only FAQ; and Backends/Roles/Casts moved below Tools with a one-line "a cast
+  is just a named team" opener.
+
 - **The read-only shell under `consult` / `explore` / `run_kaish` speaks kaish 0.11.**
   Native collections land in the toolbox the models drive: list/record literals
   (`xs=[a b c]`, `{port: 8080}`), typed subscripts and slices (`${xs[0]}`, `${r[key]}`,
