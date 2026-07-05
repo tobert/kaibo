@@ -7,6 +7,10 @@
 # fully static with nothing but a Rust toolchain plus zig (for ring's small C/asm).
 # cargo-zigbuild uses `zig cc` as the cross C compiler/linker, which keeps the Linux
 # cross-builds painless and lets one Linux runner emit both arches.
+#
+# Actions are pinned by commit SHA, not tag — a tag can be moved, a digest can't
+# (supply-chain). Each pin carries a `# vX.Y.Z` comment naming the release it points
+# at, for humans and Dependabot.
 name: release
 
 on:
@@ -14,13 +18,14 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-permissions:
-  contents: write # create the release and upload assets
+permissions: {}
 
 jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -41,15 +46,16 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # stable branch, pinned 2026-07-05
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
 
@@ -76,7 +82,7 @@ jobs:
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/kaibo"
-          dist="kaibo-${{ github.ref_name }}-${{ matrix.target }}"
+          dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" README.md LICENSE "$dist"/ 2>/dev/null || cp "$bin" "$dist"/
           tar czf "$dist.tar.gz" "$dist"
@@ -87,14 +93,14 @@ jobs:
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/kaibo.exe"
-          dist="kaibo-${{ github.ref_name }}-${{ matrix.target }}"
+          dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" "$dist"/
           7z a "$dist.zip" "$dist" >/dev/null
           sha256sum "$dist.zip" > "$dist.zip.sha256"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kaibo-${{ matrix.target }}
           path: |
@@ -106,13 +112,15 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: dist/*
           generate_release_notes: true
