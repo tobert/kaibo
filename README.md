@@ -33,7 +33,8 @@ summary back.
 
 kaibo integrates as a stdio [MCP](https://modelcontextprotocol.io) server and supports
 Anthropic, Gemini, DeepSeek, OpenRouter (one key reaching every major model family),
-and any OpenAI-compatible endpoint, including local services like llama.cpp. Each
+and any OpenAI-compatible endpoint, including local services like llama.cpp. It's a
+tool your *agent* uses — any MCP-capable client can drive it. Each
 agent is set up to mix small models for exploration with larger models for synthesis,
 to help keep your API spend down.
 
@@ -42,28 +43,65 @@ shell. kaish has all of its commands built in and mounts your project through a
 virtual filesystem layer that is read-only, so the agents can read files in your
 workspace and write nowhere.
 
+## What it looks like
+
+Your agent just reworked some concurrency-sensitive code and wants eyes from
+outside its own family. It calls:
+
+```jsonc
+consult({
+  "question": "We reworked job_wait to park instead of busy-polling — the return
+    trigger is now any Warn+ record or a clean timeout. Review the implementation:
+    does anything still return early at sub-warn levels or busy-poll? Cite spans.",
+  "cast": "deepseek"
+})
+```
+
+kaibo's explorer sweeps the repo through the read-only shell, the synth reads the
+hot spans itself, and one synthesized review comes back — cited, with the
+investigation noise left out of your context:
+
+> **No.** The `absorb` closure is the sole return gate, and it's correct
+> (`src/mcp_log.rs:250-267`): `woke` is only set when a record meets `wake_floor` —
+> rank(Warning) — and the handler hardcodes that floor (`src/server/mod.rs:2499`);
+> no caller input can change it. […] The drain→park race is handled: `notify_one()`
+> stores a permit when no task is waiting, so a push that races a `job_wait`'s
+> registration isn't missed (`src/mcp_log.rs:271-286`). […] The only real tension
+> is the unconditional `notify_one()` in `push` (`src/mcp_log.rs:166`) — every
+> record, even Debug noise, briefly wakes the parked loop. An optimization concern,
+> not a correctness one. *[abridged]*
+>
+> ——— kaibo · cast `deepseek` · explorer `deepseek-v4-flash` · synth `deepseek-v4-pro`
+
+That's a real consult against this repo. It ran about four minutes and cost
+**$0.02** (measured by account-balance delta; DeepSeek's prompt cache was warm — a
+cold first run costs a few cents more). The full answer also surfaced a benign
+spurious-wakeup path and an optimization wrinkle we hadn't written down anywhere —
+which is the point: a model that didn't make your model's mistakes, reading your
+real source, reporting back one summary.
+
 ## Installation
 
-kaibo ships as a single self-contained binary (Linux builds are fully static musl —
-they run on any distro). Requires a Rust toolchain ≥ 1.85. A simple setup will get
-most folks rolling. kaibo provides resources to your agent so that it can configure
-kaibo for your system and credentials.
+kaibo ships as a single self-contained binary per platform — download it, check the
+checksum, put it on your `PATH`, done. Linux builds are fully static musl and run on
+any distro; macOS (Apple silicon and Intel) and Windows binaries are self-contained
+too. Grab your platform's archive and its `.sha256` from the
+[releases page](https://github.com/tobert/kaibo/releases):
 
 ```sh
-cargo install kaibo
+sha256sum -c kaibo-*-x86_64-unknown-linux-musl.tar.gz.sha256
+tar xzf kaibo-*-x86_64-unknown-linux-musl.tar.gz
+install -m 0755 kaibo ~/.local/bin/    # anywhere on your PATH
 ```
 
-<!-- TODO(repo): add the release-binary download line once the v* tag workflow has
-     published artifacts — Linux x86_64/aarch64 (static musl), macOS, Windows. -->
+Prefer building from source? `git clone https://github.com/tobert/kaibo` and
+`cargo install --path kaibo` with a Rust toolchain ≥ 1.85 produces the same binary.
 
-Then register it with your agent. For **Claude Code**:
-
-```sh
-claude mcp add kaibo -- kaibo
-```
-
-or write the stdio stanza directly (`.mcp.json` in your project, or your client's MCP
-config):
+Then register it with your agent. kaibo is a standard stdio MCP server, so any
+MCP-capable client works — Claude Code, Codex CLI, Cline, OpenCode, whatever you
+run. The stanza goes in your client's MCP config; in Claude Code that's `.mcp.json`
+in your project, and `claude mcp add kaibo -- kaibo` writes the same registration
+for you:
 
 ```jsonc
 {
@@ -78,18 +116,14 @@ config):
       //   "args": ["--no-run-kaish"]                     // drop a tool from the surface
       //   "args": ["--config", "/path/to/config.toml"]   // use an explicit config file
       "args": [],
-      "env": {
-        // The consulted models need their provider keys. Set the ones whose casts
-        // you use; a missing key only matters when you actually call that cast.
-        // Want secrets out of this file? Drop `env` entirely and let kaibo read them
-        // from your shell environment, or point a backend at a key FILE via
-        // `api_key_file` in config.toml. The TOML stores only the env-var NAME or the
-        // file PATH — never the secret — so nothing sensitive lands in a config you
-        // might commit or paste.
-        "ANTHROPIC_API_KEY": "...",
-        "DEEPSEEK_API_KEY": "...",
-        "GEMINI_API_KEY": "..."
-      }
+      // The consulted models need provider keys — but don't put them here; this
+      // file tends to get committed. Leave `env` empty and kaibo reads keys from
+      // your shell environment (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY,
+      // GEMINI_API_KEY, OPENROUTER_API_KEY, …), or point a backend at a key FILE
+      // via `api_key_file` in config.toml. Config stores only the env-var NAME or
+      // the file PATH — never the secret. A missing key only matters when you
+      // actually call a cast that needs it.
+      "env": {}
     }
   }
 }
@@ -115,9 +149,85 @@ The prompt leans on two MCP resources kaibo serves, which you can also read dire
 - **`kaibo://config`** — the *resolved* runtime state: which casts and backends are
   live, what's gated, where each key is sourced from.
 
+Prompts and resources are plain MCP — any client that surfaces them can use them. If
+yours doesn't render `configure` as a command, read `kaibo://config/example`
+directly and write the TOML yourself.
+
+---
+
+## Tools
+
+Each tool is gated independently via `--no-<tool>`. All are on by default. A server with
+every tool off is refused at startup.
+
+### `consult` — hybrid agent that explores and synthesizes
+
+Ask a model *outside your own family* about a codebase; get a grounded, cited answer.
+A capable model drives a fast explorer sub-agent and can fill in any gaps using its own
+`run_kaish` tool. The models have instructions to return a synthesized report at the
+end, leaving the noise from the consultation out of your context. Describe what you did
+or want to know in prose — kaibo reads the real, current source itself, so you don't
+need to paste a diff; optionally seed it with `context` (a change summary or pasted
+source), which it trusts as starting evidence while investigating for more. The answer
+carries a provenance footer naming the cast and models that produced it.
+
+When an answer surprises you, pass `include_report: true` to get the explorer's raw
+findings back alongside it — the audit trail for how the consultation reached its
+conclusion. (For deeper tracing, kaibo emits per-tool OpenTelemetry spans; see
+[`docs/config.md`](docs/config.md).)
+
+*Args:* `question` (required), `context` (optional seed), `path` (project dir; optional
+with a default `--root`), `cast`, `session_id`, `include_report`, and per-call
+`explorer_model` / `synth_model` (+ `_backend`) overrides.
+
+### `oneshot` — a thin second opinion
+
+The counterpart to `consult` for when you already own the context: prompt in, answer
+out, no codebase access and no tools — exactly one upstream request. Use it to ask a
+model outside your family a direct question (you've pasted what's needed, or it's
+general). Pick the model with `cast`; the answer carries the same provenance footer.
+
+*Args:* `prompt` (required), `cast`, and a per-call `model` (+ `backend`) override.
+
+### `explore` — the survey, not the verdict
+
+The same read-only investigation as `consult`, returning a structured, cited survey
+report — what's where, how it fits together — instead of an answer. Reach for it
+when you want the map.
+
+### `consult_submit` + `job_wait` / `job_get` / `job_list` / `job_cancel` — async
+
+A deep consult can run minutes; `consult_submit` runs the same investigation in the
+background and hands back a job handle immediately, so your agent keeps working.
+`job_wait` parks until something finishes; `job_get` collects the answer.
+
+### `batch_submit` — frontier answers at half price
+
+`oneshot`'s async sibling: fan self-contained prompts to a top-tier model on the
+provider's batch lane — offline, maximum thinking, roughly half the interactive
+price. The built-in `anthropic-batch` and `gemini-batch` casts put Claude Opus or
+Gemini Pro on your hardest questions cheaply; handles are durable across restarts.
+
+### `deliberate` — deep offline reasoning over a dossier
+
+An investigation assembles a cited dossier from your repo, then a frontier (or big
+local) model reasons over it offline on the batch lane — depth over speed, at batch
+prices.
+
+### `run_kaish` — direct read-only shell
+
+Drive the read-only kaish shell from your agent, no model in the loop: returns exit
+code + stdout + stderr. For a Claude Code user this offers little over the built-in
+Bash tool beyond *safety* — writes and external commands are refused, so exploration
+leaves nothing to review: there's no diff, because nothing it runs can change your tree.
+
 ---
 
 ## Backends, Roles, and Casts
+
+Short version: a **cast** is just a named team — a cheap explorer that sweeps plus a
+strong synth that answers — and a call picks its team with the `cast` argument.
+Everything below is how you wire your own.
 
 Model diversity *is* the product, so configuration is first-class. kaibo works out of
 the box with environment variables and built-in defaults, so a missing config file is
@@ -166,7 +276,16 @@ merges over them by name. The built-ins are:
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-pro` |
 | `gemini` | `gemini-flash-lite-latest` | `gemini-3.5-flash` |
 | `openrouter` | `~google/gemini-flash-latest` | `~anthropic/claude-sonnet-latest` |
-| `openai` | local Gemma (small) | local Gemma (large) |
+| `openai-local` | local Gemma (small) | local Gemma (large) |
+| `anthropic-batch` | — | `claude-opus-4-8` (batch lane) |
+| `gemini-batch` | — | `gemini-pro-latest` (batch lane) |
+
+`openai-local` points at *your* OpenAI-compatible server on localhost (llama.cpp,
+Ollama, …) — you run the model server; kaibo ships no inference of its own. The
+`*-batch` casts staff the offline lane for `batch_submit` and `deliberate`. And the
+`anthropic` default is just the zero-config bring-up team — the whole point is a
+reviewer *outside your agent's family*, so if your agent is a Claude, reach for
+`--cast deepseek` or `--cast gemini`; if it runs on DeepSeek or GPT, go the other way.
 
 Per-call overrides, env vars, and CLI flags all layer over the file
 (`per-call > CLI > env > file > built-in`). The full surface — per-slot thinking
@@ -175,49 +294,6 @@ budgets, effort, sampling, system-prompt overrides, house-rules injection — is
 [`docs/config.example.toml`](docs/config.example.toml); the design rationale behind the
 backends/casts split is [`docs/casts.md`](docs/casts.md). The live, resolved state is
 always readable at the `kaibo://config` MCP resource.
-
----
-
-## Tools
-
-Each tool is gated independently via `--no-<tool>`. All are on by default. A server with
-every tool off is refused at startup.
-
-### `consult` — hybrid agent that explores and synthesizes
-
-Ask a model *outside your own family* about a codebase; get a grounded, cited answer.
-A capable model drives a fast explorer sub-agent and can fill in any gaps using its own
-`run_kaish` tool. The models have instructions to return a synthesized report at the
-end, leaving the noise from the consultation out of your context. Describe what you did
-or want to know in prose — kaibo reads the real, current source itself, so you don't
-need to paste a diff; optionally seed it with `context` (a change summary or pasted
-source), which it trusts as starting evidence while investigating for more. The answer
-carries a provenance footer naming the cast and models that produced it.
-
-When an answer surprises you, pass `include_report: true` to get the explorer's raw
-findings back alongside it — the audit trail for how the consultation reached its
-conclusion. (For deeper tracing, kaibo emits per-tool OpenTelemetry spans; see
-[`docs/config.md`](docs/config.md).)
-
-*Args:* `question` (required), `context` (optional seed), `path` (project dir; optional
-with a default `--root`), `cast`, `session_id`, `include_report`, and per-call
-`explorer_model` / `synth_model` (+ `_backend`) overrides.
-
-### `oneshot` — a thin second opinion
-
-The counterpart to `consult` for when you already own the context: prompt in, answer
-out, no codebase access and no tools — exactly one upstream request. Use it to ask a
-model outside your family a direct question (you've pasted what's needed, or it's
-general). Pick the model with `cast`; the answer carries the same provenance footer.
-
-*Args:* `prompt` (required), `cast`, and a per-call `model` (+ `backend`) override.
-
-### `run_kaish` — direct read-only shell
-
-Drive the read-only kaish shell yourself, no model in the loop: returns exit code +
-stdout + stderr. For a Claude Code user this offers little over the built-in Bash tool
-beyond *safety* — writes and external commands are refused, so exploration leaves
-nothing to review: there's no diff, because nothing it runs can change your tree.
 
 ---
 
@@ -265,7 +341,9 @@ might not trust a read-write subagent to behave.
 **Is read-only actually guaranteed, or best-effort?** It's structural, not best-effort.
 kaibo compiles in only kaish's `localfs` axis — the `subprocess`, `git`, `host`, and
 `os-integration` features are off, so `exec`/`spawn`/`git`/`ps` *don't exist in the
-binary* — and mounts the project read-only on top. The
+binary* — and mounts the project read-only on top. The same structure bounds the
+network: kaish itself reaches nothing — no sockets, no subprocesses, no credentials;
+only kaibo's provider clients dial out, to the model APIs you configure. The
 [`docs/sandbox-probes.md`](docs/sandbox-probes.md) runbook is how we live-test that
 boundary — write/external-command/read-escape batteries run against the shipped binary.
 
@@ -273,7 +351,9 @@ boundary — write/external-command/read-escape batteries run against the shippe
 call — a deep one can run a few minutes, more with thinking on and a large repo to
 sweep. kaibo emits MCP progress notifications as the explorer and synth work, so a
 client that surfaces them shows live progress; whether you actually see those beats is
-up to your agent's UI, which kaibo can't control.
+up to your agent's UI, which kaibo can't control. If you'd rather not block on it,
+`consult_submit` starts the same investigation in the background and `job_get` picks
+up the answer.
 
 **Can a runaway consultation melt my machine or my budget?** There are hard ceilings
 on both. Every kaish script is capped at 30s wall-clock, 64 KiB of output, and 64 MB of
@@ -285,9 +365,11 @@ configurable in `config.toml`.
 
 **What providers are supported?** Anthropic, DeepSeek, and Gemini natively; OpenRouter
 as a keyed gateway that reaches every major model family through one key (`~author/
-family-latest` aliases keep the built-in cast current as new models ship); and a
-generic `openai` kind for any OpenAI-compatible endpoint (hosted GPT, a local
-llama.cpp / Ollama / Gemma server, …). See [Backends, Roles, and Casts](#backends-roles-and-casts).
+family-latest` aliases — available for the major model authors — keep the built-in
+cast current as new models ship); and a generic `openai` kind for any
+OpenAI-compatible endpoint: hosted GPT, Moonshot/Kimi, Zhipu/GLM, a local
+llama.cpp / Ollama server, your org's internal gateway, ….
+See [Backends, Roles, and Casts](#backends-roles-and-casts).
 
 **Does it need network or credentials?** The consulted models do — their provider
 APIs, with keys you supply. kaish itself reaches nothing: no network, no credentials.
@@ -309,10 +391,15 @@ named as such rather than blamed on the provider. If a provider is reliably slow
 that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
 — tracked as an upstream `rig` contribution in [`docs/issues.md`](docs/issues.md).)
 
-**What's the cost?** `consult` spends tokens on the provider behind the chosen cast. A
-family-mixing cast (cheap local explorer + hosted synth) keeps the broad, token-heavy
-sweeping cheap and pays the strong model only for the answer. The agent conversations
-are set up so they can cache well on most providers.
+**What's the cost?** `consult` spends tokens on the provider behind the chosen cast.
+A real reference point: the consult in [What it looks like](#what-it-looks-like) — a
+multi-minute investigation of this repo on the `deepseek` cast — cost **$0.02**,
+measured by account-balance delta (cache-warm; a cold run costs a few cents more).
+A family-mixing cast (cheap local explorer + hosted synth) keeps the broad,
+token-heavy sweeping cheap and pays the strong model only for the answer, and the
+agent conversations are set up to cache well on most providers — that caching is
+where numbers like two cents come from. For the strongest models, `batch_submit`
+rides the provider's batch lane at roughly half the interactive price.
 
 ---
 
