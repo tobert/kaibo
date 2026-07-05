@@ -9,9 +9,9 @@
 //! This is the teeth behind "read-only is unconditional" in AGENTS.md. It *would* fire
 //! on the old `generate_image` capability (its `write_artifact` did `std::fs::create_dir_all`
 //! + `std::fs::write` to the out-dir) — that whole write path is gone. If kaibo ever
-//! grows a deliberate, individually-mediated *capability tool* that records an artifact,
-//! that's a conscious exception: this test is updated in the same change that adds it and
-//! its review, never silently.
+//!   grows a deliberate, individually-mediated *capability tool* that records an artifact,
+//!   that's a conscious exception: this test is updated in the same change that adds it and
+//!   its review, never silently.
 //!
 //! Scope: the *production* half of each `src/**.rs` — everything before the file's first
 //! `#[cfg(test)]` (test modules legitimately write fixtures). Line comments are stripped so

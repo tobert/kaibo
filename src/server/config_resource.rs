@@ -258,7 +258,7 @@ pub(super) fn render_config_resource(
                 key_optional: *key_optional,
                 request_timeout_secs: request_timeout.as_secs(),
                 data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter)
-                    .then(|| match data_collection {
+                    .then_some(match data_collection {
                         crate::config::DataCollection::Deny => "deny",
                         crate::config::DataCollection::Allow => "allow",
                     }),
