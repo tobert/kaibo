@@ -82,7 +82,7 @@ jobs:
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/kaibo"
-          dist="kaibo-${{ github.ref_name }}-${{ matrix.target }}"
+          dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" README.md LICENSE "$dist"/ 2>/dev/null || cp "$bin" "$dist"/
           tar czf "$dist.tar.gz" "$dist"
@@ -93,7 +93,7 @@ jobs:
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/kaibo.exe"
-          dist="kaibo-${{ github.ref_name }}-${{ matrix.target }}"
+          dist="kaibo-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}" # slashes in a branch ref break mkdir/tar
           mkdir "$dist"
           cp "$bin" "$dist"/
           7z a "$dist.zip" "$dist" >/dev/null
