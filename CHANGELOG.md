@@ -403,7 +403,7 @@ the git log. Each later release appends a new section at the top.
   read-only, with an in-memory scratch filesystem for everything else. Reads are
   scope-bounded to `--root` / `--allow-path` (launch cwd by default), enforced after
   symlink and `..` canonicalization.
-- **Bounded resource use.** Each kaish script is capped (30 s wall-clock, 8 KB
+- **Bounded resource use.** Each kaish script is capped (30 s wall-clock, 64 KiB
   output, 64 MB scratch — over-cap fails loudly, never a silent drop), and the model
   loops stop at turn limits, so a runaway consultation can't melt the machine or the
   budget. All configurable. Attachments are bounded too: a per-file size cap, plus a
