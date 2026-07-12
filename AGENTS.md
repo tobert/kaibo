@@ -250,19 +250,27 @@ even for a one-line doc fix.
   `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
   re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
   `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
-- **kaish pin.** Currently `kaish-kernel = "0.11.0"`. The `0.10.0 → 0.11.0` bump was
-  API-compatible — **zero** kaibo call sites changed. It looks scary in the kaish
-  changelog (four **BREAKING** entries) but none reach kaibo: the new `ToolSchema.raw_argv`
-  and `ExecResult.latch` fields are additive (kaibo builds both via constructors, never
-  struct literals), the `kaish-help` `Fragment` `rank` field only bites code that
-  constructs `Fragment` literals (kaibo doesn't), the latched-`--json` envelope change
-  never fires (kaibo is read-only, so no destructive op ever latches), and the
-  scatter/gather + sed-BRE changes are runtime behavior kaibo has no hand-rolled docs for.
-  The whole agent-facing surface (native collections, `keys`/`values`/`typeof`, the `test`
-  builtin, `help regex`/`help collections`, JSON/JSONL bridges, importance-ranked
-  onboarding) flows in *for free* because kaibo single-sources it from `kaish_kernel::help`
-  — the bump updates the sourced text, no kaibo edits. Under the hood chumsky migrated
-  `1.0.0-alpha.8 → 0.13` (two stale regex crates dropped). Offline suite green (525 tests),
-  boundary tests still have teeth. Precedent that a bump *can* move call sites: `0.8.4 →
-  0.9.0` renamed the `mcp()` config constructors to `agent()` in `sandbox.rs`. Keep this
-  current per the **Working here** kaish-bump discipline before cutting.
+- **kaish pin.** Currently `kaish-kernel = "0.12.0"`. The `0.11.0 → 0.12.0` bump was
+  again API-compatible — **zero** call-site changes, `cargo build`/`clippy`/`cargo tree -i
+  aws-lc-rs` all clean. The changelog's **BREAKING (embedders)** entries all land on
+  compiled-out or unused surface: `ExecContext.tool_schemas` moving `Vec<ToolSchema>` →
+  `Arc<[ToolSchema]>` only bites direct field assignment (kaibo never constructs
+  `ExecContext`), and `JobStatus`/`JobInfo`/`ToolResult` going `#[non_exhaustive]` (plus
+  the new `JobStatus::Latched` variant and `LatchRequest.job_id`) only bites background
+  jobs and confirmation latches — kaibo compiles with `subprocess`/`host`/`os-integration`
+  off, so `bg`/`fg`/`jobs`/`kill`/`spawn` and the whole latch surface don't exist in this
+  binary. Two things *did* change kaibo's own text and code, both improvements landing
+  for free from upstream fixes: `grep -r PATTERN FILE` (GH #105) now searches the file
+  instead of silently finding nothing, so `KAISH_SANDBOX_ADDENDUM`'s single-file caveat
+  (`kaish_syntax.rs`) was stale and dropped, and the matching `docs/issues.md` tracker
+  entry (already shipped) was deleted. And the new `MAX_RECURSION_DEPTH`
+  (48)/`RECOMMENDED_STACK_SIZE` (12 MiB) matched pair — kaish's own guard against a
+  runaway `$(...)`/shell-function/`.kai`-source recursion overflowing the native stack —
+  is now what sizes `KaishWorker`'s dedicated thread in `sandbox.rs`, replacing a
+  hand-picked 16 MiB literal with the constant kaish itself documents for embedders
+  (`docs/EMBEDDING.md` in the kaish tree); live-probed with `f() { f; }; f`, which now
+  fails loudly (`"maximum recursion depth (48) exceeded"`) instead of risking a SIGSEGV.
+  Offline suite green (531 tests), boundary tests still have teeth. Precedent that a bump
+  *can* move call sites: `0.8.4 → 0.9.0` renamed the `mcp()` config constructors to
+  `agent()` in `sandbox.rs`. Keep this current per the **Working here** kaish-bump
+  discipline before cutting.

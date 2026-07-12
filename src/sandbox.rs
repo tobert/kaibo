@@ -44,6 +44,7 @@ use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{ByteBudget, Filesystem, LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{
     IgnoreConfig, Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig, ReadRange,
+    RECOMMENDED_STACK_SIZE,
 };
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
@@ -423,9 +424,13 @@ impl KaishWorker {
 
         std::thread::Builder::new()
             .name("kaibo-kaish".to_string())
-            // kaish parses deeply-recursive ASTs on large inputs; mirror kaish-mcp's
-            // generous stack rather than the default 2 MiB worker stack.
-            .stack_size(16 * 1024 * 1024)
+            // The interpreter recurses on the native stack (command substitution,
+            // shell functions, `.kai` sourcing); `MAX_RECURSION_DEPTH` and
+            // `RECOMMENDED_STACK_SIZE` are a matched pair kaish sizes so its depth
+            // guard trips before a stack overflow (docs/EMBEDDING.md). This thread is
+            // both the tokio driver and, on a current-thread runtime, every worker —
+            // it needs at least that floor, not the default ~2 MiB worker stack.
+            .stack_size(RECOMMENDED_STACK_SIZE)
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()

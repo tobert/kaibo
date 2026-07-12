@@ -90,13 +90,6 @@ were fixed in the deliberate PR (the drifted `max_turns` schema defaults; a test
   immediately — trades away the batch lane's cross-restart durability; don't without the
   persistence decision.
 
-### Bump to kaish-kernel 0.11.0 as soon as it drops
-0.11.0 fixes grep BRE `\|` alternation silently matching nothing — measured live
-2026-07-03 costing a deepseek explorer ~10-15 retry turns in one sweep (mitigated
-meanwhile by the cheatsheet teaching `grep -rnE 'foo|bar'`, which stays valid after
-the bump). Usual bump discipline applies (adapt to any API shape change, boundary
-tests keep teeth).
-
 ### Upstream kaish-vfs: `LocalFs::list` hard-fails when an entry vanishes mid-walk
 `kaish-vfs` `LocalFs::list` (`src/local.rs`, 0.9.0) enumerates a directory with
 `read_dir`, then calls `symlink_metadata` on *each* entry and propagates any error with
