@@ -335,7 +335,7 @@ the git log. Each later release appends a new section at the top.
   read-only FAQ; and Backends/Roles/Casts moved below Tools with a one-line "a cast
   is just a named team" opener.
 
-- **The read-only shell under `consult` / `explore` / `run_kaish` speaks kaish 0.11.**
+- **The read-only shell under `consult` / `explore` / `run_kaish` speaks kaish 0.12.**
   Native collections land in the toolbox the models drive: list/record literals
   (`xs=[a b c]`, `{port: 8080}`), typed subscripts and slices (`${xs[0]}`, `${r[key]}`,
   `${xs[0:2]}`), `keys` / `values` / `typeof` and `[[ -list ]]` / `[[ -record ]]` shape
@@ -346,7 +346,14 @@ the git log. Each later release appends a new section at the top.
   slurp, and redirects work inside `$(...)`. The always-on onboarding now leads with its
   most critical rules and points enumeration at `$(keys …)` / `$(values …)`; `help regex`
   and `help collections` are new one-screen references. All of it arrives through kaibo's
-  single-sourced kaish guidance — no new resident cost.
+  single-sourced kaish guidance — no new resident cost. `grep -r PATTERN FILE` (a single
+  file, not a directory) now actually searches it instead of silently finding nothing, so
+  the cheatsheet's old workaround note is gone; a wider sweep of binary-input operands
+  (`glob --include`, repeated `--include`/`--exclude`, malformed numeric flags, and more)
+  now fail loudly instead of silently misbehaving, matching the read-only sandbox's own
+  no-silent-fallback stance; and a runaway recursive script (`$(...)`, shell functions,
+  `.kai` sourcing) now fails with a clean "maximum recursion depth exceeded" instead of
+  risking a stack overflow.
 
 - **Models read files WHOLE by default, and a truncated giant stages into targeted
   reads.** The explorer, the `consult` driver, and the shared kaish cheatsheet all

@@ -34,9 +34,8 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so just read — files WHOLE by \
-default, `cat -n FILE`. One grep note: `-r` wants a directory \
-(`grep -rn PATTERN src`); on a single file it silently finds nothing — use \
-`grep -n PATTERN FILE`. Each call starts at the project root; \
+default, `cat -n FILE`; `grep -rn PATTERN .` finds matches whether the target is a \
+file or a directory. Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
