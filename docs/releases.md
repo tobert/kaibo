@@ -107,7 +107,15 @@ rendered from `.github/release-body.md` (envsubst on TAG/VERSION, prepended abov
 auto-generated notes) — a package link, the pull + `COPY --from` lines, both
 attestation one-liners, and the cosign bundle verify, all carrying the exact tag so
 nothing needs substituting; it also warns that the package page's `sha256-*` tags are
-cosign signature artifacts, not pullable images (Amy hit exactly that). **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
+cosign signature artifacts, not pullable images (Amy hit exactly that — worse, the
+package page's own install box *offered* that tag, because GitHub advertises the most
+recently published version and the signature lands after the image). The structural
+fix rode the same slice: tag runs now push the image **by digest**, sign and attest
+the digest, then apply the version tags as the job's final act (`buildx imagetools
+create` — a tag-only copy of the signed manifest list), so the newest published
+version — the one the install box shows — is always pullable; the metadata `sha` tag
+is also disabled on tag runs (dispatch-only), keeping a release's tag set to versions
+only. Validated by the next tag. **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
 born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting

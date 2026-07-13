@@ -329,7 +329,10 @@ the git log. Each later release appends a new section at the top.
   carrying that release's exact tag, so nothing needs substituting (the README keeps
   the generic `vX.Y.Z` form). It also points out that the `sha256-*` tags on the
   package page are signature artifacts riding alongside the image, not something to
-  pull.
+  pull — and the publish order now applies the version tags *last*, so the package
+  page's install box always advertises a pullable version tag instead of the
+  signature bundle that lands after the image (copy-pasting it got a confusing
+  mediaType refusal).
 
 ### Changed
 
