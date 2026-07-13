@@ -202,17 +202,14 @@ jobs:
       # the Rekor transparency log — no long-lived key anywhere. Verification
       # REQUIRES the identity flags (a bare verify-blob cannot work for keyless);
       # the exact invocation lives in the README's "Verify a download" section.
-      # Both signature shapes ship: .sig/.pem verifies on cosign v2 and v3, and
-      # the .sigstore.json protobuf bundle is self-contained (cert + signature +
-      # Rekor entry) for a v3 `verify-blob --bundle` that works offline.
+      # One signature shape: the .sigstore.json protobuf bundle, self-contained
+      # (cert + signature + Rekor entry), so `verify-blob --bundle` works offline.
+      # cosign v3 IGNORES the legacy --output-signature/--output-certificate pair
+      # in bundle mode (v0.2.0-rc.2 proved it: warned, wrote nothing) — an operator
+      # without cosign verifies through `gh attestation verify` instead.
       - name: Sign checksums.txt (cosign keyless)
         working-directory: dist
-        run: |
-          cosign sign-blob --yes \
-            --output-signature checksums.txt.sig \
-            --output-certificate checksums.txt.pem \
-            --bundle checksums.txt.sigstore.json \
-            checksums.txt
+        run: cosign sign-blob --yes --bundle checksums.txt.sigstore.json checksums.txt
 
       # SLSA build provenance per artifact, stored in GitHub's attestation store
       # (adds no release assets): `gh attestation verify <file> -R tobert/kaibo`

@@ -110,24 +110,22 @@ against any file from the release:
 gh attestation verify kaibo-v0.2.0-x86_64-unknown-linux-musl.tar.gz -R tobert/kaibo
 ```
 
-With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) (no
-GitHub tooling needed), verify the signed checksum manifest once and it covers
-every file it lists. Grab `checksums.txt`, `checksums.txt.sig`, and
-`checksums.txt.pem` from the release, substituting the tag you downloaded:
+With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) ≥ 3
+(no GitHub tooling needed), verify the signed checksum manifest once and it
+covers every file it lists. Grab `checksums.txt` and `checksums.txt.sigstore.json`
+from the release, substituting the tag you downloaded in the identity:
 
 ```sh
 cosign verify-blob \
-  --certificate checksums.txt.pem \
-  --signature checksums.txt.sig \
+  --bundle checksums.txt.sigstore.json \
   --certificate-identity "https://github.com/tobert/kaibo/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   checksums.txt
 sha256sum -c --ignore-missing checksums.txt
 ```
 
-(cosign ≥ 3 can take the release's `checksums.txt.sigstore.json` instead of the
-`.pem`/`.sig` pair — pass `--bundle checksums.txt.sigstore.json` with the same two
-identity flags; the bundle is self-contained, so that verify works offline.)
+The bundle is self-contained — certificate, signature, and transparency-log
+entry in one file — so that verify works offline.
 
 Each release also carries an SPDX SBOM (`kaibo-<tag>-sbom.spdx.json`) cataloging
 the exact locked dependency tree the binaries were built from.
