@@ -119,7 +119,7 @@ every file it lists. Grab `checksums.txt`, `checksums.txt.sig`, and
 cosign verify-blob \
   --certificate checksums.txt.pem \
   --signature checksums.txt.sig \
-  --certificate-identity "https://github.com/tobert/kaibo/.github/workflows/release.yml@refs/tags/v0.2.0" \
+  --certificate-identity "https://github.com/tobert/kaibo/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   checksums.txt
 sha256sum -c --ignore-missing checksums.txt
