@@ -130,6 +130,51 @@ entry in one file — so that verify works offline.
 Each release also carries an SPDX SBOM (`kaibo-<tag>-sbom.spdx.json`) cataloging
 the exact locked dependency tree the binaries were built from.
 
+### Container image (ghcr)
+
+The same release ships as a multiarch (amd64/arm64) container image,
+[`ghcr.io/tobert/kaibo`](https://github.com/tobert/kaibo/pkgs/container/kaibo) — the fully-static binary
+in a distroless, shell-less, non-root base.
+
+Because the binary links against nothing, the image doubles as a **COPY
+source** — the easiest way to put kaibo into a devcontainer (or any image),
+with zero libc or package-manager concerns:
+
+```dockerfile
+COPY --from=ghcr.io/tobert/kaibo:latest /usr/local/bin/kaibo /usr/local/bin/kaibo
+```
+
+That's the whole install: inside a devcontainer your workspace mount is already
+declared, so kaibo registers as a plain local MCP server from there.
+
+To run the image itself as the MCP server, mount your project read-only at
+`/work` (the image's working directory — kaibo scopes its read access to it)
+and keep stdin open:
+
+```sh
+claude mcp add kaibo -- docker run --rm -i \
+  -u "$(id -u):$(id -g)" \
+  -v "$PWD:/work:ro" \
+  -e DEEPSEEK_API_KEY \
+  ghcr.io/tobert/kaibo:latest
+```
+
+- **`-i` is load-bearing.** kaibo is a stdio MCP server: without `-i`, stdin
+  closes immediately and the container exits 0 in silence — and distroless has
+  no shell to debug into.
+- `-u` runs the container as you so the mount's file permissions line up;
+  podman users want `--userns=keep-id` in its place.
+- Pass provider keys by name (`-e DEEPSEEK_API_KEY`) — the value rides your
+  shell environment, never your MCP config.
+- The `:ro` mount is an OS-enforced belt under kaibo's own read-only sandbox:
+  kaibo never writes either way, this just makes the kernel agree.
+
+The package is public — pulling (and `COPY --from`) needs no registry login.
+The image is signed and attested by the same machinery as the archives — verify
+with `gh attestation verify oci://ghcr.io/tobert/kaibo:<tag> -R tobert/kaibo`,
+or `cosign verify ghcr.io/tobert/kaibo:<tag>` with the same two identity flags
+shown above.
+
 Then register it with your agent. kaibo is a standard stdio MCP server, so any
 MCP-capable client works — Claude Code, Codex CLI, Cline, OpenCode, whatever you
 run. The stanza goes in your client's MCP config; in Claude Code that's `.mcp.json`

@@ -313,6 +313,16 @@ the git log. Each later release appends a new section at the top.
   submit acknowledgement. (Counts are exact on the normal path; the rare turn-cap and
   image-resume paths undercount, since the underlying loop yields no usage on those
   exits — noted in `docs/issues.md`.)
+- **A container image, built to be COPY'd.** Every release now ships
+  `ghcr.io/tobert/kaibo` — multiarch (amd64/arm64), the fully-static binary in a
+  distroless, shell-less, **non-root** base, signed and attested by the same
+  machinery as the archives. Because the binary links against nothing, the image
+  doubles as a one-line install for devcontainers and custom images
+  (`COPY --from=ghcr.io/tobert/kaibo:latest /usr/local/bin/kaibo /usr/local/bin/kaibo`),
+  and running it directly is one documented mount: your project read-only at
+  `/work`. The README's container section has the docker/podman recipes — including
+  the two footguns (`-i` is load-bearing for a stdio server; UID mapping for the
+  read-only mount).
 
 ### Changed
 
