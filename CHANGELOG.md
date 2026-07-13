@@ -397,6 +397,16 @@ the git log. Each later release appends a new section at the top.
 
 ### Security
 
+- **Releases are born signed, and you can check.** Every release now carries three
+  independently verifiable trust artifacts, produced in public CI with no maintainer
+  key to steal: a **cosign keyless signature** over an aggregated `checksums.txt`
+  (verify it once and it covers every file it lists — the signing identity is the
+  release workflow at that exact tag, witnessed by the Sigstore transparency log),
+  **SLSA build provenance** per artifact (`gh attestation verify <file> -R
+  tobert/kaibo`, one command), and an **SPDX SBOM** cataloging the exact locked
+  dependency tree the binaries were built from. The README's "Verify a download"
+  section has the copy-paste invocations, including the identity flags keyless
+  verification requires.
 - **Read-only is structural, not best-effort.** kaibo compiles in only kaish's
   `localfs` axis — `subprocess` / `git` / `host` / `os-integration` are off, so
   `exec` / `spawn` / `git` / `ps` don't exist in the binary — and mounts the project

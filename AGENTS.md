@@ -250,6 +250,10 @@ even for a one-line doc fix.
   `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
   re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
   `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
+  After the release publishes: run the README "Verify a download" commands against a
+  fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
+  identity) — the tag-gated publish job signs releases, and signing an operator can't
+  verify is theater, so prove it the way a user would.
 - **kaish pin.** Currently `kaish-kernel = "0.12.0"`. The `0.11.0 → 0.12.0` bump was
   again API-compatible — **zero** call-site changes, `cargo build`/`clippy`/`cargo tree -i
   aws-lc-rs` all clean. The changelog's **BREAKING (embedders)** entries all land on

@@ -52,7 +52,27 @@ a `cargo tree` TLS-invariant tripwire) and **`v0.2.0-rc.1`, the first-ever relea
 (#63 + tag): the publish job ran for the first time, produced a correctly-**prerelease**
 GitHub release with all 10 assets, and the end-to-end user path verified — download,
 checksum OK, fully static, binary reports `kaibo 0.2.0-rc.1`. The rc exists to prove the
-tag→release leg *before* PR 3, so the real v0.2.0 is born signed. **Next: PR 3.**
+tag→release leg *before* PR 3, so the real v0.2.0 is born signed.
+
+**PR 3 realized — 2026-07-13.** Signing/provenance/SBOM live entirely in the tag-gated
+publish job, so a `workflow_dispatch` smoke run never mints an OIDC identity (build legs
+keep `contents: read`; the publish job adds `id-token: write` + `attestations: write`).
+The layout, decided with Amy: **one signed aggregate `checksums.txt`** (cosign keyless —
+verify once, `sha256sum -c` covers any file it lists; ships both signature shapes,
+`.sig`/`.pem` for cosign v2+v3 and a self-contained `.sigstore.json` bundle for an
+offline v3 `verify-blob --bundle`; the per-artifact `.sha256` sidecars stay for the
+README's download one-liner),
+**per-artifact SLSA provenance** via `actions/attest-build-provenance` (stored in
+GitHub's attestation store — `gh attestation verify <file> -R tobert/kaibo`, zero extra
+assets), and **one SPDX SBOM from `Cargo.lock`** (a bare Rust binary carries nothing for
+syft to read; `cargo-auditable` per-binary SBOMs are a tracked follow-up in
+`docs/issues.md`). README gained a "Verify a download" section with the exact
+invocations — including the identity flags keyless verification requires and
+`--ignore-missing` so a single-file download checks clean. New pins
+(`cosign-installer`, `attest-build-provenance`, `sbom-action`) digest-verified through
+two independent paths. Validation: an rc tag exercising the signing path end-to-end,
+verified with the README's own commands. **Next: PR 4 (ghcr image), and the real
+v0.2.0 — born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
 a release (CHANGELOG retitle, kaish-kernel pin check, `docs/sandbox-probes.md` re-run,
@@ -216,7 +236,8 @@ No framework, no ABI change — sharpen what's already there.
 - Cross-family review (release surface — a real look).
 
 ### PR 3 — keyless signing + SLSA provenance + SBOM (GitHub-native)
-The transparency payoff; all free, no middleman.
+The transparency payoff; all free, no middleman. **Realized 2026-07-13 — details and
+the decided layout in "Where we are now" above.**
 - `cosign` **keyless** signing (`cosign-installer`) over the archives + checksums.
 - **SLSA build provenance** via `actions/attest-build-provenance`; add `id-token: write`
   + `attestations: write`.
