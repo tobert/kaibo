@@ -1,6 +1,6 @@
 # Releasing kaibo — pipeline plan & living record
 
-解剖（かいぼう）ships as a single static-ish binary per platform. This document is the
+kaibo ships as a single static-ish binary per platform. This document is the
 *living* plan for how we build and publish those binaries — the sequence of PRs that
 gets us from "a workflow that has never fired" to "signed, attested releases an agent
 operator can trust." Update it as PRs land; it is the durable map the conversation
