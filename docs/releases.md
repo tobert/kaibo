@@ -58,10 +58,9 @@ tag→release leg *before* PR 3, so the real v0.2.0 is born signed.
 publish job, so a `workflow_dispatch` smoke run never mints an OIDC identity (build legs
 keep `contents: read`; the publish job adds `id-token: write` + `attestations: write`).
 The layout, decided with Amy: **one signed aggregate `checksums.txt`** (cosign keyless —
-verify once, `sha256sum -c` covers any file it lists; ships both signature shapes,
-`.sig`/`.pem` for cosign v2+v3 and a self-contained `.sigstore.json` bundle for an
-offline v3 `verify-blob --bundle`; the per-artifact `.sha256` sidecars stay for the
-README's download one-liner),
+verify once, `sha256sum -c` covers any file it lists; one signature shape, the
+self-contained `.sigstore.json` bundle, which verifies offline with cosign ≥ 3; the
+per-artifact `.sha256` sidecars stay for the README's download one-liner),
 **per-artifact SLSA provenance** via `actions/attest-build-provenance` (stored in
 GitHub's attestation store — `gh attestation verify <file> -R tobert/kaibo`, zero extra
 assets), and **one SPDX SBOM from `Cargo.lock`** (a bare Rust binary carries nothing for
@@ -70,9 +69,16 @@ syft to read; `cargo-auditable` per-binary SBOMs are a tracked follow-up in
 invocations — including the identity flags keyless verification requires and
 `--ignore-missing` so a single-file download checks clean. New pins
 (`cosign-installer`, `attest-build-provenance`, `sbom-action`) digest-verified through
-two independent paths. Validation: an rc tag exercising the signing path end-to-end,
-verified with the README's own commands. **Next: PR 4 (ghcr image), and the real
-v0.2.0 — born signed.**
+two independent paths. Validated live by **`v0.2.0-rc.2`** (fired the whole path first
+try — SBOM → checksums → sign → attest → release, publish job 14s) with all three
+README verification commands proven against its real assets: `gh attestation verify`
+exit 0, `cosign verify-blob --bundle` Verified OK under the tag identity,
+`sha256sum -c --ignore-missing` OK. The rc earned its keep by catching the one kink:
+cosign v3 *ignores* the legacy `--output-signature`/`--output-certificate` flags in
+bundle mode (warned, wrote nothing — the planned `.sig`/`.pem` pair never shipped), so
+the bundle became the only signature shape rather than pinning cosign back to v2 for a
+format it deprecates; `v0.2.0-rc.3` validates the bundle-only invocation. **Next: PR 4
+(ghcr image), and the real v0.2.0 — born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
 a release (CHANGELOG retitle, kaish-kernel pin check, `docs/sandbox-probes.md` re-run,

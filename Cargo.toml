@@ -1,7 +1,7 @@
 [package]
 name = "kaibo"
 description = "解剖 — a two-phase MCP consult agent that explores a read-only filesystem through kaish builtins"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
