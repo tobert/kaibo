@@ -212,6 +212,29 @@ in-process and reliable); the classification covers the user-facing symptom toda
 
 ## P3 — Infra, perf, polish
 
+### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
+The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
+tracker pointer. Direction settled 2026-06-25 (w/ Amy): **stay OSS / GitHub-native** —
+keep the existing native `release.yml` matrix (native macOS, native Windows MSVC, Linux
+musl via zigbuild) on GitHub-hosted runners, harden it (SHA-pin actions, `--version`
+smoke per target, reproducible archives), then add the transparency payoff with free
+GitHub-native tooling: `cosign` **keyless** signing + **SLSA provenance**
+(`actions/attest-build-provenance`) + an **SBOM** (`syft`). **No GoReleaser as the spine**
+(its cross-compile value doesn't apply — macOS can't cross from Linux given
+`security-framework`, so we build native anyway); GoReleaser-OSS is an *optional later*
+back-half **only if** package channels (brew/scoop/winget/nfpm) multiply. **GoReleaser Pro
+and any release-as-a-service are off the table** (the latter doesn't viably exist — see the
+doc's axo note). No Windows ABI change — MSVC stays, so the CLAUDE.md invariant is
+untouched. The **ghcr image is a first-class, early distribution path** (multiarch, non-root
+default, devcontainer-friendly; an OS-enforced containment layer under kaibo's own read-only
+sandbox) — with a companion **`/reconfigure`** host-agent prompt to tame the docker/podman/
+devcontainer `mcp add` config friction (kaibo advises via `kaibo://config`, the host agent
+edits — kaibo can't write configs or run docker). **Going wide is gated on install ease**
+(engineering PRs and even tags land first — `v0.2.0-rc.1` already proved the tag→release
+leg). Sequenced PRs (1 plan doc, 2 harden matrix — both realized 2026-07-05 → **next: 3
+signing/provenance/SBOM** → 4 ghcr image + container UX → 5 channels, gated on demand) in
+the doc; delete this entry when the pipeline ships.
+
 ### `KaishWorker::read_file` is unbounded — stat-then-read growth race
 `sandbox.rs` `Job::Read` slurps the whole file through the VFS with no size cap.
 Both attachment resolvers check `metadata().len()` against their cap/budget *before*
