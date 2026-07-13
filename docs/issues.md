@@ -236,10 +236,11 @@ untouched. The **ghcr image is a first-class, early distribution path** (multiar
 default, devcontainer-friendly; an OS-enforced containment layer under kaibo's own read-only
 sandbox) — with a companion **`/reconfigure`** host-agent prompt to tame the docker/podman/
 devcontainer `mcp add` config friction (kaibo advises via `kaibo://config`, the host agent
-edits — kaibo can't write configs or run docker). **Parked behind the pre-1.0 work** — no
-`v*` tags until release-ready. Sequenced PRs (1 plan doc → 2 harden matrix → 3 signing/
-provenance/SBOM → 4 ghcr image + container UX → 5 channels, gated on demand) in the doc;
-delete this entry when the pipeline ships.
+edits — kaibo can't write configs or run docker). **Going wide is gated on install ease**
+(engineering PRs and even tags land first — `v0.2.0-rc.1` already proved the tag→release
+leg). Sequenced PRs (1 plan doc, 2 harden matrix — both realized 2026-07-05 → **next: 3
+signing/provenance/SBOM** → 4 ghcr image + container UX → 5 channels, gated on demand) in
+the doc; delete this entry when the pipeline ships.
 
 ### `KaishWorker::read_file` is unbounded — stat-then-read growth race
 `sandbox.rs` `Job::Read` slurps the whole file through the VFS with no size cap.
