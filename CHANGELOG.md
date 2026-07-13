@@ -323,6 +323,13 @@ the git log. Each later release appends a new section at the top.
   `/work`. The README's container section has the docker/podman recipes — including
   the two footguns (`-i` is load-bearing for a stdio server; UID mapping for the
   read-only mount).
+- **Release pages you can copy-paste from.** Every release now opens with its own
+  get-and-verify block: the container pull and `COPY --from` lines, both
+  `gh attestation verify` one-liners, and the cosign bundle verification — all
+  carrying that release's exact tag, so nothing needs substituting (the README keeps
+  the generic `vX.Y.Z` form). It also points out that the `sha256-*` tags on the
+  package page are signature artifacts riding alongside the image, not something to
+  pull.
 
 ### Changed
 
