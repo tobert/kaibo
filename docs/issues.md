@@ -232,8 +232,19 @@ devcontainer `mcp add` config friction (kaibo advises via `kaibo://config`, the 
 edits — kaibo can't write configs or run docker). **Going wide is gated on install ease**
 (engineering PRs and even tags land first — `v0.2.0-rc.1` already proved the tag→release
 leg). Sequenced PRs (1 plan doc, 2 harden matrix — realized 2026-07-05; 3 signing/
-provenance/SBOM — realized 2026-07-13 → **next: 4 ghcr image + container UX** → 5
-channels, gated on demand) in the doc; delete this entry when the pipeline ships.
+provenance/SBOM and 4 ghcr image — realized 2026-07-13 → **next: 5 channels, gated on
+demand**; the `/reconfigure` container-UX workstream rides alongside) in the doc;
+delete this entry when the pipeline ships.
+
+### Graceful no-stdin error for the container case
+`docker run` without `-i` hands kaibo a closed stdin: the MCP server sees immediate
+EOF and exits 0 in silence — the hardest failure to debug in a distroless image with
+no shell (the entrypoint IS the binary, so this is a kaibo code change, deferred out
+of pipeline PR 4; the README documents the footgun loudly meanwhile). Fix shape: when
+stdin reaches EOF before *any* MCP traffic arrived, say so on stderr ("stdin closed
+before the MCP handshake — in a container, did you forget `-i`?") and exit non-zero;
+after real traffic, EOF stays a normal shutdown. Stderr is the right channel (a host
+that captures it shows the operator; nothing breaks for hosts that don't).
 
 ### `cargo-auditable` — per-binary SBOMs
 The release SBOM is generated from `Cargo.lock` (one SPDX document covering all

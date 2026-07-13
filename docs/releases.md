@@ -77,8 +77,30 @@ exit 0, `cosign verify-blob --bundle` Verified OK under the tag identity,
 cosign v3 *ignores* the legacy `--output-signature`/`--output-certificate` flags in
 bundle mode (warned, wrote nothing — the planned `.sig`/`.pem` pair never shipped), so
 the bundle became the only signature shape rather than pinning cosign back to v2 for a
-format it deprecates; `v0.2.0-rc.3` validates the bundle-only invocation. **Next: PR 4
-(ghcr image), and the real v0.2.0 — born signed.**
+format it deprecates; `v0.2.0-rc.3` validated the bundle-only invocation end-to-end
+(all verification commands green against real assets, negative tests refused loudly,
+SBOM real — 370 packages, ring present, aws-lc absent: the TLS invariant is now
+visible in every release).
+
+**PR 4 realized — 2026-07-13, same day** (pulled forward by Amy). The ghcr image ships
+from a new tag-gated-publish `image` job: multiarch amd64+arm64 assembled from the
+per-arch musl release binaries (pure `COPY`, no emulation), `FROM
+gcr.io/distroless/static:nonroot` **pinned by manifest digest**, non-root, CA certs
+present for the outbound provider calls. The image is **born signed** — `cosign sign`
+on the manifest digest plus `attest-build-provenance` pushed to the registry, the PR-3
+machinery aimed at OCI. The Dockerfile is written as a **COPY-source contract**
+(`COPY --from=ghcr.io/tobert/kaibo:latest /usr/local/bin/kaibo …` — the fully-static
+binary is what makes this a one-liner into any devcontainer or image), `WORKDIR /work`
+as the canonical read-only project mount. The job build+smokes on a branch dispatch
+(boots the amd64 image, `--version`) with push/sign/attest tag-gated, so dispatch never
+publishes. README gained the container section: the COPY recipe, the
+`docker run --rm -i -u … -v "$PWD:/work:ro"` MCP registration, podman
+`--userns=keep-id`, and the `-i`-is-load-bearing warning. One-time operator step after
+the first push: flip the ghcr package visibility to **public** (packages created by a
+workflow default private). `v0.2.0-rc.4` validates the image path end-to-end, including
+a live consult *through the pulled image* (which exercises the distroless TLS-cert
+question for real). **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
+born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
 a release (CHANGELOG retitle, kaish-kernel pin check, `docs/sandbox-probes.md` re-run,
@@ -254,7 +276,10 @@ the decided layout in "Where we are now" above.**
 
 ### PR 4 — ghcr distroless image (multiarch, non-root) — a first-class distribution path
 Lands *after* signing so the image is **born signed** — we don't ship an unsigned primary
-artifact.
+artifact. **Realized 2026-07-13 — see "Where we are now"; the graceful no-stdin error
+moved to `docs/issues.md`** (it's a kaibo code change — the entrypoint *is* the binary in
+a shell-less image — not pipeline YAML; the README documents the `-i` footgun loudly in
+the meantime).
 - **Multiarch `amd64`+`arm64`** manifest `FROM gcr.io/distroless/static:nonroot`, copying
   the static musl binaries already built per-arch; `USER nonroot`. Push to
   `ghcr.io/tobert/kaibo` (+`latest`); `cosign` signs the image with the PR 3 machinery.
