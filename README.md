@@ -97,6 +97,41 @@ install -m 0755 kaibo ~/.local/bin/    # anywhere on your PATH
 Prefer building from source? `git clone https://github.com/tobert/kaibo` and
 `cargo install --path kaibo` with a Rust toolchain ≥ 1.85 produces the same binary.
 
+### Verify a download
+
+Every release is born signed in public CI: the signing identity *is* the release
+workflow at that tag, witnessed by the Sigstore transparency log — no maintainer
+key to steal or trust. Two independent checks; either one is sufficient.
+
+With the [`gh` CLI](https://cli.github.com/), SLSA build provenance is one command
+against any file from the release:
+
+```sh
+gh attestation verify kaibo-v0.2.0-x86_64-unknown-linux-musl.tar.gz -R tobert/kaibo
+```
+
+With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) (no
+GitHub tooling needed), verify the signed checksum manifest once and it covers
+every file it lists. Grab `checksums.txt`, `checksums.txt.sig`, and
+`checksums.txt.pem` from the release, substituting the tag you downloaded:
+
+```sh
+cosign verify-blob \
+  --certificate checksums.txt.pem \
+  --signature checksums.txt.sig \
+  --certificate-identity "https://github.com/tobert/kaibo/.github/workflows/release.yml@refs/tags/v0.2.0" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  checksums.txt
+sha256sum -c --ignore-missing checksums.txt
+```
+
+(cosign ≥ 3 can take the release's `checksums.txt.sigstore.json` instead of the
+`.pem`/`.sig` pair — pass `--bundle checksums.txt.sigstore.json` with the same two
+identity flags; the bundle is self-contained, so that verify works offline.)
+
+Each release also carries an SPDX SBOM (`kaibo-<tag>-sbom.spdx.json`) cataloging
+the exact locked dependency tree the binaries were built from.
+
 Then register it with your agent. kaibo is a standard stdio MCP server, so any
 MCP-capable client works — Claude Code, Codex CLI, Cline, OpenCode, whatever you
 run. The stanza goes in your client's MCP config; in Claude Code that's `.mcp.json`

@@ -11,6 +11,11 @@
 # Actions are pinned by commit SHA, not tag — a tag can be moved, a digest can't
 # (supply-chain). Each pin carries a `# vX.Y.Z` comment naming the release it points
 # at, for humans and Dependabot.
+#
+# Releases are born signed: the publish job cosign-signs an aggregated
+# checksums.txt (keyless — the identity IS this workflow at this tag), attaches
+# SLSA build provenance per artifact (`gh attestation verify`), and ships an SPDX
+# SBOM from Cargo.lock. Verification commands live in the README.
 name: release
 
 on:
@@ -148,6 +153,8 @@ jobs:
             kaibo-*.tar.gz*
             kaibo-*.zip*
 
+  # Signing, provenance, and the SBOM all live here in the tag-gated publish job —
+  # a `workflow_dispatch` smoke run never mints an OIDC identity or a signature.
   release:
     name: publish release
     needs: build
@@ -155,11 +162,70 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload assets
+      id-token: write # mint the OIDC identity cosign + provenance sign with
+      attestations: write # store the build-provenance attestations
     steps:
+      # Checkout is here only for Cargo.lock: the SBOM catalogs the locked
+      # dependency tree, which covers every target (the lockfile is a superset
+      # including each platform's conditional deps). The binaries themselves
+      # carry no dependency metadata for syft to read — that would take
+      # cargo-auditable, tracked as a follow-up in docs/issues.md.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
+
+      - name: SBOM (syft over Cargo.lock)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          file: Cargo.lock
+          format: spdx-json
+          output-file: dist/kaibo-${{ github.ref_name }}-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # One aggregated manifest so the signature below covers every artifact
+      # transitively: verify checksums.txt once, then `sha256sum -c` whichever
+      # file you downloaded. The per-artifact .sha256 sidecars stay — the
+      # README's download one-liner uses them.
+      - name: Aggregate checksums
+        working-directory: dist
+        run: sha256sum kaibo-*.tar.gz kaibo-*.zip kaibo-*-sbom.spdx.json > checksums.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless: the signature binds to this workflow run's OIDC identity (repo,
+      # workflow path, tag ref) via a short-lived Fulcio certificate, recorded in
+      # the Rekor transparency log — no long-lived key anywhere. Verification
+      # REQUIRES the identity flags (a bare verify-blob cannot work for keyless);
+      # the exact invocation lives in the README's "Verify a download" section.
+      # Both signature shapes ship: .sig/.pem verifies on cosign v2 and v3, and
+      # the .sigstore.json protobuf bundle is self-contained (cert + signature +
+      # Rekor entry) for a v3 `verify-blob --bundle` that works offline.
+      - name: Sign checksums.txt (cosign keyless)
+        working-directory: dist
+        run: |
+          cosign sign-blob --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem \
+            --bundle checksums.txt.sigstore.json \
+            checksums.txt
+
+      # SLSA build provenance per artifact, stored in GitHub's attestation store
+      # (adds no release assets): `gh attestation verify <file> -R tobert/kaibo`
+      # is the one-command per-file verification path.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/kaibo-*.tar.gz
+            dist/kaibo-*.zip
+            dist/kaibo-*-sbom.spdx.json
+            dist/checksums.txt
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:

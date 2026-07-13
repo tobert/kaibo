@@ -231,9 +231,19 @@ sandbox) — with a companion **`/reconfigure`** host-agent prompt to tame the d
 devcontainer `mcp add` config friction (kaibo advises via `kaibo://config`, the host agent
 edits — kaibo can't write configs or run docker). **Going wide is gated on install ease**
 (engineering PRs and even tags land first — `v0.2.0-rc.1` already proved the tag→release
-leg). Sequenced PRs (1 plan doc, 2 harden matrix — both realized 2026-07-05 → **next: 3
-signing/provenance/SBOM** → 4 ghcr image + container UX → 5 channels, gated on demand) in
-the doc; delete this entry when the pipeline ships.
+leg). Sequenced PRs (1 plan doc, 2 harden matrix — realized 2026-07-05; 3 signing/
+provenance/SBOM — realized 2026-07-13 → **next: 4 ghcr image + container UX** → 5
+channels, gated on demand) in the doc; delete this entry when the pipeline ships.
+
+### `cargo-auditable` — per-binary SBOMs
+The release SBOM is generated from `Cargo.lock` (one SPDX document covering all
+targets — a bare Rust binary carries no dependency metadata for syft to read).
+Building with `cargo auditable` would embed the dep tree in each binary, letting
+syft/`cargo audit` catalog *the artifact itself* rather than trusting the lockfile
+rode along honestly. Deliberately deferred from the signing PR (2026-07-13, w/ Amy):
+it changes the build invocation on all five legs (including through `cargo zigbuild`
+— compatibility unverified) and deserves its own validation dispatches. Do it when
+the audit story matters more than the extra moving part.
 
 ### `KaishWorker::read_file` is unbounded — stat-then-read growth race
 `sandbox.rs` `Job::Read` slurps the whole file through the VFS with no size cap.
