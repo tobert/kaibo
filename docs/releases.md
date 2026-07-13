@@ -97,9 +97,25 @@ publishes. README gained the container section: the COPY recipe, the
 `docker run --rm -i -u … -v "$PWD:/work:ro"` MCP registration, podman
 `--userns=keep-id`, and the `-i`-is-load-bearing warning. One-time operator step after
 the first push: flip the ghcr package visibility to **public** (packages created by a
-workflow default private). `v0.2.0-rc.4` validates the image path end-to-end, including
-a live consult *through the pulled image* (which exercises the distroless TLS-cert
-question for real). **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
+workflow default private). `v0.2.0-rc.4` validated the image path end-to-end — first
+ghcr push/sign/attest all green, image pulled and multiarch-confirmed, cosign +
+`gh attestation verify oci://` both pass under the tag identity, and a **live consult
+through the pulled container** answered with its provenance footer (the distroless
+TLS-cert question, settled for real). Follow-on slice, prompted by Amy reading the
+package page: **the release page now leads with per-tag get + verify commands**
+rendered from `.github/release-body.md` (envsubst on TAG/VERSION, prepended above the
+auto-generated notes) — a package link, the pull + `COPY --from` lines, both
+attestation one-liners, and the cosign bundle verify, all carrying the exact tag so
+nothing needs substituting; it also warns that the package page's `sha256-*` tags are
+cosign signature artifacts, not pullable images (Amy hit exactly that — worse, the
+package page's own install box *offered* that tag, because GitHub advertises the most
+recently published version and the signature lands after the image). The structural
+fix rode the same slice: tag runs now push the image **by digest**, sign and attest
+the digest, then apply the version tags as the job's final act (`buildx imagetools
+create` — a tag-only copy of the signed manifest list), so the newest published
+version — the one the install box shows — is always pullable; the metadata `sha` tag
+is also disabled on tag runs (dispatch-only), keeping a release's tag set to versions
+only. Validated by the next tag. **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
 born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
