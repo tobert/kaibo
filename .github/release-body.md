@@ -25,7 +25,8 @@ cosign signature/attestation artifacts riding alongside the image, not images.)
 
 ## Verify it
 
-Every artifact carries SLSA build provenance — any downloaded file, one command:
+Run these from the folder holding your downloads. Every artifact carries SLSA
+build provenance — any downloaded file, one command:
 
 ```sh
 gh attestation verify kaibo-${TAG}-x86_64-unknown-linux-musl.tar.gz -R tobert/kaibo
