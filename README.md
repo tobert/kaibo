@@ -169,6 +169,7 @@ claude mcp add kaibo -- docker run --rm -i \
 - The `:ro` mount is an OS-enforced belt under kaibo's own read-only sandbox:
   kaibo never writes either way, this just makes the kernel agree.
 
+The package is public — pulling (and `COPY --from`) needs no registry login.
 The image is signed and attested by the same machinery as the archives — verify
 with `gh attestation verify oci://ghcr.io/tobert/kaibo:<tag> -R tobert/kaibo`,
 or `cosign verify ghcr.io/tobert/kaibo:<tag>` with the same two identity flags

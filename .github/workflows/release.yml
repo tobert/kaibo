@@ -290,9 +290,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tag policy: the full semver always (0.2.0-rc.4, 0.2.0); major.minor and
-      # `latest` only for a stable release (metadata-action skips prereleases for
-      # both — an rc must never become somebody's `latest`). The sha tag exists so
-      # a dispatch run has a well-formed (never-pushed) reference.
+      # `latest` only for a stable release. Verified in metadata-action's source at
+      # the pinned SHA (meta.ts procSemver): a prerelease DEGRADES every semver
+      # pattern to {{version}} and holds `latest` false — so an rc never becomes
+      # somebody's `latest` or `0.2`. The sha tag exists so a dispatch run has a
+      # well-formed (never-pushed) reference.
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
