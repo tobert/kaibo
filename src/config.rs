@@ -1495,20 +1495,21 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         let (explorer, synth) = default_models(kind);
         // OpenRouter's vision classifier defaults false (the gateway fronts blind and
         // sighted models alike — it's a property of the pinned model, not the wire), so
-        // the built-in cast opts its slots in: both default ids (`~google/gemini-flash-latest`,
-        // `~anthropic/claude-sonnet-latest`) advertise `image` in `architecture.input_modalities`
-        // in OpenRouter's catalog (verified 2026-07-03). Every other built-in kind is
-        // classified correctly by default, so it needs no pin.
-        let vision = matches!(kind, ProviderKind::OpenRouter).then_some(true);
-        let slot = |id| ModelSlot {
+        // a multimodal default id must opt its slot in. The Qwen default splits by role:
+        // explorer `qwen/qwen3.6-flash` advertises `image` in `architecture.input_modalities`
+        // (verified 2026-07-15) so it pins vision on, while synth `qwen/qwen3.7-max` is
+        // text-only — its slot leaves `vision: None`, letting the classifier's `false`
+        // stand. Every other built-in kind is classified correctly by default, needing no pin.
+        let slot = |id, vision| ModelSlot {
             vision,
             ..ModelSlot::bare(&name, id)
         };
+        let or = matches!(kind, ProviderKind::OpenRouter);
         // Both agent roles are seeded. A cast may omit one in config — absent means
         // the capability is absent, and nothing downstream errors on that.
         let slots = BTreeMap::from([
-            (ModelRole::Explorer, slot(explorer)),
-            (ModelRole::Synth, slot(synth)),
+            (ModelRole::Explorer, slot(explorer, or.then_some(true))),
+            (ModelRole::Synth, slot(synth, None)),
         ]);
         m.insert(name.clone(), Cast { name, slots });
     }
@@ -1567,12 +1568,18 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         ProviderKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
         ProviderKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
         ProviderKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
-        // OpenRouter serves `~author/family-latest` aliases as real catalog entries
-        // that track the newest family member, so these don't rot as ids retire.
-        ProviderKind::OpenRouter => (
-            "~google/gemini-flash-latest",
-            "~anthropic/claude-sonnet-latest",
-        ),
+        // OpenRouter's job here is a family we *can't* reach directly (we key
+        // DeepSeek, Gemini, and Anthropic on their own backends), so the gateway
+        // default is Qwen — a distinct lineage for a genuine cross-family read.
+        // OpenRouter serves no `~qwen/*-latest` router alias (only anthropic /
+        // google / moonshotai / openai / x-ai get those), so we pin the *undated*
+        // family ids, which are the most rot-resistant Qwen ids available — each
+        // tracks the newest point-release until the next `.x` bump. Explorer is the
+        // cheap multimodal flash; synth is the flagship reasoner `qwen3.7-max`,
+        // which is text-only (hence the synth slot takes no vision pin below). If
+        // you'd rather keep vision on the synth, swap in the multimodal plus tier
+        // `qwen/qwen3.7-plus` (weaker reasoner, ~4.5× cheaper) and pin its vision on.
+        ProviderKind::OpenRouter => ("qwen/qwen3.6-flash", "qwen/qwen3.7-max"),
         ProviderKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
@@ -2813,16 +2820,16 @@ mod tests {
     }
 
     /// The OpenRouter built-in: a keyed backend (OPENROUTER_API_KEY, no configurable
-    /// base URL) and a cast pinning the drift-resistant `~author/family-latest` aliases,
-    /// with `vision` opted in on both slots (OpenRouter's classifier defaults false, but
-    /// both default models are multimodal — see the cast comment). Pins the whole
-    /// built-in so a bad default fails here, not mid-call.
+    /// base URL) and a Qwen cast — a family we can't reach directly. Explorer is the
+    /// multimodal flash (vision pinned on, since OpenRouter's classifier defaults false),
+    /// synth is the text-only flagship `qwen3.7-max` (no vision pin — classifier's false
+    /// stands). Pins the whole built-in so a bad default fails here, not mid-call.
     #[test]
     fn builtin_openrouter_cast_and_backend() {
         let cfg = Config::builtin();
         let (explorer, synth) = default_models(ProviderKind::OpenRouter);
-        assert_eq!(explorer, "~google/gemini-flash-latest");
-        assert_eq!(synth, "~anthropic/claude-sonnet-latest");
+        assert_eq!(explorer, "qwen/qwen3.6-flash");
+        assert_eq!(synth, "qwen/qwen3.7-max");
 
         let cast = cfg.resolve_cast("openrouter").unwrap();
         let e = cast.require_slot(ModelRole::Explorer).unwrap();
@@ -2832,8 +2839,8 @@ mod tests {
             ("openrouter", explorer)
         );
         assert_eq!((s.backend.as_str(), s.id.as_str()), ("openrouter", synth));
-        assert_eq!(e.vision, Some(true), "explorer model is multimodal-in");
-        assert_eq!(s.vision, Some(true), "synth model is multimodal-in");
+        assert_eq!(e.vision, Some(true), "explorer flash is multimodal-in");
+        assert_eq!(s.vision, None, "text-only synth leaves the classifier's false to stand");
 
         let b = cfg.resolve_backend("openrouter").unwrap();
         assert_eq!(b.kind, ProviderKind::OpenRouter);

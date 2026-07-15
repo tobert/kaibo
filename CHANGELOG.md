@@ -288,9 +288,13 @@ the git log. Each later release appends a new section at the top.
   live: effort rides through the gateway and bills real reasoning tokens). Setting a
   slot's `effort = "none"` sends OpenRouter's structural disable
   (`{"reasoning": {"enabled": false}}`), so the opt-out doesn't depend on how the
-  gateway's effort ladder happens to read the string. The built-in cast pins
-  OpenRouter's `~author/family-latest` catalog aliases, so it stays current as new
-  models ship instead of rotting on a dated id. Every OpenRouter call carries an
+  gateway's effort ladder happens to read the string. The built-in cast defaults to
+  **Qwen** (explorer `qwen/qwen3.6-flash`, synth `qwen/qwen3.7-max`) — a family kaibo
+  can't reach directly, so the gateway earns its keep with a distinct lineage for a
+  genuine cross-family read, rather than re-serving the Gemini/Claude you already have
+  keyed. OpenRouter serves no `~qwen/*-latest` router alias, so the cast pins the
+  undated family ids — the most rot-resistant Qwen ids available (each tracks the
+  newest point-release until the next `.x`). Every OpenRouter call carries an
   explicit prompt-cache breakpoint, so Anthropic-family models behind the gateway
   bill their (large, resident) system preamble at cache-read rates instead of full
   input price every turn — providers whose caching is implicit simply ignore it.

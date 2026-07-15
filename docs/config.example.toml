@@ -338,8 +338,9 @@ explorer = { backend = "deepseek", id = "deepseek-v4-flash", temperature = 0.0, 
 synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
 
 # --- The built-in `openrouter` backend already has a key source, so a custom cast on
-#     it needs only slots. `~author/family-latest` aliases (see the built-in `openrouter`
-#     cast) track the newest release instead of rotting; `effort = "xhigh"` here pushes
+#     it needs only slots. `~author/family-latest` aliases (OpenRouter serves them for
+#     anthropic/google/openai/x-ai/moonshotai — not every family) track the newest
+#     release instead of rotting; `effort = "xhigh"` here pushes
 #     the synth slot past [defaults] synth_effort ("high") into a rung only OpenRouter's
 #     unified reasoning param reaches. The same knob is the opt-out: reasoning is on by
 #     default for everything kaibo calls, and `effort = "none"` on a slot turns it off

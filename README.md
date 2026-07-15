@@ -353,7 +353,7 @@ merges over them by name. The built-ins are:
 | `anthropic` *(default)* | `claude-haiku-4-5` | `claude-sonnet-4-6` |
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-pro` |
 | `gemini` | `gemini-flash-lite-latest` | `gemini-3.5-flash` |
-| `openrouter` | `~google/gemini-flash-latest` | `~anthropic/claude-sonnet-latest` |
+| `openrouter` | `qwen/qwen3.6-flash` | `qwen/qwen3.7-max` |
 | `openai-local` | local Gemma (small) | local Gemma (large) |
 | `anthropic-batch` | — | `claude-opus-4-8` (batch lane) |
 | `gemini-batch` | — | `gemini-pro-latest` (batch lane) |
