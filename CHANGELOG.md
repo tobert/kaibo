@@ -352,6 +352,20 @@ the git log. Each later release appends a new section at the top.
   `KAIBO_STATE_DB` / `[persistence] path`. If the store can't open, kaibo **fails to start
   loudly** naming that escape hatch rather than silently losing your sessions. The db is a
   convenience layer, safe to delete. See `docs/config.md`.
+- **A CLI front door: `kaibo consult` and `kaibo config`.** kaibo now answers without
+  an MCP client: `kaibo consult "question" [--cast … --attach … --session … --json]`
+  runs the same read-only investigation from the command line — for agents that shell
+  out instead of speaking MCP (pi, scripts, CI) and for humans. The answer (with the
+  usual provenance footer) goes to **stdout**; progress and logs go to **stderr**, so
+  piping stays clean; `--json` emits a structured `{answer, cast, models, usage}`
+  envelope for script callers. Exit codes tell the truth: `0` answer, `2` usage/config
+  error, `3` containment/setup rejection, `4` consultation failure. `--session NAME`
+  rides the persistent store, so a thread started over MCP continues on the CLI and
+  vice versa; a stateless consult never touches the db. `kaibo config` prints the
+  resolved configuration (what `kaibo://config` shows). Bare `kaibo` still runs the
+  MCP server exactly as before — existing client configs are untouched (`kaibo serve`
+  is the explicit spelling). More subcommands (`oneshot`, `explore`, `kaish`, batch)
+  follow.
 
 ### Changed
 
