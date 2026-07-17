@@ -210,6 +210,31 @@ longer *mislabelled* — but the cleaner fix is to spawn the driver's kernel in 
 to `McpError::internal_error`, matching `run_kaish`. Low priority (kernel build is
 in-process and reliable); the classification covers the user-facing symptom today.
 
+### Turn-level retry on a malformed tool call (transient generation glitch)
+A single `MalformedFunctionCall` from a provider fails the whole phase, discarding an
+in-flight dossier/investigation — observed live: a Gemini Flash explorer died mid-
+`deliberate` emitting an *empty* function call. That's a generation glitch (the model
+fumbled one tool call), not a schema/content rejection, so the current
+`consultation_failed` advice — "retrying is unlikely to help" — is wrong for this class.
+Fix: a **bounded turn-level re-prompt (1–2 attempts)** before failing the phase, plus
+split the failure classification so a malformed-tool-call/generation glitch steers toward
+retry while a genuine schema/content rejection keeps the don't-bother advice. Seams:
+`run_phase` (`consult/engine.rs`) for the re-prompt, `render.rs::classify_failure` for the
+advice split. Distinct from the upstream rig retry/backoff entry above — that's transport-
+level 429/503 backoff; this is a mid-loop model fumble kaibo can re-prompt around itself.
+Surfaced by the DeepSeek CLI-subcommands review (2026-07-17).
+
+### Dossier checkpointing via the persistence store
+`deliberate`'s dossier (the synchronous explorer sweep) is the expensive artifact — minutes
+of live exploration — yet it lives only in memory until the offline synth consumes it.
+Persist it to the state store (`src/store.rs`) on completion so a **failed synth hand-off
+can resubmit without re-exploring**, and a mid-explore failure can resume from the last
+checkpoint. Natural follow-on to the persistent session/batch store: a lean text artifact
+keyed by a deliberation/job id, disposable like the rest of the store (convenience, never
+source of truth). Dovetails the "deliberate dossier vs. caller timeout" entry above — a
+persisted dossier also survives the caller dropping the connection. Surfaced by the
+DeepSeek CLI-subcommands review (2026-07-17).
+
 ## P3 — Infra, perf, polish
 
 ### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)

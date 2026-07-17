@@ -66,6 +66,17 @@ project and cannot run external commands.
   levers. Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
   `..` resolved) into the allowed set (`--root` / `--allow-path`, launch cwd when unset).
   Enforced in `server.rs::resolve_root`, with tests in `tests/containment.rs`.
+- **Operator surface vs. the model team — do not blur.** The trust model the whole
+  design rests on: the model-facing shell cannot modify the world (unconditional, above),
+  and kaibo acts only on *kaibo's own* things (the XDG state dir today) through
+  individually-gated, narrow surfaces — the project untouchable from every path. The line
+  this draws: kaibo's **tools** (the MCP verbs, the CLI subcommands) are the **operator**
+  surface — the client model / CLI caller sees kaibo's own state and config (sessions,
+  batch handles, `kaibo://config`) because it is the operator's proxy. The **inner model
+  team** (explorer/synth) never does: it works one question, and kaibo state spans
+  projects, so surfacing it to a cast is a cross-project leak. Concretely — **model-facing
+  kaish never grows `jobs`/`ps` or any kaibo-state builtin**; operator job/state visibility
+  lives only in the tools (MCP, CLI, later the REPL), never in the shell we hand a model.
 - **Persistence engine (turso) — do not weaken.** Pure-Rust `turso`, **exact-pinned**
   (`=0.7.x` — `.db-tshm` format and API both drift between releases) with
   **`default-features = false`** (defaults pull mimalloc's global-allocator hijack + fts)

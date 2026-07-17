@@ -270,6 +270,37 @@ impl Resolver {
         }
     }
 
+    /// Refuse `batch_submit` (`kaibo batch submit`) on a cast whose synth isn't on the
+    /// `batch` lane specifically — the other half of the lane split. A batch cast must
+    /// positively declare `lane = "batch"` on its synth slot, so an ordinary interactive
+    /// cast is never silently batched (an accidental Opus/Pro batch is just as costly the
+    /// other way), and a `direct` cast — offline, but not batch — gets its own honest
+    /// message rather than the generic "not a batch cast" one. Points the caller at the
+    /// built-in batch casts.
+    pub(crate) fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
+        match cast.synth_lane() {
+            Some(Lane::Batch) => Ok(()),
+            Some(Lane::Direct) => Err(McpError::invalid_params(
+                format!(
+                    "cast `{}`'s synth runs on the `direct` lane, not `batch` — \
+                     `batch_submit` needs a synth slot with `lane = \"batch\"`.",
+                    cast.name
+                ),
+                None,
+            )),
+            None => Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` is not a batch cast — `batch_submit` needs a cast whose synth \
+                     slot declares `lane = \"batch\"` (the built-ins `gemini-batch`, \
+                     `anthropic-batch`, or your own in config.toml). For an interactive \
+                     answer, use `consult`/`oneshot`.",
+                    cast.name
+                ),
+                None,
+            )),
+        }
+    }
+
     /// Apply a per-call model override to one of `cast`'s slots.
     ///
     /// The model id rides *verbatim* — an id containing `/` (HuggingFace-style
@@ -538,6 +569,33 @@ impl Resolver {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
+    /// stage): read-WHOLE directives, never inlined bytes — budget 0, so no file is read
+    /// here at all. Images are refused up front: the sweep toolset carries no `view_image`,
+    /// so naming one would send the investigator down a dead end (`cat` refuses binary).
+    /// Uses the resolver's own sandbox config for the read-only VFS.
+    pub(crate) async fn resolve_sweep_attachments(
+        &self,
+        root: &Path,
+        attach: &[String],
+        tool: &str,
+    ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
+        let attachments =
+            Self::resolve_consult_attachments(root, attach, 0, &self.config.sandbox).await?;
+        if let Some(img) = attachments.iter().find(|a| a.is_image()) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "attached file {} is an image, but {tool}'s investigator reads through \
+                     the shell and can't view images — attach it to `consult` with a \
+                     vision-capable cast instead",
+                    img.path()
+                ),
+                None,
+            ));
+        }
+        Ok(attachments)
     }
 
     /// Refuse an image attachment to a vision-blind consult synth. consult never

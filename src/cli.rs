@@ -17,10 +17,11 @@
 //!   argument, an unknown or wrong-for-the-tool cast, an image on a vision-blind cast
 //!   (also clap's own arg-parse errors, and config load); `3` = a **setup/containment**
 //!   rejection — a path or attachment outside the allowed set, a missing/unbuildable
-//!   provider key; `4` = the consultation itself ran and failed (provider/model-loop).
-//!   So an agent branches on the code without parsing prose. (An arg-parse error is
-//!   clap's: usage on stderr, exit 2, nothing on stdout — the envelope is guaranteed
-//!   only once args parse.)
+//!   provider key; `4` = the work ran and failed at runtime (a provider/model-loop
+//!   failure, or a `kaish` worker infra crash). So an agent branches on the code without
+//!   parsing prose. (An arg-parse error is clap's: usage on stderr, exit 2, nothing on
+//!   stdout — the envelope is guaranteed only once args parse. And `kaibo kaish` passes
+//!   through kaish's own exit code on a normal run — 0/126 blocked/124 timed out.)
 //!
 //! `--help` is model-facing text: an agent reads it the way an MCP client reads a
 //! tool description, so the top-level `about` front-loads what kaibo is and every
@@ -30,12 +31,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
+use rig_core::completion::Usage;
 use rmcp::ErrorData as McpError;
 
+use crate::batch::{BatchItem, BatchPoll};
 use crate::config::{Config, ModelRole, ToolDisables};
-use crate::consult::{consult, ConsultConfig, ConsultOutput, ExploreConfig, PhaseContext};
+use crate::consult::{
+    batch_system_prompt, consult, explore_with, oneshot as run_oneshot_engine, ConsultConfig,
+    ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
+};
 use crate::progress::TerminalSink;
-use crate::server::{consultation_failure_text, render_config_resource, with_provenance, Resolver};
+use crate::sandbox::KaishWorker;
+use crate::server::{
+    batch_within_window, consultation_failure_text, now_epoch_secs, render_config_resource,
+    with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
+};
 use crate::session::{SessionStore as MemSessionStore, Sessions};
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
@@ -47,7 +57,10 @@ pub const EXIT_USAGE: i32 = 2;
 /// A setup/containment rejection: a `--path`/`--root`/attachment outside the allowed
 /// boundary, or a missing/unbuildable provider key.
 pub const EXIT_SETUP: i32 = 3;
-/// The consultation ran but failed (provider overload, model-loop error, timeout).
+/// The work ran but failed at runtime: a consultation failure (provider overload,
+/// model-loop error, timeout), or a `kaish` worker infra failure (kernel crash/panic,
+/// worker channel closed) — distinct from a pre-flight rejection above. Note a normal
+/// kaish script/blocked/timeout outcome is not this: it returns kaish's own exit code.
 pub const EXIT_CONSULT_FAILURE: i32 = 4;
 
 /// kaibo (解剖) — read-only codebase consultation from a model outside your own
@@ -87,6 +100,15 @@ pub enum Command {
     Serve(ServeGates),
     /// Ask one read-only consultation question; the cited answer prints to stdout.
     Consult(ConsultArgs),
+    /// A toolless second opinion: no codebase access, the model answers from your prompt
+    /// (plus piped stdin and `--attach` files) and its own knowledge.
+    Oneshot(OneshotArgs),
+    /// Survey the codebase and print a cited report (the evidence half of consult).
+    Explore(ExploreArgs),
+    /// Run one kaish (sh-like) command against the read-only project and print its output.
+    Kaish(KaishArgs),
+    /// Provider batch lanes — submit a fan-out, get results, list live/recovered handles.
+    Batch(BatchArgs),
     /// Print the resolved runtime configuration (the `kaibo://config` document).
     Config,
 }
@@ -247,6 +269,161 @@ pub struct ConsultArgs {
     pub json: bool,
 }
 
+/// `kaibo oneshot` — a toolless second opinion from a model outside your family. No
+/// codebase access: the model answers from your prompt (plus any context piped on
+/// stdin, `… < notes.md`) and `--attach`ed files. Pick the answering team with `--cast`.
+#[derive(Args, Debug)]
+pub struct OneshotArgs {
+    /// The prompt to send the model. Context piped on stdin is appended (the
+    /// `oneshot "review this" < diff.txt` idiom). No codebase access, so include (or
+    /// `--attach`) whatever the answer needs.
+    pub prompt: String,
+
+    /// Workspace file to inline as context — kaibo reads it so its bytes never pass
+    /// through your context. Prefer whole files; an image needs a vision-capable cast.
+    /// Repeatable.
+    #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
+    pub attach: Vec<String>,
+
+    /// Override the model id (verbatim; pair with --backend to also retarget).
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+    /// Run the `--model` override on this backend (name or alias). Requires --model.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
+
+    /// Emit a JSON envelope on stdout (answer + provenance + usage) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo explore` — a cited survey report (the evidence-gathering half of consult): a
+/// model sweeps the project READ-ONLY and returns findings + `file:line` locations +
+/// the trail it followed, not a synthesized answer.
+#[derive(Args, Debug)]
+pub struct ExploreArgs {
+    /// What to survey or map. Say in prose what you want charted — kaibo's explorer
+    /// locates and reads the real, current code and reports back with citations.
+    pub question: String,
+
+    /// Project to explore. Optional — defaults to the root/allowed cwd; must resolve
+    /// to at-or-under an allowed tree.
+    #[arg(long, value_name = "DIR")]
+    pub path: Option<String>,
+
+    /// Workspace file central to the survey: the investigator is directed to read it
+    /// WHOLE. Text only (it reads through the shell). Repeatable.
+    #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
+    pub attach: Vec<String>,
+
+    /// Override the explorer model id (verbatim; pair with --explorer-backend).
+    #[arg(long, value_name = "ID")]
+    pub explorer_model: Option<String>,
+    /// Run the explorer override on this backend (name or alias). Requires --explorer-model.
+    #[arg(long, value_name = "BACKEND")]
+    pub explorer_backend: Option<String>,
+    /// Max tool-loop turns for the explorer sweep (default 100).
+    #[arg(long, value_name = "N")]
+    pub explorer_max_turns: Option<usize>,
+
+    /// Emit a JSON envelope on stdout (report + provenance + usage) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo kaish` — one non-interactive kaish command through the same READ-ONLY sandbox
+/// the `run_kaish` MCP tool uses. Scriptable single execution only: no readline, no
+/// REPL. The process exits with kaish's own exit code (0 ok, 126 blocked, 124 timed out).
+#[derive(Args, Debug)]
+pub struct KaishArgs {
+    /// The kaish (sh-like) script to run against the read-only project. Required — kaibo
+    /// has no interactive shell, so `-c` is the only way in (a missing `-c` is a usage
+    /// error, not a prompt). `cat -n FILE`, `grep -rn PATTERN .`, pipes with jq/awk/find.
+    #[arg(short = 'c', value_name = "SCRIPT")]
+    pub command: Option<String>,
+
+    /// Project to run against. Optional — defaults to the root/allowed cwd; must resolve
+    /// to at-or-under an allowed tree. Each call starts fresh at this root.
+    #[arg(long, value_name = "DIR")]
+    pub path: Option<String>,
+
+    /// Emit a JSON object `{stdout, stderr, exit_code}` instead of raw streams (the
+    /// process still exits with kaish's exit code).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo batch` — the provider batch lanes (offline, max thinking, half price) exactly
+/// as the MCP verbs drive them.
+#[derive(Args, Debug)]
+pub struct BatchArgs {
+    #[command(subcommand)]
+    pub cmd: BatchCmd,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum BatchCmd {
+    /// Fan self-contained prompts to a batch cast; prints the durable `backend/id` handle.
+    Submit(BatchSubmitArgs),
+    /// Fetch a batch by handle — a progress line while it runs, per-item answers when done.
+    Get(BatchGetArgs),
+    /// List batches the providers still know about, plus handles recovered from the store.
+    List(BatchListArgs),
+}
+
+/// `kaibo batch submit` — like `oneshot`, no tools/codebase access: each prompt carries
+/// its own context (or shared `--attach` files). Needs a batch-capable cast/backend.
+#[derive(Args, Debug)]
+pub struct BatchSubmitArgs {
+    /// The prompts to fan out, one batch item each. At least one required.
+    #[arg(required = true, value_name = "PROMPT")]
+    pub prompts: Vec<String>,
+
+    /// Workspace file inlined as shared context for every prompt (kaibo reads it so its
+    /// bytes never pass through your context). Repeatable.
+    #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
+    pub attach: Vec<String>,
+
+    /// Override the synth model id — batch a top-tier model. Pair with --backend.
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+    /// Run the `--model` override on this backend (must be batch-capable). Requires --model.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
+
+    /// Emit a JSON object `{handle, cast, model, count}` instead of the bare handle.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo batch get` — collect a batch by its `backend/provider-id` handle.
+#[derive(Args, Debug)]
+pub struct BatchGetArgs {
+    /// The `backend/provider-id` handle `batch submit` printed.
+    pub handle: String,
+
+    /// Emit a JSON object (status + progress or per-item answers) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo batch list` — the way back to a batch whose handle you lost.
+#[derive(Args, Debug)]
+pub struct BatchListArgs {
+    /// Which backend (name or alias) to list. Omit to sweep every batch-capable backend.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
+
+    /// Show all batches, including ones older than 24h (trimmed by default).
+    #[arg(long)]
+    pub all: bool,
+
+    /// Emit a JSON object (entries + recovered handles + per-backend errors) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Load config for a CLI subcommand and overlay the shared CLI flags. Tool gating
 /// stays default-on (the `--no-<tool>` gates are a serve-only concern), so a
 /// disabled-tool config never blocks a CLI consult.
@@ -286,10 +463,12 @@ fn init_cli_logging() {
         .try_init();
 }
 
-/// Print `err` to stderr and return `code` — the shared shape for a setup/usage
-/// rejection (before the model runs). With `--json`, the message rides a structured
+/// Print `err` to stderr and return `code` — the shared shape for a **pre-flight**
+/// rejection (usage *or* setup/containment), i.e. anything refused before the model
+/// runs. Carries the `kind`/`code` its caller classified (it renders both, so the name
+/// no longer claims "setup" only). With `--json`, the message rides a structured
 /// envelope on stdout so a script parses it uniformly with a success envelope.
-fn fail_setup(json: bool, kind: &str, message: String, code: i32) -> i32 {
+fn fail_preflight(json: bool, kind: &str, message: String, code: i32) -> i32 {
     if json {
         println!("{}", error_envelope(kind, &message));
     } else {
@@ -307,7 +486,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     let config = match load_config(&common) {
         Ok(c) => c,
         Err(e) => {
-            return fail_setup(
+            return fail_preflight(
                 args.json,
                 "config",
                 format!("config error: {e:#}"),
@@ -327,7 +506,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     let resolver = match Resolver::from_config(Arc::new(config)) {
         Ok(r) => r,
         Err(e) => {
-            return fail_setup(args.json, "setup", format!("{e:#}"), EXIT_SETUP);
+            return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP);
         }
     };
 
@@ -353,7 +532,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
             kind,
             message,
             code,
-        }) => fail_setup(args.json, kind, message, code),
+        }) => fail_preflight(args.json, kind, message, code),
     }
 }
 
@@ -363,6 +542,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
 /// each resolution call site tags its failure with [`usage`](Self::usage) or
 /// [`setup`](Self::setup) explicitly — that's what keeps the exit-code contract at
 /// the top of this module honest.
+#[derive(Debug)]
 struct SetupError {
     kind: &'static str,
     message: String,
@@ -506,16 +686,8 @@ async fn resolve_and_run(
             Ok(EXIT_OK)
         }
         // A provider/model-loop failure is its own exit code — the consultation ran and
-        // failed, distinct from a setup rejection. Reuse the server's classified text.
-        Err(e) => {
-            let text = consultation_failure_text("consult", &cast.name, e);
-            if args.json {
-                println!("{}", error_envelope("consultation_failure", &text));
-            } else {
-                eprintln!("kaibo: {text}");
-            }
-            Ok(EXIT_CONSULT_FAILURE)
-        }
+        // failed, distinct from a setup rejection.
+        Err(e) => Ok(fail_consultation(args.json, "consult", &cast.name, e)),
     }
 }
 
@@ -591,6 +763,18 @@ fn emit_answer(
     }
 }
 
+/// The reported token usage as a stable JSON object — one shape across every `--json`
+/// envelope (consult/oneshot/explore). Pure and testable.
+fn usage_json(usage: &Usage) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+    })
+}
+
 /// The `--json` success envelope: the raw answer (no footer), provenance, and usage —
 /// a stable shape for a script. Pure, so it's unit-testable without a model.
 fn consult_envelope(
@@ -607,13 +791,7 @@ fn consult_envelope(
         "answer": out.answer,
         "cast": cast,
         "models": { "explorer": explorer_model, "synth": synth_model },
-        "usage": {
-            "input_tokens": out.usage.input_tokens,
-            "output_tokens": out.usage.output_tokens,
-            "reasoning_tokens": out.usage.reasoning_tokens,
-            "cached_input_tokens": out.usage.cached_input_tokens,
-            "cache_creation_input_tokens": out.usage.cache_creation_input_tokens,
-        },
+        "usage": usage_json(&out.usage),
         // Non-fatal notices about this turn (e.g. a failed session record). Always
         // present (empty when the turn was clean) so a consumer can rely on the key.
         "warnings": out.warnings,
@@ -627,6 +805,66 @@ fn consult_envelope(
 /// The `--json` error envelope: `{ "error": …, "kind": … }`. Pure and testable.
 fn error_envelope(kind: &str, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": message, "kind": kind })
+}
+
+/// Render a runtime consultation failure (a provider/model-loop error, distinct from a
+/// setup rejection) and return [`EXIT_CONSULT_FAILURE`]. Reuses the server's classified
+/// failure text so the CLI and MCP tool frame a failure identically; `--json` wraps it in
+/// the error envelope. Shared by consult/oneshot/explore/batch-submit.
+fn fail_consultation(json: bool, tool: &str, cast: &str, err: anyhow::Error) -> i32 {
+    let text = consultation_failure_text(tool, cast, err);
+    if json {
+        println!("{}", error_envelope("consultation_failure", &text));
+    } else {
+        eprintln!("kaibo: {text}");
+    }
+    EXIT_CONSULT_FAILURE
+}
+
+/// Append context piped on stdin to the prompt (the `oneshot "…" < file` idiom). Only
+/// reads stdin when it's NOT a terminal (piped/redirected), so an interactive
+/// `kaibo oneshot "…"` never blocks waiting for input. Whitespace-only stdin is ignored.
+///
+/// Non-empty, non-UTF-8 stdin is a **loud usage error** (exit 2), never a silent drop:
+/// `kaibo oneshot "…" < image.png` must not run the model blind about data it never
+/// received. oneshot takes *text* on stdin; a file (incl. an image, on a vision cast)
+/// belongs on `--attach`.
+fn prompt_with_stdin(prompt: &str) -> Result<String, SetupError> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Ok(prompt.to_string());
+    }
+    let mut bytes = Vec::new();
+    // A read error (e.g. stdin already closed) is treated as "no piped context" — the
+    // bare prompt still runs. Only *present but non-text* input is the loud error.
+    if std::io::stdin().read_to_end(&mut bytes).is_err() {
+        return Ok(prompt.to_string());
+    }
+    fold_stdin_context(prompt, &bytes)
+}
+
+/// Pure core of [`prompt_with_stdin`]: fold already-read stdin `bytes` into the prompt.
+/// Empty / whitespace-only → the bare prompt; UTF-8 text → appended after a blank line;
+/// non-empty non-UTF-8 → a loud usage error. Split out so the fail-loud contract is
+/// testable without touching process stdin.
+fn fold_stdin_context(prompt: &str, bytes: &[u8]) -> Result<String, SetupError> {
+    if bytes.is_empty() {
+        return Ok(prompt.to_string());
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.trim().is_empty() => Ok(prompt.to_string()),
+        Ok(text) => Ok(format!("{prompt}\n\n{}", text.trim_end())),
+        Err(_) => Err(SetupError {
+            kind: "usage",
+            message: format!(
+                "oneshot reads TEXT context on stdin, but the piped input isn't valid UTF-8 \
+                 ({} bytes) — kaibo won't send the model a prompt about data it never got. \
+                 Pipe text, or pass the file with --attach (an image needs a vision-capable cast).",
+                bytes.len()
+            ),
+            code: EXIT_USAGE,
+        }),
+    }
 }
 
 /// Run `kaibo config`: print the resolved configuration the way the `kaibo://config`
@@ -661,6 +899,695 @@ pub fn run_config(common: CommonArgs) -> i32 {
     );
     println!("{body}");
     EXIT_OK
+}
+
+// ---------------------------------------------------------------------------
+// oneshot
+// ---------------------------------------------------------------------------
+
+/// Run `kaibo oneshot` — a toolless second opinion. Same stdout/stderr contract and
+/// exit taxonomy (usage 2 / setup 3 / failure 4) as consult.
+pub async fn run_oneshot(common: CommonArgs, args: OneshotArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    match oneshot_inner(&common, &args, &resolver).await {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(args.json, kind, message, code),
+    }
+}
+
+async fn oneshot_inner(
+    common: &CommonArgs,
+    args: &OneshotArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let mut cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    resolver
+        .reject_offline_cast(&cast, "oneshot")
+        .map_err(SetupError::usage)?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            args.model.as_deref(),
+            args.backend.as_deref(),
+            "model",
+            "backend",
+        )
+        .map_err(SetupError::usage)?;
+    let arm = resolver
+        .arm(&cast, ModelRole::Synth)
+        .map_err(SetupError::setup)?;
+    // Attachments read + containment-checked server-side (bytes never transit your
+    // context); an image needs a vision-capable cast.
+    let attachments = resolver
+        .resolve_attachments(&args.attach)
+        .await
+        .map_err(SetupError::setup)?;
+    resolver
+        .gate_image_attachments(arm.caps.vision, &attachments, &arm.model, &cast.name)
+        .map_err(SetupError::usage)?;
+    // Fold any context piped on stdin into the prompt (the `< file` idiom); non-text
+    // piped input is a loud usage error rather than a silent drop.
+    let prompt = prompt_with_stdin(&args.prompt)?;
+    let cfg = PhaseContext {
+        progress: Arc::new(TerminalSink),
+        // oneshot reads no project: no house rules, no repo map, no shell.
+        house_rules: None,
+        prompts: resolver.resolved_prompts(&cast),
+        orientation: None,
+        call_deadline: resolver.config.defaults.call_deadline,
+    };
+    match run_oneshot_engine(&prompt, &attachments, &arm, &cfg).await {
+        Ok((answer, usage)) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "answer": answer,
+                        "cast": cast.name,
+                        "model": arm.model,
+                        "usage": usage_json(&usage),
+                    })
+                );
+            } else {
+                println!(
+                    "{}",
+                    with_provenance(answer, &cast.name, &[("model", &arm.model)], &usage)
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(args.json, "oneshot", &cast.name, e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// explore
+// ---------------------------------------------------------------------------
+
+/// Run `kaibo explore` — a cited survey report. Same conventions as consult; the
+/// payload is the report (`report` field under `--json`).
+pub async fn run_explore(common: CommonArgs, args: ExploreArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    match explore_inner(&common, &args, &resolver).await {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(args.json, kind, message, code),
+    }
+}
+
+async fn explore_inner(
+    common: &CommonArgs,
+    args: &ExploreArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let root = resolver
+        .resolve_root(args.path.clone())
+        .map_err(SetupError::setup)?;
+    // NO reject_offline_cast: explore runs the *explorer* arm, so a deliberate/direct
+    // cast's explorer is valid; it needs only an explorer slot (resolved next).
+    let mut cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            args.explorer_model.as_deref(),
+            args.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )
+        .map_err(SetupError::usage)?;
+    let explorer = resolver
+        .arm(&cast, ModelRole::Explorer)
+        .map_err(SetupError::setup)?;
+    let attachments = resolver
+        .resolve_sweep_attachments(&root, &args.attach, "explore")
+        .await
+        .map_err(SetupError::setup)?;
+    let cfg = ExploreConfig {
+        phase: PhaseContext {
+            progress: Arc::new(TerminalSink),
+            house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
+            prompts: resolver.resolved_prompts(&cast),
+            orientation: resolver
+                .orientation(&root)
+                .await
+                .map_err(SetupError::setup)?,
+            call_deadline: resolver.config.defaults.call_deadline,
+        },
+        explorer_max_turns: args
+            .explorer_max_turns
+            .unwrap_or(resolver.config.defaults.explorer_max_turns),
+        sandbox: resolver.config.sandbox.clone(),
+    };
+    match explore_with(&args.question, root, &explorer, &cfg, &attachments).await {
+        Ok((report, usage)) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "report": report,
+                        "cast": cast.name,
+                        "model": explorer.model,
+                        "usage": usage_json(&usage),
+                    })
+                );
+            } else {
+                println!(
+                    "{}",
+                    with_provenance(report, &cast.name, &[("explorer", &explorer.model)], &usage)
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(args.json, "explore", &cast.name, e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kaish
+// ---------------------------------------------------------------------------
+
+/// Run `kaibo kaish -c 'SCRIPT'` — one non-interactive execution through the read-only
+/// sandbox. stdout carries the script's stdout, stderr its stderr, and the process exits
+/// with kaish's own exit code (0 ok, 126 blocked, 124 timed out). A missing `-c` is a
+/// usage error (exit 2); a bad `--path` is a setup rejection (exit 3).
+pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
+    init_cli_logging();
+    let Some(script) = args.command.clone() else {
+        let msg = "kaish needs a script — pass it with `-c 'SCRIPT'` (kaibo has no \
+                   interactive shell). e.g. kaibo kaish -c 'grep -rn TODO src/'"
+            .to_string();
+        if args.json {
+            println!("{}", error_envelope("usage", &msg));
+        } else {
+            eprintln!("kaibo: {msg}");
+        }
+        return EXIT_USAGE;
+    };
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("config error: {e:#}");
+            if args.json {
+                println!("{}", error_envelope("config", &msg));
+            } else {
+                eprintln!("kaibo: {msg}");
+            }
+            return EXIT_USAGE;
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => {
+            if args.json {
+                println!("{}", error_envelope("setup", &format!("{e:#}")));
+            } else {
+                eprintln!("kaibo: {e:#}");
+            }
+            return EXIT_SETUP;
+        }
+    };
+    let root = match resolver.resolve_root(args.path.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.message.to_string();
+            if args.json {
+                println!("{}", error_envelope("setup", &msg));
+            } else {
+                eprintln!("kaibo: {msg}");
+            }
+            return EXIT_SETUP;
+        }
+    };
+    let worker = match KaishWorker::spawn_with(&root, resolver.config.sandbox.clone()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("kaibo: could not start kaish: {e:#}");
+            return EXIT_SETUP;
+        }
+    };
+    match worker.run(script).await {
+        Ok(out) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "stdout": out.stdout,
+                        "stderr": out.stderr,
+                        "exit_code": out.code,
+                    })
+                );
+            } else {
+                // Scriptable: the script's own streams, unframed, on our streams.
+                if !out.stdout.is_empty() {
+                    print!("{}", out.stdout);
+                    if !out.stdout.ends_with('\n') {
+                        println!();
+                    }
+                }
+                if !out.stderr.is_empty() {
+                    eprint!("{}", out.stderr);
+                    if !out.stderr.ends_with('\n') {
+                        eprintln!();
+                    }
+                }
+            }
+            // Exit with kaish's own code so a script can branch on it.
+            out.code as i32
+        }
+        // A worker.run() error is a RUNTIME infra failure (kernel crash/panic, worker
+        // channel closed) — the shell ran (or tried to) and failed, not a pre-flight
+        // rejection — so it's exit 4, not a setup code. (An honest script/blocked/timeout
+        // outcome came back Ok(out) above with kaish's own code.)
+        Err(e) => {
+            eprintln!("kaibo: kaish execution failed: {e:#}");
+            EXIT_CONSULT_FAILURE
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// batch
+// ---------------------------------------------------------------------------
+
+/// Run `kaibo batch submit|get|list`.
+pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
+    init_cli_logging();
+    let json = match &args.cmd {
+        BatchCmd::Submit(a) => a.json,
+        BatchCmd::Get(a) => a.json,
+        BatchCmd::List(a) => a.json,
+    };
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(json, "config", format!("config error: {e:#}"), EXIT_USAGE)
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    let outcome = match args.cmd {
+        BatchCmd::Submit(a) => batch_submit_inner(&common, &a, &resolver).await,
+        BatchCmd::Get(a) => batch_get_inner(&a, &resolver).await,
+        BatchCmd::List(a) => batch_list_inner(&a, &resolver).await,
+    };
+    match outcome {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(json, kind, message, code),
+    }
+}
+
+/// Open the durable store for batch-handle persistence/recovery — best-effort: `None`
+/// when persistence is off, and a warn (never fatal) if the open fails, since a batch is
+/// live at the provider regardless and `batch list`'s provider query still recovers it.
+async fn open_batch_store(resolver: &Resolver) -> Option<crate::store::SessionStore> {
+    let persistence = &resolver.config.persistence;
+    if !persistence.enabled {
+        return None;
+    }
+    let path = persistence.path.clone()?;
+    let cap = resolver.config.defaults.session_capacity;
+    let allowed = resolver.allowed_set();
+    let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+    match crate::store::SessionStore::open(&path, cap, &refs).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open the state db for batch handles — continuing without persistence");
+            None
+        }
+    }
+}
+
+/// The backend names `batch list` should query — mirrors the MCP handler's rule: an
+/// explicit `--backend` scopes to that one (refused if its kind has no batch lane); else
+/// every configured batch-capable backend, sorted-by-map-order.
+fn batch_backends(resolver: &Resolver, backend: Option<&str>) -> Result<Vec<String>, SetupError> {
+    use crate::batch::{batch_supported, supported_kinds_list};
+    if let Some(name) = backend {
+        let b = resolver
+            .config
+            .resolve_backend(name)
+            .map_err(|e| SetupError {
+                kind: "usage",
+                message: e.to_string(),
+                code: EXIT_USAGE,
+            })?;
+        if !batch_supported(b.kind) {
+            return Err(SetupError {
+                kind: "usage",
+                message: format!(
+                    "backend {:?} ({:?}) has no batch lane (batch-capable: {}). Omit --backend \
+                     to list every batch-capable backend.",
+                    b.name,
+                    b.kind,
+                    supported_kinds_list()
+                ),
+                code: EXIT_USAGE,
+            });
+        }
+        return Ok(vec![b.name.clone()]);
+    }
+    let names: Vec<String> = resolver
+        .config
+        .backends
+        .values()
+        .filter(|b| batch_supported(b.kind))
+        .map(|b| b.name.clone())
+        .collect();
+    if names.is_empty() {
+        return Err(SetupError {
+            kind: "setup",
+            message: "no batch-capable backend is configured".to_string(),
+            code: EXIT_SETUP,
+        });
+    }
+    Ok(names)
+}
+
+async fn batch_submit_inner(
+    common: &CommonArgs,
+    args: &BatchSubmitArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let mut cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    resolver
+        .require_batch_cast(&cast)
+        .map_err(SetupError::usage)?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            args.model.as_deref(),
+            args.backend.as_deref(),
+            "model",
+            "backend",
+        )
+        .map_err(SetupError::usage)?;
+    // Resolve the synth slot + backend + caps (key-free — no network yet).
+    let slot = cast
+        .require_slot(ModelRole::Synth)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    let backend = resolver
+        .config
+        .resolve_backend(&slot.backend)
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: e.to_string(),
+            code: EXIT_SETUP,
+        })?;
+    let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
+    let backend_name = backend.name.clone();
+    let model = slot.id.clone();
+    // Attachments (shared context) + vision gate before the network — a bad path or a
+    // vision misconfig is a clean refusal, not a half-submitted batch.
+    let attachments = resolver
+        .resolve_attachments(&args.attach)
+        .await
+        .map_err(SetupError::setup)?;
+    resolver
+        .gate_image_attachments(caps.vision, &attachments, &model, &cast.name)
+        .map_err(SetupError::usage)?;
+    let provider =
+        crate::batch::submitter(backend, slot, &resolver.config.defaults).map_err(|e| {
+            SetupError {
+                kind: "setup",
+                message: format!("{e:#}"),
+                code: EXIT_SETUP,
+            }
+        })?;
+    let items: Vec<BatchItem> = args
+        .prompts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| BatchItem {
+            custom_id: i.to_string(),
+            prompt: p.clone(),
+        })
+        .collect();
+    let system = batch_system_prompt(resolver.resolved_prompts(&cast).batch.as_deref());
+    let provider_id = match provider.submit(&system, &attachments, &items).await {
+        Ok(id) => id,
+        // A provider submit failure ran and failed — exit 4, like a consultation failure.
+        Err(e) => return Ok(fail_consultation(args.json, "batch submit", &cast.name, e)),
+    };
+    let handle = format!("{backend_name}/{provider_id}");
+    // Persist the handle so a restart can re-list it (best-effort; the batch is already
+    // live at the provider).
+    if let Some(store) = open_batch_store(resolver).await {
+        if let Err(e) = store
+            .put_batch(&backend_name, &provider_id, Some(&model))
+            .await
+        {
+            tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
+        }
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "handle": handle,
+                "cast": cast.name,
+                "model": model,
+                "count": items.len(),
+            })
+        );
+    } else {
+        // Payload = the durable handle on stdout; the human note to stderr.
+        println!("{handle}");
+        eprintln!(
+            "kaibo: submitted {} prompt(s) on cast `{}` (model `{}`) — `kaibo batch get {}` for results",
+            items.len(),
+            cast.name,
+            model,
+            handle
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+async fn batch_get_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    let (backend_name, provider_id) = args
+        .handle
+        .split_once('/')
+        .filter(|(b, id)| !b.is_empty() && !id.is_empty())
+        .ok_or_else(|| SetupError {
+            kind: "usage",
+            message: format!(
+                "batch handle {:?} must be \"backend/provider-id\" — pass the handle \
+                 `kaibo batch submit` printed",
+                args.handle
+            ),
+            code: EXIT_USAGE,
+        })?;
+    let backend = resolver
+        .config
+        .resolve_backend(backend_name)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    let provider = crate::batch::poller(backend).map_err(|e| SetupError {
+        kind: "setup",
+        message: format!("{e:#}"),
+        code: EXIT_SETUP,
+    })?;
+    match provider.poll(provider_id).await {
+        Ok(poll) => {
+            if args.json {
+                println!("{}", batch_poll_envelope(&poll));
+            } else {
+                println!(
+                    "{}",
+                    crate::batch::render_poll(&poll, &format!("{backend_name} · {provider_id}"))
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(args.json, "batch get", backend_name, e)),
+    }
+}
+
+/// A `BatchPoll` as a stable JSON object for `batch get --json`. Pure and testable.
+fn batch_poll_envelope(poll: &BatchPoll) -> serde_json::Value {
+    match poll {
+        BatchPoll::Pending { completed, total } => {
+            serde_json::json!({ "status": "pending", "completed": completed, "total": total })
+        }
+        BatchPoll::Cancelling => serde_json::json!({ "status": "cancelling" }),
+        BatchPoll::Done(answers) => serde_json::json!({
+            "status": "done",
+            "answers": answers.iter().map(|a| match &a.text {
+                Ok(t) => serde_json::json!({ "custom_id": a.custom_id, "ok": true, "text": t }),
+                Err(reason) => serde_json::json!({ "custom_id": a.custom_id, "ok": false, "error": reason }),
+            }).collect::<Vec<_>>(),
+        }),
+        BatchPoll::Failed { state, message } => {
+            serde_json::json!({ "status": "failed", "state": state, "message": message })
+        }
+    }
+}
+
+async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    let backends = batch_backends(resolver, args.backend.as_deref())?;
+    let mut entries: Vec<(String, crate::batch::BatchListItem)> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let mut truncated: Vec<String> = Vec::new();
+    let mut shown: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in &backends {
+        let backend = match resolver.config.resolve_backend(name) {
+            Ok(b) => b,
+            Err(e) => {
+                errors.push((name.clone(), e.to_string()));
+                continue;
+            }
+        };
+        let provider = match crate::batch::poller(backend) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push((name.clone(), format!("{e:#}")));
+                continue;
+            }
+        };
+        match provider.list().await {
+            Ok((items, has_more)) => {
+                if has_more {
+                    truncated.push(name.clone());
+                }
+                for it in items {
+                    let handle = format!("{name}/{}", it.provider_id);
+                    shown.insert(handle.clone());
+                    entries.push((handle, it));
+                }
+            }
+            Err(e) => errors.push((name.clone(), format!("{e:#}"))),
+        }
+    }
+    // Trim to the last 24h unless --all (a provider keeps months of finished batches).
+    let hidden = if args.all {
+        0
+    } else {
+        let now = now_epoch_secs();
+        let before = entries.len();
+        entries.retain(|(_, it)| batch_within_window(it, now, BATCH_RECENCY_WINDOW_SECS));
+        before - entries.len()
+    };
+    // Recovered handles from the store, deduped against the live listing.
+    let mut recovered: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(store) = open_batch_store(resolver).await {
+        match store.list_batches().await {
+            Ok(handles) => {
+                for h in handles {
+                    let handle = format!("{}/{}", h.backend, h.provider_id);
+                    if !shown.contains(&handle) {
+                        recovered.push((handle, h.label));
+                    }
+                }
+            }
+            Err(e) => errors.push((
+                "(store)".to_string(),
+                format!("recovered handles unavailable: {e}"),
+            )),
+        }
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "entries": entries.iter().map(|(h, it)| serde_json::json!({
+                    "handle": h,
+                    "status": it.status,
+                    "completed": it.completed,
+                    "total": it.total,
+                    "created_at": it.created_at,
+                })).collect::<Vec<_>>(),
+                "recovered": recovered.iter().map(|(h, l)| serde_json::json!({ "handle": h, "label": l })).collect::<Vec<_>>(),
+                "errors": errors.iter().map(|(b, e)| serde_json::json!({ "backend": b, "error": e })).collect::<Vec<_>>(),
+                "hidden": hidden,
+                "truncated": truncated,
+            })
+        );
+    } else {
+        println!(
+            "{}",
+            crate::batch::render_list(&entries, &errors, &truncated)
+        );
+        if hidden > 0 {
+            println!(
+                "\n({hidden} batch(es) older than 24h hidden — `kaibo batch list --all` for the \
+                 full history.)"
+            );
+        }
+        if !recovered.is_empty() {
+            let lines: Vec<String> = recovered
+                .iter()
+                .map(|(h, l)| match l {
+                    Some(l) => format!("- `{h}` — {l}"),
+                    None => format!("- `{h}`"),
+                })
+                .collect();
+            println!(
+                "\nRecovered batch handles (kaibo-submitted, from the store — `kaibo batch get` \
+                 one for live status):\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+    Ok(EXIT_OK)
 }
 
 #[cfg(test)]
@@ -878,5 +1805,208 @@ mod tests {
         assert_eq!(err.kind, "usage");
         // And the JSON envelope a script would see carries kind "usage".
         assert_eq!(error_envelope(err.kind, &err.message)["kind"], "usage");
+    }
+
+    // --- stage 2 subcommands -------------------------------------------------
+
+    #[test]
+    fn oneshot_explore_kaish_batch_subcommands_route() {
+        // A global (--cast) before the subcommand still lands on cli.common.
+        let cli = Cli::parse_from(["kaibo", "--cast", "gemini", "oneshot", "second opinion?"]);
+        assert_eq!(cli.common.cast.as_deref(), Some("gemini"));
+        match cli.command {
+            Some(Command::Oneshot(o)) => {
+                assert_eq!(o.prompt, "second opinion?");
+                assert!(!o.json);
+            }
+            other => panic!("expected oneshot, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["kaibo", "explore", "map the sandbox", "--json"]);
+        match cli.command {
+            Some(Command::Explore(e)) => {
+                assert_eq!(e.question, "map the sandbox");
+                assert!(e.json);
+            }
+            other => panic!("expected explore, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["kaibo", "kaish", "-c", "grep -rn TODO src"]);
+        match cli.command {
+            Some(Command::Kaish(k)) => assert_eq!(k.command.as_deref(), Some("grep -rn TODO src")),
+            other => panic!("expected kaish, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from([
+            "kaibo",
+            "batch",
+            "submit",
+            "p1",
+            "p2",
+            "--cast",
+            "gemini-batch",
+        ]);
+        assert_eq!(cli.common.cast.as_deref(), Some("gemini-batch"));
+        match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Submit(s) => {
+                    assert_eq!(s.prompts, vec!["p1".to_string(), "p2".to_string()])
+                }
+                other => panic!("expected batch submit, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_submit_requires_at_least_one_prompt() {
+        let err = Cli::try_parse_from(["kaibo", "batch", "submit"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn batch_get_requires_a_handle() {
+        let err = Cli::try_parse_from(["kaibo", "batch", "get"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn fold_stdin_context_appends_text_and_fails_loud_on_binary() {
+        // No piped bytes → the bare prompt.
+        assert_eq!(fold_stdin_context("ask", b"").unwrap(), "ask");
+        // Whitespace-only stdin is ignored.
+        assert_eq!(fold_stdin_context("ask", b"  \n\t ").unwrap(), "ask");
+        // Text is appended after a blank line, trailing whitespace trimmed.
+        assert_eq!(
+            fold_stdin_context("ask", b"context here\n").unwrap(),
+            "ask\n\ncontext here"
+        );
+        // Non-empty, non-UTF-8 (e.g. a piped PNG) is a LOUD usage error, never a silent
+        // drop — the #77 DeepSeek fix.
+        let err = fold_stdin_context("ask", &[0xff, 0xfe, 0x00, 0x01])
+            .expect_err("binary stdin must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("isn't valid UTF-8"),
+            "message names the cause: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn usage_json_carries_every_field() {
+        let usage = rig_core::completion::Usage {
+            input_tokens: 3,
+            output_tokens: 4,
+            ..Default::default()
+        };
+        let u = usage_json(&usage);
+        for k in [
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            assert!(u.get(k).is_some(), "usage_json must carry {k}");
+        }
+        assert_eq!(u["input_tokens"], 3);
+        assert_eq!(u["output_tokens"], 4);
+    }
+
+    #[test]
+    fn batch_poll_envelope_shapes_each_state() {
+        use crate::batch::BatchAnswer;
+        let pending = batch_poll_envelope(&BatchPoll::Pending {
+            completed: 2,
+            total: 5,
+        });
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(pending["completed"], 2);
+        assert_eq!(pending["total"], 5);
+
+        assert_eq!(
+            batch_poll_envelope(&BatchPoll::Cancelling)["status"],
+            "cancelling"
+        );
+
+        let done = batch_poll_envelope(&BatchPoll::Done(vec![
+            BatchAnswer {
+                custom_id: "0".into(),
+                text: Ok("hi".into()),
+            },
+            BatchAnswer {
+                custom_id: "1".into(),
+                text: Err("boom".into()),
+            },
+        ]));
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["answers"][0]["ok"], true);
+        assert_eq!(done["answers"][0]["text"], "hi");
+        assert_eq!(done["answers"][1]["ok"], false);
+        assert_eq!(done["answers"][1]["error"], "boom");
+
+        let failed = batch_poll_envelope(&BatchPoll::Failed {
+            state: "expired".into(),
+            message: "too late".into(),
+        });
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["state"], "expired");
+        assert_eq!(failed["message"], "too late");
+    }
+
+    #[test]
+    fn batch_backends_scopes_and_refuses_a_non_batch_backend() {
+        let resolver = Resolver::from_config(Arc::new(Config::builtin())).unwrap();
+        // The built-in batch-capable backends (anthropic, gemini) — order-independent.
+        let all = batch_backends(&resolver, None).expect("batch-capable backends exist");
+        assert!(all.contains(&"anthropic".to_string()));
+        assert!(all.contains(&"gemini".to_string()));
+        assert!(
+            !all.contains(&"deepseek".to_string()),
+            "deepseek has no batch lane"
+        );
+        // An explicit non-batch backend is a usage error.
+        let err = batch_backends(&resolver, Some("deepseek")).unwrap_err();
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+    }
+
+    /// A non-batch cast on `batch submit` is a usage error (exit 2) — the offline
+    /// `require_batch_cast` refusal, before any network. Mirrors the consult offline-cast test.
+    #[tokio::test]
+    async fn batch_submit_on_a_non_batch_cast_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        // `anthropic` is interactive (its synth is not on the batch lane).
+        let cli = Cli::parse_from(["kaibo", "batch", "submit", "p1", "--cast", "anthropic"]);
+        let common = cli.common.clone();
+        let submit = match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Submit(s) => s,
+                _ => unreachable!(),
+            },
+            _ => unreachable!("parsed a batch submit"),
+        };
+        let err = batch_submit_inner(&common, &submit, &resolver)
+            .await
+            .expect_err("an interactive cast on batch submit must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+    }
+
+    #[test]
+    fn a_missing_kaish_script_is_a_usage_error() {
+        // clap accepts `kaibo kaish` with no -c (the arg is optional); the handler turns
+        // the absence into a usage error pointing at -c, not a REPL.
+        let cli = Cli::parse_from(["kaibo", "kaish"]);
+        match cli.command {
+            Some(Command::Kaish(k)) => assert!(k.command.is_none(), "-c is optional at parse time"),
+            other => panic!("expected kaish, got {other:?}"),
+        }
     }
 }

@@ -36,9 +36,22 @@ async fn main() -> Result<()> {
         None => serve(cli.common, cli.gates).await,
         Some(Command::Serve(gates)) => serve(cli.common, gates).await,
         // The CLI front doors own their exit codes (0 answer / 2 usage / 3 setup /
-        // 4 consultation failure), so they return a code and we exit on it.
+        // 4 consultation failure; kaish passes through its own code), so they return a
+        // code and we exit on it.
         Some(Command::Consult(args)) => {
             std::process::exit(kaibo::cli::run_consult(cli.common, args).await)
+        }
+        Some(Command::Oneshot(args)) => {
+            std::process::exit(kaibo::cli::run_oneshot(cli.common, args).await)
+        }
+        Some(Command::Explore(args)) => {
+            std::process::exit(kaibo::cli::run_explore(cli.common, args).await)
+        }
+        Some(Command::Kaish(args)) => {
+            std::process::exit(kaibo::cli::run_kaish(cli.common, args).await)
+        }
+        Some(Command::Batch(args)) => {
+            std::process::exit(kaibo::cli::run_batch(cli.common, args).await)
         }
         Some(Command::Config) => std::process::exit(kaibo::cli::run_config(cli.common)),
     }

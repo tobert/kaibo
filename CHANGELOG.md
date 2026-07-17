@@ -364,8 +364,16 @@ the git log. Each later release appends a new section at the top.
   vice versa; a stateless consult never touches the db. `kaibo config` prints the
   resolved configuration (what `kaibo://config` shows). Bare `kaibo` still runs the
   MCP server exactly as before — existing client configs are untouched (`kaibo serve`
-  is the explicit spelling). More subcommands (`oneshot`, `explore`, `kaish`, batch)
-  follow.
+  is the explicit spelling). The rest of the front door landed alongside:
+  **`kaibo oneshot "prompt"`** (a toolless second opinion — reads extra context piped on
+  stdin, the `oneshot "…" < notes.md` idiom, plus `--attach`), **`kaibo explore
+  "question"`** (a cited survey report), **`kaibo kaish -c 'script'`** (one
+  non-interactive command through the read-only sandbox; the process exits with kaish's
+  own code), and **`kaibo batch submit|get|list`** over the provider batch lanes (submit
+  prints the durable `backend/id` handle; get fetches results or a progress line; list
+  shows live + store-recovered handles). Each carries `--json` (its `answer`/`report`
+  field is the model's raw words) and the same stdout-is-payload / exit-code contract.
+  An interactive REPL is deliberately later.
 
 ### Changed
 

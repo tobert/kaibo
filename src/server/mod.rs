@@ -51,15 +51,18 @@ mod resolver;
 pub use resolver::Resolver;
 
 // Re-exported for the CLI front door (`crate::cli`), which renders the same answer
-// footer, failure text, and `kaibo://config` document the MCP handler does.
+// footer, failure text, `kaibo://config` document, and `batch list` recency window the
+// MCP handler does.
 pub(crate) use config_resource::render_config_resource;
-pub(crate) use render::{consultation_failure_text, with_provenance};
+pub(crate) use render::{
+    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
+    BATCH_RECENCY_WINDOW_SECS,
+};
 
 use render::{
-    append_warnings, batch_poll_brief, batch_within_window, consult_result, consultation_failed,
-    fmt_usage, is_batch_handle, now_epoch_secs, parse_batch_handle, render_job,
-    render_jobs_section, render_wait, wait_level_floor, wait_level_label,
-    BATCH_RECENCY_WINDOW_SECS,
+    append_warnings, batch_poll_brief, consult_result, consultation_failed, fmt_usage,
+    is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
+    wait_level_floor, wait_level_label,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -842,31 +845,18 @@ impl KaiboHandler {
         Resolver::resolve_consult_attachments(root, attach, budget, sandbox).await
     }
 
-    /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
-    /// stage): read-WHOLE directives, never inlined bytes — budget 0, so no file is
-    /// read here at all. Images are refused up front: the sweep toolset carries no
-    /// `view_image` (see `run_explore_phase`), so naming one would send the
-    /// investigator down a dead end (`cat` refuses binary).
+    /// Shim over [`Resolver::resolve_sweep_attachments`] — the resolution glue lives on
+    /// the shared resolver so the CLI `explore` front door runs the same sweep-attach
+    /// resolution + image refusal.
     async fn resolve_sweep_attachments(
         &self,
         root: &std::path::Path,
         attach: &[String],
         tool: &str,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
-        let attachments =
-            Self::resolve_consult_attachments(root, attach, 0, &self.config.sandbox).await?;
-        if let Some(img) = attachments.iter().find(|a| a.is_image()) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "attached file {} is an image, but {tool}'s investigator reads through \
-                     the shell and can't view images — attach it to `consult` with a \
-                     vision-capable cast instead",
-                    img.path()
-                ),
-                None,
-            ));
-        }
-        Ok(attachments)
+        self.resolver
+            .resolve_sweep_attachments(root, attach, tool)
+            .await
     }
 
     /// Shim over [`Resolver::gate_consult_image_attachments`] — the resolution glue
@@ -922,35 +912,10 @@ impl KaiboHandler {
         self.resolver.reject_offline_cast(cast, tool)
     }
 
-    /// Refuse `batch_submit` on a cast whose synth isn't on the `batch` lane
-    /// specifically — the other half of the lane split. A batch cast must positively
-    /// declare `lane = "batch"` on its synth slot, so an ordinary interactive cast is
-    /// never silently batched (an accidental Opus/Pro batch is just as costly the other
-    /// way), and a `direct` cast — offline, but not batch — gets its own honest
-    /// message rather than the generic "not a batch cast" one. Points the caller at
-    /// the built-in batch casts.
+    /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
+    /// shared resolver so the CLI `batch submit` front door runs the same gate.
     fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
-        match cast.synth_lane() {
-            Some(Lane::Batch) => Ok(()),
-            Some(Lane::Direct) => Err(McpError::invalid_params(
-                format!(
-                    "cast `{}`'s synth runs on the `direct` lane, not `batch` — \
-                     `batch_submit` needs a synth slot with `lane = \"batch\"`.",
-                    cast.name
-                ),
-                None,
-            )),
-            None => Err(McpError::invalid_params(
-                format!(
-                    "cast `{}` is not a batch cast — `batch_submit` needs a cast whose synth \
-                     slot declares `lane = \"batch\"` (the built-ins `gemini-batch`, \
-                     `anthropic-batch`, or your own in config.toml). For an interactive \
-                     answer, use `consult`/`oneshot`.",
-                    cast.name
-                ),
-                None,
-            )),
-        }
+        self.resolver.require_batch_cast(cast)
     }
 
     /// Refuse `deliberate` on a cast without an **offline synth**. deliberate =
@@ -1844,12 +1809,14 @@ impl KaiboHandler {
         // Gate image attachments on the synth model's vision capability before the
         // provider is built — so a vision misconfig needs no key to report.
         self.gate_image_attachments(caps.vision, &attachments, &model, &cast.name)?;
-        // Now build the network client (resolves the key); a batch-incapable backend is
-        // refused honestly here.
+        // Now build the network client (resolves the key). By here `require_batch_cast`
+        // has already vouched the cast is batch-capable, so a submitter build failure is
+        // an internal config inconsistency (an unbuildable key/endpoint on a lane we just
+        // validated), not the caller's parameter mistake — hence `internal_error`.
         let provider = self
             .batch_providers
             .submitter(backend, slot, &self.config.defaults)
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         let items: Vec<crate::batch::BatchItem> = input
             .prompts
             .iter()

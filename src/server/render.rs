@@ -274,13 +274,13 @@ pub(super) fn render_wait(
 /// The default `job_list` recency window: 24h. A provider's offline SLA is ≤24h, so an
 /// older batch is done and still collectible by its handle — trimming it saves the
 /// caller tokens without losing anything actionable.
-pub(super) const BATCH_RECENCY_WINDOW_SECS: i64 = 24 * 3600;
+pub(crate) const BATCH_RECENCY_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Unix epoch seconds now, for the `job_list` recency window — read once per `job_list` call and
 /// passed into [`batch_within_window`], not re-read per item. A pre-epoch system clock
 /// (impossible in practice) reads as 0, which keeps everything: fail-open, never hide a
 /// batch on a clock glitch. From `SystemTime`, so chrono's `clock` feature stays off.
-pub(super) fn now_epoch_secs() -> i64 {
+pub(crate) fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -293,7 +293,7 @@ pub(super) fn now_epoch_secs() -> i64 {
 /// unparseable `created_at`) is kept, not silently hidden — losing sight of a batch is
 /// worse than an extra line; a future timestamp (clock skew) yields a negative age, still
 /// within the window, so also kept.
-pub(super) fn batch_within_window(
+pub(crate) fn batch_within_window(
     it: &crate::batch::BatchListItem,
     now_epoch: i64,
     window_secs: i64,
