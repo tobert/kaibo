@@ -28,6 +28,7 @@ pub mod progress;
 pub mod sandbox;
 pub mod server;
 pub mod session;
+pub mod store;
 pub mod telemetry;
 pub mod tls;
 pub mod tool_span;

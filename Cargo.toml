@@ -74,6 +74,23 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.18"
+# Persistent session + batch-handle store (src/store.rs). turso is the pure-Rust
+# SQLite rewrite (ex-Limbo); the embedded `turso` crate, NOT libSQL or the cloud SDK.
+# EXACT-pinned (`=0.7.0`): the `.db-tshm` on-disk WAL format AND the API are declared
+# unstable between releases (same discipline as the kaish-kernel pin) — a bump must be
+# a deliberate, tested port, never a silent `^` float. `default-features = false` is
+# MANDATORY: the defaults install `mimalloc` as the whole binary's global allocator via
+# a C build (a hijack we will not accept implicitly) and pull `fts`. The `sync` feature
+# must NEVER be enabled — it materializes a network/HTTP stack, which would breach the
+# stdio-only + no-aws-lc invariants; the default `turso_sync_engine` weight carries no
+# transport without it. Verified aws-lc-rs/aws-lc-sys/openssl-sys/cmake-free via
+# `cargo tree -i` (see the store module doc-comment for the audit).
+turso = { version = "=0.7.0", default-features = false }
+# A typed store error wrapping `turso::Error` variants meaningfully (src/store.rs). The
+# rest of kaibo leans on anyhow, but a persistence library boundary wants a real error
+# enum callers can match on; thiserror is already in the tree (via kaish-kernel), so this
+# names an existing dep rather than adding build cost.
+thiserror = "2"
 # RFC3339 parsing for the `list` recency filter only — already in the tree (kaish-kernel
 # / rmcp / schemars). Parsing needs just `alloc`; "now" comes from `SystemTime`, so the
 # `clock` feature (and its iana-time-zone dep) stays off.
@@ -99,6 +116,15 @@ opentelemetry_sdk = "0.32"
 # transport features and let TLS come from the shared reqwest above.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
+
+# Local-filesystem validation for the persistence store (src/store.rs): turso's
+# multiprocess-WAL mode is unsupported on network filesystems (NFS/CIFS), where a
+# shared open can silently lose writes. On Linux we `statfs` the state dir and refuse a
+# known network fs magic. libc is already in the tree transitively (getrandom); named
+# here only under a Linux target so no new build cost lands on any platform, and no
+# heavy dependency is added for this check.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
