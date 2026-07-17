@@ -17,10 +17,11 @@
 //!   argument, an unknown or wrong-for-the-tool cast, an image on a vision-blind cast
 //!   (also clap's own arg-parse errors, and config load); `3` = a **setup/containment**
 //!   rejection — a path or attachment outside the allowed set, a missing/unbuildable
-//!   provider key; `4` = the consultation itself ran and failed (provider/model-loop).
-//!   So an agent branches on the code without parsing prose. (An arg-parse error is
-//!   clap's: usage on stderr, exit 2, nothing on stdout — the envelope is guaranteed
-//!   only once args parse.)
+//!   provider key; `4` = the work ran and failed at runtime (a provider/model-loop
+//!   failure, or a `kaish` worker infra crash). So an agent branches on the code without
+//!   parsing prose. (An arg-parse error is clap's: usage on stderr, exit 2, nothing on
+//!   stdout — the envelope is guaranteed only once args parse. And `kaibo kaish` passes
+//!   through kaish's own exit code on a normal run — 0/126 blocked/124 timed out.)
 //!
 //! `--help` is model-facing text: an agent reads it the way an MCP client reads a
 //! tool description, so the top-level `about` front-loads what kaibo is and every
@@ -56,7 +57,10 @@ pub const EXIT_USAGE: i32 = 2;
 /// A setup/containment rejection: a `--path`/`--root`/attachment outside the allowed
 /// boundary, or a missing/unbuildable provider key.
 pub const EXIT_SETUP: i32 = 3;
-/// The consultation ran but failed (provider overload, model-loop error, timeout).
+/// The work ran but failed at runtime: a consultation failure (provider overload,
+/// model-loop error, timeout), or a `kaish` worker infra failure (kernel crash/panic,
+/// worker channel closed) — distinct from a pre-flight rejection above. Note a normal
+/// kaish script/blocked/timeout outcome is not this: it returns kaish's own exit code.
 pub const EXIT_CONSULT_FAILURE: i32 = 4;
 
 /// kaibo (解剖) — read-only codebase consultation from a model outside your own
@@ -459,10 +463,12 @@ fn init_cli_logging() {
         .try_init();
 }
 
-/// Print `err` to stderr and return `code` — the shared shape for a setup/usage
-/// rejection (before the model runs). With `--json`, the message rides a structured
+/// Print `err` to stderr and return `code` — the shared shape for a **pre-flight**
+/// rejection (usage *or* setup/containment), i.e. anything refused before the model
+/// runs. Carries the `kind`/`code` its caller classified (it renders both, so the name
+/// no longer claims "setup" only). With `--json`, the message rides a structured
 /// envelope on stdout so a script parses it uniformly with a success envelope.
-fn fail_setup(json: bool, kind: &str, message: String, code: i32) -> i32 {
+fn fail_preflight(json: bool, kind: &str, message: String, code: i32) -> i32 {
     if json {
         println!("{}", error_envelope(kind, &message));
     } else {
@@ -480,7 +486,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     let config = match load_config(&common) {
         Ok(c) => c,
         Err(e) => {
-            return fail_setup(
+            return fail_preflight(
                 args.json,
                 "config",
                 format!("config error: {e:#}"),
@@ -500,7 +506,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     let resolver = match Resolver::from_config(Arc::new(config)) {
         Ok(r) => r,
         Err(e) => {
-            return fail_setup(args.json, "setup", format!("{e:#}"), EXIT_SETUP);
+            return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP);
         }
     };
 
@@ -526,7 +532,7 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
             kind,
             message,
             code,
-        }) => fail_setup(args.json, kind, message, code),
+        }) => fail_preflight(args.json, kind, message, code),
     }
 }
 
@@ -818,16 +824,46 @@ fn fail_consultation(json: bool, tool: &str, cast: &str, err: anyhow::Error) -> 
 /// Append context piped on stdin to the prompt (the `oneshot "…" < file` idiom). Only
 /// reads stdin when it's NOT a terminal (piped/redirected), so an interactive
 /// `kaibo oneshot "…"` never blocks waiting for input. Whitespace-only stdin is ignored.
-fn prompt_with_stdin(prompt: &str) -> String {
+///
+/// Non-empty, non-UTF-8 stdin is a **loud usage error** (exit 2), never a silent drop:
+/// `kaibo oneshot "…" < image.png` must not run the model blind about data it never
+/// received. oneshot takes *text* on stdin; a file (incl. an image, on a vision cast)
+/// belongs on `--attach`.
+fn prompt_with_stdin(prompt: &str) -> Result<String, SetupError> {
     use std::io::{IsTerminal, Read};
     if std::io::stdin().is_terminal() {
-        return prompt.to_string();
+        return Ok(prompt.to_string());
     }
-    let mut piped = String::new();
-    if std::io::stdin().read_to_string(&mut piped).is_ok() && !piped.trim().is_empty() {
-        format!("{prompt}\n\n{}", piped.trim_end())
-    } else {
-        prompt.to_string()
+    let mut bytes = Vec::new();
+    // A read error (e.g. stdin already closed) is treated as "no piped context" — the
+    // bare prompt still runs. Only *present but non-text* input is the loud error.
+    if std::io::stdin().read_to_end(&mut bytes).is_err() {
+        return Ok(prompt.to_string());
+    }
+    fold_stdin_context(prompt, &bytes)
+}
+
+/// Pure core of [`prompt_with_stdin`]: fold already-read stdin `bytes` into the prompt.
+/// Empty / whitespace-only → the bare prompt; UTF-8 text → appended after a blank line;
+/// non-empty non-UTF-8 → a loud usage error. Split out so the fail-loud contract is
+/// testable without touching process stdin.
+fn fold_stdin_context(prompt: &str, bytes: &[u8]) -> Result<String, SetupError> {
+    if bytes.is_empty() {
+        return Ok(prompt.to_string());
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.trim().is_empty() => Ok(prompt.to_string()),
+        Ok(text) => Ok(format!("{prompt}\n\n{}", text.trim_end())),
+        Err(_) => Err(SetupError {
+            kind: "usage",
+            message: format!(
+                "oneshot reads TEXT context on stdin, but the piped input isn't valid UTF-8 \
+                 ({} bytes) — kaibo won't send the model a prompt about data it never got. \
+                 Pipe text, or pass the file with --attach (an image needs a vision-capable cast).",
+                bytes.len()
+            ),
+            code: EXIT_USAGE,
+        }),
     }
 }
 
@@ -876,7 +912,7 @@ pub async fn run_oneshot(common: CommonArgs, args: OneshotArgs) -> i32 {
     let config = match load_config(&common) {
         Ok(c) => c,
         Err(e) => {
-            return fail_setup(
+            return fail_preflight(
                 args.json,
                 "config",
                 format!("config error: {e:#}"),
@@ -886,7 +922,7 @@ pub async fn run_oneshot(common: CommonArgs, args: OneshotArgs) -> i32 {
     };
     let resolver = match Resolver::from_config(Arc::new(config)) {
         Ok(r) => r,
-        Err(e) => return fail_setup(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
     };
     match oneshot_inner(&common, &args, &resolver).await {
         Ok(code) => code,
@@ -894,7 +930,7 @@ pub async fn run_oneshot(common: CommonArgs, args: OneshotArgs) -> i32 {
             kind,
             message,
             code,
-        }) => fail_setup(args.json, kind, message, code),
+        }) => fail_preflight(args.json, kind, message, code),
     }
 }
 
@@ -931,8 +967,9 @@ async fn oneshot_inner(
     resolver
         .gate_image_attachments(arm.caps.vision, &attachments, &arm.model, &cast.name)
         .map_err(SetupError::usage)?;
-    // Fold any context piped on stdin into the prompt (the `< file` idiom).
-    let prompt = prompt_with_stdin(&args.prompt);
+    // Fold any context piped on stdin into the prompt (the `< file` idiom); non-text
+    // piped input is a loud usage error rather than a silent drop.
+    let prompt = prompt_with_stdin(&args.prompt)?;
     let cfg = PhaseContext {
         progress: Arc::new(TerminalSink),
         // oneshot reads no project: no house rules, no repo map, no shell.
@@ -976,7 +1013,7 @@ pub async fn run_explore(common: CommonArgs, args: ExploreArgs) -> i32 {
     let config = match load_config(&common) {
         Ok(c) => c,
         Err(e) => {
-            return fail_setup(
+            return fail_preflight(
                 args.json,
                 "config",
                 format!("config error: {e:#}"),
@@ -986,7 +1023,7 @@ pub async fn run_explore(common: CommonArgs, args: ExploreArgs) -> i32 {
     };
     let resolver = match Resolver::from_config(Arc::new(config)) {
         Ok(r) => r,
-        Err(e) => return fail_setup(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
     };
     match explore_inner(&common, &args, &resolver).await {
         Ok(code) => code,
@@ -994,7 +1031,7 @@ pub async fn run_explore(common: CommonArgs, args: ExploreArgs) -> i32 {
             kind,
             message,
             code,
-        }) => fail_setup(args.json, kind, message, code),
+        }) => fail_preflight(args.json, kind, message, code),
     }
 }
 
@@ -1160,9 +1197,13 @@ pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
             // Exit with kaish's own code so a script can branch on it.
             out.code as i32
         }
+        // A worker.run() error is a RUNTIME infra failure (kernel crash/panic, worker
+        // channel closed) — the shell ran (or tried to) and failed, not a pre-flight
+        // rejection — so it's exit 4, not a setup code. (An honest script/blocked/timeout
+        // outcome came back Ok(out) above with kaish's own code.)
         Err(e) => {
             eprintln!("kaibo: kaish execution failed: {e:#}");
-            EXIT_SETUP
+            EXIT_CONSULT_FAILURE
         }
     }
 }
@@ -1181,11 +1222,13 @@ pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
     };
     let config = match load_config(&common) {
         Ok(c) => c,
-        Err(e) => return fail_setup(json, "config", format!("config error: {e:#}"), EXIT_USAGE),
+        Err(e) => {
+            return fail_preflight(json, "config", format!("config error: {e:#}"), EXIT_USAGE)
+        }
     };
     let resolver = match Resolver::from_config(Arc::new(config)) {
         Ok(r) => r,
-        Err(e) => return fail_setup(json, "setup", format!("{e:#}"), EXIT_SETUP),
+        Err(e) => return fail_preflight(json, "setup", format!("{e:#}"), EXIT_SETUP),
     };
     let outcome = match args.cmd {
         BatchCmd::Submit(a) => batch_submit_inner(&common, &a, &resolver).await,
@@ -1198,7 +1241,7 @@ pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
             kind,
             message,
             code,
-        }) => fail_setup(json, kind, message, code),
+        }) => fail_preflight(json, kind, message, code),
     }
 }
 
@@ -1825,6 +1868,30 @@ mod tests {
     fn batch_get_requires_a_handle() {
         let err = Cli::try_parse_from(["kaibo", "batch", "get"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn fold_stdin_context_appends_text_and_fails_loud_on_binary() {
+        // No piped bytes → the bare prompt.
+        assert_eq!(fold_stdin_context("ask", b"").unwrap(), "ask");
+        // Whitespace-only stdin is ignored.
+        assert_eq!(fold_stdin_context("ask", b"  \n\t ").unwrap(), "ask");
+        // Text is appended after a blank line, trailing whitespace trimmed.
+        assert_eq!(
+            fold_stdin_context("ask", b"context here\n").unwrap(),
+            "ask\n\ncontext here"
+        );
+        // Non-empty, non-UTF-8 (e.g. a piped PNG) is a LOUD usage error, never a silent
+        // drop — the #77 DeepSeek fix.
+        let err = fold_stdin_context("ask", &[0xff, 0xfe, 0x00, 0x01])
+            .expect_err("binary stdin must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("isn't valid UTF-8"),
+            "message names the cause: {}",
+            err.message
+        );
     }
 
     #[test]

@@ -1809,12 +1809,14 @@ impl KaiboHandler {
         // Gate image attachments on the synth model's vision capability before the
         // provider is built — so a vision misconfig needs no key to report.
         self.gate_image_attachments(caps.vision, &attachments, &model, &cast.name)?;
-        // Now build the network client (resolves the key); a batch-incapable backend is
-        // refused honestly here.
+        // Now build the network client (resolves the key). By here `require_batch_cast`
+        // has already vouched the cast is batch-capable, so a submitter build failure is
+        // an internal config inconsistency (an unbuildable key/endpoint on a lane we just
+        // validated), not the caller's parameter mistake — hence `internal_error`.
         let provider = self
             .batch_providers
             .submitter(backend, slot, &self.config.defaults)
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         let items: Vec<crate::batch::BatchItem> = input
             .prompts
             .iter()
