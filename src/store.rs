@@ -132,6 +132,11 @@ pub enum StoreError {
          the state dir at a local disk, or disable persistence."
     )]
     NetworkFilesystem(String),
+    /// Creating the state directory failed (permissions, a file where a dir should be, …).
+    /// The one blessed write site (see [`create_state_dir`]) reports its failure loudly
+    /// rather than opening onto a path that can't hold the db.
+    #[error("state dir: {0}")]
+    StateDir(String),
     /// The store observed an impossible internal state (an aggregate query returning no
     /// row, etc.) — surfaced loudly rather than papered over.
     #[error("corrupt store: {0}")]
@@ -157,15 +162,15 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// Open (creating the db file if absent) the state db at `path`, running schema
-    /// init/migration.
+    /// Open (creating the db file, and the state dir if absent) the state db at `path`,
+    /// running schema init/migration.
     ///
-    /// The **parent state dir must already exist** — the store performs no `std::fs`
-    /// mutation of its own (that would breach the source-level read-only guard in
-    /// `tests/no_write_path.rs`; the store's writes go only through turso, the deliberate,
-    /// contained persistence capability). Creating the XDG state dir belongs to whoever
-    /// owns that path — the config/path layer that resolves it (stage 2), not the store. A
-    /// missing parent surfaces as a loud turso open error rather than a silent create.
+    /// The parent state dir is created if missing — through [`create_state_dir`], the one
+    /// blessed filesystem-mutating site in kaibo production code (the read-only invariant
+    /// amendment; see that function and the carve-out in `tests/no_write_path.rs`). Creation
+    /// happens *after* the containment check below, so a path aimed inside a project is
+    /// refused with zero side effect — kaibo never creates a directory inside a project.
+    /// Every other write kaibo makes still goes only through turso.
     ///
     /// `allowed_trees` are the project roots the read-only sandbox may reach; the state db
     /// must live *outside* all of them. A path that resolves inside any allowed tree is
@@ -193,9 +198,16 @@ impl SessionStore {
             }
         }
 
-        // Refuse a network-mounted state dir (MP-WAL is unsupported there). Best-effort: if
-        // the parent doesn't exist yet, the probe declines to block and the missing-dir
-        // failure surfaces from the turso open below.
+        // Containment passed — now the state dir may be created and probed. Creating it is
+        // the one blessed write (through `create_state_dir`); it can't be a data-loss event,
+        // and it lets turso create the db file and the `statfs` probe below see a real dir.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                create_state_dir(parent)?;
+            }
+        }
+
+        // Refuse a network-mounted state dir (MP-WAL is unsupported there).
         validate_local_filesystem(path.parent().unwrap_or(path))?;
 
         let db = build_database(path).await?;
@@ -427,6 +439,23 @@ impl SessionStore {
         }
         Ok(out)
     }
+}
+
+/// Create the persistence state directory (and any missing parents).
+///
+/// This is the **one blessed filesystem-mutating site** in kaibo production code — the
+/// sanctioned half of the read-only invariant amendment (see
+/// `docs/kaibo-persistence-and-cli.md`). `tests/no_write_path.rs` carves out exactly this
+/// call: a `create_dir_all` in `store.rs` carrying the marker on its own line, and nowhere
+/// else. Any other `std::fs` mutation anywhere in `src/` — including a second
+/// `create_dir_all`, or one without the marker — still fails that guard. kaibo's every
+/// other write goes only through turso.
+///
+/// Callers must run the containment check first (as [`SessionStore::open`] does), so this
+/// never creates a directory inside a project tree.
+pub fn create_state_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir) // state-dir-create: blessed by the read-only invariant amendment
+        .map_err(|e| StoreError::StateDir(format!("creating state dir {}: {e}", dir.display())))
 }
 
 /// The ONE and ONLY place that calls turso's [`Builder`]. See the module doc-comment:

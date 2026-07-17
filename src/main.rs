@@ -109,6 +109,19 @@ struct Args {
     /// [context] user_files.
     #[arg(long = "user-context-file", value_name = "FILE", action = clap::ArgAction::Append)]
     user_context_file: Vec<PathBuf>,
+
+    /// Don't persist sessions or batch handles — run fully in-memory (session threads
+    /// are lost on restart, batch handles held nowhere). By default kaibo keeps a small
+    /// state db so a session survives a restart and is shared across front doors. Also
+    /// settable via KAIBO_NO_PERSISTENCE or [persistence] enabled = false.
+    #[arg(long)]
+    no_persistence: bool,
+
+    /// Path to the persistence state db. Overrides KAIBO_STATE_DB / [persistence] path /
+    /// the default ($XDG_STATE_HOME/kaibo/state.db, else ~/.local/state/kaibo/state.db).
+    /// A leading `~` is expanded by your shell, not by kaibo.
+    #[arg(long = "state-db", value_name = "FILE")]
+    state_db: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -147,6 +160,8 @@ async fn main() -> Result<()> {
         args.no_follow_worktrees,
         args.project_context_file.clone(),
         args.user_context_file.clone(),
+        args.no_persistence,
+        args.state_db.clone(),
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
@@ -235,7 +250,46 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Capture the persistence settings before `config` moves into the handler.
+    let persistence = config.persistence.clone();
+    let session_capacity = config.defaults.session_capacity;
     let handler = KaiboHandler::new(config)?.with_notifications(notifications);
+
+    // Stand up the durable session/batch store when persistence is enabled. Opening it is
+    // fallible (a bad path, a locked db on a single-process platform, a network mount), and
+    // a failure here is a LOUD startup error naming the escape hatch — never a silent
+    // fallback to memory (crash over silent fallback). The store is fed the handler's
+    // resolved allowed set so its containment guard refuses a state db inside any project
+    // tree. When persistence is off, the handler keeps its in-memory sessions unchanged.
+    let handler = if persistence.enabled {
+        let path = persistence
+            .path
+            .expect("an enabled persistence store has a resolved path (validated at load)");
+        let allowed = handler.allowed_set();
+        let allowed_refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+        let store = kaibo::store::SessionStore::open(&path, session_capacity, &allowed_refs)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to open the persistence state db at {}: {e}\n\
+                     Fix the path or permissions, or run without persistence \
+                     (--no-persistence, KAIBO_NO_PERSISTENCE, or [persistence] enabled = false \
+                     in config.toml).",
+                    path.display()
+                )
+            })?;
+        tracing::info!(
+            state_db = %path.display(),
+            "persistence enabled — sessions and batch handles are durable across restarts"
+        );
+        handler.with_session_store(store)
+    } else {
+        tracing::info!(
+            "persistence disabled — sessions are in-memory (lost on restart), \
+             batch handles held nowhere"
+        );
+        handler
+    };
     // Log the resolved (canonicalized) allowed set so the operator can verify the
     // containment boundary without inspecting config files.
     tracing::info!(

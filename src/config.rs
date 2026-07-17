@@ -657,6 +657,34 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// The `[persistence]` stanza — durable sessions + batch handles on a state db.
+///
+/// On by default: `consult` session threads and provider batch handles survive a restart
+/// and are shared across front doors (MCP ↔ CLI), stored in a SQLite file at a fixed,
+/// model-inaccessible XDG state path. Disable it (`enabled = false` /
+/// `KAIBO_NO_PERSISTENCE` / `--no-persistence`) to fall back to the historical in-memory
+/// behavior (sessions lost on restart, batch handles held nowhere). See `src/store.rs` and
+/// the read-only invariant amendment.
+#[derive(Debug, Clone)]
+pub struct PersistenceConfig {
+    /// Stand up the durable store at all. `false` → in-memory sessions, no batch persistence.
+    pub enabled: bool,
+    /// Where the state db lives. Defaults to `$XDG_STATE_HOME/kaibo/state.db`, else
+    /// `~/.local/state/kaibo/state.db`. `None` only when `enabled` is false and no default
+    /// could be resolved (no `$XDG_STATE_HOME`/`$HOME`) — `enabled` with no resolvable path
+    /// is a loud load error, never a silent in-project fallback.
+    pub path: Option<PathBuf>,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: default_state_db_path(),
+        }
+    }
+}
+
 // --- The whole config ------------------------------------------------------
 
 /// kaibo's resolved configuration.
@@ -686,6 +714,8 @@ pub struct Config {
     pub defaults: Defaults,
     /// OpenTelemetry export — off by default (see [`TelemetryConfig`]).
     pub telemetry: TelemetryConfig,
+    /// Durable sessions + batch handles — on by default (see [`PersistenceConfig`]).
+    pub persistence: PersistenceConfig,
     /// House-rules files spliced into each consultation tool's preamble (the
     /// `[context]` table). Defaults to reading `AGENTS.md` when present.
     pub context: ContextConfig,
@@ -1276,6 +1306,7 @@ impl Config {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
+        let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
@@ -1305,6 +1336,7 @@ impl Config {
             tools,
             defaults,
             telemetry,
+            persistence,
             context,
             prompts,
             orientation,
@@ -1342,9 +1374,21 @@ impl Config {
         disable_follow_worktrees: bool,
         project_context_files: Vec<String>,
         user_context_files: Vec<PathBuf>,
+        disable_persistence: bool,
+        state_db: Option<PathBuf>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
+        }
+        // Mirrors the `--no-<tool>` discipline: the CLI can only turn persistence OFF,
+        // never force it on over a `[persistence] enabled = false` in the file.
+        if disable_persistence {
+            self.persistence.enabled = false;
+        }
+        // `--state-db` is the top layer for the path (the CLI already expands `~` via the
+        // shell; a path arrives concrete). Overrides file/env/default.
+        if let Some(path) = state_db {
+            self.persistence.path = Some(path);
         }
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
         // never force it on over a `[server] follow_worktrees = false` in the file.
@@ -1587,6 +1631,7 @@ struct RawConfig {
     server: Option<RawServer>,
     defaults: Option<RawDefaults>,
     telemetry: Option<RawTelemetry>,
+    persistence: Option<RawPersistence>,
     context: Option<RawContext>,
     prompts: Option<RawPrompts>,
     orientation: Option<RawOrientation>,
@@ -1611,6 +1656,17 @@ struct RawTelemetry {
     headers: Option<BTreeMap<String, String>>,
     timeout_secs: Option<u64>,
     service_name: Option<String>,
+}
+
+/// The `[persistence]` stanza — durable sessions + batch handles. `enabled` defaults on;
+/// `path` defaults to the XDG state db. Env: `KAIBO_NO_PERSISTENCE` / `KAIBO_STATE_DB`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPersistence {
+    enabled: Option<bool>,
+    /// `$VAR`/`~`-expanded like `root`/`allow_paths`, so `$XDG_STATE_HOME/kaibo.db` or
+    /// `~/state.db` resolves per-environment rather than landing as a literal token.
+    path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2028,6 +2084,28 @@ fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
     })
 }
 
+/// Resolve `[persistence]`. `enabled` defaults on. `path` is the explicit value
+/// (`$VAR`/`~`-expanded) or the XDG default. **Enabled with no resolvable path is a loud
+/// load error** — never a silent fallback that could land the state db somewhere
+/// surprising (the same crash-over-corruption discipline `root`/`allow_paths` follow). A
+/// *disabled* store keeps whatever path resolved (possibly `None`); it is never opened.
+fn merge_persistence(raw: RawPersistence) -> Result<PersistenceConfig> {
+    let enabled = raw.enabled.unwrap_or(true);
+    let path = match raw.path {
+        Some(p) => Some(expand_path(&p)?),
+        None => default_state_db_path(),
+    };
+    if enabled && path.is_none() {
+        bail!(
+            "[persistence] is enabled but no state-db path could be determined \
+             (neither $XDG_STATE_HOME nor $HOME is set). Set [persistence] path (or \
+             KAIBO_STATE_DB), or disable it with enabled = false / KAIBO_NO_PERSISTENCE / \
+             --no-persistence."
+        );
+    }
+    Ok(PersistenceConfig { enabled, path })
+}
+
 /// Resolve `[context]`. A *missing* `project_files` keeps the built-in
 /// `["AGENTS.md"]` default (vendor-neutral, opt-out by an explicit empty list);
 /// `user_files` default to empty and are `$VAR`/`~`-expanded here (via `expand_path`,
@@ -2312,6 +2390,17 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
         telemetry.service_name = Some(v);
     }
     // headers is a map — file-only, no env form (same call as disable_builtins).
+
+    // Persistence: KAIBO_NO_PERSISTENCE flips the durable store OFF (same on/off grammar
+    // as the KAIBO_NO_* tool flags — it can only disable, matching the CLI `--no-persistence`).
+    // KAIBO_STATE_DB overrides the state-db path.
+    let persistence = raw.persistence.get_or_insert_with(Default::default);
+    if env_flag(get, "KAIBO_NO_PERSISTENCE") {
+        persistence.enabled = Some(false);
+    }
+    if let Some(v) = get("KAIBO_STATE_DB") {
+        persistence.path = Some(v);
+    }
     Ok(())
 }
 
@@ -2362,6 +2451,25 @@ pub fn default_config_path() -> Option<PathBuf> {
             .join(".config")
             .join("kaibo")
             .join("config.toml")
+    })
+}
+
+/// The default persistence state-db path: `$XDG_STATE_HOME/kaibo/state.db`, else
+/// `~/.local/state/kaibo/state.db` (the XDG state-dir convention — durable per-user data
+/// that isn't config and isn't a cache). `None` if neither `$XDG_STATE_HOME` nor `$HOME`
+/// is set; an enabled store with no path is then a loud load error (see
+/// [`merge_persistence`]). Kept separate from the file-open path so the store's single
+/// open helper stays the only site that touches turso.
+pub fn default_state_db_path() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("kaibo").join("state.db"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("kaibo")
+            .join("state.db")
     })
 }
 

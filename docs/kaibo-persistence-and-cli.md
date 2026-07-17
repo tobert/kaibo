@@ -321,8 +321,27 @@ radius; a git-root heuristic is the alternative if we want one.
   (macOS `statfs.f_fstypename`, Windows `GetDriveType`/UNC detection) is deferred; if a
   macOS/WSL user ever points the state dir at a network mount, they lose the early
   refusal but keep the single-open-path protection. Revisit if it bites.
-- **The store does not create its parent dir.** `SessionStore::open` performs no
-  `std::fs` mutation of its own (that would trip the source-level read-only guard in
-  `tests/no_write_path.rs`; the store's writes go only through turso). Creating the XDG
-  state dir belongs to the config/path layer that resolves it — wire that in the CLI/
-  config stage before `open` is called on a first run.
+- ~~**The store does not create its parent dir.**~~ **Resolved (stage 2).**
+  `SessionStore::open` now creates the state dir through `create_state_dir` — the one
+  blessed `std::fs` write site, carved out of the source-level read-only guard
+  (`tests/no_write_path.rs`) with the marker-line + exactly-one-site teeth. Creation
+  happens only *after* the containment check, so kaibo never makes a directory inside a
+  project. Every other kaibo write still goes through turso.
+
+## Stage 2 — wired
+
+- **Config**: a `[persistence]` stanza (`enabled` default on; `path` default
+  `$XDG_STATE_HOME/kaibo/state.db`, else `~/.local/state/kaibo/state.db`), following the
+  usual precedence (per-call/CLI > `KAIBO_*` env > file > built-in). CLI: `--no-persistence`,
+  `--state-db <FILE>`; env: `KAIBO_NO_PERSISTENCE`, `KAIBO_STATE_DB`. Enabled with no
+  resolvable path is a loud load error, never a silent in-project fallback.
+- **Sessions**: a `Sessions` enum seam (`Memory` | `Persistent`) hides the backend behind
+  one async `history`/`record` surface; `consult_session_turn` is backend-agnostic. `main`
+  opens the durable store (fed the resolved allowed set for containment) and swaps it in;
+  a failed open is a **loud startup error naming `--no-persistence`**, never a silent drop
+  to memory.
+- **Batch handles**: `batch_submit` records `{backend, provider_id, label}` in the store;
+  `job_list` surfaces recovered handles after a restart (deduped against the live provider
+  list). The provider stays the source of truth for batch *state*; the store is kaibo's
+  durable memory of what it launched. Status-on-poll persistence was judged not worth the
+  API surface (the provider is authoritative), so the `status` column stays reserved.

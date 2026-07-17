@@ -41,7 +41,7 @@ use crate::kaish_syntax::{
 use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
-use crate::session::SessionStore;
+use crate::session::{SessionStore, Sessions};
 
 mod config_resource;
 mod containment;
@@ -488,9 +488,12 @@ pub struct KaiboHandler {
     /// `kaibo://kaish/*` help resources and the composed onboarding instructions.
     /// `Arc` because rmcp clones the handler per request and these never change.
     tool_schemas: Arc<Vec<ToolSchema>>,
-    /// Multi-turn `consult` sessions. Internally an `Arc<Mutex<_>>`, so the
-    /// per-request handler clones all share one cache (see [`SessionStore`]).
-    sessions: SessionStore,
+    /// Multi-turn `consult` sessions, behind the [`Sessions`] seam: the in-memory LRU by
+    /// default, or the durable turso-backed store when `[persistence]` is enabled (swapped
+    /// in by [`with_session_store`](Self::with_session_store)). Cheap `Clone` either way, so
+    /// the per-request handler clones share one backend. The persistent variant also carries
+    /// the batch-handle store ([`Sessions::store`]).
+    sessions: Sessions,
     /// In-flight + collectable async consultations (`consult_submit`, collected via the
     /// shared `job_get`/`job_cancel`/`job_list`). Same `Arc<Mutex<LruCache>>` shape as
     /// `sessions`, so the per-request handler clones all share one registry (see
@@ -769,7 +772,11 @@ impl KaiboHandler {
             route.attr.meta = Some(meta);
         }
 
-        let sessions = SessionStore::new(config.defaults.session_capacity);
+        // Sessions start in-memory. When persistence is enabled, `main` opens the durable
+        // store (async, fallible) and swaps it in via `with_session_store` — keeping `new`
+        // sync and its many call sites unchanged. A test that never injects a store runs the
+        // historical in-memory path.
+        let sessions = Sessions::Memory(SessionStore::new(config.defaults.session_capacity));
         // Async-consult jobs get their own cap: a held job result (answer + optional
         // report) is heavier than a session's lean Q&A pair, so `job_capacity` is a
         // separate, smaller knob (`[defaults] job_capacity` / `KAIBO_JOB_CAPACITY`).
@@ -798,6 +805,17 @@ impl KaiboHandler {
     /// keep `new(config)` unchanged for the many call sites and tests.
     pub fn with_notifications(mut self, buffer: crate::mcp_log::NotificationBuffer) -> Self {
         self.notifications = buffer;
+        self
+    }
+
+    /// Swap the in-memory sessions for the durable turso-backed store — the persistence
+    /// seam. `main` opens the store (async, fallible, containment-checked against the
+    /// resolved allowed set) and calls this when `[persistence]` is enabled; a builder, like
+    /// [`with_notifications`](Self::with_notifications), so `new(config)` stays sync and
+    /// unchanged. The same store backs both `consult` sessions and batch-handle
+    /// recording/recovery (via [`Sessions::store`]).
+    pub fn with_session_store(mut self, store: crate::store::SessionStore) -> Self {
+        self.sessions = Sessions::Persistent(store);
         self
     }
 
@@ -2292,6 +2310,19 @@ impl KaiboHandler {
         // backend/id boundary, even when the provider id itself contains slashes (a Gemini
         // id is `batches/<id>`).
         let handle = format!("{backend_name}/{provider_id}");
+        // Persist the handle (label = model) so a restart can re-list and re-address it —
+        // the durable memory of what kaibo launched. The provider stays the source of truth
+        // for batch STATE; this is bookkeeping. A store failure is logged, never fatal: the
+        // batch is already live at the provider, so failing the call would strand it (and
+        // `job_list`'s provider query still recovers it). Only when persistence is enabled.
+        if let Some(store) = self.sessions.store() {
+            if let Err(e) = store
+                .put_batch(&backend_name, &provider_id, Some(&model))
+                .await
+            {
+                tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
+            }
+        }
         let msg = format!(
             "Submitted batch `{handle}` — {} prompt(s) on cast `{}` (model `{}`). \
              Poll it with `job_get {handle}` (it'll show progress, then per-item answers \
@@ -2421,6 +2452,11 @@ impl KaiboHandler {
             sections.push(render_jobs_section(&self.jobs.list()));
         }
 
+        // Handles the live provider listing surfaced — so the recovered-handles section
+        // below (from the persistence store) shows only what the live list *didn't*,
+        // never a duplicate.
+        let mut shown_handles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // Batches — provider-side and durable; `backend` scopes this section only. A
         // batch-resolution failure (no batch-capable backend, or a bad explicit
         // `backend`) becomes a *section note*, not a hard error — so it never sinks the
@@ -2450,6 +2486,7 @@ impl KaiboHandler {
                                 }
                                 for it in items {
                                     let handle = format!("{}/{}", name, it.provider_id);
+                                    shown_handles.insert(handle.clone());
                                     entries.push((handle, it));
                                 }
                             }
@@ -2481,6 +2518,41 @@ impl KaiboHandler {
                     }
                 }
                 Err(e) => sections.push(format!("Batches: unavailable — {}", e.message)),
+            }
+        }
+
+        // Recovered batch handles — kaibo's own durable record of batches it submitted,
+        // from the persistence store. Surfaces handles the live listing above didn't return
+        // (an unqueried backend, or an orphan from a past server session after a restart),
+        // so a restart never loses the way back to a batch. Deduped against the live list;
+        // the provider stays the source of truth for STATE — `job_get` a recovered handle
+        // for its live status. Only present when persistence is enabled.
+        if let Some(store) = self.sessions.store() {
+            match store.list_batches().await {
+                Ok(handles) => {
+                    let lines: Vec<String> = handles
+                        .iter()
+                        .map(|h| {
+                            (
+                                format!("{}/{}", h.backend, h.provider_id),
+                                h.label.as_deref(),
+                            )
+                        })
+                        .filter(|(handle, _)| !shown_handles.contains(handle))
+                        .map(|(handle, label)| match label {
+                            Some(l) => format!("- `{handle}` — {l}"),
+                            None => format!("- `{handle}`"),
+                        })
+                        .collect();
+                    if !lines.is_empty() {
+                        sections.push(format!(
+                            "Recovered batch handles (kaibo-submitted, from the persistence \
+                             store — `job_get` one for live status):\n{}",
+                            lines.join("\n")
+                        ));
+                    }
+                }
+                Err(e) => sections.push(format!("Recovered batch handles: unavailable — {e}")),
             }
         }
 
@@ -4303,6 +4375,113 @@ mod tests {
             crate::consult::batch_system_prompt(None),
             "the batch system prompt is passed through"
         );
+    }
+
+    /// Batch-handle persistence + recovery across a simulated restart. With a durable store
+    /// injected, `batch_submit` records the `backend/provider-id` handle; after a restart
+    /// (a fresh handler + store reopened on the same db, and a provider whose live list is
+    /// empty) `job_list` surfaces it under the recovered-handles section — the orphan-
+    /// recovery the design doc commits to, now durable rather than session-only.
+    #[tokio::test]
+    async fn batch_submit_persists_the_handle_and_it_recovers_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let cap = std::num::NonZeroUsize::new(8).unwrap();
+
+        let store = crate::store::SessionStore::open(&db, cap, &[])
+            .await
+            .unwrap();
+        // Provider list is EMPTY, so the store's recovered section is the *only* way the
+        // handle appears — exactly the after-restart / lost-handle case.
+        let scripted = Arc::new(
+            crate::batch::ScriptedBatch::new("msgbatch_r", vec![]).with_listing(vec![], false),
+        );
+        let h = handler_from_toml(BATCH_CASTS_TOML)
+            .with_batch_providers(Arc::new(crate::batch::ScriptedBatchProviders(
+                scripted.clone(),
+            )))
+            .with_session_store(store.clone());
+
+        h.batch_submit(Parameters(BatchSubmitInput {
+            prompts: vec!["q".into()],
+            attach: vec![],
+            cast: Some("mybatch".into()),
+            model: None,
+            backend: None,
+        }))
+        .await
+        .expect("scripted batch_submit succeeds");
+
+        // Recorded durably (backend `gem`, the scripted id, label = the synth model).
+        assert!(
+            store
+                .get_batch("gem", "msgbatch_r")
+                .await
+                .unwrap()
+                .is_some(),
+            "batch_submit must persist the handle when the store is enabled"
+        );
+
+        // Simulated restart: a brand-new handler + store reopened on the same db file, and a
+        // provider whose live list is still empty.
+        let store2 = crate::store::SessionStore::open(&db, cap, &[])
+            .await
+            .unwrap();
+        let empty = Arc::new(
+            crate::batch::ScriptedBatch::new("unused", vec![]).with_listing(vec![], false),
+        );
+        let h2 = handler_from_toml(BATCH_CASTS_TOML)
+            .with_batch_providers(Arc::new(crate::batch::ScriptedBatchProviders(empty)))
+            .with_session_store(store2);
+
+        let listing = result_text(
+            h2.job_list(Parameters(ListInput {
+                backend: None,
+                all: false,
+            }))
+            .await
+            .expect("job_list succeeds"),
+        );
+        assert!(
+            listing.contains("Recovered batch handles"),
+            "the recovered-handles section must appear after a restart:\n{listing}"
+        );
+        assert!(
+            listing.contains("gem/msgbatch_r"),
+            "the recovered handle must surface after a restart:\n{listing}"
+        );
+        assert!(
+            listing.contains("some-pro"),
+            "the recorded label (synth model) must show on the recovered handle:\n{listing}"
+        );
+    }
+
+    /// Startup loudness + the invariant amendment: `main` opens the store with the handler's
+    /// resolved allowed set, and a state db that resolves inside an allowed project tree is
+    /// refused loudly — never silently accepted onto a model-reachable path. This is the
+    /// containment feeding `main` relies on, and the reason an open failure is a hard startup
+    /// error (crash over silent fallback), not a quiet drop to memory.
+    #[tokio::test]
+    async fn persistence_store_open_refuses_a_state_db_inside_an_allowed_tree() {
+        let proj = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(proj.path().to_path_buf());
+        let h = KaiboHandler::new(config).expect("handler builds");
+        let allowed = h.allowed_set();
+        let allowed_refs: Vec<&Path> = allowed.iter().map(PathBuf::as_path).collect();
+
+        let inside = proj.path().join("state.db");
+        match crate::store::SessionStore::open(
+            &inside,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            &allowed_refs,
+        )
+        .await
+        {
+            Err(crate::store::StoreError::PathInAllowedTree(_)) => {}
+            Err(other) => panic!("wrong error kind: {other:?}"),
+            Ok(_) => panic!("a state db inside an allowed project tree must be refused"),
+        }
     }
 
     /// `deliberate`'s BATCH lane, tested directly — no explorer, no network. `deliberate_batch`

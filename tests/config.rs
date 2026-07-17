@@ -870,6 +870,8 @@ fn cli_cast_wins_over_env_and_file() {
         false,  // --no-follow-worktrees not passed
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
+        false,  // --no-persistence not passed
+        None,   // no --state-db
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -899,6 +901,8 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         false,
         vec![],
         vec![],
+        false,
+        None,
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1680,3 +1684,92 @@ fn a_zero_orientation_ceiling_is_a_loud_error() {
     );
 }
 
+// --- Persistence layering ---------------------------------------------------
+// `[persistence]` follows the same precedence as the rest of config: per-call/CLI >
+// KAIBO_* env > file > built-in. On by default, at the XDG state db.
+
+/// Default (no `[persistence]` table): enabled, at the XDG state-db path. Both the
+/// `$XDG_STATE_HOME` and `~/.local/state` branches end in `kaibo/state.db`.
+#[test]
+fn persistence_defaults_on_at_the_xdg_state_db() {
+    let c = Config::from_toml_str("").unwrap();
+    assert!(c.persistence.enabled, "persistence is on by default");
+    let path = c
+        .persistence
+        .path
+        .expect("a default state-db path resolves");
+    assert!(
+        path.ends_with("kaibo/state.db"),
+        "the default lands under the XDG state dir: {}",
+        path.display()
+    );
+}
+
+/// The file layer can turn it off and can point the db elsewhere (with `$VAR`/`~`
+/// expansion, like `root`/`allow_paths`).
+#[test]
+fn persistence_file_layer_disables_and_repoints() {
+    let off = Config::from_toml_str("[persistence]\nenabled = false\n").unwrap();
+    assert!(
+        !off.persistence.enabled,
+        "enabled = false disables the store"
+    );
+
+    let home = std::env::var("HOME").expect("HOME set in test env");
+    let repointed =
+        Config::from_toml_str("[persistence]\npath = \"$HOME/kaibo-test.db\"\n").unwrap();
+    assert_eq!(
+        repointed.persistence.path.unwrap(),
+        std::path::PathBuf::from(format!("{home}/kaibo-test.db")),
+        "an explicit path is $VAR-expanded"
+    );
+}
+
+/// The env layer: `KAIBO_NO_PERSISTENCE` disables, `KAIBO_STATE_DB` repoints — both over
+/// the file layer.
+#[test]
+fn persistence_env_disables_and_overrides_path() {
+    // KAIBO_NO_PERSISTENCE beats a file that enabled it.
+    let env: HashMap<&str, &str> = [("KAIBO_NO_PERSISTENCE", "1")].into_iter().collect();
+    let c = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert!(
+        !c.persistence.enabled,
+        "KAIBO_NO_PERSISTENCE disables the store"
+    );
+
+    // KAIBO_STATE_DB sets the path.
+    let env: HashMap<&str, &str> = [("KAIBO_STATE_DB", "/var/lib/kaibo/s.db")]
+        .into_iter()
+        .collect();
+    let c = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(
+        c.persistence.path.unwrap(),
+        std::path::PathBuf::from("/var/lib/kaibo/s.db"),
+        "KAIBO_STATE_DB sets the state-db path"
+    );
+}
+
+/// The CLI is the top layer: `--no-persistence` and `--state-db` win over file/env.
+#[test]
+fn persistence_cli_wins_over_lower_layers() {
+    // File enabled it at a path; CLI disables and repoints.
+    let mut c = Config::from_toml_str("[persistence]\npath = \"/from/file.db\"\n").unwrap();
+    assert!(c.persistence.enabled);
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        vec![],
+        vec![],
+        true,                                           // --no-persistence
+        Some(std::path::PathBuf::from("/from/cli.db")), // --state-db
+    );
+    assert!(!c.persistence.enabled, "--no-persistence wins");
+    assert_eq!(
+        c.persistence.path.unwrap(),
+        std::path::PathBuf::from("/from/cli.db"),
+        "--state-db wins over the file path"
+    );
+}
