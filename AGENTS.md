@@ -78,9 +78,13 @@ project and cannot run external commands.
   on** for 64-bit Unix: a mixed MP/non-MP open of the same file silently loses
   acknowledged writes with `integrity_check` still `ok`, and the documented upstream guard
   does **not** fire in 0.7.0 — so a second open-site is a data-loss bug (crash over corrupt
-  is the principle it violates). Windows / non-64-bit-Unix run single-process (a concurrent
-  open fails loudly); connect-per-operation, never a shared `Connection`. See `src/store.rs`
-  and `docs/kaibo-persistence-and-cli.md`.
+  is the principle it violates). Windows / non-64-bit-Unix run single-process; a concurrent
+  open (`SingleProcessLocked`) is the **one** carve-out to loud-fail-at-startup — it
+  **warns and degrades to in-memory sessions** (so an auto-restarting MCP client can't
+  crash-loop a second Windows editor window; visible in the startup log and as
+  `persistence.active = false` in `kaibo://config`). *Every other* store-open error stays
+  fatal-and-loud. Connect-per-operation, never a shared `Connection`. See `src/store.rs`,
+  `main.rs`, and `docs/kaibo-persistence-and-cli.md`.
 - **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.

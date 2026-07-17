@@ -256,9 +256,9 @@ async fn main() -> Result<()> {
     let handler = KaiboHandler::new(config)?.with_notifications(notifications);
 
     // Stand up the durable session/batch store when persistence is enabled. Opening it is
-    // fallible (a bad path, a locked db on a single-process platform, a network mount), and
-    // a failure here is a LOUD startup error naming the escape hatch — never a silent
-    // fallback to memory (crash over silent fallback). The store is fed the handler's
+    // fallible (a bad path, a locked db, a network mount). A failure is a LOUD startup error
+    // naming the escape hatch — never a silent fallback to memory (crash over silent
+    // fallback) — with ONE narrow, deliberate carve-out below. The store is fed the handler's
     // resolved allowed set so its containment guard refuses a state db inside any project
     // tree. When persistence is off, the handler keeps its in-memory sessions unchanged.
     let handler = if persistence.enabled {
@@ -267,22 +267,44 @@ async fn main() -> Result<()> {
             .expect("an enabled persistence store has a resolved path (validated at load)");
         let allowed = handler.allowed_set();
         let allowed_refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
-        let store = kaibo::store::SessionStore::open(&path, session_capacity, &allowed_refs)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
+        match kaibo::store::SessionStore::open(&path, session_capacity, &allowed_refs).await {
+            Ok(store) => {
+                tracing::info!(
+                    state_db = %path.display(),
+                    "persistence enabled — sessions and batch handles are durable across restarts"
+                );
+                handler.with_session_store(store)
+            }
+            // THE ONE CARVE-OUT (Windows / single-process platforms only): another kaibo
+            // already holds the db. MP-WAL is 64-bit-Unix-only, so a `SingleProcessLocked`
+            // can't arise on the Unix path — this is a Windows second-editor-window case.
+            // Crashing there would crash-LOOP under MCP clients that auto-restart servers, so
+            // we WARN loudly and serve with in-memory sessions instead. Not silent: the
+            // startup log says so, and `kaibo://config` shows `persistence.active = false`
+            // with `enabled = true`, which the calling model can read. Every OTHER open error
+            // (below) stays fatal-and-loud. (Flagged for Amy's review at the PR — this amends
+            // the loud-fail posture for exactly this one case.)
+            Err(e @ kaibo::store::StoreError::SingleProcessLocked(_)) => {
+                tracing::warn!(
+                    state_db = %path.display(),
+                    "{e} — continuing with IN-MEMORY sessions (this run will NOT persist; \
+                     kaibo://config shows persistence.active=false). Close the other kaibo, \
+                     point --state-db elsewhere, or set --no-persistence to silence this."
+                );
+                handler
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
                     "failed to open the persistence state db at {}: {e}\n\
-                     Fix the path or permissions, or run without persistence \
-                     (--no-persistence, KAIBO_NO_PERSISTENCE, or [persistence] enabled = false \
-                     in config.toml).",
+                     The state db is a convenience layer — if it's corrupt it is safe to \
+                     delete by hand (kaibo creates a fresh empty one on the next start; it \
+                     never auto-deletes, since the error could be transient). Otherwise fix \
+                     the path/permissions, or run without persistence (--no-persistence, \
+                     KAIBO_NO_PERSISTENCE, or [persistence] enabled = false in config.toml).",
                     path.display()
-                )
-            })?;
-        tracing::info!(
-            state_db = %path.display(),
-            "persistence enabled — sessions and batch handles are durable across restarts"
-        );
-        handler.with_session_store(store)
+                ));
+            }
+        }
     } else {
         tracing::info!(
             "persistence disabled — sessions are in-memory (lost on restart), \

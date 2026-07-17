@@ -74,6 +74,13 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// How long a batch handle is kept before it's pruned. Provider batches expire around 30
+/// days (Anthropic/Gemini both), so a handle older than that names a batch the provider has
+/// already dropped — dead weight. Pruning at every [`SessionStore::put_batch`] and at
+/// [`SessionStore::open`] bounds the table (and therefore `job_list`'s payload) via the data
+/// itself, no query `LIMIT` needed. Sessions need no TTL — they're capacity-evicted.
+const BATCH_HANDLE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// One completed turn — the lean `(question, answer)` pair, mirroring
 /// [`crate::session::QaTurn`]. No exploration report, no tool transcript, by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +200,26 @@ impl SessionStore {
         capacity: NonZeroUsize,
         allowed_trees: &[&Path],
     ) -> Result<Self> {
+        // Absolutize up front so containment only ever compares absolute paths. A *relative*
+        // db path whose parent doesn't exist would otherwise fall through the lexical
+        // fallback still relative, and `starts_with` an absolute allowed tree trivially
+        // misses it — the db then landing inside the project via cwd (Gemini review,
+        // finding 1). Everything below (containment, dir creation, turso open) uses this one
+        // absolute path.
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| {
+                    StoreError::InvalidStatePath(format!(
+                        "{}: cannot resolve current dir to absolutize a relative state db path: {e}",
+                        path.display()
+                    ))
+                })?
+                .join(path)
+        };
+        let path = path.as_path();
+
         // The state db must be a file, not a bare directory: a filename-less path (a
         // trailing `/`, `.`, `..`, or `/`) would let the containment compare below inspect
         // only the *parent* while the db itself lands AT the directory — so refuse it loudly
@@ -233,6 +260,13 @@ impl SessionStore {
             capacity: capacity.get(),
         };
         store.migrate().await?;
+        // Sweep batch handles the provider has already expired (TTL). One prune at open
+        // clears anything that aged out while kaibo was down, so `job_list` never serializes
+        // long-dead handles even on a store that hasn't seen a `put_batch` in a while.
+        {
+            let conn = store.conn().await?;
+            prune_stale_batch_handles(&conn, now()).await?;
+        }
         Ok(store)
     }
 
@@ -407,14 +441,28 @@ impl SessionStore {
 
     // --- Batch handles -----------------------------------------------------
 
-    /// Record (or refresh) a provider batch handle so a restart can re-attach to it.
-    /// Upserts on the `(backend, provider_id)` key — a repeat submit updates the label
-    /// rather than duplicating the row.
+    /// Record (or refresh) a provider batch handle so a restart can recover it. Upserts on
+    /// the `(backend, provider_id)` key — a repeat submit updates the label rather than
+    /// duplicating the row — and prunes any handles older than the TTL on the way, so the
+    /// table (and `job_list`'s payload) stays bounded by the data itself.
     pub async fn put_batch(
         &self,
         backend: &str,
         provider_id: &str,
         label: Option<&str>,
+    ) -> Result<()> {
+        self.put_batch_at(backend, provider_id, label, now()).await
+    }
+
+    /// [`put_batch`](Self::put_batch) with an explicit `created_at` (epoch seconds) — the
+    /// timestamp-injecting form, for tests exercising TTL pruning and for any future
+    /// backfill. Prunes stale handles like `put_batch` does.
+    pub async fn put_batch_at(
+        &self,
+        backend: &str,
+        provider_id: &str,
+        label: Option<&str>,
+        created_at: i64,
     ) -> Result<()> {
         let conn = self.conn().await?;
         let label_val = match label {
@@ -429,10 +477,11 @@ impl SessionStore {
                 backend.to_string(),
                 provider_id.to_string(),
                 label_val,
-                now(),
+                created_at,
             ),
         )
         .await?;
+        prune_stale_batch_handles(&conn, now()).await?;
         Ok(())
     }
 
@@ -662,6 +711,18 @@ async fn evict_over_capacity(conn: &Connection, capacity: usize) -> Result<()> {
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])
             .await?;
     }
+    Ok(())
+}
+
+/// Delete batch handles older than [`BATCH_HANDLE_TTL_SECS`] relative to `now`. A single
+/// autocommit `DELETE`; called from `put_batch_at` and at `open` so the table can't grow
+/// without bound across weeks of use (the provider has already expired anything this drops).
+async fn prune_stale_batch_handles(conn: &Connection, now: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM batch_handles WHERE created_at < ?1",
+        [now - BATCH_HANDLE_TTL_SECS],
+    )
+    .await?;
     Ok(())
 }
 

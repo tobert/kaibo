@@ -171,6 +171,13 @@ scenario):
   concurrency. Rationale: few pure-Windows users will run kaibo MCP and CLI
   simultaneously; the realistic Windows setup is kaibo + Claude Code inside WSL,
   which is the Unix path anyway.
+  - **Amended (stage 5, Gemini review, flagged for Amy):** a *fatal* second-open error
+    would **crash-loop** under an MCP client that auto-restarts its servers (a second
+    Windows editor window). So the `SingleProcessLocked` case alone is downgraded from
+    fatal to **warn-and-degrade-to-in-memory** (`main.rs`): loud on the startup log and
+    surfaced as `persistence.active = false` in `kaibo://config`, never silent. Every
+    other open failure stays fatal-and-loud. This is the single amendment to the agreed
+    loud-fail posture — narrow by design.
 - The single DB-open helper carries a **loud warning comment** explaining the
   mixed-mode silent-write-loss hazard and why the MP flag is hardwired — the
   comment is load-bearing (it's the constraint the code can't show).

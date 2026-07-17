@@ -1315,21 +1315,38 @@ pub(crate) async fn consult_session_turn(
     synth: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
+    // History (replay) failure is FATAL: nothing is paid for yet, so a broken store should
+    // fail the turn loudly rather than silently answer without the thread's context.
     let history = match session {
         Some((store, id)) => store.history(id).await?,
         None => Vec::new(),
     };
     let user_prompt = consult_user_prompt(question, context, &history, &cfg.attachments);
 
-    let out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
+    let mut out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
 
-    // Record after a successful turn. A persistent-store write error propagates (fails the
-    // turn loudly) rather than silently dropping the pair — the in-memory arm never errors,
-    // so this is a no-op change for today's default.
+    // Record failure is NON-fatal: by here the model has answered (a paid-for result), so
+    // losing that answer over a bookkeeping write would be the wrong trade — and it mirrors
+    // the non-fatal batch-handle record. Instead, keep the answer and surface the failure
+    // LOUDLY (never a silent fallback): warn on the log, and append a visible line to the
+    // answer so the caller knows this turn won't be in the thread next time. The in-memory
+    // arm never errors, so today's default is byte-for-byte unchanged.
     if let Some((store, id)) = session {
-        store
+        if let Err(e) = store
             .record(id, QaTurn::new(question, out.answer.clone()))
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                session = id,
+                error = %e,
+                "session turn not recorded — the answer stands, but this thread won't replay it"
+            );
+            out.answer.push_str(&format!(
+                "\n\n⚠️ Session turn NOT recorded (persistence error: {e}). \
+                 The answer above is complete, but this `session_id` won't include it on your \
+                 next turn — retry, or continue without relying on this turn as context."
+            ));
+        }
     }
     Ok(out)
 }
@@ -3466,6 +3483,42 @@ mod tests {
             sessions.history(sid).await.unwrap().is_empty(),
             "a failed turn must leave the thread untouched, got: {:?}",
             sessions.history(sid).await.unwrap()
+        );
+    }
+
+    /// Finding 3 (Gemini review): a *record* failure is non-fatal — by then the model has
+    /// answered (a paid-for result), so the turn returns that answer rather than throwing it
+    /// away over a bookkeeping write. The failure is surfaced LOUDLY on the result (a visible
+    /// line), never a silent drop. (History failure stays fatal; that's the `?` above.)
+    #[tokio::test]
+    async fn a_record_failure_returns_the_answer_and_surfaces_the_failure() {
+        const SYNTH: &str = "synth";
+        let client = echo_client(SYNTH);
+        let sessions = Sessions::FailingRecord;
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+
+        let out = consult_session_turn(
+            Some((&sessions, "doomed-record")),
+            "Q that answers",
+            None,
+            dir.path(),
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("a record failure must NOT fail the turn — the answer is already paid for");
+
+        assert!(
+            out.answer.contains("ANSWER[Q that answers]"),
+            "the paid-for answer must be preserved: {:?}",
+            out.answer
+        );
+        assert!(
+            out.answer.contains("NOT recorded"),
+            "the record failure must be surfaced loudly on the result: {:?}",
+            out.answer
         );
     }
 

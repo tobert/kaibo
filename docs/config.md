@@ -525,11 +525,20 @@ it can't be pointed into a repo). See `docs/kaibo-persistence-and-cli.md` and th
 "Read-only is the product" invariant.
 
 **Loud on failure, never a silent fallback.** If the store can't open (a bad path, a db
-inside a project, a locked file on a single-process platform, a network mount — turso's
-multiprocess mode is 64-bit-Unix + local-fs only), kaibo **fails to start** with an error
-naming the escape hatch, rather than quietly dropping to memory and losing your sessions
-on the next restart. On Windows the store is single-process: a second kaibo opening the
-same db fails loudly (close the other, or `--no-persistence`).
+inside a project, a network mount — turso's multiprocess mode is 64-bit-Unix + local-fs
+only), kaibo **fails to start** with an error naming the escape hatch and reminding you the
+db is a convenience layer safe to delete — rather than quietly dropping to memory and
+losing your sessions on the next restart.
+
+**One exception, Windows only.** On Windows (and other non-64-bit-Unix targets) the store
+is single-process. A *second* kaibo opening the same db — a second editor window — would,
+under an MCP client that auto-restarts its servers, crash-loop if this were fatal. So that
+one case (`SingleProcessLocked`) is the deliberate carve-out: kaibo **warns loudly and
+serves with in-memory sessions** for that run instead of crashing. It's not silent — the
+startup log says so, and `kaibo://config` shows `persistence.active = false` (with
+`enabled = true`) so the calling model can see durability is off. Close the other kaibo,
+point `--state-db` elsewhere, or `--no-persistence` to make it explicit. Every *other*
+open failure stays fatal.
 
 ## House rules: `[context]`
 

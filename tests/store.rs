@@ -198,6 +198,43 @@ async fn batch_put_get_list_and_upsert() {
     assert!(store.get_batch("nope", "nope").await.unwrap().is_none());
 }
 
+/// Finding 2 (Gemini review): batch handles are TTL-pruned so the table — and `job_list`'s
+/// payload — can't grow without bound. A handle older than ~30 days (past provider expiry)
+/// is swept; a fresh one is kept. Pruning runs on every `put_batch`.
+#[tokio::test]
+async fn stale_batch_handles_are_pruned_by_ttl() {
+    let (store, _d) = open(8).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let day = 24 * 60 * 60;
+
+    // A handle 40 days old (past the 30-day TTL) and a 1-day-old one.
+    store
+        .put_batch_at("anthropic", "old", Some("stale"), now - 40 * day)
+        .await
+        .unwrap();
+    store
+        .put_batch_at("anthropic", "new", Some("fresh"), now - day)
+        .await
+        .unwrap();
+
+    assert!(
+        store.get_batch("anthropic", "old").await.unwrap().is_none(),
+        "a handle past the TTL must be pruned"
+    );
+    assert!(
+        store.get_batch("anthropic", "new").await.unwrap().is_some(),
+        "a fresh handle must be kept"
+    );
+    assert_eq!(
+        store.list_batches().await.unwrap().len(),
+        1,
+        "job_list sees only live handles"
+    );
+}
+
 #[tokio::test]
 async fn reopen_does_not_re_run_migration() {
     // Reopening a populated db must not wipe or double-apply schema.
@@ -292,6 +329,53 @@ async fn refuses_bare_directory_and_path_equal_to_an_allowed_tree() {
         Err(other) => panic!("wrong error for a bare-directory path: {other:?}"),
         Ok(_) => panic!("a bare-directory path must be refused as invalid"),
     }
+}
+
+/// Serializes the one test that mutates the process-global cwd, and restores it on drop.
+/// (Every other store test uses absolute paths and never reads cwd, so this is belt-and-
+/// suspenders against a future cwd-dependent test.)
+struct CwdGuard {
+    prev: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+impl CwdGuard {
+    fn set(to: &Path) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(to).unwrap();
+        Self { prev, _lock: lock }
+    }
+}
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.prev);
+    }
+}
+
+/// Finding 1 (Gemini review): a **relative** db path whose parent doesn't exist must not
+/// slip the containment guard. Before the fix, `resolve_existing_parent` fell through to a
+/// lexical fallback that stayed *relative*, so `starts_with` against the absolute allowed
+/// tree trivially returned false — and the db landed inside the project via cwd. `open` now
+/// absolutizes against cwd up front, so a relative path resolving into an allowed tree is
+/// refused. (cwd == the project here, the realistic `kaibo --state-db rel/state.db` launched
+/// from inside a repo.)
+#[tokio::test]
+async fn refuses_relative_path_that_absolutizes_into_an_allowed_tree() {
+    let project = TempDir::new().unwrap();
+    let canon = project.path().canonicalize().unwrap();
+    let _cwd = CwdGuard::set(&canon);
+
+    match SessionStore::open(Path::new("nonexistent_dir/state.db"), cap(4), &[&canon]).await {
+        Err(StoreError::PathInAllowedTree(_)) => {}
+        Err(other) => panic!("wrong error for a relative in-cwd path: {other:?}"),
+        Ok(_) => panic!("a relative path resolving inside the cwd allowed tree must be refused"),
+    }
+    // Nothing was created on the way to refusing (the guard runs before any disk write).
+    assert!(
+        !canon.join("nonexistent_dir").exists(),
+        "containment refusal must not create the relative parent it refused"
+    );
 }
 
 /// Finding 3: replaying an unknown session is a pure read — it promotes nothing and leaves

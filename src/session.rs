@@ -108,13 +108,22 @@ impl SessionStore {
 /// Both variants are cheap `Clone` (an `Arc` inside), so the per-request handler clones
 /// share one backend. The methods are `async` because the persistent backend's are;
 /// the in-memory arms complete synchronously and never error, so today's behavior is
-/// byte-for-byte unchanged when `Memory` is live. A backend read/write **error
-/// propagates** (it fails the turn loudly) rather than silently falling back to memory —
-/// a broken store is surfaced, not papered over.
+/// byte-for-byte unchanged when `Memory` is live.
+///
+/// Failure is never a silent fallback to memory, but the two directions differ (see
+/// `consult_session_turn`): a [`history`](Self::history) (replay) error is **fatal** — the
+/// turn hasn't paid for anything yet, so a broken store should fail loudly; a
+/// [`record`](Self::record) error is **non-fatal** — by then the model has answered, so the
+/// caller keeps that answer and the failure is surfaced loudly on the result instead of
+/// throwing a paid-for answer away (mirroring the non-fatal batch-handle record).
 #[derive(Clone)]
 pub enum Sessions {
     Memory(SessionStore),
     Persistent(store::SessionStore),
+    /// Test-only: a backend whose `record` always fails (and `history` is empty), for
+    /// exercising the record-failure-is-non-fatal path in `consult_session_turn`.
+    #[cfg(test)]
+    FailingRecord,
 }
 
 impl Sessions {
@@ -129,6 +138,8 @@ impl Sessions {
                 .into_iter()
                 .map(|t| QaTurn::new(t.question, t.answer))
                 .collect()),
+            #[cfg(test)]
+            Sessions::FailingRecord => Ok(Vec::new()),
         }
     }
 
@@ -144,6 +155,8 @@ impl Sessions {
                 s.record_turn(id, &turn.question, &turn.answer).await?;
                 Ok(())
             }
+            #[cfg(test)]
+            Sessions::FailingRecord => Err(anyhow::anyhow!("scripted record failure")),
         }
     }
 
@@ -152,6 +165,8 @@ impl Sessions {
         match self {
             Sessions::Memory(s) => Ok(s.session_count()),
             Sessions::Persistent(s) => Ok(s.session_count().await?),
+            #[cfg(test)]
+            Sessions::FailingRecord => Ok(0),
         }
     }
 
@@ -162,6 +177,8 @@ impl Sessions {
         match self {
             Sessions::Memory(_) => None,
             Sessions::Persistent(s) => Some(s),
+            #[cfg(test)]
+            Sessions::FailingRecord => None,
         }
     }
 }
