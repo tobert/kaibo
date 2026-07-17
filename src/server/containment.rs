@@ -5,9 +5,9 @@
 //! tree (`--root` / `--allow-path`, or a followed worktree of one) before kaish ever
 //! mounts it. Attachments obey the same boundary and are read *through the read-only
 //! kaish VFS*, so a symlink swapped in after the check can't escape the mount at read
-//! time. These are a split inherent `impl` on [`super::KaiboHandler`]; the shared
+//! time. These are a split inherent `impl` on [`super::Resolver`]; the shared
 //! predicates they call (`containing_tree`, `containment_error`) live with the rest of
-//! the handler in the parent module.
+//! the resolver in `resolver.rs`.
 
 use std::path::PathBuf;
 
@@ -15,7 +15,7 @@ use rmcp::ErrorData as McpError;
 
 use crate::sandbox::KaishWorker;
 
-impl super::KaiboHandler {
+impl super::Resolver {
     /// Resolve a call's project root with containment enforcement:
     ///
     /// 1. Select the raw path: the explicit `path` arg, else the effective default
@@ -29,7 +29,7 @@ impl super::KaiboHandler {
     ///    widening knobs (`--allow-path`, `KAIBO_ALLOW_PATHS`, `[server] allow_paths`).
     ///
     /// Returns the CANONICALIZED path so the kaish mount target is always resolved.
-    pub(super) fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
+    pub(crate) fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
         // Step 1: select the raw path. The default root is the explicit `--root` or
         // the inferred launch cwd (already canonicalized and dir-checked at startup,
         // and guaranteed inside the allowed set); the steps below re-validate it

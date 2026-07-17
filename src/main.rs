@@ -1,12 +1,16 @@
-//! kaibo (解剖) — stdio MCP server. Ask `consult` a question about a codebase;
-//! kaibo explores it read-only through kaish and returns a cited answer.
+//! kaibo (解剖) — read-only codebase consultation, as a stdio MCP server and a CLI.
 //!
-//! stdio only, by design: kaibo can read a filesystem, so it must never bind a
-//! network socket. Logs go to stderr — stdout is the MCP transport.
+//! Bare `kaibo` (and `kaibo serve`) is the MCP server: ask `consult` a question about
+//! a codebase; kaibo explores it read-only through kaish and returns a cited answer.
+//! stdio only, by design — kaibo can read a filesystem, so it must never bind a
+//! network socket. Logs go to stderr; stdout carries the MCP transport.
+//!
+//! `kaibo consult "…"` and `kaibo config` are the CLI front door (see `kaibo::cli`),
+//! for CLI-first agents, scripts, and humans without an MCP client. Every existing
+//! MCP client config keeps working unchanged: a bare invocation is still the server.
 //!
 //! Configuration layers, highest wins: CLI flags > `KAIBO_*` env > the XDG
-//! `config.toml` > built-in defaults. See `docs/config.md`. The flags here are the
-//! top layer; they override whatever the config resolved.
+//! `config.toml` > built-in defaults. See `docs/config.md`.
 
 use std::path::PathBuf;
 
@@ -16,121 +20,37 @@ use rmcp::service::ServiceExt;
 use rmcp::transport::io::stdio;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use kaibo::config::{Config, ToolDisables};
+use kaibo::cli::{Cli, Command, CommonArgs, ServeGates};
+use kaibo::config::Config;
 use kaibo::mcp_log::{self, McpBridgeLayer};
 use kaibo::server::KaiboHandler;
 
-#[derive(Parser)]
-#[command(
-    name = "kaibo",
-    version,
-    about = "kaibo (解剖) — read-only codebase consult MCP server (stdio)"
-)]
-struct Args {
-    /// Path to config.toml. Overrides $KAIBO_CONFIG; default is
-    /// $XDG_CONFIG_HOME/kaibo/config.toml (absent → built-in defaults).
-    #[arg(long, value_name = "FILE")]
-    config: Option<PathBuf>,
-
-    /// Default project root to explore when a call omits `path`. Also joins the
-    /// containment allowed set: a call's `path` must resolve to at-or-under --root
-    /// or one of the --allow-path trees. With neither flag the allowed set defaults
-    /// to the launch cwd (MCP clients start stdio servers with cwd = workspace), and
-    /// that cwd is also adopted as the inferred default root — so a call may omit
-    /// `path` without configuring anything. (An --allow-path that excludes the cwd
-    /// leaves no default root, since we never default to a path containment rejects.)
-    /// A leading `~` is expanded by your shell, not by kaibo; in config.toml / KAIBO_*
-    /// kaibo expands it for you.
-    #[arg(long, value_name = "DIR")]
-    root: Option<PathBuf>,
-
-    /// Additional allowed path tree. Repeatable. A per-call `path` must resolve
-    /// to at-or-under --root or one of these; use --allow-path / to lift all
-    /// limits. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
-    /// [server] allow_paths in config.toml — those expand a leading `~`; on the CLI
-    /// your shell does (a quoted '~/src' arrives literal and fails canonicalization).
-    /// A non-empty set of --allow-path flags replaces the env/file layer.
-    #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append)]
-    allow_path: Vec<PathBuf>,
-
-    /// Don't follow git worktrees: a per-call `path` in a linked worktree of an
-    /// already-allowed repo is rejected like any other outside path. By default
-    /// kaibo admits such worktrees (resolved by reading git's link files, never by
-    /// running git), so a sibling worktree you spin up mid-session is reachable
-    /// without an --allow-path. Also settable via KAIBO_NO_FOLLOW_WORKTREES or
-    /// [server] follow_worktrees = false.
-    #[arg(long)]
-    no_follow_worktrees: bool,
-
-    /// Default cast when a call omits it (a built-in name or a cast defined in
-    /// config.toml). Built-ins: anthropic | deepseek | gemini | openrouter |
-    /// openai-local (plus aliases: claude, google, local, …) and the batch casts
-    /// gemini-batch | anthropic-batch. Replaces the old --provider flag
-    /// (clap rejects the unknown flag loudly).
-    #[arg(long)]
-    cast: Option<String>,
-
-    /// Don't advertise the `consult` tool.
-    #[arg(long)]
-    no_consult: bool,
-
-    /// Don't advertise the `explore` tool.
-    #[arg(long)]
-    no_explore: bool,
-
-    /// Don't advertise the `deliberate` tool.
-    #[arg(long)]
-    no_deliberate: bool,
-
-    /// Don't advertise the `oneshot` tool.
-    #[arg(long)]
-    no_oneshot: bool,
-
-    /// Don't advertise the `run_kaish` tool.
-    #[arg(long)]
-    no_run_kaish: bool,
-
-    /// Don't advertise `batch_submit`. The shared `job_get`/`job_cancel`/`job_list` verbs remain as
-    /// long as `consult` is on (they also collect consult jobs); they drop only when both
-    /// `--no-batch` and `--no-consult` are set.
-    #[arg(long)]
-    no_batch: bool,
-
-    /// Project house-rules file spliced into each consultation tool's preamble,
-    /// resolved relative to the project root and read only if present. Repeatable.
-    /// Defaults to AGENTS.md; passing any replaces that default. Also settable via
-    /// KAIBO_PROJECT_FILES (colon-separated) or [context] project_files.
-    #[arg(long = "project-context-file", value_name = "FILE", action = clap::ArgAction::Append)]
-    project_context_file: Vec<String>,
-
-    /// User house-rules file (e.g. ~/.claude/CLAUDE.md) spliced into each
-    /// consultation tool's preamble; read unconditionally (missing is an error).
-    /// Repeatable. Also settable via KAIBO_USER_FILES (colon-separated) or
-    /// [context] user_files.
-    #[arg(long = "user-context-file", value_name = "FILE", action = clap::ArgAction::Append)]
-    user_context_file: Vec<PathBuf>,
-
-    /// Don't persist sessions or batch handles — run fully in-memory (session threads
-    /// are lost on restart, batch handles held nowhere). By default kaibo keeps a small
-    /// state db so a session survives a restart and is shared across front doors. Also
-    /// settable via KAIBO_NO_PERSISTENCE or [persistence] enabled = false.
-    #[arg(long)]
-    no_persistence: bool,
-
-    /// Path to the persistence state db. Overrides KAIBO_STATE_DB / [persistence] path /
-    /// the default ($XDG_STATE_HOME/kaibo/state.db, else ~/.local/state/kaibo/state.db).
-    /// A leading `~` is expanded by your shell, not by kaibo.
-    #[arg(long = "state-db", value_name = "FILE")]
-    state_db: Option<PathBuf>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    // The shared flags live on `cli.common` (globals, usable before or after the
+    // subcommand); each arm consumes them alongside its own payload.
+    match cli.command {
+        // Bare `kaibo` and explicit `kaibo serve` both run the MCP server on the same
+        // flags — the compatibility contract for existing client configs.
+        None => serve(cli.common, cli.gates).await,
+        Some(Command::Serve(gates)) => serve(cli.common, gates).await,
+        // The CLI front doors own their exit codes (0 answer / 2 usage / 3 setup /
+        // 4 consultation failure), so they return a code and we exit on it.
+        Some(Command::Consult(args)) => {
+            std::process::exit(kaibo::cli::run_consult(cli.common, args).await)
+        }
+        Some(Command::Config) => std::process::exit(kaibo::cli::run_config(cli.common)),
+    }
+}
 
+/// Run the MCP server on stdio. The body of a bare `kaibo` / `kaibo serve` — behavior
+/// is byte-for-byte what it was before the CLI restructure. `common` carries the shared
+/// flags; `gates` the serve-only `--no-<tool>` toggles.
+async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     // Load config before logging so `server.log` can set the filter. A config error
     // is fatal and must be visible even though tracing isn't up yet — go to stderr.
-    let config_path = args
+    let config_path = common
         .config
         .clone()
         .or_else(|| std::env::var_os("KAIBO_CONFIG").map(PathBuf::from));
@@ -142,26 +62,18 @@ async fn main() -> Result<()> {
         }
     };
 
-    // CLI is the top layer: overlay it over the loaded config. `disable` carries the
-    // --no-<tool> flags (true = the user asked to drop that tool). A non-empty
-    // `allow_path` list replaces the env/file layer.
+    // CLI is the top layer: overlay it over the loaded config. A non-empty `allow_path`
+    // list replaces the env/file layer.
     config.apply_cli(
-        args.root.clone(),
-        args.cast.clone(),
-        ToolDisables {
-            consult: args.no_consult,
-            explore: args.no_explore,
-            deliberate: args.no_deliberate,
-            oneshot: args.no_oneshot,
-            run_kaish: args.no_run_kaish,
-            batch: args.no_batch,
-        },
-        args.allow_path.clone(),
-        args.no_follow_worktrees,
-        args.project_context_file.clone(),
-        args.user_context_file.clone(),
-        args.no_persistence,
-        args.state_db.clone(),
+        common.root.clone(),
+        common.cast.clone(),
+        gates.tool_disables(),
+        common.allow_path.clone(),
+        common.no_follow_worktrees,
+        common.project_context_file.clone(),
+        common.user_context_file.clone(),
+        common.no_persistence,
+        common.state_db.clone(),
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else

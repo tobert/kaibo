@@ -22,7 +22,7 @@ use super::ToolGating;
 /// values. The backend struct stores sources, not secrets; this renderer reads only
 /// those source fields. If Config ever gains a resolved-key cache, do not read it here.
 /// Tests in this file assert the contract holds.
-pub(super) fn render_config_resource(
+pub(crate) fn render_config_resource(
     config: &Config,
     allowed_set: &[PathBuf],
     default_root: Option<&Path>,
