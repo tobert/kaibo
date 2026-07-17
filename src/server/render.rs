@@ -355,6 +355,21 @@ pub(super) fn parse_batch_handle(handle: &str) -> Result<(&str, &str), McpError>
         })
 }
 
+/// Fold a consult's non-fatal [`warnings`](crate::consult::ConsultOutput) back into the
+/// answer text for the MCP client, appended after the answer body (so, with the
+/// provenance footer added around this, they sit between the answer and the footer —
+/// the exact position #76 shipped). The warnings live *off* the answer on the engine
+/// seam so a machine consumer of the CLI `--json` `answer` field gets clean text; the
+/// MCP client has no such structured channel, so here we render them inline, keeping
+/// the client-visible behavior unchanged. A no-op when there are no warnings.
+pub(crate) fn append_warnings(mut answer: String, warnings: &[String]) -> String {
+    for w in warnings {
+        answer.push_str("\n\n");
+        answer.push_str(w);
+    }
+    answer
+}
+
 pub(crate) fn with_provenance(
     answer: String,
     cast: &str,
@@ -406,6 +421,23 @@ pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MCP path renders a consult's warnings inline (after the answer body), so the
+    /// client sees them exactly as #76 shipped even though they now live off the answer
+    /// on the engine seam. No warnings → the answer is untouched.
+    #[test]
+    fn append_warnings_folds_notices_after_the_answer_and_is_a_noop_when_empty() {
+        assert_eq!(
+            append_warnings("the answer".to_string(), &[]),
+            "the answer",
+            "no warnings must leave the answer byte-for-byte"
+        );
+        let folded = append_warnings(
+            "the answer".to_string(),
+            &["⚠️ notice one".to_string(), "⚠️ notice two".to_string()],
+        );
+        assert_eq!(folded, "the answer\n\n⚠️ notice one\n\n⚠️ notice two");
+    }
 
     #[test]
     fn wait_level_floor_parses_the_salience_words_and_rejects_junk() {

@@ -20,7 +20,7 @@ use rmcp::service::ServiceExt;
 use rmcp::transport::io::stdio;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use kaibo::cli::{Cli, Command, ServeArgs};
+use kaibo::cli::{Cli, Command, CommonArgs, ServeGates};
 use kaibo::config::Config;
 use kaibo::mcp_log::{self, McpBridgeLayer};
 use kaibo::server::KaiboHandler;
@@ -28,25 +28,29 @@ use kaibo::server::KaiboHandler;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The shared flags live on `cli.common` (globals, usable before or after the
+    // subcommand); each arm consumes them alongside its own payload.
     match cli.command {
         // Bare `kaibo` and explicit `kaibo serve` both run the MCP server on the same
         // flags — the compatibility contract for existing client configs.
-        None => serve(cli.serve).await,
-        Some(Command::Serve(args)) => serve(args).await,
+        None => serve(cli.common, cli.gates).await,
+        Some(Command::Serve(gates)) => serve(cli.common, gates).await,
         // The CLI front doors own their exit codes (0 answer / 2 usage / 3 setup /
         // 4 consultation failure), so they return a code and we exit on it.
-        Some(Command::Consult(args)) => std::process::exit(kaibo::cli::run_consult(args).await),
-        Some(Command::Config(args)) => std::process::exit(kaibo::cli::run_config(args)),
+        Some(Command::Consult(args)) => {
+            std::process::exit(kaibo::cli::run_consult(cli.common, args).await)
+        }
+        Some(Command::Config) => std::process::exit(kaibo::cli::run_config(cli.common)),
     }
 }
 
 /// Run the MCP server on stdio. The body of a bare `kaibo` / `kaibo serve` — behavior
-/// is byte-for-byte what it was before the CLI restructure.
-async fn serve(args: ServeArgs) -> Result<()> {
+/// is byte-for-byte what it was before the CLI restructure. `common` carries the shared
+/// flags; `gates` the serve-only `--no-<tool>` toggles.
+async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     // Load config before logging so `server.log` can set the filter. A config error
     // is fatal and must be visible even though tracing isn't up yet — go to stderr.
-    let config_path = args
-        .common
+    let config_path = common
         .config
         .clone()
         .or_else(|| std::env::var_os("KAIBO_CONFIG").map(PathBuf::from));
@@ -61,15 +65,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
     // CLI is the top layer: overlay it over the loaded config. A non-empty `allow_path`
     // list replaces the env/file layer.
     config.apply_cli(
-        args.common.root.clone(),
-        args.common.cast.clone(),
-        args.tool_disables(),
-        args.common.allow_path.clone(),
-        args.common.no_follow_worktrees,
-        args.common.project_context_file.clone(),
-        args.common.user_context_file.clone(),
-        args.common.no_persistence,
-        args.common.state_db.clone(),
+        common.root.clone(),
+        common.cast.clone(),
+        gates.tool_disables(),
+        common.allow_path.clone(),
+        common.no_follow_worktrees,
+        common.project_context_file.clone(),
+        common.user_context_file.clone(),
+        common.no_persistence,
+        common.state_db.clone(),
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else

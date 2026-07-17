@@ -16,6 +16,14 @@
 //! The containment methods (`resolve_root`, `resolve_attachments`, and the private
 //! `contained`/`containing_tree`) live in the sibling `containment.rs` as a split
 //! `impl Resolver`, next to the boundary doc-comment they belong with.
+//!
+//! Not pure lookup glue: most methods here are cheap config/registry reads, but the
+//! attachment resolvers (`resolve_consult_attachments`, `resolve_attachments`) are the
+//! **heavyweight exception** — they spawn a read-only [`KaishWorker`](crate::sandbox::KaishWorker)
+//! and read file bytes through its VFS (which is *why* a `Resolver` carries the
+//! sandbox config, and why those two are `async`). Don't refactor on the assumption
+//! that resolution is side-effect-free I/O-free lookup; attachment resolution mounts a
+//! kernel and does real (read-only) filesystem work.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

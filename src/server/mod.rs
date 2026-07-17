@@ -56,9 +56,10 @@ pub(crate) use config_resource::render_config_resource;
 pub(crate) use render::{consultation_failure_text, with_provenance};
 
 use render::{
-    batch_poll_brief, batch_within_window, consult_result, consultation_failed, fmt_usage,
-    is_batch_handle, now_epoch_secs, parse_batch_handle, render_job, render_jobs_section,
-    render_wait, wait_level_floor, wait_level_label, BATCH_RECENCY_WINDOW_SECS,
+    append_warnings, batch_poll_brief, batch_within_window, consult_result, consultation_failed,
+    fmt_usage, is_batch_handle, now_epoch_secs, parse_batch_handle, render_job,
+    render_jobs_section, render_wait, wait_level_floor, wait_level_label,
+    BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -1180,8 +1181,11 @@ impl KaiboHandler {
         // Provenance: name the cast and the models that answered, so a caller (a
         // cross-model study especially) sees which model produced this without
         // digging into `kaibo://config`. consult runs two arms — both are named.
+        // Fold any non-fatal warnings (a failed session record) back into the answer
+        // text before the footer — the MCP client has no structured warnings channel, so
+        // it sees them inline exactly as #76 shipped (the CLI keeps them off `--json`).
         let answer = with_provenance(
-            out.answer,
+            append_warnings(out.answer, &out.warnings),
             &cast.name,
             &[("explorer", &explorer.model), ("synth", &synth.model)],
             &out.usage,
@@ -1296,7 +1300,7 @@ impl KaiboHandler {
             {
                 Ok(out) => {
                     let answer = with_provenance(
-                        out.answer,
+                        append_warnings(out.answer, &out.warnings),
                         &cast_name,
                         &[
                             ("explorer", explorer_model.as_str()),

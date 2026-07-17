@@ -8,13 +8,19 @@
 //! MCP continues on the CLI and back. Two contracts a script can rely on:
 //!
 //! - **stdout is the answer, stderr is everything else.** The answer (with the same
-//!   provenance footer the MCP tool returns) goes to stdout; progress beats and logs
-//!   go to stderr (via [`TerminalSink`](crate::progress::TerminalSink)). `--json`
-//!   swaps stdout for a structured envelope (answer + provenance + usage).
-//! - **exit codes have teeth.** `0` = an answer; `2` = a usage/config error; `3` = a
-//!   containment or setup rejection (bad path/cast/attachment/key); `4` = the
-//!   consultation itself failed (provider/model-loop). So an agent branches on the
-//!   code without parsing prose.
+//!   provenance footer the MCP tool returns) goes to stdout; progress beats, logs, and
+//!   any non-fatal warnings go to stderr (via
+//!   [`TerminalSink`](crate::progress::TerminalSink)). `--json` swaps stdout for a
+//!   structured envelope (answer + provenance + usage + warnings) — and the `answer`
+//!   field is the model's raw words, never kaibo's injected notices.
+//! - **exit codes have teeth.** `0` = an answer; `2` = a **usage** error — a bad
+//!   argument, an unknown or wrong-for-the-tool cast, an image on a vision-blind cast
+//!   (also clap's own arg-parse errors, and config load); `3` = a **setup/containment**
+//!   rejection — a path or attachment outside the allowed set, a missing/unbuildable
+//!   provider key; `4` = the consultation itself ran and failed (provider/model-loop).
+//!   So an agent branches on the code without parsing prose. (An arg-parse error is
+//!   clap's: usage on stderr, exit 2, nothing on stdout — the envelope is guaranteed
+//!   only once args parse.)
 //!
 //! `--help` is model-facing text: an agent reads it the way an MCP client reads a
 //! tool description, so the top-level `about` front-loads what kaibo is and every
@@ -34,10 +40,12 @@ use crate::session::{SessionStore as MemSessionStore, Sessions};
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
 pub const EXIT_OK: i32 = 0;
-/// A usage or config-load error (also clap's own arg-error code).
+/// A usage or config-load error (also clap's own arg-error code): a bad argument, an
+/// unknown or wrong-for-the-tool cast, bad model-override args, an image on a
+/// vision-blind cast.
 pub const EXIT_USAGE: i32 = 2;
-/// A containment or setup rejection: bad `--path`/`--root`, unknown cast, an
-/// attachment outside the boundary, a missing provider key.
+/// A setup/containment rejection: a `--path`/`--root`/attachment outside the allowed
+/// boundary, or a missing/unbuildable provider key.
 pub const EXIT_SETUP: i32 = 3;
 /// The consultation ran but failed (provider overload, model-loop error, timeout).
 pub const EXIT_CONSULT_FAILURE: i32 = 4;
@@ -50,15 +58,24 @@ pub const EXIT_CONSULT_FAILURE: i32 = 4;
 /// configuration.
 #[derive(Parser, Debug)]
 #[command(name = "kaibo", version)]
-#[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
+    /// The shared flags (config discovery, containment, cast, house-rules,
+    /// persistence). Defined once here as clap `global` args, so they work **before or
+    /// after** the subcommand — `kaibo --cast x consult …` and `kaibo consult … --cast
+    /// x` both reach the consult, and `kaibo --cast x` alone reaches the implicit serve.
+    #[command(flatten)]
+    pub common: CommonArgs,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// The implicit `serve` flags: a bare `kaibo` (no subcommand) runs the MCP
-    /// server, so every existing client config keeps working unchanged.
+    /// The implicit-serve tool gates: a bare `kaibo` (no subcommand) runs the MCP
+    /// server, so every existing client config keeps working unchanged. Serve-only —
+    /// they're read only on the serve path; the subcommands ignore them. (We don't use
+    /// `args_conflicts_with_subcommands` because it would also fence the shared globals
+    /// off a subcommand, defeating `kaibo --cast x consult …`.)
     #[command(flatten)]
-    pub serve: ServeArgs,
+    pub gates: ServeGates,
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,11 +84,11 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Run the MCP server on stdio (the explicit form of a bare `kaibo`).
-    Serve(ServeArgs),
+    Serve(ServeGates),
     /// Ask one read-only consultation question; the cited answer prints to stdout.
     Consult(ConsultArgs),
     /// Print the resolved runtime configuration (the `kaibo://config` document).
-    Config(CommonArgs),
+    Config,
 }
 
 /// Flags shared by every front door: config discovery, the containment boundary, the
@@ -129,13 +146,10 @@ pub struct CommonArgs {
     pub state_db: Option<PathBuf>,
 }
 
-/// The MCP server flags: the shared set plus the per-tool `--no-<tool>` gates (which
-/// only make sense for the long-lived server).
-#[derive(Args, Debug, Clone)]
-pub struct ServeArgs {
-    #[command(flatten)]
-    pub common: CommonArgs,
-
+/// The per-tool `--no-<tool>` gates — serve-only (they only make sense for the
+/// long-lived server). The shared flags live on [`Cli::common`] as globals.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ServeGates {
     /// Don't advertise the `consult` tool.
     #[arg(long)]
     pub no_consult: bool,
@@ -156,7 +170,7 @@ pub struct ServeArgs {
     pub no_batch: bool,
 }
 
-impl ServeArgs {
+impl ServeGates {
     /// The `--no-<tool>` flags as a [`ToolDisables`].
     pub fn tool_disables(&self) -> ToolDisables {
         ToolDisables {
@@ -170,12 +184,10 @@ impl ServeArgs {
     }
 }
 
-/// `kaibo consult` — one read-only consultation.
+/// `kaibo consult` — one read-only consultation. The shared flags come from
+/// [`Cli::common`] (globals); these are the consult-specific ones.
 #[derive(Args, Debug)]
 pub struct ConsultArgs {
-    #[command(flatten)]
-    pub common: CommonArgs,
-
     /// The question to investigate. Say in prose what you did or want to know — kaibo
     /// locates and reads the real, current code itself, so your intent beats a diff.
     pub question: String,
@@ -227,8 +239,10 @@ pub struct ConsultArgs {
     #[arg(long)]
     pub include_report: bool,
 
-    /// Emit a JSON envelope on stdout (answer + provenance + usage) instead of prose,
-    /// for a script caller.
+    /// Emit a JSON envelope on stdout (answer + provenance + usage + warnings) instead
+    /// of prose, for a script caller. Note: an argument-parse error prints usage to
+    /// stderr and exits 2 with nothing on stdout — the JSON envelope is guaranteed only
+    /// once the arguments parse.
     #[arg(long)]
     pub json: bool,
 }
@@ -287,10 +301,10 @@ fn fail_setup(json: bool, kind: &str, message: String, code: i32) -> i32 {
 /// Run `kaibo consult`. Returns the process exit code (never panics on an expected
 /// failure — a bad cast, a provider outage, and a clean answer all return through
 /// here with their own code).
-pub async fn run_consult(args: ConsultArgs) -> i32 {
+pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     init_cli_logging();
 
-    let config = match load_config(&args.common) {
+    let config = match load_config(&common) {
         Ok(c) => c,
         Err(e) => {
             return fail_setup(
@@ -317,9 +331,11 @@ pub async fn run_consult(args: ConsultArgs) -> i32 {
         }
     };
 
-    // Resolution stage — every refusable thing (bad path/cast/key/attachment) is an
-    // EXIT_SETUP rejection, distinct from a consultation that ran and failed.
+    // Resolution stage — every refusable thing is either a usage (exit 2) or a
+    // setup/containment (exit 3) rejection, distinct from a consultation that ran and
+    // failed (exit 4). Each call site tags its own class; see `resolve_and_run`.
     let outcome = resolve_and_run(
+        &common,
         &args,
         &resolver,
         inline_budget,
@@ -341,15 +357,36 @@ pub async fn run_consult(args: ConsultArgs) -> i32 {
     }
 }
 
-/// A setup-stage rejection carrying the exit code it maps to.
+/// A resolution-stage rejection carrying the exit code it maps to. There is
+/// deliberately **no** blanket `From<McpError>`: a `McpError` alone can't tell a
+/// usage mistake from a boundary block (both are `invalid_params` on the wire), so
+/// each resolution call site tags its failure with [`usage`](Self::usage) or
+/// [`setup`](Self::setup) explicitly — that's what keeps the exit-code contract at
+/// the top of this module honest.
 struct SetupError {
     kind: &'static str,
     message: String,
     code: i32,
 }
 
-impl From<McpError> for SetupError {
-    fn from(e: McpError) -> Self {
+impl SetupError {
+    /// A **usage** rejection (exit 2, like clap's own argument errors): the caller
+    /// named something invalid — a cast that doesn't exist or is wrong for the tool
+    /// (a batch/direct cast on interactive `consult`), bad model-override args, or an
+    /// image attached to a vision-blind cast. "Fix your command."
+    fn usage(e: McpError) -> Self {
+        SetupError {
+            kind: "usage",
+            message: e.message.to_string(),
+            code: EXIT_USAGE,
+        }
+    }
+
+    /// A **setup/containment** rejection (exit 3): a valid-looking request the
+    /// environment or boundary blocked — a path or attachment outside the allowed
+    /// set, a missing or unbuildable provider key, a house-rules/orientation read
+    /// failure. Not the caller's argument mistake; the surroundings.
+    fn setup(e: McpError) -> Self {
         SetupError {
             kind: "setup",
             message: e.message.to_string(),
@@ -360,6 +397,7 @@ impl From<McpError> for SetupError {
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_and_run(
+    common: &CommonArgs,
     args: &ConsultArgs,
     resolver: &Resolver,
     inline_budget: usize,
@@ -370,36 +408,56 @@ async fn resolve_and_run(
     persistence: &crate::config::PersistenceConfig,
     session_capacity: std::num::NonZeroUsize,
 ) -> Result<i32, SetupError> {
-    let root = resolver.resolve_root(args.path.clone())?;
-    let mut cast = resolver.resolve_cast(args.common.cast.clone())?;
-    resolver.reject_offline_cast(&cast, "consult")?;
-    resolver.apply_model_override(
-        &mut cast,
-        ModelRole::Explorer,
-        args.explorer_model.as_deref(),
-        args.explorer_backend.as_deref(),
-        "explorer_model",
-        "explorer_backend",
-    )?;
-    resolver.apply_model_override(
-        &mut cast,
-        ModelRole::Synth,
-        args.synth_model.as_deref(),
-        args.synth_backend.as_deref(),
-        "synth_model",
-        "synth_backend",
-    )?;
-    let explorer = resolver.arm(&cast, ModelRole::Explorer)?;
-    let synth = resolver.arm(&cast, ModelRole::Synth)?;
+    // Each call tags its failure explicitly (see `SetupError`): a path/attachment
+    // outside the boundary or an unbuildable key is `setup` (exit 3); a wrong-for-the-tool
+    // cast, bad override args, or an image on a blind cast is `usage` (exit 2).
+    let root = resolver
+        .resolve_root(args.path.clone())
+        .map_err(SetupError::setup)?;
+    let mut cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    resolver
+        .reject_offline_cast(&cast, "consult")
+        .map_err(SetupError::usage)?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            args.explorer_model.as_deref(),
+            args.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )
+        .map_err(SetupError::usage)?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            args.synth_model.as_deref(),
+            args.synth_backend.as_deref(),
+            "synth_model",
+            "synth_backend",
+        )
+        .map_err(SetupError::usage)?;
+    let explorer = resolver
+        .arm(&cast, ModelRole::Explorer)
+        .map_err(SetupError::setup)?;
+    let synth = resolver
+        .arm(&cast, ModelRole::Synth)
+        .map_err(SetupError::setup)?;
 
     let attachments =
-        Resolver::resolve_consult_attachments(&root, &args.attach, inline_budget, sandbox).await?;
+        Resolver::resolve_consult_attachments(&root, &args.attach, inline_budget, sandbox)
+            .await
+            .map_err(SetupError::setup)?;
     Resolver::gate_consult_image_attachments(
         &attachments,
         synth.caps.vision,
         &synth.model,
         &cast.name,
-    )?;
+    )
+    .map_err(SetupError::usage)?;
 
     // Only stand up a session store when a `--session` was named; a stateless consult
     // never opens the db. A failed open is a loud setup error naming the escape hatch.
@@ -417,9 +475,12 @@ async fn resolve_and_run(
         explore: ExploreConfig {
             phase: PhaseContext {
                 progress: Arc::new(TerminalSink),
-                house_rules: resolver.house_rules(&root)?,
+                house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
                 prompts: resolver.resolved_prompts(&cast),
-                orientation: resolver.orientation(&root).await?,
+                orientation: resolver
+                    .orientation(&root)
+                    .await
+                    .map_err(SetupError::setup)?,
                 call_deadline,
             },
             explorer_max_turns: args.explorer_max_turns.unwrap_or(default_explorer_turns),
@@ -482,7 +543,10 @@ async fn open_sessions(
             kind: "persistence",
             message: format!(
                 "failed to open the persistence state db at {}: {e:#}. \
-                 Fix the path/permissions, or pass --no-persistence.",
+                 Fix the path/permissions, or point elsewhere with --state-db. \
+                 Or pass --no-persistence to run this `--session` in memory for this \
+                 invocation only — the thread works now but is lost when the process exits \
+                 (it won't survive or be shared with the MCP server).",
                 path.display()
             ),
             code: EXIT_SETUP,
@@ -514,6 +578,12 @@ fn emit_answer(
         &out.usage,
     );
     println!("{answer}");
+    // Non-fatal warnings (a failed session record) go to STDERR, never stdout — stdout
+    // stays the model's answer, clean for a pipe. (`--json` carries them structured
+    // instead; see `consult_envelope`.)
+    for w in &out.warnings {
+        eprintln!("kaibo: {w}");
+    }
     // The report is opt-in extra; keep it off stdout's answer line — send it to stderr
     // so a pipe still captures just the answer.
     if args.include_report && !out.report.is_empty() {
@@ -531,6 +601,9 @@ fn consult_envelope(
     include_report: bool,
 ) -> serde_json::Value {
     let mut env = serde_json::json!({
+        // The raw model answer — no footer, no injected notices. A machine consumer
+        // (`jq -r .answer`) gets the model's words uncorrupted; kaibo's own non-fatal
+        // notices ride the separate `warnings` array below.
         "answer": out.answer,
         "cast": cast,
         "models": { "explorer": explorer_model, "synth": synth_model },
@@ -541,6 +614,9 @@ fn consult_envelope(
             "cached_input_tokens": out.usage.cached_input_tokens,
             "cache_creation_input_tokens": out.usage.cache_creation_input_tokens,
         },
+        // Non-fatal notices about this turn (e.g. a failed session record). Always
+        // present (empty when the turn was clean) so a consumer can rely on the key.
+        "warnings": out.warnings,
     });
     if include_report {
         env["report"] = serde_json::Value::String(out.report.clone());
@@ -599,27 +675,28 @@ mod tests {
 
     #[test]
     fn bare_invocation_is_the_implicit_serve() {
-        // No subcommand → the server path; the flattened serve args carry the flags.
+        // No subcommand → the server path; the shared flags live on `cli.common`.
         let cli = Cli::try_parse_from(["kaibo", "--root", "/tmp"]).expect("bare parse");
         assert!(
             cli.command.is_none(),
             "bare kaibo has no subcommand (implicit serve)"
         );
         assert_eq!(
-            cli.serve.common.root.as_deref(),
+            cli.common.root.as_deref(),
             Some(std::path::Path::new("/tmp"))
         );
     }
 
     #[test]
     fn explicit_serve_takes_the_same_flags() {
+        // `--cast` is a shared global (on cli.common); `--no-oneshot` is a serve gate.
         let cli = Cli::try_parse_from(["kaibo", "serve", "--no-oneshot", "--cast", "gemini"])
             .expect("serve parse");
+        assert_eq!(cli.common.cast.as_deref(), Some("gemini"));
         match cli.command {
-            Some(Command::Serve(s)) => {
-                assert!(s.no_oneshot);
-                assert_eq!(s.common.cast.as_deref(), Some("gemini"));
-                assert!(s.tool_disables().oneshot);
+            Some(Command::Serve(gates)) => {
+                assert!(gates.no_oneshot);
+                assert!(gates.tool_disables().oneshot);
             }
             other => panic!("expected serve, got {other:?}"),
         }
@@ -642,10 +719,11 @@ mod tests {
             "--json",
         ])
         .expect("consult parse");
+        // `--cast` is the shared global; the rest are consult-specific.
+        assert_eq!(cli.common.cast.as_deref(), Some("deepseek"));
         match cli.command {
             Some(Command::Consult(c)) => {
                 assert_eq!(c.question, "why is this slow?");
-                assert_eq!(c.common.cast.as_deref(), Some("deepseek"));
                 assert_eq!(c.attach, vec!["a.rs".to_string(), "b.rs".to_string()]);
                 assert_eq!(c.session.as_deref(), Some("perf"));
                 assert!(c.json);
@@ -658,7 +736,12 @@ mod tests {
     fn config_subcommand_parses() {
         let cli =
             Cli::try_parse_from(["kaibo", "config", "--root", "/srv/repo"]).expect("config parse");
-        assert!(matches!(cli.command, Some(Command::Config(_))));
+        assert!(matches!(cli.command, Some(Command::Config)));
+        // The shared `--root` global reaches the config subcommand.
+        assert_eq!(
+            cli.common.root.as_deref(),
+            Some(std::path::Path::new("/srv/repo"))
+        );
     }
 
     #[test]
@@ -668,17 +751,22 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
-    #[test]
-    fn consult_envelope_carries_answer_provenance_and_usage() {
-        let out = ConsultOutput {
-            answer: "the answer".to_string(),
+    fn out_with(answer: &str, warnings: Vec<String>) -> ConsultOutput {
+        ConsultOutput {
+            answer: answer.to_string(),
             report: "the report".to_string(),
             usage: rig_core::completion::Usage {
                 input_tokens: 10,
                 output_tokens: 20,
                 ..Default::default()
             },
-        };
+            warnings,
+        }
+    }
+
+    #[test]
+    fn consult_envelope_carries_answer_provenance_usage_and_warnings() {
+        let out = out_with("the answer", vec![]);
         let env = consult_envelope(&out, "deepseek", "explorer-m", "synth-m", false);
         assert_eq!(env["answer"], "the answer");
         assert_eq!(env["cast"], "deepseek");
@@ -686,6 +774,9 @@ mod tests {
         assert_eq!(env["models"]["synth"], "synth-m");
         assert_eq!(env["usage"]["input_tokens"], 10);
         assert_eq!(env["usage"]["output_tokens"], 20);
+        // `warnings` is always present (empty when the turn was clean) so a consumer
+        // can rely on the key.
+        assert_eq!(env["warnings"], serde_json::json!([]));
         // The report is omitted unless requested.
         assert!(env.get("report").is_none(), "report is opt-in");
 
@@ -693,10 +784,99 @@ mod tests {
         assert_eq!(with_report["report"], "the report");
     }
 
+    /// A record-failure warning rides the `warnings` array — NOT the `answer` field, which
+    /// stays the model's raw words (the #77 Gemini fix: `jq -r .answer` must be clean).
+    #[test]
+    fn consult_envelope_keeps_warnings_out_of_the_answer_field() {
+        let out = out_with(
+            "clean model words",
+            vec!["⚠️ Session turn NOT recorded (persistence error: disk full).".to_string()],
+        );
+        let env = consult_envelope(&out, "deepseek", "e", "s", false);
+        assert_eq!(
+            env["answer"], "clean model words",
+            "the answer field must be the model's raw words, no injected notices"
+        );
+        assert_eq!(env["warnings"][0], out.warnings[0]);
+    }
+
     #[test]
     fn error_envelope_shape() {
         let env = error_envelope("consultation_failure", "it broke");
         assert_eq!(env["kind"], "consultation_failure");
         assert_eq!(env["error"], "it broke");
+    }
+
+    /// A global flag placed BEFORE the subcommand (`kaibo --cast x consult "q"`)
+    /// propagates to the subcommand — the clap `global = true` contract on `CommonArgs`.
+    #[test]
+    fn a_global_flag_before_the_subcommand_reaches_it() {
+        let cli = Cli::try_parse_from(["kaibo", "--cast", "gemini", "consult", "why?"])
+            .expect("global flag before subcommand parses");
+        assert_eq!(
+            cli.common.cast.as_deref(),
+            Some("gemini"),
+            "a pre-subcommand --cast must parse and land on the shared common args"
+        );
+        match cli.command {
+            Some(Command::Consult(c)) => assert_eq!(c.question, "why?"),
+            other => panic!("expected consult, got {other:?}"),
+        }
+    }
+
+    /// A batch/direct cast on interactive `consult` is a USAGE error (exit 2, kind
+    /// "usage") — the offline-cast refusal must classify as usage, not a setup/containment
+    /// rejection. Offline: `reject_offline_cast` fires before any model/key is touched.
+    #[tokio::test]
+    async fn an_offline_cast_on_consult_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let inline_budget = config.defaults.inline_attach_budget;
+        let call_deadline = config.defaults.call_deadline;
+        let et = config.defaults.explorer_max_turns;
+        let st = config.defaults.synth_max_turns;
+        let sandbox = config.sandbox.clone();
+        let persistence = config.persistence.clone();
+        let cap = config.defaults.session_capacity;
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        // `anthropic-batch` is a built-in whose synth runs on the batch lane; `--cast`
+        // is a shared global, so it lands on `cli.common`.
+        let cli = Cli::parse_from([
+            "kaibo",
+            "consult",
+            "q",
+            "--cast",
+            "anthropic-batch",
+            "--json",
+        ]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Consult(c)) => c,
+            _ => unreachable!("parsed a consult subcommand"),
+        };
+
+        let err = resolve_and_run(
+            &common,
+            &args,
+            &resolver,
+            inline_budget,
+            call_deadline,
+            et,
+            st,
+            &sandbox,
+            &persistence,
+            cap,
+        )
+        .await
+        .expect_err("a batch cast on consult must be refused");
+        assert_eq!(
+            err.code, EXIT_USAGE,
+            "offline-cast refusal is exit 2 (usage)"
+        );
+        assert_eq!(err.kind, "usage");
+        // And the JSON envelope a script would see carries kind "usage".
+        assert_eq!(error_envelope(err.kind, &err.message)["kind"], "usage");
     }
 }

@@ -365,16 +365,26 @@ impl Arm {
 }
 
 /// The result of a consult: the final answer, the explorer's report (kept so
-/// callers can inspect/debug the hand-off, and for future session storage), and the
+/// callers can inspect/debug the hand-off, and for future session storage), the
 /// token [`Usage`] the whole consult reported — the synth loop plus every delegated
 /// `explore′` sweep, summed. Zero-valued when no provider reported usage (the
 /// existing "unknown" sentinel), so a footer can tell "cost this much" from "the
 /// backend told us nothing".
+///
+/// `warnings` carries non-fatal, caller-visible notices about the turn that are
+/// **separate from the answer text** — today only a failed session `record()` (the
+/// answer is paid-for and stands, but the turn won't replay next time). Kept off
+/// `answer` deliberately: a machine consumer of the answer (e.g. `jq -r .answer` on
+/// the CLI `--json` envelope) must get the model's words uncorrupted by kaibo's own
+/// injected notes. Each front door decides how to surface them — the MCP server
+/// appends them to the result text (client-visible behavior unchanged), the CLI
+/// prints them to stderr (prose) or as a `warnings` array (`--json`).
 #[derive(Debug, Clone)]
 pub struct ConsultOutput {
     pub answer: String,
     pub report: String,
     pub usage: Usage,
+    pub warnings: Vec<String>,
 }
 
 /// The forced-finish instruction we append when a phase exhausts its turn cap.
@@ -1288,6 +1298,9 @@ pub(crate) async fn consult_with(
         answer,
         report,
         usage,
+        // Populated downstream (`consult_session_turn` on a record failure); the raw
+        // consult loop has no non-fatal notices of its own.
+        warnings: Vec::new(),
     })
 }
 
@@ -1328,9 +1341,10 @@ pub(crate) async fn consult_session_turn(
     // Record failure is NON-fatal: by here the model has answered (a paid-for result), so
     // losing that answer over a bookkeeping write would be the wrong trade — and it mirrors
     // the non-fatal batch-handle record. Instead, keep the answer and surface the failure
-    // LOUDLY (never a silent fallback): warn on the log, and append a visible line to the
-    // answer so the caller knows this turn won't be in the thread next time. The in-memory
-    // arm never errors, so today's default is byte-for-byte unchanged.
+    // LOUDLY (never a silent fallback): warn on the log, and record a caller-visible notice
+    // on `out.warnings` — kept OFF the answer text so a machine consumer of the answer gets
+    // the model's words uncorrupted (each front door renders warnings its own way). The
+    // in-memory arm never errors, so today's default is byte-for-byte unchanged.
     if let Some((store, id)) = session {
         if let Err(e) = store
             .record(id, QaTurn::new(question, out.answer.clone()))
@@ -1341,9 +1355,9 @@ pub(crate) async fn consult_session_turn(
                 error = %e,
                 "session turn not recorded — the answer stands, but this thread won't replay it"
             );
-            out.answer.push_str(&format!(
-                "\n\n⚠️ Session turn NOT recorded (persistence error: {e}). \
-                 The answer above is complete, but this `session_id` won't include it on your \
+            out.warnings.push(format!(
+                "⚠️ Session turn NOT recorded (persistence error: {e}). \
+                 The answer is complete, but this `session_id` won't include it on your \
                  next turn — retry, or continue without relying on this turn as context."
             ));
         }
@@ -3515,10 +3529,17 @@ mod tests {
             "the paid-for answer must be preserved: {:?}",
             out.answer
         );
+        // The record failure rides on `out.warnings`, NOT the answer text — so a machine
+        // consumer of the answer gets the model's words uncorrupted (the #77 Gemini fix).
         assert!(
-            out.answer.contains("NOT recorded"),
-            "the record failure must be surfaced loudly on the result: {:?}",
+            !out.answer.contains("NOT recorded"),
+            "the answer text must stay clean of kaibo's injected notices: {:?}",
             out.answer
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("NOT recorded")),
+            "the record failure must be surfaced loudly on out.warnings: {:?}",
+            out.warnings
         );
     }
 
