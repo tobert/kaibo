@@ -130,8 +130,10 @@ fn is_vision_capable(kind: ProviderKind, _model: &str) -> bool {
         ProviderKind::Openai => false,
         // OpenRouter fronts every model — vision-capable and text-only alike — so the
         // capability is a property of the pinned *model*, not the gateway. Opt in per
-        // slot (`vision = true`), like the generic OpenAI kind; the built-in openrouter
-        // cast pins it on both its (multimodal) default models.
+        // slot (`vision = true`), like the generic OpenAI kind. The built-in openrouter
+        // cast splits by role: its explorer default (multimodal `qwen3.6-flash`) pins
+        // vision on, while its synth default (text-only `qwen3.7-max`) leaves the slot
+        // `None` and lets this false stand.
         ProviderKind::OpenRouter => false,
     }
 }

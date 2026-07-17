@@ -249,12 +249,20 @@ The `[defaults]` knobs themselves:
 
 Five backends and five same-named single-backend casts ship **in code** and
 reproduce kaibo's historical behavior exactly, so a **missing config file is not
-an error**. The `openrouter` built-in pins the drift-resistant `~author/family-latest`
-catalog aliases (explorer `~google/gemini-flash-latest`, synth
-`~anthropic/claude-sonnet-latest`) rather than a dated slug, and opts both slots into
-`vision` — the classifier defaults an `openrouter` slot to vision-off, since the
-gateway fronts blind and sighted models alike, but both default ids are
-multimodal-in per OpenRouter's own catalog. Two extra built-in casts ship for the
+an error**. The `openrouter` built-in defaults to **Qwen** — a family kaibo can't
+reach directly (DeepSeek, Gemini, and Anthropic each have their own keyed backend),
+so the gateway earns its keep with a distinct lineage for a genuine cross-family
+read. OpenRouter serves no `~qwen/*-latest` router alias (only anthropic / google /
+moonshotai / openai / x-ai get those), so the built-in pins the **undated** family
+ids — the most rot-resistant Qwen ids available, each tracking the newest
+point-release until the next `.x` bump. Explorer is the cheap multimodal
+`qwen/qwen3.6-flash`, with `vision` pinned on (the classifier defaults an
+`openrouter` slot to vision-off, since the gateway fronts blind and sighted models
+alike, but the flash is multimodal-in per OpenRouter's own catalog); synth is the
+flagship reasoner `qwen/qwen3.7-max`, which is **text-only**, so its slot takes no
+vision pin. (To keep vision on the synth, swap in the multimodal plus tier
+`qwen/qwen3.7-plus` and pin its vision on — a weaker reasoner, ~4.5× cheaper.) Two
+extra built-in casts ship for the
 offline batch lane —
 `gemini-batch` (synth Gemini Pro) and `anthropic-batch` (synth Claude Opus). Lane is
 a **per-slot** property, not a cast-level one: each carries a synth slot whose
@@ -297,7 +305,7 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 | `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
 | `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` | |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
-| `openrouter` | `openrouter/~google/gemini-flash-latest` | `openrouter/~anthropic/claude-sonnet-latest` | |
+| `openrouter` | `openrouter/qwen/qwen3.6-flash` | `openrouter/qwen/qwen3.7-max` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
 | `anthropic-batch` | — | `anthropic/claude-opus-4-8` | `batch` |

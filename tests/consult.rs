@@ -550,8 +550,10 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true)).vision);
     // OpenRouter is the same shape: the gateway fronts blind and sighted models
-    // alike, so vision is the pinned model's property — opt-in per slot (the
-    // built-in cast pins it on its multimodal defaults).
+    // alike, so vision is the pinned model's property — opt-in per slot. The
+    // built-in cast splits by role: its explorer default is multimodal and pins
+    // vision on; its text-only synth default leaves the slot None. The literal id
+    // below is arbitrary — the OpenRouter classifier ignores it, keying on the kind.
     assert!(
         !ModelCaps::resolve(
             ProviderKind::OpenRouter,
