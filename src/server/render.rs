@@ -185,6 +185,37 @@ pub(super) fn is_batch_handle(handle: &str) -> bool {
     handle.contains('/')
 }
 
+/// The reserved prefix a local-batch handle carries: `local/<id>`. The backend name
+/// `local` is refused at config load ([`crate::config::LOCAL_BACKEND_RESERVED`]), so this
+/// prefix is unownable by any provider backend — which is what makes a `local/<id>` handle
+/// unambiguously distinguishable from a `backend/provider-id` provider batch handle even
+/// though both contain a `/`. Routing checks `is_local_handle` **before** `is_batch_handle`.
+pub(crate) const LOCAL_HANDLE_PREFIX: &str = "local/";
+
+/// Is this a local-batch handle (`local/<id>`)? Checked before [`is_batch_handle`], since a
+/// local handle also contains a `/`.
+pub(crate) fn is_local_handle(handle: &str) -> bool {
+    handle.starts_with(LOCAL_HANDLE_PREFIX)
+}
+
+/// Parse the numeric id out of a `local/<id>` handle. A malformed or non-numeric id is a
+/// loud parameter error — the caller pasted something that wasn't a kaibo local handle.
+pub(crate) fn parse_local_handle(handle: &str) -> Result<i64, McpError> {
+    handle
+        .strip_prefix(LOCAL_HANDLE_PREFIX)
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "local job handle {handle:?} must be \"local/<id>\" with a positive integer \
+                     id — pass the handle `kaibo batch submit --local` printed"
+                ),
+                None,
+            )
+        })
+}
+
 /// Map a `job_wait` `level` string to a [`mcp_log::rank`] floor. `warn` (the default) is
 /// kaibo's "the calling model should see this" bar — salience, not severity.
 pub(super) fn wait_level_floor(level: Option<&str>) -> Result<u8, McpError> {
@@ -416,6 +447,119 @@ pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
         line.push_str(&format!(" · {} cache-write", usage.cache_creation_input_tokens));
     }
     Some(line)
+}
+
+// --- Local batch rendering -------------------------------------------------
+
+use crate::store::{CancelLocalOutcome, LocalJob, LocalJobStatus, LocalJobSummary};
+
+/// Render a local-job cancel outcome honestly — a running job's in-flight item is still
+/// finishing, an already-terminal job is left alone.
+pub(crate) fn render_local_cancel(handle: &str, outcome: CancelLocalOutcome) -> String {
+    match outcome {
+        CancelLocalOutcome::CancelledPending => {
+            format!("Cancelled local batch `{handle}` before it ran.")
+        }
+        CancelLocalOutcome::CancellingRunning => format!(
+            "Cancelling local batch `{handle}` — its worker stops after the in-flight item \
+             finishes (it checks between items). `kaibo batch get {handle}` for the partial results."
+        ),
+        CancelLocalOutcome::AlreadyCancelled => {
+            format!("Local batch `{handle}` was already cancelled.")
+        }
+        CancelLocalOutcome::AlreadyFinished => {
+            format!("Local batch `{handle}` had already finished — `kaibo batch get {handle}` for its results.")
+        }
+        CancelLocalOutcome::Unknown => format!("No local batch job `{handle}` to cancel."),
+    }
+}
+
+/// Render a local batch job for a caller (CLI `batch get local/<id>`, MCP `job_get`). A
+/// pending/running job shows progress and points at the worker; a done/failed/cancelled job
+/// lists each item's answer (or per-item failure), mirroring the provider batch `render_poll`
+/// shape so an agent reads the same thing from either lane. Pure and offline-testable.
+pub(crate) fn render_local_job(job: &LocalJob) -> String {
+    let handle = format!("local/{}", job.id);
+    let n = job.items.len();
+    match job.status {
+        LocalJobStatus::Pending => format!(
+            "Local batch `{handle}` — queued, {n} prompt(s), not yet claimed. Drain it with \
+             `kaibo batch work` (background it with `&` / systemd-run / cron); collect here \
+             with `kaibo batch get {handle}` afterward."
+        ),
+        LocalJobStatus::Running => {
+            let done = job.items.iter().filter(|i| i.result.is_some()).count();
+            format!(
+                "Local batch `{handle}` — running on a worker, {done}/{n} done. No need to wait \
+                 — `kaibo batch get {handle}` again later."
+            )
+        }
+        LocalJobStatus::Done | LocalJobStatus::Failed | LocalJobStatus::Cancelled => {
+            let verb = match job.status {
+                LocalJobStatus::Failed => "failed",
+                LocalJobStatus::Cancelled => "cancelled",
+                _ => "complete",
+            };
+            let mut s = format!("Local batch `{handle}` — {verb}, {n} item(s):\n");
+            for item in &job.items {
+                match &item.result {
+                    Some(Ok(text)) => s.push_str(&format!("\n## [{}]\n{}\n", item.seq, text)),
+                    Some(Err(reason)) => {
+                        s.push_str(&format!("\n## [{}] — failed: {}\n", item.seq, reason))
+                    }
+                    None => s.push_str(&format!(
+                        "\n## [{}] — not run ({})\n",
+                        item.seq,
+                        if job.status == LocalJobStatus::Cancelled {
+                            "cancelled before it ran"
+                        } else {
+                            "no result recorded"
+                        }
+                    )),
+                }
+            }
+            s.push_str(&format!(
+                "\n———\nkaibo · local batch · {} · cast {}",
+                handle, job.cast
+            ));
+            s
+        }
+    }
+}
+
+/// One-line summary of a local job for the `list` view.
+fn local_summary_line(j: &LocalJobSummary) -> String {
+    let mut line = format!(
+        "- `local/{}` — {}, {}/{} done, cast {}",
+        j.id,
+        j.status.as_str(),
+        j.done,
+        j.total,
+        j.cast
+    );
+    if j.failed > 0 {
+        line.push_str(&format!(" ({} failed)", j.failed));
+    }
+    line
+}
+
+/// Render the local-jobs section of a `list` view (CLI `batch list`, MCP `job_list`). Newest
+/// first, each with a ready `local/<id>` handle. Empty is informative ("none"), so the
+/// section renders either way.
+pub(crate) fn render_local_list(jobs: &[LocalJobSummary]) -> String {
+    if jobs.is_empty() {
+        return "Local batch jobs: none. Submit one with `kaibo batch submit --local`.".to_string();
+    }
+    let mut s = format!("Local batch jobs — {} found:\n", jobs.len());
+    for j in jobs {
+        s.push('\n');
+        s.push_str(&local_summary_line(j));
+    }
+    s.push_str(
+        "\n\nRun a worker to drain pending ones with `kaibo batch work`; collect with \
+         `kaibo batch get local/<id>`; stop one with `kaibo batch cancel`/`job_cancel local/<id>`.",
+    );
+    s
 }
 
 #[cfg(test)]

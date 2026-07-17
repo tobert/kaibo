@@ -40,13 +40,15 @@ use crate::consult::{
     batch_system_prompt, consult, explore_with, oneshot as run_oneshot_engine, ConsultConfig,
     ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
 };
-use crate::progress::TerminalSink;
+use crate::progress::{NullSink, TerminalSink};
 use crate::sandbox::KaishWorker;
 use crate::server::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, render_config_resource,
-    with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
+    batch_within_window, consultation_failure_text, is_local_handle, now_epoch_secs,
+    parse_local_handle, render_config_resource, render_local_cancel, render_local_job,
+    render_local_list, with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
+use crate::store::{CancelLocalOutcome, LocalJob, LocalJobStatus};
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
 pub const EXIT_OK: i32 = 0;
@@ -365,11 +367,19 @@ pub struct BatchArgs {
 #[allow(clippy::large_enum_variant)]
 pub enum BatchCmd {
     /// Fan self-contained prompts to a batch cast; prints the durable `backend/id` handle.
+    /// With `--local`, enqueue to the state db instead — no provider lane, drained by
+    /// `kaibo batch work` (prints a `local/<id>` handle).
     Submit(BatchSubmitArgs),
+    /// Drain the local batch queue in the foreground: claim pending `local/<id>` jobs one at
+    /// a time and run each item on its cast. Background it with `&` / systemd-run / cron.
+    Work(BatchWorkArgs),
     /// Fetch a batch by handle — a progress line while it runs, per-item answers when done.
+    /// Handles a `backend/provider-id` provider batch or a `local/<id>` local job.
     Get(BatchGetArgs),
-    /// List batches the providers still know about, plus handles recovered from the store.
+    /// List provider batches (live + store-recovered handles) and local batch jobs.
     List(BatchListArgs),
+    /// Cancel a batch by handle — a provider `backend/provider-id`, or a `local/<id>` job.
+    Cancel(BatchCancelArgs),
 }
 
 /// `kaibo batch submit` — like `oneshot`, no tools/codebase access: each prompt carries
@@ -392,7 +402,39 @@ pub struct BatchSubmitArgs {
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
+    /// Enqueue to the local batch lane (the state db) instead of a provider batch. Runs on
+    /// LOCAL compute (or any cast), no provider batch lane needed; drained by `kaibo batch
+    /// work`. Prints a `local/<id>` handle. Any cast works — no batch-capable cast required.
+    #[arg(long)]
+    pub local: bool,
+
     /// Emit a JSON object `{handle, cast, model, count}` instead of the bare handle.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo batch work` — the foreground local-batch worker. Claims pending `local/<id>` jobs
+/// one at a time and runs each item on the job's cast (resolved against THIS process's
+/// config), writing per-item results as they land. Exits 0 when the queue is empty.
+#[derive(Args, Debug)]
+pub struct BatchWorkArgs {
+    /// After draining, keep polling for new pending jobs every N seconds instead of exiting.
+    /// Omit for a single drain-then-exit pass (the cron/systemd-run shape).
+    #[arg(long, value_name = "SECS")]
+    pub watch: Option<u64>,
+
+    /// Emit a JSON object `{drained}` at the end instead of the prose summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo batch cancel` — stop a batch by handle.
+#[derive(Args, Debug)]
+pub struct BatchCancelArgs {
+    /// The handle to cancel — a provider `backend/provider-id`, or a `local/<id>` job.
+    pub handle: String,
+
+    /// Emit a JSON object instead of prose.
     #[arg(long)]
     pub json: bool,
 }
@@ -1217,8 +1259,10 @@ pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
     init_cli_logging();
     let json = match &args.cmd {
         BatchCmd::Submit(a) => a.json,
+        BatchCmd::Work(a) => a.json,
         BatchCmd::Get(a) => a.json,
         BatchCmd::List(a) => a.json,
+        BatchCmd::Cancel(a) => a.json,
     };
     let config = match load_config(&common) {
         Ok(c) => c,
@@ -1232,8 +1276,10 @@ pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
     };
     let outcome = match args.cmd {
         BatchCmd::Submit(a) => batch_submit_inner(&common, &a, &resolver).await,
+        BatchCmd::Work(a) => batch_work_inner(&a, &resolver).await,
         BatchCmd::Get(a) => batch_get_inner(&a, &resolver).await,
         BatchCmd::List(a) => batch_list_inner(&a, &resolver).await,
+        BatchCmd::Cancel(a) => batch_cancel_inner(&a, &resolver).await,
     };
     match outcome {
         Ok(code) => code,
@@ -1317,6 +1363,11 @@ async fn batch_submit_inner(
     args: &BatchSubmitArgs,
     resolver: &Resolver,
 ) -> Result<i32, SetupError> {
+    // The local lane is a different animal — no provider, no batch-cast requirement, the
+    // state db as the queue — so branch before touching any provider machinery.
+    if args.local {
+        return batch_local_submit_inner(common, args, resolver).await;
+    }
     let mut cast = resolver
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
@@ -1420,6 +1471,11 @@ async fn batch_submit_inner(
 }
 
 async fn batch_get_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    // A `local/<id>` handle collects from the state db, not a provider (checked before the
+    // `backend/provider-id` split, since a local handle also carries a `/`).
+    if is_local_handle(&args.handle) {
+        return batch_get_local_inner(args, resolver).await;
+    }
     let (backend_name, provider_id) = args
         .handle
         .split_once('/')
@@ -1526,8 +1582,9 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
         entries.retain(|(_, it)| batch_within_window(it, now, BATCH_RECENCY_WINDOW_SECS));
         before - entries.len()
     };
-    // Recovered handles from the store, deduped against the live listing.
+    // Recovered handles + local jobs from the store, deduped against the live listing.
     let mut recovered: Vec<(String, Option<String>)> = Vec::new();
+    let mut local_jobs: Vec<crate::store::LocalJobSummary> = Vec::new();
     if let Some(store) = open_batch_store(resolver).await {
         match store.list_batches().await {
             Ok(handles) => {
@@ -1543,6 +1600,13 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
                 format!("recovered handles unavailable: {e}"),
             )),
         }
+        match store.list_local().await {
+            Ok(js) => local_jobs = js,
+            Err(e) => errors.push((
+                "(store)".to_string(),
+                format!("local jobs unavailable: {e}"),
+            )),
+        }
     }
     if args.json {
         println!(
@@ -1556,6 +1620,15 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
                     "created_at": it.created_at,
                 })).collect::<Vec<_>>(),
                 "recovered": recovered.iter().map(|(h, l)| serde_json::json!({ "handle": h, "label": l })).collect::<Vec<_>>(),
+                "local": local_jobs.iter().map(|j| serde_json::json!({
+                    "handle": format!("local/{}", j.id),
+                    "status": j.status.as_str(),
+                    "cast": j.cast,
+                    "total": j.total,
+                    "done": j.done,
+                    "failed": j.failed,
+                    "created_at": j.created_at,
+                })).collect::<Vec<_>>(),
                 "errors": errors.iter().map(|(b, e)| serde_json::json!({ "backend": b, "error": e })).collect::<Vec<_>>(),
                 "hidden": hidden,
                 "truncated": truncated,
@@ -1566,6 +1639,9 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
             "{}",
             crate::batch::render_list(&entries, &errors, &truncated)
         );
+        if !local_jobs.is_empty() {
+            println!("\n{}", render_local_list(&local_jobs));
+        }
         if hidden > 0 {
             println!(
                 "\n({hidden} batch(es) older than 24h hidden — `kaibo batch list --all` for the \
@@ -1588,6 +1664,430 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
         }
     }
     Ok(EXIT_OK)
+}
+
+// ---------------------------------------------------------------------------
+// local batch
+// ---------------------------------------------------------------------------
+
+/// Open the durable store, requiring persistence — local batch lives in the state db (it's
+/// the queue AND the mailbox), so with persistence off there is nowhere for a local job to
+/// exist. A clear setup refusal, not a silent no-op.
+async fn open_required_store(
+    resolver: &Resolver,
+) -> Result<crate::store::SessionStore, SetupError> {
+    let persistence = &resolver.config.persistence;
+    if !persistence.enabled {
+        return Err(SetupError {
+            kind: "setup",
+            message: "local batch needs persistence (the state db is its queue and mailbox), \
+                      but it is disabled (--no-persistence / KAIBO_NO_PERSISTENCE). Enable \
+                      persistence to submit, run, and collect local batches."
+                .to_string(),
+            code: EXIT_SETUP,
+        });
+    }
+    let path = persistence.path.clone().ok_or_else(|| SetupError {
+        kind: "config",
+        message: "persistence is enabled but no state-db path resolved".to_string(),
+        code: EXIT_USAGE,
+    })?;
+    let cap = resolver.config.defaults.session_capacity;
+    let allowed = resolver.allowed_set();
+    let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+    crate::store::SessionStore::open(&path, cap, &refs)
+        .await
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: format!(
+                "failed to open the persistence state db at {}: {e:#}",
+                path.display()
+            ),
+            code: EXIT_SETUP,
+        })
+}
+
+/// `kaibo batch submit --local` — enqueue a local batch job to the state db and print the
+/// durable `local/<id>` handle. Any cast works (that's the point — local compute / a
+/// `direct`-lane big local model / anything); attachment CONTENT is captured now (behind the
+/// store guard) so the worker feeds the model the bytes as they were at submit, and image
+/// attachments are vision-gated here just like a provider batch.
+async fn batch_local_submit_inner(
+    common: &CommonArgs,
+    args: &BatchSubmitArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let store = open_required_store(resolver).await?;
+    let mut cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    // Deliberately NO require_batch_cast / reject_offline_cast: local batch runs any cast,
+    // interactive or offline — the worker drives each item through the toolless oneshot path.
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            args.model.as_deref(),
+            args.backend.as_deref(),
+            "model",
+            "backend",
+        )
+        .map_err(SetupError::usage)?;
+    // Resolve the synth slot + caps (key-free) for the vision gate.
+    let slot = cast
+        .require_slot(ModelRole::Synth)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    let backend = resolver
+        .config
+        .resolve_backend(&slot.backend)
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: e.to_string(),
+            code: EXIT_SETUP,
+        })?;
+    let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
+    let model = slot.id.clone();
+    // Capture attachment CONTENT now (kaibo reads them; bytes never transit the caller's
+    // context) + vision gate before enqueue.
+    let attachments = resolver
+        .resolve_attachments(&args.attach)
+        .await
+        .map_err(SetupError::setup)?;
+    resolver
+        .gate_image_attachments(caps.vision, &attachments, &model, &cast.name)
+        .map_err(SetupError::usage)?;
+
+    let id = store
+        .enqueue_local(
+            &cast.name,
+            args.model.as_deref(),
+            args.backend.as_deref(),
+            &attachments,
+            &args.prompts,
+        )
+        .await
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: format!("could not enqueue the local batch: {e:#}"),
+            code: EXIT_SETUP,
+        })?;
+    let handle = format!("local/{id}");
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "handle": handle,
+                "cast": cast.name,
+                "model": model,
+                "count": args.prompts.len(),
+                "local": true,
+            })
+        );
+    } else {
+        println!("{handle}");
+        eprintln!(
+            "kaibo: enqueued {} prompt(s) as `{}` on cast `{}` — run `kaibo batch work` to \
+             drain it (background with `&`/systemd-run/cron), then `kaibo batch get {}`.",
+            args.prompts.len(),
+            handle,
+            cast.name,
+            handle
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+/// `kaibo batch work` — the foreground worker. Claims pending jobs one at a time (the claim
+/// is a `BEGIN IMMEDIATE` status flip, so two workers on one db never double-run a job),
+/// runs each item through the oneshot engine on the job's cast (resolved against THIS
+/// process's config), and writes per-item results as they complete — a crash loses at most
+/// the in-flight item. Drains to empty and exits 0; `--watch SECS` keeps polling instead.
+async fn batch_work_inner(args: &BatchWorkArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    let store = open_required_store(resolver).await?;
+    let mut drained = 0usize;
+    loop {
+        loop {
+            match store.claim_next_local().await {
+                Ok(Some(id)) => {
+                    work_one_local_job(&store, resolver, id).await;
+                    drained += 1;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // A claim failure is a real infra problem (the queue db is unreadable) —
+                    // stop loudly rather than spin.
+                    return Err(SetupError {
+                        kind: "setup",
+                        message: format!("could not claim the next local job: {e:#}"),
+                        code: EXIT_SETUP,
+                    });
+                }
+            }
+        }
+        match args.watch {
+            Some(secs) if secs > 0 => {
+                eprintln!("kaibo: queue drained ({drained} so far) — watching, polling every {secs}s (Ctrl-C to stop).");
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+            _ => break,
+        }
+    }
+    if args.json {
+        println!("{}", serde_json::json!({ "drained": drained }));
+    } else {
+        println!("kaibo: worker drained {drained} local batch job(s).");
+    }
+    Ok(EXIT_OK)
+}
+
+/// Run one claimed local job to completion. Resolves the job's cast against the worker's own
+/// config; a setup failure (unknown cast, unbuildable key) marks every unfinished item with
+/// that reason and the job `failed`. Otherwise runs each not-yet-done item through the
+/// toolless oneshot engine, recording each result as it lands, checking for a cancel between
+/// items, then marks the job `done` (guarded so a concurrent cancel wins). Never returns an
+/// error — a per-job failure is captured in the job, so it can't sink the whole worker.
+async fn work_one_local_job(store: &crate::store::SessionStore, resolver: &Resolver, id: i64) {
+    let job = match store.get_local(id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            eprintln!("kaibo: local/{id} vanished after claim — skipping.");
+            return;
+        }
+        Err(e) => {
+            eprintln!("kaibo: could not load local/{id}: {e:#} — skipping.");
+            return;
+        }
+    };
+    eprintln!(
+        "kaibo: running local/{id} — cast `{}`, {} item(s).",
+        job.cast,
+        job.items.len()
+    );
+
+    // Resolve the cast → synth arm + oneshot context against the worker's own config.
+    let (arm, ctx) = match resolve_local_setup(resolver, &job) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            eprintln!("kaibo: local/{id} setup failed: {reason}");
+            for item in &job.items {
+                if item.result.is_none() {
+                    let _ = store
+                        .record_local_item(id, item.seq, Err(reason.clone()))
+                        .await;
+                }
+            }
+            let _ = store.mark_local_finished(id, LocalJobStatus::Failed).await;
+            return;
+        }
+    };
+
+    for item in &job.items {
+        // Resume support: an item already recorded (a worker restarted mid-job) is skipped.
+        if item.result.is_some() {
+            continue;
+        }
+        // Honest cancel semantics: the worker checks status BETWEEN items — a running item
+        // always finishes, a cancel stops the rest.
+        match store.local_status(id).await {
+            Ok(Some(LocalJobStatus::Cancelled)) => {
+                eprintln!("kaibo: local/{id} cancelled — stopping between items.");
+                return;
+            }
+            Ok(Some(LocalJobStatus::Running)) => {}
+            Ok(other) => {
+                eprintln!("kaibo: local/{id} is no longer running ({other:?}) — stopping.");
+                return;
+            }
+            Err(e) => eprintln!("kaibo: local/{id} status check failed: {e:#} — continuing."),
+        }
+        eprintln!("kaibo: local/{id} item {} running…", item.seq);
+        let result = match run_oneshot_engine(&item.prompt, &job.attachments, &arm, &ctx).await {
+            Ok((answer, _usage)) => Ok(answer),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        if let Err(e) = store.record_local_item(id, item.seq, result).await {
+            eprintln!(
+                "kaibo: could not record item {} of local/{id}: {e:#}",
+                item.seq
+            );
+        }
+    }
+    let _ = store.mark_local_finished(id, LocalJobStatus::Done).await;
+    eprintln!("kaibo: local/{id} done.");
+}
+
+/// Resolve a claimed job's cast into a synth [`Arm`] + oneshot [`PhaseContext`], using the
+/// worker's own config. Returns the failure reason as a string (captured onto the job's
+/// items) rather than a `SetupError` — the worker keeps going.
+fn resolve_local_setup(
+    resolver: &Resolver,
+    job: &LocalJob,
+) -> Result<(crate::consult::Arm, PhaseContext), String> {
+    let mut cast = resolver
+        .resolve_cast(Some(job.cast.clone()))
+        .map_err(|e| e.message.to_string())?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            job.model.as_deref(),
+            job.backend.as_deref(),
+            "model",
+            "backend",
+        )
+        .map_err(|e| e.message.to_string())?;
+    let arm = resolver
+        .arm(&cast, ModelRole::Synth)
+        .map_err(|e| e.message.to_string())?;
+    // oneshot reads no project: no house rules, no orientation, no shell. Quiet progress —
+    // the worker prints its own per-item narrative to stderr.
+    let ctx = PhaseContext {
+        progress: Arc::new(NullSink),
+        house_rules: None,
+        prompts: resolver.resolved_prompts(&cast),
+        orientation: None,
+        call_deadline: resolver.config.defaults.call_deadline,
+    };
+    Ok((arm, ctx))
+}
+
+/// `kaibo batch get local/<id>` — render a local job's status/results (prose or `--json`).
+async fn batch_get_local_inner(
+    args: &BatchGetArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let store = open_required_store(resolver).await?;
+    let id = parse_local_handle(&args.handle).map_err(|e| SetupError {
+        kind: "usage",
+        message: e.message.to_string(),
+        code: EXIT_USAGE,
+    })?;
+    let job = store
+        .get_local(id)
+        .await
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: format!("could not read local job: {e:#}"),
+            code: EXIT_SETUP,
+        })?
+        .ok_or_else(|| SetupError {
+            kind: "usage",
+            message: format!("no local batch job `{}` — check the handle.", args.handle),
+            code: EXIT_USAGE,
+        })?;
+    if args.json {
+        println!("{}", local_job_envelope(&job));
+    } else {
+        println!("{}", render_local_job(&job));
+    }
+    Ok(EXIT_OK)
+}
+
+/// A local job as a stable JSON object for `batch get local/<id> --json`. Pure and testable.
+fn local_job_envelope(job: &LocalJob) -> serde_json::Value {
+    serde_json::json!({
+        "handle": format!("local/{}", job.id),
+        "status": job.status.as_str(),
+        "cast": job.cast,
+        "items": job.items.iter().map(|i| match &i.result {
+            Some(Ok(t)) => serde_json::json!({ "seq": i.seq, "ok": true, "text": t }),
+            Some(Err(e)) => serde_json::json!({ "seq": i.seq, "ok": false, "error": e }),
+            None => serde_json::json!({ "seq": i.seq, "pending": true }),
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// `kaibo batch cancel <handle>` — a provider `backend/provider-id` or a `local/<id>` job.
+async fn batch_cancel_inner(
+    args: &BatchCancelArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    if is_local_handle(&args.handle) {
+        let store = open_required_store(resolver).await?;
+        let id = parse_local_handle(&args.handle).map_err(|e| SetupError {
+            kind: "usage",
+            message: e.message.to_string(),
+            code: EXIT_USAGE,
+        })?;
+        let outcome = store.cancel_local(id).await.map_err(|e| SetupError {
+            kind: "setup",
+            message: format!("could not cancel local job: {e:#}"),
+            code: EXIT_SETUP,
+        })?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({ "handle": args.handle, "outcome": local_cancel_str(outcome) })
+            );
+        } else {
+            println!("{}", render_local_cancel(&args.handle, outcome));
+        }
+        return Ok(EXIT_OK);
+    }
+    // Provider batch cancel.
+    let (backend_name, provider_id) = args
+        .handle
+        .split_once('/')
+        .filter(|(b, id)| !b.is_empty() && !id.is_empty())
+        .ok_or_else(|| SetupError {
+            kind: "usage",
+            message: format!(
+                "batch handle {:?} must be \"backend/provider-id\" or \"local/<id>\"",
+                args.handle
+            ),
+            code: EXIT_USAGE,
+        })?;
+    let backend = resolver
+        .config
+        .resolve_backend(backend_name)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    let provider = crate::batch::poller(backend).map_err(|e| SetupError {
+        kind: "setup",
+        message: format!("{e:#}"),
+        code: EXIT_SETUP,
+    })?;
+    match provider.cancel(provider_id).await {
+        Ok(()) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "handle": args.handle, "outcome": "cancelling" })
+                );
+            } else {
+                println!(
+                    "Requested cancellation of batch `{}`. `kaibo batch get {}` for the final \
+                     per-item results.",
+                    args.handle, args.handle
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(
+            args.json,
+            "batch cancel",
+            backend_name,
+            e,
+        )),
+    }
+}
+
+/// A stable string for a local cancel outcome in `--json`.
+fn local_cancel_str(outcome: CancelLocalOutcome) -> &'static str {
+    match outcome {
+        CancelLocalOutcome::CancelledPending => "cancelled",
+        CancelLocalOutcome::CancellingRunning => "cancelling",
+        CancelLocalOutcome::AlreadyCancelled => "already_cancelled",
+        CancelLocalOutcome::AlreadyFinished => "already_finished",
+        CancelLocalOutcome::Unknown => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -2008,5 +2508,116 @@ mod tests {
             Some(Command::Kaish(k)) => assert!(k.command.is_none(), "-c is optional at parse time"),
             other => panic!("expected kaish, got {other:?}"),
         }
+    }
+
+    // --- local batch --------------------------------------------------------
+
+    #[test]
+    fn batch_submit_local_and_work_and_cancel_parse() {
+        // `--local` on submit routes to the local lane; any cast is allowed.
+        let cli = Cli::parse_from([
+            "kaibo", "batch", "submit", "--local", "p1", "p2", "--cast", "deepseek",
+        ]);
+        match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Submit(s) => {
+                    assert!(s.local, "--local sets the local flag");
+                    assert_eq!(s.prompts, vec!["p1".to_string(), "p2".to_string()]);
+                }
+                other => panic!("expected submit, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        }
+
+        // `batch work --watch` parses the optional poll interval.
+        let cli = Cli::parse_from(["kaibo", "batch", "work", "--watch", "30"]);
+        match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Work(w) => assert_eq!(w.watch, Some(30)),
+                other => panic!("expected work, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        }
+
+        // `batch cancel` takes a handle.
+        let cli = Cli::parse_from(["kaibo", "batch", "cancel", "local/3"]);
+        match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Cancel(c) => assert_eq!(c.handle, "local/3"),
+                other => panic!("expected cancel, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_work_requires_no_positional() {
+        // A bare `batch work` is valid (drain-then-exit).
+        let cli = Cli::parse_from(["kaibo", "batch", "work"]);
+        match cli.command {
+            Some(Command::Batch(b)) => matches!(b.cmd, BatchCmd::Work(_)),
+            _ => panic!("expected batch work"),
+        };
+    }
+
+    #[test]
+    fn local_job_envelope_shapes_each_item_state() {
+        let job = LocalJob {
+            id: 7,
+            cast: "deepseek".into(),
+            model: None,
+            backend: None,
+            status: LocalJobStatus::Done,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: Some(3),
+            attachments: vec![],
+            items: vec![
+                crate::store::LocalJobItem {
+                    seq: 0,
+                    prompt: "p0".into(),
+                    result: Some(Ok("answer0".into())),
+                    finished_at: Some(3),
+                },
+                crate::store::LocalJobItem {
+                    seq: 1,
+                    prompt: "p1".into(),
+                    result: Some(Err("boom".into())),
+                    finished_at: Some(3),
+                },
+                crate::store::LocalJobItem {
+                    seq: 2,
+                    prompt: "p2".into(),
+                    result: None,
+                    finished_at: None,
+                },
+            ],
+        };
+        let env = local_job_envelope(&job);
+        assert_eq!(env["handle"], "local/7");
+        assert_eq!(env["status"], "done");
+        assert_eq!(env["cast"], "deepseek");
+        assert_eq!(env["items"][0]["ok"], true);
+        assert_eq!(env["items"][0]["text"], "answer0");
+        assert_eq!(env["items"][1]["ok"], false);
+        assert_eq!(env["items"][1]["error"], "boom");
+        assert_eq!(env["items"][2]["pending"], true);
+    }
+
+    #[test]
+    fn local_cancel_str_covers_every_outcome() {
+        assert_eq!(
+            local_cancel_str(CancelLocalOutcome::CancelledPending),
+            "cancelled"
+        );
+        assert_eq!(
+            local_cancel_str(CancelLocalOutcome::CancellingRunning),
+            "cancelling"
+        );
+        assert_eq!(
+            local_cancel_str(CancelLocalOutcome::AlreadyFinished),
+            "already_finished"
+        );
+        assert_eq!(local_cancel_str(CancelLocalOutcome::Unknown), "unknown");
     }
 }

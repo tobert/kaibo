@@ -369,6 +369,12 @@ pub fn parse_slot_ref(s: &str) -> Result<(String, String)> {
 
 // --- Backends ---------------------------------------------------------------
 
+/// The one backend name kaibo reserves. The local batch lane mints `local/<id>` handles,
+/// and kaibo routes those apart from provider `backend/provider-id` handles by this exact
+/// prefix — so no backend may be named `local`, or the two handle spaces would collide.
+/// Enforced at config load (see the backend-validation loop in [`Config::from_toml_str`]).
+pub const LOCAL_BACKEND_RESERVED: &str = "local";
+
 /// OpenRouter upstream-host data policy: whether requests may route to hosts
 /// that retain or train on prompts. kaibo ships source code in its prompts, so
 /// the default is [`DataCollection::Deny`] — OpenRouter then routes only to
@@ -1080,6 +1086,19 @@ impl Config {
                      refs (\"backend/model-id\") and batch handles (\"backend/provider-id\"), \
                      which split on the first slash",
                     b.name
+                );
+            }
+            // `local` is reserved so the local-batch handle namespace (`local/<id>`) can
+            // never collide with a provider batch handle (`backend/provider-id`). If a
+            // backend could be named `local`, a `local/msgbatch_…` provider handle would be
+            // indistinguishable from a `local/<id>` local-job handle — kaibo routes the two
+            // apart by exactly this prefix (`server::is_local_handle`), so the prefix has to
+            // stay unownable by any backend. Refuse it loudly at load.
+            if b.name == LOCAL_BACKEND_RESERVED {
+                bail!(
+                    "backend name {LOCAL_BACKEND_RESERVED:?} is reserved: the local batch lane \
+                     uses the handle namespace `{LOCAL_BACKEND_RESERVED}/<id>`, which must never \
+                     collide with a provider batch handle. Rename the backend."
                 );
             }
             // A base_url on a keyed kind: rig fixes those endpoints.
@@ -3667,6 +3686,21 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("may not contain '/'"), "got: {err}");
+    }
+
+    /// A backend named `local` is refused at load: the local batch lane owns the
+    /// `local/<id>` handle namespace, and letting a backend claim `local` would make a
+    /// `local/…` provider handle indistinguishable from a local-job handle. Reserving it
+    /// loudly at load is the collision guarantee.
+    #[test]
+    fn backend_named_local_is_reserved() {
+        let err = Config::from_toml_str(
+            "[backends.local]\nkind = \"openai\"\nbase_url = \"http://localhost:1/v1\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is reserved"), "got: {err}");
+        assert!(err.contains("local/<id>"), "got: {err}");
     }
 
     /// Alias collisions are loud, per level: a user cast named like a built-in

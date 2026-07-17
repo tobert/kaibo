@@ -512,3 +512,235 @@ async fn store_futures_are_send() {
     store.record_turn("s", "q", "a").await.unwrap();
     let _: PathBuf = Path::new("/x").to_path_buf();
 }
+
+// --- Local batch jobs (schema v2) -------------------------------------------
+
+use kaibo::attach::Attachment;
+use kaibo::store::{CancelLocalOutcome, LocalJobStatus};
+
+#[tokio::test]
+async fn local_enqueue_and_get_round_trips_captured_attachment_content() {
+    let (store, _d) = open(8).await;
+    // Two attachments — one text, one image — captured BY CONTENT at submit.
+    let atts = vec![
+        Attachment::Text {
+            path: "notes.md".into(),
+            body: "hello".into(),
+        },
+        Attachment::Image {
+            path: "shot.png".into(),
+            mime: "image/png",
+            data_b64: "AAAA".into(),
+        },
+    ];
+    let id = store
+        .enqueue_local(
+            "deepseek",
+            Some("some-model"),
+            Some("deepseek"),
+            &atts,
+            &["p0".to_string(), "p1".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, 1, "first local job id is 1");
+
+    let job = store.get_local(id).await.unwrap().expect("job exists");
+    assert_eq!(job.cast, "deepseek");
+    assert_eq!(job.model.as_deref(), Some("some-model"));
+    assert_eq!(job.backend.as_deref(), Some("deepseek"));
+    assert_eq!(job.status, LocalJobStatus::Pending);
+    // Attachment content survives the db round-trip exactly (the &'static mime re-interned).
+    assert_eq!(job.attachments, atts);
+    assert_eq!(job.items.len(), 2);
+    assert_eq!(job.items[0].prompt, "p0");
+    assert!(job.items[0].result.is_none(), "a fresh item has no result");
+}
+
+#[tokio::test]
+async fn ids_are_monotone_and_list_is_newest_first() {
+    let (store, _d) = open(8).await;
+    let a = store
+        .enqueue_local("c", None, None, &[], &["a".to_string()])
+        .await
+        .unwrap();
+    let b = store
+        .enqueue_local("c", None, None, &[], &["b".to_string()])
+        .await
+        .unwrap();
+    assert!(b > a, "ids increase monotonically");
+    let list = store.list_local().await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].id, b, "list is newest-first");
+    assert_eq!(list[1].id, a);
+    assert_eq!(list[0].total, 1);
+    assert_eq!(list[0].done, 0);
+}
+
+/// The claim-race property with teeth: two separate stores on ONE db file both try to claim
+/// the single pending job — exactly one wins (the `BEGIN IMMEDIATE` flip). With a deferred
+/// transaction both would read `pending` and double-claim; this asserts they can't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claim_next_local_is_exclusive_across_two_stores_on_one_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    let a = SessionStore::open(&path, cap(8), &[]).await.unwrap();
+    let b = SessionStore::open(&path, cap(8), &[]).await.unwrap();
+    let id = a
+        .enqueue_local("c", None, None, &[], &["only".to_string()])
+        .await
+        .unwrap();
+
+    // Two workers race for the one pending job.
+    let ha = {
+        let a = a.clone();
+        tokio::spawn(async move { a.claim_next_local().await.unwrap() })
+    };
+    let hb = {
+        let b = b.clone();
+        tokio::spawn(async move { b.claim_next_local().await.unwrap() })
+    };
+    let (ra, rb) = (ha.await.unwrap(), hb.await.unwrap());
+    let claims: Vec<i64> = [ra, rb].into_iter().flatten().collect();
+    assert_eq!(
+        claims,
+        vec![id],
+        "exactly one worker may claim the single pending job (no double-run)"
+    );
+    // It's running now; a further claim finds nothing.
+    assert_eq!(
+        a.local_status(id).await.unwrap(),
+        Some(LocalJobStatus::Running)
+    );
+    assert!(a.claim_next_local().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn worker_lifecycle_records_items_then_marks_done() {
+    let (store, _d) = open(8).await;
+    let id = store
+        .enqueue_local("c", None, None, &[], &["p0".to_string(), "p1".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(store.claim_next_local().await.unwrap(), Some(id));
+    // Per-item results as they land — one ok, one per-item error.
+    store
+        .record_local_item(id, 0, Ok("answer0".into()))
+        .await
+        .unwrap();
+    store
+        .record_local_item(id, 1, Err("model failed".into()))
+        .await
+        .unwrap();
+    store
+        .mark_local_finished(id, LocalJobStatus::Done)
+        .await
+        .unwrap();
+
+    let job = store.get_local(id).await.unwrap().unwrap();
+    assert_eq!(job.status, LocalJobStatus::Done);
+    assert_eq!(job.items[0].result, Some(Ok("answer0".to_string())));
+    assert_eq!(job.items[1].result, Some(Err("model failed".to_string())));
+    let sum = &store.list_local().await.unwrap()[0];
+    assert_eq!(sum.done, 2);
+    assert_eq!(sum.failed, 1);
+}
+
+#[tokio::test]
+async fn cancel_pending_marks_cancelled_and_dequeues_it() {
+    let (store, _d) = open(8).await;
+    let id = store
+        .enqueue_local("c", None, None, &[], &["p".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.cancel_local(id).await.unwrap(),
+        CancelLocalOutcome::CancelledPending
+    );
+    assert_eq!(
+        store.local_status(id).await.unwrap(),
+        Some(LocalJobStatus::Cancelled)
+    );
+    // A cancelled job is no longer claimable.
+    assert!(store.claim_next_local().await.unwrap().is_none());
+    // Idempotent.
+    assert_eq!(
+        store.cancel_local(id).await.unwrap(),
+        CancelLocalOutcome::AlreadyCancelled
+    );
+}
+
+#[tokio::test]
+async fn cancel_running_wins_over_a_late_finalize() {
+    let (store, _d) = open(8).await;
+    let id = store
+        .enqueue_local("c", None, None, &[], &["p".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(store.claim_next_local().await.unwrap(), Some(id));
+    // Operator cancels the running job.
+    assert_eq!(
+        store.cancel_local(id).await.unwrap(),
+        CancelLocalOutcome::CancellingRunning
+    );
+    // A worker's finalize is guarded (WHERE status='running'), so the cancel WINS.
+    store
+        .mark_local_finished(id, LocalJobStatus::Done)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.local_status(id).await.unwrap(),
+        Some(LocalJobStatus::Cancelled),
+        "a concurrent cancel must not be clobbered by the worker's Done finalize"
+    );
+}
+
+#[tokio::test]
+async fn cancel_unknown_and_finished() {
+    let (store, _d) = open(8).await;
+    assert_eq!(
+        store.cancel_local(999).await.unwrap(),
+        CancelLocalOutcome::Unknown
+    );
+    let id = store
+        .enqueue_local("c", None, None, &[], &["p".to_string()])
+        .await
+        .unwrap();
+    store.claim_next_local().await.unwrap();
+    store
+        .mark_local_finished(id, LocalJobStatus::Done)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.cancel_local(id).await.unwrap(),
+        CancelLocalOutcome::AlreadyFinished
+    );
+}
+
+#[tokio::test]
+async fn local_jobs_survive_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    let id = {
+        let store = SessionStore::open(&path, cap(8), &[]).await.unwrap();
+        let id = store
+            .enqueue_local("c", None, None, &[], &["p".to_string()])
+            .await
+            .unwrap();
+        store.claim_next_local().await.unwrap();
+        store
+            .record_local_item(id, 0, Ok("durable".into()))
+            .await
+            .unwrap();
+        store
+            .mark_local_finished(id, LocalJobStatus::Done)
+            .await
+            .unwrap();
+        id
+    };
+    // Reopen: the job and its captured result are still there (the db is the mailbox).
+    let store = SessionStore::open(&path, cap(8), &[]).await.unwrap();
+    let job = store.get_local(id).await.unwrap().unwrap();
+    assert_eq!(job.status, LocalJobStatus::Done);
+    assert_eq!(job.items[0].result, Some(Ok("durable".to_string())));
+}

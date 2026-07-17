@@ -65,6 +65,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use turso::{Builder, Connection, Database, Value};
 
+use crate::attach::Attachment;
+
 /// Per-connection busy budget. A single turso `Connection` refuses *concurrent* use, so
 /// the store mints a fresh connection per operation; this bounds how long one waits when
 /// another connection holds a write lock before it gives up with `Busy`.
@@ -72,7 +74,13 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current on-disk schema version. Bump + add a migration arm when the shape changes;
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// - **v1** — `sessions`/`turns`/`batch_handles` (the durable session log + provider
+///   batch-handle registry).
+/// - **v2** — adds `local_jobs`/`local_job_items`: the queue + mailbox for the local
+///   batch lane ([`SessionStore::enqueue_local`] and friends). A v1 db upgrades in place
+///   (its session/batch data untouched); a fresh db is created at v2.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long a batch handle is kept before it's pruned. Provider batches expire around 30
 /// days (Anthropic/Gemini both), so a handle older than that names a batch the provider has
@@ -108,6 +116,116 @@ pub struct BatchHandle {
     pub provider_id: String,
     pub label: Option<String>,
     pub created_at: i64,
+}
+
+/// Where a local batch job is in its lifecycle. Persisted as the lowercase string
+/// ([`as_str`](Self::as_str)); the db is the queue, so this is the claim state a worker
+/// flips (`Pending` → `Running` → `Done`/`Failed`) and the terminal a cancel sets
+/// (`Cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalJobStatus {
+    /// Enqueued, not yet claimed by a worker.
+    Pending,
+    /// Claimed by a worker and running its items.
+    Running,
+    /// Every item finished (each item may still carry a per-item error — the *job*
+    /// completed).
+    Done,
+    /// A setup failure (the worker couldn't resolve the cast/arm) stopped the job before
+    /// it could run its items; the items carry the reason.
+    Failed,
+    /// A cancel was requested; the worker stops between items (a running item finishes).
+    Cancelled,
+}
+
+impl LocalJobStatus {
+    /// The lowercase on-disk spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse the on-disk spelling; an unknown value is a corrupt-store error (crash over
+    /// silently mis-reading a status), never a silent default.
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(StoreError::Corrupt(format!(
+                "local job status {other:?} is not a known status"
+            ))),
+        }
+    }
+}
+
+/// One prompt of a local batch job and its outcome. `result` is `None` until the worker
+/// runs it, then `Some(Ok(text))` for the model's answer or `Some(Err(reason))` for a
+/// per-item failure — the same per-item honesty the provider batch lane keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalJobItem {
+    pub seq: i64,
+    pub prompt: String,
+    pub result: Option<std::result::Result<String, String>>,
+    pub finished_at: Option<i64>,
+}
+
+/// A local batch job with its items — the whole record a worker or a `get` reads. The
+/// attachments carry the CONTENT captured at submit (behind the store guard), so the
+/// worker feeds the model the bytes as they were when submitted, not as they are now.
+#[derive(Debug, Clone)]
+pub struct LocalJob {
+    pub id: i64,
+    pub cast: String,
+    pub model: Option<String>,
+    pub backend: Option<String>,
+    pub status: LocalJobStatus,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub attachments: Vec<Attachment>,
+    pub items: Vec<LocalJobItem>,
+}
+
+/// A local batch job as the list view sees it — identity, status, lifecycle timestamps,
+/// and item progress counts, without loading prompts/results/attachments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalJobSummary {
+    pub id: i64,
+    pub cast: String,
+    pub status: LocalJobStatus,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    /// Total items in the job.
+    pub total: i64,
+    /// Items with a result (a model answer OR a per-item error).
+    pub done: i64,
+    /// Items whose result is a per-item error.
+    pub failed: i64,
+}
+
+/// The outcome of a [`cancel_local`](SessionStore::cancel_local) request — reported
+/// honestly so a caller learns whether a running item is still finishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelLocalOutcome {
+    /// A pending job was cancelled before it ran.
+    CancelledPending,
+    /// A running job was marked cancelled; the worker stops after the in-flight item.
+    CancellingRunning,
+    /// The job was already cancelled — idempotent no-op.
+    AlreadyCancelled,
+    /// The job already finished (done/failed) — left alone.
+    AlreadyFinished,
+    /// No such job id.
+    Unknown,
 }
 
 /// The store's error surface. A persistence-library boundary wants a typed error callers
@@ -290,6 +408,7 @@ impl SessionStore {
         while version < SCHEMA_VERSION {
             match version {
                 0 => Self::apply_v1(&conn).await?,
+                1 => Self::apply_v2(&conn).await?,
                 other => {
                     return Err(StoreError::Corrupt(format!(
                         "no migration from schema version {other} (this binary knows up to \
@@ -301,6 +420,14 @@ impl SessionStore {
             conn.pragma_update("user_version", version).await?;
         }
         Ok(())
+    }
+
+    /// The current on-disk schema version (`PRAGMA user_version`) — for diagnostics and the
+    /// migration tests (a fresh db reads [`SCHEMA_VERSION`]; a migrated v1 db reads it too,
+    /// after [`migrate`](Self::migrate) has run at open).
+    pub async fn schema_version(&self) -> Result<i64> {
+        let conn = self.conn().await?;
+        user_version(&conn).await
     }
 
     /// The v1 schema (from empty). `STRICT` tables throughout (turso 0.7 enables strict
@@ -333,6 +460,46 @@ impl SessionStore {
                 created_at  INTEGER NOT NULL,
                 PRIMARY KEY (backend, provider_id)
             ) STRICT;
+            "#,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The v2 schema (v1 → v2). Adds the **local batch** queue + mailbox: `local_jobs` (one
+    /// row per submitted batch — its cast, optional model/backend override, captured
+    /// attachment content, status, and lifecycle timestamps) and `local_job_items` (one row
+    /// per prompt, with its per-item result text OR error filled in as the worker completes
+    /// it). Attachment CONTENT is captured at submit into `local_jobs.attachments` (a JSON
+    /// array) because the worker may run hours later, after the files have changed — the same
+    /// inline-at-submit discipline the provider batch lane uses. Additive: the v1 tables are
+    /// untouched, so a populated v1 db keeps every session and batch handle.
+    async fn apply_v2(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS local_jobs (
+                id          INTEGER PRIMARY KEY,
+                cast_name   TEXT    NOT NULL,
+                model       TEXT,
+                backend     TEXT,
+                attachments TEXT    NOT NULL,
+                status      TEXT    NOT NULL,
+                created_at  INTEGER NOT NULL,
+                started_at  INTEGER,
+                finished_at INTEGER
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS local_job_items (
+                job_id       INTEGER NOT NULL,
+                seq          INTEGER NOT NULL,
+                prompt       TEXT    NOT NULL,
+                result_text  TEXT,
+                result_error TEXT,
+                finished_at  INTEGER,
+                PRIMARY KEY (job_id, seq)
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS idx_local_jobs_status ON local_jobs(status);
             "#,
         )
         .await?;
@@ -516,6 +683,233 @@ impl SessionStore {
             out.push(row_to_handle(&row)?);
         }
         Ok(out)
+    }
+
+    // --- Local batch jobs (schema v2) --------------------------------------
+
+    /// Enqueue a local batch job: one `local_jobs` row (status `pending`) plus one
+    /// `local_job_items` row per prompt. `attachments` are captured **by content** here
+    /// (serialized into the row) so the worker feeds the model the bytes as they were at
+    /// submit, even if it runs hours later. The whole enqueue is one `BEGIN IMMEDIATE`
+    /// transaction, and the job id is `MAX(id)+1` allocated under that write lock — so two
+    /// processes submitting at once get distinct, monotone ids with no external id source.
+    /// Returns the new job id; the caller mints the `local/<id>` handle from it.
+    pub async fn enqueue_local(
+        &self,
+        cast: &str,
+        model: Option<&str>,
+        backend: Option<&str>,
+        attachments: &[Attachment],
+        prompts: &[String],
+    ) -> Result<i64> {
+        if prompts.is_empty() {
+            return Err(StoreError::Corrupt(
+                "a local batch job needs at least one prompt".into(),
+            ));
+        }
+        let attach_json = attachments_to_json(attachments)?;
+        let conn = self.conn().await?;
+        let ts = now();
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result =
+            enqueue_local_inner(&conn, cast, model, backend, &attach_json, prompts, ts).await;
+        match result {
+            Ok(id) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically claim the oldest pending job for this worker: inside one `BEGIN IMMEDIATE`
+    /// transaction, select the lowest-id `pending` job and flip it to `running` (stamping
+    /// `started_at`). `IMMEDIATE` takes the write lock up front, so a second worker (even in
+    /// another process on the same file) blocks until this commits and then reads no pending
+    /// row for that id — **exactly one worker ever claims a given job**. Returns the claimed
+    /// id, or `None` when the queue holds no pending job.
+    pub async fn claim_next_local(&self) -> Result<Option<i64>> {
+        let conn = self.conn().await?;
+        let ts = now();
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = claim_next_local_inner(&conn, ts).await;
+        match result {
+            Ok(id) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The full job record (base fields + attachments + items in seq order), or `None` for
+    /// an unknown id.
+    pub async fn get_local(&self, id: i64) -> Result<Option<LocalJob>> {
+        let conn = self.conn().await?;
+        let base = {
+            let mut rows = conn
+                .query(
+                    "SELECT cast_name, model, backend, attachments, status, created_at, \
+                     started_at, finished_at FROM local_jobs WHERE id = ?1",
+                    [id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some((
+                    row.get::<String>(0)?,
+                    value_opt_text(row.get_value(1)?),
+                    value_opt_text(row.get_value(2)?),
+                    row.get::<String>(3)?,
+                    LocalJobStatus::parse(&row.get::<String>(4)?)?,
+                    row.get::<i64>(5)?,
+                    value_opt_i64(row.get_value(6)?),
+                    value_opt_i64(row.get_value(7)?),
+                )),
+                None => None,
+            }
+        };
+        let Some((cast, model, backend, attach_json, status, created_at, started_at, finished_at)) =
+            base
+        else {
+            return Ok(None);
+        };
+        let attachments = attachments_from_json(&attach_json)?;
+
+        let mut items = Vec::new();
+        let mut rows = conn
+            .query(
+                "SELECT seq, prompt, result_text, result_error, finished_at \
+                 FROM local_job_items WHERE job_id = ?1 ORDER BY seq ASC",
+                [id],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            items.push(row_to_local_item(&row)?);
+        }
+        Ok(Some(LocalJob {
+            id,
+            cast,
+            model,
+            backend,
+            status,
+            created_at,
+            started_at,
+            finished_at,
+            attachments,
+            items,
+        }))
+    }
+
+    /// All local jobs as lightweight summaries, newest first — the list view.
+    pub async fn list_local(&self) -> Result<Vec<LocalJobSummary>> {
+        let conn = self.conn().await?;
+        let mut out = Vec::new();
+        let mut rows = conn
+            .query(
+                "SELECT j.id, j.cast_name, j.status, j.created_at, j.started_at, j.finished_at,
+                        (SELECT COUNT(*) FROM local_job_items i WHERE i.job_id = j.id),
+                        (SELECT COUNT(*) FROM local_job_items i WHERE i.job_id = j.id
+                             AND (i.result_text IS NOT NULL OR i.result_error IS NOT NULL)),
+                        (SELECT COUNT(*) FROM local_job_items i WHERE i.job_id = j.id
+                             AND i.result_error IS NOT NULL)
+                 FROM local_jobs j
+                 ORDER BY j.id DESC",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            out.push(LocalJobSummary {
+                id: row.get::<i64>(0)?,
+                cast: row.get::<String>(1)?,
+                status: LocalJobStatus::parse(&row.get::<String>(2)?)?,
+                created_at: row.get::<i64>(3)?,
+                started_at: value_opt_i64(row.get_value(4)?),
+                finished_at: value_opt_i64(row.get_value(5)?),
+                total: row.get::<i64>(6)?,
+                done: row.get::<i64>(7)?,
+                failed: row.get::<i64>(8)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Record one item's outcome as it completes — `Ok(text)` for an answer, `Err(reason)`
+    /// for a per-item failure — and stamp its `finished_at`. Written per item (a single
+    /// autocommit `UPDATE`), so a worker crash loses at most the one in-flight item.
+    pub async fn record_local_item(
+        &self,
+        id: i64,
+        seq: i64,
+        result: std::result::Result<String, String>,
+    ) -> Result<()> {
+        let conn = self.conn().await?;
+        let (text, err) = match result {
+            Ok(t) => (Value::Text(t), Value::Null),
+            Err(e) => (Value::Null, Value::Text(e)),
+        };
+        conn.execute(
+            "UPDATE local_job_items SET result_text = ?3, result_error = ?4, finished_at = ?5 \
+             WHERE job_id = ?1 AND seq = ?2",
+            (id, seq, text, err, now()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Finalize a job the worker drained to a terminal `status` (`Done` or `Failed`). Guarded
+    /// `WHERE status = 'running'` so a concurrent [`cancel_local`](Self::cancel_local) that
+    /// already flipped the job to `cancelled` **wins** — the worker's finalize then no-ops
+    /// rather than clobbering the operator's cancel. Idempotent for the same reason.
+    pub async fn mark_local_finished(&self, id: i64, status: LocalJobStatus) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE local_jobs SET status = ?2, finished_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (id, status.as_str().to_string(), now()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The job's current status, or `None` if unknown. The worker reads this **between
+    /// items** so an operator's cancel (which flips a running job to `cancelled`) stops it
+    /// without a signal — the honest "checks status between items" semantics.
+    pub async fn local_status(&self, id: i64) -> Result<Option<LocalJobStatus>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query("SELECT status FROM local_jobs WHERE id = ?1", [id])
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(LocalJobStatus::parse(&row.get::<String>(0)?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Cancel a local job. A `pending` job is cancelled outright; a `running` job is marked
+    /// `cancelled` and the worker stops after its in-flight item finishes (it checks
+    /// [`local_status`](Self::local_status) between items). A finished/already-cancelled job
+    /// is left alone. One `BEGIN IMMEDIATE` transaction so the read-then-write can't race a
+    /// concurrent finalize.
+    pub async fn cancel_local(&self, id: i64) -> Result<CancelLocalOutcome> {
+        let conn = self.conn().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = cancel_local_inner(&conn, id).await;
+        match result {
+            Ok(o) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(o)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -726,6 +1120,217 @@ async fn prune_stale_batch_handles(conn: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// Text of a nullable turso column (`Some` only for a genuine `Text`).
+fn value_opt_text(v: Value) -> Option<String> {
+    match v {
+        Value::Text(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Integer of a nullable turso column (`Some` only for a genuine `Integer`).
+fn value_opt_i64(v: Value) -> Option<i64> {
+    match v {
+        Value::Integer(i) => Some(i),
+        _ => None,
+    }
+}
+
+/// A nullable text param: the value as `Text`, or SQL `NULL`.
+fn opt_text_value(o: Option<&str>) -> Value {
+    match o {
+        Some(s) => Value::Text(s.to_string()),
+        None => Value::Null,
+    }
+}
+
+/// The next local-job id: `MAX(id)+1` (1 when empty). Strictly increasing when called
+/// inside a `BEGIN IMMEDIATE` transaction (as [`enqueue_local`](SessionStore::enqueue_local)
+/// does), so two concurrent submits get distinct ids.
+async fn next_local_id(conn: &Connection) -> Result<i64> {
+    let mut rows = conn
+        .query("SELECT COALESCE(MAX(id), 0) + 1 FROM local_jobs", ())
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get::<i64>(0)?),
+        None => Ok(1),
+    }
+}
+
+async fn enqueue_local_inner(
+    conn: &Connection,
+    cast: &str,
+    model: Option<&str>,
+    backend: Option<&str>,
+    attach_json: &str,
+    prompts: &[String],
+    ts: i64,
+) -> Result<i64> {
+    let id = next_local_id(conn).await?;
+    conn.execute(
+        "INSERT INTO local_jobs (id, cast_name, model, backend, attachments, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+        (
+            id,
+            cast.to_string(),
+            opt_text_value(model),
+            opt_text_value(backend),
+            attach_json.to_string(),
+            ts,
+        ),
+    )
+    .await?;
+    for (i, p) in prompts.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO local_job_items (job_id, seq, prompt) VALUES (?1, ?2, ?3)",
+            (id, i as i64, p.clone()),
+        )
+        .await?;
+    }
+    Ok(id)
+}
+
+async fn claim_next_local_inner(conn: &Connection, ts: i64) -> Result<Option<i64>> {
+    // Read the id, then drop the statement before the UPDATE (one connection can't hold a
+    // live result set open across another statement).
+    let id = {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM local_jobs WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
+                (),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => return Ok(None),
+        }
+    };
+    conn.execute(
+        "UPDATE local_jobs SET status = 'running', started_at = ?2 WHERE id = ?1",
+        (id, ts),
+    )
+    .await?;
+    Ok(Some(id))
+}
+
+async fn cancel_local_inner(conn: &Connection, id: i64) -> Result<CancelLocalOutcome> {
+    let status = {
+        let mut rows = conn
+            .query("SELECT status FROM local_jobs WHERE id = ?1", [id])
+            .await?;
+        match rows.next().await? {
+            Some(row) => LocalJobStatus::parse(&row.get::<String>(0)?)?,
+            None => return Ok(CancelLocalOutcome::Unknown),
+        }
+    };
+    match status {
+        LocalJobStatus::Pending => {
+            conn.execute(
+                "UPDATE local_jobs SET status = 'cancelled', finished_at = ?2 WHERE id = ?1",
+                (id, now()),
+            )
+            .await?;
+            Ok(CancelLocalOutcome::CancelledPending)
+        }
+        LocalJobStatus::Running => {
+            conn.execute(
+                "UPDATE local_jobs SET status = 'cancelled', finished_at = ?2 WHERE id = ?1",
+                (id, now()),
+            )
+            .await?;
+            Ok(CancelLocalOutcome::CancellingRunning)
+        }
+        LocalJobStatus::Cancelled => Ok(CancelLocalOutcome::AlreadyCancelled),
+        LocalJobStatus::Done | LocalJobStatus::Failed => Ok(CancelLocalOutcome::AlreadyFinished),
+    }
+}
+
+fn row_to_local_item(row: &turso::Row) -> Result<LocalJobItem> {
+    let seq = row.get::<i64>(0)?;
+    let prompt = row.get::<String>(1)?;
+    let text = value_opt_text(row.get_value(2)?);
+    let err = value_opt_text(row.get_value(3)?);
+    let finished_at = value_opt_i64(row.get_value(4)?);
+    // Text wins if (impossibly) both are set — an answer is more useful than an error, and
+    // the worker only ever writes one of the two.
+    let result = match (text, err) {
+        (Some(t), _) => Some(Ok(t)),
+        (None, Some(e)) => Some(Err(e)),
+        (None, None) => None,
+    };
+    Ok(LocalJobItem {
+        seq,
+        prompt,
+        result,
+        finished_at,
+    })
+}
+
+/// Serialize captured attachments to the JSON stored in `local_jobs.attachments`.
+fn attachments_to_json(atts: &[Attachment]) -> Result<String> {
+    let arr: Vec<serde_json::Value> = atts
+        .iter()
+        .map(|a| match a {
+            Attachment::Text { path, body } => {
+                serde_json::json!({ "kind": "text", "path": path, "body": body })
+            }
+            Attachment::Image {
+                path,
+                mime,
+                data_b64,
+            } => serde_json::json!({
+                "kind": "image", "path": path, "mime": mime, "data_b64": data_b64
+            }),
+        })
+        .collect();
+    serde_json::to_string(&arr)
+        .map_err(|e| StoreError::Corrupt(format!("serializing attachments: {e}")))
+}
+
+/// Rebuild attachments from the stored JSON. A missing field or an unknown kind/mime is a
+/// corrupt-store error (crash over silently feeding the model wrong bytes), never a drop.
+fn attachments_from_json(s: &str) -> Result<Vec<Attachment>> {
+    let arr: Vec<serde_json::Value> = serde_json::from_str(s)
+        .map_err(|e| StoreError::Corrupt(format!("parsing stored attachments: {e}")))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        match kind {
+            "text" => out.push(Attachment::Text {
+                path: json_str_field(&v, "path")?,
+                body: json_str_field(&v, "body")?,
+            }),
+            "image" => {
+                let mime_s = json_str_field(&v, "mime")?;
+                let mime = crate::attach::intern_image_mime(&mime_s).ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "stored attachment has unknown image mime {mime_s:?}"
+                    ))
+                })?;
+                out.push(Attachment::Image {
+                    path: json_str_field(&v, "path")?,
+                    mime,
+                    data_b64: json_str_field(&v, "data_b64")?,
+                });
+            }
+            other => {
+                return Err(StoreError::Corrupt(format!(
+                    "stored attachment has unknown kind {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read a required string field out of a stored attachment object.
+fn json_str_field(v: &serde_json::Value, key: &str) -> Result<String> {
+    v.get(key)
+        .and_then(|f| f.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| StoreError::Corrupt(format!("stored attachment missing string {key:?}")))
+}
+
 fn row_to_handle(row: &turso::Row) -> Result<BatchHandle> {
     let label = match row.get_value(2)? {
         Value::Null => None,
@@ -841,4 +1446,98 @@ fn validate_local_filesystem(dir: &Path) -> Result<()> {
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 fn validate_local_filesystem(_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    //! White-box tests for the `user_version` migration machinery — they reach the private
+    //! `build_database`/`apply_v1`/`user_version` seams, which the external `tests/store.rs`
+    //! integration suite can't. The point is to prove the migration ladder has teeth: a
+    //! fresh db is created at the latest version, and a hand-built **v1** db upgrades in
+    //! place to v2 without losing its v1 data. (Forget the `1 => apply_v2` arm and the v1
+    //! upgrade below fails loudly.)
+
+    use super::*;
+    use tempfile::TempDir;
+
+    fn cap() -> NonZeroUsize {
+        NonZeroUsize::new(4).unwrap()
+    }
+
+    /// Build a db on disk that is genuinely at schema v1: v1 tables, a seeded session, and
+    /// `user_version = 1` — the state a prior kaibo binary left behind.
+    async fn make_v1_db(path: &Path) {
+        let db = build_database(path).await.expect("build v1 db");
+        let conn = db.connect().expect("connect");
+        let _ = conn.pragma_update("journal_mode", "WAL").await;
+        SessionStore::apply_v1(&conn).await.expect("apply v1");
+        // Seed a session + turn so we can prove v1 data survives the migration.
+        conn.execute(
+            "INSERT INTO sessions (id, created_at, last_used_at, touch_seq) VALUES ('s', 1, 1, 1)",
+            (),
+        )
+        .await
+        .expect("seed session");
+        conn.execute(
+            "INSERT INTO turns (session_id, seq, question, answer, created_at) \
+             VALUES ('s', 0, 'q1', 'a1', 1)",
+            (),
+        )
+        .await
+        .expect("seed turn");
+        conn.pragma_update("user_version", 1i64)
+            .await
+            .expect("stamp v1");
+        assert_eq!(user_version(&conn).await.unwrap(), 1, "db is really at v1");
+    }
+
+    #[tokio::test]
+    async fn fresh_db_is_created_at_the_latest_version() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::open(&dir.path().join("state.db"), cap(), &[])
+            .await
+            .expect("open fresh");
+        assert_eq!(store.schema_version().await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 2, "this test pins the current version");
+        // The v2 local-job table exists and is usable on a fresh db.
+        let id = store
+            .enqueue_local("deepseek", None, None, &[], &["hi".to_string()])
+            .await
+            .expect("enqueue on fresh v2 db");
+        assert_eq!(id, 1);
+    }
+
+    #[tokio::test]
+    async fn migrates_a_v1_db_in_place_to_v2_keeping_v1_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        make_v1_db(&path).await;
+
+        // Reopen through the real path: `open` runs `migrate`, which must carry v1 → v2.
+        let store = SessionStore::open(&path, cap(), &[])
+            .await
+            .expect("reopen migrates in place");
+        assert_eq!(
+            store.schema_version().await.unwrap(),
+            2,
+            "the v1 db upgraded in place to v2"
+        );
+        // v1 data survived the migration untouched.
+        assert_eq!(
+            store.replay("s").await.unwrap(),
+            vec![Turn {
+                question: "q1".into(),
+                answer: "a1".into()
+            }],
+            "the pre-migration session must survive"
+        );
+        // And the freshly-added v2 surface works on the migrated db.
+        let id = store
+            .enqueue_local("deepseek", None, None, &[], &["p".to_string()])
+            .await
+            .expect("enqueue on migrated db");
+        let job = store.get_local(id).await.unwrap().expect("job exists");
+        assert_eq!(job.status, LocalJobStatus::Pending);
+        assert_eq!(job.items.len(), 1);
+    }
 }

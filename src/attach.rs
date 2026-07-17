@@ -76,6 +76,21 @@ pub enum Attachment {
     },
 }
 
+/// Re-intern an image mime string (as [`crate::view_image::sniff_mime`] produced it) back
+/// to the `&'static str` an [`Attachment::Image`] carries. The persistence layer round-trips
+/// an attachment through JSON, so the mime string it read back needs mapping to the same
+/// interned set; an unrecognized value is `None` (the caller crashes over silently keeping
+/// a bad mime). The four recognized formats mirror `sniff_mime`.
+pub fn intern_image_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 /// Refuse an attachment batch that busts the count or cumulative-byte budget — loud, never
 /// a silent drop (a dropped attachment the caller named would be a corrupt answer). Pure
 /// and cap-injected (the same shape as [`classify`]) so the bounds are unit-testable

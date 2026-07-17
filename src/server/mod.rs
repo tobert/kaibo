@@ -55,7 +55,8 @@ pub use resolver::Resolver;
 // MCP handler does.
 pub(crate) use config_resource::render_config_resource;
 pub(crate) use render::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
+    batch_within_window, consultation_failure_text, is_local_handle, now_epoch_secs,
+    parse_local_handle, render_local_cancel, render_local_job, render_local_list, with_provenance,
     BATCH_RECENCY_WINDOW_SECS,
 };
 
@@ -1729,6 +1730,21 @@ impl KaiboHandler {
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))
     }
 
+    /// The durable store, for local batch jobs — or a clear refusal when persistence is off.
+    /// Local jobs live in the state db (it's their queue *and* mailbox), so with persistence
+    /// disabled there is nowhere for them to exist; say so rather than 404 a handle.
+    fn local_store(&self) -> Result<&crate::store::SessionStore, McpError> {
+        self.sessions.store().ok_or_else(|| {
+            McpError::invalid_params(
+                "local batch jobs need persistence (the state db is their queue), but it is \
+                 disabled on this server (--no-persistence / KAIBO_NO_PERSISTENCE). Enable \
+                 persistence to submit, run, and collect local batches."
+                    .to_string(),
+                None,
+            )
+        })
+    }
+
     /// The set of backend names `job_list` should query. An explicit `backend` scopes
     /// to that one (resolved by name/alias, and refused loudly if its kind has no batch
     /// lane). Omitted, it's every configured batch-capable backend, sorted — the orphan-
@@ -1881,6 +1897,26 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<HandleInput>,
     ) -> Result<CallToolResult, McpError> {
+        // A `local/<id>` handle is checked BEFORE `is_batch_handle` — a local handle also
+        // carries a `/`, but its reserved `local/` prefix routes it to the state db, not a
+        // provider.
+        if is_local_handle(&input.handle) {
+            let id = parse_local_handle(&input.handle)?;
+            let store = self.local_store()?;
+            let job = store
+                .get_local(id)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("no local batch job `{}` — check the handle.", input.handle),
+                        None,
+                    )
+                })?;
+            return Ok(CallToolResult::success(vec![Content::text(
+                render_local_job(&job),
+            )]));
+        }
         if is_batch_handle(&input.handle) {
             self.ensure_batch_enabled(&input.handle)?;
             let (backend_name, provider_id) = parse_batch_handle(&input.handle)?;
@@ -1932,6 +1968,17 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<HandleInput>,
     ) -> Result<CallToolResult, McpError> {
+        if is_local_handle(&input.handle) {
+            let id = parse_local_handle(&input.handle)?;
+            let store = self.local_store()?;
+            let outcome = store
+                .cancel_local(id)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(
+                render_local_cancel(&input.handle, outcome),
+            )]));
+        }
         if is_batch_handle(&input.handle) {
             self.ensure_batch_enabled(&input.handle)?;
             let (backend_name, provider_id) = parse_batch_handle(&input.handle)?;
@@ -1986,6 +2033,18 @@ impl KaiboHandler {
         // lane both land here, so show the section when either produces jobs.
         if self.config.tools.consult || self.config.tools.deliberate {
             sections.push(render_jobs_section(&self.jobs.list()));
+        }
+
+        // Local batch jobs — the state db's own queue + mailbox (submit from anywhere, run
+        // with `kaibo batch work`, collect from anywhere). Only when persistence is on (the
+        // store is their home). Shown only when there are any, so a hosted-only setup with no
+        // local jobs stays uncluttered.
+        if let Some(store) = self.sessions.store() {
+            match store.list_local().await {
+                Ok(jobs) if !jobs.is_empty() => sections.push(render_local_list(&jobs)),
+                Ok(_) => {}
+                Err(e) => sections.push(format!("Local batch jobs: unavailable — {e}")),
+            }
         }
 
         // Handles the live provider listing surfaced — so the recovered-handles section
@@ -3996,6 +4055,77 @@ mod tests {
         assert!(
             listing.contains("some-pro"),
             "the recorded label (synth model) must show on the recovered handle:\n{listing}"
+        );
+    }
+
+    /// The operator-surface parity for local batch: the MCP `job_*` verbs route a
+    /// `local/<id>` handle to the state db (submit-from-CLI, collect-from-MCP-session). A job
+    /// enqueued directly into the store is visible via `job_get`/`job_list` and cancellable
+    /// via `job_cancel` — the cheap parity win the design commits to.
+    #[tokio::test]
+    async fn mcp_job_verbs_route_local_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let cap = std::num::NonZeroUsize::new(8).unwrap();
+        let store = crate::store::SessionStore::open(&db, cap, &[])
+            .await
+            .unwrap();
+        // Enqueue a local job the way the CLI `batch submit --local` would.
+        let id = store
+            .enqueue_local("deepseek", None, None, &[], &["q0".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(id, 1);
+        let handle = "local/1".to_string();
+
+        let h = handler_from_toml(BATCH_CASTS_TOML).with_session_store(store.clone());
+
+        // job_get routes the local handle to the store.
+        let got = result_text(
+            h.job_get(Parameters(HandleInput {
+                handle: handle.clone(),
+            }))
+            .await
+            .expect("job_get local succeeds"),
+        );
+        assert!(
+            got.contains("local/1"),
+            "job_get renders the local job:\n{got}"
+        );
+        assert!(
+            got.contains("queued"),
+            "a pending job reads as queued:\n{got}"
+        );
+
+        // job_list surfaces it under the local-jobs section.
+        let listing = result_text(
+            h.job_list(Parameters(ListInput {
+                backend: None,
+                all: false,
+            }))
+            .await
+            .expect("job_list succeeds"),
+        );
+        assert!(
+            listing.contains("Local batch jobs") && listing.contains("local/1"),
+            "job_list shows the local job:\n{listing}"
+        );
+
+        // job_cancel routes it and marks it cancelled.
+        let canceled = result_text(
+            h.job_cancel(Parameters(HandleInput {
+                handle: handle.clone(),
+            }))
+            .await
+            .expect("job_cancel local succeeds"),
+        );
+        assert!(
+            canceled.contains("Cancelled local batch `local/1`"),
+            "job_cancel cancels the pending local job:\n{canceled}"
+        );
+        assert_eq!(
+            store.local_status(1).await.unwrap(),
+            Some(crate::store::LocalJobStatus::Cancelled)
         );
     }
 

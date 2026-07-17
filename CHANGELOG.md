@@ -374,6 +374,23 @@ the git log. Each later release appends a new section at the top.
   shows live + store-recovered handles). Each carries `--json` (its `answer`/`report`
   field is the model's raw words) and the same stdout-is-payload / exit-code contract.
   An interactive REPL is deliberately later.
+- **Local batch: run a batch of prompts without a provider batch lane.**
+  `kaibo batch submit --local "prompt" …` enqueues a fan-out of toolless prompts to
+  kaibo's own state db and prints a durable `local/<id>` handle — **no provider batch
+  API needed**, so it works with a local model (or any cast, not just a batch-capable
+  one). Drain the queue with **`kaibo batch work`**, a foreground worker you background
+  yourself (`&`, `systemd-run`, `cron`): it claims one job at a time and runs each item
+  on the job's cast, writing per-item results as they land. Because the queue and the
+  results both live in the shared state db, you can **enqueue from anywhere** (CLI or an
+  MCP session), run the worker on whichever machine has the compute, and **collect from
+  anywhere**: `kaibo batch get local/<id>` (or the MCP `job_get`) renders per-item
+  answers/errors, `kaibo batch list` shows local jobs alongside provider batches, and
+  `kaibo batch cancel local/<id>` / `job_cancel local/<id>` stops one (a running item
+  finishes; the worker checks between items). Attachment content is captured at submit,
+  so the files can change before the worker runs. Local batch needs persistence enabled
+  (its queue is the state db); it refuses loudly otherwise. Two concurrent workers on one
+  db never double-run a job. Coming next: kaibo running the worker itself (an MCP client
+  with no shell to background one).
 
 ### Changed
 

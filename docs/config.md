@@ -128,6 +128,11 @@ Connection knobs only — models never live here:
   ships an `ExponentialBackoff`, wired only into its streaming path today) — landing it
   for the non-streaming completion path is tracked as an upstream contribution in
   `docs/issues.md`, not hand-rolled here.
+- **Name rules (both loud at load).** A backend name may not contain `/` — names prefix
+  slot refs (`"backend/model-id"`) and batch handles (`"backend/provider-id"`), which
+  split on the first slash. And **`local` is reserved**: the local batch lane mints
+  `local/<id>` handles, which kaibo routes apart from provider batch handles by that
+  exact prefix, so no backend may claim the name `local`.
 
 ### Casts: `[casts.<name>]`
 
