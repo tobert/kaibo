@@ -112,6 +112,29 @@ impl ProgressSink for TracingSink {
     }
 }
 
+/// A [`ProgressSink`] that renders each [`PhaseEvent`] as one concise line on
+/// **stderr** — the CLI front door's liveness channel. stdout carries the answer
+/// (so a script can capture it cleanly); progress and logs go to stderr, so a
+/// human watching a `kaibo consult` sees the same "watch it work" narrative an MCP
+/// client gets over `notifications/progress`, without polluting the captured answer.
+///
+/// Each line reuses [`PhaseEvent::message`] — the identical glanceable one-liner
+/// the MCP wire streams — prefixed `kaibo:` so it reads as tool chatter, not answer
+/// text. `emit` stays sync and infallible per the [`ProgressSink`] contract; a
+/// failed stderr write is dropped rather than allowed to sink the consult.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TerminalSink;
+
+impl ProgressSink for TerminalSink {
+    fn emit(&self, event: PhaseEvent) {
+        // `writeln!` to a locked stderr handle; ignore a write error — losing a
+        // progress beat must never fail the consultation (fire-and-forget contract).
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "kaibo: {}", event.message());
+    }
+}
+
 /// A [`ProgressSink`] decorator that remembers the most recent beat while teeing each
 /// event to an inner sink. An async `consult` job streams its progress to the caller
 /// through `job_wait` (the inner [`TracingSink`] → notification ring); a caller polling with
@@ -278,6 +301,24 @@ mod tests {
         // The thin adapter must take every event (levels are verified live / by the pure
         // predicate above, not by a flaky subscriber-capture test).
         let sink = TracingSink;
+        sink.emit(PhaseEvent::PhaseStarted { phase: "consult" });
+        sink.emit(PhaseEvent::KaishRun {
+            script: "grep -rn TODO .".into(),
+        });
+        sink.emit(PhaseEvent::SweepStarted {
+            question: "where?".into(),
+        });
+        sink.emit(PhaseEvent::SweepFinished);
+        sink.emit(PhaseEvent::TurnCapReached);
+        sink.emit(PhaseEvent::PhaseFinished { phase: "consult" });
+    }
+
+    #[test]
+    fn terminal_sink_handles_every_variant_without_panic() {
+        // The CLI's stderr sink must take every event; the line content is
+        // `PhaseEvent::message` (covered above), so here we only assert it can't panic
+        // or block on any variant (the fire-and-forget contract).
+        let sink = TerminalSink;
         sink.emit(PhaseEvent::PhaseStarted { phase: "consult" });
         sink.emit(PhaseEvent::KaishRun {
             script: "grep -rn TODO .".into(),

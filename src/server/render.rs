@@ -112,7 +112,7 @@ pub(super) fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) ->
 /// errored — the body of [`consultation_failed`], split out so the async path
 /// ([`consult_submit`]) can store a ready string in a [`JobState::Failed`] and the
 /// unified `job_get` wrap it without re-classifying.
-pub(super) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> String {
+pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> String {
     let detail = format!("{err:#}");
     let guidance = match classify_failure(&err) {
         FailureKind::TransientProvider => {
@@ -355,7 +355,7 @@ pub(super) fn parse_batch_handle(handle: &str) -> Result<(&str, &str), McpError>
         })
 }
 
-pub(super) fn with_provenance(
+pub(crate) fn with_provenance(
     answer: String,
     cast: &str,
     roles: &[(&str, &str)],

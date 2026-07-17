@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use kaish_kernel::tools::ToolSchema;
 use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -46,13 +46,19 @@ use crate::session::{SessionStore, Sessions};
 mod config_resource;
 mod containment;
 mod render;
+mod resolver;
 
-use config_resource::render_config_resource;
+pub use resolver::Resolver;
+
+// Re-exported for the CLI front door (`crate::cli`), which renders the same answer
+// footer, failure text, and `kaibo://config` document the MCP handler does.
+pub(crate) use config_resource::render_config_resource;
+pub(crate) use render::{consultation_failure_text, with_provenance};
+
 use render::{
-    batch_poll_brief, batch_within_window, consult_result, consultation_failed,
-    consultation_failure_text, fmt_usage, is_batch_handle, now_epoch_secs, parse_batch_handle,
-    render_job, render_jobs_section, render_wait, wait_level_floor, wait_level_label,
-    with_provenance, BATCH_RECENCY_WINDOW_SECS,
+    batch_poll_brief, batch_within_window, consult_result, consultation_failed, fmt_usage,
+    is_batch_handle, now_epoch_secs, parse_batch_handle, render_job, render_jobs_section,
+    render_wait, wait_level_floor, wait_level_label, BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -510,21 +516,13 @@ pub struct KaiboHandler {
     /// clone — and the drain task in `main` — share the one cell; a `setLevel` on any
     /// request takes effect immediately for the whole server.
     mcp_log_level: Arc<AtomicU8>,
-    /// The canonicalized allowed path trees. A per-call path must canonicalize to
-    /// at-or-under one of these. Computed once at construction from config.root and
-    /// config.allow_paths; falls back to the canonicalized cwd when both are empty.
-    /// `Arc` because rmcp clones the handler per request.
-    allowed_set: Arc<Vec<PathBuf>>,
-    /// The effective default root a call uses when it omits `path` — the explicit
-    /// `--root`/config value, or the launch cwd inferred when it falls inside the
-    /// allowed set. Canonicalized. `None` only when no root was configured *and* the
-    /// cwd is outside the allowed set (an `--allow-path` that excludes the cwd), in
-    /// which case an omitted `path` stays a parameter error. `Arc` for cheap clone.
-    default_root: Arc<Option<PathBuf>>,
-    /// True when [`Self::default_root`] was inferred from the launch cwd rather than
-    /// configured explicitly. Surfaced as "(inferred from launch cwd)" in the scope
-    /// section and `kaibo://config` so the boundary stays legible.
-    default_root_inferred: bool,
+    /// The shared resolution glue both front doors run (`resolve_root`,
+    /// `resolve_cast`, model overrides, `arm`, house rules / orientation / prompts,
+    /// attachment resolution + vision gates) plus the canonicalized containment
+    /// boundary (allowed set + inferred default root). Extracted so the CLI front door
+    /// runs the *identical* resolution without a full handler; the handler keeps thin
+    /// delegating shims over it (see [`Resolver`]). Cheap `Clone` (all `Arc`).
+    resolver: Resolver,
     /// How the batch handlers build provider clients — the injection seam. `new` seeds
     /// [`LiveBatchProviders`](crate::batch::LiveBatchProviders) (the real network
     /// builders); tests swap in a scripted double via
@@ -669,64 +667,6 @@ impl KaiboHandler {
             }
         }
 
-        // Build the canonicalized allowed set. Each entry must be canonicalized now
-        // so `resolve_root`'s Path::starts_with check is sound (symlinks resolved,
-        // `..` collapsed). A nonexistent path can't bound anything — loud error.
-        let mut allowed: Vec<PathBuf> = Vec::new();
-        // The explicit default root, if `--root` was configured — canonicalized so it
-        // doubles as both an allowed tree and the call's default root.
-        let mut explicit_root: Option<PathBuf> = None;
-        if let Some(root) = &config.root {
-            let canon = std::fs::canonicalize(root)
-                .with_context(|| format!("canonicalizing --root {}", root.display()))?;
-            if !canon.is_dir() {
-                anyhow::bail!("--root {} is not a directory", canon.display());
-            }
-            allowed.push(canon.clone());
-            explicit_root = Some(canon);
-        }
-        for p in &config.allow_paths {
-            let canon = std::fs::canonicalize(p)
-                .with_context(|| format!("canonicalizing --allow-path {}", p.display()))?;
-            if !canon.is_dir() {
-                anyhow::bail!("--allow-path {} is not a directory", canon.display());
-            }
-            allowed.push(canon);
-        }
-
-        // Resolve the default root and the allowed-set cwd fallback together. With an
-        // explicit `--root`, that is the default root and no cwd is consulted. Without
-        // one, the launch cwd does double duty: MCP clients start stdio servers with
-        // cwd = workspace, so it is both the zero-config allowed tree *and* the natural
-        // default root — adopt it as the inferred default root whenever it falls inside
-        // the allowed set, so a call may omit `path` in the common single-workspace
-        // case. We never adopt a cwd the containment check would then reject (an
-        // `--allow-path` that excludes the cwd leaves the default root unset, and an
-        // omitted `path` stays a parameter error).
-        let (default_root, default_root_inferred): (Option<PathBuf>, bool) = match explicit_root {
-            Some(root) => (Some(root), false),
-            None => {
-                let cwd = std::env::current_dir()
-                    .context("could not determine current directory for the default root")?;
-                let cwd_canon = std::fs::canonicalize(&cwd)
-                    .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
-                if allowed.is_empty() {
-                    // Zero config: the workspace is the whole boundary. Push it here,
-                    // *before* the guard below, so the `starts_with` check sees it and
-                    // adopts cwd as the default root in the zero-config case.
-                    allowed.push(cwd_canon.clone());
-                }
-                // Mirror `resolve_root`'s containment check (step 3): only adopt cwd
-                // when it falls inside the allowed set, so we never default to a path
-                // the call-time check would reject.
-                if allowed.iter().any(|tree| cwd_canon.starts_with(tree)) {
-                    (Some(cwd_canon), true)
-                } else {
-                    (None, false)
-                }
-            }
-        };
-
         // Stamp the live cast roster onto the consultation tools' `cast` param as a
         // JSON-Schema `enum`, so an agent choosing a team reads the menu off the tool
         // schema it already fills arguments from — not only the handshake prose, which
@@ -781,8 +721,15 @@ impl KaiboHandler {
         // report) is heavier than a session's lean Q&A pair, so `job_capacity` is a
         // separate, smaller knob (`[defaults] job_capacity` / `KAIBO_JOB_CAPACITY`).
         let jobs = JobStore::new(config.defaults.job_capacity);
+        // Wrap the config once and hand a clone to the resolver — the single point that
+        // computes the canonicalized allowed set and inferred default root, so the CLI
+        // front door bounds its own invocation cwd by the exact same rule (see
+        // `Resolver::from_config`). The handler keeps its own `Arc<Config>` clone (the
+        // same allocation) for its many `self.config` uses.
+        let config = Arc::new(config);
+        let resolver = Resolver::from_config(config.clone())?;
         Ok(Self {
-            config: Arc::new(config),
+            config,
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
@@ -792,12 +739,17 @@ impl KaiboHandler {
             // for a test has a valid, empty buffer and `job_wait` simply drains nothing.
             notifications: crate::mcp_log::NotificationBuffer::new(512),
             mcp_log_level: Arc::new(AtomicU8::new(mcp_log::rank(mcp_log::DEFAULT_LEVEL))),
-            allowed_set: Arc::new(allowed),
-            default_root: Arc::new(default_root),
-            default_root_inferred,
+            resolver,
             // The real network-client builders; tests swap in a scripted double.
             batch_providers: Arc::new(crate::batch::LiveBatchProviders),
         })
+    }
+
+    /// The shared resolver behind this handler — the CLI front door borrows the same
+    /// resolution glue from a config without standing up a full handler. Exposed so a
+    /// caller that already has a handler (tests, diagnostics) can reach it directly.
+    pub fn resolver(&self) -> &Resolver {
+        &self.resolver
     }
 
     /// Swap in the shared notification ring `main` also handed the bridge layer, so the
@@ -861,7 +813,7 @@ impl KaiboHandler {
     /// resolved path must be at-or-under one of these. Exposed for tests and for
     /// startup logging / the `kaibo://config` resource.
     pub fn allowed_set(&self) -> Vec<PathBuf> {
-        (*self.allowed_set).clone()
+        self.resolver.allowed_set()
     }
 
     /// The effective default root — what a call resolves to when it omits `path`.
@@ -869,254 +821,24 @@ impl KaiboHandler {
     /// (see [`Self::default_root_inferred`]); `None` when neither applies. Exposed
     /// for tests and the `kaibo://config` resource.
     pub fn default_root(&self) -> Option<PathBuf> {
-        (*self.default_root).clone()
+        self.resolver.default_root()
     }
 
     /// Whether [`Self::default_root`] was inferred from the launch cwd rather than
     /// configured explicitly.
     pub fn default_root_inferred(&self) -> bool {
-        self.default_root_inferred
+        self.resolver.default_root_inferred()
     }
 
-    /// The allowed tree (or followed-worktree root) that contains `canon`, or `None` when
-    /// it's outside the boundary — the *which-tree* sibling of [`contained`](Self::contained)
-    /// (which is just `is_some()` on this). A static `allow_path` wins over a followed
-    /// worktree, matching the precedence in `contained`'s original form. The returned root
-    /// is what an attachment read mounts a read-only kaish worker at, so the VFS refuses a
-    /// symlink escaping *that* tree (see [`resolve_attachments`](Self::resolve_attachments)).
-    fn containing_tree(&self, canon: &std::path::Path) -> Option<PathBuf> {
-        if let Some(tree) = self.allowed_set.iter().find(|tree| canon.starts_with(tree)) {
-            return Some(tree.clone());
-        }
-        if self.config.follow_worktrees {
-            for tree in self.allowed_set.iter() {
-                if let Some(common) = crate::worktree::common_git_dir(tree) {
-                    if let Some(wt) = crate::worktree::vouched_worktrees(&common)
-                        .into_iter()
-                        .find(|wt| canon.starts_with(wt))
-                    {
-                        return Some(wt);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// The shared "outside the allowed set" rejection, naming the boundary and the three
-    /// widening knobs. Used wherever [`contained`](Self::contained) says no, so the
-    /// caller always learns where the edge is and how to move it.
-    fn containment_error(&self, raw: &std::path::Path, canon: &std::path::Path) -> McpError {
-        let trees: Vec<String> = self
-            .allowed_set
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        McpError::invalid_params(
-            format!(
-                "path {} resolves to {}, which is outside the allowed set [{}]. \
-                 To widen the boundary: pass --allow-path DIR on the command line, \
-                 set KAIBO_ALLOW_PATHS=DIR (colon-separated), or add \
-                 `[server] allow_paths = [\"DIR\"]` in config.toml. The config and env \
-                 forms expand `$VAR` / `${{VAR}}` and a leading `~`, so a scratch dir \
-                 reads portably as `\"$TMPDIR\"` / `\"$XDG_RUNTIME_DIR/...\"`.",
-                raw.display(),
-                canon.display(),
-                trees.join(", "),
-            ),
-            None,
-        )
-    }
-
-    /// Resolve caller-named `consult`/`explore` attachments: attach means *the model
-    /// sees the bytes*. A text file within `budget` (cumulative, caller order) is read
-    /// server-side and inlined into the driver prompt; a text file past it is demoted to
-    /// a named path the prompt directs the model to read WHOLE through its shell —
-    /// loudly, never a silent drop. An image is routed to `view_image` (never inlined
-    /// here). Each path must canonicalize to a regular file *under `root`* (returned
-    /// root-relative, `cat`'d from cwd) — the only real tree the consult shell mounts;
-    /// anything out of reach is refused with guidance.
-    ///
-    /// **Inlined bytes are read through the read-only kaish VFS**, exactly like
-    /// [`resolve_attachments`](Self::resolve_attachments) and for the same reason: these
-    /// bytes enter the model's context, so a raced symlink-swap must be refused at the
-    /// mount layer, not merely at a canonicalize-then-read check. Demoted files are
-    /// never read here at all — the model's own `cat` goes through the same VFS.
+    /// Shim over [`Resolver::resolve_consult_attachments`] (static — the sandbox
+    /// rides in as a param, so the resolution glue is shared with the CLI front door).
     async fn resolve_consult_attachments(
         root: &std::path::Path,
         attach: &[String],
         budget: usize,
         sandbox: &crate::sandbox::SandboxConfig,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
-        use crate::attach::{check_attachment_bounds, DEFAULT_MAX_ATTACHMENTS};
-        // Count cap only (total pinned to 0, so the byte-budget arm never fires): a
-        // stray thousand-file glob is refused before any canonicalize/read work. There
-        // is deliberately NO cumulative byte cap on this path — `budget` bounds
-        // everything that's actually read (inlined), and a demoted file is never read
-        // here at all, so there's nothing left for a cumulative cap to protect.
-        check_attachment_bounds(
-            attach.len(),
-            0,
-            DEFAULT_MAX_ATTACHMENTS,
-            crate::attach::DEFAULT_MAX_TOTAL_BYTES,
-        )
-        .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
-        // One read-only worker rooted at the consult root, spawned lazily on the first
-        // inlined read (a demote-everything call — budget 0, say — spawns none).
-        let mut worker: Option<crate::sandbox::KaishWorker> = None;
-        let mut remaining = budget as u64;
-        let mut out = Vec::with_capacity(attach.len());
-        for p in attach {
-            let raw = std::path::PathBuf::from(p);
-            // A relative path reads from the project root (where the model's shell starts).
-            let joined = if raw.is_absolute() {
-                raw.clone()
-            } else {
-                root.join(&raw)
-            };
-            let canon = std::fs::canonicalize(&joined).map_err(|e| {
-                McpError::invalid_params(
-                    format!("attached file {} could not be resolved: {e}", raw.display()),
-                    None,
-                )
-            })?;
-            let meta = std::fs::metadata(&canon).map_err(|e| {
-                McpError::invalid_params(
-                    format!("attached file {} could not be read: {e}", canon.display()),
-                    None,
-                )
-            })?;
-            if !meta.is_file() {
-                return Err(McpError::invalid_params(
-                    format!("attached file {} is not a regular file", canon.display()),
-                    None,
-                ));
-            }
-            // The consult model reads attachments through its shell, which mounts exactly
-            // one real tree: the project root. A path under root is passed root-relative
-            // (the model `cat`s it from cwd); anything out of reach gets a refusal naming
-            // the project root.
-            let display_path = if let Ok(rel) = canon.strip_prefix(root) {
-                rel.display().to_string()
-            } else {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "attached file {} resolves outside the project root {} — consult reads \
-                         attachments through its shell, which only mounts that. Paste it into \
-                         `context`, or use `oneshot`/`batch` attach (which inline a file from \
-                         anywhere in the allowed set).",
-                        raw.display(),
-                        root.display(),
-                    ),
-                    None,
-                ));
-            };
-            // Sniff the file's type by content, not extension — a 16-byte prefix covers
-            // every magic number `sniff_mime` knows.
-            //
-            // This prefix is read with `std::fs`, NOT through the kaish VFS — a
-            // deliberate, bounded exception that only ever *routes*: the 16 bytes feed
-            // `sniff_mime` to a bool and are dropped, and kaibo's adversary is the
-            // *model*, which has no control over filesystem timing to drive a swap. For
-            // an image the authoritative read still goes through the read-only VFS in
-            // `view_image` at view time (full bytes, full containment, re-sniffed); for
-            // a demoted text file the model's own `cat` does. Anything we INLINE below
-            // is read through the VFS and re-sniffed from its full bytes, so the worst
-            // case of a raced swap here is a misrouted hint the model recovers from,
-            // never an escape or a leak. An unreadable prefix simply reads as text.
-            let prefix_is_image = {
-                use std::io::Read;
-                let mut buf = [0u8; 16];
-                let n = std::fs::File::open(&canon)
-                    .and_then(|mut f| f.read(&mut buf))
-                    .unwrap_or(0);
-                crate::view_image::sniff_mime(&buf[..n]).is_some()
-            };
-            if prefix_is_image {
-                out.push(crate::consult::ConsultAttachment::Image { path: display_path });
-                continue;
-            }
-            // Text past the remaining inline budget is demoted, not refused: unlike the
-            // tool-less tools, this model CAN read the file itself, and the prompt
-            // orders it to — whole, paged past the output cap.
-            if meta.len() > remaining {
-                out.push(crate::consult::ConsultAttachment::TextOversize {
-                    path: display_path,
-                    size: meta.len(),
-                });
-                continue;
-            }
-            // Within budget: inline. The read is VFS-mounted (see doc-comment) — these
-            // bytes enter the model's context.
-            if worker.is_none() {
-                worker = Some(
-                    crate::sandbox::KaishWorker::spawn_with(root, sandbox.clone()).map_err(
-                        |e| {
-                            McpError::internal_error(
-                                format!("attachment reader for {}: {e:#}", root.display()),
-                                None,
-                            )
-                        },
-                    )?,
-                );
-            }
-            // Read at most one byte past `remaining`. The `meta.len()` gate above is a
-            // stat, and stat-then-read is a TOCTOU: a file swapped to something enormous
-            // in that window would slurp whole into memory if the read were unbounded.
-            // Capping the read at `remaining + 1` bounds that window — a raced-huge file
-            // comes back as `remaining + 1` bytes, which the length check below reads as
-            // "over budget" and demotes to `TextOversize` (the model then `cat`s it
-            // itself), never an OOM. So the demotion path does double duty: it catches
-            // both an honest over-budget file and a raced swap, from the one length test.
-            let bytes = worker
-                .as_ref()
-                .expect("worker was just spawned")
-                .read_file_capped(canon.clone(), remaining + 1)
-                .await
-                .map_err(|e| {
-                    McpError::invalid_params(
-                        format!("attached file {} could not be read: {e:#}", canon.display()),
-                        None,
-                    )
-                })?;
-            // Re-sniff from the (capped) bytes — authoritative for anything inlined; a
-            // magic number lives in the first few bytes, so the cap never blinds it.
-            if crate::view_image::sniff_mime(&bytes).is_some() {
-                out.push(crate::consult::ConsultAttachment::Image { path: display_path });
-                continue;
-            }
-            if bytes.len() as u64 > remaining {
-                out.push(crate::consult::ConsultAttachment::TextOversize {
-                    path: display_path,
-                    size: bytes.len() as u64,
-                });
-                continue;
-            }
-            match std::str::from_utf8(&bytes) {
-                Ok(text) => {
-                    remaining -= bytes.len() as u64;
-                    out.push(crate::consult::ConsultAttachment::Text {
-                        path: display_path,
-                        body: text.to_string(),
-                    });
-                }
-                // Neither text nor image: refuse loudly — it can't be inlined honestly,
-                // and the model's shell would refuse to `cat` binary too, so naming it
-                // would burn a turn on a dead end.
-                Err(_) => {
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "attached file {display_path} is neither valid UTF-8 text nor a \
-                             recognized image (png/jpeg/gif/webp) — kaibo won't inline binary, \
-                             and the model's shell can't read it either. Convert it first, or \
-                             paste the relevant text into `context`."
-                        ),
-                        None,
-                    ));
-                }
-            }
-        }
-        Ok(out)
+        Resolver::resolve_consult_attachments(root, attach, budget, sandbox).await
     }
 
     /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
@@ -1146,40 +868,18 @@ impl KaiboHandler {
         Ok(attachments)
     }
 
-    /// Refuse an image attachment to a vision-blind consult synth — the consult analog of
-    /// [`gate_image_attachments`]. consult never inlines an image's bytes; the model opens
-    /// an attached image with the `view_image` tool, which is only wired into the toolset
-    /// when the synth is vision-capable (see `consult_tools`). So an image attached to a
-    /// blind synth could never be seen — refuse honestly up front, naming the cast, rather
-    /// than let the prompt name a file the model has no way to open. Text attachments (and
-    /// the no-attachment case) always pass.
+    /// Shim over [`Resolver::gate_consult_image_attachments`] — the resolution glue
+    /// lives on the shared resolver so the CLI runs the same gate.
     fn gate_consult_image_attachments(
         attachments: &[crate::consult::ConsultAttachment],
         vision: bool,
         model: &str,
         cast: &str,
     ) -> Result<(), McpError> {
-        if !vision && attachments.iter().any(|a| a.is_image()) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "an image was attached, but the consult synth `{model}` on cast `{cast}` \
-                     can't see images — consult opens an attached image with its `view_image` \
-                     tool, which only a vision-capable synth carries. Use a vision-capable \
-                     cast, or attach only text files. `kaibo://config` lists each slot's \
-                     `vision`."
-                ),
-                None,
-            ));
-        }
-        Ok(())
+        Resolver::gate_consult_image_attachments(attachments, vision, model, cast)
     }
 
-    /// Refuse image attachments to a vision-blind model, naming the cast so the caller
-    /// can pick a vision-capable one. Shared by the tool-less attach surfaces (`batch` and
-    /// `oneshot`) so the refusal reads identically and lives in one place; a blind model
-    /// would silently ignore or error on an image part, so we refuse honestly up front
-    /// (the project posture) rather than ship a no-op image. Text-only attachments (and
-    /// the no-attachment case) always pass.
+    /// Shim over [`Resolver::gate_image_attachments`].
     pub fn gate_image_attachments(
         &self,
         vision: bool,
@@ -1187,126 +887,38 @@ impl KaiboHandler {
         model: &str,
         cast: &str,
     ) -> Result<(), McpError> {
-        if !vision
-            && attachments
-                .iter()
-                .any(|a| matches!(a, crate::attach::Attachment::Image { .. }))
-        {
-            return Err(McpError::invalid_params(
-                format!(
-                    "an image attachment was given, but the model `{model}` on cast `{cast}` \
-                     doesn't accept image input. Use a vision-capable cast/model, or attach \
-                     only text files. `kaibo://config` lists each slot's `vision`."
-                ),
-                None,
-            ));
-        }
-        Ok(())
+        self.resolver
+            .gate_image_attachments(vision, attachments, model, cast)
     }
 
-    /// The worktrees the follow feature currently admits *beyond* the static allowed
-    /// set — for the `kaibo://config` runtime section, so the live boundary stays
-    /// legible. Recomputed on each read (it reflects worktrees that exist now, which
-    /// can change between calls). Empty when the feature is off or nothing extra is
-    /// reachable. Deduplicated and sorted for a stable resource.
+    /// Shim over [`Resolver::followed_worktrees`].
     fn followed_worktrees(&self) -> Vec<PathBuf> {
-        if !self.config.follow_worktrees {
-            return Vec::new();
-        }
-        let mut found: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
-        for tree in self.allowed_set.iter() {
-            let Some(common) = crate::worktree::common_git_dir(tree) else {
-                continue;
-            };
-            for wt in crate::worktree::vouched_worktrees(&common) {
-                // Skip worktrees already covered by the static set — those aren't
-                // "extra"; the runtime section reports only what follow adds.
-                if !self.allowed_set.iter().any(|t| wt.starts_with(t)) {
-                    found.insert(wt);
-                }
-            }
-        }
-        found.into_iter().collect()
+        self.resolver.followed_worktrees()
     }
 
-    /// Assemble the operator's house rules for this call against the resolved
-    /// `root`: the `[context]` files read here, in trusted server-side Rust, and
-    /// folded into the phase preamble. A missing *declared* user file is a loud
-    /// `internal_error`, never a silent skip — the operator was counting on that
-    /// guidance reaching the model. `None` when nothing's configured/present.
+    /// Shim over [`Resolver::house_rules`].
     fn house_rules(&self, root: &std::path::Path) -> Result<Option<Arc<str>>, McpError> {
-        self.config
-            .context
-            .assemble(root)
-            .map(|opt| opt.map(Arc::from))
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+        self.resolver.house_rules(root)
     }
 
-    /// Assemble the static repo-orientation map for this call against the resolved
-    /// `root` — the `[orientation]` block injected into the exploring preamble. Runs
-    /// the kernel's own `glob` server-side (no model turn). A repo over the file
-    /// ceiling gets a directory map, and one too large for even that gets a short
-    /// discover-as-you-go note — never a refusal, per `OrientationConfig::assemble`.
-    /// Errors here are real failures (kernel spawn, unparseable enumeration), not
-    /// size. Only the *exploring* tools call this.
+    /// Shim over [`Resolver::orientation`].
     async fn orientation(&self, root: &std::path::Path) -> Result<Option<Arc<str>>, McpError> {
-        self.config
-            .orientation
-            .assemble(root, self.config.sandbox.clone())
-            .await
-            .map(|opt| opt.map(Arc::from))
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+        self.resolver.orientation(root).await
     }
 
-    /// Resolve this call's per-phase system prompts for `cast` — the per-slot `preamble`
-    /// over the global `[prompts]` table. Thin wrapper over [`Cast::resolved_prompts`]
-    /// (the shared layering the `kaibo://prompts/{cast}` resource also renders); `cast`
-    /// is the post-override clone, so a per-call model override (a bare slot) correctly
-    /// carries no preamble.
+    /// Shim over [`Resolver::resolved_prompts`].
     fn resolved_prompts(&self, cast: &Cast) -> PromptOverrides {
-        cast.resolved_prompts(&self.config.prompts)
+        self.resolver.resolved_prompts(cast)
     }
 
-    /// Resolve a call's cast: the explicit name (looked up in the registry, by
-    /// name or alias), else the server's default cast. An unknown name is a
-    /// parameter error naming the available casts. Returns an owned clone so the
-    /// caller can layer per-call model overrides onto it.
+    /// Shim over [`Resolver::resolve_cast`].
     fn resolve_cast(&self, cast: Option<String>) -> Result<Cast, McpError> {
-        let name = cast.unwrap_or_else(|| self.config.default_cast.clone());
-        self.config
-            .resolve_cast(&name)
-            .cloned()
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))
+        self.resolver.resolve_cast(cast)
     }
 
-    /// Refuse an interactive tool (`consult`/`consult_submit`/`oneshot`) on a cast whose
-    /// synth runs on an offline lane. A `Batch` synth is a big, slow, expensive model
-    /// tuned for free offline batch latency (Gemini Pro, Claude Opus); a `Direct` synth
-    /// is a big local model kaibo runs itself, taking the time it takes — either way,
-    /// driving it through an interactive tool loop is the wrong-and-costly mistake this
-    /// gate exists to stop. Points the caller at the lane that fits.
+    /// Shim over [`Resolver::reject_offline_cast`].
     fn reject_offline_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        match cast.synth_lane() {
-            Some(Lane::Batch) => Err(McpError::invalid_params(
-                format!(
-                    "cast `{}`'s synth runs on the `batch` lane — submit it with \
-                     `batch_submit`, not `{tool}`. It's a big, slow model tuned for free \
-                     offline batch latency; running it interactively would be slow and \
-                     expensive. Pick an interactive cast for `{tool}`.",
-                    cast.name
-                ),
-                None,
-            )),
-            Some(Lane::Direct) => Err(McpError::invalid_params(
-                format!(
-                    "cast `{}`'s synth runs offline (`lane = \"direct\"`) — interactive \
-                     tools need an interactive synth. Pick an interactive cast for `{tool}`.",
-                    cast.name
-                ),
-                None,
-            )),
-            None => Ok(()),
-        }
+        self.resolver.reject_offline_cast(cast, tool)
     }
 
     /// Refuse `batch_submit` on a cast whose synth isn't on the `batch` lane
@@ -1401,16 +1013,10 @@ impl KaiboHandler {
         Ok(lane)
     }
 
-    /// Apply a per-call model override to one of `cast`'s slots.
-    ///
-    /// The model id rides *verbatim* — an id containing `/` (HuggingFace-style
-    /// `org/model`) is still one id, never parsed for a backend, so an org prefix
-    /// that happens to match a backend alias (`google/…`, `gemma/…`) can never
-    /// silently retarget the call. Retargeting is the explicit `backend` arg's
-    /// job: when set, it resolves (aliases included) and the slot is replaced
-    /// wholesale, which also works on a role the cast doesn't carry. Either way
-    /// the configured slot's pins/tunables are dropped — they described the
-    /// *configured* model; the new id classifies fresh.
+    /// Shim over [`Resolver::override_model`]. Only the offline model-override tests
+    /// still reach it directly (the live callers go through `apply_model_override`),
+    /// so it's test-scoped to stay dead-code-clean in a normal build.
+    #[cfg(test)]
     fn override_model(
         &self,
         cast: &mut Cast,
@@ -1418,43 +1024,10 @@ impl KaiboHandler {
         model: &str,
         backend: Option<&str>,
     ) -> Result<(), McpError> {
-        let model = model.trim();
-        if model.is_empty() {
-            // Same loud rule config load applies to slots (config.rs): an empty
-            // model id is a typo, never an intent — it would otherwise surface
-            // as a baffling provider 404 mid-call.
-            return Err(McpError::invalid_params(
-                format!("the {} model id is empty", role.key()),
-                None,
-            ));
-        }
-        let backend = match backend {
-            Some(name) => self
-                .config
-                .resolve_backend(name)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?
-                .name
-                .clone(),
-            None => cast.slot(role).map(|s| s.backend.clone()).ok_or_else(|| {
-                McpError::invalid_params(
-                    format!(
-                        "cast {:?} has no {} slot to override — pass the matching \
-                         backend override arg to target one",
-                        cast.name,
-                        role.key()
-                    ),
-                    None,
-                )
-            })?,
-        };
-        cast.slots.insert(role, ModelSlot::bare(backend, model));
-        Ok(())
+        self.resolver.override_model(cast, role, model, backend)
     }
 
-    /// The tool-input face of [`override_model`](Self::override_model): folds one
-    /// tool's `(model, backend)` override args onto `cast`'s `role` slot. A
-    /// backend arg without its model arg is a loud parameter error naming both
-    /// spellings — there is no configured id to guess at on a foreign backend.
+    /// Shim over [`Resolver::apply_model_override`].
     fn apply_model_override(
         &self,
         cast: &mut Cast,
@@ -1464,35 +1037,27 @@ impl KaiboHandler {
         model_arg: &str,
         backend_arg: &str,
     ) -> Result<(), McpError> {
-        match (model, backend) {
-            (Some(model), backend) => self.override_model(cast, role, model, backend),
-            (None, Some(_)) => Err(McpError::invalid_params(
-                format!(
-                    "{backend_arg} was sent without {model_arg} — a backend override \
-                     needs the model id to run there"
-                ),
-                None,
-            )),
-            (None, None) => Ok(()),
-        }
+        self.resolver
+            .apply_model_override(cast, role, model, backend, model_arg, backend_arg)
     }
 
-    /// Resolve one of `cast`'s slots into a live [`Arm`] for `role`. A missing
-    /// slot is the loud call-time gap ("cast `x` has no synth slot" — absent =
-    /// capability absent); a backend that fails to build (key resolution,
-    /// client init) is an internal error.
+    /// Shim over [`Resolver::arm`].
     fn arm(&self, cast: &Cast, role: ModelRole) -> Result<Arm, McpError> {
-        let slot = cast
-            .require_slot(role)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        // The slot's backend ref is canonical (load) or alias-resolved (override),
-        // so a failure here is a server bug, not a caller mistake.
-        let backend = self
-            .config
-            .resolve_backend(&slot.backend)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Arm::from_slot(backend, slot, role, &self.config.defaults)
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+        self.resolver.arm(cast, role)
+    }
+
+    /// Shim over [`Resolver::resolve_root`] — the containment check both front doors
+    /// share (see `containment.rs`).
+    pub(crate) fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
+        self.resolver.resolve_root(path)
+    }
+
+    /// Shim over [`Resolver::resolve_attachments`].
+    pub async fn resolve_attachments(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<crate::attach::Attachment>, McpError> {
+        self.resolver.resolve_attachments(paths).await
     }
 
     #[tool(
@@ -2751,9 +2316,9 @@ impl rmcp::ServerHandler for KaiboHandler {
             // is what re-reads a newly-set key.
             instructions: Some(kaibo_instructions_with_scope(
                 &self.config,
-                &self.allowed_set,
-                self.default_root.as_deref(),
-                self.default_root_inferred,
+                self.resolver.allowed_trees(),
+                self.resolver.default_root_ref(),
+                self.resolver.default_root_inferred(),
                 self.config
                     .default_cast_usability(|k| std::env::var(k).ok()),
                 &self.config.usable_casts(|k| std::env::var(k).ok()),
@@ -2808,9 +2373,9 @@ impl rmcp::ServerHandler for KaiboHandler {
             &request.uri,
             &self.tool_schemas,
             &self.config,
-            &self.allowed_set,
-            self.default_root.as_deref(),
-            self.default_root_inferred,
+            self.resolver.allowed_trees(),
+            self.resolver.default_root_ref(),
+            self.resolver.default_root_inferred(),
             self.followed_worktrees(),
             self.sessions.store().is_some(),
         )
