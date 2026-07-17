@@ -337,6 +337,21 @@ the git log. Each later release appends a new section at the top.
   page's install box always advertises a pullable version tag instead of the
   signature bundle that lands after the image (copy-pasting it got a confusing
   mediaType refusal).
+- **Sessions and batch handles now survive a restart (persistence, on by default).** A
+  `consult` session — the thread a `session_id` carries — used to live only for the
+  server process; it now persists, so you can restart kaibo (or reconnect, or switch
+  between the MCP server and a CLI invocation) and pick the same thread back up. Batch
+  handles persist too — recovered **on demand** when you run `job_list` (kaibo doesn't
+  reattach in the background; the provider stays the source of truth for a batch's state),
+  so a long-running batch is never orphaned by a reconnect. kaibo keeps this in a small
+  state db under your XDG state dir (`$XDG_STATE_HOME/kaibo/state.db`, else
+  `~/.local/state/kaibo/state.db`) — session Q&A turns and batch `{backend, provider-id}`
+  records only; background `job-N` handles and exploration reports stay in-memory by
+  design. Turn it off with `--no-persistence` / `KAIBO_NO_PERSISTENCE` / `[persistence]
+  enabled = false` to run fully in-memory, or move the db with `--state-db <FILE>` /
+  `KAIBO_STATE_DB` / `[persistence] path`. If the store can't open, kaibo **fails to start
+  loudly** naming that escape hatch rather than silently losing your sessions. The db is a
+  convenience layer, safe to delete. See `docs/config.md`.
 
 ### Changed
 
@@ -436,7 +451,11 @@ the git log. Each later release appends a new section at the top.
   `exec` / `spawn` / `git` / `ps` don't exist in the binary — and mounts the project
   read-only, with an in-memory scratch filesystem for everything else. Reads are
   scope-bounded to `--root` / `--allow-path` (launch cwd by default), enforced after
-  symlink and `..` canonicalization.
+  symlink and `..` canonicalization. **kaibo still writes nothing into your project.**
+  The new persistence store is the one exception to "kaibo writes nothing" — and a narrow,
+  guarded one: it lives only at the fixed XDG state path (a model never chooses it),
+  refuses to open onto any allowed project tree, and is the single write site a
+  source-level guard permits; the shell you drive stays fully read-only.
 - **Bounded resource use.** Each kaish script is capped (30 s wall-clock, 64 KiB
   output, 64 MB scratch — over-cap fails loudly, never a silent drop), and the model
   loops stop at turn limits, so a runaway consultation can't melt the machine or the

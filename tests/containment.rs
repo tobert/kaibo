@@ -522,6 +522,8 @@ fn allow_paths_cli_replaces_env_and_file() {
         false,
         vec![],
         vec![],
+        false,
+        None,
     );
     assert_eq!(c.allow_paths.len(), 2);
     assert!(c

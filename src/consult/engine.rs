@@ -28,7 +28,7 @@ use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::progress::{PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
-use crate::session::{QaTurn, SessionStore};
+use crate::session::{QaTurn, Sessions};
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
@@ -1291,10 +1291,11 @@ pub(crate) async fn consult_with(
     })
 }
 
-/// A consult turn's session binding: the store and the session id. `None` is a
+/// A consult turn's session binding: the session backend and the session id. `None` is a
 /// stateless one-shot — no prior turns replayed, nothing recorded. `Some` makes it
-/// multi-turn: replay this session's history into the prompt, record the answer.
-pub type Session<'a> = (&'a SessionStore, &'a str);
+/// multi-turn: replay this session's history into the prompt, record the answer. The
+/// backend ([`Sessions`]) is in-memory or durable; this glue doesn't care which.
+pub type Session<'a> = (&'a Sessions, &'a str);
 
 /// One sessioned (or stateless) consult turn over two resolved arms.
 ///
@@ -1314,16 +1315,38 @@ pub(crate) async fn consult_session_turn(
     synth: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
+    // History (replay) failure is FATAL: nothing is paid for yet, so a broken store should
+    // fail the turn loudly rather than silently answer without the thread's context.
     let history = match session {
-        Some((store, id)) => store.history(id),
+        Some((store, id)) => store.history(id).await?,
         None => Vec::new(),
     };
     let user_prompt = consult_user_prompt(question, context, &history, &cfg.attachments);
 
-    let out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
+    let mut out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
 
+    // Record failure is NON-fatal: by here the model has answered (a paid-for result), so
+    // losing that answer over a bookkeeping write would be the wrong trade — and it mirrors
+    // the non-fatal batch-handle record. Instead, keep the answer and surface the failure
+    // LOUDLY (never a silent fallback): warn on the log, and append a visible line to the
+    // answer so the caller knows this turn won't be in the thread next time. The in-memory
+    // arm never errors, so today's default is byte-for-byte unchanged.
     if let Some((store, id)) = session {
-        store.record(id, QaTurn::new(question, out.answer.clone()));
+        if let Err(e) = store
+            .record(id, QaTurn::new(question, out.answer.clone()))
+            .await
+        {
+            tracing::warn!(
+                session = id,
+                error = %e,
+                "session turn not recorded — the answer stands, but this thread won't replay it"
+            );
+            out.answer.push_str(&format!(
+                "\n\n⚠️ Session turn NOT recorded (persistence error: {e}). \
+                 The answer above is complete, but this `session_id` won't include it on your \
+                 next turn — retry, or continue without relying on this turn as context."
+            ));
+        }
     }
     Ok(out)
 }
@@ -1354,17 +1377,31 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::session::SessionStore;
+    use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
         transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
     };
     use std::fs;
     use std::num::NonZeroUsize;
+    use std::path::Path;
     use tempfile::tempdir;
 
-    fn store() -> SessionStore {
-        SessionStore::new(NonZeroUsize::new(4).unwrap())
+    /// The in-memory session backend behind the seam — today's default.
+    fn store() -> Sessions {
+        Sessions::Memory(SessionStore::new(NonZeroUsize::new(4).unwrap()))
+    }
+
+    /// The durable, turso-backed session backend at a tempfile db — the persistence path.
+    /// Same seam the server threads through `consult_session_turn`, so a store-backed
+    /// replay exercises exactly the wiring a persistent server runs.
+    async fn persistent_store(dir: &Path) -> Sessions {
+        let path = dir.join("state.db");
+        Sessions::Persistent(
+            crate::store::SessionStore::open(&path, NonZeroUsize::new(4).unwrap(), &[])
+                .await
+                .expect("open persistent store"),
+        )
     }
 
     /// An arm over the scripted client with no thinking params — for the tests
@@ -3328,7 +3365,7 @@ mod tests {
         .unwrap();
         assert_eq!(out1.answer, "ANSWER[Q1 what is kaish]");
         assert_eq!(
-            sessions.history(sid),
+            sessions.history(sid).await.unwrap(),
             vec![QaTurn::new("Q1 what is kaish", "ANSWER[Q1 what is kaish]")],
             "turn 1 must be recorded"
         );
@@ -3360,9 +3397,56 @@ mod tests {
         );
         assert_eq!(out2.answer, "ANSWER[Q2 who calls it]");
         assert_eq!(
-            sessions.history(sid).len(),
+            sessions.history(sid).await.unwrap().len(),
             2,
             "both turns accumulate in the thread"
+        );
+    }
+
+    /// The same replay→record dance, but over the **durable** seam backed by a tempfile
+    /// turso db — proving `consult_session_turn` works byte-for-byte against the persistent
+    /// store the server uses when `[persistence]` is on. A reopen of the same db (a
+    /// simulated restart) still shows both turns, so the thread survives a process restart.
+    #[tokio::test]
+    async fn store_backed_session_replays_records_and_survives_reopen() {
+        const SYNTH: &str = "synth";
+        let client = echo_client(SYNTH);
+        let dir = tempdir().unwrap();
+        let sessions = persistent_store(dir.path()).await;
+        let cfg = ConsultConfig::default();
+        let sid = "durable-thread";
+
+        // Turn 1 then turn 2, exactly as the in-memory test.
+        for q in ["Q1 durable", "Q2 durable"] {
+            consult_session_turn(
+                Some((&sessions, sid)),
+                q,
+                None,
+                dir.path(),
+                &arm(&client, "explorer"),
+                &arm(&client, SYNTH),
+                &cfg,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            sessions.history(sid).await.unwrap(),
+            vec![
+                QaTurn::new("Q1 durable", "ANSWER[Q1 durable]"),
+                QaTurn::new("Q2 durable", "ANSWER[Q2 durable]"),
+            ],
+            "both turns accumulate in the durable thread"
+        );
+
+        // Simulated restart: drop the store handle, reopen the same db file. The thread
+        // must still be there — the point of persistence.
+        drop(sessions);
+        let reopened = persistent_store(dir.path()).await;
+        assert_eq!(
+            reopened.history(sid).await.unwrap().len(),
+            2,
+            "the thread must survive a store reopen (process restart)"
         );
     }
 
@@ -3396,9 +3480,45 @@ mod tests {
             "a provider error must surface, not be swallowed"
         );
         assert!(
-            sessions.history(sid).is_empty(),
+            sessions.history(sid).await.unwrap().is_empty(),
             "a failed turn must leave the thread untouched, got: {:?}",
-            sessions.history(sid)
+            sessions.history(sid).await.unwrap()
+        );
+    }
+
+    /// Finding 3 (Gemini review): a *record* failure is non-fatal — by then the model has
+    /// answered (a paid-for result), so the turn returns that answer rather than throwing it
+    /// away over a bookkeeping write. The failure is surfaced LOUDLY on the result (a visible
+    /// line), never a silent drop. (History failure stays fatal; that's the `?` above.)
+    #[tokio::test]
+    async fn a_record_failure_returns_the_answer_and_surfaces_the_failure() {
+        const SYNTH: &str = "synth";
+        let client = echo_client(SYNTH);
+        let sessions = Sessions::FailingRecord;
+        let dir = tempdir().unwrap();
+        let cfg = ConsultConfig::default();
+
+        let out = consult_session_turn(
+            Some((&sessions, "doomed-record")),
+            "Q that answers",
+            None,
+            dir.path(),
+            &arm(&client, "explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("a record failure must NOT fail the turn — the answer is already paid for");
+
+        assert!(
+            out.answer.contains("ANSWER[Q that answers]"),
+            "the paid-for answer must be preserved: {:?}",
+            out.answer
+        );
+        assert!(
+            out.answer.contains("NOT recorded"),
+            "the record failure must be surfaced loudly on the result: {:?}",
+            out.answer
         );
     }
 
@@ -3426,7 +3546,7 @@ mod tests {
 
         assert_eq!(out.answer, "ANSWER[lone question]");
         assert_eq!(
-            sessions.session_count(),
+            sessions.session_count().await.unwrap(),
             0,
             "a stateless turn creates no session"
         );

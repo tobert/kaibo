@@ -29,10 +29,14 @@
 //! (file-based) is a tracked follow-on in `docs/issues.md`. An unsupported backend kind
 //! is refused loudly at resolution ([`submitter`]/[`poller`]), never a silent no-op.
 //!
-//! **No persistent state.** kaibo holds nothing on disk; a batch id *is* the provider's
-//! own id, so poll/cancel rebuild a fresh client from the backend and re-address it. A
-//! restart drops nothing the provider still has — the design the `docs/issues.md` entry
-//! commits to.
+//! **The provider owns batch state.** A batch id *is* the provider's own id, so
+//! poll/cancel rebuild a fresh client from the backend and re-address it, and a restart
+//! drops nothing the provider still has — the provider's list endpoint is the source of
+//! truth for a batch's state. Persistence adds only a *durable memory of what kaibo
+//! submitted*: when `[persistence]` is on, `batch_submit` records the `backend/provider-id`
+//! handle (+ label) in the state db so `job_list` can recover it after a restart even
+//! before re-querying the provider (see `src/store.rs`, `server::job_list`). That record
+//! is bookkeeping, never the authority on batch state.
 
 use std::sync::Arc;
 
