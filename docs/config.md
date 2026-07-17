@@ -388,6 +388,8 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | export timeout (s) | `telemetry.timeout_secs` *(must be > 0)* | `KAIBO_TELEMETRY_TIMEOUT_SECS` | — |
 | trace service name | `telemetry.service_name` | `KAIBO_TELEMETRY_SERVICE_NAME` | — |
 | export headers | `telemetry.headers` *(map; file-only — values are secrets)* | — | — |
+| persistence on/off | `persistence.enabled` *(default true)* | `KAIBO_NO_PERSISTENCE` | `--no-persistence` |
+| state-db path | `persistence.path` *(default `$XDG_STATE_HOME/kaibo/state.db`)* | `KAIBO_STATE_DB` | `--state-db FILE` |
 | project house-rules files | `context.project_files` *(list; default `["AGENTS.md"]`)* | `KAIBO_PROJECT_FILES` *(colon-separated)* | `--project-context-file FILE` *(repeatable)* |
 | user house-rules files | `context.user_files` *(list)* | `KAIBO_USER_FILES` *(colon-separated)* | `--user-context-file FILE` *(repeatable)* |
 | explorer system prompt | `prompts.explorer` *(file-only — full replace)* | — | — |
@@ -490,6 +492,44 @@ to send traces — with full content — to a remote. Header **values** are secr
 never appear in the `kaibo://config` render (only the header *names* do, like an
 API-key env-var name). Logs continue to ride the `tracing` → stderr + MCP
 `notifications/message` path regardless; telemetry adds the *traces* signal only.
+
+## Persistence: `[persistence]`
+
+**On by default.** kaibo keeps a small state db so a `consult` session thread and the
+provider batch handles you launch **survive a server restart** and are shared across
+front doors (start a session over MCP, continue it from the CLI). It lives at a fixed
+XDG state path, never a path a model controls:
+
+```toml
+[persistence]
+enabled = true                                  # default true
+path    = "$XDG_STATE_HOME/kaibo/state.db"      # default; else ~/.local/state/kaibo/state.db
+```
+
+CLI/env: `--no-persistence` / `KAIBO_NO_PERSISTENCE` disable it (in-memory, like before);
+`--state-db <FILE>` / `KAIBO_STATE_DB` move the db. `path` is `$VAR`/`~`-expanded like
+`root`/`allow_paths`.
+
+**What persists:** the lean `(question, answer)` turns of each session (capacity-evicted,
+no TTL — same as the in-memory store), and the `{backend, provider-id, label}` of each
+batch you submit (so `job_list` can re-surface a handle after a restart). **What never
+persists:** background *consult/deliberate* job handles (`job-N` — in-memory, session-only
+by design) and exploration reports (ephemeral by design — they'd be stale bloat). The db
+is a convenience layer, **never a source of truth**: safe to delete, and its content is
+model output, never anything the calling model steers onto disk.
+
+**Read-only toward your project is unchanged.** The store is handler-side, at the XDG
+path — kaish's read-only sandbox never sees it, kaibo still writes nothing into any
+project, and `open` **refuses a state-db path that resolves inside an allowed tree** (so
+it can't be pointed into a repo). See `docs/kaibo-persistence-and-cli.md` and the
+"Read-only is the product" invariant.
+
+**Loud on failure, never a silent fallback.** If the store can't open (a bad path, a db
+inside a project, a locked file on a single-process platform, a network mount — turso's
+multiprocess mode is 64-bit-Unix + local-fs only), kaibo **fails to start** with an error
+naming the escape hatch, rather than quietly dropping to memory and losing your sessions
+on the next restart. On Windows the store is single-process: a second kaibo opening the
+same db fails loudly (close the other, or `--no-persistence`).
 
 ## House rules: `[context]`
 

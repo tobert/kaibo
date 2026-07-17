@@ -53,15 +53,33 @@ project and cannot run external commands.
   disk), and (3) external commands disabled. The `Blocked` wrapper survives only for
   the config-driven `[sandbox].disable_builtins`, which can make the box *stricter* —
   see the module doc-comment. Any change here keeps `tests/sandbox.rs` green and adds
-  a test that can fail. **kaibo writes nothing, anywhere** — there is no write path
-  through kaish and no handler-side write either; read-only is unconditional. The door
-  this leaves open is deliberate and narrow: if kaibo ever needs to *record* or *emit*
-  something, that is a specific, individually-gated **mediated tool** with its own small
-  surface (provider call → result handed back), granted on purpose — never a general
-  filesystem escape hatch and never a loosening of the four levers. No such tool exists
-  today. Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
-  `..` resolved) into the allowed set (`--root` / `--allow-path`, launch cwd when
-  unset). Enforced in `server.rs::resolve_root`, with tests in `tests/containment.rs`.
+  a test that can fail. **The shell writes nothing, and kaibo never touches the
+  project** — no write path through kaish, the four levers unconditional. Read-only is
+  scoped to what the *model can steer*: kaish's VFS never sees kaibo's own state. kaibo
+  *does* keep handler-side state — durable sessions + batch handles — but only through
+  the persistence store (`src/store.rs`) at a **fixed XDG path no model controls**,
+  refused if it resolves into any allowed tree (`tests/store.rs`), created via the
+  **single blessed `create_dir_all`** that `tests/no_write_path.rs` carves out — every
+  other `std::fs` mutation in `src/` still fails that guard, and the store's own data
+  writes go through turso, not `std::fs`. That store is the one deliberate, individually
+  guarded write surface; anything else that ever needs to *record* or *emit* is a
+  specific mediated tool (provider call → result handed back), never a general filesystem
+  escape hatch and never a loosening of the four levers. Read-*scope* is also bounded:
+  every call's path must canonicalize (symlinks, `..` resolved) into the allowed set
+  (`--root` / `--allow-path`, launch cwd when unset). Enforced in
+  `server.rs::resolve_root`, with tests in `tests/containment.rs`.
+- **Persistence engine (turso) — do not weaken.** The durable store is the pure-Rust
+  `turso`, **exact-pinned** (`=0.7.x`: the `.db-tshm` on-disk format *and* API drift
+  between releases, so bump deliberately and re-verify, like the kaish pin) with
+  **`default-features = false`** — the defaults hijack the global allocator with mimalloc
+  and pull fts, and the **`sync` feature must stay off** (it materializes a network stack,
+  breaching stdio-only and the aws-lc-free tree). One DB-open helper, MP-WAL **hardwired
+  on** for 64-bit Unix: a mixed MP/non-MP open of the same file silently loses
+  acknowledged writes with `integrity_check` still `ok`, and the documented upstream guard
+  does **not** fire in 0.7.0 — so a second open-site is a data-loss bug (crash over corrupt
+  is the principle it violates). Windows / non-64-bit-Unix run single-process (a concurrent
+  open fails loudly); connect-per-operation, never a shared `Connection`. See `src/store.rs`
+  and `docs/kaibo-persistence-and-cli.md`.
 - **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.
@@ -247,9 +265,11 @@ even for a one-line doc fix.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
-  `v*` tag. Before tagging: confirm the `kaish-kernel` pin is current (next bullet),
-  re-run `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
-  `cargo tree -i aws-lc-rs` is empty and the musl binary is `not a dynamic executable`.
+  `v*` tag. Before tagging: confirm the `kaish-kernel` **and `turso`** pins are current
+  (next bullet; turso is `default-features = false`, `sync` off), re-run
+  `docs/sandbox-probes.md` and stamp its "Last run" line, and verify
+  `cargo tree -i` is empty for **`aws-lc-rs` and `mimalloc`** (the turso default-features
+  guard) and the musl binary is `not a dynamic executable`.
   After the release publishes: run the README "Verify a download" commands against a
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't

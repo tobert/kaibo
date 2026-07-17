@@ -28,6 +28,7 @@ pub(super) fn render_config_resource(
     default_root: Option<&Path>,
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
+    persistence_active: bool,
 ) -> String {
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -65,6 +66,9 @@ pub(super) fn render_config_resource(
         /// OpenTelemetry export state (off by default). Header *names* only — a
         /// value could be a bearer token, so it's withheld like an API key.
         telemetry: TelemetryDoc,
+        /// Durable-store state (on by default): whether persistence is enabled, the
+        /// resolved state-db path, and whether the store is actually open right now.
+        persistence: PersistenceDoc,
         /// alias → canonical backend name. Aliases are valid slot-ref prefixes
         /// and per-call backend overrides, so callers must be able to discover
         /// them here — built-in and file-declared both.
@@ -159,6 +163,19 @@ pub(super) fn render_config_resource(
         service_name: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         header_names: Vec<String>,
+    }
+
+    /// Persistence as resolved. `path` is the state db kaibo would open (absent only
+    /// when disabled and no default resolved). `active` is runtime truth — the store is
+    /// open now. With `enabled`, a failed open is a loud startup error, so a running
+    /// server shows `active == enabled`; surfaced so a reader confirms durability is live,
+    /// not merely requested. No secrets: a db path is a path, like `default_root`.
+    #[derive(Serialize)]
+    struct PersistenceDoc {
+        enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        active: bool,
     }
 
     #[derive(Serialize)]
@@ -438,6 +455,15 @@ pub(super) fn render_config_resource(
             service_name: telemetry_service_name.clone(),
             header_names: telemetry_headers.keys().cloned().collect(),
         },
+        persistence: PersistenceDoc {
+            enabled: config.persistence.enabled,
+            path: config
+                .persistence
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            active: persistence_active,
+        },
         backend_aliases: config.backend_aliases().clone(),
         backends,
         cast_aliases: config.cast_aliases().clone(),
@@ -477,7 +503,7 @@ mod tests {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/the-repo")];
         let followed = vec![std::path::PathBuf::from("/tmp/the-repo-feature")];
-        let body = render_config_resource(&config, &allowed, None, false, followed);
+        let body = render_config_resource(&config, &allowed, None, false, followed, false);
         assert!(
             body.contains("[runtime]") && body.contains("follow_worktrees = true"),
             "runtime section must echo the follow knob:\n{body}"
@@ -516,7 +542,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![]);
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
             doc.get("casts")
@@ -562,7 +588,7 @@ mod tests {
     fn config_resource_renders_expected_fields() {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
-        let body = render_config_resource(&config, &allowed, None, false, vec![]);
+        let body = render_config_resource(&config, &allowed, None, false, vec![], false);
         // Structural presence checks — the resource is TOML or a document, not prose.
         for needle in [
             "allowed_paths",
@@ -645,7 +671,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![]);
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
         // The header NAME is discoverable…
         assert!(
             body.contains("authorization"),
@@ -655,6 +681,35 @@ mod tests {
         assert!(
             !body.contains("super-secret-token") && !body.contains("Bearer"),
             "a header value must never render — it can be a bearer token:\n{body}"
+        );
+    }
+
+    /// Persistence state is part of the resolved runtime: an operator must see whether
+    /// the durable store is on, where its db lives, and whether it actually opened.
+    #[test]
+    fn config_resource_shows_persistence_state() {
+        // Enabled (the default) with the store open.
+        let config =
+            Config::from_toml_str("[persistence]\npath = \"/var/lib/kaibo/state.db\"\n").unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], true);
+        let section = body
+            .split_once("[persistence]")
+            .expect("a [persistence] table renders")
+            .1;
+        assert!(
+            section.contains("enabled = true")
+                && section.contains("/var/lib/kaibo/state.db")
+                && section.contains("active = true"),
+            "enabled store must show on, its resolved path, and active:\n{body}"
+        );
+
+        // Disabled: off and inactive.
+        let off = Config::from_toml_str("[persistence]\nenabled = false\n").unwrap();
+        let body = render_config_resource(&off, &[], None, false, vec![], false);
+        let section = body.split_once("[persistence]").expect("table renders").1;
+        assert!(
+            section.contains("enabled = false") && section.contains("active = false"),
+            "a disabled store renders off and inactive:\n{body}"
         );
     }
 
@@ -676,7 +731,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![]);
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
         for needle in ["[backend_aliases]", "[cast_aliases]"] {
             assert!(body.contains(needle), "must render {needle}:\n{body}");
         }
@@ -723,7 +778,7 @@ mod tests {
             unsafe {
                 std::env::set_var(var_name, SENTINEL);
             }
-            let b = render_config_resource(&config, &allowed, None, false, vec![]);
+            let b = render_config_resource(&config, &allowed, None, false, vec![], false);
             #[allow(deprecated)]
             unsafe {
                 std::env::remove_var(var_name);
@@ -749,7 +804,7 @@ mod tests {
         let file_path = tmp.path().to_string_lossy().to_string();
         let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
         let config2 = Config::from_toml_str(&toml2).expect("valid config");
-        let body2 = render_config_resource(&config2, &allowed, None, false, vec![]);
+        let body2 = render_config_resource(&config2, &allowed, None, false, vec![], false);
         // The file path (source pointer) may appear, but not the file contents.
         assert!(
             !body2.contains(SENTINEL),

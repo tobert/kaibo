@@ -2812,6 +2812,7 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.default_root.as_deref(),
             self.default_root_inferred,
             self.followed_worktrees(),
+            self.sessions.store().is_some(),
         )
     }
 
@@ -3397,6 +3398,10 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
 ///
 /// This is the handler-level dispatch: call it from `read_resource` so the config
 /// resource gets its config.
+// The resolved-config inputs the config arm needs are inherently many (allowed set,
+// default root + inferred flag, live worktrees, persistence-active) — bundling them into
+// a struct would just relocate the arg list, so we accept the count here.
+#[allow(clippy::too_many_arguments)]
 fn read_kaibo_resource_with_config(
     uri: &str,
     schemas: &[ToolSchema],
@@ -3405,6 +3410,7 @@ fn read_kaibo_resource_with_config(
     default_root: Option<&Path>,
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
+    persistence_active: bool,
 ) -> Result<ReadResourceResult, McpError> {
     if uri == PROMPTS_URI {
         return Ok(ReadResourceResult {
@@ -3435,6 +3441,7 @@ fn read_kaibo_resource_with_config(
             default_root,
             default_root_inferred,
             followed_worktrees,
+            persistence_active,
         );
         return Ok(ReadResourceResult {
             contents: vec![ResourceContents::text(body, uri)],
@@ -5033,9 +5040,17 @@ mod tests {
         // Use the config-aware dispatch for all URIs — same path the handler takes.
         let config = Config::builtin();
         let allowed: Vec<PathBuf> = Vec::new();
-        let result =
-            read_kaibo_resource_with_config(uri, schemas, &config, &allowed, None, false, vec![])
-                .expect("known uri must read");
+        let result = read_kaibo_resource_with_config(
+            uri,
+            schemas,
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+        )
+        .expect("known uri must read");
         match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
@@ -5254,6 +5269,7 @@ mod tests {
             None,
             false,
             vec![],
+            false,
         )
         .expect_err("an unknown cast must be a not-found");
         assert!(
@@ -5282,6 +5298,7 @@ mod tests {
                 None,
                 false,
                 vec![],
+                false,
             )
             .is_err(),
             "an unregistered builtin must be a not-found error"
@@ -5300,7 +5317,8 @@ mod tests {
                 &allowed,
                 None,
                 false,
-                vec![]
+                vec![],
+                false,
             )
             .is_err(),
             "an unknown URI must be a not-found error, not an empty success"
@@ -5331,6 +5349,7 @@ mod tests {
             None,
             false,
             vec![],
+            false,
         )
         .expect("example resource must be readable");
         let body = match &result.contents[0] {
@@ -5376,7 +5395,7 @@ mod tests {
     fn read_kaibo_config_resource_is_readable() {
         let config = Config::builtin();
         let allowed = handler().allowed_set();
-        let body_str = render_config_resource(&config, &allowed, None, false, vec![]);
+        let body_str = render_config_resource(&config, &allowed, None, false, vec![], false);
         // Sanity: the rendered document has something in it.
         assert!(
             !body_str.is_empty(),
@@ -5391,6 +5410,7 @@ mod tests {
             None,
             false,
             vec![],
+            false,
         );
         assert!(
             result.is_ok(),

@@ -301,12 +301,14 @@ radius; a git-root heuristic is the alternative if we want one.
 1. ✅ Spike launched (three legs above).
 2. Synthesize spike results here → engine decision.
 3. Implementation PRs, each branch → PR → cross-family review:
-   - store module + invariant amendment (CLAUDE.md rewrite, containment test,
-     sandbox-probes battery) — the hard-look review tier;
-   - resolver extraction + CLI subcommands;
-   - CHANGELOG entries per user-visible change.
+   - ✅ **stage 1** — store module (`src/store.rs`, `tests/store.rs`);
+   - ✅ **stage 2** — wired into config/server/CLI (see "Stage 2 — wired" below);
+   - ✅ **stage 3** — the documentation half of the invariant amendment + release
+     hygiene (see "Stage 3 — documented" below);
+   - ⏳ resolver extraction + CLI subcommands (the `kaibo consult …` front door — this
+     doc's remaining reason to live; the CLI sketch above is still the plan).
 4. Melt the durable parts of this doc into the shipped docs
-   (`docs/config.md` / CLAUDE.md / README), then **delete it**.
+   (`docs/config.md` / AGENTS.md / README), then **delete it** — after the CLI ships.
 
 ## Deferred
 
@@ -345,3 +347,27 @@ radius; a git-root heuristic is the alternative if we want one.
   list). The provider stays the source of truth for batch *state*; the store is kaibo's
   durable memory of what it launched. Status-on-poll persistence was judged not worth the
   API surface (the provider is authoritative), so the `status` column stays reserved.
+
+## Stage 3 — documented
+
+The documentation half of the invariant amendment plus release hygiene — the durable
+record now lives in the shipped docs, so this section is a pointer, not a duplicate:
+
+- **AGENTS.md invariant rewrite** (the load-bearing one): "Read-only is the product" now
+  scopes read-only to what the *shell* can steer and documents the store as the one
+  handler-side write (fixed XDG path, containment-guarded, the single `no_write_path`
+  carve-out); a new "Persistence engine (turso)" invariant bullet folds in the disciplines
+  a maintainer must not weaken (exact-pin, `default-features` off + `sync` off, hardwired
+  MP-WAL + the mixed-mode silent-write-loss hazard, Windows single-process, connect-per-op).
+  The release checklist gained the turso-pin + `mimalloc`-absent checks.
+- **docs/config.md**: a `[persistence]` section (enabled/path, env, CLI, XDG default, what
+  persists vs. never persists, escape hatch, loud-failure posture) + the layering-table rows.
+- **CHANGELOG.md**: the user-facing "sessions survive restarts / batch handles re-listed"
+  entry, and the read-only-toward-projects reassurance folded into the Security bullet.
+- **docs/sandbox-probes.md**: Battery E (store-refuses-allowed-tree, kaish-can't-read-the-
+  store — verified live, and the `no_write_path` teeth as the compile-time leg).
+- **kaibo://config** now renders `[persistence]` (enabled, resolved path, active) —
+  `server/config_resource.rs`, tested.
+
+What's left to keep this doc alive: the **CLI front door** (§"CLI shape") and the resolver
+extraction. When those ship, melt the durable bits into the shipped docs and delete this file.

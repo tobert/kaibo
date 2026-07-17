@@ -26,8 +26,9 @@ What we're verifying, concretely:
 4. **No secret leaks via the environment** — the sandbox runs with an empty env.
 
 The structural design these probes exercise lives in `src/sandbox.rs` (the four
-read-only levers) and `src/server.rs::resolve_root` (containment). The probes are
-the *empirical* check on top of the *structural* guarantee.
+read-only levers), `src/server.rs::resolve_root` (project containment), and
+`src/store.rs` (the persistence store's own containment + single blessed write site,
+Battery E). The probes are the *empirical* check on top of the *structural* guarantee.
 
 ---
 
@@ -158,7 +159,53 @@ path arg itself, and a file (vs. directory) is refused at the parameter boundary
 
 ---
 
-## 5. The always-on guard: the test suites
+## 5. Battery E — the persistence store stays out of reach
+
+kaibo keeps durable state (sessions, batch handles) in a SQLite db under the XDG state
+dir. Read-only *toward the project* is unchanged: the store lives at a fixed path no
+model controls, outside every allowed tree, and kaish can't see it. Three probes.
+
+**E1 — the store refuses a path inside the project (startup, loud, no file).** kaibo
+opens the store against its resolved allowed set, so a `--state-db` aimed inside a
+project tree is refused *before any write*:
+
+```sh
+kaibo --state-db "$ROOT/state.db" < /dev/null ; echo "exit=$?"
+```
+
+**Pass:** kaibo exits non-zero with `state db path must live outside every allowed
+project tree` (the message names `--no-persistence` as the escape hatch), and **no
+`state.db` is created** under `$ROOT`. The guard canonicalizes the parent, so a symlink
+or `..` reaching into the tree is caught too — pinned by `tests/store.rs` and
+`server::mod.rs::persistence_store_open_refuses_a_state_db_inside_an_allowed_tree`.
+
+**E2 — kaish cannot read the store.** The db lives outside the mount, so reading its
+real absolute path from inside kaish routes into the empty `/` MemoryFs and 404s — the
+Battery C mechanism, on the store's own path:
+
+```sh
+cat $XDG_STATE_HOME/kaibo/state.db      ; echo "store-read=$?"   # or ~/.local/state/kaibo/state.db
+```
+
+**Pass:** `not found`, exit `1` — never the db bytes, even though the file exists on
+real disk (verified live 2026-07-17: a 4 KiB store on disk read back `not found` through
+`run_kaish`). The model driving the shell can never exfiltrate another session's data.
+
+**E3 — the source-level write guard (compile-time leg).** kaibo makes exactly one
+`std::fs` mutation in production — the blessed `create_dir_all` that creates the state
+dir — and a source scan proves it is the only one:
+
+```sh
+cargo test --test no_write_path
+```
+
+**Pass:** green. The guard fails if any other `std::fs` write appears in `src/`, if the
+blessed `create_dir_all` loses its marker or moves out of `store.rs`, or if a second
+blessed site is added (teeth pinned by the `teeth_*` cases in that file).
+
+---
+
+## 6. The always-on guard: the test suites
 
 The live probes are a periodic spot-check; the *continuous* guard is the test tree.
 Run before any change near the boundary:
@@ -174,7 +221,7 @@ live battery is the bar for trusting the read-only claim.
 
 ---
 
-## 6. Model-driven probe (end-to-end, optional)
+## 7. Model-driven probe (end-to-end, optional)
 
 To confirm the *injected* path end-to-end — that a model given an adversarial brief
 still can't escape — run **Battery A+B+C as one `consult` question on a local cast**
