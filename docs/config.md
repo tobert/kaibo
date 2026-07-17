@@ -521,8 +521,8 @@ model output, never anything the calling model steers onto disk.
 **Read-only toward your project is unchanged.** The store is handler-side, at the XDG
 path — kaish's read-only sandbox never sees it, kaibo still writes nothing into any
 project, and `open` **refuses a state-db path that resolves inside an allowed tree** (so
-it can't be pointed into a repo). See `docs/kaibo-persistence-and-cli.md` and the
-"Read-only is the product" invariant.
+it can't be pointed into a repo). See the "Read-only is the product" invariant in
+AGENTS.md.
 
 **Loud on failure, never a silent fallback.** If the store can't open (a bad path, a db
 inside a project, a network mount — turso's multiprocess mode is 64-bit-Unix + local-fs

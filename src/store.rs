@@ -522,12 +522,12 @@ impl SessionStore {
 /// Create the persistence state directory (and any missing parents).
 ///
 /// This is the **one blessed filesystem-mutating site** in kaibo production code — the
-/// sanctioned half of the read-only invariant amendment (see
-/// `docs/kaibo-persistence-and-cli.md`). `tests/no_write_path.rs` carves out exactly this
-/// call: a `create_dir_all` in `store.rs` carrying the marker on its own line, and nowhere
-/// else. Any other `std::fs` mutation anywhere in `src/` — including a second
-/// `create_dir_all`, or one without the marker — still fails that guard. kaibo's every
-/// other write goes only through turso.
+/// sanctioned half of the read-only invariant amendment (see the "Read-only is the product"
+/// invariant in AGENTS.md). `tests/no_write_path.rs` carves out exactly this call: a
+/// `create_dir_all` in `store.rs` carrying the marker on its own line, and nowhere else.
+/// Any other `std::fs` mutation anywhere in `src/` — including a second `create_dir_all`, or
+/// one without the marker — still fails that guard. kaibo's every other write goes only
+/// through turso.
 ///
 /// Callers must run the containment check first (as [`SessionStore::open`] does), so this
 /// never creates a directory inside a project tree.
