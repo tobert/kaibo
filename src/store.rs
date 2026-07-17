@@ -115,6 +115,11 @@ pub enum StoreError {
     /// state db can never be pointed where a model can reach it (the invariant amendment).
     #[error("state db path must live outside every allowed project tree, but {0} is inside one")]
     PathInAllowedTree(String),
+    /// The db path has no file-name component (a bare directory, a trailing `/`, or `..`).
+    /// The state db must be a *file* path; a directory-only path has no db file to contain
+    /// and would let the containment compare inspect only the parent — refused loudly.
+    #[error("state db path {0} must name a file, not a bare directory")]
+    InvalidStatePath(String),
     /// On a single-process platform (Windows / non-64-bit-Unix), another kaibo already
     /// holds the state db open. There is no concurrent-open mode there, so this is a
     /// clear refusal rather than silent divergence.
@@ -188,12 +193,24 @@ impl SessionStore {
         capacity: NonZeroUsize,
         allowed_trees: &[&Path],
     ) -> Result<Self> {
-        // Containment first — before we touch the disk at all, so a path aimed inside a
-        // project is refused with zero side effect.
-        let resolved_parent = resolve_existing_parent(path);
+        // The state db must be a file, not a bare directory: a filename-less path (a
+        // trailing `/`, `.`, `..`, or `/`) would let the containment compare below inspect
+        // only the *parent* while the db itself lands AT the directory — so refuse it loudly
+        // up front. `file_name()` is None for exactly those cases.
+        let file_name = path
+            .file_name()
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| StoreError::InvalidStatePath(path.display().to_string()))?;
+
+        // Containment — before we touch the disk at all, so a path aimed inside a project is
+        // refused with zero side effect. Compare the resolved parent *plus the file name*
+        // (the full db path), not just the parent: a path that equals an allowed tree has a
+        // parent *above* the tree yet the db would land inside it, and only the full-path
+        // compare catches that.
+        let resolved_full = resolve_existing_parent(path).join(file_name);
         for tree in allowed_trees {
             let tree_resolved = tree.canonicalize().unwrap_or_else(|_| normalize(tree));
-            if resolved_parent.starts_with(&tree_resolved) {
+            if resolved_full.starts_with(&tree_resolved) {
                 return Err(StoreError::PathInAllowedTree(path.display().to_string()));
             }
         }
@@ -279,7 +296,6 @@ impl SessionStore {
                 backend     TEXT    NOT NULL,
                 provider_id TEXT    NOT NULL,
                 label       TEXT,
-                status      TEXT,
                 created_at  INTEGER NOT NULL,
                 PRIMARY KEY (backend, provider_id)
             ) STRICT;
@@ -291,14 +307,15 @@ impl SessionStore {
 
     /// Append a completed turn to `id`, creating the session if new. Promotes `id` to
     /// most-recently-used; creating a session past the cap evicts the LRU one. The whole
-    /// write is one transaction on one connection.
+    /// write — touch-seq allocation included — is one `BEGIN IMMEDIATE` transaction, so a
+    /// concurrent writer sees a consistent snapshot and the touch key stays strictly
+    /// increasing (see [`next_touch`]).
     pub async fn record_turn(&self, id: &str, question: &str, answer: &str) -> Result<()> {
         let conn = self.conn().await?;
         let ts = now();
-        let touch = next_touch(&conn).await?;
 
         conn.execute("BEGIN IMMEDIATE", ()).await?;
-        let result = record_turn_inner(&conn, self.capacity, id, question, answer, ts, touch).await;
+        let result = record_turn_inner(&conn, self.capacity, id, question, answer, ts).await;
         match result {
             Ok(()) => {
                 conn.execute("COMMIT", ()).await?;
@@ -314,30 +331,27 @@ impl SessionStore {
     /// Snapshot `id`'s prior turns oldest-first — empty if unknown. Touching promotes it to
     /// most-recently-used, so an actively-replayed thread can't be evicted out from under a
     /// client still asking on it (mirrors the in-memory store's `history`).
+    ///
+    /// The promote + read run in one `BEGIN IMMEDIATE` transaction, so a concurrent
+    /// capacity-pushing `record_turn` cannot evict the session *between* our promotion and
+    /// our read and hand us an empty history for a thread we just protected. An unknown id
+    /// is a pure read: the promote `UPDATE` matches no row, allocates no touch key, and
+    /// leaves the store byte-for-byte unchanged (mirroring the in-memory arm's zero side
+    /// effects on a miss).
     pub async fn replay(&self, id: &str) -> Result<Vec<Turn>> {
         let conn = self.conn().await?;
-        let ts = now();
-        let touch = next_touch(&conn).await?;
-        conn.execute(
-            "UPDATE sessions SET last_used_at = ?2, touch_seq = ?3 WHERE id = ?1",
-            (id.to_string(), ts, touch),
-        )
-        .await?;
-
-        let mut out = Vec::new();
-        let mut rows = conn
-            .query(
-                "SELECT question, answer FROM turns WHERE session_id = ?1 ORDER BY seq ASC",
-                [id.to_string()],
-            )
-            .await?;
-        while let Some(row) = rows.next().await? {
-            out.push(Turn {
-                question: row.get::<String>(0)?,
-                answer: row.get::<String>(1)?,
-            });
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = replay_inner(&conn, id).await;
+        match result {
+            Ok(turns) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(turns)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
         }
-        Ok(out)
     }
 
     /// Live session count — for tests and diagnostics.
@@ -349,6 +363,21 @@ impl SessionStore {
             .await?
             .ok_or_else(|| StoreError::Corrupt("COUNT(*) returned no row".into()))?;
         Ok(row.get::<i64>(0)? as usize)
+    }
+
+    /// The current maximum `touch_seq` (0 when empty) — the next allocation is this + 1.
+    /// For tests and diagnostics: asserting that a no-op operation (e.g. replaying an
+    /// unknown session) allocated nothing and left the LRU clock where it was.
+    pub async fn max_touch_seq(&self) -> Result<i64> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query("SELECT COALESCE(MAX(touch_seq), 0) FROM sessions", ())
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| StoreError::Corrupt("MAX(touch_seq) returned no row".into()))?;
+        Ok(row.get::<i64>(0)?)
     }
 
     /// All live sessions, most-recently-used first.
@@ -506,8 +535,12 @@ async fn user_version(conn: &Connection) -> Result<i64> {
     Ok(v)
 }
 
-/// Next strictly-increasing touch sequence — a clock-free LRU ordering key, so eviction is
-/// deterministic even when several sessions share a wall-clock second (tests depend on it).
+/// The next touch-seq value: `MAX(touch_seq)+1` over `sessions` (1 when empty). A
+/// clock-free LRU key. **Strictly increasing when called inside a `BEGIN IMMEDIATE`
+/// transaction** (as both writers do): `IMMEDIATE` takes the write lock up front, so a
+/// concurrent writer blocks until we commit and then reads a strictly larger max — no two
+/// committed writes tie. (turso 0.7 rejects this as an inline `SET`/`VALUES` subquery, so it
+/// is a separate statement; correctness rests on the enclosing transaction, not autocommit.)
 async fn next_touch(conn: &Connection) -> Result<i64> {
     let mut rows = conn
         .query("SELECT COALESCE(MAX(touch_seq), 0) + 1 FROM sessions", ())
@@ -518,6 +551,44 @@ async fn next_touch(conn: &Connection) -> Result<i64> {
     }
 }
 
+/// Does a session with this id exist? Used inside [`replay_inner`]'s transaction so an
+/// unknown id promotes nothing (no touch allocated, no row touched) — a pure read.
+async fn session_exists(conn: &Connection, id: &str) -> Result<bool> {
+    let mut rows = conn
+        .query("SELECT 1 FROM sessions WHERE id = ?1", [id.to_string()])
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
+/// The promote + read of [`SessionStore::replay`], run inside its transaction. Promotes only
+/// an *existing* session — an unknown id skips the promote entirely (no touch consumed, no
+/// row changed), so a miss leaves the store byte-for-byte unchanged.
+async fn replay_inner(conn: &Connection, id: &str) -> Result<Vec<Turn>> {
+    if session_exists(conn, id).await? {
+        let touch = next_touch(conn).await?;
+        conn.execute(
+            "UPDATE sessions SET last_used_at = ?2, touch_seq = ?3 WHERE id = ?1",
+            (id.to_string(), now(), touch),
+        )
+        .await?;
+    }
+
+    let mut out = Vec::new();
+    let mut rows = conn
+        .query(
+            "SELECT question, answer FROM turns WHERE session_id = ?1 ORDER BY seq ASC",
+            [id.to_string()],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        out.push(Turn {
+            question: row.get::<String>(0)?,
+            answer: row.get::<String>(1)?,
+        });
+    }
+    Ok(out)
+}
+
 async fn record_turn_inner(
     conn: &Connection,
     capacity: usize,
@@ -525,9 +596,10 @@ async fn record_turn_inner(
     question: &str,
     answer: &str,
     ts: i64,
-    touch: i64,
 ) -> Result<()> {
-    // Upsert the session row, promoting it to MRU.
+    // Allocate the touch key inside the caller's transaction (findings: strictly increasing
+    // under IMMEDIATE serialization), then upsert the session row, promoting it to MRU.
+    let touch = next_touch(conn).await?;
     conn.execute(
         "INSERT INTO sessions (id, created_at, last_used_at, touch_seq)
                  VALUES (?1, ?2, ?2, ?3)

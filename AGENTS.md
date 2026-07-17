@@ -56,8 +56,9 @@ project and cannot run external commands.
   a test that can fail. **The shell writes nothing, and kaibo never touches the
   project** — no write path through kaish, the four levers unconditional. Read-only is
   scoped to what the *model can steer*: kaish's VFS never sees kaibo's own state. kaibo
-  *does* keep handler-side state — durable sessions + batch handles — but only through
-  the persistence store (`src/store.rs`) at a **fixed XDG path no model controls**,
+  *does* keep handler-side state — durable sessions + batch handles (the latter recovered
+  on demand via `job_list`, the provider still authoritative for batch state) — but only
+  through the persistence store (`src/store.rs`) at a **fixed XDG path no model controls**,
   refused if it resolves into any allowed tree (`tests/store.rs`), created via the
   **single blessed `create_dir_all`** that `tests/no_write_path.rs` carves out — every
   other `std::fs` mutation in `src/` still fails that guard, and the store's own data

@@ -269,6 +269,115 @@ async fn allows_path_outside_allowed_trees() {
     assert_eq!(store.replay("s").await.unwrap(), vec![turn("q", "a")]);
 }
 
+/// The containment guard must compare the *full* db path, not just its parent. A path that
+/// equals an allowed tree has a parent *above* the tree (which passes a parent-only check),
+/// yet the db would land AT the tree root — so it must be refused. And a filename-less path
+/// (a bare directory / `..`) has no db file to contain and is refused loudly up front.
+#[tokio::test]
+async fn refuses_bare_directory_and_path_equal_to_an_allowed_tree() {
+    let project = TempDir::new().unwrap();
+
+    // A db path that *is* the allowed tree: parent is the tree's parent (outside), but the
+    // full path resolves onto the tree — the full-path compare must catch it.
+    match SessionStore::open(project.path(), cap(4), &[project.path()]).await {
+        Err(StoreError::PathInAllowedTree(_)) => {}
+        Err(other) => panic!("wrong error for path == allowed tree: {other:?}"),
+        Ok(_) => panic!("a db path equal to an allowed tree must be refused"),
+    }
+
+    // A filename-less path (ends in `..`, so `file_name()` is None) is an invalid state path.
+    let bare = project.path().join("sub").join("..");
+    match SessionStore::open(&bare, cap(4), &[]).await {
+        Err(StoreError::InvalidStatePath(_)) => {}
+        Err(other) => panic!("wrong error for a bare-directory path: {other:?}"),
+        Ok(_) => panic!("a bare-directory path must be refused as invalid"),
+    }
+}
+
+/// Finding 3: replaying an unknown session is a pure read — it promotes nothing and leaves
+/// the LRU clock (`MAX(touch_seq)`) exactly where it was, mirroring the in-memory arm's
+/// zero side effects on a miss. Would fail if the promote `UPDATE` (and its touch
+/// allocation) ran unconditionally.
+#[tokio::test]
+async fn replay_of_unknown_session_has_no_side_effect() {
+    let (store, _d) = open(8).await;
+    store.record_turn("a", "q", "a").await.unwrap();
+    store.record_turn("b", "q", "a").await.unwrap();
+    let before = store.max_touch_seq().await.unwrap();
+    assert!(
+        before > 0,
+        "recording two sessions advanced the touch clock"
+    );
+
+    for _ in 0..5 {
+        assert!(store.replay("nonexistent").await.unwrap().is_empty());
+    }
+
+    assert_eq!(
+        store.max_touch_seq().await.unwrap(),
+        before,
+        "replaying an unknown session must not advance the touch clock"
+    );
+    assert_eq!(
+        store.session_count().await.unwrap(),
+        2,
+        "replaying an unknown session must not create a row"
+    );
+}
+
+/// Finding 1: `replay` promotes and reads in one `BEGIN IMMEDIATE` transaction, so a
+/// concurrent capacity-pushing `record_turn` cannot evict the session *between* the
+/// promotion and the read and hand back an empty history for a thread it just protected.
+/// The atomicity itself is **structural** — the single `BEGIN IMMEDIATE`/read/`COMMIT` in
+/// `replay` (the transaction serializes writers, so the interleaving simply can't occur, and
+/// can't be forced from outside). This test guards the surrounding contract under real
+/// contention: many tasks replaying and recording (with eviction churn) on one file must all
+/// succeed — no `Busy` storm, deadlock, or corruption — and the cap stays honored. A replayed
+/// history, when non-empty, is always a valid oldest-first prefix (never a torn read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_replay_and_record_stay_consistent_under_churn() {
+    let (store, _d) = open(3).await;
+    store.record_turn("keep", "q", "keep-answer").await.unwrap();
+
+    let mut handles = Vec::new();
+    // Churners: push fresh sessions past the cap of 3, forcing continuous eviction.
+    for i in 0..8 {
+        let s = store.clone();
+        handles.push(tokio::spawn(async move {
+            for j in 0..6 {
+                s.record_turn(&format!("churn-{i}-{j}"), "q", "a")
+                    .await
+                    .expect("record under churn must not error");
+            }
+        }));
+    }
+    // Keepers: interleave record + replay on "keep". Every replay that returns turns must
+    // return a clean oldest-first run of the recorded answer — never a torn/partial read.
+    for _ in 0..4 {
+        let s = store.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..6 {
+                s.record_turn("keep", "q", "keep-answer")
+                    .await
+                    .expect("record under churn must not error");
+                let h = s
+                    .replay("keep")
+                    .await
+                    .expect("replay under churn must not error");
+                assert!(
+                    h.iter().all(|t| t.answer == "keep-answer"),
+                    "a replayed history must be a consistent snapshot, never a torn read"
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    // The store is internally consistent: the cap is honored despite the concurrent churn.
+    assert!(store.session_count().await.unwrap() <= 3);
+}
+
 /// The concurrency verdict, as a test. kaibo runs consult jobs in concurrent spawned
 /// tasks, all sharing one cloned store. A single turso Connection refuses concurrent use,
 /// so the store mints a connection per op — this proves that holds up: many tasks writing

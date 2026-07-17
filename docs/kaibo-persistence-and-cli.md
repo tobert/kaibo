@@ -343,10 +343,12 @@ radius; a git-root heuristic is the alternative if we want one.
   a failed open is a **loud startup error naming `--no-persistence`**, never a silent drop
   to memory.
 - **Batch handles**: `batch_submit` records `{backend, provider_id, label}` in the store;
-  `job_list` surfaces recovered handles after a restart (deduped against the live provider
-  list). The provider stays the source of truth for batch *state*; the store is kaibo's
-  durable memory of what it launched. Status-on-poll persistence was judged not worth the
-  API surface (the provider is authoritative), so the `status` column stays reserved.
+  a restart recovers them **on demand** via `job_list` (deduped against the live provider
+  list), not by active reattachment. The provider stays the source of truth for batch
+  *state*; the store is kaibo's durable memory of what it launched. Status-on-poll caching
+  was judged not worth persisting (the provider is authoritative), so the v1 schema **drops
+  the `status` column entirely** rather than carry dead schema — a `user_version` migration
+  re-adds it trivially if status caching is ever wanted (cross-family review, finding 5).
 
 ## Stage 3 — documented
 

@@ -337,7 +337,8 @@ the git log. Each later release appends a new section at the top.
   `consult` session — the thread a `session_id` carries — used to live only for the
   server process; it now persists, so you can restart kaibo (or reconnect, or switch
   between the MCP server and a CLI invocation) and pick the same thread back up. Batch
-  handles persist too: `job_list` re-surfaces a batch you submitted even after a restart,
+  handles persist too — recovered **on demand** when you run `job_list` (kaibo doesn't
+  reattach in the background; the provider stays the source of truth for a batch's state),
   so a long-running batch is never orphaned by a reconnect. kaibo keeps this in a small
   state db under your XDG state dir (`$XDG_STATE_HOME/kaibo/state.db`, else
   `~/.local/state/kaibo/state.db`) — session Q&A turns and batch `{backend, provider-id}`
