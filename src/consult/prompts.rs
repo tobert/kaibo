@@ -298,6 +298,15 @@ pub fn oneshot_preamble() -> String {
 /// - **Depth is free.** The lane forces high effort + a generous token floor precisely
 ///   because the latency is already accepted. The prompt says so out loud — spend the
 ///   room on depth — rather than leaving that intent only in the knobs.
+/// - **The written answer comes before the depth (GH #75).** Reasoning and answer draw
+///   on one shared output budget, so a big attached-file review at max thinking can spend
+///   the whole budget thinking and get truncated *before* the answer is written — the
+///   caller then sees a cut-off reasoning fragment with no verdict. Depth stays free, but
+///   it can't be free at the cost of an unwritten answer, so the prompt orders it: land
+///   the conclusion in full first, then let the reasoning build under it. (kaibo also now
+///   *flags* a truncated batch result rather than passing the fragment off as clean — see
+///   `finish_gated_answer` in `batch.rs` — so this prompt nudge and the parser guard are
+///   the two halves of the same fix.)
 /// - **Primary answer, not a footnote.** Batch is for asking the best model the hard
 ///   question, so the "second opinion" framing under-positions it; the load-bearing
 ///   part is "for another agent" (an external advisor owns no context), which we keep.
@@ -310,11 +319,15 @@ pub fn batch_preamble() -> String {
      from the material it provides and your own knowledge — this call has no codebase \
      access and no tools, so the caller owns all the context you have. This is your \
      single response: there is no follow-up turn and the caller cannot clarify, so make \
-     the answer complete and self-contained, and spend the room you have on depth — \
-     reason the problem all the way through. Be direct and precise. Ground every claim \
-     in the material or your own knowledge, and say where the evidence runs out. Where \
-     something you'd need is missing, state the assumption you're making, answer under \
-     it, and flag what would change if the assumption is wrong."
+     the answer complete and self-contained. The lane gives you room and high effort — \
+     spend it on depth, but spend it on the *written* answer: lead with the conclusion \
+     (the findings, the verdict, the recommendation) and write it in full, then let your \
+     reasoning build under it. Your thinking and your answer draw on one shared output \
+     budget, so land the deliverable the caller can act on first — don't reason at length \
+     and leave the answer unfinished. Be direct and precise. Ground every claim in the \
+     material or your own knowledge, and say where the evidence runs out. Where something \
+     you'd need is missing, state the assumption you're making, answer under it, and flag \
+     what would change if the assumption is wrong."
         .to_string()
 }
 
@@ -613,10 +626,10 @@ mod tests {
         }
     }
 
-    /// The batch preamble encodes the async lane's distinct contract — the three things
-    /// a cross-model review flagged the oneshot wording getting wrong for batch. These
-    /// are behavioral promises, so they get a test that fails if the prose drifts back
-    /// toward the synchronous oneshot framing.
+    /// The batch preamble encodes the async lane's distinct contract — the things a
+    /// cross-model review flagged the oneshot wording getting wrong for batch, plus the
+    /// GH #75 output-discipline promise. These are behavioral promises, so they get a test
+    /// that fails if the prose drifts back toward the synchronous oneshot framing.
     #[test]
     fn batch_preamble_encodes_the_offline_one_shot_contract() {
         let p = batch_preamble();
@@ -628,6 +641,13 @@ mod tests {
         );
         // (2) Depth is free here — spend the budget the lane forces on.
         assert!(lower.contains("depth"), "batch must ask for depth: {p}");
+        // (2b) GH #75: the written answer comes before the depth. Reasoning and answer
+        // share one output budget, so lead with the conclusion rather than reasoning at
+        // length into a truncated, verdict-less fragment.
+        assert!(
+            lower.contains("lead with the conclusion") && lower.contains("shared output budget"),
+            "batch must order the written answer ahead of the depth (GH #75): {p}"
+        );
         // (3) Assume-and-answer, not flag-and-stall: state the assumption and answer
         // under it (the synchronous oneshot would say "name what you'd need").
         assert!(
@@ -893,8 +913,12 @@ mod tests {
                 text_attach("notes.md", "note body"),
             ],
         );
-        let inline_at = prompt.find("<file path=\"notes.md\">").expect("text inlines");
-        let oversize_at = prompt.find("- src/big.rs (500000 bytes)").expect("oversize listed");
+        let inline_at = prompt
+            .find("<file path=\"notes.md\">")
+            .expect("text inlines");
+        let oversize_at = prompt
+            .find("- src/big.rs (500000 bytes)")
+            .expect("oversize listed");
         let image_at = prompt.find("- docs/shot.png").expect("image listed");
         let question_at = prompt.find("Assess the change.").expect("question present");
         assert!(
@@ -914,10 +938,7 @@ mod tests {
             "q",
             None,
             &[],
-            &[
-                oversize_attach(evil, 42),
-                image_attach("img\nfake.png"),
-            ],
+            &[oversize_attach(evil, 42), image_attach("img\nfake.png")],
         );
         assert!(
             !prompt.contains("\n- /etc/shadow"),

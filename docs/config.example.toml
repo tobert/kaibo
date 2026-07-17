@@ -381,6 +381,16 @@ batch    = true
 synth    = "gemini/gemini-pro-latest"        # batch-capable synth (Anthropic | Gemini); Pro is batch-only
 # Equivalent, spelled directly on the slot (no cast-level sugar):
 #   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+#
+# OUTPUT BUDGET. Batch maxes the knobs: high effort + a 32768-token output-token FLOOR (it
+# never skimps on the cheap async lane). Reasoning bills against that same output budget, so a
+# big attached-file review at max thinking can spend the budget thinking and truncate the
+# answer — kaibo flags such a result INCOMPLETE with its finishReason rather than passing off
+# the cut-off fragment as a clean answer. Give batch more answer headroom by raising
+# `max_tokens` on the synth slot; it's a floor, so a higher value wins, and mind each model's
+# output ceiling (Gemini Pro is generous; some backends cap lower). `effort` / `thinking_budget`
+# ride the same slot if you want to tune reasoning depth:
+#   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch", max_tokens = 65536 }
 
 # --- DELIBERATE casts: an interactive explorer PLUS an offline synth. `deliberate` runs
 #     the explorer live to build a cited dossier, then hands dossier+question to the offline
