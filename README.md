@@ -234,11 +234,12 @@ human at a terminal can drive kaibo directly:
 kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 ```
 
-**Bare `kaibo` (no subcommand) is still the MCP server** — every existing client
-config keeps working unchanged; `kaibo serve` is the explicit spelling for the
-same thing. `consult_submit`/`job_wait` and `deliberate`'s direct lane are the
-one gap — every other tool in the table above has a CLI subcommand; queued as
-[#82](https://github.com/tobert/kaibo/issues/82).
+**Bare `kaibo` with no subcommand is the stdio MCP server**
+`kaibo serve` is the explicit spelling for the same thing and may become required
+in the future.
+
+`consult_submit`/`job_wait` and `deliberate`'s direct lane are not fully implemented
+on the cli yet. [#82](https://github.com/tobert/kaibo/issues/82).
 
 **stdout is the answer, stderr is everything else.** Progress, logs, and warnings
 go to stderr, so piping stays clean; the answer (with the same provenance footer
