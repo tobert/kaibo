@@ -527,6 +527,14 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
   `effort = "low"` on a `lane = "batch"` slot is a silent no-op the render doesn't flag.
   Same display-accuracy class as the `thinking_style` gap above; make the inert check
   lane-aware — mark batch `effort` as overridden and batch sampling as inert.
+- **The `inert_tunables` render resolves the shape differently from validation**
+  (deepseek review, 2026-07-18): the render resolves `thinking_style` via
+  `unwrap_or_default()` (→ `Auto`), while the validation/`slot.tunables` path uses the
+  `defaults.thinking_style` fallback — so a `[defaults].thinking_style = "adaptive"` set
+  without a per-slot override is missed by the render, which can mislabel a
+  `thinking_budget`'s inertness on an actually-adaptive Anthropic slot. Display-only,
+  no wire effect. The clean fix for this whole render-accuracy cluster: resolve the
+  slot's shape in the render exactly as `slot.tunables` does.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
