@@ -14,6 +14,39 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-18 — Gemini's effort lever was silently disconnected
+
+Investigating batch truncation (#79, already fixed) turned up a *separate* correctness
+bug: the Gemini thinking-knob classifier, `is_gemini3_level`, matched only the bare
+`gemini-3` / `gemini-3-*` form. But every Gemini id kaibo actually ships is a 3.x-line
+model the substring test missed — the `-latest` aliases the built-in casts pin
+(`gemini-flash-lite-latest` explorer, `gemini-pro-latest` batch synth) carry no
+`gemini-3` at all, and the dotted previews they resolve to (`gemini-3.1-pro-preview`)
+put a dot after the 3. All of them fell to the `GeminiBudget` arm, which emits a fixed
+`thinkingBudget` and **drops the per-role `effort`**. A user setting `effort = "low"`/
+`"high"` on a Gemini synth was quietly ignored — no crash, since both knobs are accepted
+on the wire, just the wrong one sent.
+
+The prior code deliberately kept `gemini-3.5-flash` on budget, citing a 2026-06-06 live
+test that confirmed budget *works* there. The flaw in that reasoning: "budget works"
+never established "level fails" — and if both work, `thinkingLevel` is strictly better
+because it carries the effort lever. Rather than re-probe, we went to Google's current
+[thinking doc](https://ai.google.dev/gemini-api/docs/thinking): it lists `thinkingLevel`
+(`minimal|low|medium|high`) across the whole 3-line — 3-pro, 3-flash, **3.5-flash**,
+3.1-pro — and doesn't mention `thinkingBudget` at all; that's the retired 2.5-era knob.
+
+So the fix isn't a wider classifier — it's a *collapse*. Amy's call: kaibo targets the
+Gemini 3-line and newer, and we say so. `ProviderKind::Gemini` always resolves to
+`GeminiLevel`; `is_gemini3_level` and the whole `GeminiBudget` `ThinkingStyle` variant
+are gone (dead surface once nothing produces it — there's no `thinking_style` override
+for Gemini). A pre-3.x id now emits a level and fails loud at the provider, the honest
+"unsupported" signal, over silently mis-shaping. TDD: a failing test pinning the
+configured ids' effort → `thinkingLevel` came first (RED on `gemini-flash-lite-latest`),
+then the collapse turned it green. Dependent tests that used 2.5 ids as fixtures moved
+to 3.x; the engine per-arm straddle test — which had leaned on the now-defunct
+*intra-Gemini* budget/level split — was re-aimed at a stronger cross-*provider* straddle
+(Anthropic-adaptive synth vs Gemini-level explorer, structurally disjoint param trees).
+
 ## 2026-07-05 — the build bootstrap: never-fired workflow → verified first release, in a day
 
 The release plan (PR #25, `docs/releases.md`) had sat unmerged since 2026-06-25 with its

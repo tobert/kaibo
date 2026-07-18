@@ -434,6 +434,18 @@ the git log. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A Gemini slot's reasoning-effort setting now actually reaches Gemini.** kaibo's
+  Gemini casts (the default `gemini` synth, the `gemini-batch` Pro synth, the Flash-Lite
+  explorer) all name 3.x-line models, but the thinking-knob classifier recognized only
+  the bare `gemini-3-…` form — so the `-latest` aliases and the dotted 3.x ids (e.g.
+  `gemini-3.1-pro-preview`) fell through to the retired 2.5-era `thinkingBudget` path,
+  which pins depth to a fixed number and silently drops the per-role `effort` lever.
+  Setting `effort = "low"` (or `"high"`, `"max"`, …) on a Gemini slot had no effect. kaibo
+  now routes every Gemini id to `thinkingLevel` — the knob Google's current API documents
+  across the whole 3-line — so the effort you configure is the reasoning depth Gemini
+  runs at. (kaibo targets the Gemini 3-line and newer; the legacy 2.5 budget knob is no
+  longer modeled — a pre-3.x id fails loud rather than silently mis-shaping.)
+
 - **A truncated batch answer no longer masquerades as a finished one.** When a batch
   item hit its output-token budget mid-response — most often a big attached-file review
   where max-effort thinking spends the whole budget before the answer is written — kaibo

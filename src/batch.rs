@@ -1913,8 +1913,10 @@ mod tests {
 
     // --- Gemini ------------------------------------------------------------
 
-    /// Gemini's maxed shape lands in `generationConfig` (the completion budget is nested
-    /// there, not top-level): a budget-tier id carries `thinkingConfig.thinkingBudget`.
+    /// Gemini's maxed shape lands in `generationConfig` (the completion budget nests
+    /// there, not top-level): a Gemini slot carries `thinkingConfig.thinkingLevel`, and
+    /// `max_tokens` is floored to the batch minimum. The whole 3-line is single-tier, so
+    /// batch forces the level and never a token budget.
     #[test]
     fn gemini_shaping_nests_thinking_in_generation_config() {
         let (max_tokens, params) = batch_shaping(
@@ -1925,16 +1927,21 @@ mod tests {
         assert!(max_tokens >= BATCH_MAX_TOKENS_FLOOR);
         let params = params.expect("a gemini slot carries a thinking block");
         let tc = &params["generationConfig"]["thinkingConfig"];
+        assert_eq!(
+            tc["thinkingLevel"], BATCH_EFFORT,
+            "gemini batch forces the level, nested in generationConfig: {params}"
+        );
         assert!(
-            tc["thinkingBudget"].as_u64().unwrap() >= BATCH_THINKING_BUDGET,
-            "gemini batch floors the thinking budget: {params}"
+            tc.get("thinkingBudget").is_none(),
+            "Gemini has no budget tier — the level is the only knob: {params}"
         );
     }
 
-    /// A pure `gemini-3-*` line id takes `thinkingLevel`, forced to BATCH_EFFORT — the
-    /// per-role effort lever, not a token budget. (The `gemini-batch` cast itself synths
-    /// `gemini-pro-latest`, which classifies as a *budget*-tier id; this exercises the
-    /// other Gemini thinking tier so both paths through `batch_shaping` are covered.)
+    /// A 3-line id takes `thinkingLevel`, forced to BATCH_EFFORT — the per-role effort
+    /// lever, not a token budget — even when the slot asked for a shallower "low". (The
+    /// `gemini-batch` cast synths `gemini-pro-latest`, also a level-tier id now that the
+    /// whole Gemini 3-line takes a level; every Gemini id runs this one path through
+    /// `batch_shaping`.)
     #[test]
     fn gemini_3_line_uses_thinking_level_at_batch_effort() {
         let (_max, params) = batch_shaping(

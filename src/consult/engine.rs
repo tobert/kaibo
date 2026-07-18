@@ -2888,15 +2888,18 @@ mod tests {
         }
     }
 
-    /// The per-phase payoff: when a cast's synth and explorer straddle the Gemini
-    /// 3-line capability boundary, each request must carry the thinking shape fit to
-    /// *its own* model — the driver `thinkingLevel`, the sweep `thinkingBudget`. A
-    /// regression that resolved thinking once and shared it — the old
-    /// profile-level shape — would put one model's params on the other's request.
+    /// The per-phase payoff: when a cast's synth and explorer straddle a thinking-shape
+    /// boundary, each request must carry the shape fit to *its own* model — never one
+    /// resolved once and shared. Here an Anthropic-adaptive driver (top-level
+    /// `thinking:{type:adaptive}` + `output_config.effort`) runs beside a Gemini-level
+    /// explorer (nested `generationConfig.thinkingConfig.thinkingLevel`): structurally
+    /// disjoint blobs, so a regression that shared one arm's params would land the wrong
+    /// keys on the other's request and this test would catch it. (A cross-*provider*
+    /// straddle now that Gemini is single-tier — the whole 3-line takes a level.)
     #[tokio::test]
     async fn each_phase_gets_thinking_fit_to_its_own_model() {
-        const SYNTH: &str = "gemini-3-pro-preview"; // 3-line → thinkingLevel
-        const EXPLORER: &str = "gemini-2.5-flash"; // 2.5 → thinkingBudget
+        const SYNTH: &str = "claude-sonnet-4-6"; // Anthropic adaptive → output_config.effort
+        const EXPLORER: &str = "gemini-flash-lite-latest"; // Gemini → thinkingLevel
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
@@ -2927,30 +2930,41 @@ mod tests {
             &arm_with(
                 &client,
                 SYNTH,
-                thinking_params(ProviderKind::Gemini, SYNTH, 4096),
+                thinking_params(ProviderKind::Anthropic, SYNTH, 4096),
             ),
             &cfg,
         )
         .await
         .unwrap();
 
-        let tc = |r: &crate::test_support::RecordedRequest| {
-            r.additional_params.as_ref().unwrap()["generationConfig"]["thinkingConfig"].clone()
-        };
+        let params =
+            |r: &crate::test_support::RecordedRequest| r.additional_params.as_ref().unwrap().clone();
+        // The adaptive synth: top-level adaptive thinking + effort, no Gemini nesting.
         for r in client.requests_for(SYNTH) {
-            let cfg = tc(&r);
-            assert_eq!(cfg["thinkingLevel"], "high", "3-line driver wants a level");
+            let p = params(&r);
+            assert_eq!(
+                p["thinking"]["type"], "adaptive",
+                "adaptive driver wants adaptive thinking"
+            );
+            assert_eq!(
+                p["output_config"]["effort"], "high",
+                "adaptive depth rides output_config.effort"
+            );
             assert!(
-                cfg.get("thinkingBudget").is_none(),
-                "level and budget are exclusive"
+                p.get("generationConfig").is_none(),
+                "the Gemini nesting must not leak onto the Anthropic arm"
             );
         }
+        // The Gemini explorer: nested thinkingLevel, none of the adaptive keys.
         for r in client.requests_for(EXPLORER) {
-            let cfg = tc(&r);
-            assert_eq!(cfg["thinkingBudget"], 4096, "2.5 explorer wants a budget");
+            let p = params(&r);
+            assert_eq!(
+                p["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high",
+                "the Gemini sweep wants a level"
+            );
             assert!(
-                cfg.get("thinkingLevel").is_none(),
-                "level and budget are exclusive"
+                p.get("thinking").is_none() && p.get("output_config").is_none(),
+                "the adaptive keys must not leak onto the Gemini arm"
             );
         }
     }

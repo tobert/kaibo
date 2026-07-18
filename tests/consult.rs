@@ -121,13 +121,14 @@ fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
         "adaptive carries no budget"
     );
 
-    // Gemini 2.5: nested under generationConfig.thinkingConfig with camelCase keys —
-    // rig parses these into a typed GenerationConfig, so the shape must be exact.
-    let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", THINKING_BUDGET)
+    // Gemini (3.x+): nested under generationConfig.thinkingConfig with camelCase keys —
+    // rig parses these into a typed GenerationConfig, so the shape must be exact. The
+    // whole 3-line takes a level; the default effort rides it as thinkingLevel.
+    let g = thinking_params(ProviderKind::Gemini, "gemini-3.5-flash", THINKING_BUDGET)
         .expect("gemini has a thinking toggle");
     assert_eq!(
-        g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-        THINKING_BUDGET
+        g["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "high"
     );
     assert_eq!(
         g["generationConfig"]["thinkingConfig"]["includeThoughts"],
@@ -136,53 +137,39 @@ fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
 }
 
 #[test]
-fn gemini_3_line_takes_thinking_level_not_budget() {
-    // Gemini 3 officially uses `thinkingLevel` (mutually exclusive with budget); rig's
-    // typed ThinkingConfig carries both, serializing the level as snake_case "high".
-    // The boundary is empirical: the pure 3-line flips, but `gemini-3.5-flash` (a
-    // confirmed-working default on budget) and 2.x stay on budget — switching them
-    // would silently regress a request that works (docs/issues.md).
-    let g3 = thinking_params(
-        ProviderKind::Gemini,
-        "gemini-3-pro-preview",
-        THINKING_BUDGET,
-    )
-    .expect("gemini 3 has a thinking toggle");
-    let tc = &g3["generationConfig"]["thinkingConfig"];
-    assert_eq!(tc["thinkingLevel"], "high", "the 3-line wants a level");
-    assert!(
-        tc.get("thinkingBudget").is_none(),
-        "level and budget are mutually exclusive"
-    );
-    assert_eq!(tc["includeThoughts"], true);
-
-    // The minor 3.5 line and 2.x stay on budget (the conservative, evidence-backed arm).
-    for id in ["gemini-3.5-flash", "gemini-2.5-pro"] {
+fn every_gemini_id_takes_thinking_level_not_budget() {
+    // kaibo targets the Gemini 3-line and newer, whose whole family uses `thinkingLevel`
+    // (mutually exclusive with the retired 2.5-era budget); rig's typed ThinkingConfig
+    // serializes the level as snake_case "high". Every Gemini id kaibo ships must route
+    // there — the dash 3-line, the dotted 3.x previews, and the `-latest` aliases whose
+    // literal id carries no version at all.
+    for id in [
+        "gemini-3-pro-preview",     // dash 3-line
+        "gemini-3.1-pro-preview",   // dotted 3.x preview
+        "gemini-3.5-flash",         // built-in gemini synth default
+        "gemini-flash-lite-latest", // built-in explorer default (a -latest alias)
+        "gemini-pro-latest",        // built-in gemini-batch synth (a -latest alias)
+    ] {
         let g = thinking_params(ProviderKind::Gemini, id, THINKING_BUDGET).expect("toggle");
         let tc = &g["generationConfig"]["thinkingConfig"];
-        assert_eq!(
-            tc["thinkingBudget"], THINKING_BUDGET,
-            "{id} stays on budget"
-        );
+        assert_eq!(tc["thinkingLevel"], "high", "{id} wants a level");
         assert!(
-            tc.get("thinkingLevel").is_none(),
-            "{id} must not send a level"
+            tc.get("thinkingBudget").is_none(),
+            "{id}: level and budget are mutually exclusive"
         );
+        assert_eq!(tc["includeThoughts"], true, "{id} includes thoughts");
     }
 }
 
 #[test]
 fn thinking_budget_is_threaded_through_not_hardcoded() {
-    // A per-slot budget must reach the request, not the old global constant. Use a
-    // budget-tier Anthropic model (Haiku 4.5) — the adaptive tier carries no budget.
+    // A per-slot budget must reach the request, not the old global constant. The one
+    // remaining budget sink is legacy-tier Anthropic (Haiku 4.5) — the adaptive tier
+    // carries no budget, and Gemini takes a level not a budget — so Haiku is what
+    // exercises budget threading.
     let a = thinking_params(ProviderKind::Anthropic, "claude-haiku-4-5", 4096)
         .expect("anthropic toggle");
     assert_eq!(a["thinking"]["budget_tokens"], 4096);
-    let g = thinking_params(ProviderKind::Gemini, "gemini-2.5-flash", 4096).expect("gemini toggle");
-    assert_eq!(
-        g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-        4096
-    );
 }
 
 #[test]
@@ -191,7 +178,7 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     // the thinkingConfig — one merged blob, not two.
     let g = request_params(
         ProviderKind::Gemini,
-        "gemini-2.5-flash",
+        "gemini-3.5-flash",
         THINKING_BUDGET,
         Some(0.1),
         Some(0.95),
@@ -201,7 +188,7 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     assert_eq!(gc["temperature"], 0.1);
     assert_eq!(gc["topP"], 0.95, "Gemini uses camelCase topP");
     assert_eq!(
-        gc["thinkingConfig"]["thinkingBudget"], THINKING_BUDGET,
+        gc["thinkingConfig"]["thinkingLevel"], "high",
         "thinking still rides along"
     );
     assert!(
@@ -398,7 +385,25 @@ fn effort_is_per_role_and_provider_mapped() {
     .expect("deepseek params");
     assert_eq!(deepseek["reasoning_effort"], "max");
 
-    // Budget-tier Anthropic and Gemini have no effort sink — the value is ignored, not leaked.
+    // Gemini's wire field for effort is thinkingLevel, nested in generationConfig — a
+    // level ("low"), not the reasoning_effort/output_config the other providers use.
+    let gemini = ModelShape::resolve(
+        ProviderKind::Gemini,
+        "gemini-3.5-flash",
+        ThinkingStyleOverride::Auto,
+    )
+    .to_params(THINKING_BUDGET, None, None, "low")
+    .expect("gemini params");
+    assert_eq!(
+        gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low",
+        "Gemini effort rides thinkingLevel"
+    );
+    assert!(
+        gemini.get("reasoning_effort").is_none() && gemini.get("output_config").is_none(),
+        "Gemini uses its own field, not another provider's"
+    );
+
+    // Budget-tier Anthropic (Haiku 4.5) has no effort sink — the value is ignored, not leaked.
     let budget = ModelShape::resolve(
         ProviderKind::Anthropic,
         "claude-haiku-4-5",
@@ -410,18 +415,6 @@ fn effort_is_per_role_and_provider_mapped() {
         budget.get("output_config").is_none(),
         "budget tier has no effort sink"
     );
-    let gemini = ModelShape::resolve(
-        ProviderKind::Gemini,
-        "gemini-2.5-flash",
-        ThinkingStyleOverride::Auto,
-    )
-    .to_params(THINKING_BUDGET, None, None, "xhigh")
-    .expect("gemini params");
-    assert!(
-        gemini.get("reasoning_effort").is_none(),
-        "Gemini has no effort sink"
-    );
-    assert!(gemini.get("output_config").is_none());
 
     // Per-role resolution through the slot fallback: with no per-slot override, the
     // explorer and synth arms of the *same* slot resolve their own [defaults] effort
@@ -1369,7 +1362,7 @@ async fn oneshot_answers_from_pasted_context() {
 
 // Live thinking-on checks for the keyed providers. They exercise the risky paths:
 // Anthropic's thinking blocks round-tripping through the tool loop, and Gemini's
-// thinkingConfig shape (thinkingBudget vs the Gemini-3 thinkingLevel split).
+// thinkingConfig shape (the thinkingLevel the whole 3-line takes).
 #[tokio::test]
 #[ignore = "hits the DeepSeek API (consult); run with --ignored and a key"]
 async fn two_phase_consult_via_deepseek() {

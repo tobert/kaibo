@@ -199,14 +199,14 @@ The `[defaults]` knobs themselves:
   per slot, an out-of-range value is rejected at load, not clamped.
 - **`explorer_effort` / `synth_effort`** (`"high"` both): reasoning depth for the
   models that take an effort param — Anthropic's adaptive tier
-  (→ `output_config.effort`), DeepSeek (→ `reasoning_effort`), the Gemini
-  3-line (→ `thinkingLevel`: the values align, `"high"`/`"low"`), and OpenRouter
-  (→ its unified `{"reasoning":{"effort":…}}`, forwarded verbatim to whatever the
-  pinned model actually supports). A passthrough string the provider validates
-  (like a model id), so a new level lands without a code change — set a synth
+  (→ `output_config.effort`), DeepSeek (→ `reasoning_effort`), Gemini
+  (→ `thinkingLevel`: the values align, `"minimal"`/`"low"`/`"medium"`/`"high"`),
+  and OpenRouter (→ its unified `{"reasoning":{"effort":…}}`, forwarded verbatim to
+  whatever the pinned model actually supports). A passthrough string the provider
+  validates (like a model id), so a new level lands without a code change — set a synth
   slot's `effort = "max"`/`"xhigh"` for heavier runs; OpenRouter is where those
   deeper rungs are actually reachable today. Ignored by models with no effort
-  sink (budget-tier Anthropic/Gemini, OpenAI).
+  sink (budget-tier Anthropic, OpenAI).
 - **`thinking_style`** (`auto` | `adaptive` | `budget`, default `auto`) forces the
   Anthropic thinking shape instead of the built-in classifier. `auto` picks
   adaptive for Opus 4.6+/Sonnet 4.6/Fable 5 and enabled-budget for older models +

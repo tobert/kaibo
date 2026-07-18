@@ -496,17 +496,12 @@ P1 entry):
 `ModelShape` (`consult.rs`) resolves request params per (kind, model), fit per
 *arm* with the slot's tunables via `Arm::from_slot` (each falling back to the
 per-role `[defaults]`). Thinking is model-aware across all providers (Anthropic
-adaptive vs enabled-budget, Gemini 3-line `thinkingLevel` vs 2.5/3.5
-`thinkingBudget`), reasoning depth is per-role effort (with `thinkingLevel` as
-the 3-line's effort sink), and `thinking_style` (per slot or `[defaults]`)
-overrides the Anthropic classifier. `max_tokens`/`thinking_budget` are per-slot
-tunables — if a provider caps output low, cap that slot, not the global, per the
-`large-token-headroom` memory. Remaining knobs on the same seam:
-- **Gemini 3.5 boundary is empirical.** The classifier (`is_gemini3_level`) flips
-  only the pure `gemini-3-*` line to `thinkingLevel`; `gemini-3.5-flash` stays on
-  budget because the 2026-06-06 live test confirmed budget works there. If a future
-  3.5 build *rejects* budget, widen the classifier — but confirm with a live probe,
-  don't guess.
+adaptive vs enabled-budget; Gemini is single-tier — the whole 3-line, which is all
+kaibo targets, takes `thinkingLevel`), reasoning depth is per-role effort (with
+`thinkingLevel` as Gemini's effort sink), and `thinking_style` (per slot or
+`[defaults]`) overrides the Anthropic classifier. `max_tokens`/`thinking_budget`
+are per-slot tunables — if a provider caps output low, cap that slot, not the
+global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
 - **Anthropic adaptive boundary is empirical.** `is_anthropic_adaptive` flips Opus
   4.6+/Sonnet 4.6/Fable 5 to adaptive (the rest stay enabled-budget). Add ids as models
   ship, or set `thinking_style` on the slot to override; confirm a new id with the

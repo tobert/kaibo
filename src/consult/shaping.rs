@@ -13,19 +13,6 @@ use crate::credentials::ProviderKind;
 /// Anthropic additionally *requires* `max_tokens > budget_tokens`.
 pub const THINKING_BUDGET: u64 = 8192;
 
-/// Does this Gemini id belong to the *pure* 3-line (e.g. `gemini-3-pro-preview`),
-/// which takes `thinkingLevel` rather than the 2.5-era `thinkingBudget`?
-///
-/// The boundary is **empirical, not nominal**: `gemini-3.5-flash` *accepted*
-/// `thinkingBudget` in the 2026-06-06 live test, so switching it to `thinkingLevel`
-/// would be a silent regression of a working default. We only flip the ids the
-/// official API + gemini-cli confirm want a level — `gemini-3-…` — and leave the
-/// `3.5` minor line (and 2.x) on budget. Any new id past these wants a live probe,
-/// not a guess. See `docs/issues.md` "Per-model request shaping".
-fn is_gemini3_level(model: &str) -> bool {
-    model == "gemini-3" || model.starts_with("gemini-3-")
-}
-
 /// The per-role thinking-depth lever for the models that expose one as a request
 /// param (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`).
 /// A passthrough string the provider validates — like a model id — so a new level
@@ -36,13 +23,12 @@ pub const DEFAULT_EFFORT: &str = "high";
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
 /// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
 ///
-/// **Empirical — confirm by probe** (the discipline of [`is_gemini3_level`]): Opus
-/// 4.7/4.8 and Fable 5 *reject* enabled/budget and sampling outright (400); Opus 4.6 /
-/// Sonnet 4.6 take adaptive too — it's the recommended shape, `budget_tokens` is
-/// deprecated there. Everything older, and Haiku 4.5, stays on enabled/budget. Matched
-/// by `contains` (not `starts_with`, unlike `is_gemini3_level`) so a vendor-prefixed id
-/// still resolves. Add ids as they ship; a slot (or `[defaults]`) can force a tier
-/// via `thinking_style`.
+/// **Empirical — confirm by probe**: Opus 4.7/4.8 and Fable 5 *reject* enabled/budget
+/// and sampling outright (400); Opus 4.6 / Sonnet 4.6 take adaptive too — it's the
+/// recommended shape, `budget_tokens` is deprecated there. Everything older, and Haiku
+/// 4.5, stays on enabled/budget. Matched by `contains` so a vendor-prefixed id still
+/// resolves. Add ids as they ship; a slot (or `[defaults]`) can force a tier via
+/// `thinking_style`.
 fn is_anthropic_adaptive(model: &str) -> bool {
     ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"]
         .iter()
@@ -145,10 +131,11 @@ enum ThinkingStyle {
     AnthropicBudget,
     /// Anthropic 4.6+: `{thinking:{type:"adaptive"}}` + `output_config.effort`.
     AnthropicAdaptive,
-    /// Gemini 3-line: `generationConfig.thinkingConfig.thinkingLevel`.
+    /// Gemini (3.x+): `generationConfig.thinkingConfig.thinkingLevel`. kaibo supports
+    /// the Gemini 3-line and newer only — the whole line takes a level; the legacy
+    /// 2.5-era `thinkingBudget` knob is not modeled (a pre-3.x id would emit a level
+    /// and fail loud at the provider, the intended "unsupported" signal).
     GeminiLevel,
-    /// Gemini 2.5/3.5: `generationConfig.thinkingConfig.thinkingBudget`.
-    GeminiBudget,
     /// DeepSeek V4 hybrids: `{thinking:{type:"enabled"}, reasoning_effort:<role>}`.
     DeepSeekEffort,
     /// OpenRouter's unified reasoning param: `{reasoning:{effort:<role>}}`. The gateway
@@ -228,13 +215,12 @@ impl ModelShape {
                     ThinkingStyle::AnthropicBudget
                 }
             }
-            ProviderKind::Gemini => {
-                if is_gemini3_level(model) {
-                    ThinkingStyle::GeminiLevel
-                } else {
-                    ThinkingStyle::GeminiBudget
-                }
-            }
+            // kaibo targets the Gemini 3-line and newer, whose whole family takes
+            // `thinkingLevel` (Google's current thinking doc lists level for 3-pro /
+            // 3-flash / 3.1-pro / 3.5-flash and drops `thinkingBudget` entirely — that
+            // knob is the retired 2.5-era shape). So every Gemini id routes to level;
+            // the per-role effort rides it. A pre-3.x id fails loud, not silent.
+            ProviderKind::Gemini => ThinkingStyle::GeminiLevel,
             ProviderKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
             ProviderKind::OpenRouter => ThinkingStyle::OpenRouterEffort,
             ProviderKind::Openai => ThinkingStyle::None,
@@ -255,16 +241,14 @@ impl ModelShape {
         }
     }
 
-    /// Does this shape have a sink for a `thinking_budget` tunable? Only the two
-    /// explicit-budget styles emit it (`budget_tokens` / `thinkingBudget`); the
-    /// effort-driven styles (Anthropic adaptive, the Gemini 3-line, DeepSeek) and the
-    /// toggle-less openai path ignore a budget entirely. Lets the `kaibo://config`
-    /// render flag a per-slot `thinking_budget` that will never leave the process.
+    /// Does this shape have a sink for a `thinking_budget` tunable? Only the
+    /// Anthropic legacy-budget style emits one (`budget_tokens`); every other style —
+    /// the effort-driven ones (Anthropic adaptive, Gemini's `thinkingLevel`, DeepSeek,
+    /// OpenRouter) and the toggle-less openai path — ignores a budget entirely. Lets the
+    /// `kaibo://config` render flag a per-slot `thinking_budget` that will never leave
+    /// the process.
     pub fn sinks_thinking_budget(&self) -> bool {
-        matches!(
-            self.thinking,
-            ThinkingStyle::AnthropicBudget | ThinkingStyle::GeminiBudget
-        )
+        matches!(self.thinking, ThinkingStyle::AnthropicBudget)
     }
 
     /// Does this shape have a sink for an `effort` tunable? Only the effort-driven
@@ -367,21 +351,15 @@ impl ModelShape {
                 obj.insert("output_config".into(), json!({ "effort": effort }));
             }
             ThinkingStyle::GeminiLevel => {
-                // The 3-line's depth lever IS the per-role effort: the values align
-                // ("high"/"low" are valid levels; the default "high" matches
-                // gemini-cli's investigator, rig deserializes it to
-                // ThinkingLevel::High), and like every effort it's a passthrough
-                // string the provider validates. Dropping it for a hardcoded
-                // "high" would silently ignore a slot's `effort = "low"`.
+                // Gemini's depth lever IS the per-role effort: the values align (Google's
+                // thinking doc lists `minimal|low|medium|high` across the 3-line; the
+                // default "high" matches gemini-cli's investigator, rig deserializes it to
+                // ThinkingLevel::High), and like every effort it's a passthrough string
+                // the provider validates. Dropping it for a hardcoded "high" would
+                // silently ignore a slot's `effort = "low"`.
                 obj.insert(
                     "generationConfig".into(),
                     json!({ "thinkingConfig": { "thinkingLevel": effort, "includeThoughts": true } }),
-                );
-            }
-            ThinkingStyle::GeminiBudget => {
-                obj.insert(
-                    "generationConfig".into(),
-                    json!({ "thinkingConfig": { "thinkingBudget": budget, "includeThoughts": true } }),
                 );
             }
             ThinkingStyle::DeepSeekEffort => {
@@ -516,6 +494,51 @@ mod tests {
             params["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
         );
+    }
+
+    /// Every Gemini slot kaibo actually ships routes the per-role effort as
+    /// `thinkingLevel` — including the ones a nominal `gemini-3-…` substring test would
+    /// miss: the `-latest` aliases the built-in casts pin
+    /// (`gemini-flash-lite-latest`/`gemini-pro-latest`/`gemini-flash-latest`, no
+    /// `gemini-3` substring at all) and the concrete 3.x previews with a *dot* after the
+    /// 3 (`gemini-3.1-pro-preview`, `gemini-3.5-flash`). Google's thinking doc lists
+    /// `thinkingLevel` across the whole 3-line, so it's the native depth knob and the
+    /// sink the effort lever rides. The classifier must reach all of them; a shape that
+    /// dropped effort into a fixed `thinkingBudget` would silently ignore a slot's
+    /// `effort = "low"`. This asserts the effort reaches the wire as the level, and no
+    /// budget rides along.
+    #[test]
+    fn configured_gemini_ids_take_the_effort_as_thinking_level() {
+        // The literal ids kaibo classifies from (config.rs `default_models` + the
+        // built-in `gemini-batch` cast), plus the concrete 3.x previews they resolve to.
+        let ids = [
+            "gemini-flash-lite-latest", // built-in Gemini explorer default
+            "gemini-3.5-flash",         // built-in gemini synth default
+            "gemini-pro-latest",        // built-in gemini-batch synth
+            "gemini-flash-latest",      // a -latest alias with no version in the id
+            "gemini-3.1-pro-preview",   // a dotted 3.x id the old dash test missed
+        ];
+        for id in ids {
+            let shape = ModelShape::resolve(ProviderKind::Gemini, id, ThinkingStyleOverride::Auto);
+            assert!(
+                shape.sinks_effort(),
+                "{id}: a Gemini slot must route the per-role effort, not drop it"
+            );
+            assert!(
+                !shape.sinks_thinking_budget(),
+                "{id}: Gemini has no budget sink — a per-slot thinking_budget is inert"
+            );
+            let params = shape.to_params(8192, None, None, "low").unwrap();
+            let cfg = &params["generationConfig"]["thinkingConfig"];
+            assert_eq!(
+                cfg["thinkingLevel"], "low",
+                "{id}: the slot's effort must land as thinkingLevel"
+            );
+            assert!(
+                cfg.get("thinkingBudget").is_none(),
+                "{id}: Gemini takes the level, not a fixed budget"
+            );
+        }
     }
 
     /// OpenRouter's unified reasoning knob: the per-role effort must land as
