@@ -879,3 +879,8 @@ debugging a missing-key error needs to see what source the backend is pointing a
 See `docs/config.example.toml` for the full, commented surface, and `docs/casts.md`
 for the design record of the backends/casts split (including how a cast resolves
 into per-phase arms).
+
+All three "help me set up models" surfaces have a CLI mirror, for a caller with no MCP
+client at all: `kaibo config` prints this resolved state, `kaibo example-config`
+prints the annotated template, and `kaibo configure [goal]` prints the same guided
+walkthrough as the `configure` MCP prompt.

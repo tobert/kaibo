@@ -104,7 +104,9 @@ const PROMPTS_CAST_URI_TEMPLATE: &str = "kaibo://prompts/{cast}";
 /// `docs/config.example.toml`, embedded at compile time so it ships *inside* the
 /// binary — `cargo install kaibo` lays down no docs, so reading the file at runtime
 /// would 404 at exactly the fresh-install moment the example matters most.
-const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.example.toml");
+/// `pub(crate)` so `kaibo example-config` (`cli.rs`) can print the exact same string
+/// the `kaibo://config/example` resource serves — one source, no drift.
+pub(crate) const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.example.toml");
 
 /// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
 /// its wall-clock backstop: the per-request reqwest deadline should fire first (a
@@ -2456,7 +2458,7 @@ const CONFIGURE_PROMPT_NAME: &str = "configure";
 /// casts) instead of restating the manual, so "configure kaibo" is a grounded flow
 /// rather than freehand. Positive framing throughout — name the good idiom, not the
 /// prohibition (the house prompt discipline, see AGENTS.md).
-const CONFIGURE_PROMPT_BODY: &str = "\
+const CONFIGURE_PROMPT_INTRO_MCP: &str = "\
 You're configuring **kaibo**, the MCP server you're connected to right now — it lends \
 your work a second opinion from models outside your own family. This sets up which \
 models it uses.
@@ -2467,6 +2469,15 @@ Work through these steps:
    • `kaibo://config/example` — the annotated config.toml template, every knob explained.
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
+";
+
+/// Steps 2-5, channel-neutral (which provider, what roster shape, keeping secrets out
+/// of the file, and the optional read-scope widening) — the substance both the MCP
+/// `configure` prompt and `kaibo configure` (CLI) share verbatim, so a future edit to
+/// the roster-design guidance can't drift between the two front doors. Each caller
+/// wraps it in its own channel-specific opening (how to *read* kaibo's own config) and
+/// closing (how to make kaibo *pick up* the written file).
+const CONFIGURE_STEPS_CORE: &str = "\
 2. Ask me which providers I can actually reach before writing anything: which of \
 Anthropic / DeepSeek / Gemini / OpenRouter I hold API keys for, and whether I run any \
 OpenAI-compatible local servers (llama.cpp, Ollama, an image server) and at what base \
@@ -2502,8 +2513,32 @@ diff, a log, a generated file you dropped somewhere — name that directory in \
 `[server] allow_paths` (`$VAR` / `${VAR}` and a leading `~` expand, resolving per machine). \
 It's a deliberate opt-in worth asking me about first, since it widens what a consult can \
 read (and can ship to a model).
+";
+
+const CONFIGURE_PROMPT_OUTRO_MCP: &str = "\
 6. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
 the config and keys — both load once at startup.";
+
+/// The CLI-flavored opening/step-1: kaibo's own config surfaces read as plain
+/// subcommands, no MCP client needed — the whole reason `kaibo configure` exists is
+/// for a caller that may not have MCP resource access at all.
+const CONFIGURE_PROMPT_INTRO_CLI: &str = "\
+You're configuring **kaibo** — it lends your work a second opinion from models outside \
+your own family. This sets up which models it uses.
+
+Work through these steps:
+
+1. Read kaibo's own config surfaces first, no MCP client needed:
+   • `kaibo example-config` — the annotated config.toml template, every knob explained.
+   • `kaibo config` — the resolved live state: the casts and backends that exist now, \
+and where each key is sourced from.
+";
+
+const CONFIGURE_PROMPT_OUTRO_CLI: &str = "\
+6. When the file is written, you're done — kaibo re-reads `config.toml` fresh on every \
+invocation, so the very next `kaibo consult` (or any other subcommand) picks it up. \
+Only reconnect something if you're *also* running kaibo as a long-lived MCP server \
+elsewhere — that process still loads config once at startup.";
 
 /// The prompts kaibo advertises (`list_prompts`). Currently just `configure`.
 fn kaibo_prompts() -> Vec<Prompt> {
@@ -2537,12 +2572,10 @@ fn kaibo_prompt_messages(
 ) -> Result<GetPromptResult, McpError> {
     match name {
         CONFIGURE_PROMPT_NAME => {
-            // A blank/whitespace goal reads as "no goal" — don't append an empty line.
-            let goal = arguments
-                .and_then(|a| a.get("goal"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
+            // Blank/whitespace-vs-absent is normalized in `append_configure_goal` (the
+            // one gate both this MCP path and the CLI's `run_configure` go through), so
+            // this just extracts the raw value.
+            let goal = arguments.and_then(|a| a.get("goal")).and_then(|v| v.as_str());
             Ok(GetPromptResult {
                 description: Some("Configure kaibo's models for this codebase".to_string()),
                 messages: vec![PromptMessage::new_text(
@@ -2558,14 +2591,42 @@ fn kaibo_prompt_messages(
     }
 }
 
-/// The `configure` body, with an optional caller `goal` appended verbatim.
-fn configure_prompt_text(goal: Option<&str>) -> String {
-    let mut body = String::from(CONFIGURE_PROMPT_BODY);
-    if let Some(goal) = goal {
+/// Appends an optional caller `goal` to a rendered configure body — shared by the MCP
+/// prompt and the CLI text so the goal-weaving behavior can't diverge between them. A
+/// blank/whitespace-only goal reads as "no goal" (trimmed and filtered here, the one
+/// gate both callers go through) — a CLI caller's `kaibo configure ""` or `"   "` gets
+/// the same clean output as the MCP prompt's blank-goal case, not a dangling
+/// "My goal for this setup:" line.
+fn append_configure_goal(mut body: String, goal: Option<&str>) -> String {
+    if let Some(goal) = goal.map(str::trim).filter(|s| !s.is_empty()) {
         body.push_str("\n\nMy goal for this setup: ");
         body.push_str(goal);
     }
     body
+}
+
+/// The `configure` MCP prompt body, with an optional caller `goal` appended verbatim.
+/// `pub(crate)` so tests reach it directly. The CLI equivalent is
+/// [`configure_prompt_text_cli`] — same [`CONFIGURE_STEPS_CORE`] roster-design
+/// guidance, wrapped in this channel's opening/closing (MCP resource reads, reconnect
+/// the server) rather than the CLI's (plain subcommands, nothing to reconnect).
+pub(crate) fn configure_prompt_text(goal: Option<&str>) -> String {
+    let body =
+        format!("{CONFIGURE_PROMPT_INTRO_MCP}{CONFIGURE_STEPS_CORE}{CONFIGURE_PROMPT_OUTRO_MCP}");
+    append_configure_goal(body, goal)
+}
+
+/// The `kaibo configure` CLI text — the same [`CONFIGURE_STEPS_CORE`] roster-design
+/// guidance as the MCP `configure` prompt (so an edit to the substance can't drift
+/// between the two front doors), wrapped in CLI-flavored framing: kaibo's own config
+/// surfaces read as plain subcommands (no MCP client needed — the whole reason this
+/// command exists), and no "reconnect the server" step, since a one-shot CLI
+/// invocation re-reads `config.toml` fresh every time. `pub(crate)` so `cli.rs`'s
+/// `kaibo configure` prints it.
+pub(crate) fn configure_prompt_text_cli(goal: Option<&str>) -> String {
+    let body =
+        format!("{CONFIGURE_PROMPT_INTRO_CLI}{CONFIGURE_STEPS_CORE}{CONFIGURE_PROMPT_OUTRO_CLI}");
+    append_configure_goal(body, goal)
 }
 
 /// The URI templates kaibo advertises: per-builtin help and per-cast prompts, each
@@ -4557,6 +4618,58 @@ mod tests {
             !text.contains("My goal for this setup:"),
             "a blank goal must not append an empty goal line; body:\n{text}"
         );
+    }
+
+    /// `kaibo configure` (CLI) must point a caller at the plain subcommands it can
+    /// actually reach, never the MCP resource URIs the whole command exists to work
+    /// around — but it must still carry the same roster-design substance (the shared
+    /// [`CONFIGURE_STEPS_CORE`]) as the MCP prompt, so a CLI-only reader isn't shorted.
+    #[test]
+    fn configure_prompt_text_cli_points_at_subcommands_not_mcp_resources() {
+        let text = configure_prompt_text_cli(None);
+        for needle in [
+            "kaibo example-config", // read the annotated template
+            "kaibo config",         // and the resolved live state
+            "config.toml",          // write target
+            "api_key_env",          // keys-by-reference, not inline
+            "both within it",       // shared roster-design substance
+        ] {
+            assert!(
+                text.contains(needle),
+                "kaibo configure should mention {needle:?}; body:\n{text}"
+            );
+        }
+        for unreachable in [CONFIG_EXAMPLE_URI, CONFIG_URI] {
+            assert!(
+                !text.contains(unreachable),
+                "kaibo configure must not point a CLI-only caller at an MCP resource \
+                 URI it may not be able to reach ({unreachable:?}); body:\n{text}"
+            );
+        }
+    }
+
+    /// Same goal-weaving contract as the MCP prompt ([`configure_prompt_weaves_in_a_goal`]):
+    /// a supplied goal appears verbatim, and blank/whitespace reads as absent. Also covers
+    /// an *empty* string (`Some("")`, not just whitespace) — clap hands `run_configure` a
+    /// raw `Option<String>` straight from `argv` with no upstream trim/filter (unlike the
+    /// MCP path's `kaibo_prompt_messages`), so `append_configure_goal` is the only gate;
+    /// this pins that it actually catches the empty case, not just whitespace.
+    #[test]
+    fn configure_prompt_text_cli_weaves_in_a_goal_and_filters_blank_or_empty() {
+        let with_goal = configure_prompt_text_cli(Some("a local-only privacy cast"));
+        assert!(
+            with_goal.contains("a local-only privacy cast"),
+            "a supplied goal must appear in the CLI text; body:\n{with_goal}"
+        );
+
+        for blank in [None, Some(""), Some("   ")] {
+            let text = configure_prompt_text_cli(blank);
+            assert!(
+                !text.contains("My goal for this setup:"),
+                "a blank/empty/absent goal ({blank:?}) must not append an empty goal \
+                 line; body:\n{text}"
+            );
+        }
     }
 
     /// An unknown prompt name is a loud `invalid_params`, never a silent empty prompt

@@ -229,6 +229,8 @@ human at a terminal can drive kaibo directly:
 | `run_kaish` | `kaibo kaish -c 'script'` |
 | `batch_submit`, `job_get`/`job_list` (batch handles) | `kaibo batch submit \| get \| list` |
 | `kaibo://config` resource | `kaibo config` |
+| `kaibo://config/example` resource | `kaibo example-config` |
+| `configure` prompt | `kaibo configure [goal]` |
 
 ```sh
 kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
@@ -315,8 +317,12 @@ The prompt leans on two MCP resources kaibo serves, which you can also read dire
   live, what's gated, where each key is sourced from.
 
 Prompts and resources are plain MCP — any client that surfaces them can use them. If
-yours doesn't render `configure` as a command, read `kaibo://config/example`
-directly and write the TOML yourself.
+yours doesn't render `configure` as a command, or you're driving kaibo purely through
+the CLI with no MCP client at all, both surfaces are also plain subcommands:
+**`kaibo configure [goal]`** prints the same guided walkthrough (pointed at these
+subcommands instead of MCP resource URIs you may not be able to reach), and **`kaibo
+example-config`** prints the annotated template verbatim — `kaibo example-config >
+~/.config/kaibo/config.toml` is a starting point to edit by hand.
 
 ---
 

@@ -54,6 +54,8 @@ async fn main() -> Result<()> {
             std::process::exit(kaibo::cli::run_batch(cli.common, args).await)
         }
         Some(Command::Config) => std::process::exit(kaibo::cli::run_config(cli.common)),
+        Some(Command::Configure(args)) => std::process::exit(kaibo::cli::run_configure(args.goal)),
+        Some(Command::ExampleConfig) => std::process::exit(kaibo::cli::run_example_config()),
     }
 }
 
