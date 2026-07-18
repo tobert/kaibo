@@ -272,7 +272,10 @@ the git log. Each later release appends a new section at the top.
   `run_phase` span carries `gen_ai.request.thinking` — the exact reasoning/sampling blob
   it shipped (Gemini's `thinkingLevel`, an Anthropic adaptive `effort`, a DeepSeek
   `reasoning_effort`) — so a trace shows *whether and at what depth* thinking was on, the
-  wire truth behind each `chat` span's `reasoning_tokens`.
+  wire truth behind each `chat` span's `reasoning_tokens`. The **batch** lane is equally
+  legible: a `batch_submit` span records the same `gen_ai.request.thinking` (the forced
+  `BATCH_EFFORT` shape) plus the `model` and item count, so a batch fan-out shows what it
+  shipped even though it's assembled outside `run_phase`.
 - **A failed provider doesn't fail your turn.** When a model or its provider misbehaves
   (a 429/529 overload, a connection reset, a wedged backend that hits the
   `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the
