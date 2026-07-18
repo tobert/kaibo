@@ -180,6 +180,31 @@ pub fn batch_shaping(
     (max_tokens, params)
 }
 
+/// The batch-lane analog of the `run_phase` span (`consult/engine.rs`): a `batch_submit`
+/// span carrying the resolved request shape, so a trace shows what a batch shipped —
+/// `model`, the item count, and `gen_ai.request.thinking` (the forced thinking/effort
+/// blob from [`batch_shaping`], e.g. Gemini's `thinkingLevel` at [`BATCH_EFFORT`]). The
+/// batch request is assembled outside `run_phase`, so without this the batch lane is
+/// wire-invisible where the interactive lane is legible.
+///
+/// Sync, and returns the span (rather than an `#[instrument]` on the network-bound
+/// `submit`) so it owns *both* the field declaration and the record and is fully
+/// unit-testable without a live submit; each provider's `submit` holds it for the call's
+/// lifetime. Inert with no exporter — a disabled span skips the `%model` format and the
+/// `record` is a no-op — and a toggle-less shape (`params == None`) records nothing.
+fn batch_request_span(model: &str, params: Option<&Value>, items: usize) -> tracing::Span {
+    let span = tracing::info_span!(
+        "batch_submit",
+        model = %model,
+        items = items,
+        gen_ai.request.thinking = tracing::field::Empty,
+    );
+    if let Some(p) = params {
+        span.record("gen_ai.request.thinking", tracing::field::display(p));
+    }
+    span
+}
+
 /// Build one Anthropic message `content` for a prompt plus the shared attachments.
 /// With no attachments it stays a plain string (the unchanged wire shape — a bare
 /// prompt). With attachments it becomes a content-block array: the attachments first
@@ -663,6 +688,9 @@ impl BatchProvider for AnthropicBatch {
         if items.is_empty() {
             return Err(anyhow!("a batch needs at least one prompt"));
         }
+        // Record the resolved batch request shape (held for the submit's lifetime) — the
+        // batch-lane analog of run_phase's gen_ai.request.thinking.
+        let _span = batch_request_span(&self.model, self.params.as_ref(), items.len());
         let body = anthropic_batch_body(
             &self.model,
             self.max_tokens,
@@ -1171,6 +1199,9 @@ impl BatchProvider for GeminiBatch {
         if items.is_empty() {
             return Err(anyhow!("a batch needs at least one prompt"));
         }
+        // Record the resolved batch request shape (held for the submit's lifetime) — the
+        // batch-lane analog of run_phase's gen_ai.request.thinking.
+        let _span = batch_request_span(&self.model, self.params.as_ref(), items.len());
         let body = gemini_batch_body(self.max_tokens, system, &self.params, attachments, items);
         let url = format!(
             "{}/models/{}:batchGenerateContent",
@@ -1953,6 +1984,146 @@ mod tests {
         assert_eq!(
             params["generationConfig"]["thinkingConfig"]["thinkingLevel"], BATCH_EFFORT,
             "the 3-line forces BATCH_EFFORT as thinkingLevel: {params}"
+        );
+    }
+
+    /// The `batch_submit` span makes the batch lane wire-legible like `run_phase`: it must
+    /// record `model` and the resolved `gen_ai.request.thinking` blob (here a Gemini
+    /// `thinkingLevel` at `BATCH_EFFORT`), and record *no* thinking field for a toggle-less
+    /// shape (`params == None`). Discriminating on both edges, so a regression that drops
+    /// the field or records it unconditionally fails one branch. `batch_request_span` owns
+    /// both the field declaration and the record, so this covers the exact production
+    /// span-builder without a live submit.
+    #[test]
+    fn batch_submit_span_carries_the_thinking_params() {
+        use crate::test_support::serialized_capture;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        fn dbg_str(v: &dyn std::fmt::Debug) -> String {
+            format!("{v:?}")
+        }
+        #[derive(Default)]
+        struct Grab {
+            model: Option<String>,
+            thinking: Option<String>,
+        }
+        impl tracing::field::Visit for Grab {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                match f.name() {
+                    "model" => self.model = Some(dbg_str(v)),
+                    "gen_ai.request.thinking" => self.thinking = Some(dbg_str(v)),
+                    _ => {}
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Stored {
+            model: Option<String>,
+            thinking: Option<String>,
+        }
+        /// One closed `batch_submit` span's `(model, thinking)`.
+        type Captured = (Option<String>, Option<String>);
+        /// Collects each closed `batch_submit` span's fields.
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<Vec<Captured>>>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Cap {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if attrs.metadata().name() != "batch_submit" {
+                    return;
+                }
+                let mut g = Grab::default(); // model lands here (%model at creation)
+                attrs.record(&mut g);
+                ctx.span(id).unwrap().extensions_mut().insert(Stored {
+                    model: g.model,
+                    thinking: g.thinking, // Empty at open — the record fills it below.
+                });
+            }
+            fn on_record(
+                &self,
+                id: &tracing::Id,
+                values: &tracing::span::Record<'_>,
+                ctx: Context<'_, S>,
+            ) {
+                let mut g = Grab::default();
+                values.record(&mut g);
+                if let (Some(t), Some(span)) = (g.thinking, ctx.span(id)) {
+                    if let Some(st) = span.extensions_mut().get_mut::<Stored>() {
+                        st.thinking = Some(t);
+                    }
+                }
+            }
+            fn on_close(&self, id: tracing::Id, ctx: Context<'_, S>) {
+                let span = ctx.span(&id).unwrap();
+                if span.name() != "batch_submit" {
+                    return;
+                }
+                let (m, t) = span
+                    .extensions()
+                    .get::<Stored>()
+                    .map(|s| (s.model.clone(), s.thinking.clone()))
+                    .unwrap_or_default();
+                self.0.lock().unwrap().push((m, t));
+            }
+        }
+
+        // The on-theme Gemini batch shape: thinkingLevel forced to BATCH_EFFORT.
+        let (_max, params) = batch_shaping(
+            ProviderKind::Gemini,
+            "gemini-pro-latest",
+            &tunables("low", 100),
+        );
+        let expected = params.expect("gemini carries a thinking block").to_string();
+        assert!(
+            expected.contains("thinkingLevel"),
+            "fixture must be the level blob, got {expected}"
+        );
+
+        let cap = Cap::default();
+        serialized_capture(async {
+            let sub = tracing_subscriber::registry().with(cap.clone());
+            let _g = tracing::subscriber::set_default(sub);
+            // Positive: a real Gemini shape → model + thinking recorded.
+            let (_m, params) = batch_shaping(
+                ProviderKind::Gemini,
+                "gemini-pro-latest",
+                &tunables("low", 100),
+            );
+            drop(batch_request_span(
+                "gemini-pro-latest",
+                params.as_ref(),
+                3,
+            ));
+            // Negative: no thinking block → the field stays absent.
+            drop(batch_request_span("poll-only", None, 1));
+        });
+
+        let seen = cap.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both spans closed, got {seen:?}");
+        let pos = seen
+            .iter()
+            .find(|(m, _)| m.as_deref() == Some("gemini-pro-latest"))
+            .expect("the gemini submit span");
+        assert_eq!(
+            pos.1.as_deref(),
+            Some(expected.as_str()),
+            "the batch_submit span must record the exact thinking blob"
+        );
+        let neg = seen
+            .iter()
+            .find(|(m, _)| m.as_deref() == Some("poll-only"))
+            .expect("the toggle-less span");
+        assert!(
+            neg.1.is_none(),
+            "a toggle-less shape records no thinking blob, got {:?}",
+            neg.1
         );
     }
 
