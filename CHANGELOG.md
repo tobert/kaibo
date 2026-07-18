@@ -434,6 +434,20 @@ the git log. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A truncated batch answer no longer masquerades as a finished one.** When a batch
+  item hit its output-token budget mid-response — most often a big attached-file review
+  where max-effort thinking spends the whole budget before the answer is written — kaibo
+  presented whatever text came back as a clean result, with no signal it was cut off. A
+  caller skimming for findings could mistake a truncated reasoning fragment (no verdict,
+  no structure) for "the model found little." kaibo now reads each item's finish reason
+  (Gemini `finishReason`, Anthropic `stop_reason`): a clean finish is unchanged, but a
+  truncated or policy-halted one is flagged — the partial text is kept under a loud
+  `⚠️ INCOMPLETE` banner naming the reason, and an item that produced no answer at all
+  becomes an honest per-item failure instead of a blank success. The batch preamble also
+  now steers the model to write its conclusion first (reasoning and answer share one
+  output budget), and the example config documents raising a batch cast's `max_tokens`
+  for long reviews. (GH #75)
+
 - **A stalled backend can no longer hang a call overnight.** An interactive
   `consult` / `explore` / `oneshot` now runs under a whole-call wall-clock deadline
   (`call_deadline_secs`, default 1 hour; env `KAIBO_CALL_DEADLINE_SECS`), independent

@@ -375,6 +375,64 @@ fn message_text(message: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Compose one batch item's answer from its assembled text and a *normalized* completion
+/// signal — the shared gate both providers pass their finish reason through. `Ok(())` is a
+/// clean finish; `Err(detail)` names an abnormal one (a truncation or policy halt). The
+/// point is that an abnormal finish is never presented as a clean completion (GH #75):
+///
+/// - clean + text → the answer as-is,
+/// - clean + empty → an honest per-item failure (a completed-but-empty answer is no answer),
+/// - abnormal + empty → a per-item failure naming the finish reason (e.g. the model spent
+///   its whole budget thinking and never reached an answer),
+/// - abnormal + text → the *partial* text kept under a loud INCOMPLETE banner, so a caller
+///   skimming for findings can't mistake a clipped fragment (often trailing reasoning, with
+///   none of the requested structure or verdict) for a finished answer. The text is kept,
+///   not dropped — a genuinely-clipped real answer stays useful — but it announces itself.
+fn finish_gated_answer(text: String, gate: Result<(), String>) -> Result<String, String> {
+    match gate {
+        Ok(()) => {
+            if text.trim().is_empty() {
+                Err("model returned an empty answer".to_string())
+            } else {
+                Ok(text)
+            }
+        }
+        Err(detail) => {
+            if text.trim().is_empty() {
+                Err(format!("model produced no answer — {detail}"))
+            } else {
+                Ok(format!(
+                    "⚠️ INCOMPLETE — {detail}\nThe text below is a truncated fragment, not a \
+                     finished answer (it may be trailing reasoning and is missing any requested \
+                     structure or verdict).\n\n{text}"
+                ))
+            }
+        }
+    }
+}
+
+/// Gate an Anthropic message's `stop_reason`. A toolless batch item finishes cleanly on
+/// `end_turn` / `stop_sequence`; `max_tokens` is the silent-truncation case this guards
+/// against, and any other value (a refusal, an unknown) is likewise abnormal. An absent
+/// reason (a real succeeded message always carries one) is treated as clean — the
+/// empty-text check still catches a genuinely empty response.
+fn anthropic_finish_gate(stop_reason: Option<&str>) -> Result<(), String> {
+    match stop_reason {
+        Some("end_turn") | Some("stop_sequence") | None => Ok(()),
+        Some(reason) => {
+            let note = match reason {
+                "max_tokens" => {
+                    "the response hit its output-token budget before finishing; \
+                    re-run with a higher max_tokens or a narrower prompt"
+                }
+                "refusal" => "the model declined to complete this request",
+                _ => "the response did not complete normally",
+            };
+            Err(format!("stop_reason={reason}: {note}"))
+        }
+    }
+}
+
 /// Parse the JSONL results body: one `{custom_id, result}` per line. A `succeeded`
 /// result yields the message text; `errored`/`canceled`/`expired` yield a per-item
 /// `Err(reason)` so a single bad item is reported, never silently dropped.
@@ -401,7 +459,8 @@ fn parse_results_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
                 let message = result
                     .get("message")
                     .ok_or_else(|| anyhow!("succeeded result has no `message`: {line}"))?;
-                Ok(message_text(message))
+                let stop = message.get("stop_reason").and_then(Value::as_str);
+                finish_gated_answer(message_text(message), anthropic_finish_gate(stop))
             }
             "errored" => {
                 // Prefer the human `error.message`, then its `type`, then the raw blob —
@@ -733,16 +792,20 @@ fn gemini_progress(meta: Option<&Value>) -> (u64, u64) {
     )
 }
 
-/// Join the non-thought `text` parts of a Gemini response's first candidate. With
-/// `includeThoughts` on, the reasoning rides as separate `"thought": true` parts; those
-/// are the model's scratchpad, not its answer, so the answer is the text parts that are
-/// *not* thoughts (a final answer part may still carry a `thoughtSignature` — that's not
-/// a thought part, so it stays).
-fn gemini_message_text(response: &Value) -> String {
-    response
+/// The answer text (non-thought parts joined) plus the candidate's `finishReason`.
+/// Separating the two lets result assembly gate on the finish reason instead of presenting
+/// an incomplete fragment as a clean answer (GH #75). With `includeThoughts` on, the model's
+/// reasoning rides as separate `"thought": true` parts — the scratchpad, not the answer — so
+/// the answer is the text parts that are *not* thoughts. A finished answer part may still
+/// carry a `thoughtSignature`: under a clean `STOP` that's a real answer, so it stays; under
+/// a truncated finish (`MAX_TOKENS`) it's trailing reasoning that lost its `thought` marker,
+/// which the finish-reason gate catches — the signal we can't get from the parts alone.
+fn gemini_candidate(response: &Value) -> (String, Option<String>) {
+    let cand = response
         .get("candidates")
         .and_then(Value::as_array)
-        .and_then(|c| c.first())
+        .and_then(|c| c.first());
+    let text = cand
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array)
@@ -754,7 +817,37 @@ fn gemini_message_text(response: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join("")
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let finish = cand
+        .and_then(|c| c.get("finishReason"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (text, finish)
+}
+
+/// Gate a Gemini `finishReason`. `STOP` is a clean completion; an absent reason (a real
+/// candidate always carries one) is treated as clean too. Every other value is abnormal —
+/// `MAX_TOKENS` is the common one for attached-file reviews at max thinking (the exact
+/// GH #75 case: the whole output budget spent thinking, no answer reached), so its note
+/// points at the fix; the policy halts name themselves.
+fn gemini_finish_gate(finish: Option<&str>) -> Result<(), String> {
+    match finish {
+        Some("STOP") | None => Ok(()),
+        Some(reason) => {
+            let note = match reason {
+                "MAX_TOKENS" => {
+                    "the response hit its output-token budget before finishing — \
+                    common when a big attached-file review spends the budget thinking; re-run \
+                    with a higher max_tokens or a narrower prompt"
+                }
+                "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII" => {
+                    "the provider halted generation on a content policy"
+                }
+                _ => "the response did not complete normally",
+            };
+            Err(format!("finishReason={reason}: {note}"))
+        }
+    }
 }
 
 /// Locate a batch's inlined per-item responses. Gemini puts them in the long-running
@@ -785,7 +878,8 @@ fn parse_gemini_inlined(arr: &[Value]) -> Vec<BatchAnswer> {
                 .unwrap_or("")
                 .to_string();
             let text = if let Some(resp) = el.get("response") {
-                Ok(gemini_message_text(resp))
+                let (answer, finish) = gemini_candidate(resp);
+                finish_gated_answer(answer, gemini_finish_gate(finish.as_deref()))
             } else if let Some(err) = el.get("error") {
                 let detail = err
                     .get("message")
@@ -1619,7 +1713,7 @@ mod tests {
     #[test]
     fn results_jsonl_succeeded_and_failed_per_item() {
         let body = concat!(
-            r#"{"custom_id":"0","result":{"type":"succeeded","message":{"content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}}"#,
+            r#"{"custom_id":"0","result":{"type":"succeeded","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}}"#,
             "\n",
             r#"{"custom_id":"1","result":{"type":"errored","error":{"type":"overloaded"}}}"#,
             "\n",
@@ -1632,11 +1726,47 @@ mod tests {
             answers[0],
             BatchAnswer {
                 custom_id: "0".into(),
+                // A clean `end_turn` passes through untouched — no banner.
                 text: Ok("hello world".into())
             }
         );
         assert!(matches!(&answers[1].text, Err(m) if m.contains("overloaded")));
         assert!(matches!(&answers[2].text, Err(m) if m.contains("expired")));
+    }
+
+    /// An Anthropic item that hit `stop_reason: max_tokens` is *not* a clean completion:
+    /// its partial text is kept but announces itself under an INCOMPLETE banner naming the
+    /// stop reason, so a caller can't mistake a clipped answer for a finished one (GH #75).
+    #[test]
+    fn results_jsonl_max_tokens_is_flagged_incomplete() {
+        let body = concat!(
+            r#"{"custom_id":"0","result":{"type":"succeeded","message":{"stop_reason":"max_tokens","content":[{"type":"text","text":"partial finding, cut off mid-"}]}}}"#,
+            "\n",
+        );
+        let answers = parse_results_jsonl(body).unwrap();
+        let text = answers[0]
+            .text
+            .as_ref()
+            .expect("partial text kept, not an Err");
+        assert!(text.contains("INCOMPLETE"), "banner present: {text}");
+        assert!(text.contains("max_tokens"), "names the stop reason: {text}");
+        assert!(
+            text.contains("partial finding, cut off mid-"),
+            "the partial text is kept, not dropped: {text}"
+        );
+    }
+
+    /// An Anthropic item that truncated before emitting *any* answer text is an honest
+    /// per-item failure naming the stop reason — never a silent empty success.
+    #[test]
+    fn results_jsonl_max_tokens_empty_is_failure() {
+        let body = r#"{"custom_id":"0","result":{"type":"succeeded","message":{"stop_reason":"max_tokens","content":[]}}}"#;
+        let answers = parse_results_jsonl(body).unwrap();
+        assert!(
+            matches!(&answers[0].text, Err(m) if m.contains("no answer") && m.contains("max_tokens")),
+            "empty + truncated is a failure naming the reason: {:?}",
+            answers[0].text
+        );
     }
 
     /// The Anthropic provider refuses any non-Anthropic backend at construction — the
@@ -1977,11 +2107,13 @@ mod tests {
         let v = json!({
             "metadata": { "state": "BATCH_STATE_SUCCEEDED" },
             "response": { "inlinedResponses": { "inlinedResponses": [
-                { "metadata": { "key": "0" }, "response": { "candidates": [ { "content": { "parts": [
-                    { "text": "thinking out loud", "thought": true },
-                    { "text": "the ", "thoughtSignature": "sig" },
-                    { "text": "answer" }
-                ] } } ] } },
+                { "metadata": { "key": "0" }, "response": { "candidates": [ {
+                    "finishReason": "STOP",
+                    "content": { "parts": [
+                        { "text": "thinking out loud", "thought": true },
+                        { "text": "the ", "thoughtSignature": "sig" },
+                        { "text": "answer" }
+                    ] } } ] } },
                 { "metadata": { "key": "1" }, "error": { "code": 7, "message": "permission denied" } }
             ] } }
         });
@@ -1992,9 +2124,114 @@ mod tests {
         };
         assert_eq!(answers.len(), 2);
         assert_eq!(answers[0].custom_id, "0");
-        // Thought part dropped; the two real text parts joined; the signature is irrelevant.
+        // Clean STOP: thought part dropped; the two real text parts joined; a final answer
+        // part keeping its thoughtSignature stays (a signatured part is a real answer under
+        // STOP). No banner.
         assert_eq!(answers[0].text, Ok("the answer".to_string()));
         assert!(matches!(&answers[1].text, Err(m) if m.contains("permission denied")));
+    }
+
+    /// GH #75, ground-truthed against the real durable payload
+    /// (`gemini/batches/laaxe5t0oa9181hhc1y65282fow9fksnpz6i`): a `MAX_TOKENS` batch item
+    /// whose budget was spent thinking. The response has a `thought:true` summary part and a
+    /// *second* non-thought part that carries a `thoughtSignature` but is really trailing
+    /// reasoning — it starts mid-sentence and never reaches the requested structure. The old
+    /// code emitted that fragment as a clean answer; now the finish reason gates it into a
+    /// loud INCOMPLETE banner (the partial text kept, but unmistakably not a finished review).
+    #[test]
+    fn gemini_max_tokens_leaked_reasoning_is_flagged() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_SUCCEEDED" },
+            "response": { "inlinedResponses": { "inlinedResponses": [
+                { "metadata": { "key": "0" }, "response": { "candidates": [ {
+                    "finishReason": "MAX_TOKENS",
+                    "content": { "role": "model", "parts": [
+                        { "text": "**Comprehensive Lexer Review**\nMy task is to review...", "thought": true },
+                        { "text": "has_bracket_pair` is true. The parser will see `Int(1)`, `MinusAlone`.", "thoughtSignature": "Ct8B..." }
+                    ] } } ] } }
+            ] } }
+        });
+        let answers = match parse_gemini_poll(&v).unwrap() {
+            BatchPoll::Done(a) => a,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        let text = answers[0]
+            .text
+            .as_ref()
+            .expect("partial text kept, not an Err");
+        assert!(text.contains("INCOMPLETE"), "banner present: {text}");
+        assert!(
+            text.contains("MAX_TOKENS"),
+            "names the finish reason: {text}"
+        );
+        // The thought *summary* is still dropped; the leaked-reasoning fragment is what's
+        // kept (under the banner) — never presented as a clean answer.
+        assert!(
+            !text.contains("Comprehensive Lexer Review"),
+            "the thought-summary part is still filtered out: {text}"
+        );
+        assert!(
+            text.contains("has_bracket_pair"),
+            "the truncated fragment is kept under the banner: {text}"
+        );
+    }
+
+    /// A `MAX_TOKENS` finish that produced *only* a thought part (no answer text at all) is a
+    /// per-item failure naming the reason — "model produced no answer" beats a blank success.
+    #[test]
+    fn gemini_max_tokens_only_thoughts_is_failure() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_SUCCEEDED" },
+            "response": { "inlinedResponses": { "inlinedResponses": [
+                { "metadata": { "key": "0" }, "response": { "candidates": [ {
+                    "finishReason": "MAX_TOKENS",
+                    "content": { "parts": [
+                        { "text": "still reasoning about the lexer...", "thought": true }
+                    ] } } ] } }
+            ] } }
+        });
+        let answers = match parse_gemini_poll(&v).unwrap() {
+            BatchPoll::Done(a) => a,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        assert!(
+            matches!(&answers[0].text, Err(m) if m.contains("no answer") && m.contains("MAX_TOKENS")),
+            "only-thoughts + truncated is a failure naming the reason: {:?}",
+            answers[0].text
+        );
+    }
+
+    /// The pure finish-gate + compose contract, straight — including the paths the
+    /// inlined-parse tests don't reach (a policy halt, a clean-but-empty answer).
+    #[test]
+    fn finish_gate_and_compose_contract() {
+        // Clean finishes pass text through untouched, both providers.
+        assert!(gemini_finish_gate(Some("STOP")).is_ok());
+        assert!(gemini_finish_gate(None).is_ok());
+        assert!(anthropic_finish_gate(Some("end_turn")).is_ok());
+        assert!(anthropic_finish_gate(Some("stop_sequence")).is_ok());
+        assert_eq!(
+            finish_gated_answer("answer".into(), gemini_finish_gate(Some("STOP"))),
+            Ok("answer".into())
+        );
+        // A clean finish with no text is an honest failure, not a blank success.
+        assert!(
+            matches!(finish_gated_answer(String::new(), Ok(())), Err(m) if m.contains("empty"))
+        );
+        // A policy halt is abnormal and names itself; an empty one is a per-item failure.
+        let safety = gemini_finish_gate(Some("SAFETY"));
+        assert!(matches!(&safety, Err(m) if m.contains("SAFETY") && m.contains("policy")));
+        assert!(
+            matches!(finish_gated_answer(String::new(), safety), Err(m) if m.contains("no answer"))
+        );
+        // A refusal on the Anthropic side likewise gates into a banner with kept text.
+        let out = finish_gated_answer(
+            "as far as I got".into(),
+            anthropic_finish_gate(Some("refusal")),
+        );
+        assert!(
+            matches!(&out, Ok(t) if t.contains("INCOMPLETE") && t.contains("refusal") && t.contains("as far as I got"))
+        );
     }
 
     /// A cancelled batch with no partial results is a [`BatchPoll::Failed`] naming the
