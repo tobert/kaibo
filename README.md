@@ -234,12 +234,11 @@ human at a terminal can drive kaibo directly:
 kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 ```
 
-**Bare `kaibo` with no subcommand is the stdio MCP server**
-`kaibo serve` is the explicit spelling for the same thing and may become required
-in the future.
+**Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
+explicit spelling for the same thing, and may become required in the future.
 
 `consult_submit`/`job_wait` and `deliberate`'s direct lane are not fully implemented
-on the cli yet. [#82](https://github.com/tobert/kaibo/issues/82).
+on the CLI yet — tracked as [#82](https://github.com/tobert/kaibo/issues/82).
 
 **stdout is the answer, stderr is everything else.** Progress, logs, and warnings
 go to stderr, so piping stays clean; the answer (with the same provenance footer
@@ -247,13 +246,14 @@ the MCP tool appends) is the only thing on stdout. `--json` swaps that for a
 structured envelope (`{answer, cast, models, usage, warnings}`) for a script
 caller — its `answer` field is always the model's raw words, never a kaibo notice.
 
-**Exit codes have teeth**, so a caller branches on the code instead of parsing
-prose: `0` an answer, `2` a usage error (bad flag, unknown or wrong-for-the-tool
-cast), `3` a setup/containment rejection (a path outside the allowed set, a
-missing provider key), `4` the work ran and failed at runtime (a provider
-error, a model-loop failure). `kaibo kaish` is the one exception — it passes
-through kaish's own exit code (`0` ok, `126` blocked, `124` timed out) instead,
-since a script branches on *that* to know what the sandboxed command did.
+**Exit codes have defined behavior**, so a caller branches on the code instead
+of parsing prose: `0` an answer, `2` a usage error (bad flag, unknown or
+wrong-for-the-tool cast), `3` a setup/containment rejection (a path outside
+the allowed set, a missing provider key), `4` the work ran and failed at
+runtime (a provider error, a model-loop failure). `kaibo kaish` is the one
+exception — it passes through kaish's own exit code (`0` ok, `126` blocked,
+`124` timed out) instead, since a script branches on *that* to know what the
+sandboxed command did. The same table is in `kaibo --help`.
 
 The shared flags (`--root`, `--allow-path`, `--cast`, `--config`, house-rules
 files, …) work before or after the subcommand and are documented in `kaibo

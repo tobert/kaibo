@@ -105,7 +105,7 @@ project and cannot run external commands.
 ## Working here
 
 - **TDD.** Tests that can and will fail. The sandbox boundary gets failing-first
-  tests — and we prove they have teeth (mount the project writable with
+  tests — and we prove they actually work (e.g. mount the project writable with
   `LocalFs::new` instead of `read_only`, watch the write-denial tests fail).
 - **`docs/sandbox-probes.md` is the read-only/containment audit runbook.** The
   `cargo test` suites are the continuous guard; that doc is how we *live-test* the
@@ -302,7 +302,7 @@ even for a one-line doc fix.
   hand-picked 16 MiB literal with the constant kaish itself documents for embedders
   (`docs/EMBEDDING.md` in the kaish tree); live-probed with `f() { f; }; f`, which now
   fails loudly (`"maximum recursion depth (48) exceeded"`) instead of risking a SIGSEGV.
-  Offline suite green (531 tests), boundary tests still have teeth. Precedent that a bump
+  Offline suite green (531 tests), boundary tests are effective. Precedent that a bump
   *can* move call sites: `0.8.4 → 0.9.0` renamed the `mcp()` config constructors to
   `agent()` in `sandbox.rs`. Keep this current per the **Working here** kaish-bump
   discipline before cutting.
