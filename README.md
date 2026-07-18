@@ -34,9 +34,10 @@ summary back.
 kaibo integrates as a stdio [MCP](https://modelcontextprotocol.io) server and supports
 Anthropic, Gemini, DeepSeek, OpenRouter (one key reaching every major model family),
 and any OpenAI-compatible endpoint, including local services like llama.cpp. It's a
-tool your *agent* uses — any MCP-capable client can drive it. Each
-agent is set up to mix small models for exploration with larger models for synthesis,
-to help keep your API spend down.
+tool your *agent* uses — any MCP-capable client can drive it — and it's also a
+[CLI](#cli) for scripts, CI, and terminals that would rather shell out than speak
+MCP. Each agent is set up to mix small models for exploration with larger models
+for synthesis, to help keep your API spend down.
 
 The agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
 shell. kaish has all of its commands built in and mounts your project through a
@@ -169,6 +170,14 @@ claude mcp add kaibo -- docker run --rm -i \
 - The `:ro` mount is an OS-enforced belt under kaibo's own read-only sandbox:
   kaibo never writes either way, this just makes the kernel agree.
 
+The same image is a [CLI](#cli) too — append a subcommand and drop `-i` (there's no
+stdio transport to hold open for a one-shot run):
+
+```sh
+docker run --rm -v "$PWD:/work:ro" -e DEEPSEEK_API_KEY \
+  ghcr.io/tobert/kaibo:latest consult "what does this project do?" --cast deepseek
+```
+
 The package is public — pulling (and `COPY --from`) needs no registry login.
 The image is signed and attested by the same machinery as the archives — verify
 with `gh attestation verify oci://ghcr.io/tobert/kaibo:<tag> -R tobert/kaibo`,
@@ -206,6 +215,84 @@ for you:
   }
 }
 ```
+
+## CLI
+
+Every tool below is also a command — no MCP client needed, so scripts, CI, and a
+human at a terminal can drive kaibo directly:
+
+| MCP tool | CLI equivalent |
+|---|---|
+| `consult` | `kaibo consult "question" [--cast … --attach … --session … --json]` |
+| `oneshot` | `kaibo oneshot "prompt" [--attach … --json]` (context also via stdin: `oneshot "review this" < diff.txt`) |
+| `explore` | `kaibo explore "question" [--cast … --json]` |
+| `run_kaish` | `kaibo kaish -c 'script'` |
+| `batch_submit`, `job_get`/`job_list` (batch handles) | `kaibo batch submit \| get \| list` |
+| `kaibo://config` resource | `kaibo config` |
+
+```sh
+kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
+```
+
+**Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
+explicit spelling for the same thing, and may become required in the future.
+
+`consult_submit`/`job_wait` and `deliberate`'s direct lane are not fully implemented
+on the CLI yet — tracked as [#82](https://github.com/tobert/kaibo/issues/82).
+
+**stdout is the answer, stderr is everything else.** Progress, logs, and warnings
+go to stderr, so piping stays clean; the answer (with the same provenance footer
+the MCP tool appends) is the only thing on stdout. `--json` swaps that for a
+structured envelope (`{answer, cast, models, usage, warnings}`) for a script
+caller — its `answer` field is always the model's raw words, never a kaibo notice.
+
+**Exit codes have defined behavior**, so a caller branches on the code instead
+of parsing prose: `0` an answer, `2` a usage error (bad flag, unknown or
+wrong-for-the-tool cast), `3` a setup/containment rejection (a path outside
+the allowed set, a missing provider key), `4` the work ran and failed at
+runtime (a provider error, a model-loop failure). `kaibo kaish` is the one
+exception — it passes through kaish's own exit code (`0` ok, `126` blocked,
+`124` timed out) instead, since a script branches on *that* to know what the
+sandboxed command did. The same table is in `kaibo --help`.
+
+The shared flags (`--root`, `--allow-path`, `--cast`, `--config`, house-rules
+files, …) work before or after the subcommand and are documented in `kaibo
+--help`; each subcommand's own flags are in `kaibo <subcommand> --help`.
+
+A `--session NAME` thread and a submitted batch job both stick around between
+runs — see [What kaibo remembers](#what-kaibo-remembers) below for what that
+means and where it lives.
+
+## What kaibo remembers
+
+Most of what kaibo does is a single question in, a single answer out —
+nothing to remember, nothing saved. Two things stick around on your machine,
+and both are things you opted into by name:
+
+- **A conversation you named.** Pass `--session NAME` on the CLI, or
+  `session_id` over MCP, and kaibo keeps that thread's back-and-forth so you
+  can pick it up later — from the CLI, from your MCP client, doesn't matter,
+  they share the same memory. Ask a one-off question with no session name and
+  nothing is kept.
+- **A batch job you submitted.** `batch_submit` (or `kaibo batch submit`)
+  hands back a handle right away; kaibo remembers that handle so `kaibo batch
+  list` (or `job_list`) can find it again later — even after a restart —
+  without you having to keep it written down somewhere.
+
+That's genuinely all of it: no chat history beyond a session you named, no
+file contents, nothing about your project. It lives in one small file on
+your machine, separate from your project, that the read-only models kaibo
+consults never see or touch — by default `~/.local/state/kaibo/state.db`
+(`$XDG_STATE_HOME/kaibo/state.db` if you have that set).
+
+You never have to manage this file. It's a convenience cache, not a record
+you depend on: delete it any time and kaibo just starts fresh, nothing
+breaks. Prefer kaibo forgets everything between runs? `--no-persistence` (or
+`KAIBO_NO_PERSISTENCE`) turns it off entirely. Want it somewhere else?
+`--state-db FILE` (or `KAIBO_STATE_DB`) moves it. The full technical
+contract — exactly which fields are stored, what's deliberately left out,
+and the one platform-specific edge case — is in
+[`docs/config.md`](docs/config.md#persistence-persistence).
 
 ## Configuration
 

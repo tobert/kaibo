@@ -63,6 +63,22 @@ pub const EXIT_SETUP: i32 = 3;
 /// kaish script/blocked/timeout outcome is not this: it returns kaish's own exit code.
 pub const EXIT_CONSULT_FAILURE: i32 = 4;
 
+/// The `EXIT CODES` block appended to `kaibo --help` (long form only — `-h` stays a
+/// terse usage line). This is the one place the taxonomy is spelled out for a human
+/// or script reading `--help` cold, rather than the doc-comments above or the README.
+const EXIT_CODES_HELP: &str = "\
+EXIT CODES
+    0  an answer
+    2  usage error — a bad argument, an unknown or wrong-for-the-tool cast, an
+       image on a vision-blind cast, or a clap argument-parse error
+    3  setup/containment rejection — a path or attachment outside the allowed
+       set, a missing or unbuildable provider key
+    4  the work ran and failed — a provider/model-loop failure, or a kaish
+       worker infra crash
+
+`kaibo kaish` is the one exception: it exits with kaish's own code instead of
+this table (0 ok, 126 blocked, 124 timed out).";
+
 /// kaibo (解剖) — read-only codebase consultation from a model outside your own
 /// family. Ask a question; a capable model (DeepSeek, Gemini, Anthropic, OpenRouter,
 /// or local — pick with `--cast`) reads the project READ-ONLY and answers with
@@ -70,7 +86,7 @@ pub const EXIT_CONSULT_FAILURE: i32 = 4;
 /// (stdio); `kaibo consult` is the one-shot CLI; `kaibo config` prints the resolved
 /// configuration.
 #[derive(Parser, Debug)]
-#[command(name = "kaibo", version)]
+#[command(name = "kaibo", version, after_long_help = EXIT_CODES_HELP)]
 pub struct Cli {
     /// The shared flags (config discovery, containment, cast, house-rules,
     /// persistence). Defined once here as clap `global` args, so they work **before or
@@ -1598,6 +1614,28 @@ mod tests {
     #[test]
     fn clap_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `kaibo --help` (long form) documents the exit-code taxonomy — the only place a
+    /// script author reading `--help` cold learns it. `-h` (short form) stays terse.
+    #[test]
+    fn long_help_documents_exit_codes() {
+        let long_help = Cli::command().render_long_help().to_string();
+        assert!(
+            long_help.contains("EXIT CODES"),
+            "long --help should carry the exit-code table:\n{long_help}"
+        );
+        for code in ["0  an answer", "2  usage error", "3  setup/containment", "4  the work ran"] {
+            assert!(
+                long_help.contains(code),
+                "long --help should document exit code {code:?}:\n{long_help}"
+            );
+        }
+        let short_help = Cli::command().render_help().to_string();
+        assert!(
+            !short_help.contains("EXIT CODES"),
+            "short -h should stay terse, not carry the full exit-code table"
+        );
     }
 
     #[test]
