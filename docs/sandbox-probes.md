@@ -215,7 +215,7 @@ cargo test --test containment --test sandbox --test run_kaish_tool
 ```
 
 These prove the same four properties with failing-first fixtures (and we prove the
-fixtures have teeth — e.g. mount the project with `LocalFs::new` instead of
+fixtures actually work — e.g. mount the project with `LocalFs::new` instead of
 `read_only` and watch the write-denial tests fail). A green run here plus a clean
 live battery is the bar for trusting the read-only claim.
 
@@ -245,3 +245,15 @@ toolset has drifted from the direct one and that's the bug.
   probe re-run on the local `openai` cast (gemma4, after raising its window to 131072)
   reproduced the direct results exactly. Update this line each pass; git history is
   the rest of the record.
+- **2026-07-18** — Batteries A/B/C direct via `kaibo kaish` (built binary, base
+  commit `c1267bd` + the `kaish-kernel` 0.12.0 → 0.13.0 bump, branch
+  `chore/kaish-0.13.0`), specifically to spot-check that bump against the sandbox
+  boundary. All clear: every write in Battery A refused with `permission denied:
+  filesystem is read-only` and nothing landed on real disk; every external command
+  in Battery B came back `command not found` (exit 127); every out-of-mount read in
+  Battery C (`/etc/passwd`, `..` traversal, `~/.ssh`, the adjacent-secret probe) came
+  back `not found`, and `env`/the key-var check came back empty. Full `cargo test`
+  (598 passed) green on the same build. Batteries D/E (path containment, the
+  persistence store) not re-run live this pass — unaffected by a kaish-kernel bump
+  and already covered by `tests/containment.rs`/`tests/store.rs` in that same green
+  run.

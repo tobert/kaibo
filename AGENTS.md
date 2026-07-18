@@ -282,27 +282,21 @@ even for a one-line doc fix.
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't
   verify is theater, so prove it the way a user would.
-- **kaish pin.** Currently `kaish-kernel = "0.12.0"`. The `0.11.0 → 0.12.0` bump was
-  again API-compatible — **zero** call-site changes, `cargo build`/`clippy`/`cargo tree -i
-  aws-lc-rs` all clean. The changelog's **BREAKING (embedders)** entries all land on
-  compiled-out or unused surface: `ExecContext.tool_schemas` moving `Vec<ToolSchema>` →
-  `Arc<[ToolSchema]>` only bites direct field assignment (kaibo never constructs
-  `ExecContext`), and `JobStatus`/`JobInfo`/`ToolResult` going `#[non_exhaustive]` (plus
-  the new `JobStatus::Latched` variant and `LatchRequest.job_id`) only bites background
-  jobs and confirmation latches — kaibo compiles with `subprocess`/`host`/`os-integration`
-  off, so `bg`/`fg`/`jobs`/`kill`/`spawn` and the whole latch surface don't exist in this
-  binary. Two things *did* change kaibo's own text and code, both improvements landing
-  for free from upstream fixes: `grep -r PATTERN FILE` (GH #105) now searches the file
-  instead of silently finding nothing, so `KAISH_SANDBOX_ADDENDUM`'s single-file caveat
-  (`kaish_syntax.rs`) was stale and dropped, and the matching `docs/issues.md` tracker
-  entry (already shipped) was deleted. And the new `MAX_RECURSION_DEPTH`
-  (48)/`RECOMMENDED_STACK_SIZE` (12 MiB) matched pair — kaish's own guard against a
-  runaway `$(...)`/shell-function/`.kai`-source recursion overflowing the native stack —
-  is now what sizes `KaishWorker`'s dedicated thread in `sandbox.rs`, replacing a
-  hand-picked 16 MiB literal with the constant kaish itself documents for embedders
-  (`docs/EMBEDDING.md` in the kaish tree); live-probed with `f() { f; }; f`, which now
-  fails loudly (`"maximum recursion depth (48) exceeded"`) instead of risking a SIGSEGV.
-  Offline suite green (531 tests), boundary tests are effective. Precedent that a bump
-  *can* move call sites: `0.8.4 → 0.9.0` renamed the `mcp()` config constructors to
-  `agent()` in `sandbox.rs`. Keep this current per the **Working here** kaish-bump
-  discipline before cutting.
+- **kaish pin.** Currently `kaish-kernel = "0.13.0"`. The `0.12.0 → 0.13.0` bump was
+  again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
+  full `cargo test` (598 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc`
+  both empty. A large release (six crates bumped, ~270 changelog lines: lexer/parser
+  fixes, stricter binary-input handling across several builtins, a browser/wasm target)
+  but its **BREAKING (embedders)** entries all land on surface kaibo doesn't touch:
+  buffered stdin going `Vec<u8>` instead of `String` (`ExecContext::stdin`/
+  `ExecuteOptions::stdin`, `read_stdin_to_string` removed) only bites a caller that
+  feeds/reads kaish's own stdin, which kaibo never does (`cli.rs`'s `--attach`/piped-stdin
+  handling is unrelated CLI-level plumbing, not kaish's `ExecContext`); `ToolArgs::to_argv()`
+  returning `Result` instead of a bare `Vec<String>` only bites a caller that calls it —
+  `Blocked::execute` (`sandbox.rs`) receives a `ToolArgs` parameter but never calls
+  `.to_argv()` on it; and `output_limit::spill_aware_collect` + its private helpers being
+  removed is internal plumbing behind `OutputLimitConfig` (`.agent()`/`.set_limit()`/
+  `.with_output_limit()` in `sandbox.rs`), which the kaish changelog states explicitly is
+  unaffected. Precedent that a bump *can* move call sites: `0.8.4 → 0.9.0` renamed the
+  `mcp()` config constructors to `agent()` in `sandbox.rs`. Keep this current per the
+  **Working here** kaish-bump discipline before cutting.
