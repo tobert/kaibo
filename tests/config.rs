@@ -700,14 +700,16 @@ fn zero_request_timeout_is_rejected_loudly() {
 
 #[test]
 fn an_inverted_thinking_budget_is_rejected_at_the_resolved_slot() {
-    // Anthropic requires max_tokens > thinking_budget; catch the inverted pair at
-    // load, not as a runtime 400 — validated on the slot's RESOLVED values.
+    // The rule (Anthropic requires max_tokens > thinking_budget) binds only where the
+    // model actually *sends* a budget; catch the inverted pair at load, not as a runtime
+    // 400 — validated on the slot's RESOLVED values.
 
-    // Per-slot override pair, inverted.
+    // Per-slot override pair, inverted, on a budget-tier model (Haiku 4.5 sends
+    // `budget_tokens`).
     let err = Config::from_toml_str(
         r#"
         [casts.x]
-        synth = { backend = "anthropic", id = "claude-sonnet-4-6", max_tokens = 1000, thinking_budget = 2000 }
+        synth = { backend = "anthropic", id = "claude-haiku-4-5", max_tokens = 1000, thinking_budget = 2000 }
         "#,
     )
     .unwrap_err();
@@ -715,23 +717,28 @@ fn an_inverted_thinking_budget_is_rejected_at_the_resolved_slot() {
     assert!(msg.contains("thinking_budget (2000)"), "got: {msg}");
     assert!(msg.contains("max_tokens (1000)"), "got: {msg}");
 
-    // The inversion can also arrive purely through [defaults]: a global
-    // max_tokens below the default 8192 budget breaks the built-in anthropic
-    // and gemini slots at resolution time.
+    // The inversion can also arrive purely through [defaults]: a global max_tokens below
+    // the default 8192 budget breaks the built-in budget-tier Anthropic slot (Haiku
+    // explorer) at resolution time.
     let err = Config::from_toml_str("[defaults]\nmax_tokens = 4096\n").unwrap_err();
     assert!(
         format!("{err:#}").contains("thinking_budget"),
         "got: {err:#}"
     );
 
-    // The same inverted pair on a non-thinking-budget kind is accepted.
-    Config::from_toml_str(
-        r#"
-        [casts.x]
-        synth = { backend = "openai-local", id = "m", max_tokens = 1000, thinking_budget = 2000 }
-        "#,
-    )
-    .expect("openai-kind slots have no budget/headroom coupling");
+    // The same inverted pair is accepted where the model sends no budget: the generic
+    // openai path (no thinking toggle), Gemini (takes a `thinkingLevel`), and Anthropic's
+    // adaptive tier (takes an `output_config.effort`) all carry an inert `thinking_budget`.
+    for (backend, id) in [
+        ("openai-local", "m"),
+        ("gemini", "gemini-3.5-flash"),
+        ("anthropic", "claude-sonnet-4-6"),
+    ] {
+        Config::from_toml_str(&format!(
+            "[casts.x]\nsynth = {{ backend = \"{backend}\", id = \"{id}\", max_tokens = 1000, thinking_budget = 2000 }}\n"
+        ))
+        .unwrap_or_else(|e| panic!("{backend}/{id} has no budget sink; the inverted pair must load: {e}"));
+    }
 }
 
 #[test]

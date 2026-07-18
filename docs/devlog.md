@@ -47,6 +47,23 @@ to 3.x; the engine per-arm straddle test — which had leaned on the now-defunct
 *intra-Gemini* budget/level split — was re-aimed at a stronger cross-*provider* straddle
 (Anthropic-adaptive synth vs Gemini-level explorer, structurally disjoint param trees).
 
+The cross-family review earned its keep. DeepSeek's pass came back clean and, usefully,
+independently confirmed `includeThoughts: true` is *not* a stale 2.5-era field — the batch
+`#75` truncation detector depends on those thought parts arriving. GPT (via OpenRouter)
+went deeper and caught what the classifier collapse left behind: the `thinking_budget <
+max_tokens` load check (`config.rs`, `engine.rs::from_slot`) was still gated on
+`ProviderKind::{Anthropic, Gemini}`. Now that Gemini sends no budget, that gate *falsely
+refused* a valid Gemini slot (e.g. `max_tokens = 4096` under the default
+`thinking_budget = 8192`) — and it had always wrongly refused Anthropic *adaptive* slots
+too, whose budget is equally inert. The right gate is the resolved shape's
+`sinks_thinking_budget()`, not the kind: only a style that actually puts a budget on the
+wire can starve the answer. Fixed both sites (TDD: RED on the adaptive/Gemini accept
+cases), plus the doc drift GPT flagged — the effort-taker lists that omitted Gemini, the
+batch example claiming `effort` tunes depth (batch forces it). GPT's remaining note — the
+`kaibo://config` inert-tunables render is lane-blind (a batch slot's forced `effort` shows
+as effective) — is pre-existing and now tracked in `issues.md` beside the sibling
+`thinking_style` render gap, not fixed here.
+
 ## 2026-07-05 — the build bootstrap: never-fired workflow → verified first release, in a day
 
 The release plan (PR #25, `docs/releases.md`) had sat unmerged since 2026-06-25 with its

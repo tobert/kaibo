@@ -211,14 +211,16 @@ impl Arm {
         defaults: &Defaults,
     ) -> Result<Self> {
         let t = slot.tunables(role, defaults);
+        let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
         // Re-assert the budget rule at the single live construction point: config
         // load validates every *configured* slot, but per-call overrides build
         // bare slots that never saw it — an inverted pair must be the same
-        // keyworded boundary error here, not a provider 400 mid-call. Checked
-        // before key resolution so it fires with no key configured.
-        if matches!(backend.kind, ProviderKind::Anthropic | ProviderKind::Gemini)
-            && t.thinking_budget >= t.max_tokens
-        {
+        // keyworded boundary error here, not a provider 400 mid-call. Gate on the
+        // shape's budget sink, not the kind: only a style that puts a budget on the
+        // wire can starve the answer — Gemini (`thinkingLevel`) and Anthropic adaptive
+        // (`output_config.effort`) carry no budget. Checked before key resolution so it
+        // fires with no key configured.
+        if shape.sinks_thinking_budget() && t.thinking_budget >= t.max_tokens {
             return Err(anyhow!(
                 "model {:?} (backend {:?}): thinking_budget ({}) must be < max_tokens \
                  ({}) — reasoning would starve the answer (Anthropic rejects it \
@@ -229,7 +231,7 @@ impl Arm {
                 t.max_tokens
             ));
         }
-        let params = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style).to_params(
+        let params = shape.to_params(
             t.thinking_budget,
             Some(t.temperature),
             Some(t.top_p),
@@ -3290,6 +3292,39 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("thinking_budget"), "got: {msg}");
         assert!(msg.contains("max_tokens"), "got: {msg}");
+    }
+
+    /// The mirror: a shape with no budget sink (Gemini takes a `thinkingLevel`, not a
+    /// budget) carries an inert `thinking_budget`, so an inverted pair can't starve the
+    /// answer and must not be refused here. The arm may still fail later on key
+    /// resolution (no key configured), but never with the inverted-budget error — that
+    /// distinguishes the fix from the pre-gate behavior, which refused Gemini the same
+    /// way it refuses a budget-tier Anthropic slot.
+    #[test]
+    fn arm_from_slot_accepts_an_inverted_budget_with_no_budget_sink() {
+        let defaults = crate::config::Defaults {
+            max_tokens: 4096,
+            thinking_budget: 8192, // inverted vs max_tokens, but inert for Gemini
+            ..crate::config::Defaults::default()
+        };
+        let backend = crate::config::Backend {
+            name: "gemini".into(),
+            kind: ProviderKind::Gemini,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: false,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+        };
+        let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
+        if let Err(e) = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults) {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("thinking_budget"),
+                "Gemini carries no budget; the inverted pair must not be refused: {msg}"
+            );
+        }
     }
 
     /// `run_phase` builds the toolset twice — once for the main loop, again for the

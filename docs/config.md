@@ -185,9 +185,11 @@ The `[defaults]` knobs themselves:
 
 - **`max_tokens` / `thinking_budget`** (16384 / 8192): output headroom and
   reasoning budget. Reasoning eats the *completion* budget, so `max_tokens` must
-  sit well above `thinking_budget` — for slots on Anthropic- or Gemini-kind
-  backends an inverted pair is rejected at load on the slot's *resolved* values
-  (Anthropic would 400 on it mid-call).
+  sit well above `thinking_budget` — for a slot whose model actually *sends* a
+  budget (Anthropic's legacy `budget_tokens` tier) an inverted pair is rejected at
+  load on the slot's *resolved* values (Anthropic would 400 on it mid-call). A slot
+  with no budget sink (Gemini takes a `thinkingLevel`, Anthropic's adaptive tier an
+  effort) carries an inert `thinking_budget`, so the pair isn't checked there.
 - **`explorer_temperature` / `synth_temperature` / `top_p`** (0.1 / 0.3 / 0.95):
   sampling per role — the explorer gathers exact citations, so it runs cold; the
   synth composes the answer, so it gets a touch more room. Sent where a model

@@ -440,11 +440,21 @@ the git log. Each later release appends a new section at the top.
   the bare `gemini-3-…` form — so the `-latest` aliases and the dotted 3.x ids (e.g.
   `gemini-3.1-pro-preview`) fell through to the retired 2.5-era `thinkingBudget` path,
   which pins depth to a fixed number and silently drops the per-role `effort` lever.
-  Setting `effort = "low"` (or `"high"`, `"max"`, …) on a Gemini slot had no effect. kaibo
-  now routes every Gemini id to `thinkingLevel` — the knob Google's current API documents
-  across the whole 3-line — so the effort you configure is the reasoning depth Gemini
-  runs at. (kaibo targets the Gemini 3-line and newer; the legacy 2.5 budget knob is no
-  longer modeled — a pre-3.x id fails loud rather than silently mis-shaping.)
+  Setting `effort = "low"` (or `"high"`, `"max"`, …) on an interactive Gemini slot had no
+  effect. kaibo now routes every Gemini id to `thinkingLevel` — the knob Google's current
+  API documents across the whole 3-line — so an interactive Gemini slot's configured
+  effort is the reasoning depth it runs at. (The batch lane still runs at its own forced
+  max effort, by design. kaibo targets the Gemini 3-line and newer; the legacy 2.5 budget
+  knob is no longer modeled — a pre-3.x id fails loud rather than silently mis-shaping.)
+
+- **A Gemini or Anthropic-adaptive slot with a large `thinking_budget` no longer fails to
+  load.** The `thinking_budget < max_tokens` load check (Anthropic 400s on an inverted
+  pair) was gated on the provider *kind*, so it also rejected slots whose model sends no
+  budget at all — a Gemini slot (takes a `thinkingLevel`) or an Anthropic *adaptive* slot
+  (takes an `output_config.effort`) with, say, `max_tokens = 4096` and the default
+  `thinking_budget = 8192` was refused even though that budget never reaches the wire. The
+  check now gates on whether the resolved model shape actually *sends* a budget, so an
+  inert `thinking_budget` no longer blocks a valid config.
 
 - **A truncated batch answer no longer masquerades as a finished one.** When a batch
   item hit its output-token budget mid-response — most often a big attached-file review

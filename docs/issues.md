@@ -520,6 +520,13 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
   `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
   slot whose kind ignores the override (anything non-Anthropic) renders as if
   effective. Display accuracy only; add it to the inert check alongside the others.
+- **The `inert_tunables` render is lane-blind** (or-gpt review, 2026-07-18): it
+  resolves only the model *shape*, not the slot's `lane`, so a **batch** slot renders
+  `effort` and `temperature` as effective even though `batch_shaping` forces
+  `BATCH_EFFORT` (ignoring the slot's `effort`) and passes `None` sampling. A configured
+  `effort = "low"` on a `lane = "batch"` slot is a silent no-op the render doesn't flag.
+  Same display-accuracy class as the `thinking_style` gap above; make the inert check
+  lane-aware — mark batch `effort` as overridden and batch sampling as inert.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
