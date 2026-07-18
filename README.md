@@ -259,19 +259,40 @@ The shared flags (`--root`, `--allow-path`, `--cast`, `--config`, house-rules
 files, …) work before or after the subcommand and are documented in `kaibo
 --help`; each subcommand's own flags are in `kaibo <subcommand> --help`.
 
-**State: where `--session` lives.** A `--session NAME` thread (and every
-`batch_submit`/`kaibo batch submit` handle) is durable by default, in a small
-[turso](https://github.com/tursodatabase/turso) db at a fixed path kaibo picks —
-`$XDG_STATE_HOME/kaibo/state.db` (`~/.local/state/kaibo/state.db` when unset) —
-never inside your project and never a path a model controls. It's what lets a
-session started over MCP continue on the CLI and back, and a batch handle survive
-a restart. It stores only the lean `(question, answer)` turns of sessions you
-name and each batch's `{backend, provider-id}` — never anything else, and never a
-source of truth: safe to delete, or move it with `--state-db FILE`
-(`KAIBO_STATE_DB`), or skip it for one run with `--no-persistence`
-(`KAIBO_NO_PERSISTENCE`) to go fully in-memory. See
-[Persistence](docs/config.md#persistence-persistence) for the full contract
-(what's excluded, the fail-loud-on-a-bad-path behavior, the one Windows carve-out).
+A `--session NAME` thread and a submitted batch job both stick around between
+runs — see [What kaibo remembers](#what-kaibo-remembers) below for what that
+means and where it lives.
+
+## What kaibo remembers
+
+Most of what kaibo does is a single question in, a single answer out —
+nothing to remember, nothing saved. Two things stick around on your machine,
+and both are things you opted into by name:
+
+- **A conversation you named.** Pass `--session NAME` on the CLI, or
+  `session_id` over MCP, and kaibo keeps that thread's back-and-forth so you
+  can pick it up later — from the CLI, from your MCP client, doesn't matter,
+  they share the same memory. Ask a one-off question with no session name and
+  nothing is kept.
+- **A batch job you submitted.** `batch_submit` (or `kaibo batch submit`)
+  hands back a handle right away; kaibo remembers that handle so `kaibo batch
+  list` (or `job_list`) can find it again later — even after a restart —
+  without you having to keep it written down somewhere.
+
+That's genuinely all of it: no chat history beyond a session you named, no
+file contents, nothing about your project. It lives in one small file on
+your machine, separate from your project, that the read-only models kaibo
+consults never see or touch — by default `~/.local/state/kaibo/state.db`
+(`$XDG_STATE_HOME/kaibo/state.db` if you have that set).
+
+You never have to manage this file. It's a convenience cache, not a record
+you depend on: delete it any time and kaibo just starts fresh, nothing
+breaks. Prefer kaibo forgets everything between runs? `--no-persistence` (or
+`KAIBO_NO_PERSISTENCE`) turns it off entirely. Want it somewhere else?
+`--state-db FILE` (or `KAIBO_STATE_DB`) moves it. The full technical
+contract — exactly which fields are stored, what's deliberately left out,
+and the one platform-specific edge case — is in
+[`docs/config.md`](docs/config.md#persistence-persistence).
 
 ## Configuration
 
