@@ -64,6 +64,44 @@ batch example claiming `effort` tunes depth (batch forces it). GPT's remaining n
 as effective) — is pre-existing and now tracked in `issues.md` beside the sibling
 `thinking_style` render gap, not fixed here.
 
+**Then we made the fix verifiable on the wire.** Validating the collapse meant reading a
+`chat` span's `reasoning_tokens` and *inferring* the request shape — kaibo traced response
+usage, never the outbound request. Amy asked to fix the spans, so the `run_phase` span now
+records `gen_ai.request.thinking`: the exact `additional_params` blob a phase ships
+(thinkingLevel/budget + effort + sampling), declared `Empty` in the instrument and filled
+in the body only when `thinking` is `Some` — inert with no exporter, and a toggle-less
+provider records nothing. With it, the fix stopped being a claim: a live flash-lite →
+`gemini-3.5-flash` → `gemini-pro-latest` ladder each showed `thinkingLevel: "high"` on the
+wire (explorer at `temperature 0.1`, synth at `0.3`, sampling correctly nested in
+`generationConfig`) — every one of which misses the old `gemini-3` prefix and would have
+shipped `thinkingBudget` on main. That also answered the question that started the
+investigation — *were Pro batches thinking-off before?* No: `gemini-pro-latest` fell to a
+fixed `thinkingBudget: 8192` with the per-role effort dropped, so it thought at a flat
+depth and the batch lane's forced effort was ignored; now it's `thinkingLevel` at the
+forced `BATCH_EFFORT`.
+
+Landing the span meant a test that captures it, which meant confronting the callsite-
+interest-poisoning flake `tool_span.rs` had already solved. Rather than a second copy, we
+promoted the fix (`CAPTURE_SERIAL`, `force_multi_dispatcher`, `serialized_capture`) into the
+shared `test_support` module: one serial guard now covers the whole unit-test binary, which
+is the *correct* scope — a `run_phase` capture and a `tool` capture must serialize against
+each other, and it's a *third* no-subscriber test that poisons a callsite, so a per-module
+guard was never enough. The new `run_phase_span_carries_the_thinking_params` discriminates
+on both edges (records the exact Gemini `thinkingLevel` blob with params, records nothing
+without) and was teeth-proven the repo's way — neuter the `record` call, watch it go RED
+(`[None, None]`), restore. Cross-family review of the fold-in ran on `gemini-pro-latest`
+itself (reading the uncommitted worktree), which independently confirmed the field's
+inertness, that sharing one guard *improves* the flake guarantee, and the test's teeth:
+"safe and robustly tested… good to go."
+
+One gap stays open by design: `run_phase` covers the *interactive* lanes. The batch lane
+builds its own request in `batch.rs::gemini_batch_body`, outside `run_phase`, so a live Pro
+*batch* can't be wire-checked the way the interactive ladder was — its
+`thinkingLevel`-at-`BATCH_EFFORT` shape rests on offline tests
+(`gemini_3_line_uses_thinking_level_at_batch_effort`,
+`gemini_shaping_nests_thinking_in_generation_config`). A span in the batch builder is the
+follow-up that would make the batch lane as legible as the interactive one.
+
 ## 2026-07-05 — the build bootstrap: never-fired workflow → verified first release, in a day
 
 The release plan (PR #25, `docs/releases.md`) had sat unmerged since 2026-06-25 with its
