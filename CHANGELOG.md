@@ -451,6 +451,18 @@ the git log. Each later release appends a new section at the top.
   whole-first goes further. Attached files the caller flagged as central keep the
   read-it-ALL directive — there the full cost is deliberate.)
 
+- **The read-only shell now speaks kaish 0.13.** A bug-fix release, inherited for
+  free (no kaibo-side change needed): `wc`/`xxd` now refuse invalid UTF-8 loudly
+  instead of lossy-decoding it into wrong char/word counts or corrupt bytes; a
+  failed `$((...))` arithmetic expansion propagates its real error instead of
+  silently splicing in an empty string; `push` accepts a bracket-path target
+  (`push services[web][tags] item`), not just a top-level name; case patterns
+  accept dash/plus bare words (`--`, `-h|--help) ...`); `printf`/`awk`'s `%Ns`
+  width now pads by display width, so a CJK or emoji argument lines up instead
+  of under-padding; and several heredoc/arithmetic/quoting parser fixes (nested
+  `${X:-${Y}}` defaults, arithmetic inside command substitution, an apostrophe in
+  a heredoc body no longer poisoning later arithmetic).
+
 ### Fixed
 
 - **A Gemini slot's reasoning-effort setting now actually reaches Gemini.** kaibo's

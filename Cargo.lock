@@ -1839,9 +1839,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "743a50dfd43176ebbf9937414d25c0297c388822552d648d7cf4cbcd3ad58df0"
+checksum = "9d1b83e11685a62a96a9a15f67a574db1042e98087d6523d9112c6d302fcbf6d"
 dependencies = [
  "async-trait",
  "ignore",
@@ -1851,18 +1851,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f42b8c076e569b5f43658232f52795362fbb474cb4d1002d2b7de41282cbff11"
+checksum = "f6237b6de41c07f23a2d182f9321131f00dce98240d1d37e8294b269158b9b1d"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1630ff9099d8499c5eb5080e5130b2b07aa2058a528be5bb523e849335c6ebdc"
+checksum = "3e36030288cdb9a235c3ef27f98d63da96d1e06c62949535c6245d0c1d724e75"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1902,13 +1902,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-opentelemetry 0.32.1",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffc5938c7abe6e2101df2d61aecc507ed4ae5ca4975ed1ea76e3c87ccc7feab2"
+checksum = "a1d1852d1bb674446c6d80f7d8d8615d16fbac2adb6b4a5c6b1791081e242826"
 dependencies = [
  "async-trait",
  "clap",
@@ -1917,22 +1918,23 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43846e2eae7ace733e86bc5dea173c08438ce0ecb5f20cc3a8cc8d88bd370bd6"
+checksum = "550e90c247c8fd0815a2224a1bde0a4c6dea7944edc391b1ba2387efeeb3c116"
 dependencies = [
  "base64",
  "serde",
  "serde_json",
  "thiserror",
  "tokio-util",
+ "web-time",
 ]
 
 [[package]]
 name = "kaish-vfs"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d0bb521e87439f50c540dcf712493a2da52718eb2de8abc84fd964ffaa8251b"
+checksum = "acfd478a3979372cecd0416a78a0e8de99da4bb3774b6e683f97281c82351791"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
