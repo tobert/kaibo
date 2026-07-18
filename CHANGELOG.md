@@ -403,6 +403,18 @@ the git log. Each later release appends a new section at the top.
   read-only FAQ; and Backends/Roles/Casts moved below Tools with a one-line "a cast
   is just a named team" opener.
 
+- **The README documents the CLI.** The `kaibo consult`/`oneshot`/`explore`/`kaish`/
+  `batch`/`config` subcommand surface shipped in earlier PRs (#77, #78) with zero
+  README coverage — a reader had no way to discover it existed. A new **CLI** section
+  (an MCP-tool-to-subcommand table, the stdout-is-the-answer/stderr-is-everything-else
+  + `--json` + exit-code contract, and where `--session`/batch-handle state actually
+  lives on disk) now sits right after Installation; the Introduction and the
+  container-image section point at it too (the same image runs as a CLI — drop `-i`,
+  append a subcommand). `consult_submit`/`job_wait` and `deliberate`'s direct lane are
+  the one gap: their job handles are in-memory on a long-running server process, so a
+  one-shot CLI invocation would exit and take the job with it before it could be
+  collected — tracked as [#82](https://github.com/tobert/kaibo/issues/82).
+
 - **The read-only shell under `consult` / `explore` / `run_kaish` speaks kaish 0.12.**
   Native collections land in the toolbox the models drive: list/record literals
   (`xs=[a b c]`, `{port: 8080}`), typed subscripts and slices (`${xs[0]}`, `${r[key]}`,
