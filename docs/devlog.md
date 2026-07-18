@@ -14,6 +14,94 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-18 — Gemini's effort lever was silently disconnected
+
+Investigating batch truncation (#79, already fixed) turned up a *separate* correctness
+bug: the Gemini thinking-knob classifier, `is_gemini3_level`, matched only the bare
+`gemini-3` / `gemini-3-*` form. But every Gemini id kaibo actually ships is a 3.x-line
+model the substring test missed — the `-latest` aliases the built-in casts pin
+(`gemini-flash-lite-latest` explorer, `gemini-pro-latest` batch synth) carry no
+`gemini-3` at all, and the dotted previews they resolve to (`gemini-3.1-pro-preview`)
+put a dot after the 3. All of them fell to the `GeminiBudget` arm, which emits a fixed
+`thinkingBudget` and **drops the per-role `effort`**. A user setting `effort = "low"`/
+`"high"` on a Gemini synth was quietly ignored — no crash, since both knobs are accepted
+on the wire, just the wrong one sent.
+
+The prior code deliberately kept `gemini-3.5-flash` on budget, citing a 2026-06-06 live
+test that confirmed budget *works* there. The flaw in that reasoning: "budget works"
+never established "level fails" — and if both work, `thinkingLevel` is strictly better
+because it carries the effort lever. Rather than re-probe, we went to Google's current
+[thinking doc](https://ai.google.dev/gemini-api/docs/thinking): it lists `thinkingLevel`
+(`minimal|low|medium|high`) across the whole 3-line — 3-pro, 3-flash, **3.5-flash**,
+3.1-pro — and doesn't mention `thinkingBudget` at all; that's the retired 2.5-era knob.
+
+So the fix isn't a wider classifier — it's a *collapse*. Amy's call: kaibo targets the
+Gemini 3-line and newer, and we say so. `ProviderKind::Gemini` always resolves to
+`GeminiLevel`; `is_gemini3_level` and the whole `GeminiBudget` `ThinkingStyle` variant
+are gone (dead surface once nothing produces it — there's no `thinking_style` override
+for Gemini). A pre-3.x id now emits a level and fails loud at the provider, the honest
+"unsupported" signal, over silently mis-shaping. TDD: a failing test pinning the
+configured ids' effort → `thinkingLevel` came first (RED on `gemini-flash-lite-latest`),
+then the collapse turned it green. Dependent tests that used 2.5 ids as fixtures moved
+to 3.x; the engine per-arm straddle test — which had leaned on the now-defunct
+*intra-Gemini* budget/level split — was re-aimed at a stronger cross-*provider* straddle
+(Anthropic-adaptive synth vs Gemini-level explorer, structurally disjoint param trees).
+
+The cross-family review earned its keep. DeepSeek's pass came back clean and, usefully,
+independently confirmed `includeThoughts: true` is *not* a stale 2.5-era field — the batch
+`#75` truncation detector depends on those thought parts arriving. GPT (via OpenRouter)
+went deeper and caught what the classifier collapse left behind: the `thinking_budget <
+max_tokens` load check (`config.rs`, `engine.rs::from_slot`) was still gated on
+`ProviderKind::{Anthropic, Gemini}`. Now that Gemini sends no budget, that gate *falsely
+refused* a valid Gemini slot (e.g. `max_tokens = 4096` under the default
+`thinking_budget = 8192`) — and it had always wrongly refused Anthropic *adaptive* slots
+too, whose budget is equally inert. The right gate is the resolved shape's
+`sinks_thinking_budget()`, not the kind: only a style that actually puts a budget on the
+wire can starve the answer. Fixed both sites (TDD: RED on the adaptive/Gemini accept
+cases), plus the doc drift GPT flagged — the effort-taker lists that omitted Gemini, the
+batch example claiming `effort` tunes depth (batch forces it). GPT's remaining note — the
+`kaibo://config` inert-tunables render is lane-blind (a batch slot's forced `effort` shows
+as effective) — is pre-existing and now tracked in `issues.md` beside the sibling
+`thinking_style` render gap, not fixed here.
+
+**Then we made the fix verifiable on the wire.** Validating the collapse meant reading a
+`chat` span's `reasoning_tokens` and *inferring* the request shape — kaibo traced response
+usage, never the outbound request. Amy asked to fix the spans, so the `run_phase` span now
+records `gen_ai.request.thinking`: the exact `additional_params` blob a phase ships
+(thinkingLevel/budget + effort + sampling), declared `Empty` in the instrument and filled
+in the body only when `thinking` is `Some` — inert with no exporter, and a toggle-less
+provider records nothing. With it, the fix stopped being a claim: a live flash-lite →
+`gemini-3.5-flash` → `gemini-pro-latest` ladder each showed `thinkingLevel: "high"` on the
+wire (explorer at `temperature 0.1`, synth at `0.3`, sampling correctly nested in
+`generationConfig`) — every one of which misses the old `gemini-3` prefix and would have
+shipped `thinkingBudget` on main. That also answered the question that started the
+investigation — *were Pro batches thinking-off before?* No: `gemini-pro-latest` fell to a
+fixed `thinkingBudget: 8192` with the per-role effort dropped, so it thought at a flat
+depth and the batch lane's forced effort was ignored; now it's `thinkingLevel` at the
+forced `BATCH_EFFORT`.
+
+Landing the span meant a test that captures it, which meant confronting the callsite-
+interest-poisoning flake `tool_span.rs` had already solved. Rather than a second copy, we
+promoted the fix (`CAPTURE_SERIAL`, `force_multi_dispatcher`, `serialized_capture`) into the
+shared `test_support` module: one serial guard now covers the whole unit-test binary, which
+is the *correct* scope — a `run_phase` capture and a `tool` capture must serialize against
+each other, and it's a *third* no-subscriber test that poisons a callsite, so a per-module
+guard was never enough. The new `run_phase_span_carries_the_thinking_params` discriminates
+on both edges (records the exact Gemini `thinkingLevel` blob with params, records nothing
+without) and was teeth-proven the repo's way — neuter the `record` call, watch it go RED
+(`[None, None]`), restore. Cross-family review of the fold-in ran on `gemini-pro-latest`
+itself (reading the uncommitted worktree), which independently confirmed the field's
+inertness, that sharing one guard *improves* the flake guarantee, and the test's teeth:
+"safe and robustly tested… good to go."
+
+One gap stays open by design: `run_phase` covers the *interactive* lanes. The batch lane
+builds its own request in `batch.rs::gemini_batch_body`, outside `run_phase`, so a live Pro
+*batch* can't be wire-checked the way the interactive ladder was — its
+`thinkingLevel`-at-`BATCH_EFFORT` shape rests on offline tests
+(`gemini_3_line_uses_thinking_level_at_batch_effort`,
+`gemini_shaping_nests_thinking_in_generation_config`). A span in the batch builder is the
+follow-up that would make the batch lane as legible as the interactive one.
+
 ## 2026-07-05 — the build bootstrap: never-fired workflow → verified first release, in a day
 
 The release plan (PR #25, `docs/releases.md`) had sat unmerged since 2026-06-25 with its

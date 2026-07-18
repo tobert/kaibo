@@ -268,7 +268,11 @@ the git log. Each later release appends a new section at the top.
   tool and a short argument summary; a `run_kaish` span additionally carries
   `kaish.exit_code` and `kaish.output_bytes`, so a trace can distinguish a read that
   *truncated* (exit `3`) at the output cap — and forced narrow re-reads — from one the
-  model chose to slice, rather than every script reading as a plain success.
+  model chose to slice, rather than every script reading as a plain success. Each phase's
+  `run_phase` span carries `gen_ai.request.thinking` — the exact reasoning/sampling blob
+  it shipped (Gemini's `thinkingLevel`, an Anthropic adaptive `effort`, a DeepSeek
+  `reasoning_effort`) — so a trace shows *whether and at what depth* thinking was on, the
+  wire truth behind each `chat` span's `reasoning_tokens`.
 - **A failed provider doesn't fail your turn.** When a model or its provider misbehaves
   (a 429/529 overload, a connection reset, a wedged backend that hits the
   `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the
@@ -433,6 +437,28 @@ the git log. Each later release appends a new section at the top.
   read-it-ALL directive — there the full cost is deliberate.)
 
 ### Fixed
+
+- **A Gemini slot's reasoning-effort setting now actually reaches Gemini.** kaibo's
+  Gemini casts (the default `gemini` synth, the `gemini-batch` Pro synth, the Flash-Lite
+  explorer) all name 3.x-line models, but the thinking-knob classifier recognized only
+  the bare `gemini-3-…` form — so the `-latest` aliases and the dotted 3.x ids (e.g.
+  `gemini-3.1-pro-preview`) fell through to the retired 2.5-era `thinkingBudget` path,
+  which pins depth to a fixed number and silently drops the per-role `effort` lever.
+  Setting `effort = "low"` (or `"high"`, `"max"`, …) on an interactive Gemini slot had no
+  effect. kaibo now routes every Gemini id to `thinkingLevel` — the knob Google's current
+  API documents across the whole 3-line — so an interactive Gemini slot's configured
+  effort is the reasoning depth it runs at. (The batch lane still runs at its own forced
+  max effort, by design. kaibo targets the Gemini 3-line and newer; the legacy 2.5 budget
+  knob is no longer modeled — a pre-3.x id fails loud rather than silently mis-shaping.)
+
+- **A Gemini or Anthropic-adaptive slot with a large `thinking_budget` no longer fails to
+  load.** The `thinking_budget < max_tokens` load check (Anthropic 400s on an inverted
+  pair) was gated on the provider *kind*, so it also rejected slots whose model sends no
+  budget at all — a Gemini slot (takes a `thinkingLevel`) or an Anthropic *adaptive* slot
+  (takes an `output_config.effort`) with, say, `max_tokens = 4096` and the default
+  `thinking_budget = 8192` was refused even though that budget never reaches the wire. The
+  check now gates on whether the resolved model shape actually *sends* a budget, so an
+  inert `thinking_budget` no longer blocks a valid config.
 
 - **A truncated batch answer no longer masquerades as a finished one.** When a batch
   item hit its output-token budget mid-response — most often a big attached-file review

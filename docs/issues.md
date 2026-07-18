@@ -496,17 +496,12 @@ P1 entry):
 `ModelShape` (`consult.rs`) resolves request params per (kind, model), fit per
 *arm* with the slot's tunables via `Arm::from_slot` (each falling back to the
 per-role `[defaults]`). Thinking is model-aware across all providers (Anthropic
-adaptive vs enabled-budget, Gemini 3-line `thinkingLevel` vs 2.5/3.5
-`thinkingBudget`), reasoning depth is per-role effort (with `thinkingLevel` as
-the 3-line's effort sink), and `thinking_style` (per slot or `[defaults]`)
-overrides the Anthropic classifier. `max_tokens`/`thinking_budget` are per-slot
-tunables — if a provider caps output low, cap that slot, not the global, per the
-`large-token-headroom` memory. Remaining knobs on the same seam:
-- **Gemini 3.5 boundary is empirical.** The classifier (`is_gemini3_level`) flips
-  only the pure `gemini-3-*` line to `thinkingLevel`; `gemini-3.5-flash` stays on
-  budget because the 2026-06-06 live test confirmed budget works there. If a future
-  3.5 build *rejects* budget, widen the classifier — but confirm with a live probe,
-  don't guess.
+adaptive vs enabled-budget; Gemini is single-tier — the whole 3-line, which is all
+kaibo targets, takes `thinkingLevel`), reasoning depth is per-role effort (with
+`thinkingLevel` as Gemini's effort sink), and `thinking_style` (per slot or
+`[defaults]`) overrides the Anthropic classifier. `max_tokens`/`thinking_budget`
+are per-slot tunables — if a provider caps output low, cap that slot, not the
+global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
 - **Anthropic adaptive boundary is empirical.** `is_anthropic_adaptive` flips Opus
   4.6+/Sonnet 4.6/Fable 5 to adaptive (the rest stay enabled-budget). Add ids as models
   ship, or set `thinking_style` on the slot to override; confirm a new id with the
@@ -525,6 +520,21 @@ tunables — if a provider caps output low, cap that slot, not the global, per t
   `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
   slot whose kind ignores the override (anything non-Anthropic) renders as if
   effective. Display accuracy only; add it to the inert check alongside the others.
+- **The `inert_tunables` render is lane-blind** (or-gpt review, 2026-07-18): it
+  resolves only the model *shape*, not the slot's `lane`, so a **batch** slot renders
+  `effort` and `temperature` as effective even though `batch_shaping` forces
+  `BATCH_EFFORT` (ignoring the slot's `effort`) and passes `None` sampling. A configured
+  `effort = "low"` on a `lane = "batch"` slot is a silent no-op the render doesn't flag.
+  Same display-accuracy class as the `thinking_style` gap above; make the inert check
+  lane-aware — mark batch `effort` as overridden and batch sampling as inert.
+- **The `inert_tunables` render resolves the shape differently from validation**
+  (deepseek review, 2026-07-18): the render resolves `thinking_style` via
+  `unwrap_or_default()` (→ `Auto`), while the validation/`slot.tunables` path uses the
+  `defaults.thinking_style` fallback — so a `[defaults].thinking_style = "adaptive"` set
+  without a per-slot override is missed by the render, which can mislabel a
+  `thinking_budget`'s inertness on an actually-adaptive Anthropic slot. Display-only,
+  no wire effect. The clean fix for this whole render-accuracy cluster: resolve the
+  slot's shape in the render exactly as `slot.tunables` does.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.

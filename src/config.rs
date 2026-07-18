@@ -33,7 +33,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::consult::{ModelCaps, PromptOverrides, ThinkingStyleOverride};
+use crate::consult::{ModelCaps, ModelShape, PromptOverrides, ThinkingStyleOverride};
 use crate::context::ContextConfig;
 use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
 use crate::orientation::OrientationConfig;
@@ -64,9 +64,10 @@ pub struct Defaults {
     /// lever.
     pub top_p: f64,
     /// Per-role reasoning effort for the models that take one as a request param
-    /// (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`).
-    /// A passthrough string — the provider validates it. Default `"high"` both roles;
-    /// bump a synth slot's `effort` to `"max"`/`"xhigh"` for heavier synth runs.
+    /// (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`,
+    /// Gemini's `thinkingLevel`, OpenRouter's unified `reasoning.effort`). A passthrough
+    /// string — the provider validates it. Default `"high"` both roles; bump a synth
+    /// slot's `effort` to `"max"`/`"xhigh"` for heavier synth runs.
     pub explorer_effort: String,
     pub synth_effort: String,
     /// Force the Anthropic thinking style (`auto`/`adaptive`/`budget`) instead of the
@@ -1219,12 +1220,16 @@ impl Config {
                     }
                 }
                 // Thinking-on kinds need output headroom above the reasoning budget;
-                // Anthropic *requires* max_tokens > budget_tokens (see consult.rs).
-                // Validate the slot's *resolved* values (per-slot override else
-                // defaults) so an inverted pair is caught here, not as a 400 mid-call.
+                // Anthropic *requires* max_tokens > budget_tokens (see consult.rs). The
+                // rule binds only where the budget actually reaches the wire — gate on
+                // the resolved shape's budget sink, not the kind: Gemini takes a
+                // `thinkingLevel` and Anthropic adaptive an `output_config.effort`, so an
+                // inverted pair there is inert, not a starve. Validate the slot's
+                // *resolved* values (per-slot override else defaults) so a real inverted
+                // pair is caught here, not as a 400 mid-call.
                 let kind = backends[&slot.backend].kind;
                 let t = slot.tunables(*role, &defaults);
-                if matches!(kind, ProviderKind::Anthropic | ProviderKind::Gemini)
+                if ModelShape::resolve(kind, &slot.id, t.thinking_style).sinks_thinking_budget()
                     && t.thinking_budget >= t.max_tokens
                 {
                     bail!(
@@ -3711,28 +3716,42 @@ mod tests {
         assert!(err.contains("claimed by both"), "got: {err}");
     }
 
-    /// A slot whose resolved thinking budget would starve its resolved max_tokens
-    /// on a thinking-on kind is caught at load, not as a 400 mid-call.
+    /// A slot whose resolved thinking budget would starve its resolved max_tokens is
+    /// caught at load — but only where the budget actually reaches the wire. The rule
+    /// is an Anthropic legacy-budget requirement (Anthropic 400s on
+    /// `max_tokens <= budget_tokens`); a shape with no budget sink has an inert budget,
+    /// so an inverted pair there is harmless and must load. The gate is the resolved
+    /// shape's budget sink, not the provider kind.
     #[test]
-    fn an_inverted_thinking_budget_is_a_load_error() {
+    fn an_inverted_thinking_budget_is_a_load_error_only_where_the_budget_is_sunk() {
+        // Anthropic legacy-budget tier (Haiku 4.5) puts the budget on the wire → rejected.
         let err = Config::from_toml_str(
             r#"
             [casts.x]
-            synth = { backend = "anthropic", id = "claude-sonnet-4-6", max_tokens = 1000, thinking_budget = 2000 }
+            synth = { backend = "anthropic", id = "claude-haiku-4-5", max_tokens = 1000, thinking_budget = 2000 }
             "#,
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("thinking_budget"), "got: {err}");
         assert!(err.contains("max_tokens"), "got: {err}");
-        // The same pair on a non-thinking-budget kind is accepted.
-        Config::from_toml_str(
-            r#"
-            [casts.x]
-            synth = { backend = "openai-local", id = "m", max_tokens = 1000, thinking_budget = 2000 }
-            "#,
-        )
-        .unwrap();
+        // Shapes with no budget sink accept the same inverted pair — the budget never
+        // leaves the process, so it can't starve anything: Anthropic adaptive (Sonnet
+        // 4.6) expresses depth via `output_config.effort`, Gemini takes a `thinkingLevel`,
+        // and the generic openai path has no thinking toggle at all.
+        for (backend, id) in [
+            ("anthropic", "claude-sonnet-4-6"),
+            ("gemini", "gemini-3.5-flash"),
+            ("openai-local", "m"),
+        ] {
+            Config::from_toml_str(&format!(
+                "[casts.x]\n\
+                 synth = {{ backend = \"{backend}\", id = \"{id}\", max_tokens = 1000, thinking_budget = 2000 }}\n"
+            ))
+            .unwrap_or_else(|e| {
+                panic!("{backend}/{id} has no budget sink; the inverted pair must load: {e}")
+            });
+        }
     }
 
     /// An unknown cast at resolve time names the known casts.

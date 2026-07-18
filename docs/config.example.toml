@@ -95,8 +95,8 @@ synth_temperature    = 0.3
 top_p                = 0.95
 
 # Reasoning depth, per role, for the models that take an effort param (Anthropic
-# adaptive tier, DeepSeek). A passthrough string the provider validates — bump
-# synth_effort to "max"/"xhigh" for heavier runs without a kaibo release.
+# adaptive tier, DeepSeek, Gemini's thinkingLevel, OpenRouter). A passthrough string
+# the provider validates — bump synth_effort to "max"/"xhigh" for heavier runs.
 explorer_effort = "high"
 synth_effort    = "high"
 
@@ -388,8 +388,9 @@ synth    = "gemini/gemini-pro-latest"        # batch-capable synth (Anthropic | 
 # answer — kaibo flags such a result INCOMPLETE with its finishReason rather than passing off
 # the cut-off fragment as a clean answer. Give batch more answer headroom by raising
 # `max_tokens` on the synth slot; it's a floor, so a higher value wins, and mind each model's
-# output ceiling (Gemini Pro is generous; some backends cap lower). `effort` / `thinking_budget`
-# ride the same slot if you want to tune reasoning depth:
+# output ceiling (Gemini Pro is generous; some backends cap lower). Batch forces effort to
+# high and ignores a per-slot `thinking_budget` (Gemini takes a level; Anthropic floors it),
+# so `max_tokens` is the knob worth setting here:
 #   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch", max_tokens = 65536 }
 
 # --- DELIBERATE casts: an interactive explorer PLUS an offline synth. `deliberate` runs

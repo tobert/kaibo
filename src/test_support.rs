@@ -416,3 +416,62 @@ impl crate::progress::ProgressSink for RecordingSink {
             .push(event);
     }
 }
+
+// --- Span-capture harness -----------------------------------------------------
+//
+// Reusable machinery for the crate's tracing-field tests (the `tool` span in
+// `tool_span.rs`, the `run_phase` span in `consult/engine.rs`). Centralized here so
+// every capture test in the lib's unit-test binary shares ONE serial guard and ONE
+// keepalive dispatcher — the correctness reason: two per-module `CAPTURE_SERIAL`s
+// wouldn't serialize a `tool` capture against a `run_phase` capture, and it's a
+// *third* no-subscriber test that poisons a callsite, so the guard must span modules.
+
+/// Serializes the span-capturing tests so their `set_default` installs and teardowns —
+/// which mutate *process-global* tracing state (the callsite interest cache, the
+/// live-dispatcher set, the global max-level) via `Dispatch::new` →
+/// `callsite::register_dispatch` — never interleave with each other. Belt to the
+/// [`force_multi_dispatcher`] suspenders.
+pub static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// A leaked, permanently-registered second dispatcher, established once.
+///
+/// The flake this kills: an `info_span!` callsite registers *lazily*, on first hit.
+/// While tracing's `has_just_one` fast path holds — true whenever ≤1 dispatcher is
+/// registered, which is exactly our case since each test installs a single subscriber —
+/// that first registration computes the callsite's interest from **the registering
+/// thread's current default**, not from the installed subscriber. So when a
+/// no-subscriber test (this binary is full of them) wins the race to first-touch a
+/// captured callsite during a capture test's window, it caches `Interest::never()`
+/// against `NoSubscriber`, gating the span off — an empty capture, the ~5% full-suite
+/// flake. Serializing the capture tests can't prevent that: the poisoning thread is a
+/// *third* test with no subscriber.
+///
+/// Holding a second registered dispatcher forever forces `has_just_one` false, so every
+/// callsite registration instead consults the registered-dispatcher set — which
+/// contains a span-enabling registry — regardless of which thread triggers it. It is
+/// never a thread's default, so it receives no events; it exists only to keep the
+/// registration path honest. Leaked deliberately: it must outlive every test.
+pub fn force_multi_dispatcher() {
+    use std::sync::OnceLock;
+    static KEEPALIVE: OnceLock<()> = OnceLock::new();
+    KEEPALIVE.get_or_init(|| {
+        let keep = tracing::Dispatch::new(tracing_subscriber::registry());
+        std::mem::forget(keep);
+    });
+}
+
+/// Drive an async body to completion on a private current-thread runtime while holding
+/// [`CAPTURE_SERIAL`]. Sync (not `#[tokio::test]`) so the ordering guard isn't held
+/// across an `.await`, and `block_on` polls the future on *this* thread — the one whose
+/// `set_default` is in scope, so the spans route to the test's capture.
+pub fn serialized_capture<F: std::future::Future>(body: F) {
+    let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    force_multi_dispatcher();
+    tokio::runtime::Builder::new_current_thread()
+        // Timers/IO on: a captured body may drive the full consult loop (deadlines,
+        // request timeouts), not just a bare tool call.
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(body);
+}
