@@ -268,7 +268,11 @@ the git log. Each later release appends a new section at the top.
   tool and a short argument summary; a `run_kaish` span additionally carries
   `kaish.exit_code` and `kaish.output_bytes`, so a trace can distinguish a read that
   *truncated* (exit `3`) at the output cap — and forced narrow re-reads — from one the
-  model chose to slice, rather than every script reading as a plain success.
+  model chose to slice, rather than every script reading as a plain success. Each phase's
+  `run_phase` span carries `gen_ai.request.thinking` — the exact reasoning/sampling blob
+  it shipped (Gemini's `thinkingLevel`, an Anthropic adaptive `effort`, a DeepSeek
+  `reasoning_effort`) — so a trace shows *whether and at what depth* thinking was on, the
+  wire truth behind each `chat` span's `reasoning_tokens`.
 - **A failed provider doesn't fail your turn.** When a model or its provider misbehaves
   (a 429/529 overload, a connection reset, a wedged backend that hits the
   `request_timeout`), `consult`/`oneshot` return a *clean tool-result error* naming the

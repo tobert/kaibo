@@ -116,57 +116,13 @@ fn arg_summary(args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::serialized_capture;
     use serde::Deserialize;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::registry::LookupSpan;
     use tracing_subscriber::Layer;
-
-    /// Serializes the span-capturing tests so their `set_default` installs and
-    /// teardowns — which mutate *process-global* tracing state (the callsite interest
-    /// cache, the live-dispatcher set, the global max-level) via
-    /// `Dispatch::new` → `callsite::register_dispatch` — never interleave with each
-    /// other. Belt to the [`force_multi_dispatcher`] suspenders below.
-    static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
-
-    /// A leaked, permanently-registered second dispatcher, established once.
-    ///
-    /// The flake this kills: `info_span!("tool")` registers its callsite *lazily*, on
-    /// first hit. While tracing's `has_just_one` fast path holds — true whenever ≤1
-    /// dispatcher is registered, which is exactly our case since each test installs a
-    /// single subscriber — that first registration computes the callsite's interest
-    /// from **the registering thread's current default**, not from the installed
-    /// subscriber. So when a no-subscriber `consult` test (this binary is full of them)
-    /// wins the race to first-touch the `tool` callsite during a capture test's window,
-    /// it caches `Interest::never()` against `NoSubscriber`, gating the span off — an
-    /// empty capture, the ~5% full-suite flake. Serializing the two capture tests can't
-    /// prevent that: the poisoning thread is a *third* test with no subscriber.
-    ///
-    /// Holding a second registered dispatcher forever forces `has_just_one` false, so
-    /// every callsite registration instead consults the registered-dispatcher set —
-    /// which contains a span-enabling registry — regardless of which thread triggers
-    /// it. It is never a thread's default, so it receives no events; it exists only to
-    /// keep the registration path honest. Leaked deliberately: it must outlive every
-    /// test in the process.
-    ///
-    /// A subtlety worth stating, because it looks like a residual race and isn't: a
-    /// no-subscriber test *can* poison the `tool` callsite to `never` before the first
-    /// capture test runs. But registering a dispatcher (`Dispatch::new` →
-    /// `callsite::register_dispatch`) *rebuilds the interest cache for every already-
-    /// registered callsite* against the live set — so this very call un-poisons `tool`,
-    /// and the test's own `set_default` rebuilds it again. The only window that ever
-    /// mattered was poisoning *after* those rebuilds but before the span fires, by a
-    /// concurrent first-touch under `has_just_one` — which is exactly the window forcing
-    /// `has_just_one` false closes. Hence 0/150 full-suite runs (was ~5%).
-    fn force_multi_dispatcher() {
-        use std::sync::OnceLock;
-        static KEEPALIVE: OnceLock<()> = OnceLock::new();
-        KEEPALIVE.get_or_init(|| {
-            let keep = tracing::Dispatch::new(tracing_subscriber::registry());
-            std::mem::forget(keep);
-        });
-    }
 
     /// A trivial tool to wrap: echoes its `msg`, or errors on "boom".
     struct Echo;
@@ -346,19 +302,6 @@ mod tests {
                 self.0.lock().unwrap().push(row);
             }
         }
-    }
-
-    /// Drive an async body to completion on a private current-thread runtime while
-    /// holding [`CAPTURE_SERIAL`]. Sync (not `#[tokio::test]`) so the ordering guard
-    /// isn't held across an `.await`, and `block_on` polls the future on *this* thread
-    /// — the one whose `set_default` is in scope, so the span routes to our capture.
-    fn serialized_capture<F: std::future::Future>(body: F) {
-        let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        force_multi_dispatcher();
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(body);
     }
 
     /// A success emits a `tool` span tagged with the tool's name, an args summary,

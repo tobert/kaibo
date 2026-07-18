@@ -654,7 +654,20 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 // span and nests under this one, so a phase's whole model loop (every `chat` turn,
 // every `tool` call) hangs off one `run_phase` span carrying the model. Inert
 // unless an exporter is attached (telemetry off → no subscriber records it).
-#[tracing::instrument(name = "run_phase", skip_all, fields(model = %model_name, max_turns = max_turns))]
+#[tracing::instrument(
+    name = "run_phase",
+    skip_all,
+    fields(
+        model = %model_name,
+        max_turns = max_turns,
+        // The resolved wire blob (thinkingLevel/thinkingBudget + effort + sampling) as
+        // actually sent — ground truth for "what reasoning shape shipped", which the
+        // response-usage spans can only hint at. Empty here, filled in the body once it's
+        // known non-None, so a `None` (toggle-less) provider records nothing and
+        // telemetry-off stays a no-op.
+        gen_ai.request.thinking = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn run_phase<M, F>(
     model: &M,
     model_name: &str,
@@ -679,6 +692,13 @@ where
     // the transcript and re-enters here (holistic review, Gemini Pro 2026-06-22).
     let mut prompt: Message = initial_prompt;
     let mut history: Vec<Message> = Vec::new();
+
+    // Surface the exact reasoning/sampling params this phase ships (constant across the
+    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
+    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
 
     loop {
         // Outer turn budget: rig's `max_turns` resets each resume, so subtract the
@@ -2888,6 +2908,158 @@ mod tests {
                 r.additional_params
             );
         }
+    }
+
+    /// The `run_phase` span surfaces the exact reasoning params it ships, so a trace can
+    /// show whether — and at what depth — thinking was on (the wire truth behind the
+    /// `chat` spans' `reasoning_tokens`). Discriminating on both edges: a phase carrying
+    /// `additional_params` records `gen_ai.request.thinking` equal to the blob it sent
+    /// (here the on-theme Gemini `thinkingLevel`), and a toggle-less phase
+    /// (`thinking == None`) records nothing — so a regression that always-records or
+    /// never-records fails one branch. The field is filled in the body via
+    /// `Span::current().record`, so the capture merges `on_record` into per-span state,
+    /// exactly like the `tool` span harness.
+    #[test]
+    fn run_phase_span_carries_the_thinking_params() {
+        use crate::test_support::serialized_capture;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        /// Grabs the one field we care about; a `%display` value lands as a debug value.
+        #[derive(Default)]
+        struct Grab(Option<String>);
+        impl tracing::field::Visit for Grab {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "gen_ai.request.thinking" {
+                    self.0 = Some(format!("{v:?}"));
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Stored(Option<String>);
+        /// Collects, per closed `run_phase` span, whatever `gen_ai.request.thinking` held.
+        #[derive(Clone, Default)]
+        struct PhaseCapture(Arc<Mutex<Vec<Option<String>>>>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for PhaseCapture {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if attrs.metadata().name() != "run_phase" {
+                    return;
+                }
+                let mut g = Grab::default();
+                attrs.record(&mut g); // Empty at open — the body records it later.
+                ctx.span(id).unwrap().extensions_mut().insert(Stored(g.0));
+            }
+            fn on_record(
+                &self,
+                id: &tracing::Id,
+                values: &tracing::span::Record<'_>,
+                ctx: Context<'_, S>,
+            ) {
+                let mut g = Grab::default();
+                values.record(&mut g);
+                if let (Some(v), Some(span)) = (g.0, ctx.span(id)) {
+                    // Only run_phase spans carry a `Stored`; others (chat/tool) no-op.
+                    if let Some(st) = span.extensions_mut().get_mut::<Stored>() {
+                        st.0 = Some(v);
+                    }
+                }
+            }
+            fn on_close(&self, id: tracing::Id, ctx: Context<'_, S>) {
+                let span = ctx.span(&id).unwrap();
+                if span.name() != "run_phase" {
+                    return;
+                }
+                let v = span.extensions().get::<Stored>().and_then(|s| s.0.clone());
+                self.0.lock().unwrap().push(v);
+            }
+        }
+
+        // A driver that delegates one sweep then answers; the sweep returns a report.
+        // Same shape as the request-shaping tests — the mock ignores the blob's content,
+        // we only assert what the span recorded.
+        fn client() -> ScriptedClient {
+            const SYNTH: &str = "gemini-3.5-flash";
+            const EXPLORER: &str = "gemini-flash-lite-latest";
+            ScriptedClient::builder()
+                .on_model(SYNTH, |req| {
+                    if transcript_text(req).contains("REPORT") {
+                        Ok(text_response("ANSWER"))
+                    } else {
+                        Ok(tool_call_response("s1", "explore", json!({ "question": "q" })))
+                    }
+                })
+                .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
+                .build()
+        }
+        const SYNTH: &str = "gemini-3.5-flash";
+        const EXPLORER: &str = "gemini-flash-lite-latest";
+
+        // On-theme: the Gemini 3-line thinkingLevel blob — the very shape PR 80 routes.
+        let expected =
+            thinking_params(ProviderKind::Gemini, SYNTH, 8192).expect("gemini sends params");
+        let expected_str = expected.to_string();
+        assert!(
+            expected_str.contains("thinkingLevel"),
+            "fixture must be the level blob, got {expected_str}"
+        );
+
+        // Positive: both arms carry the blob → every run_phase span records it.
+        let cap = PhaseCapture::default();
+        serialized_capture(async {
+            let sub = tracing_subscriber::registry().with(cap.clone());
+            let _g = tracing::subscriber::set_default(sub);
+            let cl = client();
+            let dir = project_with_marker();
+            consult_with(
+                "q",
+                dir.path(),
+                &arm_with(&cl, EXPLORER, Some(expected.clone())),
+                &arm_with(&cl, SYNTH, Some(expected.clone())),
+                &ConsultConfig::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let seen = cap.0.lock().unwrap().clone();
+        assert!(
+            seen.len() >= 2,
+            "both the driver and its sweep must emit a run_phase span, got {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|v| v.as_deref() == Some(expected_str.as_str())),
+            "every run_phase span must record the exact thinking blob, got {seen:?}"
+        );
+
+        // Negative: no params → the field stays Empty → recorded as absent.
+        let cap = PhaseCapture::default();
+        serialized_capture(async {
+            let sub = tracing_subscriber::registry().with(cap.clone());
+            let _g = tracing::subscriber::set_default(sub);
+            let cl = client();
+            let dir = project_with_marker();
+            consult_with(
+                "q",
+                dir.path(),
+                &arm(&cl, EXPLORER),
+                &arm(&cl, SYNTH),
+                &ConsultConfig::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let seen = cap.0.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "run_phase spans must still have fired");
+        assert!(
+            seen.iter().all(|v| v.is_none()),
+            "a toggle-less phase must record no thinking blob, got {seen:?}"
+        );
     }
 
     /// The per-phase payoff: when a cast's synth and explorer straddle a thinking-shape
