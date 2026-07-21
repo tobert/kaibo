@@ -71,9 +71,13 @@ Connection knobs only — models never live here:
   local llama.cpp servers, an Ollama box) be live at once, each its own name.
   A *new* openai-kind backend must set it: the `OPENAI_BASE_URL`/local-default
   fallback belongs to the built-in `openai-local` backend alone, so a forgotten
-  `base_url` is a load error, not a silent dial of the wrong server. For the
-  keyed kinds rig fixes the endpoint, so a `base_url` there is a config error,
-  surfaced loudly — not silently ignored.
+  `base_url` is a load error, not a silent dial of the wrong server. It is also
+  meaningful — but *optional* — for `kind = "anthropic"`: unset still resolves to
+  rig's built-in `https://api.anthropic.com`; set, it points the Anthropic wire
+  protocol at any Anthropic-Messages-API-compatible gateway/proxy instead (a
+  corporate LLM gateway, say). For every *other* keyed kind rig fixes the
+  endpoint, so a `base_url` there is a config error, surfaced loudly — not
+  silently ignored.
 - A backend resolves its key from `api_key_env` then `api_key_file` (env wins).
   **Secrets never live inline in the TOML** — only the *name* of an env var or the
   *path* to a key file. A config you can commit or paste shouldn't leak a key.
@@ -296,7 +300,7 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 
 | backend | kind | base_url | key env / file | aliases |
 |---|---|---|---|---|
-| `anthropic` | anthropic | — | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
+| `anthropic` | anthropic | — *(optional)* | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
 | `deepseek` | deepseek | — | `DEEPSEEK_API_KEY` / `~/.deepseek-key` | — |
 | `gemini` | gemini | — | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
 | `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
@@ -856,9 +860,11 @@ operator) the full picture:
   `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope`
 - `defaults` — the global tunables every slot falls back to (rendered so the
   per-slot values below read as deltas against it)
-- `backends` — each connection: its kind, the *resolved* `base_url` (openai kind),
-  key source env var name and key file path (never the resolved key value),
-  `key_optional`, and `request_timeout_secs`
+- `backends` — each connection: its kind, `base_url` (the *resolved* value for the
+  openai kind — env/local-default fallback applied; the raw configured value,
+  when set, for the anthropic kind; absent for every other kind), key source env
+  var name and key file path (never the resolved key value), `key_optional`, and
+  `request_timeout_secs`
 - `backend_aliases` / `cast_aliases` — alias → canonical name, built-in and
   file-declared both: every name a `cast` param, slot ref, or per-call backend
   override will resolve

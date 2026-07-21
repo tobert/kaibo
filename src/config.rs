@@ -411,8 +411,11 @@ pub struct Backend {
     pub name: String,
     /// Which wire protocol / rig client to construct.
     pub kind: ProviderKind,
-    /// Endpoint base URL. Meaningful only for `kind = Openai`; a `Some` on any keyed
-    /// kind is rejected at load (rig fixes those endpoints).
+    /// Endpoint base URL. Meaningful for `kind = Openai` (required for a new
+    /// backend) and `kind = Anthropic` (optional — unset falls back to rig's
+    /// built-in `https://api.anthropic.com`, e.g. for an Anthropic-Messages-API
+    /// -compatible gateway/proxy). A `Some` on any other keyed kind is rejected
+    /// at load (rig fixes those endpoints).
     pub base_url: Option<String>,
     /// Env var to read the API key from (checked before `api_key_file`).
     pub api_key_env: Option<String>,
@@ -1083,11 +1086,17 @@ impl Config {
                     b.name
                 );
             }
-            // A base_url on a keyed kind: rig fixes those endpoints.
-            if b.kind != ProviderKind::Openai && b.base_url.is_some() {
+            // A base_url on a keyed kind: rig fixes those endpoints — except Anthropic,
+            // which also accepts one (for an Anthropic-Messages-API-compatible
+            // gateway/proxy in front of the real backend), optionally: unset still
+            // dials rig's built-in https://api.anthropic.com.
+            if b.kind != ProviderKind::Openai
+                && b.kind != ProviderKind::Anthropic
+                && b.base_url.is_some()
+            {
                 bail!(
-                    "backend {:?} (kind {:?}) sets base_url, but only the `openai` kind \
-                     has a configurable endpoint",
+                    "backend {:?} (kind {:?}) sets base_url, but only the `openai` and \
+                     `anthropic` kinds have a configurable endpoint",
                     b.name,
                     b.kind
                 );
@@ -3641,7 +3650,7 @@ mod tests {
     }
 
     /// A new backend must declare a kind; redeclaring a different kind on an
-    /// existing one is a loud error; base_url is openai-kind only.
+    /// existing one is a loud error; base_url is openai/anthropic-kind only.
     #[test]
     fn backend_stanza_validation_is_loud() {
         let err = Config::from_toml_str("[backends.mine]\nbase_url = \"http://x\"\n")
@@ -3654,10 +3663,26 @@ mod tests {
             .to_string();
         assert!(err.contains("already exists as kind"), "got: {err}");
 
-        let err = Config::from_toml_str("[backends.anthropic]\nbase_url = \"http://x\"\n")
+        // A keyed kind other than anthropic still rejects base_url — rig fixes
+        // that endpoint.
+        let err = Config::from_toml_str("[backends.gemini]\nbase_url = \"http://x\"\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("only the `openai` kind"), "got: {err}");
+        assert!(err.contains("only the `openai` and `anthropic` kinds"), "got: {err}");
+    }
+
+    /// The anthropic kind, uniquely among the keyed kinds, may set base_url — for
+    /// an Anthropic-Messages-API-compatible gateway/proxy in front of the real
+    /// backend. Unset still resolves to rig's built-in api.anthropic.com (proven
+    /// by the builtin_anthropic_cast_and_backend-style tests having no base_url).
+    #[test]
+    fn anthropic_backend_accepts_a_base_url() {
+        let cfg = Config::from_toml_str(
+            "[backends.anthropic]\nbase_url = \"http://ai.example.ts.net\"\n",
+        )
+        .unwrap();
+        let b = cfg.backends.get("anthropic").unwrap();
+        assert_eq!(b.base_url.as_deref(), Some("http://ai.example.ts.net"));
     }
 
     /// A backend name containing '/' is refused at load. Both the slot ref

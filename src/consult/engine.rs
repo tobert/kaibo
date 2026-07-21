@@ -256,9 +256,15 @@ impl Arm {
 
         match backend.kind {
             ProviderKind::Anthropic => {
+                // base_url is optional here (unlike the openai kind): unset dials
+                // rig's built-in https://api.anthropic.com; set, it points at an
+                // Anthropic-Messages-API-compatible gateway/proxy instead.
                 let key = backend.resolve_key()?;
-                let client = anthropic::Client::builder()
-                    .api_key(&key)
+                let mut builder = anthropic::Client::builder().api_key(&key);
+                if let Some(base_url) = backend.base_url.as_deref() {
+                    builder = builder.base_url(base_url);
+                }
+                let client = builder
                     .http_client(http)
                     .build()
                     .map_err(|e| anyhow!("anthropic client init: {e}"))?;

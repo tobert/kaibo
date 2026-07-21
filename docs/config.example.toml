@@ -196,8 +196,11 @@ scratch_limit_bytes = 67108864
 #
 # Keys are referenced, never inlined: api_key_env names an env var, api_key_file a
 # path (~ ok). env wins over file. key_optional=true falls back to a placeholder
-# bearer token (keyless local servers). base_url is only legal on the openai kind
-# (rig fixes the keyed endpoints — a base_url there is a loud load error).
+# bearer token (keyless local servers). base_url is legal on the openai kind
+# (required for a new backend) and the anthropic kind (optional — unset still
+# dials rig's built-in api.anthropic.com; set it to point at an Anthropic-
+# Messages-API-compatible gateway/proxy instead). Every other keyed kind rejects
+# base_url at load (rig fixes those endpoints).
 # ---------------------------------------------------------------------------
 
 # --- The five built-ins, shown with their current defaults. You only need to
@@ -210,6 +213,10 @@ scratch_limit_bytes = 67108864
 kind = "anthropic"
 api_key_env  = "ANTHROPIC_API_KEY"
 api_key_file = "~/.anthropic-key.txt"
+# Uncomment to dial an Anthropic-Messages-API-compatible gateway/proxy (e.g. a
+# corporate LLM gateway) instead of api.anthropic.com directly. Optional —
+# unlike the openai kind, unset still resolves to rig's built-in endpoint.
+# base_url = "https://llm-gateway.example.internal"
 
 [backends.deepseek]
 kind = "deepseek"
