@@ -1508,7 +1508,8 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         kind,
         // No base_url baked in: `resolved_base_url` supplies the default (or
         // OPENAI_BASE_URL, for the openai kind) at use-time, keeping construction
-        // pure. A keyed kind with an explicit base_url is rejected in `merge`.
+        // pure. Every keyed kind except anthropic rejects an explicit base_url
+        // at load (see the validation loop above); anthropic's is optional.
         base_url: None,
         api_key_env: Some(kind.env_var().to_string()),
         api_key_file: Some(format!("~/{}", kind.key_file_name())),

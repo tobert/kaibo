@@ -3283,6 +3283,40 @@ mod tests {
         );
     }
 
+    /// An anthropic-kind backend pointed at a custom `base_url` (an Anthropic-
+    /// Messages-API-compatible gateway/proxy, auth via network identity rather than
+    /// a real key) must still build offline, exactly like the keyless openai arm
+    /// above — proving the conditional `.base_url(...)` call in the Anthropic arm
+    /// of `Arm::from_slot` doesn't disturb the builder chain (the ordering a
+    /// cross-family review flagged for a closer look).
+    #[test]
+    fn arm_from_slot_builds_an_anthropic_arm_with_a_custom_base_url() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "anthropic".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: Some("https://gateway.example.ts.net".into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+        };
+        let slot = ModelSlot::bare("anthropic", "claude-sonnet-4-6");
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyless anthropic arm with a custom base_url builds offline");
+        assert_eq!(arm.model, "claude-sonnet-4-6");
+
+        // An anthropic backend with no base_url must still build (the default
+        // rig endpoint applies) — the conditional branch must not be required.
+        let default_backend = crate::config::Backend {
+            base_url: None,
+            ..backend
+        };
+        Arm::from_slot(&default_backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyless anthropic arm with no base_url still builds offline");
+    }
+
     /// The OpenRouter arm's full params assembly — `to_params` chained through
     /// `inject_output_budget` at the single live construction point. The reasoning
     /// object (thinking on by default), the rig-defect budget workaround, and the

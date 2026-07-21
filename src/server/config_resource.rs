@@ -183,7 +183,9 @@ pub(crate) fn render_config_resource(
         kind: String,
         /// Resolved endpoint for openai-kind backends (explicit base_url, else
         /// OPENAI_BASE_URL, else the built-in default) — the "resolved runtime
-        /// state" promise. Other kinds have fixed endpoints baked into rig.
+        /// state" promise. The raw configured value for anthropic-kind backends,
+        /// when set (an Anthropic-Messages-API-compatible gateway/proxy); absent
+        /// otherwise. Every other kind has a fixed endpoint baked into rig.
         #[serde(skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
         /// Env var name whose value is the API key (checked first). The NAME, not
