@@ -613,17 +613,33 @@ fn alias_collisions_are_loud_at_each_level() {
 
 #[test]
 fn base_url_on_a_keyed_backend_is_rejected() {
-    // rig fixes the keyed kinds' endpoints; a base_url there is a config mistake.
+    // rig fixes most keyed kinds' endpoints; a base_url there is a config mistake.
+    // (Anthropic is the one exception — see `anthropic_backend_accepts_a_base_url`.)
     let err = Config::from_toml_str(
         r#"
-        [backends.anthropic]
+        [backends.gemini]
         base_url = "https://example.test/v1"
         "#,
     )
     .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("base_url"), "got: {msg}");
-    assert!(msg.contains("only the `openai` kind"), "got: {msg}");
+    assert!(msg.contains("only the `openai` and `anthropic` kinds"), "got: {msg}");
+}
+
+#[test]
+fn anthropic_backend_accepts_a_base_url() {
+    // Unlike the other keyed kinds, anthropic may point at a compatible
+    // gateway/proxy (e.g. a corporate LLM gateway) instead of api.anthropic.com.
+    let cfg = Config::from_toml_str(
+        r#"
+        [backends.anthropic]
+        base_url = "https://example.test/v1"
+        "#,
+    )
+    .unwrap();
+    let b = cfg.backends.get("anthropic").unwrap();
+    assert_eq!(b.base_url.as_deref(), Some("https://example.test/v1"));
 }
 
 #[test]

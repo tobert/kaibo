@@ -48,8 +48,10 @@ use crate::attach::Attachment;
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot, SlotTunables};
 use crate::credentials::ProviderKind;
 
-/// Anthropic's API base. The keyed Anthropic backend carries no `base_url` (rig fixes
-/// its endpoint), so batch addresses the service directly.
+/// Anthropic's default API base, used when the backend sets no `base_url` of its own
+/// (the common case — rig fixes the endpoint for most keyed kinds, but the anthropic
+/// kind may override it to dial an Anthropic-Messages-API-compatible gateway/proxy;
+/// see [`AnthropicBatch::base_url`]).
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 
 /// The effort batch runs every item at — the maxed knob. Equal to
@@ -594,6 +596,7 @@ pub fn render_list(
 pub struct AnthropicBatch {
     http: reqwest::Client,
     api_key: String,
+    base_url: String,
     /// Submit-only: empty on a poll/cancel-only client.
     model: String,
     max_tokens: u64,
@@ -617,6 +620,16 @@ impl AnthropicBatch {
         Ok(())
     }
 
+    /// The backend's configured `base_url`, if it set one (an Anthropic-Messages-API
+    /// -compatible gateway/proxy), else [`ANTHROPIC_API_BASE`] — mirrors
+    /// [`GeminiBatch::base_url`].
+    fn base_url(backend: &Backend) -> String {
+        backend
+            .base_url
+            .clone()
+            .unwrap_or_else(|| ANTHROPIC_API_BASE.to_string())
+    }
+
     /// A submit-capable client: the cast's synth slot, shaped to batch's maxed knobs.
     pub fn from_slot(backend: &Backend, slot: &ModelSlot, defaults: &Defaults) -> Result<Self> {
         Self::require_anthropic(backend)?;
@@ -625,6 +638,7 @@ impl AnthropicBatch {
         Ok(Self {
             http: batch_http_client(backend)?,
             api_key: backend.resolve_key()?,
+            base_url: Self::base_url(backend),
             model: slot.id.clone(),
             max_tokens,
             params,
@@ -638,6 +652,7 @@ impl AnthropicBatch {
         Ok(Self {
             http: batch_http_client(backend)?,
             api_key: backend.resolve_key()?,
+            base_url: Self::base_url(backend),
             model: String::new(),
             max_tokens: 0,
             params: None,
@@ -699,7 +714,7 @@ impl BatchProvider for AnthropicBatch {
             attachments,
             items,
         );
-        let url = format!("{ANTHROPIC_API_BASE}/v1/messages/batches");
+        let url = format!("{}/v1/messages/batches", self.base_url);
         let resp = self
             .auth(self.http.post(&url))
             .body(serde_json::to_vec(&body)?)
@@ -720,7 +735,7 @@ impl BatchProvider for AnthropicBatch {
     }
 
     async fn poll(&self, batch_id: &str) -> Result<BatchPoll> {
-        let url = format!("{ANTHROPIC_API_BASE}/v1/messages/batches/{batch_id}");
+        let url = format!("{}/v1/messages/batches/{batch_id}", self.base_url);
         let resp = self
             .auth(self.http.get(&url))
             .send()
@@ -746,7 +761,7 @@ impl BatchProvider for AnthropicBatch {
     }
 
     async fn cancel(&self, batch_id: &str) -> Result<()> {
-        let url = format!("{ANTHROPIC_API_BASE}/v1/messages/batches/{batch_id}/cancel");
+        let url = format!("{}/v1/messages/batches/{batch_id}/cancel", self.base_url);
         let resp = self
             .auth(self.http.post(&url))
             .send()
@@ -764,7 +779,7 @@ impl BatchProvider for AnthropicBatch {
         // One page at the API's max (100), newest-first by default. `has_more` rides
         // back so a truncated view announces itself — orphan recovery wants the recent
         // tail, and a caller who needs deeper history polls a known handle directly.
-        let url = format!("{ANTHROPIC_API_BASE}/v1/messages/batches?limit=100");
+        let url = format!("{}/v1/messages/batches?limit=100", self.base_url);
         let resp = self
             .auth(self.http.get(&url))
             .send()
@@ -786,8 +801,10 @@ impl BatchProvider for AnthropicBatch {
 
 // --- Gemini provider -------------------------------------------------------
 
-/// Gemini's API base. The keyed Gemini backend carries no `base_url` (rig fixes its
-/// endpoint), so batch addresses the service directly, as Anthropic does.
+/// Gemini's default API base, used when the backend sets no `base_url` of its own.
+/// The keyed Gemini backend cannot set one today (rig fixes the endpoint), unlike the
+/// anthropic kind — but [`GeminiBatch::base_url`] already reads `backend.base_url` in
+/// case that changes, the same pattern [`AnthropicBatch::base_url`] follows now.
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 /// A reqwest client carrying the backend's per-request deadline — the shared
@@ -1823,6 +1840,31 @@ mod tests {
                 "error should explain the anthropic-only constraint: {err}"
             );
         }
+    }
+
+    /// A backend's configured `base_url` (an Anthropic-Messages-API-compatible
+    /// gateway/proxy) must actually reach the batch client — the bug a cross-family
+    /// review caught: `AnthropicBatch` once hardcoded `ANTHROPIC_API_BASE` and
+    /// silently ignored `backend.base_url`, so interactive `consult` reached a custom
+    /// gateway while batch calls kept dialing api.anthropic.com. Both constructors
+    /// must resolve it, and an unset `base_url` must still fall back to the default.
+    #[test]
+    fn base_url_reaches_the_batch_client() {
+        let mut b = anthropic_backend();
+        b.base_url = Some("https://gateway.example.ts.net".to_string());
+        b.key_optional = true;
+        let slot = ModelSlot::bare(&b.name, "claude-sonnet-4-6");
+
+        let submit_client = AnthropicBatch::from_slot(&b, &slot, &Defaults::default()).unwrap();
+        assert_eq!(submit_client.base_url, "https://gateway.example.ts.net");
+
+        let poll_client = AnthropicBatch::from_backend(&b).unwrap();
+        assert_eq!(poll_client.base_url, "https://gateway.example.ts.net");
+
+        let mut default_backend = anthropic_backend();
+        default_backend.key_optional = true;
+        let default_client = AnthropicBatch::from_backend(&default_backend).unwrap();
+        assert_eq!(default_client.base_url, ANTHROPIC_API_BASE);
     }
 
     #[test]

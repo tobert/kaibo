@@ -393,6 +393,14 @@ the git log. Each later release appends a new section at the top.
   (pointing at the new plain subcommands instead of MCP resource URIs a CLI-only caller
   can't necessarily reach, and skipping the "reconnect the server" step since a
   one-shot CLI invocation re-reads `config.toml` fresh every time).
+- **An `anthropic`-kind backend can now set `base_url`.** Unset still dials rig's
+  built-in `https://api.anthropic.com`; set, it points the Anthropic Messages API
+  wire protocol at a compatible gateway or proxy instead (a corporate LLM
+  gateway, a Tailscale-fronted endpoint, etc.) — the same escape hatch the
+  `openai` kind already had, extended to the one other kind whose wire protocol a
+  proxy can plausibly reimplement. Every other keyed kind (DeepSeek, Gemini,
+  OpenRouter) still rejects `base_url` at load; rig fixes those endpoints. See
+  `docs/config.md`.
 
 ### Changed
 
