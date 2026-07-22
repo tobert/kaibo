@@ -381,6 +381,18 @@ the git log. Each later release appends a new section at the top.
   shows live + store-recovered handles). Each carries `--json` (its `answer`/`report`
   field is the model's raw words) and the same stdout-is-payload / exit-code contract.
   An interactive REPL is deliberately later.
+- **`kaibo configure` and `kaibo example-config`** round out the CLI front door with
+  the two setup surfaces that were MCP-only: `kaibo configure [goal]` prints the same
+  guided "set up my models" walkthrough as the `configure` MCP prompt (`/kaibo:configure`
+  in Claude Code), and `kaibo example-config` prints the annotated `config.toml`
+  template the `kaibo://config/example` resource serves — `kaibo example-config >
+  ~/.config/kaibo/config.toml` is a one-line starting point. Both reuse the exact same
+  text/template the MCP surfaces render, so the two front doors can't drift apart.
+  kaibo's CLI still never writes `config.toml` itself — `configure`'s roster-design
+  guidance is unchanged from the MCP prompt, only its opening and closing steps differ
+  (pointing at the new plain subcommands instead of MCP resource URIs a CLI-only caller
+  can't necessarily reach, and skipping the "reconnect the server" step since a
+  one-shot CLI invocation re-reads `config.toml` fresh every time).
 - **An `anthropic`-kind backend can now set `base_url`.** Unset still dials rig's
   built-in `https://api.anthropic.com`; set, it points the Anthropic Messages API
   wire protocol at a compatible gateway or proxy instead (a corporate LLM

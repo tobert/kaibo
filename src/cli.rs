@@ -43,8 +43,9 @@ use crate::consult::{
 use crate::progress::TerminalSink;
 use crate::sandbox::KaishWorker;
 use crate::server::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, render_config_resource,
-    with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
+    batch_within_window, configure_prompt_text_cli, consultation_failure_text, now_epoch_secs,
+    render_config_resource, with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
+    CONFIG_EXAMPLE_TOML,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
 
@@ -127,6 +128,21 @@ pub enum Command {
     Batch(BatchArgs),
     /// Print the resolved runtime configuration (the `kaibo://config` document).
     Config,
+    /// Print the guided "set up my models" walkthrough — the CLI equivalent of the
+    /// `configure` MCP prompt, for a CLI-driving agent or a human with no MCP prompt
+    /// support. Never writes config.toml itself; the caller does, with its own access.
+    Configure(ConfigureArgs),
+    /// Print the annotated config.toml template (the `kaibo://config/example` document).
+    ExampleConfig,
+}
+
+/// `kaibo configure` — the same guided "set up my models" walkthrough as the
+/// `configure` MCP prompt, framed for a caller with no MCP resource access.
+#[derive(Args, Debug)]
+pub struct ConfigureArgs {
+    /// What you want from the setup, e.g. "a local-only privacy cast" or "a cheap
+    /// DeepSeek explorer with a Claude synth". Optional — omit for a general walkthrough.
+    pub goal: Option<String>,
 }
 
 /// Flags shared by every front door: config discovery, the containment boundary, the
@@ -914,6 +930,26 @@ pub fn run_config(common: CommonArgs) -> i32 {
         persistence_enabled,
     );
     println!("{body}");
+    EXIT_OK
+}
+
+/// Run `kaibo configure`: print the same guided "set up my models" walkthrough the
+/// `configure` MCP prompt gives an agent — the roster-design guidance is the exact
+/// same shared text ([`configure_prompt_text_cli`]), just wrapped in framing that
+/// points at `kaibo example-config`/`kaibo config` instead of MCP resource URIs a
+/// CLI-only caller may not be able to reach. kaibo's CLI never writes `config.toml`
+/// itself, same as the MCP prompt — the caller (a CLI-driving agent, or a human) reads
+/// this and writes the file with its own access.
+pub fn run_configure(goal: Option<String>) -> i32 {
+    println!("{}", configure_prompt_text_cli(goal.as_deref()));
+    EXIT_OK
+}
+
+/// Run `kaibo example-config`: print the annotated config.toml template — the same
+/// embedded string the `kaibo://config/example` MCP resource serves, so the two never
+/// drift.
+pub fn run_example_config() -> i32 {
+    println!("{CONFIG_EXAMPLE_TOML}");
     EXIT_OK
 }
 
@@ -1707,6 +1743,30 @@ mod tests {
             cli.common.root.as_deref(),
             Some(std::path::Path::new("/srv/repo"))
         );
+    }
+
+    #[test]
+    fn configure_subcommand_parses_with_and_without_goal() {
+        let cli = Cli::try_parse_from(["kaibo", "configure"]).expect("configure parse");
+        match cli.command {
+            Some(Command::Configure(c)) => assert_eq!(c.goal, None),
+            other => panic!("expected configure, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["kaibo", "configure", "a local-only privacy cast"])
+            .expect("configure parse with goal");
+        match cli.command {
+            Some(Command::Configure(c)) => {
+                assert_eq!(c.goal.as_deref(), Some("a local-only privacy cast"))
+            }
+            other => panic!("expected configure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn example_config_subcommand_parses() {
+        let cli = Cli::try_parse_from(["kaibo", "example-config"]).expect("example-config parse");
+        assert!(matches!(cli.command, Some(Command::ExampleConfig)));
     }
 
     #[test]
