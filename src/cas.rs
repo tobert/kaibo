@@ -94,8 +94,10 @@
 //! kaibo does not prune this store. The user backs it up or prunes it by hand (`find
 //! -mtime`, `restic`, …) if they want to. For that to be an honest position rather than a
 //! punt, every object gets a `<hex>.json` provenance sidecar (prompt, model, cast,
-//! timestamp, mime) next to it — the metadata a human (or a script) needs to prune
-//! intelligently instead of guessing at opaque bytes.
+//! timestamp, mime, seed) next to it — the metadata a human (or a script) needs to prune
+//! intelligently instead of guessing at opaque bytes. Because nothing here is ever
+//! rewritten, that sidecar's schema can only ever grow *compatibly* — see
+//! [`Provenance`]'s doc for the rule that keeps a decade-old sidecar readable.
 //!
 //! # Never mounted into kaish
 //!
@@ -262,10 +264,25 @@ impl Extension {
 }
 
 /// The provenance sidecar recorded next to every object: `prompt`, `model`, `cast`,
-/// `timestamp` (epoch seconds), `mime`. This is the whole point of shipping with no
-/// built-in GC — a user (or their own script) can `find`/`jq` over these sidecars and
-/// prune intelligently instead of guessing at opaque hashed bytes. See the module doc's
-/// "No GC here, on purpose" section.
+/// `timestamp` (epoch seconds), `mime`, and `seed`. This is the whole point of shipping
+/// with no built-in GC — a user (or their own script) can `find`/`jq` over these sidecars
+/// and prune intelligently instead of guessing at opaque hashed bytes. See the module
+/// doc's "No GC here, on purpose" section.
+///
+/// # Every new field must be `Option`, or carry `#[serde(default)]`
+///
+/// The CAS never deletes, so a sidecar written by *today's* kaibo must stay readable by
+/// *every future* kaibo — there is no migration pass available to us, because rewriting a
+/// sidecar is a write we have structurally forbidden. A new **required** field would make
+/// every previously-written sidecar fail to deserialize, silently turning a user's
+/// paid-for archive into unreadable bytes. That is the exact failure the stewardship
+/// stance exists to prevent, so this is a hard rule, not a convenience.
+///
+/// Serde already treats an `Option` field as optional, so `Option` alone satisfies the
+/// rule and an added `#[serde(default)]` on one is redundant — worth stating, because the
+/// redundant spelling reads like the thing doing the work and invites a future field to
+/// rely on the attribute while being non-`Option` in a way that *does* break old
+/// sidecars. The rule is about the field's optionality, not the attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     pub prompt: String,
@@ -273,6 +290,14 @@ pub struct Provenance {
     pub cast: String,
     pub timestamp: i64,
     pub mime: String,
+    /// The provider-reported seed, when it reports one — the single most valuable field
+    /// here. The stewardship argument for the whole CAS is that a generated artifact may
+    /// be *irreproducible*; the seed is precisely what makes one reproducible, so
+    /// dropping it while carefully preserving the bytes would be perverse. `Option`
+    /// because not every provider or operation reports one (an upscale has no seed of
+    /// its own), and `String` rather than an integer because it is an opaque provider
+    /// token we echo back, never arithmetic we perform.
+    pub seed: Option<String>,
 }
 
 /// A content-addressed store of generated media artifacts, rooted at a fixed,

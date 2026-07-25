@@ -19,7 +19,37 @@ fn prov() -> Provenance {
         cast: "image".into(),
         timestamp: 1_753_000_000,
         mime: "image/png".into(),
+        seed: Some("9259671".into()),
     }
+}
+
+/// A sidecar written before `seed` existed must still deserialize, because the CAS
+/// **cannot rewrite it** — there is no migration pass available when every write is
+/// `create_new` and nothing is ever deleted. A new *required* field would silently turn a
+/// user's paid-for archive into unreadable bytes.
+///
+/// Be precise about what this pins, because it is easy to overclaim: serde already treats
+/// an `Option` field as optional, so this does **not** discriminate a redundant
+/// `#[serde(default)]` — verified by removing the attribute and watching this still pass.
+/// What it does catch is the realistic future mistake: making `seed` (or any later field)
+/// **non-`Option`**, which fails this file at compile time on the `None` comparison below.
+/// That is a real guard, just a narrower one than "the attribute is present."
+#[test]
+fn a_sidecar_written_before_seed_existed_still_deserializes() {
+    let old = r#"{"prompt":"a cat","model":"m","cast":"c","timestamp":1,"mime":"image/png"}"#;
+    let p: Provenance = serde_json::from_str(old).expect("an older sidecar must still load");
+    assert_eq!(p.seed, None, "a missing seed reads as None, not an error");
+    assert_eq!(p.prompt, "a cat");
+}
+
+/// The round trip a user's `jq`-based GC depends on: what we write is what we read back,
+/// seed included.
+#[test]
+fn provenance_round_trips_through_json_with_its_seed() {
+    let json = serde_json::to_string(&prov()).expect("serialize");
+    let back: Provenance = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, prov());
+    assert_eq!(back.seed.as_deref(), Some("9259671"));
 }
 
 /// A fresh CAS rooted under a temp dir plus the dir (kept alive by the caller), with a
