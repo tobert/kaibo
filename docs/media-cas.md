@@ -50,9 +50,19 @@ artifacts as opaque bytes.
   API — the path is *derived* from the content. A caller structurally cannot aim it, so
   the whole path-traversal / clobber-the-user's-file class does not exist. This is the
   load-bearing safety property; it is a shape, not a policy we enforce.
-- **Write-only, `create_new` (O_EXCL).** No unlink, no truncate, no rename. Same hash ⇒
-  same bytes ⇒ the write is a no-op, so even a collision cannot clobber. Copy-on-write
-  for "edits" falls out for free: new content is a new address.
+- **Write-only, `create_new` (O_EXCL), `sync_all`'d.** No unlink, no truncate, no rename.
+  Same hash ⇒ same bytes ⇒ the write is a no-op, so even a collision cannot clobber.
+  Copy-on-write for "edits" falls out for free: new content is a new address.
+- **Verify before trusting a path exists.** A crash between `create_new` and a completed
+  `write_all` can leave a truncated object sitting at the exact path a later write of the
+  same content would treat as "already there" — `sync_all` narrows that window, it can't
+  close it. So `get` recomputes the SHA-256 of every byte it reads and refuses to return
+  anything that doesn't match the digest it was asked for (`Err(CasError::Corrupt)`,
+  never a silent `None`), and `put`'s dedup path performs the same check before reporting
+  success on an `AlreadyExists`. This is affordable because the whole object is always
+  slurped into memory before any byte reaches the caller — see `src/cas.rs`'s module doc
+  ("Integrity") for why a future streaming read could not inherit this guarantee for
+  free.
 - **We stay out of the GC game.** The user backs it up (`rsync`, `restic`) or prunes it
   (`find -mtime +N`) if they want to. For that to be *honest* rather than a punt, each
   object gets a provenance sidecar (prompt, model, cast, timestamp) so a user can prune
@@ -153,6 +163,17 @@ Failing-first tests the boundary needs:
   `tests/store.rs`'s containment test for the db).
 - The soft cap **refuses** rather than evicts.
 - Round-trip digest stability (the e2e above).
+- **`get` refuses to hand back unverified bytes.** A poisoned object (content that does
+  not hash to the address it's stored at — the truncated-write crash scenario above,
+  reproduced in tests by writing directly at the object path) surfaces
+  `Err(CasError::Corrupt)`, not silently-wrong bytes and not a false `None`. A never-written
+  digest still returns `Ok(None)`, and a healthy round-trip still returns `Ok(Some(bytes))`.
+- **`put`'s dedup path refuses to report false success.** Re-`put`ting content whose slot
+  was poisoned out-of-band returns `Err(CasError::Corrupt)` rather than `Ok` — a caller
+  must never believe its bytes were saved when they were silently discarded onto bad data.
+- An object that exists but can't be read at all (not just wrong content) surfaces
+  `Err(CasError::Io)`, distinct from both of the above — none of "missing," "unreadable,"
+  and "wrong content" are allowed to look the same to a caller.
 
 ## Separable now — the "disposable" language
 

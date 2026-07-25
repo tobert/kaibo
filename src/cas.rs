@@ -39,11 +39,44 @@
 //!   free-form string here would reopen exactly the aim-the-write hole the digest
 //!   already closed for the rest of the path — so it doesn't get one.
 //! - **Write-only** ([`Cas::put`]): every file is created with `create_new` (`O_EXCL` on
-//!   Unix). There is no unlink, truncate, or rename anywhere in this module. Because the
-//!   path is the content's own hash, `AlreadyExists` cannot mean "someone else's data is
-//!   here" — it can only mean "these exact bytes are already here" — so it is mapped to
-//!   `Ok`, not an error and not a rewrite. Editing is copy-on-write for free: different
-//!   bytes hash to a different address, so an "edit" is just a new object.
+//!   Unix), then `sync_all`'d before the call returns. There is no unlink, truncate, or
+//!   rename anywhere in this module. Because the path is the content's own hash,
+//!   `AlreadyExists` *should* mean "these exact bytes are already here" rather than
+//!   "someone else's data is here" — but that claim only holds if every object at that
+//!   path was placed by this CAS, and placed *completely*. Neither half is structurally
+//!   enforced: a crash between `create_new` and a completed `write_all` (the `sync_all`
+//!   narrows this window, it cannot close it — see [`write_new_file`]) can leave a
+//!   truncated file sitting at the exact path future writes of the same content will see
+//!   as "already there." So `AlreadyExists` is no longer trusted blindly — see "Integrity"
+//!   below. Editing is copy-on-write for free either way: different bytes hash to a
+//!   different address, so an "edit" is just a new object.
+//!
+//! # Integrity: verify before trusting a path exists — a whole-object guarantee
+//!
+//! [`Cas::get`] recomputes the SHA-256 of every byte it reads and compares it to the
+//! digest the caller asked for *before returning anything*: `Ok(Some(bytes))` means found
+//! **and verified**, `Ok(None)` means never written, `Err(CasError::Corrupt)` means an
+//! object exists at this address but its content doesn't hash to it (unrecoverable in
+//! place — this store never rewrites, so the fix is operator intervention: remove the bad
+//! file, re-`put` the content), and `Err(CasError::Io)` means it exists but couldn't even
+//! be read. None of these fold into each other — an unreadable object is not "missing," and
+//! neither is a hash mismatch; both used to be silently swallowed into `None`, which is
+//! exactly the silent-fallback shape this codebase forbids. [`Cas::put`]'s dedup path gets
+//! the same treatment: on `AlreadyExists` it reads the existing object back and verifies it
+//! before reporting success, rather than trusting the path and silently discarding the
+//! caller's good bytes into a slot that was actually poisoned.
+//!
+//! **Why this is possible here, and why it wouldn't survive streaming reads.** This module
+//! only ever reads a whole object into memory (`std::fs::read`) before handing bytes back —
+//! so the *entire* content is available to hash before a single byte reaches the caller.
+//! That ordering is what makes "verify, then return" a real guarantee rather than
+//! after-the-fact bookkeeping. A future streaming read (open a handle, hand the caller a
+//! `Read`/`AsyncRead` instead of a `Vec<u8>`) could not inherit this guarantee for free: by
+//! the time a stream reached EOF and discovered a hash mismatch, it would already have
+//! emitted unverified bytes to whatever was consuming it. Adding streaming reads means
+//! *solving* that problem — failing the stream mid-read on mismatch, and requiring every
+//! caller to handle a truncated/failed read as a first-class outcome — not carrying this
+//! module's verify-before-return contract over unexamined. Read this before adding one.
 //!
 //! # The soft cap refuses; it never evicts
 //!
@@ -112,6 +145,22 @@ pub enum CasError {
     /// disk full, an unreadable existing file, …), surfaced verbatim.
     #[error("media CAS io: {0}")]
     Io(String),
+    /// An object exists at the path its digest addresses, but the bytes read back from that
+    /// path do not hash to that digest. This is the corruption case the module doc's write
+    /// path cannot fully rule out on its own (see [`write_new_file`]): a crash or power loss
+    /// between `create_new` and a completed `write_all` can leave a truncated or partial file
+    /// sitting at a content-addressed path, and nothing about the write side can detect that
+    /// after the fact — the path existing was, until this variant existed, silently treated
+    /// as proof the bytes were good (`AlreadyExists` mapped straight to `Ok`). There is no
+    /// recovery *in place*: this store never unlinks, truncates, or renames (see the module
+    /// doc), so a poisoned object stays poisoned at this address forever — the operator must
+    /// intervene by hand (remove the bad file and re-`put` the content) once this fires.
+    #[error(
+        "media CAS object corrupt: expected digest {expected}, but the bytes at this path hash \
+         to {actual} — the object is unrecoverable in place (this store never rewrites; remove \
+         the file by hand and re-put the content)"
+    )]
+    Corrupt { expected: String, actual: String },
     /// The provenance sidecar failed to serialize to JSON. `Provenance`'s fields are
     /// plain strings/ints, so this should not happen in practice; surfaced loudly rather
     /// than silently dropping the sidecar (which would defeat the whole GC-by-sidecar
@@ -304,16 +353,33 @@ impl Cas {
         })
     }
 
-    /// Read an object's bytes back by digest, or `None` if nothing with this digest has
-    /// been written. A read failure on a path that *does* exist (permissions, a
-    /// mid-write crash leaving a partial file some other tool created out-of-band) is
-    /// folded into `None` here — the read side has no destination-path parameter to
-    /// misuse and no obligation to distinguish "missing" from "unreadable" for a caller
-    /// that only wants bytes; a caller that needs the distinction can stat
-    /// [`Cas::path_for`] itself.
-    pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
-        let path = self.path_for(digest)?;
-        std::fs::read(path).ok()
+    /// Read an object's bytes back by digest, **verifying** them against that digest before
+    /// returning anything: `Ok(Some(bytes))` means an object exists at this digest's path
+    /// *and* its content hashes to it; `Ok(None)` means nothing with this digest has ever
+    /// been written; `Err(CasError::Corrupt)` means a file exists at the address but its
+    /// bytes do not hash to it (see [`write_new_file`]'s fsync-window note — a crash mid-write
+    /// is exactly how this happens); `Err(CasError::Io)` means the object could not even be
+    /// read (permissions, disk error). None of these fold into each other: an I/O error is
+    /// not "missing" and a hash mismatch is not "missing" either — both are surfaced loudly
+    /// rather than silently treated as "nothing here," which is the silent-fallback shape
+    /// this store now refuses to repeat (see [`CasError::Corrupt`]'s doc and the module doc's
+    /// "why verification is possible here" note).
+    ///
+    /// Verification is affordable *because this call slurps the whole object into memory
+    /// before returning it* — the hash can be checked against every byte before the first one
+    /// reaches the caller. A future streaming read (open a handle, hand back a reader) could
+    /// not inherit this guarantee for free: by the time a streaming reader discovered a
+    /// mismatch at the end of the stream, it would already have emitted unverified bytes to
+    /// whoever was consuming it. Adding a streaming read path means solving *that* problem
+    /// (failing the stream on mismatch, and requiring every caller to handle a mid-stream
+    /// integrity failure) rather than carrying this function's contract over unexamined.
+    pub fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>> {
+        let Some(path) = self.path_for(digest) else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(&path)
+            .map_err(|e| CasError::Io(format!("reading cas object {}: {e}", path.display())))?;
+        verify(digest, bytes).map(Some)
     }
 
     /// Recursively sum the size in bytes of every file currently in the store. Backs the
@@ -345,20 +411,43 @@ impl Cas {
     ///
     /// The digest is computed from `bytes` — the caller supplies no path, and cannot
     /// influence where the object lands beyond choosing `ext` (a closed enum). If an
-    /// object with this exact digest already exists, this is a no-op: same hash means
-    /// same bytes, so nothing is rewritten and the existing digest is returned as-is
-    /// (**not** re-checked against the soft cap — it adds zero new bytes, so it cannot be
-    /// what pushes the store over the line). Otherwise the soft cap is checked *before*
-    /// any write: if the current total plus `bytes.len()` would exceed `max_bytes`, the
-    /// write is refused with [`CasError::CapacityExceeded`] and nothing is written —
-    /// never evicted, see the module doc.
+    /// object with this exact digest already exists, this is a **verified** no-op: the
+    /// existing bytes are read back and checked against `digest` before anything is
+    /// reported as success — same hash means same bytes only if the object on disk is
+    /// actually intact, which a bare path-exists check cannot tell (see
+    /// [`CasError::Corrupt`]). If that check fails, the write returns
+    /// `Err(CasError::Corrupt)` rather than silently discarding the caller's good bytes
+    /// into a poisoned slot — the caller's data was never at risk, only the report of
+    /// success was. A verified dedup is **not** re-checked against the soft cap — it adds
+    /// zero new bytes, so it cannot be what pushes the store over the line. Otherwise (new
+    /// content) the soft cap is checked *before* any write: if the current total plus
+    /// `bytes.len()` would exceed `max_bytes`, the write is refused with
+    /// [`CasError::CapacityExceeded`] and nothing is written — never evicted, see the
+    /// module doc.
     pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
         let digest = Digest::of_bytes(bytes);
         let shard = self.shard_dir(&digest);
         let obj_path = self.object_path(&digest, ext);
         let sidecar_path = self.sidecar_path(&digest);
 
-        if !obj_path.is_file() {
+        if obj_path.is_file() {
+            // Dedup path: the module doc's "AlreadyExists means these exact bytes are
+            // already here" claim only holds if every object at this path was placed by
+            // this CAS *and placed completely* — neither half is actually enforced (see
+            // CasError::Corrupt's doc), so verify rather than trust the path's existence
+            // before reporting success. A caller whose good bytes silently vanish into a
+            // poisoned slot is the worst failure mode this module can produce; refuse to
+            // produce it. Verified, we still fall through to the (no-op) write below — it
+            // costs nothing on a healthy object, and covers the edge case of a sidecar that
+            // is somehow missing next to an otherwise-good object.
+            let existing = std::fs::read(&obj_path).map_err(|e| {
+                CasError::Io(format!(
+                    "reading existing cas object {} to verify dedup: {e}",
+                    obj_path.display()
+                ))
+            })?;
+            verify(&digest, existing)?;
+        } else {
             // New content only: check the soft cap before growing the store at all.
             let current = self.total_bytes()?;
             let incoming = bytes.len() as u64;
@@ -391,13 +480,24 @@ impl Cas {
     }
 }
 
-/// Create `path` as a brand-new file (`create_new` — `O_EXCL` on Unix) and write `bytes`
-/// to it. If `path` already exists this is a deliberate no-op (`Ok(())`, not an error):
-/// on a content-addressed path that can only mean these exact bytes are already there,
-/// so there is nothing to rewrite. Any other I/O failure (permissions, disk full, the
-/// parent directory missing) is propagated. There is no unlink, truncate, or rename
-/// anywhere in this function or its caller — an "edit" is always a new digest, never a
-/// mutation of an existing object.
+/// Create `path` as a brand-new file (`create_new` — `O_EXCL` on Unix), write `bytes` to
+/// it, and `sync_all` before returning — pushing both data and metadata to durable storage
+/// rather than leaving them in a page-cache buffer a crash could still lose. If `path`
+/// already exists this is a deliberate no-op (`Ok(())`, not an error): on a
+/// content-addressed path that *should* only mean these exact bytes are already there —
+/// see [`CasError::Corrupt`] and [`Cas::get`] for why callers can no longer take that on
+/// faith alone. Any other I/O failure (permissions, disk full, the parent directory
+/// missing) is propagated. There is no unlink, truncate, or rename anywhere in this
+/// function or its caller — an "edit" is always a new digest, never a mutation of an
+/// existing object.
+///
+/// `sync_all` **shrinks** the crash window between `open` and durable bytes on disk; it
+/// does not close it. A crash can still land between `write_all` succeeding and `sync_all`
+/// completing, or (rarer, but real on some filesystems/hardware) `sync_all` can itself
+/// return `Ok` ahead of what the physical medium has actually made durable. That residual
+/// window is exactly why verification on read ([`Cas::get`]) and on dedup ([`Cas::put`])
+/// exists as the actual backstop — fsync narrows how often corruption occurs, verification
+/// is what guarantees it is never handed back silently when it does.
 fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -407,7 +507,24 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(e) => return Err(e),
     };
-    file.write_all(bytes) // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
+    file.write_all(bytes)?; // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
+    file.sync_all()
+}
+
+/// Verify that `bytes` hashes to `digest`, consuming `bytes` into the `Ok` case so a
+/// caller doesn't have to clone just to satisfy the borrow checker across the check.
+/// Shared by [`Cas::get`] (verify-before-return) and [`Cas::put`] (verify-before-dedup) —
+/// one place computing the "does this content match its address" predicate, since both
+/// call sites need the exact same answer for the exact same reason.
+fn verify(digest: &Digest, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    let actual = Digest::of_bytes(&bytes);
+    if actual != *digest {
+        return Err(CasError::Corrupt {
+            expected: digest.to_hex(),
+            actual: actual.to_hex(),
+        });
+    }
+    Ok(bytes)
 }
 
 /// The default media CAS directory: `$XDG_DATA_HOME/kaibo/cas`, else

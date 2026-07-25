@@ -201,18 +201,115 @@ fn put_then_get_round_trips_bytes() {
     let (cas, _d) = open(u64::MAX);
     let bytes = b"not really a png".to_vec();
     let digest = cas.put(&bytes, Extension::Png, &prov()).unwrap();
-    assert_eq!(cas.get(&digest), Some(bytes.clone()));
+    assert_eq!(cas.get(&digest).unwrap(), Some(bytes.clone()));
     // The sharp edge from the design doc: the digest recomputed off the bytes that came
     // back out must equal the digest we wrote under — byte-exactness across the boundary.
-    assert_eq!(Digest::of_bytes(&cas.get(&digest).unwrap()), digest);
+    assert_eq!(
+        Digest::of_bytes(&cas.get(&digest).unwrap().unwrap()),
+        digest
+    );
 }
 
 #[test]
 fn get_returns_none_for_unknown_digest() {
     let (cas, _d) = open(u64::MAX);
     let unknown = Digest::of_bytes(b"never written");
-    assert_eq!(cas.get(&unknown), None);
+    assert_eq!(cas.get(&unknown).unwrap(), None);
     assert_eq!(cas.path_for(&unknown), None);
+}
+
+// --- Integrity: get/put verify the digest before trusting bytes --------------
+
+/// The defect this guards: `write_new_file` has no fsync, so a crash between `open` and a
+/// completed `write_all` can leave a truncated/wrong-content file sitting at an object's
+/// content-addressed path. Nothing on the write side can detect that after the fact — the
+/// path existing was being treated as proof the bytes were good. Simulate exactly that by
+/// writing bad bytes directly at the path a real `put` would have used, then prove `get`
+/// notices rather than handing back silently-wrong bytes.
+#[test]
+fn get_returns_corrupt_error_for_object_whose_content_does_not_match_its_digest() {
+    let (cas, _d) = open(u64::MAX);
+    let bytes = b"the real content".to_vec();
+    let digest = cas.put(&bytes, Extension::Png, &prov()).unwrap();
+    let path = cas.path_for(&digest).unwrap();
+
+    // Simulate a crash mid-write: truncated/wrong bytes at the exact path `put` used.
+    std::fs::write(&path, b"truncated garbage").unwrap();
+
+    match cas.get(&digest) {
+        Err(CasError::Corrupt { .. }) => {}
+        Err(other) => panic!("wrong error: {other:?}"),
+        Ok(v) => panic!("must not silently return unverified bytes, got: {v:?}"),
+    }
+}
+
+/// `put` must not treat a poisoned dedup slot as success: on `AlreadyExists`, it must read
+/// back the existing object and verify it hashes to the digest before reporting `Ok`. A
+/// caller that thinks its bytes were saved when a poisoned slot silently ate them is the
+/// worst outcome here — so this must be a loud `Err(Corrupt)`, never `Ok`.
+#[test]
+fn put_returns_corrupt_error_when_dedup_slot_is_poisoned() {
+    let (cas, _d) = open(u64::MAX);
+    let bytes = b"good bytes that should be saved".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+
+    // Poison the slot out-of-band, as if a prior crash left a truncated file there — before
+    // any real `put` ever wrote to it.
+    let shard = cas.root().join(&digest.to_hex()[0..2]).join(&digest.to_hex()[2..4]);
+    std::fs::create_dir_all(&shard).unwrap();
+    let path = shard.join(format!("{}.png", digest.to_hex()));
+    std::fs::write(&path, b"poisoned").unwrap();
+
+    match cas.put(&bytes, Extension::Png, &prov()) {
+        Err(CasError::Corrupt { .. }) => {}
+        Err(other) => panic!("wrong error: {other:?}"),
+        Ok(d) => panic!(
+            "must not silently report success over a poisoned slot, got Ok({})",
+            d.to_hex()
+        ),
+    }
+}
+
+/// An object that exists but cannot be read at all (not just wrong content) must surface an
+/// error, never fold into `Ok(None)` — that would look identical to "never written" and hide
+/// a real filesystem problem. Skipped rather than silently passing if this process can read
+/// anything regardless of permissions (e.g. running as root).
+#[cfg(unix)]
+#[test]
+fn get_surfaces_io_error_for_unreadable_existing_object() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (cas, _d) = open(u64::MAX);
+    let bytes = b"unreadable please".to_vec();
+    let digest = cas.put(&bytes, Extension::Jpeg, &prov()).unwrap();
+    let path = cas.path_for(&digest).unwrap();
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Portable root/override detection: rather than pulling in a uid-checking dependency,
+    // just ask whether *reading the file directly* ignores the 0o000 bits (root, or a
+    // capability/ACL override, does exactly this). If it does, the whole premise of this
+    // test doesn't hold in this environment — skip rather than silently pass on a
+    // conclusion (`Ok`) the test never actually reached. Must be checked before restoring
+    // permissions below, and before calling `cas.get` so a false pass can't hide behind it.
+    let can_read_anyway = std::fs::read(&path).is_ok();
+
+    let result = cas.get(&digest);
+    // Restore permissions so `TempDir`'s drop can clean up the file afterward.
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+
+    if can_read_anyway {
+        eprintln!(
+            "skipping: this process can read a 0o000 file directly (likely running as root) — \
+             cannot exercise an unreadable-existing-object condition here"
+        );
+        return;
+    }
+
+    match result {
+        Err(CasError::Io(_)) => {}
+        other => panic!("expected Err(Io(_)) for an unreadable existing object, got {other:?}"),
+    }
 }
 
 #[test]
@@ -270,7 +367,7 @@ fn writing_the_same_content_twice_is_a_noop_not_a_rewrite() {
     assert_eq!(d1, d2, "same content hashes to the same digest");
     let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
     assert_eq!(mtime1, mtime2, "an existing object must never be rewritten");
-    assert_eq!(cas.get(&d1).unwrap(), bytes);
+    assert_eq!(cas.get(&d1).unwrap().unwrap(), bytes);
 }
 
 // --- Soft cap: refuse loudly, never evict ------------------------------------
@@ -289,10 +386,10 @@ fn soft_cap_refuses_a_write_that_would_exceed_it() {
     }
 
     // Never evicts: the first object must still be present and readable.
-    assert_eq!(cas.get(&d1), Some(small));
+    assert_eq!(cas.get(&d1).unwrap(), Some(small));
     // The refused content must never have landed on disk.
     let rejected_digest = Digest::of_bytes(&too_big);
-    assert_eq!(cas.get(&rejected_digest), None);
+    assert_eq!(cas.get(&rejected_digest).unwrap(), None);
 }
 
 /// A dedup write of content already on disk must not be penalized by the cap check just
