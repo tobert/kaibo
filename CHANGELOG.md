@@ -13,6 +13,9 @@ the git log. Each later release appends a new section at the top.
 
 ### Added
 
+- `docs/openai-api-plan.md`, a living plan for making hosted OpenAI a first-class kaibo
+  backend and clarifying that kaibo's OpenAI model calls use OpenAI Platform API keys, not
+  Codex subscription entitlement.
 - **`consult`** — the headline tool: ask a model *outside your own family* about a
   codebase and get a grounded, cited answer. A capable model reads precise spans
   directly and delegates broad sweeps to a cheap explorer sub-agent, then synthesizes

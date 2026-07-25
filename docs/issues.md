@@ -22,6 +22,15 @@ the model-facing surface pass + the full consultation ladder (arc closeout, #37�
 
 ## P1 — High-leverage features & robustness
 
+### Hosted OpenAI as a first-class backend
+The current `openai` kind is generic OpenAI-compatible plumbing: good for local servers
+and usable for hosted GPT when configured manually, but not yet first-class hosted
+OpenAI behavior. The living plan is `docs/openai-api-plan.md`.
+
+Open work in that plan: copy-paste hosted config, live text/image probes with
+`OPENAI_API_KEY`, OpenAI reasoning shaping (today `ProviderKind::Openai` emits no thinking),
+Responses API evaluation, OpenAI Batch, and Platform data-control documentation.
+
 ### Media spine — perception in, production removed
 
 Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
@@ -249,7 +258,7 @@ GitHub-native tooling: `cosign` **keyless** signing + **SLSA provenance**
 `security-framework`, so we build native anyway); GoReleaser-OSS is an *optional later*
 back-half **only if** package channels (brew/scoop/winget/nfpm) multiply. **GoReleaser Pro
 and any release-as-a-service are off the table** (the latter doesn't viably exist — see the
-doc's axo note). No Windows ABI change — MSVC stays, so the CLAUDE.md invariant is
+doc's axo note). No Windows ABI change — MSVC stays, so the AGENTS.md invariant is
 untouched. The **ghcr image is a first-class, early distribution path** (multiarch, non-root
 default, devcontainer-friendly; an OS-enforced containment layer under kaibo's own read-only
 sandbox) — with a companion **`/reconfigure`** host-agent prompt to tame the docker/podman/
@@ -324,8 +333,7 @@ The `[context]` files are spliced into the preamble whole (`context.rs::assemble
 → `consult.rs::with_house_rules`), the preamble is re-sent on *every* model turn,
 and the block rides every codebase-reading phase — the `consult` driver and each
 nested `explore′` sweep (the toolless `oneshot` reads no project, so it gets none).
-A large `AGENTS.md` +
-`~/.claude/CLAUDE.md` is real token cost multiplied across turns *and* sweeps. No
+A large repo/user guidance bundle is real token cost multiplied across turns *and* sweeps. No
 truncation by design — silent truncation of operator guidance is the wrong failure
 — but a generous cap with a *loud* error (or a startup warning naming the byte
 count) would catch a runaway file before it quietly bloats every call. Measure a

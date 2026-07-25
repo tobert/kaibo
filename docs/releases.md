@@ -120,7 +120,7 @@ born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
 a release (CHANGELOG retitle, kaish-kernel pin check, `docs/sandbox-probes.md` re-run,
-`cargo tree -i aws-lc-rs` empty, musl `not a dynamic executable`) lives in CLAUDE.md
+`cargo tree -i aws-lc-rs` empty, musl `not a dynamic executable`) lives in AGENTS.md
 **Cutting a release** — the two reference each other so neither drifts.
 
 ## The decisions (settled 2026-06-25, with Amy)
@@ -213,7 +213,7 @@ Validated and actionable, with their home PR:
 
 - **"C-free" is imprecise** (both reviewers). `ring` *does* compile C/asm (via `cc` /
   `zig cc`); the tree is free of *cmake/autotools/OpenSSL/aws-lc system-C*, not free of C.
-  Tighten the wording in `release.yml` comments and the CLAUDE.md **Build & release** /
+  Tighten the wording in `release.yml` comments and the AGENTS.md **Build & release** /
   **TLS** lines when PR 2/3 touches them. (No behavior change — the invariant holds; `cargo
   tree -i aws-lc-rs` stays empty.)
 - **cosign keyless `verify-blob` fails without identity flags** (Gemini). A bare verify
@@ -274,7 +274,7 @@ No framework, no ABI change — sharpen what's already there.
 - **Install `cargo-zigbuild` prebuilt** (a SHA-pinned installer action, e.g.
   `taiki-e/install-action`) instead of `cargo install --locked` compiling it from
   source on every run.
-- Tighten the **"C-free" wording** in the workflow comments (and CLAUDE.md if touched).
+- Tighten the **"C-free" wording** in the workflow comments (and AGENTS.md if touched).
 - **Validation gate:** the matrix already builds all five natively; confirm the musl binary
   is `not a dynamic executable` (`ldd`) and `cargo tree -i aws-lc-rs` is empty.
 - Cross-family review (release surface — a real look).
@@ -311,15 +311,15 @@ the meantime).
 
 ### Container UX: the configurator / `reconfigure` pass (related host-agent workstream)
 The Docker downside is real — a verbose `docker run -i -u … -v …` line is painful to get
-right in `claude mcp add`, and iterating means a frustrating remove/re-add loop. Fix it in
+right in an MCP registration command, and iterating can mean a frustrating remove/re-add loop. Fix it in
 two phases: a known-good **baseline** `mcp add` (cwd mounted read-only) connects you, then a
 companion **`/reconfigure`** rewrites the *stored* MCP config **in place** for the user's
 real setup — podman vs docker, UID mapping, extra roots/worktrees, network policy,
-devcontainer nesting — which kills the re-add loop (you edit `~/.claude.json`, you don't
-re-run `mcp add`).
+devcontainer nesting — which kills the re-add loop (you edit the stored MCP config, you
+don't re-run `mcp add`).
 
 **Where it lives matters for the invariants:** kaibo is read-only and runs no external
-commands, so it **cannot** write `~/.claude.json` or run docker itself. So `reconfigure` is
+commands, so it **cannot** write a host MCP config file or run docker itself. So `reconfigure` is
 a **host-agent skill / a kaibo-provided MCP *prompt***: kaibo *advises* (it already knows
 the roots/mounts it needs and exposes them via `kaibo://config`, so it can hand the agent
 the exact `-v` flags), and the host agent *acts* (edits the config with its own tools). That
@@ -363,9 +363,9 @@ reference for the signing/attestation layer other projects lack:
 - **Docker — RESOLVED (2026-06-25, with Amy): keep & promote** to a first-class, early
   distribution path (multiarch, non-root default, devcontainer-friendly). See decision 4 and
   PR 4.
-- **Configurator / `reconfigure` ownership & scope** — a kaibo MCP prompt, a Claude Code
+- **Configurator / `reconfigure` ownership & scope** — a kaibo MCP prompt, a host-agent
   skill, or both? How much does it auto-detect (podman/devcontainer/UID) vs. ask? It edits a
-  sensitive file (`~/.claude.json`) with the *host agent's* tools (kaibo can't), so consent/
+  sensitive MCP config file with the *host agent's* tools (kaibo can't), so consent/
   safety shape it. Design when PR 4's container UX is real.
 - **How many channels?** Few (a brew tap) → hand-roll, no GoReleaser. Many (brew+scoop+winget+nfpm)
   → bring in GoReleaser-OSS as the back-half. Decide when demand is real, not now.

@@ -299,15 +299,15 @@ and the one platform-specific edge case — is in
 ## Configuration
 
 The fastest way to set up is to let your agent do it. kaibo ships a **`configure`
-prompt** for exactly this — in Claude Code it shows up as `/kaibo:configure` (pass an
-optional goal, e.g. `/kaibo:configure a local-only privacy cast`). It walks the agent
-through reading kaibo's config, asking which providers you have, and writing your
-`config.toml` — keeping keys in env vars or files, never inline.
+prompt** for exactly this; MCP clients expose prompts in different ways (for example,
+some show it as `/kaibo:configure`). Pass an optional goal such as
+`a local-only privacy cast`. It walks the agent through reading kaibo's config, asking
+which providers you have, and writing your `config.toml` — keeping keys in env vars or
+files, never inline.
 
-The file is written by your **host agent** (Claude Code) with its own permissions,
-the same way it edits any file — *not* by kaibo's sandboxed sub-agents, which remain
-strictly read-only and never touch disk. The prompt just hands your agent the
-knowledge to do it.
+The file is written by your **host agent** with its own permissions, the same way it
+edits any file — *not* by kaibo's sandboxed sub-agents, which remain strictly read-only
+and never touch disk. The prompt just hands your agent the knowledge to do it.
 
 The prompt leans on two MCP resources kaibo serves, which you can also read directly:
 
@@ -388,9 +388,9 @@ prices.
 ### `run_kaish` — direct read-only shell
 
 Drive the read-only kaish shell from your agent, no model in the loop: returns exit
-code + stdout + stderr. For a Claude Code user this offers little over the built-in
-Bash tool beyond *safety* — writes and external commands are refused, so exploration
-leaves nothing to review: there's no diff, because nothing it runs can change your tree.
+code + stdout + stderr. For an agent that already has a shell tool, this mostly adds
+*safety* — writes and external commands are refused, so exploration leaves nothing to
+review: there's no diff, because nothing it runs can change your tree.
 
 ---
 
