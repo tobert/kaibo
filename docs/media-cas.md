@@ -205,23 +205,70 @@ through rig's generic `additional_params` only to unpack them), and coherence wi
 
 - **The facade does NOT survive async, and we should stop claiming it does.** It absorbs
   new *synchronous* operations cleanly — `erase`, `remove-background`, image-to-image are
-  a new `Operation` variant and a route. But `upscale/creative` and `image-to-video` break
-  three things at once: async endpoints return **`202 Accepted` + JSON job id**, not `200`
-  + bytes, so the status gate is wrong; `handle_response` requires `content-type: image/*`,
-  so both a `202` JSON body and a finished `video/mp4` are refused; and `GeneratedImage`
-  (bytes + seed) cannot express a deferred handle or a video. The reshape is a
-  `StabilityResponse` enum (`Image` / `Video` / `Deferred(JobId)`) plus a polling
-  abstraction. **Decide before stage 3 pins the signature** — there are no callers today.
+  a new `Operation` variant and a route. But `upscale/creative` and `stable-audio` break
+  things at once: their POST doesn't return the artifact, so the old `200`-with-bytes
+  assumption is wrong, and `handle_response` hardcoded `content-type: image/*`, so a
+  non-image artifact was refused outright. **Closed** — see "Reshaped for async" below.
+  The review's own description of the async shape was **wrong in two specifics**,
+  corrected against the live spec before building: (1) deferred POSTs are **not**
+  uniformly `202` — `upscale/creative` returns **`200`** with `{id}`,
+  `stable-audio/text-to-audio` returns **`202`** with `{id}` — so status-code sniffing is
+  structurally wrong; dispatch has to be on what the operation *declares*. (2) **there is
+  no image-to-video endpoint anywhere in the spec** — the review's `Video` variant was a
+  misreading; the two real non-image artifact families are audio (`audio/mpeg`,
+  `audio/wav`) and 3D (`model/gltf-binary`). No speculative `Video` variant was added.
 - **`seed` is captured but has nowhere to go.** `stability.rs` reads the `seed` response
   header; `cas.rs`'s `Provenance` has no field for it. Stage 3 must add one. This is the
   single most valuable provenance field — the stewardship argument for the CAS is that
   generated artifacts may be irreproducible, and the seed is precisely what makes one
-  reproducible. Dropping it would be perverse.
+  reproducible. Dropping it would be perverse. **Still open** — unaffected by the async
+  reshape; `Artifact::seed` (formerly `GeneratedImage::seed`) still carries it.
 - **The width/height → aspect_ratio bridge is lossy and silent.** A rig caller asking for
   1000×800 gets snapped to the nearest supported ratio with no signal. Damage is bounded —
   it only affects the *rig adapter* path, and a caller who needs precision owns
   `StabilityRequest` and can set `aspect_ratio` directly — but the chosen ratio should
-  probably surface on `GeneratedImage` so a caller can at least observe what it got.
+  probably surface on `Artifact` so a caller can at least observe what it got. **Still
+  open.**
+
+### Reshaped for async (2026-07-25)
+
+`src/stability.rs` now has the shape the review asked for, built against the live spec
+rather than the review's description of it:
+
+- **`Operation::shape()`** declares `Shape::Sync` / `Shape::Deferred` per operation —
+  dispatch reads this, never the response's status code (which can't tell sync from
+  deferred, and reads differently across routes even within "deferred").
+- **`StabilityResponse`** — `Complete(Artifact)` | `Deferred(JobId)` — is `call`'s return
+  type; `PollOutcome` (`Pending` | `Complete(Artifact)`) is `poll`'s.
+- **`Artifact { bytes, media_type: String, seed }`** replaces `GeneratedImage`.
+  `media_type` stays a `String`, not an enum — the same reasoning
+  `GenerateRoute::classify` already uses against a model-id allowlist applies to media
+  kinds: Stability's spec already spans `image/*`, `audio/*`, `model/gltf-binary`, and a
+  closed enum here would rot the same way a closed model-id set would. The CAS boundary
+  (`cas.rs::Extension`) is the *other* half of that boundary and stays closed on purpose —
+  it's the only caller-influenced path component. Mapping a `media_type` string onto a
+  validated `Extension` (and refusing types the CAS can't name yet — today that's every
+  non-image type) is still a job for the CAS-writing tool, not this module; not built
+  here (see the "Do NOT implement" scope note below).
+- **`handle_response`/`handle_poll_response`** no longer hardcode an `image/`
+  content-type prefix; the only content-type check left is refusing `application/json`
+  on a path that expects raw bytes (the base64-JSON shape this module never asks for).
+  Every other existing safety property is unchanged: `finish-reason` strictness (any
+  non-`SUCCESS` is an error, missing is an error), the empty-body refusal, non-2xx
+  `{errors,id,name}` handling, and the case-INSENSITIVE content-type comparison.
+- **`StabilityClient::poll`** is one shot — no baked-in sleep/retry loop. A caller (a
+  test, a future MCP tool) drives its own cadence.
+- Proven with tests, not just asserted: a `200`+`{id}` and a `202`+`{id}` deferred POST
+  both resolve to `Deferred` (proves shape-not-status dispatch); a poll goes
+  `Pending` → `Complete` across two calls with no sleep; an `audio/mpeg` and a
+  `model/gltf-binary` body flow through `handle_response` unmodified (proves the
+  `image/*` allowlist is actually gone, not just undocumented). Each of these
+  properties was also broken on purpose and confirmed to fail the right test before
+  being reverted — see the commit for what was broken.
+- **Not built** (scope stayed reshape-only, per direction): `upscale/creative`, any
+  audio operation, any 3D operation, the CAS-boundary `media_type → Extension` mapping,
+  and any `ProviderKind`/`config.rs`/cast wiring. There are still no callers of this
+  module.
 
 **One finding assessed and NOT adopted:** the review called `GenerateRoute::classify`'s
 default-to-`sd3` a rot risk, on the grounds that a future `sd4-*` model would silently hit
@@ -255,16 +302,27 @@ endpoint the model id was routed to. Worth adding when something else touches th
     (`StabilityRequest`/`Operation`/`StabilityClient`) is the primary abstraction, with
     rig's `ImageGenerationModel` as a thin adapter (`from_rig_request`) over it — not
     the other way around. Reason: v2beta is bigger than text-to-image (upscale, edit,
-    control, image-to-video), and several of those operations take an **input image**
-    alongside the prompt — a fact rig's thin `{prompt,width,height,additional_params}`
-    shape has no room for. `StabilityRequest` already carries `input_image: Option<Vec<u8>>`
-    so those operations are new `Operation` variants, not a redesign, when they land.
+    control, audio, 3D), and several of the image-family operations take an **input
+    image** alongside the prompt — a fact rig's thin
+    `{prompt,width,height,additional_params}` shape has no room for. `StabilityRequest`
+    already carries `input_image: Option<Vec<u8>>` so those operations are new
+    `Operation` variants, not a redesign, when they land.
   - Not built in this stage (deliberately out of scope, see below): any `ProviderKind`/
     `config.rs`/cast wiring, `ModelRole` change, or MCP tool/CLI verb — `StabilityImageModel`
     exists and compiles but nothing constructs one outside its own tests yet.
+- ~~Reshape for async~~ **Done** — see "Reshaped for async" above. `Operation::shape()`,
+  `StabilityResponse`/`Artifact`/`JobId`/`PollOutcome`, and `StabilityClient::poll` land
+  with no real deferred operation wired yet (by design — see scope note above).
 - Next: wire `Provenance.seed`-equivalent (currently `Provenance` has no `seed` field —
   add one) so a CAS-writing tool can record the reproducibility value `stability.rs`
   now surfaces on every successful generation.
+- Next (surfaced by the async reshape): the CAS boundary needs a `media_type: &str ->
+  Extension` mapping that refuses unrecognized types loudly — `cas.rs::Extension` today
+  only names `png`/`jpeg`/`webp`/`gif`, so `audio/*` and `model/gltf-binary` (both real
+  `Artifact::media_type` values once audio/3D operations exist) have nowhere to land on
+  disk yet. That refusal is a feature, not a gap to silently patch over: it forces a
+  deliberate decision (a new `Extension` variant, a different sidecar shape, whatever
+  the CAS-writing tool needs) instead of a silent wrong-extension write.
 - Turning `feature = "image"` back on is worth it beyond Stability: an `image` **role** in
   a cast could point at openai / xai / huggingface for free.
 - Config surface to re-add: `986806f` reduced `ModelRole` to Explorer/Synth and made an

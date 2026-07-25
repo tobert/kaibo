@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-use kaibo::stability::{resolve_key, GenerateRoute, Operation, StabilityClient, StabilityRequest};
+use kaibo::stability::{
+    resolve_key, GenerateRoute, Operation, StabilityClient, StabilityRequest, StabilityResponse,
+};
 
 #[tokio::test]
 #[ignore = "hits the Stability API (generate/core, 3 credits); run with --ignored and \
@@ -26,14 +28,25 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
         fields: vec![("output_format".to_string(), "png".to_string())],
     };
 
-    let image = client
+    let response = client
         .call(&Operation::Generate(GenerateRoute::Core), &request)
         .await
         .expect("a live generate/core call should succeed");
 
+    // `Operation::Generate` always declares `Shape::Sync` (see `Operation::shape`), so a
+    // live call must resolve to `Complete`, never `Deferred` — asserting that here keeps
+    // this the one live check that the shape declaration matches reality.
+    let image = match response {
+        StabilityResponse::Complete(artifact) => artifact,
+        StabilityResponse::Deferred(id) => {
+            panic!("generate/core is declared Shape::Sync but returned a deferred job id {id:?}")
+        }
+    };
+
     eprintln!(
-        "=== STABILITY LIVE: {} bytes, seed={:?} ===",
+        "=== STABILITY LIVE: {} bytes, media_type={:?}, seed={:?} ===",
         image.bytes.len(),
+        image.media_type,
         image.seed
     );
 
@@ -41,6 +54,7 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
     // PNG magic bytes — confirms this is really an image, not e.g. a stray JSON body
     // that slipped past `handle_response`'s content-type check.
     assert_eq!(&image.bytes[..8], b"\x89PNG\r\n\x1a\n", "expected PNG magic bytes");
+    assert_eq!(image.media_type, "image/png");
     assert!(
         image.seed.is_some(),
         "Stability should report the seed it used, for reproducibility"
