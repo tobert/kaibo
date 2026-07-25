@@ -69,16 +69,23 @@ project and cannot run external commands.
   state (sessions + batch handles, the latter recovered on demand via `job_list`) only
   through the persistence store (`src/store.rs`) at a **fixed XDG path no model controls**:
   refused if it resolves into any allowed tree (`tests/store.rs`), and written via turso
-  plus the **single blessed `create_dir_all`** that `tests/no_write_path.rs` carves out —
-  every other `std::fs` mutation in `src/` still fails that guard. That store is the one
-  deliberate write surface; anything else that must *record* or *emit* is a specific
-  mediated tool, never a general filesystem escape hatch or a loosening of the four
-  levers. Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
+  plus a **blessed `create_dir_all`** that `tests/no_write_path.rs` carves out. That store
+  was the one deliberate write surface; the **media CAS** (`src/cas.rs` — generated
+  artifacts) is the second and last, under the same discipline: fixed XDG path, refused if
+  it resolves into an allowed tree, its own blessed marker. The CAS is safe by *shape*, not
+  policy — **the address is the content hash**, so its API has no destination-path
+  parameter for a model to aim; it is write-only (`create_new`; no unlink/truncate/rename,
+  so an edit is copy-on-write) and never mounted into kaish, whose read side would
+  otherwise enumerate every project's artifacts. `tests/no_write_path.rs` blesses exactly
+  those two sites — every other `std::fs` mutation in `src/` still fails that guard.
+  Anything further that must *record* or *emit* is its own individually-gated mediated
+  tool, never a general filesystem escape hatch or a loosening of the four levers.
+  Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
   `..` resolved) into the allowed set (`--root` / `--allow-path`, launch cwd when unset).
   Enforced in `server.rs::resolve_root`, with tests in `tests/containment.rs`.
 - **Operator surface vs. the model team — do not blur.** The trust model the whole
   design rests on: the model-facing shell cannot modify the world (unconditional, above),
-  and kaibo acts only on *kaibo's own* things (the XDG state dir today) through
+  and kaibo acts only on *kaibo's own* things (the XDG state dir and media CAS) through
   individually-gated, narrow surfaces — the project untouchable from every path. The line
   this draws: kaibo's **tools** (the MCP verbs, the CLI subcommands) are the **operator**
   surface — the client model / CLI caller sees kaibo's own state and config (sessions,
