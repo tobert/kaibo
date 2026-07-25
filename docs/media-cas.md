@@ -196,6 +196,43 @@ deletion story than the db, not because it cost more but because it is less reco
 
 **This should ship as its own small PR**, independent of the CAS decision.
 
+## Design review findings (Gemini Pro deliberate, 2026-07-25)
+
+Verdict: the shape is sound, the abstraction boundary is right (kaibo's facade over rig's
+trait, *not* the reverse — reversing it would mean serializing input images and masks
+through rig's generic `additional_params` only to unpack them), and coherence with
+`cas.rs`/`credentials.rs` is high. Three findings worth carrying forward:
+
+- **The facade does NOT survive async, and we should stop claiming it does.** It absorbs
+  new *synchronous* operations cleanly — `erase`, `remove-background`, image-to-image are
+  a new `Operation` variant and a route. But `upscale/creative` and `image-to-video` break
+  three things at once: async endpoints return **`202 Accepted` + JSON job id**, not `200`
+  + bytes, so the status gate is wrong; `handle_response` requires `content-type: image/*`,
+  so both a `202` JSON body and a finished `video/mp4` are refused; and `GeneratedImage`
+  (bytes + seed) cannot express a deferred handle or a video. The reshape is a
+  `StabilityResponse` enum (`Image` / `Video` / `Deferred(JobId)`) plus a polling
+  abstraction. **Decide before stage 3 pins the signature** — there are no callers today.
+- **`seed` is captured but has nowhere to go.** `stability.rs` reads the `seed` response
+  header; `cas.rs`'s `Provenance` has no field for it. Stage 3 must add one. This is the
+  single most valuable provenance field — the stewardship argument for the CAS is that
+  generated artifacts may be irreproducible, and the seed is precisely what makes one
+  reproducible. Dropping it would be perverse.
+- **The width/height → aspect_ratio bridge is lossy and silent.** A rig caller asking for
+  1000×800 gets snapped to the nearest supported ratio with no signal. Damage is bounded —
+  it only affects the *rig adapter* path, and a caller who needs precision owns
+  `StabilityRequest` and can set `aspect_ratio` directly — but the chosen ratio should
+  probably surface on `GeneratedImage` so a caller can at least observe what it got.
+
+**One finding assessed and NOT adopted:** the review called `GenerateRoute::classify`'s
+default-to-`sd3` a rot risk, on the grounds that a future `sd4-*` model would silently hit
+the legacy endpoint. It would — but the failure is a provider `400`/`404`, which is loud,
+not silent corruption; and the alternative (a client-side allowlist) rots *against* us by
+rejecting valid new models, which is exactly what the "provider model ids drift" lesson in
+AGENTS.md warns about. The existing doc comment (`stability.rs:195-199`) already makes this
+argument and it holds. The real gap is smaller: `StabilityError::Provider` carries `status`
+and `body` but **not the route**, so an operator debugging such a rejection cannot see which
+endpoint the model id was routed to. Worth adding when something else touches that signature.
+
 ## Open
 
 - ~~Provider wiring for Stability~~ **Done** (`src/stability.rs`). Confirmed live against
