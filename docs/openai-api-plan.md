@@ -31,7 +31,7 @@ Codex, not act as a drop-in replacement for kaibo's provider-backed `CompletionM
 Sources:
 
 - [Using Codex with your ChatGPT plan](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan.pdf)
-- [Managing Billing Settings on ChatGPT Web and Platform](https://help.openai.com/en/articles/9039756-managing-your-work-in-the-api-platform-with-projects%25252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525253F.docx)
+- [Managing Billing Settings on ChatGPT Web and Platform](https://help.openai.com/en/articles/9039756-managing-your-work-in-the-api-platform-with-projects)
 - [OpenAI API quickstart](https://platform.openai.com/docs/quickstart/make-your-first-api-request)
 
 ## Current state in kaibo

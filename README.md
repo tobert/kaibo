@@ -299,8 +299,8 @@ and the one platform-specific edge case — is in
 ## Configuration
 
 The fastest way to set up is to let your agent do it. kaibo ships a **`configure`
-prompt** for exactly this; MCP clients expose prompts in different ways (for example,
-some show it as `/kaibo:configure`). Pass an optional goal such as
+prompt** for exactly this; MCP clients expose prompts in different ways, commonly as
+`/kaibo:configure`. Pass an optional goal such as
 `a local-only privacy cast`. It walks the agent through reading kaibo's config, asking
 which providers you have, and writing your `config.toml` — keeping keys in env vars or
 files, never inline.

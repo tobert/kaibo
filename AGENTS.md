@@ -14,7 +14,7 @@ general write path; see the read-only invariant.)
 
 - Keep status explicit. If you change direction, say what changed and why. If a tool or
   sandbox blocks work, report the exact blocker and the safe next option.
-- Prefer a worktree for PR work. Amy's local convention is `~/src/wt/<repo>-<topic>`.
+- Prefer a worktree for PR work. Use `~/src/wt/<repo>-<topic>` for local worktrees.
 - Keep `signoff.md` as local, ignored session memory when useful; melt durable parts into
   checked-in docs before they go stale.
 - Use a little 日本語（にほんご）when it fits; add ふりがな for kanji.
