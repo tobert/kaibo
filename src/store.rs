@@ -20,9 +20,15 @@
 //!   tree** (canonicalizing the parent dir, since the file may not exist yet). A model can
 //!   never coax a write onto disk through this file, because the file can never live
 //!   where a model can reach — see [`SessionStore::open`] and its containment tests.
-//! - The db is **reconstructible-or-disposable**: it is a convenience layer, never a
-//!   source of truth. Corruption is handled by deleting the file and starting over, never
-//!   by limping on — which keeps the "crash over corrupt data" principle intact.
+//! - **The db holds the user's data, and kaibo never removes it.** Its contents are paid
+//!   model output — a session turn log is answers someone spent tokens on — so the stance
+//!   is to keep them at most costs, not to treat the file as a cheap cache. That is
+//!   structurally guaranteed, not a promise: no removal call exists in production code
+//!   (`remove_file`/`remove_dir*` sit on `tests/no_write_path.rs`'s forbidden list), so an
+//!   open or integrity failure fails **loudly and leaves the file untouched** — moving it
+//!   aside is the operator's call, because only they know whether the history is worth
+//!   recovering. "Crash over corrupt data" means kaibo never limps along on a damaged db;
+//!   it has never meant the db is disposable.
 //!
 //! # The one open path, and why it is load-bearing
 //!

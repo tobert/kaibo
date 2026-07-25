@@ -528,9 +528,10 @@ CLI/env: `--no-persistence` / `KAIBO_NO_PERSISTENCE` disable it (in-memory, like
 no TTL — same as the in-memory store), and the `{backend, provider-id, label}` of each
 batch you submit (so `job_list` can re-surface a handle after a restart). **What never
 persists:** background *consult/deliberate* job handles (`job-N` — in-memory, session-only
-by design) and exploration reports (ephemeral by design — they'd be stale bloat). The db
-is a convenience layer, **never a source of truth**: safe to delete, and its content is
-model output, never anything the calling model steers onto disk.
+by design) and exploration reports (ephemeral by design — they'd be stale bloat). Its
+content is model output, never anything the calling model steers onto disk — and because
+that output is **what you paid for**, kaibo treats the db as your data: it never removes
+the file, under any error, so moving it aside is always your decision.
 
 **Read-only toward your project is unchanged.** The store is handler-side, at the XDG
 path — kaish's read-only sandbox never sees it, kaibo still writes nothing into any
@@ -540,9 +541,9 @@ AGENTS.md.
 
 **Loud on failure, never a silent fallback.** If the store can't open (a bad path, a db
 inside a project, a network mount — turso's multiprocess mode is 64-bit-Unix + local-fs
-only), kaibo **fails to start** with an error naming the escape hatch and reminding you the
-db is a convenience layer safe to delete — rather than quietly dropping to memory and
-losing your sessions on the next restart.
+only), kaibo **fails to start** with an error naming the escape hatch and leaving the db
+untouched — rather than quietly dropping to memory and losing your sessions on the next
+restart.
 
 **One exception, Windows only.** On Windows (and other non-64-bit-Unix targets) the store
 is single-process. A *second* kaibo opening the same db — a second editor window — would,
