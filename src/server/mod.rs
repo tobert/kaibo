@@ -2508,7 +2508,8 @@ slug where offered.
 the secret stays outside it. Tell me which env vars to set or files to write, and let \
 me put the keys in myself.
 5. (Optional) Read scope. By default kaibo reads only the project tree (plus linked git \
-worktrees) and only ever *reads* — never writes. To let the team see a scratch space — a \
+worktrees) and only ever *reads* it — never writes to your project. To let the team see \
+a scratch space — a \
 diff, a log, a generated file you dropped somewhere — name that directory in \
 `[server] allow_paths` (`$VAR` / `${VAR}` and a leading `~` expand, resolving per machine). \
 It's a deliberate opt-in worth asking me about first, since it widens what a consult can \

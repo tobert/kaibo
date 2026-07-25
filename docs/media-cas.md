@@ -213,4 +213,13 @@ deletion story than the db, not because it cost more but because it is less reco
   `image =` cast slot a loud `deny_unknown_fields` load error.
 - Check `reqwest`'s `multipart` feature against the TLS invariant (`cargo tree -i
   aws-lc-rs` must stay empty; expected clean — it pulls `mime_guess`, not crypto).
-- The exact replacement wording for the headline invariant claim.
+- **Container distribution has no CAS volume story.** The ghcr image is a first-class
+  distribution path, and a CAS at `$XDG_DATA_HOME/kaibo/cas` inside a container evaporates
+  on exit unless the operator mounts it. Artifacts the user paid for silently vanishing is
+  the exact failure the stewardship stance forbids — so the image needs either a documented
+  volume or a loud startup warning when the CAS dir is not persistent. Surfaced by the
+  Gemini design pass (2026-07-25).
+- **Unqualified "never writes" phrasing** was tightened in `README.md` and the client-facing
+  configure guidance (`server/mod.rs`) to say *never writes **to your project***, which is
+  the claim that stays true. Re-check every remaining absolute phrasing when the first CAS
+  tool ships — that is when an unqualified claim becomes visibly false to a user.
