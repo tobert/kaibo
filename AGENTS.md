@@ -76,8 +76,11 @@ project and cannot run external commands.
   policy — **the address is the content hash**, so its API has no destination-path
   parameter for a model to aim; it is write-only (`create_new`; no unlink/truncate/rename,
   so an edit is copy-on-write) and never mounted into kaish, whose read side would
-  otherwise enumerate every project's artifacts. `tests/no_write_path.rs` blesses exactly
-  those two sites — every other `std::fs` mutation in `src/` still fails that guard.
+  otherwise enumerate every project's artifacts. `tests/no_write_path.rs` blesses only
+  those two files' individually **marked lines**, at a *pinned exact count* — four today,
+  since the store's one `create_dir_all` plus the CAS's O_EXCL write trips three separate
+  needles — so a new write site can't ride in behind an existing marker without failing
+  that test. Every other `std::fs` mutation in `src/` still fails the guard.
   Anything further that must *record* or *emit* is its own individually-gated mediated
   tool, never a general filesystem escape hatch or a loosening of the four levers.
   Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
