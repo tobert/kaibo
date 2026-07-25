@@ -32,7 +32,14 @@ anyhow = "1"
 # pull `reqwest/rustls` → the aws-lc-rs crypto provider (C + cmake, the one thing
 # that makes a static musl build painful). We re-add the other defaults rig needs
 # (`reqwest`, `derive`) and let TLS come from our own `rustls`+ring wiring below.
-rig-core = { version = "0.38", default-features = false, features = ["reqwest", "derive"] }
+# `image` gates rig's `image_generation` module (lib.rs:159) — the
+# `ImageGenerationModel` trait and its request/response types. It is a pure-Rust,
+# dependency-free feature flag (enabling it added ZERO crates to Cargo.lock, verified
+# 2026-07-25), and it buys more than the provider we hand-write: rig already ships
+# openai / xai / azure / huggingface impls of that trait, so an `image` cast slot can
+# reach them for free. Turned off by 986806f when image generation was removed; back
+# on with the media CAS.
+rig-core = { version = "0.38", default-features = false, features = ["reqwest", "derive", "image"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
@@ -46,7 +53,14 @@ rig-core = { version = "0.38", default-features = false, features = ["reqwest", 
 # installed (never a silent no-TLS fallback). We install ring once at startup —
 # see `src/tls.rs`. This keeps the whole tree aws-lc-free for static builds; verify
 # with `cargo tree -i aws-lc-rs` (must be empty).
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+#
+# `multipart` is for image generation: Stability's v2beta `stable-image/generate/*`
+# takes `multipart/form-data` and returns raw image bytes, so it is NOT the
+# OpenAI-shaped JSON path rig's built-in image providers use — we build that body
+# ourselves. Like the rig `image` feature, it pulled ZERO new crates (verified
+# 2026-07-25) and is crypto-free, so the aws-lc-free tree is untouched. Re-verify with
+# `cargo tree -i aws-lc-rs` (must stay empty) if either feature moves.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "multipart"] }
 # The crypto provider behind rustls, chosen explicitly: ring, not aws-lc-rs. ring
 # builds with no C toolchain or cmake, so `x86_64-unknown-linux-musl` (and friends)
 # link fully static out of the box. reqwest pins rustls `default-features = false`,
