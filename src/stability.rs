@@ -579,8 +579,22 @@ impl MediaType {
     /// other value is [`StabilityError::UnknownMediaType`], naming exactly what arrived
     /// — a seventh content-type is a real decision for this module to make, never a
     /// silent fallthrough.
+    ///
+    /// **Parameters are stripped before matching.** RFC 7231 §3.1.1.1 allows a media type
+    /// to carry them (`image/png; charset=binary`), and they are the *server's* business,
+    /// not ours — an exact match on the whole header would reject perfectly good image
+    /// bytes because a proxy or CDN appended a `charset`. That is the same failure
+    /// direction the case-insensitivity above exists to avoid: discarding **sound** bytes
+    /// over spelling. Contrast the strict `finish-reason` comparison, where strictness
+    /// discards **suspect** bytes and is therefore right. Stability sends no parameters
+    /// today (confirmed against the live spec), so this is armour, not a workaround.
     pub fn parse(content_type: &str) -> Result<Self, StabilityError> {
-        match content_type.to_ascii_lowercase().as_str() {
+        let essence = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim();
+        match essence.to_ascii_lowercase().as_str() {
             "image/png" => Ok(MediaType::ImagePng),
             "image/webp" => Ok(MediaType::ImageWebp),
             "image/jpeg" => Ok(MediaType::ImageJpeg),
@@ -1286,6 +1300,36 @@ mod tests {
         ] {
             assert_eq!(MediaType::parse(mixed), Ok(expected), "input {mixed:?}");
         }
+    }
+
+    /// A media type may legitimately carry parameters (RFC 7231 §3.1.1.1). Matching the
+    /// whole header exactly would refuse real image bytes because a proxy appended a
+    /// `charset` — discarding SOUND bytes over spelling, the same failure direction the
+    /// case-insensitivity above exists to prevent. Note the whitespace and case variants:
+    /// a parameter can arrive with or without a space after the `;`, and the essence is
+    /// still case-insensitive once split.
+    #[test]
+    fn media_type_parse_strips_parameters() {
+        for (raw, expected) in [
+            ("image/png; charset=binary", MediaType::ImagePng),
+            ("image/png;charset=binary", MediaType::ImagePng),
+            ("IMAGE/PNG ; charset=binary", MediaType::ImagePng),
+            ("audio/wav; rate=44100", MediaType::AudioWav),
+            ("model/gltf-binary; v=2", MediaType::ModelGltfBinary),
+        ] {
+            assert_eq!(MediaType::parse(raw), Ok(expected), "input {raw:?}");
+        }
+    }
+
+    /// Stripping parameters must not become a way for an unknown type to slip through —
+    /// the essence is still matched exhaustively, and an unknown one still names itself.
+    #[test]
+    fn media_type_parse_unknown_essence_with_parameters_still_fails() {
+        let err = MediaType::parse("image/avif; charset=binary").unwrap_err();
+        assert_eq!(
+            err,
+            StabilityError::UnknownMediaType("image/avif".to_string())
+        );
     }
 
     /// An unrecognized content-type must fail loudly, naming exactly what was received
