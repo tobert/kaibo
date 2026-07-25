@@ -31,7 +31,24 @@ Open work in that plan: copy-paste hosted config, live text/image probes with
 `OPENAI_API_KEY`, OpenAI reasoning shaping (today `ProviderKind::Openai` emits no thinking),
 Responses API evaluation, OpenAI Batch, and Platform data-control documentation.
 
-### Media spine — perception in, production removed
+### `deliberate` cannot be staffed by any built-in cast — advertised but DOA
+`cast_can_deliberate` (`config.rs:846`) needs an **offline synth lane plus an explorer
+slot**. Of the built-in casts, only `anthropic-batch` and `gemini-batch` carry an offline
+lane, and both are **synth-only** — so every `deliberate` call on a stock install fails
+`cast "…" has no explorer slot`. The tool's own description points at `fable` /
+`gemini-deliberate` / `local-direct`, which live in `docs/config.example.toml` and are
+**not** built in, so the guidance names casts the user does not have. Either ship a
+deliberate-capable built-in (a Flash-Lite explorer beside the Pro batch synth is one line)
+or have the refusal say "no built-in cast can staff this; copy `gemini-deliberate` from
+`docs/config.example.toml`". Surfaced 2026-07-25 trying to run a `deliberate` design pass
+on the media CAS; worked around locally by adding the cast to the XDG config.
+
+### Media spine — perception in, production REOPENED (2026-07-25)
+
+**Superseded in part.** The 2026-06-28 direction below removed `generate_image` and made
+read-only unconditional. Image *production* is being reopened — see **`docs/media-cas.md`**
+for the current design, the identity argument that reopens it, and the CAS that makes the
+write path acceptable. The perception half below stands unchanged.
 
 Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
 *unconditional* — no out-dir, no handler-side write, no write path of any kind. Image
@@ -61,8 +78,9 @@ sound devices in scope — file-in only.
 **TTS and any record/emit are output, so they don't return as roles.** TTS (text→audio) is
 a render, not perception; it leaves with image gen rather than parking as a reserved seam.
 If kaibo ever needs to record or emit, that's a deliberately-mediated tool — individually
-gated, its own narrow surface — never a production role or a general write path. None
-planned.
+gated, its own narrow surface — never a production role or a general write path. That
+sentence held: the media CAS *is* that mediated tool, built to those terms (see
+`docs/media-cas.md`). TTS still has no plan.
 
 ---
 
