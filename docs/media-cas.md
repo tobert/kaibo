@@ -198,21 +198,45 @@ deletion story than the db, not because it cost more but because it is less reco
 
 ## Open
 
-- Provider wiring for Stability (key at `~/.stability-key.txt`). rig has the *shape* —
-  `ImageGenerationModel` / `ImageGenerationRequest{prompt,width,height,additional_params}`
-  / `ImageGenerationResponse{image: Vec<u8>}` — behind `feature = "image"`
-  (`rig-core/src/lib.rs:159`), which `986806f` turned off. **No Stability provider**
-  (impls: openai, xai, azure, huggingface, hyperbolic), so we write it, templated on
-  `providers/xai/image_generation.rs` (~120 lines). Stability v2beta is
-  `multipart/form-data` in and raw image bytes out, *not* OpenAI-shaped — confirm against
-  current docs at implementation time rather than from memory. `width`/`height` vs
-  Stability's `aspect_ratio` rides in `additional_params`.
+- ~~Provider wiring for Stability~~ **Done** (`src/stability.rs`). Confirmed live against
+  `https://api.stability.ai/v2alpha/openapi` (the spec backing
+  `platform.stability.ai/docs/api-reference`, which is a client-rendered app with nothing
+  to scrape statically) *and* one real `generate/core` call, so the shape below is
+  verified, not assumed:
+  - `multipart/form-data` in, raw image bytes out (`Accept: image/*`) — as expected.
+    `width`/`height` → `aspect_ratio` is a real bridge (nearest of Stability's nine
+    ratios by log-distance, not linear — see `aspect_ratio_for`'s doc), not a pass-
+    through, since Stability has no `width`/`height` concept at all.
+  - **Two response headers turned out to be load-bearing, missed in the original
+    design pass:** `finish-reason` (a `200` with image bytes is not sufficient —
+    Stability returns `200`/`CONTENT_FILTERED` with a blurred image when moderation
+    trips, which this module now refuses as an error rather than a successful result)
+    and `seed` (the value actually used — captured through to the caller, since it is
+    the one field that aids reproducing an otherwise-irreproducible generation; not
+    yet wired into `Provenance`, see below).
+  - **Design pivot mid-implementation (Amy):** kaibo's own facade
+    (`StabilityRequest`/`Operation`/`StabilityClient`) is the primary abstraction, with
+    rig's `ImageGenerationModel` as a thin adapter (`from_rig_request`) over it — not
+    the other way around. Reason: v2beta is bigger than text-to-image (upscale, edit,
+    control, image-to-video), and several of those operations take an **input image**
+    alongside the prompt — a fact rig's thin `{prompt,width,height,additional_params}`
+    shape has no room for. `StabilityRequest` already carries `input_image: Option<Vec<u8>>`
+    so those operations are new `Operation` variants, not a redesign, when they land.
+  - Not built in this stage (deliberately out of scope, see below): any `ProviderKind`/
+    `config.rs`/cast wiring, `ModelRole` change, or MCP tool/CLI verb — `StabilityImageModel`
+    exists and compiles but nothing constructs one outside its own tests yet.
+- Next: wire `Provenance.seed`-equivalent (currently `Provenance` has no `seed` field —
+  add one) so a CAS-writing tool can record the reproducibility value `stability.rs`
+  now surfaces on every successful generation.
 - Turning `feature = "image"` back on is worth it beyond Stability: an `image` **role** in
   a cast could point at openai / xai / huggingface for free.
 - Config surface to re-add: `986806f` reduced `ModelRole` to Explorer/Synth and made an
-  `image =` cast slot a loud `deny_unknown_fields` load error.
-- Check `reqwest`'s `multipart` feature against the TLS invariant (`cargo tree -i
-  aws-lc-rs` must stay empty; expected clean — it pulls `mime_guess`, not crypto).
+  `image =` cast slot a loud `deny_unknown_fields` load error. `ProviderKind` also needs
+  a `Stability` variant (or equivalent) — today `src/stability.rs` resolves its own key
+  independently of `credentials.rs`'s enum (same `resolve()` core, a parallel file-name
+  constant) precisely because that enum/config wiring is this bullet, not the previous one.
+- Confirmed clean: `reqwest`'s `multipart` feature added zero crates and `cargo tree -i
+  aws-lc-rs` / `-i mimalloc` both stay empty with `stability.rs` in the tree.
 - **Container distribution has no CAS volume story.** The ghcr image is a first-class
   distribution path, and a CAS at `$XDG_DATA_HOME/kaibo/cas` inside a container evaporates
   on exit unless the operator mounts it. Artifacts the user paid for silently vanishing is
