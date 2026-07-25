@@ -334,6 +334,65 @@ argument and it holds. The real gap is smaller: `StabilityError::Provider` carri
 and `body` but **not the route**, so an operator debugging such a rejection cannot see which
 endpoint the model id was routed to. Worth adding when something else touches that signature.
 
+## Gates — these block shipping, whatever the identity decision is
+
+Three things must be true before a CAS-writing capability reaches a user. They are listed
+here rather than in "Open" because they are not *work to schedule* — they are conditions
+on shipping, and each is easy to lose track of precisely because none of them can be
+implemented at the moment they are discovered.
+
+1. **A loud warning when the CAS is on ephemeral storage.** Gemini's design pass ranks this
+   the single riskiest remaining thing, and it is right. The ghcr image is a first-class
+   distribution path; a CAS at `$XDG_DATA_HOME/kaibo/cas` inside a container with no
+   volume mounted will happily accept the prompt, **spend the user's provider credits**,
+   verify and write the artifact to the overlayfs, and destroy it on container exit. Paid
+   artifacts silently evaporating is the exact failure the whole stewardship stance — and
+   this store's refusal to ever delete — exists to prevent. It cannot be built yet: there
+   is no `Cas` construction site outside tests. It must land **with** the first one.
+   Detect ephemeral/overlay/tmpfs backing and warn severely, or require an explicit
+   acknowledgement flag; do not fail silently and do not proceed quietly.
+2. **Melt this document before deleting it.** It is a living doc slated for deletion when
+   the work ships, with its durable reasoning moving into code doc-comments and
+   `docs/devlog.md`. The failure mode is mundane and total: someone deletes the file
+   thinking the work is done, and every "why not" recorded here — why files and not turso
+   blobs, why sha2 and not blake3, why the CAS is never mounted into kaish, why
+   `finish-reason` is load-bearing — survives only in git history where nobody will look.
+   Treat "reasoning verifiably transplanted" as a merge gate, not an intention.
+3. **Reconcile `AGENTS.md`'s opening paragraph.** It still says kaibo *"produces no output
+   artifacts — it reasons over code, it doesn't render or emit."* That is false on this
+   branch. It is deliberately **not** quietly edited, because which way it gets reconciled
+   depends on the unresolved identity question (below) — rewriting it would silently
+   decide that question. If image generation stays, this paragraph is rewritten. If it
+   moves to a sibling pal, this paragraph was right all along and the code moves instead.
+
+## Unresolved: does this belong in kaibo at all?
+
+A direction review (Fable 5, batch, 2026-07-25) argues the reopening is **drift with a good
+name**, and the argument deserves recording rather than burying:
+
+- The June removal was decided on *identity*. Everything built since answers **safety**. The
+  reopening doc's own word is "supersedes" — which concedes the argument was overruled, not
+  refuted.
+- "Sidekick bringing other model capabilities" is a **null thesis** — it describes every MCP
+  multiplexer. Kaibo's actual moat (cross-family anti-monoculture, structural read-only,
+  cited grounding) does not transfer to generation: nobody wants a second opinion from an
+  image model, and a generated image cites nothing.
+- **Resident cost.** A coding agent mid-task will never search for "generate an image," so an
+  image tool either displaces `consult`/`deliberate` in the documented 2048-character
+  retrieval budget or rides below the fold unfound, billing every session regardless. The
+  canary is already lit: `deliberate` is DOA on stock installs (P1 in `issues.md`).
+- `cas.rs` calls itself the *"second and last"* write surface. `MediaType` already parses
+  `audio/*` and `model/gltf-binary`, and `to_cas_extension` refuses them *"when"* audio lands,
+  not *if* — the next amendment is pre-staged in the code.
+- **The exit it proposes:** ship as a **sibling pal** (the gpal/dpal/cpal family already
+  exists). The CAS, `stability.rs`, and the cast machinery move intact; kaibo's resident
+  pitch and one-breath invariant stay whole. Nothing built is wasted.
+
+It is emphatic that safety did **not** erode and that these modules are good work — the case
+is about *where the product lives*, not whether the code should exist. Gemini's architecture
+pass independently agrees the engineering is coherent. Amy has not decided; until she does,
+gate 3 above stays deliberately unresolved.
+
 ## Open
 
 - ~~Provider wiring for Stability~~ **Done** (`src/stability.rs`). Confirmed live against
