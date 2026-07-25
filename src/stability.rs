@@ -436,7 +436,13 @@ pub fn handle_response(
     let Some(ct) = content_type else {
         return Err(StabilityError::MissingContentType);
     };
-    if !ct.starts_with("image/") {
+    // Case-INSENSITIVE, unlike the `finish-reason` comparison below, and the asymmetry is
+    // deliberate. RFC 7231 §3.1.1.1 makes media types case-insensitive, so `IMAGE/PNG` is a
+    // perfectly valid spelling of a perfectly good response. Being strict here fails the
+    // wrong way: it would refuse real image bytes over letter case. Strictness on
+    // `finish-reason` refuses *suspect* bytes, which is the direction we want to err in;
+    // strictness here would refuse *sound* ones.
+    if !ct.to_ascii_lowercase().starts_with("image/") {
         return Err(StabilityError::UnexpectedContentType {
             content_type: ct.to_string(),
         });
@@ -900,6 +906,30 @@ mod tests {
     fn handle_response_200_missing_content_type_is_refused() {
         let err = handle_response(200, None, Some("SUCCESS"), None, b"bytes").unwrap_err();
         assert_eq!(err, StabilityError::MissingContentType);
+    }
+
+    /// RFC 7231 §3.1.1.1: media types are case-INSENSITIVE. An upstream that spells the
+    /// header `IMAGE/PNG` is returning a perfectly good image, and refusing it over letter
+    /// case would fail in the wrong direction — throwing away sound bytes. Contrast
+    /// `finish-reason`, which is compared strictly on purpose because there strictness
+    /// refuses *suspect* bytes.
+    #[test]
+    fn handle_response_accepts_an_uppercase_image_content_type() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        for ct in ["IMAGE/PNG", "Image/Png", "image/PNG"] {
+            let out = handle_response(200, Some(ct), Some("SUCCESS"), Some("7"), png)
+                .unwrap_or_else(|e| panic!("content-type {ct:?} must be accepted, got {e}"));
+            assert_eq!(out.bytes, png, "content-type {ct:?}");
+        }
+    }
+
+    /// The degenerate corners `aspect_ratio_zero_dimension_does_not_panic` leaves open:
+    /// both dimensions zero, and both at the integer ceiling. Each is ratio 1.0 after the
+    /// clamp, so both must land on the square label rather than panicking or drifting.
+    #[test]
+    fn aspect_ratio_equal_degenerate_dimensions_are_square() {
+        assert_eq!(aspect_ratio_for(0, 0), "1:1");
+        assert_eq!(aspect_ratio_for(u32::MAX, u32::MAX), "1:1");
     }
 
     #[test]
