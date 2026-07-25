@@ -241,15 +241,13 @@ rather than the review's description of it:
 - **`StabilityResponse`** — `Complete(Artifact)` | `Deferred(JobId)` — is `call`'s return
   type; `PollOutcome` (`Pending` | `Complete(Artifact)`) is `poll`'s.
 - **`Artifact { bytes, media_type: String, seed }`** replaces `GeneratedImage`.
-  `media_type` stays a `String`, not an enum — the same reasoning
-  `GenerateRoute::classify` already uses against a model-id allowlist applies to media
-  kinds: Stability's spec already spans `image/*`, `audio/*`, `model/gltf-binary`, and a
-  closed enum here would rot the same way a closed model-id set would. The CAS boundary
-  (`cas.rs::Extension`) is the *other* half of that boundary and stays closed on purpose —
-  it's the only caller-influenced path component. Mapping a `media_type` string onto a
+  `media_type` stayed a `String`, not an enum, at the time — the same reasoning
+  `GenerateRoute::classify` already uses against a model-id allowlist was assumed to
+  apply to media kinds too. **This assumption was checked and found false — see
+  "`media_type` becomes a closed `MediaType` enum" below.** Mapping a media type onto a
   validated `Extension` (and refusing types the CAS can't name yet — today that's every
-  non-image type) is still a job for the CAS-writing tool, not this module; not built
-  here (see the "Do NOT implement" scope note below).
+  non-image type) was left as a job for the CAS-writing tool, not this module; not built
+  here at the time (see the "Do NOT implement" scope note below).
 - **`handle_response`/`handle_poll_response`** no longer hardcode an `image/`
   content-type prefix; the only content-type check left is refusing `application/json`
   on a path that expects raw bytes (the base64-JSON shape this module never asks for).
@@ -266,9 +264,65 @@ rather than the review's description of it:
   properties was also broken on purpose and confirmed to fail the right test before
   being reverted — see the commit for what was broken.
 - **Not built** (scope stayed reshape-only, per direction): `upscale/creative`, any
-  audio operation, any 3D operation, the CAS-boundary `media_type → Extension` mapping,
-  and any `ProviderKind`/`config.rs`/cast wiring. There are still no callers of this
-  module.
+  audio operation, any 3D operation, and any `ProviderKind`/`config.rs`/cast wiring.
+  There are still no callers of this module. (The CAS-boundary media-type → `Extension`
+  mapping *was* built in a later stage — see below.)
+
+### `media_type` becomes a closed `MediaType` enum (2026-07-25)
+
+The `String` decision above was made on a false premise, and Amy overruled it. The
+premise was that Stability's media-type set would grow open-endedly, the way model ids
+do. It doesn't: every `200`/`202` response content-type across the *entire*
+`https://api.stability.ai/v2alpha/openapi` spec was counted exhaustively (not sampled,
+not guessed) — twice, independently, by Amy and by the agent that built this change, with
+matching results:
+
+```
+19  image/png
+19  image/webp
+18  image/jpeg
+ 4  audio/mpeg
+ 4  audio/wav
+ 2  model/gltf-binary
+```
+
+Six types, 66 mentions, full stop. (A parallel set of `application/json; type=...`
+entries in the spec describes the alternate base64-JSON envelope this module already
+refuses via its `application/json` content-type check — those aren't a seventh kind,
+just the same six wrapped differently.) A model-id allowlist rots because providers mint
+new ids constantly; Stability has not added a new artifact family since v2beta shipped.
+Collapsing the two arguments into one was the mistake — `GenerateRoute::classify`'s
+doc-comment reasoning still holds for model ids, it just never applied to media kinds.
+
+`src/stability.rs` now defines `MediaType`, a closed six-variant enum:
+
+- **`MediaType::parse(content_type: &str)`** parses a response `content-type` header
+  case-insensitively (RFC 7231 §3.1.1.1, preserving the same laxness the module's
+  existing content-type comparison already defended) into one of the six variants. An
+  unrecognized value is a loud, typed `StabilityError::UnknownMediaType(String)` naming
+  exactly what arrived — a seventh content-type is now a real decision this module
+  forces, not a value it quietly passes through.
+- **`Artifact::media_type`** is now `MediaType`, not `String`.
+- **`MediaType::to_cas_extension(&self) -> Result<cas::Extension, StabilityError>`** is
+  the fallible mapping the "Not built" note above deferred — built now, and deliberately
+  incomplete: `cas::Extension` already covers every image kind Stability returns
+  (`png`/`jpeg`/`webp`) and additionally carries `gif`, which Stability never produces;
+  `MediaType` additionally covers audio and 3D, which `Extension` has no on-disk shape
+  for at all. Neither enum is a subset of the other, so the mapping refuses `audio/*`
+  and `model/gltf-binary` loudly (`StabilityError::NoCasExtension`) rather than
+  inventing an extension or silently writing bytes nobody can open. That refusal is a
+  feature: when audio/3D support lands, it forces the deliberate decision of how the CAS
+  should name them on disk, instead of a silent wrong-extension write.
+- Every existing safety property is unchanged: `finish-reason` strictness, empty-body
+  refusal, non-2xx `{errors,id,name}` handling, and the case-insensitive content-type
+  comparison. `MediaType::parse` runs *after* those checks in `parse_artifact` — a
+  non-2xx body, a JSON envelope, an empty body, and a bad `finish-reason` are each a more
+  specific, more informative failure than "media type not recognized."
+- Proven with tests, not just asserted: each of the six types parses (including mixed
+  case), an unrecognized content-type fails loudly both at `MediaType::parse` and through
+  the full `handle_response` pipeline, and `to_cas_extension` accepts the three image
+  types while refusing audio and 3D by name. Each new property was also broken on
+  purpose and confirmed to fail the right test before being reverted.
 
 **One finding assessed and NOT adopted:** the review called `GenerateRoute::classify`'s
 default-to-`sd3` a rot risk, on the grounds that a future `sd4-*` model would silently hit
@@ -316,13 +370,12 @@ endpoint the model id was routed to. Worth adding when something else touches th
 - Next: wire `Provenance.seed`-equivalent (currently `Provenance` has no `seed` field —
   add one) so a CAS-writing tool can record the reproducibility value `stability.rs`
   now surfaces on every successful generation.
-- Next (surfaced by the async reshape): the CAS boundary needs a `media_type: &str ->
-  Extension` mapping that refuses unrecognized types loudly — `cas.rs::Extension` today
-  only names `png`/`jpeg`/`webp`/`gif`, so `audio/*` and `model/gltf-binary` (both real
-  `Artifact::media_type` values once audio/3D operations exist) have nowhere to land on
-  disk yet. That refusal is a feature, not a gap to silently patch over: it forces a
-  deliberate decision (a new `Extension` variant, a different sidecar shape, whatever
-  the CAS-writing tool needs) instead of a silent wrong-extension write.
+- ~~The CAS boundary needs a `media_type -> Extension` mapping~~ **Done** — see
+  "`media_type` becomes a closed `MediaType` enum" above. `MediaType::to_cas_extension`
+  refuses `audio/*` and `model/gltf-binary` loudly (`cas.rs::Extension` still only names
+  `png`/`jpeg`/`webp`/`gif`); a CAS-writing tool still needs to decide how audio/3D
+  should land on disk when those operations arrive — that decision itself remains open,
+  only the refusal that forces it is built.
 - Turning `feature = "image"` back on is worth it beyond Stability: an `image` **role** in
   a cast could point at openai / xai / huggingface for free.
 - Config surface to re-add: `986806f` reduced `ModelRole` to Explorer/Synth and made an

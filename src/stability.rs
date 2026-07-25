@@ -56,22 +56,50 @@
 //! deliberately out of scope here — see `docs/media-cas.md`); this is the plumbing that
 //! lets one land as a new `Operation` variant + a `shape()`/route arm, not a redesign.
 //!
-//! # `media_type` is a `String`, not an enum
+//! # `MediaType` — a closed six-variant enum, not a `String`
 //!
-//! [`Artifact::media_type`] carries the response's `content-type`, verbatim
-//! (lowercased). Stability's spec already spans `image/*`, `audio/*`, and
-//! `model/gltf-binary` — the same reasoning [`GenerateRoute::classify`] already uses for
-//! why it defaults rather than allowlists a model id applies here too: a client-side
-//! enum of media kinds rots the moment the provider ships a new one, silently rejecting
-//! content this module was never asked to have an opinion about. The CAS boundary
-//! (`cas.rs`'s [`crate::cas::Extension`]) is where the *opposite* property lives, on
-//! purpose — it is the only caller-influenced component of an on-disk path, so it stays
-//! a closed enum and refuses anything it doesn't recognize (including `audio/*` and
-//! `model/gltf-binary` today — the CAS genuinely cannot name those on disk yet, and a
-//! silent write of unrecognized bytes under a wrong extension is exactly the failure
-//! this module's whole design refuses). Permissive at the wire, strict at the path —
-//! see `cas.rs`'s module doc for the other half of this boundary, and its "Extension" doc
-//! for where that mapping lives when it's built.
+//! An earlier version of this module argued [`Artifact::media_type`] should stay a
+//! `String` because Stability's media-type set would grow open-endedly, the same way
+//! [`GenerateRoute::classify`] refuses to allowlist model ids. **That premise was
+//! checked against the live spec and is false, and the argument built on it doesn't
+//! survive the check.** Every `200`/`202` response content-type across the *entire*
+//! `https://api.stability.ai/v2alpha/openapi` spec was counted exhaustively, not
+//! sampled: `image/png` (19), `image/webp` (19), `image/jpeg` (18), `audio/mpeg` (4),
+//! `audio/wav` (4), `model/gltf-binary` (2) — six types, 66 mentions, full stop. (The
+//! spec also lists a matching set of `application/json; type=image/png`-shaped content
+//! types — the base64-JSON envelope this module already refuses via the
+//! `application/json` prefix check in [`parse_artifact`] — so those aren't a seventh
+//! kind, just the same six wrapped differently.) A set that is provably six things,
+//! confirmed by a real count rather than a guess about the future, is exactly the small
+//! closed enum a model-id allowlist is *not*: providers mint new model ids constantly,
+//! but Stability has not added a new artifact family since v2beta shipped, and each one
+//! ([`GenerateRoute::classify`]'s doc) is a genuinely different argument from this one —
+//! collapsing them was the mistake.
+//!
+//! [`MediaType`] is that enum. [`MediaType::parse`] reads a response `content-type`
+//! header **case-insensitively** (RFC 7231 §3.1.1.1 — see [`parse_artifact`]'s comment
+//! for why that laxness is deliberate) and returns one of the six variants; anything
+//! else is a loud, typed [`StabilityError::UnknownMediaType`] naming exactly what was
+//! received — the failure direction we want, since a seventh content-type appearing
+//! means Stability shipped something this module has an actual decision to make about,
+//! not something to silently pass through.
+//!
+//! That enum buys the exhaustive `match` at the CAS boundary the old `String` never
+//! could: [`MediaType::to_cas_extension`] maps onto `cas.rs`'s [`crate::cas::Extension`]
+//! — and deliberately can't map all six, because the two enums describe different sets
+//! on purpose. `Extension` is what the CAS can *name on disk*; it already covers every
+//! image kind Stability returns (`png`/`jpeg`/`webp`) and additionally carries `gif`,
+//! which Stability never produces (that variant exists for some other CAS caller, not
+//! for symmetry with `MediaType`). `MediaType` is what Stability can *return* —
+//! including audio and 3D, which `Extension` has no shape for at all. Neither is a
+//! subset of the other, so [`MediaType::to_cas_extension`] refuses `audio/*` and
+//! `model/gltf-binary` loudly today ([`StabilityError::NoCasExtension`]). That refusal
+//! is a feature: when audio/3D support lands, it forces a deliberate decision — a new
+//! `Extension` variant? a different sidecar shape entirely? — instead of silently
+//! writing bytes to disk under an extension nobody can open them with. Permissive at
+//! the wire (`MediaType` parses everything Stability can send), strict at the path
+//! (`Extension` stays closed — the only caller-influenced path component) — see
+//! `cas.rs`'s module doc for the other half of this boundary.
 //!
 //! # The wire, confirmed live (2026-07-25)
 //!
@@ -443,6 +471,20 @@ pub enum StabilityError {
     /// loudly here, not panic or silently drop a job id rig's synchronous trait has no
     /// way to express.
     UnexpectedlyDeferred,
+    /// A `200`/`202` content-type that parsed past the `application/json` check but
+    /// isn't one of [`MediaType`]'s six variants — see the module doc for why that set
+    /// is closed and confirmed by an exhaustive spec count, not a guess. The raw string
+    /// received is carried so an operator can see exactly what Stability sent, since a
+    /// seventh media type appearing means this module has a real decision to make, not
+    /// a bug to paper over.
+    UnknownMediaType(String),
+    /// [`MediaType::to_cas_extension`] was asked to map a media type `cas.rs`'s
+    /// [`crate::cas::Extension`] has no shape for — today that's every `audio/*` variant
+    /// and `model/gltf-binary`. See the module doc's "`MediaType`" section for why this
+    /// refusal is deliberate: the CAS genuinely cannot name these on disk yet, and
+    /// writing them under a wrong or invented extension would be exactly the
+    /// silent-garbage failure this module's whole design refuses.
+    NoCasExtension { media_type: MediaType },
 }
 
 impl std::fmt::Display for StabilityError {
@@ -493,6 +535,19 @@ impl std::fmt::Display for StabilityError {
                  this facade has no synchronous caller that can wait on a job, so refusing \
                  rather than silently discarding the id"
             ),
+            StabilityError::UnknownMediaType(content_type) => write!(
+                f,
+                "Stability returned content-type {content_type:?}, which isn't one of the six \
+                 media types this module recognizes (image/png, image/webp, image/jpeg, \
+                 audio/mpeg, audio/wav, model/gltf-binary) — refusing rather than guessing at \
+                 an unrecognized media family"
+            ),
+            StabilityError::NoCasExtension { media_type } => write!(
+                f,
+                "media type {media_type:?} has no cas::Extension to be written under yet — the \
+                 CAS cannot name this on disk, so refusing rather than writing it under a wrong \
+                 or invented extension"
+            ),
         }
     }
 }
@@ -501,6 +556,78 @@ impl std::error::Error for StabilityError {}
 
 // --- Response handling ---------------------------------------------------------
 
+/// One of the six response `content-type`s Stability's v2beta spec documents at all —
+/// see the module doc's "`MediaType`" section for the exhaustive live-spec count that
+/// justifies this being closed rather than an open `String`. Every variant name mirrors
+/// its wire spelling directly, so [`MediaType::as_str`]/[`MediaType::parse`] are a
+/// trivial round trip rather than a lookup table that could drift out of sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaType {
+    ImagePng,
+    ImageWebp,
+    ImageJpeg,
+    AudioMpeg,
+    AudioWav,
+    ModelGltfBinary,
+}
+
+impl MediaType {
+    /// Parse a response `content-type` header into one of the six variants,
+    /// **case-insensitively** — RFC 7231 §3.1.1.1 makes media types case-insensitive, so
+    /// `IMAGE/PNG` is exactly as valid a spelling as `image/png` (mirrors the same
+    /// laxness [`parse_artifact`]'s comment already defends for the raw header). Any
+    /// other value is [`StabilityError::UnknownMediaType`], naming exactly what arrived
+    /// — a seventh content-type is a real decision for this module to make, never a
+    /// silent fallthrough.
+    pub fn parse(content_type: &str) -> Result<Self, StabilityError> {
+        match content_type.to_ascii_lowercase().as_str() {
+            "image/png" => Ok(MediaType::ImagePng),
+            "image/webp" => Ok(MediaType::ImageWebp),
+            "image/jpeg" => Ok(MediaType::ImageJpeg),
+            "audio/mpeg" => Ok(MediaType::AudioMpeg),
+            "audio/wav" => Ok(MediaType::AudioWav),
+            "model/gltf-binary" => Ok(MediaType::ModelGltfBinary),
+            other => Err(StabilityError::UnknownMediaType(other.to_string())),
+        }
+    }
+
+    /// The canonical lowercase wire spelling — [`MediaType::parse`]'s inverse, used
+    /// anywhere a string form is still useful (logs, diagnostics, a live probe's
+    /// `eprintln!`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaType::ImagePng => "image/png",
+            MediaType::ImageWebp => "image/webp",
+            MediaType::ImageJpeg => "image/jpeg",
+            MediaType::AudioMpeg => "audio/mpeg",
+            MediaType::AudioWav => "audio/wav",
+            MediaType::ModelGltfBinary => "model/gltf-binary",
+        }
+    }
+
+    /// Map this media type onto the CAS's closed [`crate::cas::Extension`] — the seam
+    /// where Stability's wire enum meets the CAS's on-disk-path enum, and they are
+    /// deliberately *not* the same set. `Extension` already covers every image kind
+    /// Stability returns (`png`/`jpeg`/`webp`) and additionally carries `gif`, which
+    /// Stability never produces (that variant serves some other CAS caller, not
+    /// symmetry with this type). This type additionally covers audio and 3D, which
+    /// `Extension` has no on-disk shape for at all. Neither enum is a subset of the
+    /// other, so this mapping is fallible on purpose: `audio/*` and
+    /// `model/gltf-binary` refuse loudly with [`StabilityError::NoCasExtension`] today.
+    /// That refusal is a feature, not an oversight — see the module doc's `MediaType`
+    /// section for why forcing a decision beats a silent wrong-extension write.
+    pub fn to_cas_extension(&self) -> Result<crate::cas::Extension, StabilityError> {
+        match self {
+            MediaType::ImagePng => Ok(crate::cas::Extension::Png),
+            MediaType::ImageJpeg => Ok(crate::cas::Extension::Jpeg),
+            MediaType::ImageWebp => Ok(crate::cas::Extension::Webp),
+            MediaType::AudioMpeg | MediaType::AudioWav | MediaType::ModelGltfBinary => {
+                Err(StabilityError::NoCasExtension { media_type: *self })
+            }
+        }
+    }
+}
+
 /// One successful artifact: raw bytes plus whatever Stability told us about them.
 /// Kept separate from rig's `ImageGenerationResponse` wrapper so this facade has a
 /// return type of its own — a future direct (non-rig) caller (e.g. the media CAS
@@ -508,10 +635,10 @@ impl std::error::Error for StabilityError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifact {
     pub bytes: Vec<u8>,
-    /// The response's `content-type`, verbatim (lowercased) — see the module doc's
-    /// "`media_type` is a `String`, not an enum" section for why this isn't a
-    /// client-side allowlist of media kinds.
-    pub media_type: String,
+    /// The response's `content-type`, parsed to one of [`MediaType`]'s six variants —
+    /// see the module doc's "`MediaType`" section for why this is a closed enum, not an
+    /// open `String`.
+    pub media_type: MediaType,
     /// The seed Stability actually used, from the `seed` response header — present
     /// whenever the provider reports one, whether or not the caller pinned one via
     /// `additional_params`/`fields`. Carried through so a caller can reproduce this
@@ -587,12 +714,15 @@ fn parse_deferred(body: &[u8]) -> Result<JobId, StabilityError> {
 /// `finish-reason`, an optional `seed`, and the bytes.
 ///
 /// `Ok` means: a `content-type` present and not `application/json` (the base64-JSON
-/// shape this module never asks for — see the module doc), a non-empty body, and a
-/// `finish-reason` header reading exactly `"SUCCESS"`. Never returns empty bytes, and
-/// never returns a moderation-blurred result, as `Ok`. Deliberately does **not** check
-/// `content_type` against any specific media family (`image/`, `audio/`, `model/`) —
-/// see the module doc's "`media_type` is a `String`" section for why validating the
-/// wire that way would just be the old image-only mistake with a longer allowlist.
+/// shape this module never asks for — see the module doc), a non-empty body, a
+/// `finish-reason` header reading exactly `"SUCCESS"`, and a `content-type` that parses
+/// as one of [`MediaType`]'s six variants. Never returns empty bytes, and never returns
+/// a moderation-blurred result, as `Ok`. The [`MediaType::parse`] call is deliberately
+/// last among these checks — a non-2xx body, a JSON envelope, an empty body, and a bad
+/// `finish-reason` are all more specific, more informative failures than "media type not
+/// recognized," so each gets first refusal on a response that fails more than one check
+/// at once. See the module doc's "`MediaType`" section for why an unrecognized type is
+/// its own loud, typed error rather than a longer prefix allowlist.
 fn parse_artifact(
     content_type: Option<&str>,
     finish_reason: Option<&str>,
@@ -607,7 +737,8 @@ fn parse_artifact(
     // perfectly valid spelling of a perfectly good response. Being strict here fails the
     // wrong way: it would refuse real bytes over letter case. Strictness on
     // `finish-reason` refuses *suspect* bytes, which is the direction we want to err in;
-    // strictness here would refuse *sound* ones.
+    // strictness here would refuse *sound* ones. [`MediaType::parse`] preserves this same
+    // case-insensitive property below.
     let ct_lower = ct.to_ascii_lowercase();
     if ct_lower.starts_with("application/json") {
         return Err(StabilityError::UnexpectedContentType {
@@ -628,9 +759,11 @@ fn parse_artifact(
         Some(_) => {}
     }
 
+    let media_type = MediaType::parse(&ct_lower)?;
+
     Ok(Artifact {
         bytes: body.to_vec(),
-        media_type: ct_lower,
+        media_type,
         seed: seed.map(str::to_string),
     })
 }
@@ -1120,6 +1253,106 @@ mod tests {
         assert!(matches!(err, StabilityError::InvalidAdditionalParams(_)));
     }
 
+    // --- MediaType --------------------------------------------------------------
+
+    /// Every one of the six variants parses from its canonical lowercase wire spelling
+    /// — the exhaustive set confirmed against the live spec (see the module doc).
+    #[test]
+    fn media_type_parse_recognizes_all_six_variants() {
+        assert_eq!(MediaType::parse("image/png"), Ok(MediaType::ImagePng));
+        assert_eq!(MediaType::parse("image/webp"), Ok(MediaType::ImageWebp));
+        assert_eq!(MediaType::parse("image/jpeg"), Ok(MediaType::ImageJpeg));
+        assert_eq!(MediaType::parse("audio/mpeg"), Ok(MediaType::AudioMpeg));
+        assert_eq!(MediaType::parse("audio/wav"), Ok(MediaType::AudioWav));
+        assert_eq!(
+            MediaType::parse("model/gltf-binary"),
+            Ok(MediaType::ModelGltfBinary)
+        );
+    }
+
+    /// RFC 7231 §3.1.1.1: media types are case-insensitive. `MediaType::parse` must
+    /// preserve the same laxness `parse_artifact`'s raw content-type comparison already
+    /// grants — every variant recognized regardless of how the wire spelled its case.
+    #[test]
+    fn media_type_parse_is_case_insensitive_for_every_variant() {
+        for (mixed, expected) in [
+            ("IMAGE/PNG", MediaType::ImagePng),
+            ("Image/Png", MediaType::ImagePng),
+            ("IMAGE/WEBP", MediaType::ImageWebp),
+            ("Image/Jpeg", MediaType::ImageJpeg),
+            ("AUDIO/MPEG", MediaType::AudioMpeg),
+            ("Audio/Wav", MediaType::AudioWav),
+            ("MODEL/GLTF-BINARY", MediaType::ModelGltfBinary),
+        ] {
+            assert_eq!(MediaType::parse(mixed), Ok(expected), "input {mixed:?}");
+        }
+    }
+
+    /// An unrecognized content-type must fail loudly, naming exactly what was received
+    /// — never silently coerced into one of the six or dropped.
+    #[test]
+    fn media_type_parse_unknown_content_type_fails_loudly() {
+        let err = MediaType::parse("application/octet-stream").unwrap_err();
+        match err {
+            StabilityError::UnknownMediaType(ct) => assert_eq!(ct, "application/octet-stream"),
+            other => panic!("expected UnknownMediaType, got {other:?}"),
+        }
+    }
+
+    /// The full pipeline, not just the unit: a `200` with an otherwise-valid response
+    /// but an unrecognized content-type must be refused by `handle_response`, not just
+    /// by `MediaType::parse` in isolation.
+    #[test]
+    fn handle_response_unknown_media_type_is_refused() {
+        let err = handle_response(
+            Shape::Sync,
+            200,
+            Some("text/plain"),
+            Some("SUCCESS"),
+            None,
+            b"bytes",
+        )
+        .unwrap_err();
+        match err {
+            StabilityError::UnknownMediaType(ct) => assert_eq!(ct, "text/plain"),
+            other => panic!("expected UnknownMediaType, got {other:?}"),
+        }
+    }
+
+    /// The three image types map onto the CAS's real extensions.
+    #[test]
+    fn media_type_to_cas_extension_accepts_the_three_image_types() {
+        assert_eq!(
+            MediaType::ImagePng.to_cas_extension(),
+            Ok(crate::cas::Extension::Png)
+        );
+        assert_eq!(
+            MediaType::ImageJpeg.to_cas_extension(),
+            Ok(crate::cas::Extension::Jpeg)
+        );
+        assert_eq!(
+            MediaType::ImageWebp.to_cas_extension(),
+            Ok(crate::cas::Extension::Webp)
+        );
+    }
+
+    /// Audio and 3D have no `cas::Extension` to land on yet — the mapping must refuse
+    /// loudly, naming the media type that was refused, rather than inventing an
+    /// extension or silently dropping the media family. See the module doc's
+    /// `MediaType` section for why this refusal is a deliberate feature.
+    #[test]
+    fn media_type_to_cas_extension_refuses_audio_and_3d() {
+        for media_type in [MediaType::AudioMpeg, MediaType::AudioWav, MediaType::ModelGltfBinary] {
+            let err = media_type.to_cas_extension().unwrap_err();
+            match err {
+                StabilityError::NoCasExtension { media_type: got } => {
+                    assert_eq!(got, media_type)
+                }
+                other => panic!("expected NoCasExtension for {media_type:?}, got {other:?}"),
+            }
+        }
+    }
+
     // --- handle_response (Shape::Sync) ----------------------------------------
 
     /// Unwrap a `Shape::Sync` [`handle_response`] success down to the [`Artifact`] —
@@ -1146,7 +1379,7 @@ mod tests {
             body,
         ));
         assert_eq!(got.bytes, body.to_vec());
-        assert_eq!(got.media_type, "image/png");
+        assert_eq!(got.media_type, MediaType::ImagePng);
         assert_eq!(got.seed.as_deref(), Some("343940597"));
     }
 
@@ -1166,7 +1399,7 @@ mod tests {
             body,
         ));
         assert_eq!(got.bytes, body.to_vec());
-        assert_eq!(got.media_type, "audio/mpeg");
+        assert_eq!(got.media_type, MediaType::AudioMpeg);
         assert_eq!(got.seed.as_deref(), Some("99"));
     }
 
@@ -1184,7 +1417,7 @@ mod tests {
             body,
         ));
         assert_eq!(got.bytes, body.to_vec());
-        assert_eq!(got.media_type, "model/gltf-binary");
+        assert_eq!(got.media_type, MediaType::ModelGltfBinary);
     }
 
     #[test]
@@ -1253,9 +1486,9 @@ mod tests {
                 png,
             ));
             assert_eq!(out.bytes, png, "content-type {ct:?}");
-            // Stored lowercased regardless of how the wire spelled it — see
-            // `Artifact::media_type`'s doc.
-            assert_eq!(out.media_type, "image/png", "content-type {ct:?}");
+            // Parses to the same variant regardless of how the wire spelled its case —
+            // see `MediaType::parse`'s doc.
+            assert_eq!(out.media_type, MediaType::ImagePng, "content-type {ct:?}");
         }
     }
 
@@ -1397,7 +1630,7 @@ mod tests {
         match got {
             PollOutcome::Complete(artifact) => {
                 assert_eq!(artifact.bytes, body.to_vec());
-                assert_eq!(artifact.media_type, "image/png");
+                assert_eq!(artifact.media_type, MediaType::ImagePng);
                 assert_eq!(artifact.seed.as_deref(), Some("42"));
             }
             PollOutcome::Pending => panic!("expected Complete, got Pending"),
@@ -1415,7 +1648,7 @@ mod tests {
         let done = handle_poll_response(200, Some("audio/wav"), Some("SUCCESS"), None, b"RIFF....WAVEfmt ")
             .unwrap();
         match done {
-            PollOutcome::Complete(artifact) => assert_eq!(artifact.media_type, "audio/wav"),
+            PollOutcome::Complete(artifact) => assert_eq!(artifact.media_type, MediaType::AudioWav),
             PollOutcome::Pending => panic!("expected Complete on the second poll"),
         }
     }

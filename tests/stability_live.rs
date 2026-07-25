@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use kaibo::stability::{
-    resolve_key, GenerateRoute, Operation, StabilityClient, StabilityRequest, StabilityResponse,
+    resolve_key, GenerateRoute, MediaType, Operation, StabilityClient, StabilityRequest,
+    StabilityResponse,
 };
 
 #[tokio::test]
@@ -44,9 +45,9 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
     };
 
     eprintln!(
-        "=== STABILITY LIVE: {} bytes, media_type={:?}, seed={:?} ===",
+        "=== STABILITY LIVE: {} bytes, media_type={}, seed={:?} ===",
         image.bytes.len(),
-        image.media_type,
+        image.media_type.as_str(),
         image.seed
     );
 
@@ -54,7 +55,7 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
     // PNG magic bytes — confirms this is really an image, not e.g. a stray JSON body
     // that slipped past `handle_response`'s content-type check.
     assert_eq!(&image.bytes[..8], b"\x89PNG\r\n\x1a\n", "expected PNG magic bytes");
-    assert_eq!(image.media_type, "image/png");
+    assert_eq!(image.media_type, MediaType::ImagePng);
     assert!(
         image.seed.is_some(),
         "Stability should report the seed it used, for reproducibility"
