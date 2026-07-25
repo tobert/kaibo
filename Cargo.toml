@@ -117,6 +117,12 @@ opentelemetry_sdk = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
 
+# sha256 for the media CAS (src/cas.rs): the address IS the digest, so hashing is the
+# one operation the whole design leans on. Pure Rust, no C/asm, already in the lock
+# transitively (via kaish-kernel and rig-core's provider stack) — named here explicitly
+# so it's ours, not implicit, matching how the other deps above are documented.
+sha2 = "0.10"
+
 # Local-filesystem validation for the persistence store (src/store.rs): turso's
 # multiprocess-WAL mode is unsupported on network filesystems (NFS/CIFS), where a
 # shared open can silently lose writes. On Linux we `statfs` the state dir and refuse a
