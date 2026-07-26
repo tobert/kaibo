@@ -191,7 +191,8 @@ pub struct ConsultInput {
     pub context: Option<String>,
 
     /// Absolute path to the project to explore. Optional when the server has a default
-    /// root; must be at-or-under an allowed tree (`kaibo://config` shows the set).
+    /// root; must be at-or-under an allowed tree, or a linked git worktree of one
+    /// (`kaibo://config` shows the set).
     #[serde(default)]
     pub path: Option<String>,
 
@@ -268,7 +269,8 @@ pub struct ExploreInput {
     pub attach: Vec<String>,
 
     /// Absolute path to the project to explore. Optional when the server has a default
-    /// root; must be at-or-under an allowed tree (`kaibo://config` shows the set).
+    /// root; must be at-or-under an allowed tree, or a linked git worktree of one
+    /// (`kaibo://config` shows the set).
     #[serde(default)]
     pub path: Option<String>,
 
@@ -314,7 +316,8 @@ pub struct DeliberateInput {
     pub attach: Vec<String>,
 
     /// Absolute path to the project. Optional when the server has a default root; must
-    /// be at-or-under an allowed tree (`kaibo://config` shows the set).
+    /// be at-or-under an allowed tree, or a linked git worktree of one (`kaibo://config`
+    /// shows the set).
     #[serde(default)]
     pub path: Option<String>,
 
@@ -482,8 +485,9 @@ pub struct RunKaishInput {
     pub script: String,
 
     /// Absolute path to the project. Optional when the server has a default root; must be
-    /// at-or-under an allowed tree (`kaibo://config` shows the set). Each call starts fresh
-    /// at this root — there is no persistent cwd across calls.
+    /// at-or-under an allowed tree, or a linked git worktree of one (`kaibo://config`
+    /// shows the set). Each call starts fresh at this root — there is no persistent cwd
+    /// across calls.
     #[serde(default)]
     pub path: Option<String>,
 }
