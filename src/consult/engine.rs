@@ -12,9 +12,13 @@ use anyhow::{anyhow, Context, Result};
 use rig_core::agent::{AgentBuilder, HookAction, PromptHook};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
-    UserContent,
+    Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent, UserContent,
 };
+// Only referenced from the offline-loop tests below (constructing a scripted
+// `view_image`/co-tool-call assistant turn) — the generalized rewrite (`the_result`,
+// not the tool call) no longer needs it in production code.
+#[cfg(test)]
+use rig_core::completion::message::AssistantContent;
 use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
 use rig_core::tool::{Tool, ToolDyn};
@@ -73,7 +77,7 @@ trait PhaseRunner: Send + Sync {
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
-        break_on_view_image: bool,
+        break_on_tool_images: bool,
     ) -> PhaseFuture<'a>;
 }
 
@@ -103,7 +107,7 @@ where
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
-        break_on_view_image: bool,
+        break_on_tool_images: bool,
     ) -> PhaseFuture<'a> {
         Box::pin(run_phase(
             &self.model,
@@ -116,7 +120,7 @@ where
             params,
             progress,
             make_tools,
-            break_on_view_image,
+            break_on_tool_images,
         ))
     }
 }
@@ -412,7 +416,7 @@ impl Arm {
     /// the model can *see* but its transport can't carry the image in a tool result
     /// (an OpenAI VLM) — the predicate [`run_phase`]'s break-rewrite-resume gate reads.
     /// A blind arm never sees `view_image`, so this is false there regardless.
-    fn rewrites_view_image(&self) -> bool {
+    fn rewrites_tool_images(&self) -> bool {
         self.caps.vision && !self.caps.tool_result_images
     }
 
@@ -439,7 +443,7 @@ impl Arm {
                 self.params.as_ref(),
                 progress,
                 make_tools,
-                self.rewrites_view_image(),
+                self.rewrites_tool_images(),
             )
             .await
     }
@@ -507,17 +511,17 @@ fn finalize_prompt(mut chat_history: Vec<Message>) -> (Vec<Message>, Message) {
     }
 }
 
-// --- view_image on the user-turn channel (the openai VLM path) ----------------
+// --- an image-bearing tool result on the user-turn channel (the openai VLM path) --
 
-/// The cancellation reason [`ViewImageBreakHook`] terminates with, so [`run_phase`]
+/// The cancellation reason [`ToolImageBreakHook`] terminates with, so [`run_phase`]
 /// can tell *its* deliberate break from any other `PromptCancelled` rig might raise
 /// (a lost prompt, an empty tool batch). An internal sentinel; never shown to a model.
-const VIEW_IMAGE_BREAK: &str = "kaibo:view_image_break";
+const TOOL_IMAGE_BREAK: &str = "kaibo:view_image_break";
 
 /// The text a rewritten `view_image` tool result carries when its own note is somehow
 /// absent — enough to satisfy the `tool_use → tool_result` pairing every provider
 /// requires. The image itself rides the separate user turn the rewrite inserts.
-const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
+const TOOL_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
 
 /// Breaks the managed tool loop at the turn boundary after a `view_image` ran, so
 /// [`run_phase`] can move the image onto the **user-turn** channel for a transport
@@ -535,50 +539,76 @@ const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the nex
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
 /// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
 #[derive(Clone)]
-struct ViewImageBreakHook {
+struct ToolImageBreakHook {
     enabled: bool,
     /// Set once a `view_image` tool result lands this turn; read at the next
     /// completion call. Interior mutability because `PromptHook`'s callbacks are `&self`
     /// and rig runs a turn's tools concurrently.
-    saw_view_image: Arc<AtomicBool>,
+    saw_tool_image: Arc<AtomicBool>,
 }
 
-impl ViewImageBreakHook {
+impl ToolImageBreakHook {
     fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            saw_view_image: Arc::new(AtomicBool::new(false)),
+            saw_tool_image: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-impl<M: CompletionModel> PromptHook<M> for ViewImageBreakHook {
+impl<M: CompletionModel> PromptHook<M> for ToolImageBreakHook {
     async fn on_tool_result(
         &self,
-        tool_name: &str,
+        _tool_name: &str,
         _tool_call_id: Option<String>,
         _internal_call_id: &str,
         _args: &str,
-        _result: &str,
+        result: &str,
     ) -> HookAction {
-        if self.enabled && tool_name == ViewImage::NAME {
-            self.saw_view_image.store(true, Ordering::SeqCst);
+        if self.enabled && tool_result_carries_image(result) {
+            self.saw_tool_image.store(true, Ordering::SeqCst);
         }
         HookAction::cont()
     }
 
     async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
-        if self.enabled && self.saw_view_image.load(Ordering::SeqCst) {
-            HookAction::terminate(VIEW_IMAGE_BREAK)
+        if self.enabled && self.saw_tool_image.load(Ordering::SeqCst) {
+            HookAction::terminate(TOOL_IMAGE_BREAK)
         } else {
             HookAction::cont()
         }
     }
 }
 
-/// Rewrite a transcript so every `view_image` image rides the **user-turn** channel
-/// instead of the tool-result channel. For each `view_image` tool result that still
-/// carries an image: keep its text as a short ack (so the `tool_use → tool_result`
+/// Does this tool result (rig's raw serialized `Tool::Output`) carry an image part?
+/// Keys the break hook on the RESULT, not the tool's name — fully general, so the
+/// next image-bearing tool (`view_image` today, and a sweep's `explore` result
+/// carrying a routed image) needs no new `if`. A cheap substring guard first (every
+/// non-image-bearing result, the overwhelming majority, never pays the parse), then
+/// a real JSON confirm that `parts[]` actually holds an image — rig hands the raw
+/// serialized output straight to this hook (`rig-core` `agent/prompt_request/mod.rs`),
+/// which is exactly the hybrid envelope [`crate::view_image::ViewImage`] and
+/// [`crate::consult::RunExplore`] both emit.
+fn tool_result_carries_image(result: &str) -> bool {
+    if !result.contains("\"type\":\"image\"") {
+        return false;
+    }
+    serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|v| {
+            v.get("parts")?.as_array().map(|parts| {
+                parts
+                    .iter()
+                    .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Rewrite a transcript so every image-bearing tool result rides the **user-turn**
+/// channel instead of the tool-result channel — `view_image`, or a delegated
+/// `explore` sweep that routed an image via `attach`. For each such result that
+/// still carries an image: keep its text as a short ack (so the `tool_use → tool_result`
 /// pairing stays valid) and emit a separate, tool-result-free `Message::User { [Image] }`
 /// right after that user message — the bytes the model now sees on a channel OpenAI
 /// accepts. Every other block (assistant text/thinking, other tools' use/result pairs)
@@ -593,24 +623,7 @@ impl<M: CompletionModel> PromptHook<M> for ViewImageBreakHook {
 /// result already acked to text (an earlier break) and an already-inserted image
 /// message both pass through untouched — safe to run after every break. Pure and
 /// offline-testable.
-fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
-    // The tool_use ids naming a view_image call live on the *assistant* `ToolCall`,
-    // not on the user `ToolResult` — collect them first, then match results against them.
-    let view_image_ids: HashSet<String> = history
-        .iter()
-        .filter_map(|m| match m {
-            Message::Assistant { content, .. } => Some(content),
-            _ => None,
-        })
-        .flat_map(|content| content.iter())
-        .filter_map(|c| match c {
-            AssistantContent::ToolCall(tc) if tc.function.name == ViewImage::NAME => {
-                Some(tc.id.clone())
-            }
-            _ => None,
-        })
-        .collect();
-
+fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(history.len());
     for msg in history {
         let content = match msg {
@@ -622,21 +635,32 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
         };
 
         let mut new_parts: Vec<UserContent> = Vec::new();
-        // Images pulled out of this turn's view_image results, re-emitted as their own
-        // user messages immediately after (one per image), preserving order.
+        // Images pulled out of this turn's image-bearing tool results, re-emitted as
+        // their own user messages immediately after (one per image), preserving order.
         let mut extracted: Vec<Image> = Vec::new();
 
         for part in content {
             match part {
-                UserContent::ToolResult(tr) if view_image_ids.contains(&tr.id) => {
+                // Key on the RESULT still carrying an image — not the tool's name or
+                // id. Fully general: the next image-bearing tool (today: `view_image`
+                // and a sweep's `explore` result carrying a routed image) needs no
+                // edit here. A result already acked to text (an earlier break, or an
+                // already-inserted image turn) holds no `ToolResultContent::Image`, so
+                // it falls through untouched — the idempotency that makes re-running
+                // this safe.
+                UserContent::ToolResult(tr)
+                    if tr
+                        .content
+                        .iter()
+                        .any(|rc| matches!(rc, ToolResultContent::Image(_))) =>
+                {
                     let ToolResult {
                         id,
                         call_id,
                         content,
                     } = tr;
                     // Split the result into its text (the load note → ack) and its
-                    // image (→ a user turn). A result already acked has no image, so
-                    // this is a no-op for it — the idempotency that makes re-running safe.
+                    // image(s) (→ a user turn each).
                     let mut texts: Vec<ToolResultContent> = Vec::new();
                     for rc in content {
                         match rc {
@@ -645,7 +669,7 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
                         }
                     }
                     let content = OneOrMany::many(texts).unwrap_or_else(|_| {
-                        OneOrMany::one(ToolResultContent::text(VIEW_IMAGE_ACK))
+                        OneOrMany::one(ToolResultContent::text(TOOL_IMAGE_ACK))
                     });
                     new_parts.push(UserContent::ToolResult(ToolResult {
                         id,
@@ -719,14 +743,16 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// declared so the accumulated tool_use/tool_result history stays valid, but
 /// `ToolChoice::None` forbids new calls — the model must answer from what it has.
 ///
-/// **view_image on the user-turn channel.** When `break_on_view_image` is set (a
-/// vision model whose transport can't carry an image in a tool result — an OpenAI
-/// VLM), a [`ViewImageBreakHook`] terminates the loop at the turn boundary after a
-/// `view_image` call. rig hands back the full transcript via `PromptCancelled`; we
-/// rewrite each `view_image` result onto a separate user `Image` turn
-/// ([`rewrite_view_image_history`]) and re-enter the loop with the remaining turn
-/// budget. The model now sees the image in user content, the one channel every
-/// provider accepts. When unset the hook is inert and this is the old single call.
+/// **A tool-result image on the user-turn channel.** When `break_on_tool_images` is
+/// set (a vision model whose transport can't carry an image in a tool result — an
+/// OpenAI VLM), a [`ToolImageBreakHook`] terminates the loop at the turn boundary
+/// after any tool result carries an image — `view_image`, or a delegated `explore`
+/// sweep that routed one via `attach`. rig hands back the full transcript via
+/// `PromptCancelled`; we rewrite each image-bearing result onto a separate user
+/// `Image` turn ([`rewrite_tool_image_history`]) and re-enter the loop with the
+/// remaining turn budget. The model now sees the image in user content, the one
+/// channel every provider accepts. When unset the hook is inert and this is the old
+/// single call.
 #[allow(clippy::too_many_arguments)]
 // each arg is a distinct, named loop input
 // A named parent for rig's GenAI spans: rig's `invoke_agent` checks the current
@@ -758,7 +784,7 @@ pub(crate) async fn run_phase<M, F>(
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
     make_tools: F,
-    break_on_view_image: bool,
+    break_on_tool_images: bool,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -816,7 +842,7 @@ where
         }
         let agent = builder.tools(make_tools()?).build();
 
-        // A fresh hook per loop iteration is load-bearing: its `saw_view_image` flag
+        // A fresh hook per loop iteration is load-bearing: its `saw_tool_image` flag
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
@@ -832,7 +858,7 @@ where
         let result = agent
             .prompt(prompt.clone())
             .with_history(history.clone())
-            .with_hook(ViewImageBreakHook::new(break_on_view_image))
+            .with_hook(ToolImageBreakHook::new(break_on_tool_images))
             .max_turns(remaining)
             .extended_details()
             .await;
@@ -862,8 +888,8 @@ where
             Err(PromptError::PromptCancelled {
                 chat_history,
                 reason,
-            }) if reason == VIEW_IMAGE_BREAK => {
-                let (rest, next) = split_for_resume(rewrite_view_image_history(chat_history));
+            }) if reason == TOOL_IMAGE_BREAK => {
+                let (rest, next) = split_for_resume(rewrite_tool_image_history(chat_history));
                 history = rest;
                 prompt = next;
             }
@@ -1091,7 +1117,12 @@ impl Tool for RunExplore {
     const NAME: &'static str = "explore";
     type Error = RunExploreError;
     type Args = RunExploreArgs;
-    type Output = String;
+    /// `Value`, not `String`: no attachment → `Value::String(report)`, byte-identical
+    /// on the wire to today's plain `String` (both serialize to a bare JSON string).
+    /// With a routed image → the rig hybrid envelope `{"response":…,"parts":[…]}`,
+    /// exactly what [`crate::view_image::ViewImage::view`] emits — verified against
+    /// rig's `from_tool_output`, which only extracts image parts from that shape.
+    type Output = Value;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
@@ -1168,18 +1199,38 @@ impl Tool for RunExplore {
         // What the DRIVER sees on the tool result: the report plus whatever this
         // sweep routed via `attach` — text bodies inline, an image manifest, notes,
         // and demotions. `None` (no sink, or a sink that never attached anything)
-        // leaves this byte-for-byte the bare report.
-        let text = match &sink {
+        // leaves this byte-for-byte the bare report, and `images` stays empty.
+        let (text, images) = match &sink {
             Some(sink) => {
                 let delivery = sink.drain();
-                match sweep_evidence_block(&self.consumer, &delivery) {
+                let images = delivery.images();
+                let text = match sweep_evidence_block(&self.consumer, &delivery) {
                     Some(block) => format!("{report}{block}"),
                     None => report,
-                }
+                };
+                (text, images)
             }
-            None => report,
+            None => (report, Vec::new()),
         };
-        Ok(text)
+        // No image → a bare JSON string, byte-for-byte the pre-attach wire shape (see
+        // the `Output` doc). With one or more → the rig hybrid envelope, one `parts`
+        // entry per routed image, same shape `view_image` emits for one.
+        if images.is_empty() {
+            Ok(Value::String(text))
+        } else {
+            let parts: Vec<Value> = images
+                .iter()
+                .filter_map(|a| match a {
+                    Attachment::Image { mime, data_b64, .. } => Some(json!({
+                        "type": "image",
+                        "data": data_b64,
+                        "mimeType": mime,
+                    })),
+                    Attachment::Text { .. } => None,
+                })
+                .collect();
+            Ok(json!({ "response": text, "parts": parts }))
+        }
     }
 }
 
@@ -1190,8 +1241,8 @@ impl Tool for RunExplore {
 /// exactly one upstream request. Neither orientation nor operator house rules are
 /// spliced — both are project guidance, and oneshot reads no project.
 ///
-/// Safe-by-accident note: a vision synth arm carries `break_on_view_image = true`
-/// (via `Arm::rewrites_view_image`), but the empty toolset has no `view_image` tool,
+/// Safe-by-accident note: a vision synth arm carries `break_on_tool_images = true`
+/// (via `Arm::rewrites_tool_images`), but the empty toolset has no `view_image` tool,
 /// so the break hook can never fire and the single turn always completes cleanly. If
 /// you ever give oneshot a tool, revisit this — a live break would consume the turn
 /// and land in the turn-cap finalize path.
@@ -2743,6 +2794,219 @@ mod tests {
             }),
             "an attach call must surface as progress: {events:?}"
         );
+    }
+
+    /// A minimal PNG signature plus filler — enough to sniff as an image without
+    /// decoding it (mirrors the `view_image`/`attach.rs`/`sweep_attach.rs` test helpers).
+    fn fake_png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend(std::iter::repeat_n(0xAB, 16));
+        v
+    }
+
+    /// A vision-capable driver (Anthropic/Gemini-shaped: `tool_result_images = true`)
+    /// receives a sweep's routed image right on the `explore` tool result — no break,
+    /// no user-turn rewrite, since this transport carries an image in a tool result.
+    #[tokio::test]
+    async fn a_vision_driver_receives_the_sweep_image_in_the_tool_result() {
+        const SYNTH: &str = "vision-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                if any_tool_result_image(&history) {
+                    Ok(text_response("ANSWER: saw the diagram"))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: the diagram shows the pipeline"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+        // vision + tool_result_images: the Anthropic/Gemini shape.
+        let synth = vision_arm(&client, SYNTH);
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &synth,
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        assert!(
+            client
+                .requests_for(SYNTH)
+                .iter()
+                .any(|r| any_tool_result_image(&r.chat_history)),
+            "the vision driver must receive the image on the explore tool result"
+        );
+    }
+
+    /// A vision-capable driver whose TRANSPORT can't carry an image in a tool result
+    /// (an OpenAI VLM shape: `tool_result_images = false`) still receives the sweep's
+    /// image — on a separate user `Image` turn, via the same break-rewrite-resume
+    /// path `view_image` uses, now generalized to any image-bearing tool result.
+    #[tokio::test]
+    async fn an_openai_vlm_driver_receives_the_sweep_image_on_a_user_turn() {
+        const SYNTH: &str = "openai-vlm-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                if user_image_messages(&history) > 0 {
+                    Ok(text_response("ANSWER: saw the diagram"))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: the diagram shows the pipeline"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+        // vision but NOT tool_result_images: the OpenAI VLM shape that must break,
+        // rewrite, and resume.
+        let synth = Arm::new(
+            client.clone(),
+            SYNTH,
+            16384,
+            None,
+            ModelCaps {
+                vision: true,
+                tool_result_images: false,
+            },
+        );
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &synth,
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| user_image_messages(&r.chat_history) > 0),
+            "the OpenAI-shaped driver must receive the image on its own user turn: {:?}",
+            synth_reqs.iter().map(|r| r.chat_history.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            synth_reqs
+                .iter()
+                .all(|r| !any_tool_result_image(&r.chat_history)),
+            "an image must never ride this transport's tool-result channel"
+        );
+    }
+
+    /// A blind consumer (the default `arm()` — not vision-capable) never receives an
+    /// image: `attach` refuses it in the receipt, and the EXPLORER sees that refusal
+    /// on its very next turn (immediately, within the same sweep) rather than only
+    /// finding out once the whole sweep concludes.
+    #[tokio::test]
+    async fn a_blind_driver_refuses_the_image_and_the_explorer_learns_immediately() {
+        const SYNTH: &str = "blind-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: no diagram available"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("not attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    // The explorer learns of the refusal on its OWN very next turn —
+                    // it doesn't have to wait for anything downstream.
+                    assert!(
+                        transcript_text(req).contains("reads text only"),
+                        "the explorer must see the refusal reason immediately: {}",
+                        transcript_text(req)
+                    );
+                    Ok(text_response("REPORT: could not attach the diagram"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH), // the default arm is blind
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        for r in client.requests_for(SYNTH) {
+            assert!(
+                !any_tool_result_image(&r.chat_history),
+                "a blind driver must never receive an image on any channel"
+            );
+        }
     }
 
     /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
@@ -4803,7 +5067,7 @@ mod tests {
                 content: OneOrMany::one(vi_result("call-1")),
             },
         ];
-        let out = rewrite_view_image_history(history);
+        let out = rewrite_tool_image_history(history);
 
         assert!(
             !any_tool_result_image(&out),
@@ -4856,8 +5120,8 @@ mod tests {
                 content: OneOrMany::one(vi_result("c1")),
             },
         ];
-        let once = rewrite_view_image_history(history);
-        let twice = rewrite_view_image_history(once.clone());
+        let once = rewrite_tool_image_history(history);
+        let twice = rewrite_tool_image_history(once.clone());
         assert_eq!(once, twice, "a second rewrite pass is a no-op");
         assert_eq!(user_image_messages(&twice), 1, "no duplicate image turn");
     }
@@ -4887,7 +5151,7 @@ mod tests {
             ])
             .unwrap(),
         };
-        let out = rewrite_view_image_history(vec![Message::user("q"), assistant, results]);
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
 
         assert!(!any_tool_result_image(&out), "view_image image moved out");
         assert_eq!(user_image_messages(&out), 1, "exactly the one image turn");
@@ -4898,6 +5162,52 @@ mod tests {
                     && tr.content.iter().any(|rc| matches!(rc,
                         ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
             "the run_kaish tool_result is preserved verbatim: {out:?}"
+        );
+    }
+
+    /// The generalization's whole point: an `explore` sweep's result carrying a
+    /// routed image (the hybrid envelope `RunExplore::call` emits once it attached
+    /// an image) gets EXACTLY the same user-turn-channel treatment as `view_image` —
+    /// no per-tool `if` was added for it, because the rewrite keys on the result,
+    /// not the tool's name.
+    #[test]
+    fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "explore-1",
+                "explore",
+                json!({ "question": "what does the diagram show?" }),
+            )),
+        };
+        let result = Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "explore-1".to_string(),
+                call_id: None,
+                content: OneOrMany::many([
+                    ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
+                    ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                ])
+                .unwrap(),
+            })),
+        };
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, result]);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "the explore result's image must leave the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            1,
+            "it reappears as exactly one user Image message: {out:?}"
+        );
+        assert!(
+            out.iter().any(|m| matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                    if tr.id == "explore-1"
+                    && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+            "the explore tool_use stays answered by a text-only result: {out:?}"
         );
     }
 
