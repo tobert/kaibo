@@ -594,6 +594,7 @@ fn allow_paths_cli_replaces_env_and_file() {
         vec![],
         false,
         None,
+        None,
     );
     assert_eq!(c.allow_paths.len(), 2);
     assert!(c
@@ -841,5 +842,88 @@ async fn sibling_reachable_when_rooted_at_linked_worktree() {
     assert!(
         out.contains("main worktree"),
         "should read the main worktree's file, got: {out}"
+    );
+}
+
+// --- (g) the explorer's `attach` tool obeys the same containment boundary ----
+//
+// `attach` (the sweep routing verb, `src/sweep_attach.rs`) resolves paths through
+// the same canonicalize-then-`starts_with(root)` primitive `run_kaish` does, but it
+// is a distinct code path (its own tool, its own resolver), so it earns its own
+// containment teeth here — constructed directly against the public tool, no model
+// or MCP handler needed.
+
+use kaibo::progress::NullSink;
+use kaibo::sandbox::KaishWorker;
+use kaibo::sweep_attach::{SweepAttach, SweepAttachArgs, SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use rig_core::tool::Tool;
+use std::sync::Arc;
+
+fn attach_tool_over(root: &Path) -> SweepAttach {
+    let sink = Arc::new(SweepAttachSink::new(
+        8,
+        SweepConsumer {
+            kind: SweepConsumerKind::ConsultDriver,
+            label: Arc::from("the consult driver (`test-model`)"),
+            vision: false,
+        },
+        std::collections::HashSet::new(),
+    ));
+    SweepAttach::new(
+        KaishWorker::spawn(root).expect("spawn read-only worker"),
+        root,
+        sink,
+        Arc::new(NullSink),
+    )
+}
+
+/// A path outside the project root must be refused, and nothing routed.
+#[tokio::test]
+async fn sweep_attach_refuses_a_path_outside_the_project_root() {
+    let allowed = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let root = fs::canonicalize(allowed.path()).unwrap();
+    let stray = fs::canonicalize(outside.path()).unwrap().join("secret.txt");
+    fs::write(&stray, "sensitive\n").unwrap();
+
+    let tool = attach_tool_over(&root);
+    let receipt = tool
+        .call(SweepAttachArgs {
+            paths: vec![stray.to_string_lossy().to_string()],
+            note: None,
+        })
+        .await
+        .expect("attach itself never hard-errors on a bad path — refusal rides the receipt");
+
+    assert!(
+        receipt.contains("OUTSIDE") && receipt.to_lowercase().contains("not attached"),
+        "the receipt must name the boundary and refuse the route: {receipt}"
+    );
+}
+
+/// A symlink inside the project root whose target escapes it must be refused —
+/// `canonicalize` resolves the target before the containment check runs, exactly
+/// as it does for `run_kaish`.
+#[tokio::test]
+async fn sweep_attach_refuses_a_symlink_escape() {
+    let allowed = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let root = fs::canonicalize(allowed.path()).unwrap();
+    fs::write(outside.path().join("secret.txt"), "sensitive\n").unwrap();
+    let link = root.join("escape");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+    let tool = attach_tool_over(&root);
+    let receipt = tool
+        .call(SweepAttachArgs {
+            paths: vec!["escape/secret.txt".to_string()],
+            note: None,
+        })
+        .await
+        .expect("attach itself never hard-errors on a bad path — refusal rides the receipt");
+
+    assert!(
+        receipt.contains("OUTSIDE"),
+        "a symlink escaping the root must be refused: {receipt}"
     );
 }
