@@ -1383,14 +1383,18 @@ impl KaiboHandler {
         let span =
             tracing::info_span!("explore", cast = %cast.name, explorer_model = %explorer.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
-        let (report, usage) = match explore_with(&input.question, root, &explorer, &cfg, &attachments)
-            .instrument(span)
-            .await
-        {
-            Ok(out) => out,
-            // A provider/model-loop failure is a clean tool-result error, same as `consult`.
-            Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
-        };
+        // The top-level `explore` tool doesn't inject `attach` (v1 scope) — its
+        // report goes straight back to the calling agent's own context, which is
+        // exactly the channel `attach` exists to bypass; no consumer to route to.
+        let (report, usage) =
+            match explore_with(&input.question, root, &explorer, &cfg, &attachments, None)
+                .instrument(span)
+                .await
+            {
+                Ok(out) => out,
+                // A provider/model-loop failure is a clean tool-result error, same as `consult`.
+                Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
+            };
         progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
 
         // The report IS the text (no structured_content). Provenance names the one arm
@@ -1465,8 +1469,12 @@ impl KaiboHandler {
         progress.emit(PhaseEvent::PhaseStarted {
             phase: "deliberate.dossier",
         });
+        // TODO(explorer-attach deliberate stage): route through a SweepAttachSink
+        // scoped to the offline synth (SweepConsumerKind::OfflineSynth) instead of
+        // `None` — the dossier stage is the one place `attach` should NOT dedupe
+        // against caller attachments (see `SweepAttachSink`'s doc).
         let (dossier, dossier_usage) =
-            match explore_with(&input.question, root, &explorer, &cfg, &attachments)
+            match explore_with(&input.question, root, &explorer, &cfg, &attachments, None)
                 .instrument(span)
                 .await
             {

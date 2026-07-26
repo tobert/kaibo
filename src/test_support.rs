@@ -81,6 +81,13 @@ pub struct RecordedRequest {
     pub max_tokens: Option<u64>,
     /// `Some(ToolChoice::None)` marks the forced finalize turn after a turn-cap hit.
     pub tool_choice: Option<ToolChoice>,
+    /// The raw chat history rig forwarded, images and all. `transcript`/`user_text`
+    /// only extract `Text` content, so an image (a `view_image`/`explore` tool
+    /// result, or a user `Image` turn from the break-rewrite path) is invisible to
+    /// them — a test that must see whether an image actually reached a request
+    /// needs this instead (with the `any_tool_result_image`/`user_image_messages`
+    /// helpers in `consult/engine.rs`'s test module).
+    pub chat_history: Vec<Message>,
 }
 
 impl RecordedRequest {
@@ -94,6 +101,7 @@ impl RecordedRequest {
             additional_params: req.additional_params.clone(),
             max_tokens: req.max_tokens,
             tool_choice: req.tool_choice.clone(),
+            chat_history: req.chat_history.iter().cloned().collect(),
         }
     }
 }

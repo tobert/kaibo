@@ -29,13 +29,17 @@ use crate::explorer::RunKaish;
 use crate::progress::{PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, Sessions};
+use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepConsumerKind};
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
 use super::config::{ConsultConfig, ExploreConfig, PhaseContext};
 #[cfg(test)]
 use super::prompts::PromptOverrides;
-use super::prompts::{consult_user_prompt, deliberation_prompt, resolve_phase_preamble, Phase};
+use super::prompts::{
+    consult_user_prompt, deliberation_prompt, explorer_attach_directive, resolve_phase_preamble,
+    sweep_evidence_block, Phase,
+};
 use super::shaping::{ModelCaps, ModelShape};
 
 // --- The Arm seam ------------------------------------------------------------
@@ -930,6 +934,14 @@ where
 /// handed to `run_kaish` so the sweep's own reads surface too. `!Send` care (an
 /// invariant): the kernel stays on its `KaishWorker` thread and never crosses the
 /// `.await`.
+///
+/// `attach` is the sweep's [`SweepAttachSink`] — `Some` injects the `attach` tool
+/// alongside `run_kaish` (sharing the same kernel `view_image` shares with
+/// `run_kaish` in `consult_tools`) and appends [`explorer_attach_directive`] to the
+/// preamble in the same place, so preamble and toolset can never drift apart.
+/// `None` (the top-level `explore` tool, v1) is byte-for-byte the old behavior —
+/// same preamble, same two-line toolset.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 pub(crate) async fn run_explore_phase(
     arm: &Arm,
     preamble: &str,
@@ -938,17 +950,39 @@ pub(crate) async fn run_explore_phase(
     sandbox: &SandboxConfig,
     max_turns: usize,
     progress: &Arc<dyn ProgressSink>,
+    attach: Option<&Arc<SweepAttachSink>>,
 ) -> Result<(String, Usage)> {
+    let preamble_owned;
+    let preamble = match attach {
+        Some(sink) => {
+            preamble_owned = format!(
+                "{preamble}{}",
+                explorer_attach_directive(sink.max_attachments(), sink.consumer())
+            );
+            preamble_owned.as_str()
+        }
+        None => preamble,
+    };
     arm.run(
         preamble,
         Message::user(question.to_string()),
         max_turns,
         progress.as_ref(),
         &|| -> Result<Vec<Box<dyn ToolDyn>>> {
-            Ok(vec![traced(RunKaish::with_progress(
-                KaishWorker::spawn_with(&root, sandbox.clone())?,
+            let worker = KaishWorker::spawn_with(&root, sandbox.clone())?;
+            let mut tools: Vec<Box<dyn ToolDyn>> = vec![traced(RunKaish::with_progress(
+                worker.clone(),
                 progress.clone(),
-            ))])
+            ))];
+            if let Some(sink) = attach {
+                tools.push(traced(SweepAttach::new(
+                    worker,
+                    root.clone(),
+                    Arc::clone(sink),
+                    progress.clone(),
+                )));
+            }
+            Ok(tools)
         },
     )
     .await
@@ -990,6 +1024,18 @@ pub struct RunExplore {
     /// nested explorer carries the explorer's `[prompts]`/`[context]` framing,
     /// built once instead of per sweep.
     preamble: Arc<str>,
+    /// Who reads this sweep's report — decides the vision gate and the demotion
+    /// wording a fresh [`SweepAttachSink`] is built with per sweep.
+    consumer: SweepConsumer,
+    /// This sweep's attach budget. `0` means "don't inject the tool at all" — no
+    /// sink is built, `run_explore_phase` gets `None`, byte-for-byte the pre-attach
+    /// behavior.
+    max_attachments: usize,
+    /// Canonical paths whose bytes already reach the consumer another way (the
+    /// caller's own `consult` attachments) — seeded into every sweep's sink so
+    /// `attach` doesn't re-route what's already in front of the driver. Empty for
+    /// `deliberate` (see `SweepAttachSink`'s doc).
+    already_delivered: Arc<HashSet<PathBuf>>,
 }
 
 impl RunExplore {
@@ -1003,6 +1049,9 @@ impl RunExplore {
         usage_sink: Arc<Mutex<Usage>>,
         progress: Arc<dyn ProgressSink>,
         preamble: Arc<str>,
+        consumer: SweepConsumer,
+        max_attachments: usize,
+        already_delivered: Arc<HashSet<PathBuf>>,
     ) -> Self {
         Self {
             arm,
@@ -1013,6 +1062,9 @@ impl RunExplore {
             usage_sink,
             progress,
             preamble,
+            consumer,
+            max_attachments,
+            already_delivered,
         }
     }
 }
@@ -1069,6 +1121,18 @@ impl Tool for RunExplore {
         self.progress.emit(PhaseEvent::SweepStarted {
             question: args.question.clone(),
         });
+        // A fresh sink per sweep — `attach`'s budget/dedupe is scoped to ONE sweep,
+        // not the whole consult (a driver that delegates 5 sweeps pays for 5 budgets;
+        // see the residual-risk note in the design doc). `0` means the operator
+        // turned the tool off: no sink, `run_explore_phase` gets `None`, byte-for-byte
+        // the pre-attach behavior.
+        let sink = (self.max_attachments > 0).then(|| {
+            Arc::new(SweepAttachSink::new(
+                self.max_attachments,
+                self.consumer.clone(),
+                (*self.already_delivered).clone(),
+            ))
+        });
         // Reuse the one seam — explore′ is just the shared explorer phase, run on the
         // sub-agent's arm with its resolved preamble. The sweep bracket
         // (started/finished) and the reports-sink push stay here (consult-loop
@@ -1081,6 +1145,7 @@ impl Tool for RunExplore {
             &self.sandbox,
             self.max_turns,
             &self.progress,
+            sink.as_ref(),
         )
         .await;
         self.progress.emit(PhaseEvent::SweepFinished);
@@ -1092,11 +1157,29 @@ impl Tool for RunExplore {
             .usage_sink
             .lock()
             .expect("explore usage sink poisoned") += usage;
+        // The `reports` sink feeds `ConsultOutput.report` (the readable artifact a
+        // caller sees via `include_report`) — the explorer's own prose only, never
+        // the routed bytes (those already reached the driver on the tool result; a
+        // caller-facing summary duplicating full attached files would just bloat it).
         self.reports
             .lock()
             .expect("explore report sink poisoned")
             .push(report.clone());
-        Ok(report)
+        // What the DRIVER sees on the tool result: the report plus whatever this
+        // sweep routed via `attach` — text bodies inline, an image manifest, notes,
+        // and demotions. `None` (no sink, or a sink that never attached anything)
+        // leaves this byte-for-byte the bare report.
+        let text = match &sink {
+            Some(sink) => {
+                let delivery = sink.drain();
+                match sweep_evidence_block(&self.consumer, &delivery) {
+                    Some(block) => format!("{report}{block}"),
+                    None => report,
+                }
+            }
+            None => report,
+        };
+        Ok(text)
     }
 }
 
@@ -1183,7 +1266,7 @@ fn consult_tools(
     cfg: &ConsultConfig,
     reports: Arc<Mutex<Vec<String>>>,
     explore_usage: Arc<Mutex<Usage>>,
-    synth_vision: bool,
+    synth: &Arm,
 ) -> Result<Vec<Box<dyn ToolDyn>>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
@@ -1209,6 +1292,22 @@ fn consult_tools(
         explorer_preamble_owned.push_str(&directive);
     }
     let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
+    // Who a delegated sweep's `attach` calls route to: the DRIVER (this loop runs on
+    // the synth arm), named so the explorer knows who reads its report, gated on the
+    // synth's own vision cap (the same cap `view_image` below rides).
+    let consumer = SweepConsumer {
+        kind: SweepConsumerKind::ConsultDriver,
+        label: Arc::from(format!("the consult driver (`{}`)", synth.model)),
+        vision: synth.caps.vision,
+    };
+    // The caller's own `consult` attachments already reach the driver another way
+    // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
+    // doesn't re-route what's already in front of the driver.
+    let already_delivered: HashSet<PathBuf> = cfg
+        .attachments
+        .iter()
+        .map(|a| root.join(a.path()))
+        .collect();
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explore.explorer_max_turns,
@@ -1218,6 +1317,9 @@ fn consult_tools(
         explore_usage,
         cfg.explore.phase.progress.clone(),
         explorer_preamble,
+        consumer,
+        cfg.explore.max_attachments,
+        Arc::new(already_delivered),
     );
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
         traced(RunKaish::with_progress(
@@ -1229,7 +1331,7 @@ fn consult_tools(
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
-    if synth_vision {
+    if synth.caps.vision {
         tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     Ok(tools)
@@ -1250,6 +1352,7 @@ pub(crate) async fn explore_with(
     explorer: &Arm,
     cfg: &ExploreConfig,
     attached: &[super::prompts::ConsultAttachment],
+    attach: Option<&Arc<SweepAttachSink>>,
 ) -> Result<(String, Usage)> {
     let mut preamble = resolve_phase_preamble(
         Phase::Explorer,
@@ -1271,6 +1374,7 @@ pub(crate) async fn explore_with(
             &cfg.sandbox,
             cfg.explorer_max_turns,
             &cfg.phase.progress,
+            attach,
         ),
     )
     .await
@@ -1387,7 +1491,7 @@ pub(crate) async fn consult_with(
                     cfg,
                     reports.clone(),
                     explore_usage.clone(),
-                    synth.caps.vision,
+                    synth,
                 )
             },
         ),
@@ -1543,6 +1647,22 @@ mod tests {
             params,
             ModelCaps {
                 vision: false,
+                tool_result_images: true,
+            },
+        )
+    }
+
+    /// A vision-capable arm on a transport that carries an image in a tool result
+    /// (Anthropic/Gemini-shaped caps) — the toolset-wiring tests' injection point for
+    /// "the synth can see", distinct from `arm`'s deliberately blind default.
+    fn vision_arm(client: &ScriptedClient, model: &str) -> Arm {
+        Arm::new(
+            client.clone(),
+            model,
+            16384,
+            None,
+            ModelCaps {
+                vision: true,
                 tool_result_images: true,
             },
         )
@@ -2271,6 +2391,360 @@ mod tests {
         );
     }
 
+    // --- The explorer `attach` tool, wired into the recomposed consult loop ------
+
+    /// The load-bearing wiring test: a sweep that calls `attach` must land its
+    /// routed file — full body, numbered — on the DRIVER's tool result, not just
+    /// in the sweep's own transcript.
+    #[tokio::test]
+    async fn a_sweep_attachment_rides_the_tool_result_to_the_driver() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("<file path=\"src/foo.rs\">") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs.iter().any(|r| r.transcript.contains("<file path=\"src/foo.rs\">")
+                && r.transcript.contains("fn target_marker")),
+            "the driver's transcript must carry the attached file's numbered body: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// The explorer's OWN context (its later requests, after the attach call) must
+    /// never carry the routed bytes — the whole premise of the feature is that the
+    /// bytes bypass the sweep's own context.
+    #[tokio::test]
+    async fn the_explorer_never_sees_the_attached_bytes() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT: routed") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        for r in client.requests_for(EXPLORER) {
+            assert!(
+                !r.transcript.contains("fn target_marker"),
+                "the explorer's own transcript must never carry the routed bytes: {:?}",
+                r.transcript
+            );
+        }
+    }
+
+    /// A sweep that never calls `attach` hands the driver exactly the bare report —
+    /// no evidence block appended, byte-for-byte the pre-attach behavior.
+    #[tokio::test]
+    async fn a_sweep_with_no_attachment_hands_the_driver_the_bare_report() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("PLAIN REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |_req| Ok(text_response("PLAIN REPORT: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("PLAIN REPORT: src/foo.rs:1")
+                    && !r.transcript.contains("Files the explorer routed")),
+            "no attach call -> no evidence block, just the bare report: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// Past `max_attachments`, the extra file's demotion reaches the DRIVER as a
+    /// loud, consumer-shaped line — the driver learns it can still `run_kaish` the
+    /// file itself.
+    #[tokio::test]
+    async fn an_over_cap_sweep_attach_reaches_the_driver_as_a_loud_demotion() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("could not route") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach two files" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("1 of 1 attachments") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs", "src/bar.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: tried to route both"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::write(dir.path().join("src/bar.rs"), "fn other() {}\n").unwrap();
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                max_attachments: 1,
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "attach two files",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("could not route")
+                    && r.transcript.contains("budget of 1 was full")),
+            "the over-cap demotion must reach the driver: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// `explore` (v1) never offers `attach` — the top-level tool passes `None`
+    /// straight through to `run_explore_phase`, so the toolset stays exactly
+    /// `{run_kaish}`.
+    #[tokio::test]
+    async fn the_top_level_explore_sweep_offers_no_attach_tool() {
+        const EXPLORER: &str = "cheap-explorer";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "attach"),
+                    "the top-level explore tool must not offer attach"
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        explore_with(
+            "q",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[],
+            None,
+        )
+        .await
+        .expect("scripted explore should succeed");
+    }
+
+    /// `max_attachments: 0` omits the `attach` tool from a delegated sweep's
+    /// toolset entirely — the config-driven off switch, distinct from the v1
+    /// top-level-`explore` exclusion above (this one is `consult`'s nested sweep).
+    #[tokio::test]
+    async fn max_attachments_zero_omits_the_attach_tool() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "q" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "attach"),
+                    "max_attachments = 0 must omit the attach tool"
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                max_attachments: 0,
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+    }
+
+    /// A sweep's `attach` call surfaces as `PhaseEvent::Attached` on the shared
+    /// progress sink — the one beat that lets an operator observe the pattern the
+    /// generous default budget exists to watch for.
+    #[tokio::test]
+    async fn sweep_attachments_surface_as_progress() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT: routed") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: sink.clone(),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let events = sink.events();
+        assert!(
+            events.contains(&PhaseEvent::Attached {
+                path: "src/foo.rs".into()
+            }),
+            "an attach call must surface as progress: {events:?}"
+        );
+    }
+
     /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
     /// explorer arm over `{run_kaish}` against the real repo and returns the
     /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
@@ -2314,6 +2788,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &cfg,
             &[],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -2361,6 +2836,7 @@ mod tests {
                 path: "src/parser_gen.rs".into(),
                 size: 900_000,
             }],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -2417,6 +2893,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &cfg,
             &[],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -2561,6 +3038,7 @@ mod tests {
                 &arm(&client, EXPLORER),
                 &cfg,
                 &[],
+                None,
             ),
         )
         .await
@@ -4111,13 +4589,14 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
+        let synth = arm(&client, "synth-model"); // not vision-capable
         let tools = consult_tools(
             &arm(&client, "explorer-model"),
             dir.path(),
             &cfg,
             reports,
             Arc::new(Mutex::new(Usage::new())),
-            false, // synth is not vision-capable
+            &synth,
         )
         .expect("building the consult toolset should succeed");
 
@@ -4146,13 +4625,14 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
+        let synth = vision_arm(&client, "synth-model"); // synth IS vision-capable
         let tools = consult_tools(
             &arm(&client, "explorer-model"),
             dir.path(),
             &cfg,
             reports,
             Arc::new(Mutex::new(Usage::new())),
-            true, // synth IS vision-capable
+            &synth,
         )
         .expect("building the consult toolset should succeed");
 
@@ -4177,13 +4657,14 @@ mod tests {
         let reports = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let usage_sink = Arc::new(Mutex::new(Usage::new()));
+        let blind_synth = arm(&client, "synth-model");
         let blind = consult_tools(
             &explorer,
             dir.path(),
             &cfg,
             reports.clone(),
             usage_sink.clone(),
-            false,
+            &blind_synth,
         )
         .expect("blind toolset builds");
         let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
@@ -4194,7 +4675,8 @@ mod tests {
             "no view_image without vision, got {blind_names:?}"
         );
 
-        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, true)
+        let seeing_synth = vision_arm(&client, "synth-model");
+        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, &seeing_synth)
             .expect("vision toolset builds");
         let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
         assert!(

@@ -209,6 +209,18 @@ impl SweepAttachSink {
             .push(note);
     }
 
+    /// This sweep's attach budget — the seam `explorer_attach_directive` reads to
+    /// render "up to N files this sweep" in the preamble that installs the tool.
+    pub(crate) fn max_attachments(&self) -> usize {
+        self.max
+    }
+
+    /// Who this sweep's routed bytes go to — the seam `explorer_attach_directive`
+    /// and `sweep_evidence_block` both read to name the reader and pick wording.
+    pub(crate) fn consumer(&self) -> &SweepConsumer {
+        &self.consumer
+    }
+
     /// `(committed, max)` — used for the receipt's running tally and the tool
     /// description's "up to N files" line.
     fn usage(&self) -> (usize, usize) {

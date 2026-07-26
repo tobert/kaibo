@@ -1178,7 +1178,7 @@ async fn explore_inner(
         sandbox: resolver.config.sandbox.clone(),
         max_attachments: resolver.config.defaults.max_attachments,
     };
-    match explore_with(&args.question, root, &explorer, &cfg, &attachments).await {
+    match explore_with(&args.question, root, &explorer, &cfg, &attachments, None).await {
         Ok((report, usage)) => {
             if args.json {
                 println!(
