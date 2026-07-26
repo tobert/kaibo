@@ -268,6 +268,10 @@ model or tool review that changed confidence or content (for example, a kaibo ca
 review). Prefer concrete names and stable identities when the host supplies them; if it
 doesn't, name the model/tool plainly in the PR body instead of inventing an email.
 
+Stage deliberately. Do not use `git add -A`, `git add .`, or broad globs when preparing
+commits; stage only the files intentionally changed for the current task. Check
+`git status --short` before committing, and leave unrelated/untracked user files alone.
+
 ## Pull requests & the changelog
 
 Every change lands through a pull request — `main` is never committed to directly.
