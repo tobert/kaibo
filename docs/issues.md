@@ -472,6 +472,14 @@ in the module doc and `docs/devlog.md`. What's left:
   finished handle; OpenAI expires batch outputs itself after 30 days. What's open is an
   opt-in `config.toml` flag for callers who'd rather not accrete: scope it to the *input*
   file after a terminal poll, or make it loud that enabling it makes results one-shot.
+- **The `anthropic` kind will need the same per-backend treatment.** Amy's call, 2026-07-26,
+  on landing the OpenAI lane: as more providers implement Anthropic's API as a *generic*
+  wire (the way `openai` already is one), `kind == Anthropic ⇒ batch` stops being true —
+  an Anthropic-Messages-compatible gateway or proxy has no `/v1/messages/batches`. The seam
+  is already in the right place (`batch_supported` takes a `&Backend`), so this is a new
+  arm plus a hosted-ness predicate beside `is_hosted_openai`, not a refactor. Do it when the
+  first such backend shows up, not before — the `anthropic` kind already permits a custom
+  `base_url` (`AnthropicBatch::base_url`), so the predicate needs deciding, not discovering.
 - **The many-casts fork.** `batch_submit` today is many-prompts/**one**-cast (one
   provider batch). The diverse-opinion panel — one question across **many** casts — is N
   provider batches under a composite handle; deferred. The provenance footer already

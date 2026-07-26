@@ -390,12 +390,12 @@ synth    = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "med
 #     choice, not a rule: a cast MAY pair an interactive explorer with an offline synth (the
 #     `deliberate` shape), since the lane lives on the slot, not the whole cast. Gemini Pro
 #     especially earns this lane: interactively it's refusal-prone on security framing and
-#     503s under load, but batch sidesteps both — so reach for Pro batch-only (the built-in
-#     `gemini-batch` cast, or a custom one like this). ---
+#     503s under load, but batch sidesteps both — so Pro is more reliable via batch (the
+#     built-in `gemini-batch` cast, or a custom one like this). ---
 
 [casts.pro-batch]
 batch    = true
-synth    = "gemini/gemini-pro-latest"        # batch-capable synth; Pro is batch-only
+synth    = "gemini/gemini-pro-latest"        # batch-capable synth; Pro is more reliable via batch
 # Equivalent, spelled directly on the slot (no cast-level sugar):
 #   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
 
