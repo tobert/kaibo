@@ -1281,7 +1281,7 @@ impl Config {
                             lane.as_str()
                         );
                     }
-                    if lane == Lane::Batch && !crate::batch::batch_supported(kind) {
+                    if lane == Lane::Batch && !crate::batch::batch_supported(&backends[&slot.backend]) {
                         bail!(
                             "cast {name:?}: synth lane = \"batch\" but the synth backend \
                              {:?} ({}) has no batch API — a batch synth must sit on a \
@@ -3088,7 +3088,7 @@ mod tests {
             let synth = cast.require_slot(ModelRole::Synth).unwrap();
             assert_eq!(synth.backend, backend, "{name:?} synths its named backend");
             assert!(
-                crate::batch::batch_supported(cfg.backends[&synth.backend].kind),
+                crate::batch::batch_supported(&cfg.backends[&synth.backend]),
                 "{name:?} must synth a batch-capable backend"
             );
         }
@@ -3111,6 +3111,49 @@ mod tests {
         assert!(
             msg.contains("bad") && msg.contains("batch"),
             "load error must name the cast and the batch problem, got: {msg}"
+        );
+    }
+
+    /// The `openai` kind's batch verdict is per-*backend*, and cast validation honors that:
+    /// the same kind, the same model, two base URLs — one loads, one is refused. A local
+    /// OpenAI-compatible server implements `/chat/completions` and nothing else, so a batch
+    /// cast pointed at it would 404 at submit; catching it at load is the whole point.
+    #[test]
+    fn batch_cast_on_openai_depends_on_the_backend_being_hosted() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.gpt]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+            key_optional = true
+
+            [casts.gpt-batch]
+            synth = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
+            "#,
+        )
+        .expect("a batch cast on hosted OpenAI Platform loads");
+        assert_eq!(cfg.casts["gpt-batch"].synth_lane(), Some(Lane::Batch));
+
+        let err = Config::from_toml_str(
+            r#"
+            [backends.localish]
+            kind = "openai"
+            base_url = "http://localhost:8000/v1"
+            key_optional = true
+
+            [casts.gpt-batch]
+            synth = { backend = "localish", id = "gemma-4", lane = "batch" }
+            "#,
+        )
+        .expect_err("a batch cast on a local OpenAI-compatible server must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("gpt-batch") && msg.contains("localish"),
+            "load error names the cast and the backend, got: {msg}"
+        );
+        assert!(
+            msg.contains("hosted OpenAI Platform"),
+            "…and names the condition the backend misses, got: {msg}"
         );
     }
 
