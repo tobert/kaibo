@@ -7,7 +7,7 @@ about a codebase. The team
 *perceives* what fuses into its reasoning (image input today — `view_image` and image
 attachments on the model-driven tools; more modalities as the models gain them), but
 kaibo produces **no output artifacts** — it reasons over code, it doesn't render or
-emit. (If it ever needs to *record* something, that's a specific mediated tool, not a
+emit. (When it needs to *record* something, that's a specific mediated tool, not a
 general write path; see the read-only invariant.)
 
 ## For agents working here
