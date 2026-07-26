@@ -34,6 +34,69 @@ asks before opening XDG paths, names Codex's `network_access` / `writable_roots`
 offers a Codex-only state db or CAS dir as a cleaner multi-agent default when sharing is not
 the goal.
 
+## 2026-07-26 — the explorer learns to attach: bytes route past the model that found them
+
+Amy asked "what if we gave explorers an attach tool that would work like the other
+attachments kaibo does" — and the 2026-07-03 reframe ("attach means the model sees the
+bytes") turned out to be only half-finished. That work made the caller's attachments
+reach every reader as real bytes, operator→down. But the explorer's only channel *up*
+was its report string: any evidence it wanted its consumer to hold, it had to
+transcribe — out of its own `max_tokens`, through its own window, lossily. The cheap
+explorer was the narrowest pipe in the system and we were pushing whole files through
+it by hand.
+
+The fix is a **routing verb, not a reading verb**: `attach` joins `run_kaish` in the
+sweep toolset. The explorer names paths; kaibo resolves them through the same
+containment + TOCTOU-capped VFS read + `classify` + `number_lines` machinery the
+caller's attach uses, and the bytes ride *alongside* the report to whoever reads it.
+The explorer gets back a receipt — path, line count, size, budget remaining — and
+never the contents. A 3,000-line file costs the explorer ~20 tokens to deliver. The
+receipt-never-carries-bytes property is the module's load-bearing test, and it was
+mutation-checked (leak the body into the receipt → red; disable the `starts_with`
+containment guard → four tests red across two binaries).
+
+Where the bytes land is consumer-shaped, and that shape carried the design:
+
+- **`deliberate` is the case the feature exists for.** Its offline synth is toolless —
+  everything it reasons over must already be in the dossier, and until now "in the
+  dossier" meant "transcribed by the explorer." Now the dossier carries the real
+  numbered file. Consequently deliberate's sink does **no** caller-file dedupe: a
+  caller attachment there is only a read-WHOLE directive to the explorer, so the
+  explorer re-routing it is the delivery, not a duplicate. `consult`'s sink dedupes
+  the same paths, because its driver already holds them inlined. One concept — "seed
+  the sink with paths whose bytes already reach the consumer by another channel" —
+  two seedings. Over-cap demotion splits the same way: consult's says "read it
+  yourself: `cat -n …`", deliberate's says **NOT INCLUDED — you cannot fetch it**,
+  because a silent gap in front of a toolless synth is the failure mode.
+- **Images route to vision.** Amy's call to keep them in scope: the shell can't read
+  a PNG, so before this a blind explorer hitting a diagram had nothing to offer a
+  vision-capable consumer. Now it staples the picture to its report. The gate is the
+  *receiving arm's* vision cap, refused loudly in the receipt (naming the consumer
+  and the remedy) so the explorer learns on the spot. Mechanically this forced
+  `RunExplore::Output` to become `serde_json::Value` — rig only extracts image parts
+  from its hybrid `{"response", "parts"}` envelope (verified in rig-core 0.38.2
+  source, not guessed), and a text-only sweep still returns a bare `Value::String`,
+  wire-identical to the old `String`. The OpenAI-family transport (no tool-result
+  images) reuses the view_image break→rewrite→resume path, *generalized*: the hook
+  now keys on "any tool result carrying an image," so the next image-bearing tool
+  needs no edit. The alternative — drain a sink into a following user turn — died on
+  a provider fact: Anthropic rejects consecutive user turns.
+- **`explore` (top-level) sits out v1.** Its caller can read files itself; one `None`
+  at the call site suppresses both the tool and its preamble paragraph, so toolset
+  and prompt can't drift.
+
+The knob is a **count, not bytes**: `[defaults] max_attachments`, default 32 per
+sweep, `0` = the tool isn't injected at all. Deliberately high — Amy wants to watch
+for problematic patterns in the wild before clamping, so every accepted attach emits
+a progress beat (`PhaseEvent::Attached`) and the existing per-file/cumulative byte
+caps in `classify` keep the worst case bounded. No per-call MCP arg: that would be
+resident schema text under the 2048-char budget for an operator guardrail, wrong
+trade.
+
+Process note: Opus designed (every seam pre-anchored `file:line` against the
+worktree), Sonnet implemented tests-first-ish and disclosed honestly where it wasn't
+strict — which is exactly what the mutation pass above was for.
+
 ## 2026-07-26 — OpenAI joins the batch lane, and batch capability stops being a kind
 
 The third batch provider, and the one that broke an assumption the other two never
