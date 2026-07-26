@@ -14,6 +14,59 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-26 — OpenAI joins the batch lane, and batch capability stops being a kind
+
+The third batch provider, and the one that broke an assumption the other two never
+tested: **batch capability is a property of a backend, not of a provider kind.**
+
+`batch_supported(kind: ProviderKind)` was fine while the answer was "anthropic and gemini,"
+because those kinds are keyed — one endpoint, one capability. `openai` isn't. The *kind* is
+"anything speaking the OpenAI wire," which spans OpenAI Platform, llama.cpp, Ollama, LM
+Studio, and every compatibility gateway; `/v1/batches` belongs to Platform alone. A
+kind-keyed check would have handed a local Gemma server a batch lane it cannot serve, and
+the user would have found out as a 404 at submit — after kaibo told them, at config load,
+that their cast was fine. So the signature moved to `batch_supported(&Backend)` and reuses
+the exact-base-URL seam (`is_hosted_openai`) that #92 built for interactive Responses
+routing. A `lane = "batch"` synth on a local endpoint is now a **load error naming the
+fix**, which is the shape this project wants: loud at the earliest point, with the next
+move spelled out.
+
+**Responses-only, deliberately.** Every item is a `POST /v1/responses` — the same endpoint
+the interactive hosted arm uses, so batch and interactive share one body shape, one
+reasoning knob (`reasoning.effort` at `BATCH_EFFORT`), one answer parser. A Chat
+Completions fallback was on the table (`docs/openai-api-plan.md` listed it as an open
+question) and lost: it's a second body builder *and* a second answer parser for no model
+kaibo can reach today. Older `gpt-4*` families work on Responses too — they just take
+sampling instead of reasoning, which the model-aware classifier already knows.
+
+**The file question, which Amy asked better than the plan did.** The plan framed this as a
+retention policy; her question was "why is it a file anyway — could we do it in memory?"
+The answer is that the file is never *ours*. Anthropic carries its requests inline in one
+POST and Gemini nests them inline; OpenAI is the odd one out, requiring the requests as a
+file resource **in the caller's own OpenAI account**. kaibo builds the JSONL in memory and
+streams it into the multipart upload — no temp file, no local write, the read-only
+invariant untouched by this lane. Reframing it that way also settled retention: the input
+file is the *only* surviving record of what was submitted (the store keeps the handle and
+label, never the prompts), deleting an output on poll would break re-polling a finished
+handle, and OpenAI expires batch outputs itself after 30 days. So kaibo deletes nothing,
+says so plainly in the docs, and an opt-in cleanup flag stays a tracked follow-on. Deleting
+is easy to add later and impossible to undo.
+
+**Two small things the other providers didn't need.** OpenAI splits succeeded and failed
+items across *separate* files (output and error), so a poll reads both and merges — a
+per-item failure that lives only in the error file must not vanish from the answer set —
+and then re-sorts by kaibo's own index `custom_id`s, because the merge order is otherwise
+an artifact of which file an item landed in. And OpenAI dates batches in Unix epoch
+seconds where Anthropic and Gemini send RFC3339, so the list view converts; the test pins
+the round trip through `rfc3339_to_epoch` that the 24-hour recency filter depends on.
+
+**Live probe (2026-07-26).** A two-item batch on `gpt-5.6-sol` went `validating` →
+`in_progress` → `completed` and returned both answers under their submit indices;
+`kaibo batch list` swept the new backend alongside the Anthropic and Gemini batches in one
+view. The counts parse (`request_counts.completed + failed` over `total`), the empty-string
+`error_file_id` OpenAI sends for a clean batch reads as absent rather than as a file to
+fetch, and the epoch timestamp rendered into the shared list.
+
 ## 2026-07-25 — image generation reopened: a second write surface, earned by shape
 
 kaibo **built image generation and deleted it** on 2026-06-28 (`986806f`, ~1,700 lines).

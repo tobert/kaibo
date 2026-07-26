@@ -17,10 +17,20 @@ the git log. Each later release appends a new section at the top.
   A `kind = "openai"` backend pointed exactly at `https://api.openai.com/v1` can run
   current GPT-5.6 models through `oneshot` and `consult`, including image attachment and
   `view_image`; generic/local OpenAI-compatible backends stay on the Chat Completions path.
+- **OpenAI joins the offline batch lane.** A hosted OpenAI Platform backend can now staff a
+  `lane = "batch"` synth, so `batch_submit`/`job_get`/`job_cancel`/`job_list` and
+  `deliberate` all reach GPT — same kaibo semantics as the Anthropic and Gemini lanes
+  (toolless, max thinking, half price, a durable `backend/provider-id` handle). OpenAI's
+  batch protocol is the file-based one: kaibo builds the requests as JSONL **in memory** and
+  uploads them as a file in *your* OpenAI account, then downloads the results — it writes
+  nothing locally, and deletes nothing (that input file is the only record of what you
+  submitted, and OpenAI expires batch outputs itself after 30 days). Batch capability is now
+  judged per **backend** rather than per provider kind, because only OpenAI Platform serves
+  `/v1/batches` — a `lane = "batch"` synth on a local OpenAI-compatible server is refused at
+  config load with the fix named, instead of 404ing at submit time.
 - `docs/openai-api-plan.md`, a living plan for making hosted OpenAI a first-class kaibo
   backend and clarifying that kaibo's OpenAI model calls use OpenAI Platform API keys, not
-  Codex subscription entitlement. It also tracks OpenAI's `/v1/batch` support and the
-  kaibo provider adapter still needed before Sol can run on kaibo's offline batch lane.
+  Codex subscription entitlement.
 - **`consult`** — the headline tool: ask a model *outside your own family* about a
   codebase and get a grounded, cited answer. A capable model reads precise spans
   directly and delegates broad sweeps to a cheap explorer sub-agent, then synthesizes

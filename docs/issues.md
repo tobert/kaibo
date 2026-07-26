@@ -22,24 +22,6 @@ the model-facing surface pass + the full consultation ladder (arc closeout, #37�
 
 ## P1 — High-leverage features & robustness
 
-### OpenAI Batch provider lane
-
-Hosted OpenAI interactive calls now have a first-class Responses path, but kaibo's batch
-lane still supports only Anthropic and Gemini. OpenAI's Batch API is file-based: upload
-JSONL with purpose `batch`, create a batch for an endpoint such as `/v1/responses`, poll,
-then download output/error files. That lifecycle needs its own provider adapter, not a
-flag on the interactive OpenAI arm.
-
-The kaibo contract should match Anthropic/Gemini batch: no tools during the provider
-batch. `batch_submit` is one tool-less answer per item; `deliberate` is the codebase-aware
-path, using an interactive medium-tier model to build a cited dossier before handing that
-dossier to a Sol batch synth.
-
-Open work: decide whether the first OpenAI batch adapter is Responses-only or also carries
-a Chat Completions fallback, define output-file retention/deletion policy, and map direct
-`batch_submit` attachments into JSONL without adding a model-steerable write path. The
-living plan is `docs/openai-api-plan.md`.
-
 ### `deliberate` cannot be staffed by any built-in cast — advertised but DOA
 `cast_can_deliberate` (`config.rs:846`) needs an **offline synth lane plus an explorer
 slot**. Of the built-in casts, only `anthropic-batch` and `gemini-batch` carry an offline
@@ -482,12 +464,22 @@ The batch tool class shipped Anthropic- and Gemini-first (`src/batch.rs`,
 toolless, max-effort fan-out behind the `BatchProvider` seam, with the design rationale
 in the module doc and `docs/devlog.md`. What's left:
 
-- **OpenAI batch** — file-based (upload JSONL, reference a file id, poll, download an
-  output file), unlike Anthropic's inline POST. Same kaibo semantics as the existing
-  providers: no tools in the provider batch; `deliberate` builds the dossier first when
-  codebase context is needed. The output file is left in place by default; add a
-  `config.toml` flag to opt into cleanup for callers who'd rather not accrete files. The
-  generic local `openai` kind stays ✗ (no batch endpoint).
+- **OpenAI batch file cleanup (opt-in).** The lane itself shipped (`OpenaiBatch`,
+  Responses-only on `/v1/responses`), and it deletes nothing: every submit leaves an input
+  JSONL in the caller's OpenAI account, plus the output/error files. That's deliberate —
+  the input file is the *only* record of what was submitted (kaibo's store keeps the
+  handle, never the prompts), and deleting an output on poll would break re-polling a
+  finished handle; OpenAI expires batch outputs itself after 30 days. What's open is an
+  opt-in `config.toml` flag for callers who'd rather not accrete: scope it to the *input*
+  file after a terminal poll, or make it loud that enabling it makes results one-shot.
+- **The `anthropic` kind will need the same per-backend treatment.** Amy's call, 2026-07-26,
+  on landing the OpenAI lane: as more providers implement Anthropic's API as a *generic*
+  wire (the way `openai` already is one), `kind == Anthropic ⇒ batch` stops being true —
+  an Anthropic-Messages-compatible gateway or proxy has no `/v1/messages/batches`. The seam
+  is already in the right place (`batch_supported` takes a `&Backend`), so this is a new
+  arm plus a hosted-ness predicate beside `is_hosted_openai`, not a refactor. Do it when the
+  first such backend shows up, not before — the `anthropic` kind already permits a custom
+  `base_url` (`AnthropicBatch::base_url`), so the predicate needs deciding, not discovering.
 - **The many-casts fork.** `batch_submit` today is many-prompts/**one**-cast (one
   provider batch). The diverse-opinion panel — one question across **many** casts — is N
   provider batches under a composite handle; deferred. The provenance footer already
@@ -515,11 +507,14 @@ in the module doc and `docs/devlog.md`. What's left:
     mode, not a body-builder tweak. Park `FileRef` until that mode is on the table.
 
 Per-provider capability, `None` where unsupported: Anthropic ✓ (shipped), Gemini ✓
-(shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ file-based (next),
+(shipped — inline batch, `gemini-batch` cast synths Pro), OpenAI ✓ (shipped — file-based
+JSONL on `/v1/responses`, **hosted Platform backends only**, which is why
+`batch_supported` takes a `&Backend`, not a `ProviderKind`),
 DeepSeek ✗ (confirmed 2026-06-22 against the official API reference — no batch endpoint;
 its routes are chat/completions/models only, and its cost-saving lane is off-peak
 discount pricing, not a batch API; third-party batch like Novita/Together/Bedrock wraps
-the model, out of reach of the keyed `deepseek` backend), local `openai` ✗.
+the model, out of reach of the keyed `deepseek` backend), local/gateway `openai` ✗ (no
+`/v1/batches` behind a merely OpenAI-*compatible* endpoint).
 
 ### Batch design hardening (cross-model Opus review, 2026-06-22)
 A cross-family review of the batch slice (Opus 4.8, run *through* `batch_submit` itself

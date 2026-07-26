@@ -1332,7 +1332,7 @@ fn batch_backends(resolver: &Resolver, backend: Option<&str>) -> Result<Vec<Stri
                 message: e.to_string(),
                 code: EXIT_USAGE,
             })?;
-        if !batch_supported(b.kind) {
+        if !batch_supported(b) {
             return Err(SetupError {
                 kind: "usage",
                 message: format!(
@@ -1351,7 +1351,7 @@ fn batch_backends(resolver: &Resolver, backend: Option<&str>) -> Result<Vec<Stri
         .config
         .backends
         .values()
-        .filter(|b| batch_supported(b.kind))
+        .filter(|b| batch_supported(b))
         .map(|b| b.name.clone())
         .collect();
     if names.is_empty() {

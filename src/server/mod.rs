@@ -1742,7 +1742,7 @@ impl KaiboHandler {
                 .config
                 .resolve_backend(name)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-            if !crate::batch::batch_supported(b.kind) {
+            if !crate::batch::batch_supported(b) {
                 return Err(McpError::invalid_params(
                     format!(
                         "backend {:?} ({:?}) has no batch lane, so it can't be listed \
@@ -1761,7 +1761,7 @@ impl KaiboHandler {
             .config
             .backends
             .values()
-            .filter(|b| crate::batch::batch_supported(b.kind))
+            .filter(|b| crate::batch::batch_supported(b))
             .map(|b| b.name.clone())
             .collect();
         if names.is_empty() {

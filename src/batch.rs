@@ -21,13 +21,17 @@
 //! model the hard question and waiting.
 //!
 //! **Per-provider HTTP seam.** rig-core has no batch path, so each provider is
-//! hand-rolled behind the [`BatchProvider`] trait (one trait, per-kind impls, honest
-//! refusal where absent). Two protocols ship: **Anthropic Message Batches** ([`AnthropicBatch`]),
-//! whose requests ride inline in one POST, and **Gemini batch** ([`GeminiBatch`]), whose
-//! inline requests nest under `input_config.requests` and whose results come back inline
-//! in the batch's long-running-operation object (no separate results URL). OpenAI batch
-//! (file-based) is a tracked follow-on in `docs/issues.md`. An unsupported backend kind
-//! is refused loudly at resolution ([`submitter`]/[`poller`]), never a silent no-op.
+//! hand-rolled behind the [`BatchProvider`] trait (one trait, per-provider impls, honest
+//! refusal where absent). Three protocols ship: **Anthropic Message Batches**
+//! ([`AnthropicBatch`]), whose requests ride inline in one POST; **Gemini batch**
+//! ([`GeminiBatch`]), whose inline requests nest under `input_config.requests` and whose
+//! results come back inline in the batch's long-running-operation object (no separate
+//! results URL); and **OpenAI Batch** ([`OpenaiBatch`]), the file-based one — the JSONL is
+//! built in memory and uploaded as a file *in the caller's OpenAI account*, the batch
+//! references it, and results are downloaded back as files (kaibo still writes nothing
+//! locally). A backend with no batch lane is refused loudly at resolution
+//! ([`submitter`]/[`poller`]), never a silent no-op — and for `openai` that verdict is
+//! per-*backend*, since only OpenAI Platform serves `/v1/batches` ([`batch_supported`]).
 //!
 //! **The provider owns batch state.** A batch id *is* the provider's own id, so
 //! poll/cancel rebuild a fresh client from the backend and re-address it, and a restart
@@ -1255,34 +1259,643 @@ impl BatchProvider for GeminiBatch {
     }
 }
 
+// --- OpenAI provider -------------------------------------------------------
+
+/// The endpoint every kaibo OpenAI batch item targets. Responses is also the *interactive*
+/// hosted-GPT path (`consult/engine.rs` routes an exact-Platform backend through rig's
+/// Responses client), so batch and interactive share one body shape, one reasoning knob
+/// (`reasoning.effort`), and one answer parser. A Chat Completions lane would be a second
+/// of each for no model kaibo can reach today; if one ever needs it, it's a new endpoint
+/// constant plus its own body/answer pair, not a flag on this one.
+const OPENAI_BATCH_ENDPOINT: &str = "/v1/responses";
+
+/// The only completion window OpenAI's Batch API accepts.
+const OPENAI_COMPLETION_WINDOW: &str = "24h";
+
+/// The filename kaibo gives its uploaded input. OpenAI keys batch input on the file's
+/// `purpose`, not its name, but the name is what a human sees in the Files dashboard —
+/// so it says who made it.
+const OPENAI_INPUT_FILENAME: &str = "kaibo-batch-input.jsonl";
+
+/// Batch's maxed request shape for a *hosted* OpenAI slot — the Responses-flavored sibling
+/// of [`batch_shaping`]. It can't go through [`ModelShape`](crate::consult::ModelShape):
+/// that classifier maps the whole `openai` kind to [`ThinkingStyle::None`] on purpose
+/// (a local llama.cpp/Ollama server takes no reasoning params), and hosted-ness is a
+/// property of the *backend*, not the kind. So this reuses the same model-aware classifier
+/// the interactive hosted arm uses, at [`BATCH_EFFORT`] instead of the interactive default.
+///
+/// `max_tokens` is floored exactly like [`batch_shaping`] (never undercut a slot that asks
+/// for more). Sampling is left to the provider default — `top_p = None` — matching the
+/// other providers' batch shape; only the reasoning knob is forced.
+pub fn openai_batch_shaping(model: &str, tunables: &SlotTunables) -> (u64, Option<Value>) {
+    let max_tokens = tunables.max_tokens.max(BATCH_MAX_TOKENS_FLOOR);
+    let params = crate::consult::hosted_openai_responses_params(model, None, BATCH_EFFORT);
+    (max_tokens, params)
+}
+
+/// Build one Responses `input` for a prompt plus the shared attachments. With no
+/// attachments it stays a bare string (the Responses API's own shorthand, and the
+/// unchanged wire shape). With attachments it becomes one user turn whose content is the
+/// attachments first as context (a text file as an `input_text` under its `<file>` wrapper,
+/// an image as an `input_image` data URL), then the prompt last.
+fn openai_input(attachments: &[Attachment], prompt: &str) -> Value {
+    if attachments.is_empty() {
+        return json!(prompt);
+    }
+    let mut parts: Vec<Value> = attachments
+        .iter()
+        .map(|att| match att {
+            Attachment::Text { .. } => json!({
+                "type": "input_text",
+                "text": att.wrapped_text().expect("text attachment wraps")
+            }),
+            Attachment::Image { mime, data_b64, .. } => json!({
+                "type": "input_image",
+                "image_url": format!("data:{mime};base64,{data_b64}")
+            }),
+        })
+        .collect();
+    parts.push(json!({ "type": "input_text", "text": prompt }));
+    json!([{ "role": "user", "content": Value::Array(parts) }])
+}
+
+/// Build the JSONL input body — one line per item, each a self-contained Responses
+/// request: `custom_id` (kaibo's item index, the correlation key that comes back in the
+/// output file), the `POST` + `url` OpenAI's batch runner replays, and a `body` carrying
+/// the model, the shared preamble as `instructions`, the item's input, the floored
+/// `max_output_tokens`, and the flattened shaping params (`reasoning.effort`).
+///
+/// Pure, so the wire shape is pinned without a network — and note the whole file is a
+/// `String` built in memory. kaibo writes no local file here: the "file" OpenAI's batch
+/// API needs is a resource in the *caller's OpenAI account*, POSTed straight from this
+/// buffer (see [`OpenaiBatch::upload_input`]).
+pub fn openai_batch_jsonl(
+    model: &str,
+    max_tokens: u64,
+    system: &str,
+    params: &Option<Value>,
+    attachments: &[Attachment],
+    items: &[BatchItem],
+) -> Result<String> {
+    let mut out = String::new();
+    for it in items {
+        let mut body = Map::new();
+        body.insert("model".into(), json!(model));
+        if !system.is_empty() {
+            body.insert("instructions".into(), json!(system));
+        }
+        body.insert("input".into(), openai_input(attachments, &it.prompt));
+        body.insert("max_output_tokens".into(), json!(max_tokens));
+        if let Some(Value::Object(extra)) = params {
+            for (k, v) in extra {
+                body.insert(k.clone(), v.clone());
+            }
+        }
+        let line = json!({
+            "custom_id": it.custom_id,
+            "method": "POST",
+            "url": OPENAI_BATCH_ENDPOINT,
+            "body": Value::Object(body),
+        });
+        out.push_str(&serde_json::to_string(&line)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Where an OpenAI batch object says it is. Mirrors Anthropic's [`StatusKind`]: the
+/// terminal arm carries the *file ids* rather than results, because OpenAI hands results
+/// back as account files the poll then downloads.
+#[derive(Debug, PartialEq, Eq)]
+enum OpenaiStatus {
+    Pending {
+        completed: u64,
+        total: u64,
+    },
+    Cancelling,
+    /// A terminal state (`completed`/`failed`/`expired`/`cancelled`). Either file id may
+    /// be absent: a validation `failed` batch has neither, while `expired`/`cancelled`
+    /// can still carry the items that finished before the clock or the cancel caught up.
+    Ended {
+        state: String,
+        output_file_id: Option<String>,
+        error_file_id: Option<String>,
+    },
+}
+
+/// Read an OpenAI batch's `request_counts` into `(completed, total)`. `completed` sums the
+/// terminal buckets (`completed` + `failed`); `total` is the provider's own `total`. A
+/// missing block reads as 0/0 rather than erroring — a just-created batch has no counts.
+fn openai_counts(v: &Value) -> (u64, u64) {
+    let c = v.get("request_counts");
+    let get = |k: &str| c.and_then(|c| c.get(k)).and_then(Value::as_u64).unwrap_or(0);
+    (get("completed") + get("failed"), get("total"))
+}
+
+/// Read a batch object's `status` (+ counts, + result file ids) into an [`OpenaiStatus`].
+/// An unknown status is a loud error, not a guess — OpenAI's set is closed and a new
+/// member is something we want to see, not silently mis-render as pending.
+fn parse_openai_status(v: &Value) -> Result<OpenaiStatus> {
+    let status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("batch object has no `status`: {v}"))?;
+    let file_id = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match status {
+        "validating" | "in_progress" | "finalizing" => {
+            let (completed, total) = openai_counts(v);
+            Ok(OpenaiStatus::Pending { completed, total })
+        }
+        "cancelling" => Ok(OpenaiStatus::Cancelling),
+        "completed" | "failed" | "expired" | "cancelled" => Ok(OpenaiStatus::Ended {
+            state: status.to_string(),
+            output_file_id: file_id("output_file_id"),
+            error_file_id: file_id("error_file_id"),
+        }),
+        other => Err(anyhow!("unknown batch status {other:?}")),
+    }
+}
+
+/// The batch object's own `errors` — input-file validation failures, which is why a
+/// `failed` batch has no results at all. Joined into one readable reason (with the
+/// offending JSONL line number where the provider gives one). `None` when the provider
+/// offered no detail, so the caller can say *that* rather than print an empty reason.
+fn openai_batch_error_text(v: &Value) -> Option<String> {
+    let joined = v
+        .get("errors")
+        .and_then(|e| e.get("data"))
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|e| {
+            let msg = e.get("message").and_then(Value::as_str)?;
+            Some(match e.get("line").and_then(Value::as_u64) {
+                Some(line) => format!("line {line}: {msg}"),
+                None => msg.to_string(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// The answer text of a Responses body: the assistant message's `output_text` parts,
+/// joined. The `output` array also carries `reasoning` items — the model's scratchpad,
+/// not the answer — so they're skipped, the way the Gemini path skips `thought` parts.
+fn openai_response_text(body: &Value) -> String {
+    body.get("output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("message"))
+                .filter_map(|i| i.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("output_text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Gate a Responses body's own `status`. `completed` is a clean finish; `incomplete`
+/// names why it stopped (`max_output_tokens` is the truncation case max thinking makes
+/// common — the GH #75 shape); `failed` carries the model-run error. An absent status is
+/// treated as clean, with the empty-text check still catching a genuinely empty answer.
+fn openai_finish_gate(body: &Value) -> Result<(), String> {
+    match body.get("status").and_then(Value::as_str) {
+        Some("completed") | None => Ok(()),
+        Some("incomplete") => {
+            let reason = body
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let note = match reason {
+                "max_output_tokens" => {
+                    "the response hit its output-token budget before finishing — common \
+                     when a big attached-file review spends the budget thinking; re-run \
+                     with a higher max_tokens or a narrower prompt"
+                }
+                "content_filter" => "the provider halted generation on a content policy",
+                _ => "the response did not complete normally",
+            };
+            Err(format!("incomplete ({reason}): {note}"))
+        }
+        Some("failed") => {
+            let detail = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given");
+            Err(format!("the model run failed: {detail}"))
+        }
+        Some(other) => Err(format!(
+            "status={other}: the response did not complete normally"
+        )),
+    }
+}
+
+/// Parse an output- or error-file body: one `{custom_id, response, error}` per line. The
+/// *same* parser reads both files — OpenAI splits succeeded and failed requests across
+/// them, but the line shape is identical, and a per-item failure is surfaced as an
+/// `Err(reason)` either way rather than silently dropped.
+fn parse_openai_output_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value =
+            serde_json::from_str(line).with_context(|| format!("parsing result line {line:?}"))?;
+        let custom_id = v
+            .get("custom_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("result line has no `custom_id`: {line}"))?
+            .to_string();
+        // A non-null `error` is the request never reaching the model at all.
+        let request_error = v.get("error").filter(|e| !e.is_null());
+        let response = v.get("response").filter(|r| !r.is_null());
+        let text = match (request_error, response) {
+            (Some(err), _) => {
+                let detail = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| err.get("code").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| err.to_string());
+                Err(format!("provider error: {detail}"))
+            }
+            (None, Some(resp)) => {
+                let code = resp
+                    .get("status_code")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200);
+                let body = resp.get("body");
+                if code != 200 {
+                    // A non-2xx per-item response carries an OpenAI error envelope.
+                    let detail = body
+                        .and_then(|b| b.get("error"))
+                        .and_then(|e| e.get("message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| body.map(|b| b.to_string()))
+                        .unwrap_or_else(|| "no detail given".into());
+                    Err(format!("provider error (HTTP {code}): {detail}"))
+                } else {
+                    let body = body
+                        .ok_or_else(|| anyhow!("succeeded result has no `response.body`: {line}"))?;
+                    finish_gated_answer(openai_response_text(body), openai_finish_gate(body))
+                }
+            }
+            (None, None) => Err(
+                "the provider returned neither a response nor an error for this item".to_string(),
+            ),
+        };
+        out.push(BatchAnswer { custom_id, text });
+    }
+    Ok(out)
+}
+
+/// Put a merged result set back in submit order. kaibo's `custom_id`s are item indices, but
+/// OpenAI hands succeeded and failed items back in *separate files*, so the merge order is
+/// an artifact of which file they landed in — sorting by index restores the caller's own
+/// ordering. Only when every id is numeric: a future non-index `custom_id` keeps the
+/// provider's order untouched rather than being silently reshuffled.
+fn order_by_index(mut answers: Vec<BatchAnswer>) -> Vec<BatchAnswer> {
+    if answers.iter().all(|a| a.custom_id.parse::<u64>().is_ok()) {
+        answers.sort_by_key(|a| a.custom_id.parse::<u64>().unwrap_or(0));
+    }
+    answers
+}
+
+/// Parse one batch object from the list endpoint. A missing `id`/`status` is a broken
+/// contract, surfaced rather than papered over; counts are best-effort. `created_at` is
+/// Unix epoch seconds on this provider (Anthropic and Gemini send RFC3339 strings), so it's
+/// rendered to RFC3339 here — [`BatchListItem::created_at`] is the shared string field the
+/// recency filter reads back through [`rfc3339_to_epoch`].
+fn parse_openai_list_item(v: &Value) -> Result<BatchListItem> {
+    let provider_id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("batch list item has no `id`: {v}"))?
+        .to_string();
+    let status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("batch list item has no `status`: {v}"))?
+        .to_string();
+    let (completed, total) = openai_counts(v);
+    let created_at = v
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|dt| dt.to_rfc3339());
+    Ok(BatchListItem {
+        provider_id,
+        status,
+        completed,
+        total,
+        created_at,
+    })
+}
+
+/// Parse the list endpoint's `{ data: [...], has_more }` page (newest first), carrying
+/// `has_more` back so a truncated view announces itself.
+fn parse_openai_list(v: &Value) -> Result<(Vec<BatchListItem>, bool)> {
+    let data = v
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("batch list response has no `data` array: {v}"))?;
+    let items = data
+        .iter()
+        .map(parse_openai_list_item)
+        .collect::<Result<Vec<_>>>()?;
+    let has_more = v.get("has_more").and_then(Value::as_bool).unwrap_or(false);
+    Ok((items, has_more))
+}
+
+/// OpenAI Batch over HTTP — the *file-based* protocol, and the odd one out. Anthropic
+/// carries its requests inline in one POST and Gemini nests them inline too; OpenAI takes
+/// them as a file resource in the caller's own OpenAI account (upload JSONL → create a
+/// batch against it → poll → download the result files).
+///
+/// **No local file, ever.** The JSONL is built in memory and streamed straight into the
+/// multipart upload; results come back as strings. kaibo's read-only invariant is untouched
+/// by this lane — the only artifacts live in the user's OpenAI account.
+///
+/// **kaibo deletes nothing.** The input file is, in fact, the only surviving record of what
+/// was submitted (kaibo's store keeps the handle and label, never the prompts), and deleting
+/// an output file on poll would break re-polling a finished handle. OpenAI expires batch
+/// output files on its own (30 days today). An opt-in cleanup flag is tracked in
+/// `docs/issues.md`.
+pub struct OpenaiBatch {
+    http: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    /// Submit-only: empty on a poll/cancel-only client.
+    model: String,
+    max_tokens: u64,
+    params: Option<Value>,
+}
+
+impl OpenaiBatch {
+    /// Refuse a backend this provider can't serve. Two gates, because `openai` is the one
+    /// *kind* whose batch capability is a per-backend property: the wrong kind is a
+    /// dispatch bug (belt-and-suspenders, like the other providers), while a generic
+    /// OpenAI-compatible endpoint is an ordinary user misconfiguration that deserves a
+    /// message naming the fix.
+    fn require_hosted(backend: &Backend) -> Result<()> {
+        if backend.kind != ProviderKind::Openai {
+            return Err(anyhow!(
+                "this is the OpenAI batch provider, but backend {:?} is {:?}. (Batch \
+                 dispatch should never route a non-OpenAI backend here; see \
+                 `submitter`/`poller`.)",
+                backend.name,
+                backend.kind
+            ));
+        }
+        if !backend.is_hosted_openai() {
+            return Err(anyhow!(
+                "backend {:?} is an OpenAI-compatible endpoint at {}, not OpenAI Platform — \
+                 the Batch API is Platform's, so a local server or gateway has no \
+                 /v1/batches to submit to. A batch cast's synth needs a backend whose \
+                 base_url is exactly {}.",
+                backend.name,
+                backend.resolved_base_url(),
+                crate::credentials::HOSTED_OPENAI_BASE_URL
+            ));
+        }
+        Ok(())
+    }
+
+    /// The API root, trailing slash trimmed so `{base}/files` never doubles it.
+    fn base_url(backend: &Backend) -> String {
+        backend
+            .resolved_base_url()
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    /// A submit-capable client: the cast's synth slot, shaped to batch's maxed knobs.
+    pub fn from_slot(backend: &Backend, slot: &ModelSlot, defaults: &Defaults) -> Result<Self> {
+        Self::require_hosted(backend)?;
+        let tunables = slot.tunables(ModelRole::Synth, defaults);
+        let (max_tokens, params) = openai_batch_shaping(&slot.id, &tunables);
+        Ok(Self {
+            http: batch_http_client(backend)?,
+            api_key: backend.resolve_key()?,
+            base_url: Self::base_url(backend),
+            model: slot.id.clone(),
+            max_tokens,
+            params,
+        })
+    }
+
+    /// A poll/cancel/list-only client (no model).
+    pub fn from_backend(backend: &Backend) -> Result<Self> {
+        Self::require_hosted(backend)?;
+        Ok(Self {
+            http: batch_http_client(backend)?,
+            api_key: backend.resolve_key()?,
+            base_url: Self::base_url(backend),
+            model: String::new(),
+            max_tokens: 0,
+            params: None,
+        })
+    }
+
+    /// Send a request under the bearer key, returning the parsed JSON body or a loud error
+    /// carrying the raw text.
+    async fn send_json(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Value> {
+        let text = self.send_text(req, what).await?;
+        serde_json::from_str(&text).with_context(|| format!("parsing openai batch {what}: {text}"))
+    }
+
+    /// The same call, returning the raw body — the result files are JSONL, not JSON.
+    async fn send_text(&self, req: reqwest::RequestBuilder, what: &str) -> Result<String> {
+        let resp = req
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("openai batch {what} failed: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow!("reading openai batch {what} body: {e}"))?;
+        if !status.is_success() {
+            return Err(anyhow!("openai batch {what} {status}: {text}"));
+        }
+        Ok(text)
+    }
+
+    /// Upload the in-memory JSONL as a `purpose = "batch"` file, returning its id. The
+    /// bytes go straight from the buffer into the multipart body — nothing is written
+    /// locally (see the type doc).
+    async fn upload_input(&self, jsonl: String) -> Result<String> {
+        let part = reqwest::multipart::Part::bytes(jsonl.into_bytes())
+            .file_name(OPENAI_INPUT_FILENAME)
+            .mime_str("application/jsonl")
+            .map_err(|e| anyhow!("building openai batch upload part: {e}"))?;
+        let form = reqwest::multipart::Form::new()
+            .text("purpose", "batch")
+            .part("file", part);
+        let url = format!("{}/files", self.base_url);
+        let v = self
+            .send_json(self.http.post(&url).multipart(form), "input upload")
+            .await?;
+        v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("uploaded batch input has no string `id`: {v}"))
+    }
+
+    /// Download a result file's JSONL body.
+    async fn fetch_file_text(&self, file_id: &str, what: &str) -> Result<String> {
+        let url = format!("{}/files/{file_id}/content", self.base_url);
+        self.send_text(self.http.get(&url), what).await
+    }
+}
+
+#[async_trait]
+impl BatchProvider for OpenaiBatch {
+    async fn submit(
+        &self,
+        system: &str,
+        attachments: &[Attachment],
+        items: &[BatchItem],
+    ) -> Result<String> {
+        if self.model.is_empty() {
+            return Err(anyhow!(
+                "this batch client was built for poll/cancel only (no model) — submit \
+                 needs a synth slot"
+            ));
+        }
+        if items.is_empty() {
+            return Err(anyhow!("a batch needs at least one prompt"));
+        }
+        // Record the resolved batch request shape (held for the submit's lifetime) — the
+        // batch-lane analog of run_phase's gen_ai.request.thinking.
+        let _span = batch_request_span(&self.model, self.params.as_ref(), items.len());
+        let jsonl = openai_batch_jsonl(
+            &self.model,
+            self.max_tokens,
+            system,
+            &self.params,
+            attachments,
+            items,
+        )?;
+        let input_file_id = self.upload_input(jsonl).await?;
+        let body = json!({
+            "input_file_id": input_file_id,
+            "endpoint": OPENAI_BATCH_ENDPOINT,
+            "completion_window": OPENAI_COMPLETION_WINDOW,
+        });
+        let url = format!("{}/batches", self.base_url);
+        let v = self
+            .send_json(
+                self.http
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_vec(&body)?),
+                "submit",
+            )
+            .await?;
+        parse_batch_id(&v)
+    }
+
+    async fn poll(&self, batch_id: &str) -> Result<BatchPoll> {
+        let url = format!("{}/batches/{batch_id}", self.base_url);
+        let v = self.send_json(self.http.get(&url), "status").await?;
+        match parse_openai_status(&v)? {
+            OpenaiStatus::Pending { completed, total } => {
+                Ok(BatchPoll::Pending { completed, total })
+            }
+            OpenaiStatus::Cancelling => Ok(BatchPoll::Cancelling),
+            OpenaiStatus::Ended {
+                state,
+                output_file_id,
+                error_file_id,
+            } => {
+                // Succeeded and failed items live in *separate* files; read both so a
+                // per-item failure is reported rather than quietly missing from the set.
+                let mut answers = Vec::new();
+                if let Some(id) = output_file_id {
+                    answers.extend(parse_openai_output_jsonl(
+                        &self.fetch_file_text(&id, "results").await?,
+                    )?);
+                }
+                if let Some(id) = error_file_id {
+                    answers.extend(parse_openai_output_jsonl(
+                        &self.fetch_file_text(&id, "errors").await?,
+                    )?);
+                }
+                if answers.is_empty() {
+                    // A validation `failed` batch never ran an item; the reason is on the
+                    // batch object itself. Name it instead of rendering "0 results".
+                    return Ok(BatchPoll::Failed {
+                        state,
+                        message: openai_batch_error_text(&v).unwrap_or_else(|| {
+                            "the provider returned no result file and no error detail".to_string()
+                        }),
+                    });
+                }
+                Ok(BatchPoll::Done(order_by_index(answers)))
+            }
+        }
+    }
+
+    async fn cancel(&self, batch_id: &str) -> Result<()> {
+        let url = format!("{}/batches/{batch_id}/cancel", self.base_url);
+        self.send_json(self.http.post(&url), "cancel").await?;
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<(Vec<BatchListItem>, bool)> {
+        // One page at the API's max (100), newest-first by default. `has_more` rides back
+        // so a truncated view announces itself — orphan recovery wants the recent tail.
+        let url = format!("{}/batches?limit=100", self.base_url);
+        let v = self.send_json(self.http.get(&url), "list").await?;
+        parse_openai_list(&v)
+    }
+}
+
 // --- Dispatch --------------------------------------------------------------
 
-/// Does this provider kind have a batch lane? The single source of truth — dispatch
-/// ([`submitter`]/[`poller`]), `list`'s backend filter, and refusal messages all
-/// defer to it, so adding a provider is a one-line change here. Keep the `matches!` arm in
-/// step with the per-kind impls below.
-pub fn batch_supported(kind: ProviderKind) -> bool {
-    matches!(kind, ProviderKind::Anthropic | ProviderKind::Gemini)
+/// Does this *backend* have a batch lane? The single source of truth — dispatch
+/// ([`submitter`]/[`poller`]), `list`'s backend filter, cast validation, and refusal
+/// messages all defer to it, so adding a provider is one arm here.
+///
+/// Keyed on the backend, not the kind, because `openai` is the kind whose batch capability
+/// is a per-*backend* property: OpenAI's Batch API belongs to OpenAI Platform, so an
+/// `openai`-kind backend aimed at a local llama.cpp/Ollama server or a compatibility
+/// gateway has no `/v1/batches` to submit to. Same seam the interactive Responses routing
+/// uses ([`Backend::is_hosted_openai`]).
+pub fn batch_supported(backend: &Backend) -> bool {
+    match backend.kind {
+        ProviderKind::Anthropic | ProviderKind::Gemini => true,
+        ProviderKind::Openai => backend.is_hosted_openai(),
+        ProviderKind::DeepSeek | ProviderKind::OpenRouter => false,
+    }
 }
 
-/// The batch-capable kinds as a display list, derived from [`batch_supported`] so a refusal
-/// names the live set without a hand-maintained string that drifts as providers are added.
+/// The batch-capable kinds as a display list, naming `openai`'s condition — that kind's
+/// lane is per-backend, so a bare "openai" would send a user with a local server in
+/// circles (see [`batch_supported`]).
 pub fn supported_kinds_list() -> String {
-    [
-        ProviderKind::Anthropic,
-        ProviderKind::DeepSeek,
-        ProviderKind::Gemini,
-        ProviderKind::OpenRouter,
-        ProviderKind::Openai,
-    ]
-    .into_iter()
-    .filter(|k| batch_supported(*k))
-    .map(ProviderKind::canonical_name)
-    .collect::<Vec<_>>()
-    .join(", ")
+    "anthropic, gemini, openai (hosted OpenAI Platform only — not a local \
+     OpenAI-compatible server)"
+        .to_string()
 }
 
-/// The refusal for an unsupported backend kind — shared by [`submitter`] and [`poller`] so
+/// The refusal for a backend with no batch lane — shared by [`submitter`] and [`poller`] so
 /// the message stays in one place. Names the live supported set via [`supported_kinds_list`].
 fn unsupported(backend: &Backend) -> anyhow::Error {
     anyhow!(
@@ -1306,6 +1919,9 @@ pub fn submitter(
             backend, slot, defaults,
         )?)),
         ProviderKind::Gemini => Ok(Arc::new(GeminiBatch::from_slot(backend, slot, defaults)?)),
+        ProviderKind::Openai if backend.is_hosted_openai() => {
+            Ok(Arc::new(OpenaiBatch::from_slot(backend, slot, defaults)?))
+        }
         _ => Err(unsupported(backend)),
     }
 }
@@ -1315,6 +1931,9 @@ pub fn poller(backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
     match backend.kind {
         ProviderKind::Anthropic => Ok(Arc::new(AnthropicBatch::from_backend(backend)?)),
         ProviderKind::Gemini => Ok(Arc::new(GeminiBatch::from_backend(backend)?)),
+        ProviderKind::Openai if backend.is_hosted_openai() => {
+            Ok(Arc::new(OpenaiBatch::from_backend(backend)?))
+        }
         _ => Err(unsupported(backend)),
     }
 }
@@ -2539,40 +3158,497 @@ mod tests {
         assert!(err.to_string().contains("Gemini batch provider"), "{err}");
     }
 
-    /// Dispatch refuses a kind with no batch lane (DeepSeek / local openai) and points at
-    /// the supported casts; `batch_supported` agrees with that set.
+    /// Dispatch refuses a backend with no batch lane (DeepSeek / OpenRouter / a *local*
+    /// openai endpoint) and points at the supported set; `batch_supported` agrees.
     #[test]
-    fn dispatch_refuses_unsupported_kinds() {
-        assert!(batch_supported(ProviderKind::Anthropic));
-        assert!(batch_supported(ProviderKind::Gemini));
-        assert!(!batch_supported(ProviderKind::DeepSeek));
-        assert!(!batch_supported(ProviderKind::OpenRouter));
-        assert!(!batch_supported(ProviderKind::Openai));
-        for kind in [
-            ProviderKind::DeepSeek,
-            ProviderKind::OpenRouter,
-            ProviderKind::Openai,
+    fn dispatch_refuses_unsupported_backends() {
+        assert!(batch_supported(&anthropic_backend()));
+        assert!(batch_supported(&hosted_openai_backend()));
+        for mut b in [
+            {
+                let mut b = anthropic_backend();
+                b.kind = ProviderKind::DeepSeek;
+                b
+            },
+            {
+                let mut b = anthropic_backend();
+                b.kind = ProviderKind::OpenRouter;
+                b
+            },
+            local_openai_backend(),
         ] {
-            let mut b = anthropic_backend();
-            b.kind = kind;
-            b.name = format!("{kind:?}").to_lowercase();
+            b.name = format!("{:?}", b.kind).to_lowercase();
+            assert!(!batch_supported(&b), "{:?} has no batch lane", b.kind);
             let slot = ModelSlot::bare(&b.name, "m");
             let err = submitter(&b, &slot, &Defaults::default())
                 .err()
-                .unwrap_or_else(|| panic!("{kind:?} must be refused"));
+                .unwrap_or_else(|| panic!("{:?} must be refused", b.kind));
             let msg = err.to_string();
             assert!(
                 msg.contains("no batch lane"),
                 "refusal explains the gap: {err}"
             );
-            // The supported set is named dynamically from `batch_supported`, so the message
-            // tracks the live set rather than a hand-maintained string.
+            // The refusal names the live supported set, `openai`'s condition included —
+            // a bare "openai" would send a local-server user in circles.
             assert!(
-                msg.contains("anthropic") && msg.contains("gemini"),
+                msg.contains("anthropic") && msg.contains("gemini") && msg.contains("openai"),
                 "refusal names the live supported set: {err}"
             );
             assert!(poller(&b).is_err());
         }
+    }
+
+    // --- OpenAI batch --------------------------------------------------------
+
+    /// A hosted OpenAI Platform backend: kind `openai`, base URL exactly Platform's.
+    /// That exact-URL match is the whole capability seam (`Backend::is_hosted_openai`).
+    fn hosted_openai_backend() -> Backend {
+        Backend {
+            name: "gpt".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some(crate::credentials::HOSTED_OPENAI_BASE_URL.to_string()),
+            key_optional: false,
+            ..anthropic_backend()
+        }
+    }
+
+    /// The same kind pointed at a local llama.cpp/Ollama-style server — OpenAI-compatible
+    /// on `/chat/completions`, with no Batch API behind it at all.
+    fn local_openai_backend() -> Backend {
+        Backend {
+            name: "openai-local".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some("http://localhost:8000/v1".into()),
+            key_optional: true,
+            ..anthropic_backend()
+        }
+    }
+
+    /// The `openai` kind's batch verdict is a *backend* property, not a kind property:
+    /// same kind, opposite answers, decided by the base URL. This is the regression that
+    /// matters — a kind-keyed check would hand a local server a batch lane it can't serve.
+    #[test]
+    fn openai_batch_lane_is_per_backend_not_per_kind() {
+        assert!(batch_supported(&hosted_openai_backend()));
+        assert!(!batch_supported(&local_openai_backend()));
+        // A trailing slash on the configured URL is the same Platform endpoint.
+        let mut slashed = hosted_openai_backend();
+        slashed.base_url = Some(format!("{}/", crate::credentials::HOSTED_OPENAI_BASE_URL));
+        assert!(batch_supported(&slashed));
+    }
+
+    /// Refusing a local openai backend names the *fix* (Platform's URL), not just the gap —
+    /// the user's next move is a one-line config edit, so say which line.
+    #[test]
+    fn local_openai_batch_refusal_names_the_platform_url() {
+        let err = OpenaiBatch::from_backend(&local_openai_backend())
+            .err()
+            .expect("a local openai endpoint has no batch lane");
+        let msg = err.to_string();
+        assert!(msg.contains("localhost:8000"), "names the endpoint: {msg}");
+        assert!(
+            msg.contains(crate::credentials::HOSTED_OPENAI_BASE_URL),
+            "names the fix: {msg}"
+        );
+    }
+
+    /// Batch maxes the knobs on hosted OpenAI too: a slot tuned thin and low-effort for
+    /// interactive use is floored to the batch budget and forced to `BATCH_EFFORT`.
+    #[test]
+    fn openai_shaping_floors_tokens_and_forces_high_effort() {
+        let (max_tokens, params) = openai_batch_shaping("gpt-5.6-sol", &tunables("low", 100));
+        assert!(
+            max_tokens >= BATCH_MAX_TOKENS_FLOOR,
+            "floored to the batch budget, got {max_tokens}"
+        );
+        assert_eq!(
+            params.as_ref().unwrap()["reasoning"]["effort"],
+            json!(BATCH_EFFORT),
+            "the slot's `low` is overridden by the batch effort"
+        );
+        assert!(
+            params.as_ref().unwrap().get("top_p").is_none(),
+            "batch leaves sampling to the provider default"
+        );
+        // A slot already asking for more keeps it — floored, never capped.
+        let (bigger, _) = openai_batch_shaping("gpt-5.6-sol", &tunables("low", 1 << 20));
+        assert_eq!(bigger, 1 << 20);
+    }
+
+    /// The model-aware half: an older chat family takes no `reasoning` block at all, so
+    /// batch sends none rather than a 400-bait guess.
+    #[test]
+    fn openai_shaping_omits_reasoning_for_non_reasoning_families() {
+        let (_, params) = openai_batch_shaping("gpt-4.1-mini", &tunables("high", 100));
+        assert!(
+            params.is_none(),
+            "no reasoning block, and batch sends no sampling: {params:?}"
+        );
+    }
+
+    /// The JSONL input file's wire shape, pinned: one line per item, each a self-contained
+    /// Responses request carrying the correlation id, the endpoint OpenAI replays, and the
+    /// maxed body.
+    #[test]
+    fn openai_jsonl_pins_the_request_shape() {
+        let (max_tokens, params) = openai_batch_shaping("gpt-5.6-sol", &tunables("low", 100));
+        let items = vec![
+            BatchItem {
+                custom_id: "0".into(),
+                prompt: "first".into(),
+            },
+            BatchItem {
+                custom_id: "1".into(),
+                prompt: "second".into(),
+            },
+        ];
+        let jsonl =
+            openai_batch_jsonl("gpt-5.6-sol", max_tokens, "be terse", &params, &[], &items).unwrap();
+        let lines: Vec<Value> = jsonl
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per item");
+        assert_eq!(lines[0]["custom_id"], json!("0"));
+        assert_eq!(lines[1]["custom_id"], json!("1"));
+        assert_eq!(lines[0]["method"], json!("POST"));
+        assert_eq!(lines[0]["url"], json!("/v1/responses"));
+        let body = &lines[0]["body"];
+        assert_eq!(body["model"], json!("gpt-5.6-sol"));
+        assert_eq!(body["instructions"], json!("be terse"));
+        assert_eq!(
+            body["input"],
+            json!("first"),
+            "no attachments stays the bare-string shorthand"
+        );
+        assert_eq!(body["max_output_tokens"], json!(max_tokens));
+        assert_eq!(
+            body["reasoning"]["effort"],
+            json!(BATCH_EFFORT),
+            "shaping params are flattened into the request body"
+        );
+        assert!(
+            jsonl.ends_with('\n'),
+            "JSONL is newline-terminated, not newline-separated"
+        );
+    }
+
+    /// Shared attachments ride ahead of every item's prompt as native Responses parts:
+    /// text under its `<file>` wrapper, an image as a data URL, the prompt last.
+    #[test]
+    fn openai_jsonl_carries_attachments_as_responses_parts() {
+        let attachments = vec![
+            Attachment::Text {
+                path: "src/lib.rs".into(),
+                body: "fn main() {}".into(),
+            },
+            Attachment::Image {
+                path: "diagram.png".into(),
+                mime: "image/png",
+                data_b64: "AAAA".into(),
+            },
+        ];
+        let items = vec![BatchItem {
+            custom_id: "0".into(),
+            prompt: "review it".into(),
+        }];
+        let jsonl =
+            openai_batch_jsonl("gpt-5.6-sol", 4096, "", &None, &attachments, &items).unwrap();
+        let line: Value = serde_json::from_str(jsonl.trim()).unwrap();
+        assert!(
+            line["body"].get("instructions").is_none(),
+            "an empty preamble sends no `instructions` key"
+        );
+        let content = &line["body"]["input"][0]["content"];
+        assert_eq!(line["body"]["input"][0]["role"], json!("user"));
+        assert_eq!(content[0]["type"], json!("input_text"));
+        assert!(
+            content[0]["text"].as_str().unwrap().contains("src/lib.rs"),
+            "the text attachment keeps its <file> wrapper: {content}"
+        );
+        assert_eq!(content[1]["type"], json!("input_image"));
+        assert_eq!(
+            content[1]["image_url"],
+            json!("data:image/png;base64,AAAA"),
+            "images ride as data URLs"
+        );
+        assert_eq!(
+            content[2],
+            json!({ "type": "input_text", "text": "review it" }),
+            "the prompt comes last, after its context"
+        );
+    }
+
+    fn openai_batch_object(status: &str, extra: Value) -> Value {
+        let mut v = json!({
+            "id": "batch_abc",
+            "object": "batch",
+            "endpoint": "/v1/responses",
+            "status": status,
+            "request_counts": { "total": 4, "completed": 3, "failed": 1 },
+        });
+        if let (Value::Object(base), Value::Object(more)) = (&mut v, extra) {
+            base.extend(more);
+        }
+        v
+    }
+
+    /// The status map, pinned across OpenAI's whole lifecycle. `completed` sums the
+    /// terminal buckets — a batch whose items *failed* still counts them as done, or the
+    /// progress line would stall short of its total forever.
+    #[test]
+    fn openai_status_maps_the_lifecycle() {
+        for pending in ["validating", "in_progress", "finalizing"] {
+            assert_eq!(
+                parse_openai_status(&openai_batch_object(pending, json!({}))).unwrap(),
+                OpenaiStatus::Pending {
+                    completed: 4,
+                    total: 4
+                },
+                "{pending} is progress, not a terminal state"
+            );
+        }
+        assert_eq!(
+            parse_openai_status(&openai_batch_object("cancelling", json!({}))).unwrap(),
+            OpenaiStatus::Cancelling
+        );
+        assert_eq!(
+            parse_openai_status(&openai_batch_object(
+                "completed",
+                json!({ "output_file_id": "file-out", "error_file_id": "file-err" })
+            ))
+            .unwrap(),
+            OpenaiStatus::Ended {
+                state: "completed".into(),
+                output_file_id: Some("file-out".into()),
+                error_file_id: Some("file-err".into()),
+            }
+        );
+        // A cancelled/expired batch can still carry the items that finished in time.
+        assert_eq!(
+            parse_openai_status(&openai_batch_object(
+                "expired",
+                json!({ "output_file_id": "file-out" })
+            ))
+            .unwrap(),
+            OpenaiStatus::Ended {
+                state: "expired".into(),
+                output_file_id: Some("file-out".into()),
+                error_file_id: None,
+            }
+        );
+        // An unknown status is loud — OpenAI's set is closed, so a new member is news.
+        let err = parse_openai_status(&openai_batch_object("teleporting", json!({})))
+            .expect_err("unknown status is refused");
+        assert!(err.to_string().contains("teleporting"), "{err}");
+    }
+
+    /// An empty string file id reads as absent, not as a downloadable file — OpenAI sends
+    /// `""` (not `null`) for a batch that produced no errors, and fetching `/files//content`
+    /// would 404 the whole poll.
+    #[test]
+    fn openai_status_treats_empty_file_ids_as_absent() {
+        assert_eq!(
+            parse_openai_status(&openai_batch_object(
+                "completed",
+                json!({ "output_file_id": "file-out", "error_file_id": "" })
+            ))
+            .unwrap(),
+            OpenaiStatus::Ended {
+                state: "completed".into(),
+                output_file_id: Some("file-out".into()),
+                error_file_id: None,
+            }
+        );
+    }
+
+    fn openai_result_line(custom_id: &str, body: Value) -> String {
+        json!({
+            "id": "batch_req_1",
+            "custom_id": custom_id,
+            "response": { "status_code": 200, "request_id": "req_1", "body": body },
+            "error": null,
+        })
+        .to_string()
+    }
+
+    /// A succeeded item's answer is the assistant message's `output_text`, with reasoning
+    /// items skipped — the scratchpad is not the answer.
+    #[test]
+    fn openai_results_join_output_text_and_skip_reasoning() {
+        let body = json!({
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "thinking…" }] },
+                { "type": "message", "role": "assistant", "content": [
+                    { "type": "output_text", "text": "the " },
+                    { "type": "output_text", "text": "answer" },
+                ]},
+            ],
+        });
+        let answers = parse_openai_output_jsonl(&openai_result_line("0", body)).unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].custom_id, "0");
+        assert_eq!(answers[0].text.as_deref(), Ok("the answer"));
+    }
+
+    /// A truncated answer is kept but announces itself — never presented as a finished one.
+    #[test]
+    fn openai_incomplete_response_is_banner_gated() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{ "type": "message", "role": "assistant", "content": [
+                { "type": "output_text", "text": "half an ans" }
+            ]}],
+        });
+        let answers = parse_openai_output_jsonl(&openai_result_line("0", body)).unwrap();
+        let text = answers[0].text.as_ref().expect("partial text is kept");
+        assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(text.contains("max_output_tokens"), "{text}");
+        assert!(text.contains("half an ans"), "the fragment survives: {text}");
+
+        // …and with no text at all it's an honest per-item failure, not an empty success.
+        let empty = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{ "type": "reasoning", "summary": [] }],
+        });
+        let answers = parse_openai_output_jsonl(&openai_result_line("0", empty)).unwrap();
+        assert!(answers[0].text.is_err(), "{:?}", answers[0].text);
+    }
+
+    /// A completed-but-empty answer is no answer — the same gate the other providers pass.
+    #[test]
+    fn openai_empty_completed_answer_is_a_failure() {
+        let body = json!({ "status": "completed", "output": [] });
+        let answers = parse_openai_output_jsonl(&openai_result_line("0", body)).unwrap();
+        assert_eq!(
+            answers[0].text.as_ref().unwrap_err(),
+            "model returned an empty answer"
+        );
+    }
+
+    /// The error file's lines and non-200 per-item responses both land as per-item
+    /// failures with the provider's own reason — one bad item never sinks the batch, and
+    /// never silently vanishes either.
+    #[test]
+    fn openai_per_item_failures_surface_their_reason() {
+        let request_error = json!({
+            "id": "batch_req_2",
+            "custom_id": "1",
+            "response": null,
+            "error": { "code": "invalid_request", "message": "model not found" },
+        })
+        .to_string();
+        let http_error = json!({
+            "id": "batch_req_3",
+            "custom_id": "2",
+            "response": { "status_code": 429, "request_id": "req_3", "body": {
+                "error": { "message": "rate limit reached", "type": "rate_limit_error" }
+            }},
+            "error": null,
+        })
+        .to_string();
+        let answers =
+            parse_openai_output_jsonl(&format!("{request_error}\n{http_error}\n")).unwrap();
+        assert!(answers[0]
+            .text
+            .as_ref()
+            .unwrap_err()
+            .contains("model not found"));
+        let http = answers[1].text.as_ref().unwrap_err();
+        assert!(http.contains("429"), "{http}");
+        assert!(http.contains("rate limit reached"), "{http}");
+    }
+
+    /// Succeeded and failed items come back in *separate files*, so the merged set is
+    /// re-ordered by kaibo's own index ids — the caller's submit order, restored.
+    #[test]
+    fn openai_results_are_reordered_by_submit_index() {
+        let merged = order_by_index(vec![
+            BatchAnswer {
+                custom_id: "2".into(),
+                text: Ok("third".into()),
+            },
+            BatchAnswer {
+                custom_id: "0".into(),
+                text: Ok("first".into()),
+            },
+            BatchAnswer {
+                custom_id: "1".into(),
+                text: Err("failed".into()),
+            },
+        ]);
+        let ids: Vec<&str> = merged.iter().map(|a| a.custom_id.as_str()).collect();
+        assert_eq!(ids, ["0", "1", "2"]);
+        // Numeric sort, not lexicographic: "10" comes after "9".
+        let many = order_by_index(
+            ["9", "10", "1"]
+                .into_iter()
+                .map(|id| BatchAnswer {
+                    custom_id: id.into(),
+                    text: Ok(String::new()),
+                })
+                .collect(),
+        );
+        let ids: Vec<&str> = many.iter().map(|a| a.custom_id.as_str()).collect();
+        assert_eq!(ids, ["1", "9", "10"]);
+        // Non-numeric ids keep the provider's order rather than being reshuffled.
+        let opaque = order_by_index(
+            ["zeta", "alpha"]
+                .into_iter()
+                .map(|id| BatchAnswer {
+                    custom_id: id.into(),
+                    text: Ok(String::new()),
+                })
+                .collect(),
+        );
+        let ids: Vec<&str> = opaque.iter().map(|a| a.custom_id.as_str()).collect();
+        assert_eq!(ids, ["zeta", "alpha"]);
+    }
+
+    /// A batch that fails input validation has no result files at all — the reason lives
+    /// on the batch object, with the offending JSONL line.
+    #[test]
+    fn openai_validation_failure_reads_its_reason_off_the_batch() {
+        let v = openai_batch_object(
+            "failed",
+            json!({ "errors": { "object": "list", "data": [
+                { "code": "invalid_json_line", "message": "not valid JSON", "line": 3 },
+                { "code": "model_not_found", "message": "unknown model" },
+            ]}}),
+        );
+        let text = openai_batch_error_text(&v).expect("a failed batch names its reason");
+        assert!(text.contains("line 3: not valid JSON"), "{text}");
+        assert!(text.contains("unknown model"), "{text}");
+        // No `errors` block at all is None, so the poll can say *that* instead of "".
+        assert_eq!(
+            openai_batch_error_text(&openai_batch_object("failed", json!({}))),
+            None
+        );
+    }
+
+    /// The list view: epoch seconds become the RFC3339 the recency filter reads back, and
+    /// `has_more` rides along so a truncated page announces itself.
+    #[test]
+    fn openai_list_renders_timestamps_the_recency_filter_can_read() {
+        let page = json!({
+            "object": "list",
+            "data": [openai_batch_object("in_progress", json!({ "created_at": 946_684_800 }))],
+            "has_more": true,
+        });
+        let (items, has_more) = parse_openai_list(&page).unwrap();
+        assert!(has_more);
+        assert_eq!(items[0].provider_id, "batch_abc");
+        assert_eq!(items[0].status, "in_progress");
+        assert_eq!((items[0].completed, items[0].total), (4, 4));
+        let created = items[0].created_at.as_deref().expect("a dated batch");
+        assert_eq!(
+            rfc3339_to_epoch(created),
+            Some(946_684_800),
+            "the round trip the `list` recency filter depends on: {created}"
+        );
     }
 
     /// Failed renders a clear terminal line (state + reason), not a "0 results" success.
