@@ -31,7 +31,116 @@ Open work in that plan: copy-paste hosted config, live text/image probes with
 `OPENAI_API_KEY`, OpenAI reasoning shaping (today `ProviderKind::Openai` emits no thinking),
 Responses API evaluation, OpenAI Batch, and Platform data-control documentation.
 
-### Media spine — perception in, production removed
+### `deliberate` cannot be staffed by any built-in cast — advertised but DOA
+`cast_can_deliberate` (`config.rs:846`) needs an **offline synth lane plus an explorer
+slot**. Of the built-in casts, only `anthropic-batch` and `gemini-batch` carry an offline
+lane, and both are **synth-only** — so every `deliberate` call on a stock install fails
+`cast "…" has no explorer slot`. The tool's own description points at `fable` /
+`gemini-deliberate` / `local-direct`, which live in `docs/config.example.toml` and are
+**not** built in, so the guidance names casts the user does not have. Either ship a
+deliberate-capable built-in (a Flash-Lite explorer beside the Pro batch synth is one line)
+or have the refusal say "no built-in cast can staff this; copy `gemini-deliberate` from
+`docs/config.example.toml`". Surfaced 2026-07-25 trying to run a `deliberate` design pass
+on the media CAS; worked around locally by adding the cast to the XDG config.
+
+### Media spine — perception in, production REOPENED (2026-07-25)
+
+**Superseded in part.** The 2026-06-28 direction below removed `generate_image` and made
+read-only unconditional. Image *production* was reopened 2026-07-25 (Amy) — the decision,
+the argument against it, and the CAS that makes the write path acceptable are in
+`docs/devlog.md` (2026-07-25); the shape rationale lives in `src/cas.rs`'s module doc. The
+perception half below stands unchanged.
+
+**Open work to make it reachable.** `src/cas.rs` and `src/stability.rs` exist and are
+tested, but nothing constructs either outside their own tests — no `ProviderKind::Stability`,
+no `image` cast slot (`986806f` reduced `ModelRole` to Explorer/Synth and made `image =` a
+loud `deny_unknown_fields` error), no MCP tool or CLI verb, no `[cas]` config. Three things
+must land *together* with the first tool, because each is unsafe or dishonest alone:
+
+- **A loud guard when the CAS is on ephemeral storage.** The ghcr image is a first-class
+  distribution path, and a CAS at `$XDG_DATA_HOME/kaibo/cas` in a container with no volume
+  mounted will accept the prompt, **spend the user's provider credits**, verify and write
+  the artifact, then destroy it on exit. Silently evaporating paid artifacts is exactly what
+  a store that refuses to ever delete exists to prevent. Ranked the top remaining risk by
+  the Gemini design pass. Detect overlay/tmpfs backing and warn severely, or require an
+  explicit acknowledgement — never proceed quietly.
+- **`AGENTS.md`'s opening paragraph** still says kaibo "produces no output artifacts." That
+  is *true today* (nothing reachable produces anything) and becomes false the moment a tool
+  lands. Rewrite it in that same change.
+- **The tool must be gated and auto-disabled** — see the next entry, which this shares a
+  mechanism with.
+
+**Decided, so it isn't re-litigated:** audio and 3D are *not* refused on principle. The
+account-fleet argument that justifies image generation extends to them; the real constraint
+is resident tool cost and curation. `MediaType::to_cas_extension` already refuses `audio/*`
+and `model/gltf-binary` loudly so that adding one forces a deliberate naming decision rather
+than silently writing bytes nobody can open.
+
+### Someday: the CAS as kaish's egress gateway (design note, not scheduled)
+Amy's direction 2026-07-25, explicitly *"need to think about it more"* — recorded so the
+reasoning survives, not to be built. The shape she wants: kaish can **read** from the CAS
+when it holds an address, and can **write** to it through a tool when a consultant produces
+an artifact worth egressing. Likely a specialized, opt-in consultant rather than the default
+toolset.
+
+**The read half is already sanctioned by our own reasoning.** The recorded decision was not
+to *mount* the CAS, and the stated reason was never read-access — it was **enumeration**: a
+browsable mount lets any project's model team walk every other project's artifacts, which is
+the operator/model-team leak. The same decision named the property to defend if revisited:
+*non-enumerable*, not read-only. A by-digest lookup leaks nothing, because in a CAS the
+address **is** the capability — you can only fetch what someone already handed you. This is a
+continuation, not a reversal.
+
+**The write half is the real change, and it is more defensible than it sounds.** The four
+levers are scoped to the **VFS**: no write mount, MemoryFs at `/`, no subprocess, minimal
+feature surface. A kaibo-injected *tool* is a different axis — architecturally `view_image`
+already proves it (a tool the model team invokes that reaches outside the shell's
+filesystem), just reading rather than writing. And the CAS's safety does not depend on *who*
+calls it: the address is the content hash, so a model-invoked `put` is exactly as unaimable
+as an operator-invoked one. That is precisely why safety-by-shape was worth building instead
+of safety-by-policy — policy would have to be re-argued for each new caller; shape does not.
+
+**Why one gateway beats ad-hoc write paths.** If artifacts must ever leave a consultant, a
+single content-addressed, non-aimable, provenance-recorded egress is the *strongest* form
+that can take. The alternative anyone reaches for otherwise — "let this one tool write a
+file" — is the general escape hatch the invariant exists to refuse.
+
+**Language that will need reworking when this lands** (audited 2026-07-25; the known-false
+"second and last" claims were already dropped):
+- `AGENTS.md`: *"The shell writes nothing"* / *"no kaish write path"*. Both stay true of the
+  **VFS** and become misleading as flat statements. Rework to scope them to the filesystem
+  explicitly, and say the mediated-tool axis is where egress lives.
+- `src/cas.rs`: *"never mounted into kaish"* may survive intact — a by-digest tool is not a
+  mount — but confirm rather than assume, and make "non-enumerable" the stated property.
+- `tests/no_write_path.rs`: a `cas_put` tool adds no `std::fs` call (it routes through
+  `Cas::put`), so the pinned blessed-line count likely does not move. Verify.
+
+**What must not weaken:** kaibo never touches the *project* — that is the user promise and
+egress-to-CAS does not touch it. And the model team still must not enumerate.
+
+### Never advertise a tool no configured cast can staff
+A single rule that fixes an existing bug and pre-empts a coming one. Tools are gated at
+startup by dropping routes from the `ToolRouter` (`server/mod.rs`, the `remove_route` loop),
+and `CAST_ENUM_RULES` already computes per-tool cast eligibility from live config
+(`cast_can_explore`, `cast_can_deliberate`, …). But eligibility currently only shapes the
+`cast` *enum* — it never removes the tool. `inject_cast_enum` even documents the near-miss:
+when no cast qualifies it *skips* injecting the enum, because an empty enum reads as "no
+valid value." So the tool ships advertised with no usable cast, which is precisely the
+`deliberate` DOA bug above.
+
+Fix: when a tool's eligible-cast list is empty, **remove the route** instead of skipping its
+enum. That repairs `deliberate` on stock installs, and gives image tools zero resident cost
+for the many users who configure no image cast — answering the resident-cost objection from
+the direction review with a mechanism rather than a caveat. It generalizes to `explore` and
+`batch_submit`, which have the same latent shape.
+
+Pair it with a **startup log line naming what was dropped and why** ("deliberate disabled:
+no configured cast pairs an explorer with an offline synth — see
+`docs/config.example.toml`"). Vanishing is right for the model's tool list and wrong for
+operator discoverability; the log plus `kaibo://config`'s roster keeps the operator informed
+without spending resident characters on the model. Amy agreed 2026-07-25; deliberately kept
+out of the media-CAS PR since it changes `deliberate`'s live behavior and deserves its own
+review.
 
 Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
 *unconditional* — no out-dir, no handler-side write, no write path of any kind. Image
@@ -61,8 +170,9 @@ sound devices in scope — file-in only.
 **TTS and any record/emit are output, so they don't return as roles.** TTS (text→audio) is
 a render, not perception; it leaves with image gen rather than parking as a reserved seam.
 If kaibo ever needs to record or emit, that's a deliberately-mediated tool — individually
-gated, its own narrow surface — never a production role or a general write path. None
-planned.
+gated, its own narrow surface — never a production role or a general write path. That
+sentence held: the media CAS *is* that mediated tool, built to those terms (see
+`src/cas.rs`). TTS still has no plan.
 
 ---
 

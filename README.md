@@ -168,7 +168,7 @@ claude mcp add kaibo -- docker run --rm -i \
 - Pass provider keys by name (`-e DEEPSEEK_API_KEY`) — the value rides your
   shell environment, never your MCP config.
 - The `:ro` mount is an OS-enforced belt under kaibo's own read-only sandbox:
-  kaibo never writes either way, this just makes the kernel agree.
+  kaibo never writes to your project either way, this just makes the kernel agree.
 
 The same image is a [CLI](#cli) too — append a subcommand and drop `-i` (there's no
 stdio transport to hold open for a one-shot run):

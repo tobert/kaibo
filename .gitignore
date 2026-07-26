@@ -16,3 +16,12 @@
 # signoff.md — ephemeral, personal cross-session handoff; never commit.
 # Shared working notes live in docs/issues.md and docs/devlog.md.
 signoff.md
+
+# Node artifacts from tooling run inside the repo (codex CLI and friends). kaibo has
+# no JS build; these are never ours. Listed because @openai/codex vendors a ~300MB
+# binary, which GitHub's 100MB pre-receive hook rejects — a `git add -A` that swept it
+# in cost a reset and recommit (2026-07-25). Staging by name is the real fix; this is
+# the belt.
+node_modules/
+package.json
+package-lock.json

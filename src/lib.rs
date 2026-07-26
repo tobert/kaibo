@@ -15,6 +15,7 @@
 
 pub mod attach;
 pub mod batch;
+pub mod cas;
 pub mod cli;
 pub mod config;
 pub mod consult;
@@ -29,6 +30,7 @@ pub mod progress;
 pub mod sandbox;
 pub mod server;
 pub mod session;
+pub mod stability;
 pub mod store;
 pub mod telemetry;
 pub mod tls;

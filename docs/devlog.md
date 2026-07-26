@@ -14,6 +14,88 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-25 — image generation reopened: a second write surface, earned by shape
+
+kaibo **built image generation and deleted it** on 2026-06-28 (`986806f`, ~1,700 lines).
+The recorded reason was *identity, not safety*: "image output used none of kaibo's
+differentiators (read-only sandbox, cross-model code reasoning)." This is the arc that
+reopened it, and the reasoning is worth keeping because the decision was genuinely
+contested — we commissioned an argument against it and it was good.
+
+**The decision (Amy).** Image generation stays in kaibo. Her reasoning is *not* the
+"sidekick bringing other model capabilities" framing we started with — that one is weak,
+and a review correctly called it a null thesis describing every MCP multiplexer. The
+load-bearing argument is narrower and better: **a user configures their whole model fleet
+here.** The backends/casts/credentials machinery — cross-backend teams, per-slot lanes and
+vision pins, key resolution that keeps secrets out of config, the TLS/static-binary
+discipline — already exists and transfers completely to generation. Someone who has told
+kaibo about their Anthropic, Gemini, DeepSeek, OpenRouter and Stability accounts should
+not have to tell a second tool the same thing to use a model they have already configured.
+
+**The dissent, kept because the decision beat it.** A Fable-5 batch review argued this is
+drift: that June was *overruled* rather than answered (the design doc's own word was
+"supersedes"), that resident tool cost is a real tax on every session in a hard
+2048-character budget, that `cas.rs` calling itself the "second and last" write surface is
+hope rather than an invariant, and that the honest exit was a sibling pal in the
+gpal/dpal/cpal family. It also said plainly that safety had *not* eroded and the modules
+were good work. Two of its points survive the decision and are now tracked, not dismissed:
+resident cost is answered by **curation** (see the tool-gating entry in `issues.md`), and
+the line that would refuse the *next* capability is admittedly about cost, not principle.
+
+**Why a CAS made the write path acceptable.** Safety comes from *shape*, not policy: the
+address of every object is its own SHA-256, so no public API takes a destination path and
+a caller structurally cannot aim the write. Write-only via `create_new`; no unlink,
+truncate, or rename anywhere. The full argument, plus the two alternatives we rejected
+(turso blobs, blake3), lives in `src/cas.rs`'s module doc. We also decided **not** to mount
+the CAS into kaish: read access breaches nothing about writes, but it would breach the
+operator/model-team line, since kaibo state spans projects and a browsable mount lets any
+project's team enumerate every other project's artifacts. The address *is* the capability
+there — you can only read a digest you already hold — so the single leak a mount would
+open is enumeration. If it is ever revisited, **non-enumerable** is the property to defend,
+not read-only.
+
+**The defect two model families found independently.** Before the fix, a crash between
+`create_new` and a completed `write_all` left a truncated object at the exact path a later
+write of the same content would treat as "already there" — `put` then silently accepted it
+and `get` served the corrupt bytes forever, in a store that by design cannot delete.
+DeepSeek found it as a narrow TOCTOU; Gemini Pro ranked it Critical and named it the atomic
+write paradox. Neither saw the other's review. The fix verifies the SHA-256 of every byte
+before returning any (`get`) and before reporting success on a dedup (`put`), which is
+stronger than the size check the review proposed — a same-length corruption passes a size
+check. Convergence from two lineages on the same defect is the clearest evidence we have
+that the cross-family review discipline earns its cost.
+
+**Wire facts, verified live rather than read.** Stability's docs site is a client-rendered
+app with nothing to scrape; the real spec is at `https://api.stability.ai/v2alpha/openapi`.
+Three things came out of checking it (and one real `generate/core` call) that a docs-only
+reading would have missed, all now encoded in `src/stability.rs`:
+
+- **`finish-reason` is load-bearing.** A `200` with image bytes is *not* success —
+  moderation returns `200`/`CONTENT_FILTERED` with a genuinely *blurred* image. Real bytes,
+  valid PNG, plausible. Without the check, the CAS would store it under a valid digest,
+  permanently.
+- **Deferred POSTs are not uniformly `202`** (`upscale/creative` → `200`+`{id}`,
+  `stable-audio` → `202`+`{id}`), so deferred-ness cannot be sniffed from a status code.
+  `Operation::shape()` declares it instead.
+- **Exactly six non-JSON media types exist** across the whole spec. That is what makes
+  `MediaType` a closed enum rather than a `String` — a call Amy made over our initial
+  design, and the count is what settled it.
+
+**The async reshape happened before it had callers**, deliberately: the signature was free
+then and expensive after a config surface and tool pinned it. It looked speculative until
+we checked Amy's own Gemini key and found `veo-3.1-*` exposed as `predictLongRunning` —
+genuinely deferred, on an account she already has.
+
+**Landed:** `src/cas.rs`, `src/stability.rs`, the `no_write_path.rs` amendment (per-file
+marked lines at a pinned exact count, so a new write site cannot ride in behind an existing
+marker), rig's `image` feature and reqwest's `multipart` re-enabled (both added *zero*
+crates and left the aws-lc-free tree intact), and the `AGENTS.md` invariant rewritten to
+describe two deliberate write surfaces. Nothing is user-reachable yet — no `ProviderKind`,
+no cast slot, no MCP tool — which is why there is no changelog entry. That wiring, and the
+container-evaporation guard it must ship with, are in `issues.md`.
+
+---
+
 ## 2026-07-18 — Gemini's effort lever was silently disconnected
 
 Investigating batch truncation (#79, already fixed) turned up a *separate* correctness
