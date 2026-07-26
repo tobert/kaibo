@@ -262,6 +262,12 @@ change, **drawn from the conversation with the user**. Commit messages briefly e
 what happened as context for the more important task of explaining the decisions we
 made.
 
+Credit the loop in trailers when it materially shaped the change. Use `Co-authored-by`
+for an agent that wrote or substantially rewrote the patch and `Reviewed-by` for a
+model or tool review that changed confidence or content (for example, a kaibo cast
+review). Prefer concrete names and stable identities when the host supplies them; if it
+doesn't, name the model/tool plainly in the PR body instead of inventing an email.
+
 ## Pull requests & the changelog
 
 Every change lands through a pull request — `main` is never committed to directly.
