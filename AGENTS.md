@@ -1,13 +1,23 @@
 # AGENTS.md — kaibo (解剖)
 
 Kaibo is a stdio MCP server that provides an assistant agent **for other agents**.
-It augments a calling agent (Claude, etc.) with a team of models, lending one kind of
-help — *consultation*: grounded, cited, read-only answers about a codebase. The team
+It augments a calling agent (Codex, Claude, Gemini, local agents, etc.) with a team of
+models, lending one kind of help — *consultation*: grounded, cited, read-only answers
+about a codebase. The team
 *perceives* what fuses into its reasoning (image input today — `view_image` and image
 attachments on the model-driven tools; more modalities as the models gain them), but
 kaibo produces **no output artifacts** — it reasons over code, it doesn't render or
 emit. (If it ever needs to *record* something, that's a specific mediated tool, not a
 general write path; see the read-only invariant.)
+
+## For agents working here
+
+- Keep status explicit. If you change direction, say what changed and why. If a tool or
+  sandbox blocks work, report the exact blocker and the safe next option.
+- Prefer a worktree for PR work. Use `~/src/wt/<repo>-<topic>` for local worktrees.
+- Keep `signoff.md` as local, ignored session memory when useful; melt durable parts into
+  checked-in docs before they go stale.
+- Use a little 日本語（にほんご）when it fits; add ふりがな for kanji.
 
 **Consultation: one primitive, three tools.** The primitive is `run_phase`
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
@@ -199,7 +209,7 @@ Two audiences are optimized differently:
 
 ## Driving the models
 
-How kaibo talks to LLMs — Amy's defaults, made local so any agent here inherits them.
+How kaibo talks to LLMs — project defaults, made local so any agent here inherits them.
 
 - **Thinking ON by default**, every model that supports it, both phases (Anthropic
   `thinking`, Gemini `thinkingConfig`, DeepSeek reasoners; in rig via
@@ -251,6 +261,16 @@ Commit and pull request bodies should usually summarize the decisions behind the
 change, **drawn from the conversation with the user**. Commit messages briefly explain
 what happened as context for the more important task of explaining the decisions we
 made.
+
+Credit the loop in trailers when it materially shaped the change. Use `Co-authored-by`
+for an agent that wrote or substantially rewrote the patch and `Reviewed-by` for a
+model or tool review that changed confidence or content (for example, a kaibo cast
+review). Prefer concrete names and stable identities when the host supplies them; if it
+doesn't, name the model/tool plainly in the PR body instead of inventing an email.
+
+Stage deliberately. Do not use `git add -A`, `git add .`, or broad globs when preparing
+commits; stage only the files intentionally changed for the current task. Check
+`git status --short` before committing, and leave unrelated/untracked user files alone.
 
 ## Pull requests & the changelog
 

@@ -560,7 +560,7 @@ open failure stays fatal.
 kaibo's models are *for other agents*, so it helps when they inherit the calling
 agent's conventions. `[context]` names files whose contents are spliced into each
 consultation tool's preamble (the system prompt) as standing guidance — an
-`AGENTS.md`, a shared `~/.claude/CLAUDE.md`, whatever you call yours. **Vendor-
+`AGENTS.md`, a shared user guidance file, whatever you call yours. **Vendor-
 neutral:** no filename is hardcoded in the product; the only default is the
 emerging cross-tool `AGENTS.md` convention, and that's just a config default you
 can change or turn off.
@@ -573,7 +573,7 @@ project_files = ["AGENTS.md", "docs/CONVENTIONS.md"]
 
 # Absolute/tilde paths, read UNCONDITIONALLY (a missing one is a startup-visible
 # error — you declared it, so kaibo won't silently drop it). Default: none.
-user_files = ["~/.claude/CLAUDE.md"]
+user_files = ["~/.config/kaibo/agent-guidance.md"]
 ```
 
 Two lists, two deliberately different failure semantics:
@@ -590,7 +590,7 @@ Two lists, two deliberately different failure semantics:
 **The trust boundary** (why `user_files` may sit outside the allowed set): these
 files are read in trusted server-side Rust at the tool handler — the same trust
 level as `config.toml` itself — and only their *contents* reach the model, never
-the path. The read-only kaish shell still cannot reach `~/.claude`; the model's
+the path. The read-only kaish shell still cannot reach the user guidance path; the model's
 read scope is *not* widened. That's the distinction from `[server] allow_paths`
 below: `allow_paths` widens what the *model* can explore, `[context]` injects
 fixed operator text the model never navigates to.
