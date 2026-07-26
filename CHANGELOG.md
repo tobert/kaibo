@@ -11,6 +11,17 @@ the git log. Each later release appends a new section at the top.
 
 ## [0.2.0] — unreleased
 
+### Changed
+
+- **Configure guidance now calls out host-agent sandboxes.** `/kaibo:configure`,
+  `kaibo configure`, and the setup docs now tell agents that kaibo needs outbound network
+  to configured model APIs, writable access to its XDG state dir for persistent MCP
+  sessions/batch handles, and XDG data access for the media CAS when artifact-producing
+  tools are enabled. The guidance also names the per-client split option so Codex,
+  Claude Code, and other agents can keep session history or generated artifacts separate,
+  and notes that Codex commonly needs explicit sandbox grants where Claude Code usually
+  starts local MCP servers with ordinary home-dir access.
+
 ### Added
 
 - **Hosted OpenAI Platform backends now use the Responses API for interactive GPT calls.**

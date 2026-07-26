@@ -14,6 +14,26 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-07-26 — Configure names host-agent sandbox access and per-client state
+
+The first Codex MCP bring-up surfaced a setup mismatch rather than a kaibo runtime bug:
+kaibo's own model-facing shell is read-only, but the **host agent** may also sandbox the
+kaibo process. Codex commonly does; Claude Code commonly doesn't. A stdio MCP server
+launched under that stronger sandbox needs two explicit grants before kaibo is useful:
+outbound network to the configured model APIs, and a narrow writable root for kaibo's own
+XDG state db if persistence is on. The CAS follows the same operator choice when
+artifact-producing tools are enabled: share the default XDG data path for cross-agent
+workflows, or split it if artifacts should not cross client boundaries.
+
+The important wording correction was **per-client**, not per-host. The useful split is
+Codex vs. Claude Code vs. another MCP-capable agent on the same machine, not one physical
+machine vs. another. That keeps the recommendation aligned with the trust boundary:
+opening the shared XDG state dir to a Codex session exposes that history to the outer Codex
+agent, even though kaibo's inner model team never sees it. So the configure guidance now
+asks before opening XDG paths, names Codex's `network_access` / `writable_roots` shape, and
+offers a Codex-only state db or CAS dir as a cleaner multi-agent default when sharing is not
+the goal.
+
 ## 2026-07-26 — OpenAI joins the batch lane, and batch capability stops being a kind
 
 The third batch provider, and the one that broke an assumption the other two never

@@ -540,6 +540,17 @@ project, and `open` **refuses a state-db path that resolves inside an allowed tr
 it can't be pointed into a repo). See the "Read-only is the product" invariant in
 AGENTS.md.
 
+**Host-agent sandboxes still matter.** kaibo's inner model-facing shell is read-only, but
+your MCP client or calling agent may also sandbox the kaibo process itself. If that host
+sandbox blocks network, model-backed tools cannot reach providers. If it blocks writes to
+the XDG state dir, a long-lived MCP server with persistence enabled fails during startup.
+Grant the host sandbox outbound network and a narrow writable root for kaibo's state dir,
+or move the db with `--state-db` / `KAIBO_STATE_DB` / `[persistence] path`. For multi-agent
+setups, a per-client state db is often cleaner than sharing one history file across Claude
+Code, Codex, and other agents. Apply the same judgment to the media CAS when an
+artifact-producing tool is enabled: the default XDG data path is convenient for sharing
+generated artifacts across agents, while a per-client CAS keeps those artifacts separated.
+
 **Loud on failure, never a silent fallback.** If the store can't open (a bad path, a db
 inside a project, a network mount — turso's multiprocess mode is 64-bit-Unix + local-fs
 only), kaibo **fails to start** with an error naming the escape hatch and leaving the db
