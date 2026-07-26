@@ -524,10 +524,12 @@ pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String
          context. When the whole file is the evidence, attach it — your report cites, the \
          attachment carries the bytes. That is cheaper and more accurate than \
          transcribing a span into your report: transcription spends your own budget and \
-         can drift; an attachment is the real file, numbered like `cat -n`. Attach the \
-         file a load-bearing claim rests on; keep writing exact `file:line` cites, \
-         because the attachment is what lets them be checked. Up to {max} files this \
-         sweep.",
+         can drift; an attachment is the real file, numbered like `cat -n`. Attach is \
+         for delivering, not reading — you get back a one-line receipt (path, lines, \
+         size), never the contents; read with `cat -n` anything you need to see \
+         yourself. Attach the file a load-bearing claim rests on; keep writing exact \
+         `file:line` cites, because the attachment is what lets them be checked. Up to \
+         {max} files this sweep.",
         consumer.label,
     )
 }
@@ -1132,6 +1134,11 @@ mod tests {
         let d = explorer_attach_directive(5, &consult_driver_consumer());
         assert!(d.contains("`attach`"), "{d}");
         assert!(d.contains("5 files"), "{d}");
+        // Both cross-family reviewers converged here: a weak explorer must be told
+        // up front that attach hands back a receipt, never the file — otherwise it
+        // attaches what it meant to read and hallucinates the contents.
+        assert!(d.contains("never the contents"), "{d}");
+        assert!(d.contains("delivering, not reading"), "{d}");
         assert!(
             d.contains("the consult driver (`claude-sonnet-4-6`)"),
             "{d}"

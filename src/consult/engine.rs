@@ -5371,6 +5371,82 @@ mod tests {
         );
     }
 
+    /// Two image-bearing results in ONE assistant turn (`view_image` + an `explore`
+    /// sweep that routed a picture): the rewrite must move BOTH out — per-part
+    /// filtering that stopped at the first image-bearing result would strand the
+    /// second on a channel the transport rejects. (DeepSeek review gap, 2026-07-26.)
+    #[test]
+    fn rewrite_moves_both_images_when_two_tools_carry_them() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::many([
+                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+                AssistantContent::tool_call("ex", "explore", json!({ "question": "diagram?" })),
+            ])
+            .unwrap(),
+        };
+        let results = Message::User {
+            content: OneOrMany::many([
+                vi_result("vi"),
+                UserContent::ToolResult(ToolResult {
+                    id: "ex".to_string(),
+                    call_id: None,
+                    content: OneOrMany::many([
+                        ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
+                        ToolResultContent::image_base64("ZmFrZTI=", None, None),
+                    ])
+                    .unwrap(),
+                }),
+            ])
+            .unwrap(),
+        };
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "both images must leave the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            2,
+            "each image gets its own user Image turn: {out:?}"
+        );
+        for id in ["vi", "ex"] {
+            assert!(
+                out.iter().any(|m| matches!(m, Message::User { content }
+                    if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                        if tr.id == id
+                        && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+                "tool_use `{id}` stays answered by a text-only result: {out:?}"
+            );
+        }
+    }
+
+    /// The break keys on the parsed envelope, never the raw substring: a *text*
+    /// result that happens to contain the literal `"type":"image"` — an explorer
+    /// cat-ing this very file, a JSON fixture, a grep hit — must not trip the
+    /// break/rewrite machinery. The substring check is only the cheap pre-filter;
+    /// serde confirms `parts[]` actually holds an image. (Pins the gate the Gemini
+    /// review assumed was missing, 2026-07-26.)
+    #[test]
+    fn a_text_result_containing_the_image_literal_does_not_carry_an_image() {
+        // A run_kaish-style plain string result quoting envelope-shaped JSON.
+        let grep_hit = r#"exit:0
+src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data": b64}]})"#;
+        assert!(!tool_result_carries_image(grep_hit));
+
+        // Even a String OUTPUT that serializes envelope-looking text stays a JSON
+        // string on the wire — parsing yields a String, not an object with parts[].
+        let stringified =
+            serde_json::to_string(&json!({"response": "r", "parts": [{"type":"image"}]}).to_string())
+                .unwrap();
+        assert!(!tool_result_carries_image(&stringified));
+
+        // The genuine hybrid envelope, serialized as rig hands it over, does carry.
+        let envelope = json!({"response": "r", "parts": [{"type": "image", "data": "ZmFrZQ=="}]});
+        assert!(tool_result_carries_image(&envelope.to_string()));
+    }
+
     /// The outer turn budget is derived from the transcript (rig carries no
     /// `turns_used`): one model turn per assistant message, so a looping `view_image`
     /// can't refresh its budget every break.

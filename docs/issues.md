@@ -347,6 +347,16 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
+### Server-level test: a sweep-routed image survives the whole `deliberate` handler
+The engine layer pins dossier stitching and `deliberate_direct`-with-images, but
+neither `deliberate_batch` nor `deliberate_direct_job` has a server-level test
+proving a sweep-routed image survives the full handler pipeline (dossier sweep →
+`sink.drain()` → image collection → lane dispatch). The code reads correctly
+(`src/server/mod.rs`, `deliberate`), and the engine tests cover the seams — but a
+future refactor could drop the `images` variable between drain and dispatch
+undetected. Flagged by the DeepSeek cross-family review of the explorer `attach`
+feature (2026-07-26).
+
 ### `RunExplore`'s image-bearing tool result arrives JSON-quoted to the driver
 When a sweep routes an image via `attach`, `RunExplore::call` returns the rig hybrid
 envelope `{"response": …, "parts": [...]}` (`Value`) instead of a plain `String` —
