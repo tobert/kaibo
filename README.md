@@ -309,6 +309,17 @@ The file is written by your **host agent** with its own permissions, the same wa
 edits any file — *not* by kaibo's sandboxed sub-agents, which remain strictly read-only
 and never touch disk. The prompt just hands your agent the knowledge to do it.
 
+If your host agent sandboxes local commands or MCP servers, give kaibo the host access
+it actually needs: outbound network to your configured model APIs, and write access to
+kaibo's own XDG state dir if you want persistent sessions/batch handles. The default
+state db is `$XDG_STATE_HOME/kaibo/state.db` (else
+`~/.local/state/kaibo/state.db`); artifact-producing tools use the media CAS under
+`$XDG_DATA_HOME/kaibo/cas` (else `~/.local/share/kaibo/cas`) when enabled. You can
+also point state/CAS at separate per-client locations so Claude Code, Codex, and other
+agents don't share history or generated artifacts. Codex commonly has a stricter
+sandbox default than Claude Code, so its setup may need explicit network and writable
+root entries where Claude Code just works.
+
 The prompt leans on two MCP resources kaibo serves, which you can also read directly:
 
 - **`kaibo://config/example`** — the fully annotated `config.toml` template, every

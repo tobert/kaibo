@@ -2471,8 +2471,8 @@ Work through these steps:
 and where each key is sourced from.
 ";
 
-/// Steps 2-5, channel-neutral (which provider, what roster shape, keeping secrets out
-/// of the file, and the optional read-scope widening) — the substance both the MCP
+/// Steps 2-6, channel-neutral (which provider, what roster shape, keeping secrets out
+/// of the file, optional read-scope widening, and host-agent sandbox setup) — the substance both the MCP
 /// `configure` prompt and `kaibo configure` (CLI) share verbatim, so a future edit to
 /// the roster-design guidance can't drift between the two front doors. Each caller
 /// wraps it in its own channel-specific opening (how to *read* kaibo's own config) and
@@ -2514,10 +2514,23 @@ diff, a log, a generated file you dropped somewhere — name that directory in \
 `[server] allow_paths` (`$VAR` / `${VAR}` and a leading `~` expand, resolving per machine). \
 It's a deliberate opt-in worth asking me about first, since it widens what a consult can \
 read (and can ship to a model).
+6. Host-agent sandbox. kaibo's own model-facing shell stays read-only, but the host \
+agent or MCP client that launches kaibo may sandbox the kaibo process. A useful kaibo \
+setup needs outbound network access to the model APIs I configure, and long-lived MCP \
+servers need write access to kaibo's own XDG state path \
+(`$XDG_STATE_HOME/kaibo/state.db`, else `~/.local/state/kaibo/state.db`). If a \
+media-producing tool is enabled, its content-addressed media CAS lives under the XDG \
+data dir (`$XDG_DATA_HOME/kaibo/cas`, else `~/.local/share/kaibo/cas`) and may also \
+need host-sandbox access. Ask before opening those paths. I may prefer separate \
+per-client stores — for example a Codex-only state db or CAS dir — when I don't want \
+Claude Code, Codex, and other agents sharing session history or generated artifacts. \
+Codex has a stronger sandbox default than Claude Code in common setups, so its config \
+often needs explicit `network_access` and `writable_roots`; Claude Code usually starts \
+local MCP servers with ordinary access to my home XDG dirs.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_MCP: &str = "\
-6. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
+7. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
 the config and keys — both load once at startup.";
 
 /// The CLI-flavored opening/step-1: kaibo's own config surfaces read as plain
@@ -2536,7 +2549,7 @@ and where each key is sourced from.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_CLI: &str = "\
-6. When the file is written, you're done — kaibo re-reads `config.toml` fresh on every \
+7. When the file is written, you're done — kaibo re-reads `config.toml` fresh on every \
 invocation, so the very next `kaibo consult` (or any other subcommand) picks it up. \
 Only reconnect something if you're *also* running kaibo as a long-lived MCP server \
 elsewhere — that process still loads config once at startup.";
@@ -4592,6 +4605,32 @@ mod tests {
             text.contains("don't reach for it by default"),
             "the prompt must tell the agent not to default to a chimera; body:\n{text}"
         );
+    }
+
+    /// Host-agent sandboxes are a setup concern outside kaibo's inner read-only shell.
+    /// The configure guidance must name the access kaibo actually needs and the option to
+    /// split durable state per client/host-agent, especially for Codex's stricter default.
+    #[test]
+    fn configure_prompt_covers_host_sandbox_state_and_cas_access() {
+        let result =
+            kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, None).expect("configure must resolve");
+        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+            panic!("configure prompt must be a text message");
+        };
+        for needle in [
+            "network_access",
+            "writable_roots",
+            "$XDG_STATE_HOME/kaibo/state.db",
+            "$XDG_DATA_HOME/kaibo/cas",
+            "per-client stores",
+            "Codex",
+            "Claude Code",
+        ] {
+            assert!(
+                text.contains(needle),
+                "configure prompt should mention host-sandbox setup fact {needle:?}; body:\n{text}"
+            );
+        }
     }
 
     /// A supplied `goal` is woven into the message so the agent tailors the roster;
