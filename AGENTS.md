@@ -71,7 +71,7 @@ project and cannot run external commands.
   refused if it resolves into any allowed tree (`tests/store.rs`), and written via turso
   plus a **blessed `create_dir_all`** that `tests/no_write_path.rs` carves out. That store
   was the one deliberate write surface; the **media CAS** (`src/cas.rs` — generated
-  artifacts) is the second and last, under the same discipline: fixed XDG path, refused if
+  artifacts) is the second, under the same discipline: fixed XDG path, refused if
   it resolves into an allowed tree, its own blessed marker. The CAS is safe by *shape*, not
   policy — **the address is the content hash**, so its API has no destination-path
   parameter for a model to aim; it is write-only (`create_new`; no unlink/truncate/rename,

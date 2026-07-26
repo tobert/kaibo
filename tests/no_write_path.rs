@@ -13,7 +13,7 @@
 //! persistence store creates its XDG state dir — a fixed, model-inaccessible path, only
 //! after the containment check.
 //!
-//! **Blessed site 2** (the second and last amendment; see `docs/devlog.md` (2026-07-25) and
+//! **Blessed site 2** (see `docs/devlog.md` (2026-07-25) and
 //! `src/cas.rs`'s module doc): the media CAS, a content-addressed store of generated
 //! artifacts. Unlike `store.rs`, one write-only object write there touches the filesystem
 //! at **three** distinct seams, not one — `create_dir_all` for the two-level hex shard

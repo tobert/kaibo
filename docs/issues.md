@@ -76,6 +76,48 @@ is resident tool cost and curation. `MediaType::to_cas_extension` already refuse
 and `model/gltf-binary` loudly so that adding one forces a deliberate naming decision rather
 than silently writing bytes nobody can open.
 
+### Someday: the CAS as kaish's egress gateway (design note, not scheduled)
+Amy's direction 2026-07-25, explicitly *"need to think about it more"* — recorded so the
+reasoning survives, not to be built. The shape she wants: kaish can **read** from the CAS
+when it holds an address, and can **write** to it through a tool when a consultant produces
+an artifact worth egressing. Likely a specialized, opt-in consultant rather than the default
+toolset.
+
+**The read half is already sanctioned by our own reasoning.** The recorded decision was not
+to *mount* the CAS, and the stated reason was never read-access — it was **enumeration**: a
+browsable mount lets any project's model team walk every other project's artifacts, which is
+the operator/model-team leak. The same decision named the property to defend if revisited:
+*non-enumerable*, not read-only. A by-digest lookup leaks nothing, because in a CAS the
+address **is** the capability — you can only fetch what someone already handed you. This is a
+continuation, not a reversal.
+
+**The write half is the real change, and it is more defensible than it sounds.** The four
+levers are scoped to the **VFS**: no write mount, MemoryFs at `/`, no subprocess, minimal
+feature surface. A kaibo-injected *tool* is a different axis — architecturally `view_image`
+already proves it (a tool the model team invokes that reaches outside the shell's
+filesystem), just reading rather than writing. And the CAS's safety does not depend on *who*
+calls it: the address is the content hash, so a model-invoked `put` is exactly as unaimable
+as an operator-invoked one. That is precisely why safety-by-shape was worth building instead
+of safety-by-policy — policy would have to be re-argued for each new caller; shape does not.
+
+**Why one gateway beats ad-hoc write paths.** If artifacts must ever leave a consultant, a
+single content-addressed, non-aimable, provenance-recorded egress is the *strongest* form
+that can take. The alternative anyone reaches for otherwise — "let this one tool write a
+file" — is the general escape hatch the invariant exists to refuse.
+
+**Language that will need reworking when this lands** (audited 2026-07-25; the known-false
+"second and last" claims were already dropped):
+- `AGENTS.md`: *"The shell writes nothing"* / *"no kaish write path"*. Both stay true of the
+  **VFS** and become misleading as flat statements. Rework to scope them to the filesystem
+  explicitly, and say the mediated-tool axis is where egress lives.
+- `src/cas.rs`: *"never mounted into kaish"* may survive intact — a by-digest tool is not a
+  mount — but confirm rather than assume, and make "non-enumerable" the stated property.
+- `tests/no_write_path.rs`: a `cas_put` tool adds no `std::fs` call (it routes through
+  `Cas::put`), so the pinned blessed-line count likely does not move. Verify.
+
+**What must not weaken:** kaibo never touches the *project* — that is the user promise and
+egress-to-CAS does not touch it. And the model team still must not enumerate.
+
 ### Never advertise a tool no configured cast can staff
 A single rule that fixes an existing bug and pre-empts a coming one. Tools are gated at
 startup by dropping routes from the `ToolRouter` (`server/mod.rs`, the `remove_route` loop),

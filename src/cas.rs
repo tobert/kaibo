@@ -1,6 +1,6 @@
 //! Content-addressed store for generated media artifacts.
 //!
-//! This is the second and last deliberate write surface kaibo has (the first is
+//! This is the second deliberate write surface kaibo has (the first is
 //! [`crate::store`]'s XDG state db). Where that store earns its exception through
 //! *policy* (a containment check plus a single blessed `create_dir_all`), the CAS earns
 //! it through **shape**: the address of every object is its own SHA-256 digest, so
