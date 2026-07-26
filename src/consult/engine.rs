@@ -2454,6 +2454,47 @@ mod tests {
 
     // --- The explorer `attach` tool, wired into the recomposed consult loop ------
 
+    /// A delegated sweep's OWN toolset (not the driver's) is exactly
+    /// `{run_kaish, attach}` — never a nested `explore` (a sweep doesn't delegate
+    /// further). Pinned by asserting inside the EXPLORER's own responder, since the
+    /// inner toolset only exists once the driver actually delegates.
+    #[tokio::test]
+    async fn the_delegated_sweep_toolset_is_run_kaish_and_attach() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "q" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(has_tool(req, "run_kaish"), "{:?}", req.tools);
+                assert!(has_tool(req, "attach"), "{:?}", req.tools);
+                assert!(
+                    !has_tool(req, "explore"),
+                    "a sweep does not delegate further: {:?}",
+                    req.tools
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+    }
+
     /// The load-bearing wiring test: a sweep that calls `attach` must land its
     /// routed file — full body, numbered — on the DRIVER's tool result, not just
     /// in the sweep's own transcript.
