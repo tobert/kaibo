@@ -371,6 +371,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | config file location | — | `KAIBO_CONFIG` | `--config <path>` |
 | default root | `server.root` | `KAIBO_ROOT` | `--root` |
 | additional allowed trees | `server.allow_paths` *(list)* | `KAIBO_ALLOW_PATHS` *(colon-separated)* | `--allow-path DIR` *(repeatable)* |
+| infer the cwd as an allowed tree + default root | `server.infer_cwd` *(default true)* | `KAIBO_NO_CWD` *(disables)* | `--no-cwd` *(disables)* |
 | default cast | `server.cast` | `KAIBO_CAST` | `--cast` |
 | disable a tool | `server.tools.<t> = false` | `KAIBO_NO_<T>` | `--no-<t>` |
 | log filter | `server.log` | `RUST_LOG` *(wins)* / `KAIBO_LOG` | — |
@@ -742,22 +743,27 @@ one of the allowed trees is `invalid_params`, naming the allowed trees and the t
 knobs that widen them.
 
 **The allowed set** is constructed at startup from the canonicalized `--root` plus
-every canonicalized `--allow-path`. When both are absent the allowed set defaults to
-the canonicalized launch cwd. MCP clients start stdio servers with cwd = workspace,
-so the zero-config case scopes itself to the project naturally, without any operator
-action. The default isn't silent: the resolved allowed set is reported in a startup
+every canonicalized `--allow-path`, plus the canonicalized launch cwd — unless `--root`
+named a project, or `--no-cwd` opted out. MCP clients start stdio servers with cwd =
+workspace, so the zero-config case scopes itself to the project naturally, without any
+operator action.
+
+**`--allow-path` is additive.** It widens the boundary and never narrows it: adding one
+does *not* cost you the cwd, because reaching one more tree should never evict the
+workspace your question is about. Naming a `--root` is different — that is you choosing
+the project, so the cwd is not added beside it. When you want the allowed set to be
+exactly what you named, say so with `--no-cwd` (`KAIBO_NO_CWD`, `[server] infer_cwd =
+false`); every call must then pass its own `path`. The default isn't silent: the resolved allowed set is reported in a startup
 log line and in the `## Scope` section of the server's MCP `instructions` (visible in
 every `initialize` response), and at `kaibo://config`.
 
 **The default root** is what a call resolves to when it omits `path`: an explicit
-`--root`, or — when none is set — the launch cwd, *inferred* whenever it falls inside
-the allowed set (it always does in the zero-config case, since the cwd is the whole
-allowed set). So the common single-workspace case needs no `--root`: kaibo already
-knows the workspace from its cwd and uses it for both bounding and defaulting. The
-inferred case is labelled as such in the `## Scope` handshake and at `kaibo://config`
-(`default_root_inferred`). The one gap: an `--allow-path` that *excludes* the cwd
-leaves no default root — kaibo never defaults to a path its own containment check
-would then reject, so an omitted `path` there stays an error.
+`--root`, or — when none is set — the launch cwd, *inferred*. So the common
+single-workspace case needs no `--root`: kaibo already knows the workspace from its cwd
+and uses it for both bounding and defaulting. The inferred case is labelled as such in
+the `## Scope` handshake and at `kaibo://config` (`default_root_inferred`). Only
+`--no-cwd` leaves you without a default root, and then an omitted `path` is a clear
+parameter error rather than a guess.
 
 **Widening the boundary:**
 
@@ -776,7 +782,12 @@ kaibo --allow-path ~/src --allow-path /data/fixtures
 ```
 
 A non-empty CLI `--allow-path` set replaces the env/file layer entirely (same
-precedence rule as `--root`). To lift all limits: `--allow-path /`.
+precedence rule as `--root`) — that is *layer* precedence, not narrowing: whichever
+layer wins still sits alongside the inferred cwd. To lift all limits: `--allow-path /`.
+
+`--root` is deliberately **not** repeatable — it names *the* project a path-less call
+defaults to, and there can only be one; the parser refuses a second occurrence rather
+than silently picking. `--allow-path` is the repeatable knob.
 
 **Set it once.** Putting your whole workspace tree in `allow_paths`
 (`["~/src"]`) means every project under it is in-bounds, and because the client's

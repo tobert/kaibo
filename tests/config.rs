@@ -891,6 +891,7 @@ fn cli_cast_wins_over_env_and_file() {
         },
         vec![], // no --allow-path flags
         false,  // --no-follow-worktrees not passed
+        false,  // --no-cwd not passed
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
         false,  // --no-persistence not passed
@@ -921,6 +922,7 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         None,
         ToolDisables::default(),
         vec![],
+        false,
         false,
         vec![],
         vec![],
@@ -1783,6 +1785,7 @@ fn persistence_cli_wins_over_lower_layers() {
         None,
         ToolDisables::default(),
         vec![],
+        false,
         false,
         vec![],
         vec![],
