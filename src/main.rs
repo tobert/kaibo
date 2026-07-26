@@ -223,11 +223,13 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "failed to open the persistence state db at {}: {e}\n\
-                     The state db is a convenience layer — if it's corrupt it is safe to \
-                     delete by hand (kaibo creates a fresh empty one on the next start; it \
-                     never auto-deletes, since the error could be transient). Otherwise fix \
-                     the path/permissions, or run without persistence (--no-persistence, \
-                     KAIBO_NO_PERSISTENCE, or [persistence] enabled = false in config.toml).",
+                     kaibo never deletes this file: it holds your session history, which is \
+                     model output you paid for. Fix the path or permissions if that is the \
+                     problem, or run without persistence to get going right now without \
+                     touching it (--no-persistence, KAIBO_NO_PERSISTENCE, or [persistence] \
+                     enabled = false in config.toml). If the db really is corrupt, back it \
+                     up and move it aside by hand — kaibo creates a fresh one on the next \
+                     start.",
                     path.display()
                 ));
             }

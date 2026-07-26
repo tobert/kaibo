@@ -230,8 +230,8 @@ of live exploration — yet it lives only in memory until the offline synth cons
 Persist it to the state store (`src/store.rs`) on completion so a **failed synth hand-off
 can resubmit without re-exploring**, and a mid-explore failure can resume from the last
 checkpoint. Natural follow-on to the persistent session/batch store: a lean text artifact
-keyed by a deliberation/job id, disposable like the rest of the store (convenience, never
-source of truth). Dovetails the "deliberate dossier vs. caller timeout" entry above — a
+keyed by a deliberation/job id, and kept like the rest of the store — expensive model
+output we hold onto, not a scratch cache. Dovetails the "deliberate dossier vs. caller timeout" entry above — a
 persisted dossier also survives the caller dropping the connection. Surfaced by the
 DeepSeek CLI-subcommands review (2026-07-17).
 

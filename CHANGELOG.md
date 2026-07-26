@@ -357,8 +357,9 @@ the git log. Each later release appends a new section at the top.
   design. Turn it off with `--no-persistence` / `KAIBO_NO_PERSISTENCE` / `[persistence]
   enabled = false` to run fully in-memory, or move the db with `--state-db <FILE>` /
   `KAIBO_STATE_DB` / `[persistence] path`. If the store can't open, kaibo **fails to start
-  loudly** naming that escape hatch rather than silently losing your sessions. The db is a
-  convenience layer, safe to delete. See `docs/config.md`.
+  loudly** naming that escape hatch rather than silently losing your sessions. kaibo never
+  deletes that db — it holds answers you paid for, so moving it aside is always your call.
+  See `docs/config.md`.
 - **A CLI front door: `kaibo consult` and `kaibo config`.** kaibo now answers without
   an MCP client: `kaibo consult "question" [--cast … --attach … --session … --json]`
   runs the same read-only investigation from the command line — for agents that shell
