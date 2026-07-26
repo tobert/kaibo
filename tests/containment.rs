@@ -44,6 +44,16 @@ fn handler_with_allowed(root: Option<&Path>, allow_paths: &[&Path]) -> KaiboHand
     KaiboHandler::new(config).expect("handler builds")
 }
 
+/// The same, with the cwd inference turned off (`--no-cwd` / `KAIBO_NO_CWD` /
+/// `[server] infer_cwd = false`).
+fn handler_no_cwd(root: Option<&Path>, allow_paths: &[&Path]) -> KaiboHandler {
+    let mut config = Config::builtin();
+    config.root = root.map(|p| p.to_path_buf());
+    config.allow_paths = allow_paths.iter().map(|p| p.to_path_buf()).collect();
+    config.infer_cwd = false;
+    KaiboHandler::new(config).expect("handler builds")
+}
+
 // --- (a) path outside the allowed set is rejected ----------------------------
 
 /// A call whose `path` resolves outside the allowed tree must be rejected with an
@@ -262,21 +272,52 @@ async fn omitted_path_zero_config_infers_cwd_as_default_root() {
     );
 }
 
-// --- (f2) an allow-path that excludes the cwd leaves no default root ----------
+// --- (f2) --allow-path is ADDITIVE: it never costs you the cwd ---------------
 
-/// When `--allow-path` is set to a tree that does NOT contain the launch cwd and
-/// no `--root` is given, the cwd is outside the boundary, so it must NOT be adopted
-/// as the default root. An omitted `path` then remains a parameter error — we never
-/// default to a root the containment check would reject.
+/// `--allow-path` widens the boundary; it must never *narrow* it. With no explicit
+/// `--root`, the launch cwd stays in the allowed set and stays the inferred default
+/// root even when an `--allow-path` names an unrelated tree.
+///
+/// This is the flag's whole contract, and getting it backwards was a live footgun: a
+/// user who added `--allow-path` to reach one more tree used to lose the workspace they
+/// were consulting about, and every call without an explicit `path` started erroring.
 #[tokio::test]
-async fn omitted_path_with_allow_path_excluding_cwd_still_errors() {
-    let allowed = tempdir().unwrap(); // a tempdir, never an ancestor of the crate cwd
-    let handler = handler_with_allowed(None, &[allowed.path()]);
+async fn allow_path_is_additive_and_keeps_the_cwd() {
+    let extra = tempdir().unwrap(); // a tempdir, never an ancestor of the crate cwd
+    let handler = handler_with_allowed(None, &[extra.path()]);
 
-    // No default root was inferred (cwd is outside the allow-path).
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    assert_eq!(
+        handler.default_root().as_deref(),
+        Some(cwd.as_path()),
+        "adding an allow-path must not cost you the cwd as default root"
+    );
+    assert!(handler.default_root_inferred());
+
+    // Both trees are readable: the cwd (implicit) and the named one (explicit).
+    handler
+        .run_kaish(Parameters(RunKaishInput {
+            script: "ls".to_string(),
+            path: None,
+        }))
+        .await
+        .expect("an omitted path resolves to the still-inferred cwd");
+    try_run(&handler, extra.path().to_str().unwrap(), "ls")
+        .await
+        .expect("the explicitly allowed tree is readable too");
+}
+
+/// `--no-cwd` is how you get the strict reading: only what you named is allowed, and an
+/// omitted `path` is a parameter error rather than a silent default. (This is the
+/// behavior `--allow-path` alone used to impose on everyone.)
+#[tokio::test]
+async fn no_cwd_drops_the_inferred_root_and_the_cwd_tree() {
+    let extra = tempdir().unwrap();
+    let handler = handler_no_cwd(None, &[extra.path()]);
+
     assert!(
         handler.default_root().is_none(),
-        "cwd outside the allowed set must not be adopted as a default root"
+        "--no-cwd means no inferred default root"
     );
     assert!(!handler.default_root_inferred());
 
@@ -287,33 +328,39 @@ async fn omitted_path_with_allow_path_excluding_cwd_still_errors() {
         }))
         .await
         .expect_err("omitted path with no default root must be a parameter error");
-
     let err_str = format!("{err:?}");
     assert!(
         err_str.contains("path") || err_str.contains("root") || err_str.contains("parameter"),
         "omitted path must produce a parameter-flavored error, got: {err_str}"
     );
+
+    // …and the cwd itself is outside the boundary, not merely undefaulted.
+    let cwd = std::env::current_dir().unwrap();
+    try_run(&handler, cwd.to_str().unwrap(), "ls")
+        .await
+        .expect_err("--no-cwd removes the cwd from the allowed set entirely");
 }
 
-// --- (f3) cwd is an *ancestor* of the only allow-path: no default root --------
+// --- (f3) cwd as an *ancestor* of the allow-path is still additive ------------
 
-/// When the only `--allow-path` is a *descendant* of the launch cwd (so cwd is an
-/// ancestor of the boundary, not inside it), the cwd must NOT be adopted as the
-/// default root: `cwd.starts_with(allow_path)` is false, so cwd is above the boundary
-/// and resolving to it would escape the allowed set. This pins the ancestor-vs-
-/// descendant semantic distinctly from the sibling case in (f2).
+/// The ancestor case: the only `--allow-path` is a *descendant* of the launch cwd.
+/// `cwd.starts_with(allow_path)` is false, so before the additive rule the cwd was
+/// judged "above the boundary" and dropped. Now the cwd is a tree in its own right, so
+/// it is both allowed and the default root — and the descendant is reachable because it
+/// sits inside the cwd anyway. Pins the ancestor case distinctly from the sibling case
+/// in (f2).
 #[tokio::test]
-async fn omitted_path_with_cwd_ancestor_of_allow_path_has_no_default_root() {
-    // Create the allow-path *inside* the crate cwd so cwd is its ancestor. (tempdir's
-    // usual /tmp location would be a sibling, exercising a different branch.)
+async fn cwd_ancestor_of_allow_path_stays_the_default_root() {
     let sub = tempfile::tempdir_in(".").expect("tempdir under cwd");
     let handler = handler_with_allowed(None, &[sub.path()]);
 
-    assert!(
-        handler.default_root().is_none(),
-        "cwd as an ancestor of the allow-path is outside the boundary; no default root"
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    assert_eq!(
+        handler.default_root().as_deref(),
+        Some(cwd.as_path()),
+        "an allow-path inside the cwd must not displace the cwd as default root"
     );
-    assert!(!handler.default_root_inferred());
+    assert!(handler.default_root_inferred());
 
     handler
         .run_kaish(Parameters(RunKaishInput {
@@ -321,7 +368,29 @@ async fn omitted_path_with_cwd_ancestor_of_allow_path_has_no_default_root() {
             path: None,
         }))
         .await
-        .expect_err("omitted path with no default root must be a parameter error");
+        .expect("an omitted path resolves to the cwd");
+}
+
+/// An explicit `--root` is the user naming *the* project, so the cwd is NOT quietly
+/// added beside it: the boundary stays exactly what was asked for. (Repeating `--root`
+/// is refused by the parser — it is the default project, and there can only be one;
+/// `--allow-path` is the repeatable, additive knob.)
+#[tokio::test]
+async fn explicit_root_does_not_pull_in_the_cwd() {
+    let root = tempdir().unwrap();
+    let handler = handler_with_allowed(Some(root.path()), &[]);
+
+    let canon_root = std::fs::canonicalize(root.path()).unwrap();
+    assert_eq!(handler.default_root().as_deref(), Some(canon_root.as_path()));
+    assert!(
+        !handler.default_root_inferred(),
+        "an explicit root is configured, not inferred"
+    );
+
+    let cwd = std::env::current_dir().unwrap();
+    try_run(&handler, cwd.to_str().unwrap(), "ls")
+        .await
+        .expect_err("naming a root must not silently allow the launch cwd as well");
 }
 
 // --- (h) empty-string path is rejected as invalid_params --------------------
@@ -519,6 +588,7 @@ fn allow_paths_cli_replaces_env_and_file() {
             std::path::PathBuf::from("/tmp/cli-a"),
             std::path::PathBuf::from("/tmp/cli-b"),
         ],
+        false,
         false,
         vec![],
         vec![],

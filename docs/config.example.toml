@@ -46,10 +46,19 @@
 # root = "/home/atobey/src/kaibo"
 
 # Additional allowed path trees beyond root. A per-call `path` must resolve to
-# at-or-under root OR one of these trees. With neither set, the server defaults
-# to the launch cwd. Also settable via --allow-path (CLI) or KAIBO_ALLOW_PATHS
-# (colon-separated env var); a non-empty CLI list replaces the env/file layer.
+# at-or-under root OR one of these trees. ADDITIVE: setting this never costs you
+# the launch cwd, which stays an allowed tree (and the default root) unless you
+# set `root` above or turn it off with `infer_cwd` below. Also settable via
+# --allow-path (CLI) or KAIBO_ALLOW_PATHS (colon-separated env var); a non-empty
+# CLI list replaces the env/file layer.
 # allow_paths = ["/home/atobey/shared-libs", "/data/shared"]
+
+# Adopt the invocation cwd as an allowed tree and the default root (default true).
+# This is what makes the zero-config case work: an MCP client launches kaibo with
+# cwd = your workspace, so kaibo scopes itself there with no configuration at all.
+# Set false when the allowed set should be exactly what you named above — every
+# call must then pass its own `path` (also: --no-cwd, KAIBO_NO_CWD).
+# infer_cwd = false
 
 # Follow git worktrees of an already-allowed repo (default true). When a call's
 # `path` misses the allowed set, kaibo admits it if it is a linked worktree of a

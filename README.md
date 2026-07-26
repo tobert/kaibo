@@ -219,8 +219,9 @@ for you:
       "command": "kaibo",
       // No args needed — an MCP client launches kaibo with cwd = your workspace, and
       // it scopes its read-only access there. Common overrides (pick what you need):
-      //   "args": ["--root", "/path/to/project"]        // pin a fixed project root
-      //   "args": ["--allow-path", "/extra/tree"]        // widen read scope (repeatable)
+      //   "args": ["--root", "/path/to/project"]        // pin the project (not repeatable)
+      //   "args": ["--allow-path", "/extra/tree"]        // ADD a tree; keeps the cwd too
+      //   "args": ["--no-cwd"]                           // …unless you want only what you named
       //   "args": ["--cast", "deepseek"]                 // default cast when a call omits it
       //   "args": ["--no-run-kaish"]                     // drop a tool from the surface
       //   "args": ["--config", "/path/to/config.toml"]   // use an explicit config file

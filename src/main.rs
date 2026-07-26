@@ -85,6 +85,7 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         gates.tool_disables(),
         common.allow_path.clone(),
         common.no_follow_worktrees,
+        common.no_cwd,
         common.project_context_file.clone(),
         common.user_context_file.clone(),
         common.no_persistence,

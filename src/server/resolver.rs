@@ -44,14 +44,14 @@ pub struct Resolver {
     /// the handler (which keeps its own clone of the same `Arc`).
     pub(crate) config: Arc<Config>,
     /// The canonicalized allowed path trees. A per-call path must canonicalize to
-    /// at-or-under one of these. Computed once from config.root/allow_paths;
-    /// falls back to the canonicalized cwd when both are empty.
+    /// at-or-under one of these. Computed once from config.root/allow_paths, plus the
+    /// canonicalized cwd unless `--root` named a project or `--no-cwd` opted out.
     allowed_set: Arc<Vec<PathBuf>>,
     /// The effective default root a call uses when it omits `path` — the explicit
-    /// `--root`/config value, or the launch/invocation cwd inferred when it falls
-    /// inside the allowed set. Canonicalized. `None` only when no root was
-    /// configured *and* the cwd is outside the allowed set. `pub(super)` so the
-    /// split containment `impl` in `containment.rs` reads it.
+    /// `--root`/config value, else the inferred invocation cwd. Canonicalized. `None`
+    /// only when no root was configured *and* the cwd inference was turned off
+    /// (`--no-cwd`). `pub(super)` so the split containment `impl` in `containment.rs`
+    /// reads it.
     pub(super) default_root: Arc<Option<PathBuf>>,
     /// True when [`default_root`](Self::default_root) was inferred from the cwd
     /// rather than configured explicitly. Surfaced in the scope section and
@@ -65,11 +65,11 @@ impl Resolver {
     /// share. A nonexistent or non-directory entry in root / allow_paths is a loud
     /// construction error (a path that can't be canonicalized can't bound anything).
     ///
-    /// Without an explicit `--root`, the process cwd does double duty: it is both the
-    /// zero-config allowed tree *and* the inferred default root — adopted whenever it
-    /// falls inside the allowed set, so a call may omit `path` in the common
-    /// single-workspace case. A cwd the containment check would reject is never
-    /// adopted (an `--allow-path` that excludes it leaves the default root unset).
+    /// Without an explicit `--root`, the process cwd does double duty: it is both an
+    /// allowed tree *and* the inferred default root, so a call may omit `path` in the
+    /// common single-workspace case. That holds regardless of `--allow-path`, which is
+    /// purely additive — see the rationale at the resolution site below. `--no-cwd`
+    /// opts out, leaving the allowed set exactly what was named.
     pub fn from_config(config: Arc<Config>) -> Result<Self> {
         // Build the canonicalized allowed set. Each entry is canonicalized now so
         // the `starts_with` containment check is sound (symlinks resolved, `..`
@@ -96,29 +96,37 @@ impl Resolver {
             allowed.push(canon);
         }
 
-        // Resolve the default root and the allowed-set cwd fallback together. With an
-        // explicit `--root`, that is the default root and no cwd is consulted. Without
-        // one, the launch/invocation cwd is both the zero-config allowed tree and the
-        // natural default root — adopt it whenever it falls inside the allowed set. We
-        // never adopt a cwd the containment check would then reject.
+        // Resolve the default root and the cwd's place in the allowed set together.
+        //
+        // With an explicit `--root`, that is the default root and no cwd is consulted:
+        // naming a root is the operator choosing the project, so we don't quietly widen
+        // the boundary to wherever their shell happened to be.
+        //
+        // Without one, the invocation cwd is *additive* — an allowed tree in its own
+        // right and the natural default root. It is deliberately NOT conditional on
+        // `allowed` being empty: `--allow-path` says "also allow this", so reaching one
+        // more tree must never cost the caller the workspace they launched in (which is
+        // the workspace an MCP client sets as cwd, and the one their question is about).
+        // `--no-cwd` / `KAIBO_NO_CWD` / `[server] infer_cwd = false` opts out, leaving
+        // the allowed set exactly what was named and every call obliged to pass `path`.
+        //
+        // The old rule — cwd only when nothing else was allowed — meant a single
+        // `--allow-path` silently evicted the project from scope, turning every
+        // path-less call into a parameter error. See `tests/containment.rs`.
         let (default_root, default_root_inferred): (Option<PathBuf>, bool) = match explicit_root {
             Some(root) => (Some(root), false),
+            None if !config.infer_cwd => (None, false),
             None => {
                 let cwd = std::env::current_dir()
                     .context("could not determine current directory for the default root")?;
                 let cwd_canon = std::fs::canonicalize(&cwd)
                     .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
-                if allowed.is_empty() {
-                    // Zero config: the workspace is the whole boundary. Push it here,
-                    // before the guard below, so the `starts_with` check adopts cwd as
-                    // the default root in the zero-config case.
+                // Push before the containment check so the cwd is judged against a set
+                // that includes itself — it is an allowed tree, not a guest of one.
+                if !allowed.iter().any(|tree| cwd_canon.starts_with(tree)) {
                     allowed.push(cwd_canon.clone());
                 }
-                if allowed.iter().any(|tree| cwd_canon.starts_with(tree)) {
-                    (Some(cwd_canon), true)
-                } else {
-                    (None, false)
-                }
+                (Some(cwd_canon), true)
             }
         };
 

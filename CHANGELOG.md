@@ -434,6 +434,15 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- **`--allow-path` is additive now — it no longer costs you the launch cwd.** Adding a
+  tree used to *replace* the zero-config workspace: `--allow-path /extra` with no
+  `--root` dropped your project out of the allowed set entirely, so every call that
+  omitted `path` failed with "no default root". The flag widens the boundary and never
+  narrows it. Naming a `--root` is unchanged — that's you choosing the project, so the
+  cwd isn't added beside it — and the new **`--no-cwd`** (`KAIBO_NO_CWD`,
+  `[server] infer_cwd = false`) gives back the strict reading: the allowed set is exactly
+  what you named, and every call passes its own `path`. If you were relying on
+  `--allow-path` alone to *narrow* scope, add `--no-cwd`.
 - The README explains `consult` up front now — who acts, in what order — instead of
   leaving the mechanism scattered across four sections.
 - Hosted GPT examples now use the current GPT-5.6 family: a fast/tool-capable

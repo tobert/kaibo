@@ -719,6 +719,17 @@ pub struct Config {
     /// `--no-follow-worktrees`, `KAIBO_NO_FOLLOW_WORKTREES`, or
     /// `[server] follow_worktrees = false`) to keep the boundary strictly static.
     pub follow_worktrees: bool,
+    /// Adopt the invocation cwd as an allowed tree and the inferred default root
+    /// (default `true`) — the zero-config case, and what makes an MCP client's
+    /// "launch kaibo in the workspace" just work.
+    ///
+    /// It holds *unless* `root` is set: naming a root is the operator choosing the
+    /// project, so the cwd is not quietly added beside it. It is deliberately
+    /// independent of `allow_paths`, which is **additive** — reaching one more tree
+    /// must never cost you the workspace you started in. Set `false` (via `--no-cwd`,
+    /// `KAIBO_NO_CWD`, or `[server] infer_cwd = false`) when the allowed set should be
+    /// exactly what you named; every call must then pass `path` explicitly.
+    pub infer_cwd: bool,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -1329,6 +1340,7 @@ impl Config {
             .map(|s| expand_path(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
+        let infer_cwd = server.infer_cwd.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
@@ -1355,6 +1367,7 @@ impl Config {
             root,
             allow_paths,
             follow_worktrees,
+            infer_cwd,
             default_cast,
             log,
             tools,
@@ -1396,6 +1409,7 @@ impl Config {
         disable: ToolDisables,
         allow_paths: Vec<PathBuf>,
         disable_follow_worktrees: bool,
+        disable_infer_cwd: bool,
         project_context_files: Vec<String>,
         user_context_files: Vec<PathBuf>,
         disable_persistence: bool,
@@ -1418,6 +1432,11 @@ impl Config {
         // never force it on over a `[server] follow_worktrees = false` in the file.
         if disable_follow_worktrees {
             self.follow_worktrees = false;
+        }
+        // Same discipline for the cwd inference: `--no-cwd` narrows, and never widens
+        // over a `[server] infer_cwd = false` in the file.
+        if disable_infer_cwd {
+            self.infer_cwd = false;
         }
         if let Some(cast) = cast {
             self.default_cast = cast;
@@ -1806,6 +1825,9 @@ struct RawServer {
     /// Follow git worktrees of an already-allowed repo. Default `true`. Env:
     /// `KAIBO_NO_FOLLOW_WORKTREES`. CLI: `--no-follow-worktrees`.
     follow_worktrees: Option<bool>,
+    /// Adopt the invocation cwd as an allowed tree + default root. Default `true`.
+    /// `KAIBO_NO_CWD`. CLI: `--no-cwd`.
+    infer_cwd: Option<bool>,
     /// The default cast (was `provider` before the backends/casts split; the old
     /// key is now an unknown-field load error via `deny_unknown_fields`).
     cast: Option<String>,
@@ -2299,6 +2321,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
         if !paths.is_empty() {
             server.allow_paths = Some(paths);
         }
+    }
+    if env_flag(get, "KAIBO_NO_CWD") {
+        server.infer_cwd = Some(false);
     }
     if env_flag(get, "KAIBO_NO_FOLLOW_WORKTREES") {
         server.follow_worktrees = Some(false);
