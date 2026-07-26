@@ -53,7 +53,7 @@
 //! *not* a sleep/retry loop with wall-clock timing, so a caller (a test, a future MCP
 //! tool with its own cadence) drives the wait itself and this module never forces a
 //! timing model on it. No deferred `Operation` is wired yet (that's the next stage,
-//! deliberately out of scope here — see `docs/media-cas.md`); this is the plumbing that
+//! deliberately out of scope here — see `docs/issues.md`); this is the plumbing that
 //! lets one land as a new `Operation` variant + a `shape()`/route arm, not a redesign.
 //!
 //! # `MediaType` — a closed six-variant enum, not a `String`
@@ -148,7 +148,7 @@
 //!     documented, not that everything's fine.
 //!   - `seed` — the value Stability actually used (it fills one in when the caller
 //!     didn't pin one). Captured into [`Artifact::seed`] rather than discarded: the
-//!     whole stewardship argument for the media CAS (`docs/media-cas.md`) is that a
+//!     whole stewardship argument for the media CAS ([`crate::cas`]) is that a
 //!     generated image may never be reproducible again, so throwing away the one field
 //!     that aids reproduction would undercut that argument on day one. The next stage
 //!     wires this into the CAS's `Provenance` sidecar.
@@ -165,7 +165,7 @@
 //! Through [`crate::credentials::resolve`] — the same env-wins-over-dotfile core every
 //! keyed `ProviderKind` in `credentials.rs` already uses — not a second mechanism.
 //! Stability isn't a `ProviderKind` yet (that enum/config/cast wiring is explicitly the
-//! *next* stage; see `docs/media-cas.md`'s "Open" list), so [`STABILITY_KEY_ENV_VAR`]/
+//! *next* stage; see `docs/issues.md`), so [`STABILITY_KEY_ENV_VAR`]/
 //! [`STABILITY_KEY_FILE_NAME`] and [`resolve_key`] live here rather than there until it
 //! is. Nothing in this module hardcodes a path to any specific machine's key-file — the
 //! file name is a fixed convention (matching every sibling provider), the directory
@@ -231,7 +231,7 @@ pub fn resolve_key() -> AnyResult<String> {
 pub struct StabilityRequest {
     /// Mandatory for every operation wired so far. A future prompt-less operation
     /// (`remove-background`, `erase`) would need this widened to `Option<String>` —
-    /// noted rather than solved speculatively; see `docs/media-cas.md`'s "Open" list.
+    /// noted rather than solved speculatively; see `docs/issues.md`.
     pub prompt: String,
     /// Bytes of an input image, for operations that take one (every edit/control/
     /// upscale call, and generate's own image-to-image mode — audio and 3D operations

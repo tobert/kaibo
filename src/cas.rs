@@ -18,7 +18,31 @@
 //! nobody kept), and may never be reproducible again. That is squarely what the XDG
 //! *data* dir is for — durable user data a backup tool (`rsync`, `restic`) should carry.
 //! Putting the CAS in state right next to a "delete me on corruption" db would invite
-//! exactly the wrong operator instinct. See `docs/media-cas.md` for the full reasoning.
+//! exactly the wrong operator instinct.
+//!
+//! # Two alternatives that were considered and rejected
+//!
+//! Recorded here rather than in a design doc because this is where someone would think of
+//! them — both look obviously better until you check.
+//!
+//! **Blobs in the turso db, instead of files.** kaibo already has a SQLite store, so
+//! putting artifacts in it looks like one fewer moving part. Checked turso 0.7.0 directly:
+//! `Value::Blob(Vec<u8>)` is the *entire* surface — there is no incremental or streaming
+//! blob I/O — so every read and write materializes a whole multi-megabyte image in memory.
+//! The bytes would land in overflow page chains that grow the db file with no working
+//! VACUUM story, and they would live inside the one file whose documented lethal hazard is
+//! *silently losing acknowledged writes* on a mixed MP/non-MP open (see
+//! [`crate::store`]). It would also destroy the `rsync`/`find`/`restic` story that makes
+//! the no-GC stance honest — a user cannot prune blobs in a SQLite file with `find`.
+//! Files win on every axis.
+//!
+//! **blake3 instead of sha2.** Faster on paper, and the usual choice for a modern CAS.
+//! But `sha2` is *already in our dependency tree* (pure Rust, no C), while `blake3` is not
+//! and carries a `cc` build-dependency; its `pure` feature disables the C/asm path, but
+//! that is still a new dependency and a build-shape decision. The speed edge it buys is
+//! invisible at image sizes — roughly a millisecond either way, and both are 256-bit. The
+//! static-musl/no-C-toolchain invariant (see `AGENTS.md`) costs more to defend than the
+//! milliseconds are worth.
 //!
 //! # The four safety properties, and how each is enforced
 //!
@@ -107,7 +131,7 @@
 //! any project's model team enumerate every other project's generated artifacts. The
 //! address is the capability here — you can only read a digest you already have — so the
 //! one leak surface a mount would open is enumeration, not disclosure of an already-known
-//! object. See `docs/media-cas.md`'s "Decided: no CAS access from kaish".
+//! object. The decision not to mount it is recorded in `docs/devlog.md` (2026-07-25).
 //!
 //! # `tests/no_write_path.rs`
 //!
