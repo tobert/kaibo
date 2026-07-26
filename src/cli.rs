@@ -213,6 +213,13 @@ pub struct CommonArgs {
     /// / the default ($XDG_STATE_HOME/kaibo/state.db).
     #[arg(long = "state-db", value_name = "FILE", global = true)]
     pub state_db: Option<PathBuf>,
+
+    /// Cap on how many files one explorer sweep may route with its `attach` tool
+    /// (the bytes ride to whoever reads the sweep's report — the consult driver, or
+    /// deliberate's offline synth). `0` turns the tool off. Also KAIBO_MAX_ATTACHMENTS
+    /// / [defaults] max_attachments.
+    #[arg(long = "max-attachments", value_name = "N", global = true)]
+    pub max_attachments: Option<usize>,
 }
 
 /// The per-tool `--no-<tool>` gates — serve-only (they only make sense for the
@@ -510,6 +517,7 @@ fn load_config(common: &CommonArgs) -> anyhow::Result<Config> {
         common.user_context_file.clone(),
         common.no_persistence,
         common.state_db.clone(),
+        common.max_attachments,
     );
     Ok(config)
 }
@@ -732,6 +740,7 @@ async fn resolve_and_run(
             },
             explorer_max_turns: args.explorer_max_turns.unwrap_or(default_explorer_turns),
             sandbox: sandbox.clone(),
+            max_attachments: resolver.config.defaults.max_attachments,
         },
         synth_max_turns: args.synth_max_turns.unwrap_or(default_synth_turns),
         attachments,
@@ -1167,6 +1176,7 @@ async fn explore_inner(
             .explorer_max_turns
             .unwrap_or(resolver.config.defaults.explorer_max_turns),
         sandbox: resolver.config.sandbox.clone(),
+        max_attachments: resolver.config.defaults.max_attachments,
     };
     match explore_with(&args.question, root, &explorer, &cfg, &attachments).await {
         Ok((report, usage)) => {

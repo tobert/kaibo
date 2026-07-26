@@ -1135,6 +1135,7 @@ impl KaiboHandler {
                     .explorer_max_turns
                     .unwrap_or(defaults.explorer_max_turns),
                 sandbox: self.config.sandbox.clone(),
+                max_attachments: defaults.max_attachments,
             },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             attachments,
@@ -1265,6 +1266,7 @@ impl KaiboHandler {
                     .explorer_max_turns
                     .unwrap_or(defaults.explorer_max_turns),
                 sandbox: self.config.sandbox.clone(),
+                max_attachments: defaults.max_attachments,
             },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             attachments,
@@ -1375,6 +1377,7 @@ impl KaiboHandler {
                 .explorer_max_turns
                 .unwrap_or(defaults.explorer_max_turns),
             sandbox: self.config.sandbox.clone(),
+            max_attachments: defaults.max_attachments,
         };
 
         let span =
@@ -1456,6 +1459,7 @@ impl KaiboHandler {
                 .explorer_max_turns
                 .unwrap_or(defaults.explorer_max_turns),
             sandbox: self.config.sandbox.clone(),
+            max_attachments: defaults.max_attachments,
         };
         let span = tracing::info_span!("deliberate.dossier", cast = %cast.name, explorer_model = %explorer_model);
         progress.emit(PhaseEvent::PhaseStarted {

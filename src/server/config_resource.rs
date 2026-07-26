@@ -150,6 +150,7 @@ pub(crate) fn render_config_resource(
         session_capacity: usize,
         job_capacity: usize,
         inline_attach_budget: usize,
+        max_attachments: usize,
     }
 
     /// Telemetry as resolved. SECRET-SAFETY: `header_names` lists the keys of any
@@ -420,6 +421,7 @@ pub(crate) fn render_config_resource(
         session_capacity,
         job_capacity,
         inline_attach_budget,
+        max_attachments,
     } = &config.defaults;
     let crate::config::TelemetryConfig {
         enabled: telemetry_enabled,
@@ -486,6 +488,7 @@ pub(crate) fn render_config_resource(
             session_capacity: session_capacity.get(),
             job_capacity: job_capacity.get(),
             inline_attach_budget: *inline_attach_budget,
+            max_attachments: *max_attachments,
         },
         telemetry: TelemetryDoc {
             enabled: *telemetry_enabled,

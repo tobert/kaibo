@@ -270,6 +270,14 @@ The `[defaults]` knobs themselves:
   bounds resident prompt cost, not just one request. The tool-less tools
   (`oneshot`/`batch_submit`) are unaffected — with no shell to fall back on, they
   keep their own hard per-file/per-call caps.
+- **`max_attachments`** (32; `0` is legal): cap on how many files ONE explorer sweep
+  may route with its `attach` tool — the bytes ride ALONGSIDE the sweep's report to
+  whoever reads it (the `consult` driver, or `deliberate`'s offline synth) without
+  ever entering the explorer's own context. Distinct from `inline_attach_budget`
+  (which bounds inlining the *caller's* attachments into the driver prompt): this
+  bounds a sweep's own routing, and it's a behavioral guard, not a memory one — the
+  per-file/cumulative byte caps (`attach.rs`) already bound worst case. `0` turns the
+  tool off entirely.
 
 ### Built-in registry (the defaults)
 
@@ -414,6 +422,7 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | async job cache size | `defaults.job_capacity` *(must be > 0; default 64)* | `KAIBO_JOB_CAPACITY` | — |
 | attach inline budget (bytes) | `defaults.inline_attach_budget` *(0 = never inline; default 262144)* | `KAIBO_INLINE_ATTACH_BUDGET` | — |
+| explorer attach cap (count) | `defaults.max_attachments` *(0 = attach tool off; default 32)* | `KAIBO_MAX_ATTACHMENTS` | `--max-attachments N` |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |
