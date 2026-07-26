@@ -423,6 +423,8 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- The README explains `consult` up front now — who acts, in what order — instead of
+  leaving the mechanism scattered across four sections.
 - Hosted GPT examples now use the current GPT-5.6 family: a fast/tool-capable
   `gpt-5.6-luna` explorer paired with `gpt-5.6-sol` as the flagship consult synth, plus
   `gpt-5.6-terra` as a balanced alternative.
@@ -507,15 +509,15 @@ the git log. Each later release appends a new section at the top.
 
 ### Fixed
 
-- **The README described the state db wrongly.** It called the file a "convenience cache"
-  holding "no file contents" — but a named session stores your questions and answers, which
-  quote your source, and deleting it drops your batch handles too. `docs/config.md` already
-  said otherwise. The FAQ also stops promising a budget ceiling kaibo doesn't have, and now
-  answers what actually leaves your machine.
-- **The README implied kaibo picks an outside model family for you.** It can't tell what's
-  asking, and the default cast is `anthropic` — so a Claude user calling `consult` with no
-  `cast` got Claude reviewing Claude. Picking the outside view is yours to make, and the
-  README now says so.
+- **The README described the state db wrongly** — a "convenience cache" holding "no file
+  contents", when a named session holds your questions and answers, and deleting it drops
+  your batch handles.
+- **The README implied kaibo picks an outside model family for you** — it can't tell what's
+  asking, and the default cast is `anthropic`, so a `cast`-less call could be Claude
+  reviewing Claude.
+- The FAQ drops the dollar figures (pricing moves, and cost swings by cast), stops
+  promising a budget ceiling kaibo doesn't have, and answers what actually leaves your
+  machine.
 - **A Gemini slot's reasoning-effort setting now actually reaches Gemini.** kaibo's
   Gemini casts (the default `gemini` synth, the `gemini-batch` Pro synth, the Flash-Lite
   explorer) all name 3.x-line models, but the thinking-knob classifier recognized only

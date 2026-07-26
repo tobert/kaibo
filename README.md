@@ -89,12 +89,11 @@ of your context:
 >
 > ——— kaibo · cast `deepseek` · explorer `deepseek-v4-flash` · synth `deepseek-v4-pro`
 
-That's a real consult against this repo. It ran about four minutes and cost
-**$0.02** (measured by account-balance delta; DeepSeek's prompt cache was warm — a
-cold first run costs a few cents more). The full answer also surfaced a benign
-spurious-wakeup path and an optimization wrinkle we hadn't written down anywhere —
-which is the point: a model that didn't make your model's mistakes, reading your
-real source, reporting back one summary.
+That's a real consult against this repo, and it ran about four minutes. The
+full answer also surfaced a benign spurious-wakeup path and an optimization
+wrinkle we hadn't written down anywhere — which is the point: a model that
+didn't make your model's mistakes, reading your real source, reporting back
+one summary.
 
 Note the `cast` in that call — a cast names which models kaibo's agents run on.
 **kaibo can't tell what model your agent runs on, so picking a different family is up
@@ -319,13 +318,13 @@ back to the model, which is how it picks up where you left off, but no model
 can go browsing the file.
 
 kaibo never deletes this file, even on errors — cleanup is your call. Delete
-or move it and kaibo starts fresh: you lose named sessions and the batch handles
-it remembered for you, and nothing else breaks. Prefer kaibo forgets everything
-between runs?
-`--no-persistence` (or `KAIBO_NO_PERSISTENCE`) turns it off entirely. Want
-it somewhere else? `--state-db FILE` (or `KAIBO_STATE_DB`) moves it. The
-full technical contract — exactly which fields are stored, what's
-deliberately left out, and the one platform-specific edge case — is in
+or move it and kaibo starts fresh: you lose named sessions and the batch
+handles it remembered for you, and nothing else breaks. Prefer kaibo forgets
+everything between runs? `--no-persistence` (or `KAIBO_NO_PERSISTENCE`) turns
+it off entirely. Want it somewhere else? `--state-db FILE` (or
+`KAIBO_STATE_DB`) moves it. The full technical contract — exactly which fields
+are stored, what's deliberately left out, and the one platform-specific edge
+case — is in
 [`docs/config.md`](docs/config.md#persistence-persistence).
 
 ## Configuration
@@ -403,12 +402,12 @@ A deep consult can run minutes; `consult_submit` runs the same investigation in 
 background and hands back a job handle immediately, so your agent keeps working.
 `job_wait` parks until something finishes; `job_get` collects the answer.
 
-### `batch_submit` — frontier answers at half price
+### `batch_submit` — frontier answers on the discounted lane
 
 `oneshot`'s async sibling: fan self-contained prompts to a top-tier model on the
-provider's batch lane — offline, maximum thinking, roughly half the interactive
-price. The built-in `anthropic-batch` and `gemini-batch` casts put Claude Opus or
-Gemini Pro on your hardest questions cheaply; handles are durable across restarts.
+provider's batch lane — offline, maximum thinking, and discounted against the
+interactive rate. The built-in `anthropic-batch` and `gemini-batch` casts put Claude
+Opus or Gemini Pro on your hardest questions; handles are durable across restarts.
 A hosted OpenAI Platform backend can staff the lane too — declare `lane = "batch"`
 on its synth slot (`docs/config.example.toml`), and GPT joins the same handles,
 polling, and `deliberate` flow.
@@ -416,8 +415,8 @@ polling, and `deliberate` flow.
 ### `deliberate` — deep offline reasoning over a dossier
 
 An investigation assembles a cited dossier from your repo, then a frontier (or big
-local) model reasons over it offline on the batch lane — depth over speed, at batch
-prices.
+local) model reasons over it offline on the batch lane — depth over speed, at the
+batch discount.
 
 ### `run_kaish` — direct read-only shell
 
@@ -519,11 +518,12 @@ your agent ──stdio MCP──▶ kaibo
                        back to your agent
 ```
 
-kaibo is an agent for your agent. The shell mounts your repository, so its models can
-read it; the shell has no write path, so nothing can change. Putting the bulk of the tool
-calling on a smaller, faster explorer is what keeps a consult quick and cheap — the big
-model spends its budget on the answer instead of the search. (oneshot() skips all of that
-— a single direct call when you already have the context.)
+kaibo is an agent for your agent. Its models work the filesystem — and transform what
+they read — through kaish: it mounts your repository so they can read it, and has no
+write path, so nothing can change. Putting the bulk of that tool calling on a smaller,
+faster explorer is what keeps a consult quick and cheap — the big model spends its
+budget on the answer instead of the search. (oneshot() skips all of that — a single
+direct call when you already have the context.)
 
 It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)
@@ -577,9 +577,8 @@ without bound), so a `while true; grep -r /` can't run away. Spend has limits bu
 hard cap: the loops stop at a turn limit (100 and 200 by default) and each turn has an
 output-token ceiling, so a confused model can't loop forever burning tokens — but
 there's no dollar or total-token budget you can set, and kaibo won't stop a call partway
-through for cost. A deep consult on a large repo is a few cents, not a few dollars; if
-you want a harder bound today, lower the turn limits or `max_tokens`. All of these are
-configurable in `config.toml`.
+through for cost. If you want a harder bound today, lower the turn limits or
+`max_tokens`. All of these are configurable in `config.toml`.
 
 **What providers are supported?** Anthropic, DeepSeek, and Gemini natively; OpenRouter
 as a keyed gateway that reaches every major model family through one key (`~author/
@@ -609,15 +608,15 @@ named as such rather than blamed on the provider. If a provider is reliably slow
 that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
 — tracked as an upstream `rig` contribution in [`docs/issues.md`](docs/issues.md).)
 
-**What's the cost?** `consult` spends tokens on the provider behind the chosen cast.
-A real reference point: the consult in [What it looks like](#what-it-looks-like) — a
-multi-minute investigation of this repo on the `deepseek` cast — cost **$0.02**,
-measured by account-balance delta (cache-warm; a cold run costs a few cents more).
-A family-mixing cast (cheap local explorer + hosted synth) keeps the broad,
-token-heavy sweeping cheap and pays the strong model only for the answer, and the
-agent conversations are set up to cache well on most providers — that caching is
-where numbers like two cents come from. For the strongest models, `batch_submit`
-rides the provider's batch lane at roughly half the interactive price.
+**What's the cost?** `consult` spends tokens on the provider behind the chosen cast,
+so the cast is what decides. A DeepSeek-class team is inexpensive enough to reach for
+without thinking about it; a frontier Anthropic or OpenAI cast adds up a good deal
+faster, especially with thinking on. Check your provider's current rates — they move,
+and kaibo won't guess at them for you. What kaibo does do is spend as little as the
+work allows: a family-mixing cast (cheap local explorer + hosted synth) keeps the
+broad, token-heavy sweeping off the expensive model and pays it only for the answer,
+and the agent conversations are set up to cache well on most providers. For the
+strongest models, `batch_submit` rides the provider's discounted batch lane.
 
 ---
 
