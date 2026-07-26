@@ -435,7 +435,7 @@ key_optional = true
 # the answer. Two families, not two flavors of one.)
 [casts.mixed]
 explorer = "llama/qwen2.5-coder-7b"       # cheap, local sweeps — Qwen family
-synth    = "gpt/gpt-5"                     # the answer gets the big model — GPT family
+synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
 ```
 
 Some default casts ship in code so kaibo runs with zero config; your `config.toml`
