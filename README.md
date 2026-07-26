@@ -21,28 +21,44 @@ last night, or any number of reasons. This happens with agents too. A new model 
 out, your model writes some bad code. It can't see the bug right in front of it.
 The solution for both humans and agents is the same: get a second opinion.
 
-kaibo is a suite of agents wrapped in an MCP server, and the agents run on a
-different model family than yours. Biases tend to be shared across
+kaibo is a suite of agents wrapped in an MCP server — kaibo agents running on model
+families you choose, ideally not the one asking. Biases tend to be shared across
 a model lineage: the Claudes share them, the GPTs share them, and spawning more
 subagents from the same family repeats them. It's a bit like monoculture, leaving you
 vulnerable to blight. A reviewer whose mistakes don't line up with
 yours has a chance of catching what your model can't see. So you can bring that
 outside perspective into a code review, design session, or research: your agent calls
-`consult`, and the subagent does its own exploration and synthesis, reporting a
-summary back.
+`consult`, and kaibo's agents investigate your project and report back.
 
 kaibo integrates as a stdio [MCP](https://modelcontextprotocol.io) server and supports
 Anthropic, Gemini, DeepSeek, OpenRouter (one key reaching every major model family),
 and any OpenAI-compatible endpoint, including local services like llama.cpp. It's a
 tool your *agent* uses — any MCP-capable client can drive it — and it's also a
-[CLI](#cli) for scripts, CI, and terminals that would rather shell out than speak
-MCP. Each agent is set up to mix small models for exploration with larger models
-for synthesis, to help keep your API spend down.
+[CLI](#cli) for scripts, CI, and terminals that would rather shell out than speak MCP.
 
-The agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
+kaibo's agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
 shell. kaish has all of its commands built in and mounts your project through a
-virtual filesystem layer that is read-only, so the agents can read files in your
+virtual filesystem layer that is read-only, so a kaibo agent can read files in your
 workspace and write nowhere.
+
+## How `consult` works
+
+You ask your agent for something. It calls `consult` with a question and a cast — the
+two-model team you picked, from whatever family you like.
+
+From there kaibo runs its own agents. The **synth** owns the investigation: it's the
+capable model, and it decides how to work. It reads spans through the read-only shell
+itself, and it can hand a broad sweep to the **explorer** — a cheaper, faster model that
+searches the repo and reports back what it found. Delegating is a tool call, and it's the
+synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
+writes the answer.
+
+So the chain runs: you → your agent → kaibo's synth → kaibo's explorer. If your agent
+spawned a subagent to do the work, that's one more link, and the inside is the same. Every
+link is a model plus the harness it acts through, working for the link above it, and every
+link hands back a summary instead of everything it saw. That's the whole idea: your agent
+gets one cited answer instead of an investigation, and the cheap model does most of the
+reading.
 
 ## What it looks like
 
@@ -58,9 +74,8 @@ consult({
 })
 ```
 
-kaibo's explorer sweeps the repo through the read-only shell, the synth reads the
-hot spans itself, and one synthesized review comes back — cited, with the
-investigation noise left out of your context:
+One synthesized review comes back — cited, with the investigation noise left out
+of your context:
 
 > **No.** The `absorb` closure is the sole return gate, and it's correct
 > (`src/mcp_log.rs:250-267`): `woke` is only set when a record meets `wake_floor` —
@@ -74,12 +89,19 @@ investigation noise left out of your context:
 >
 > ——— kaibo · cast `deepseek` · explorer `deepseek-v4-flash` · synth `deepseek-v4-pro`
 
-That's a real consult against this repo. It ran about four minutes and cost
-**$0.02** (measured by account-balance delta; DeepSeek's prompt cache was warm — a
-cold first run costs a few cents more). The full answer also surfaced a benign
-spurious-wakeup path and an optimization wrinkle we hadn't written down anywhere —
-which is the point: a model that didn't make your model's mistakes, reading your
-real source, reporting back one summary.
+That's a real consult against this repo, and it ran about four minutes. The
+full answer also surfaced a benign spurious-wakeup path and an optimization
+wrinkle we hadn't written down anywhere — which is the point: a model that
+didn't make your model's mistakes, reading your real source, reporting back
+one summary.
+
+Note the `cast` in that call — a cast names which models kaibo's agents run on.
+**kaibo can't tell what model your agent runs on, so picking a different family is up
+to you.** A call that names no cast falls back to the default, which ships as
+`anthropic` — a good answer, but not an outside one when Claude is doing the asking.
+Set your default once at registration (`"args": ["--cast", "deepseek"]`) or in
+`config.toml`, and make sure that cast's key is the one you exported. That mismatch is
+the most common first-run stumble.
 
 ## Installation
 
@@ -281,19 +303,28 @@ and both are things you opted into by name:
   list` (or `job_list`) can find it again later — even after a restart —
   without you having to keep it written down somewhere.
 
-That's genuinely all of it: no chat history beyond a session you named, no
-file contents, nothing about your project. It lives in one small file on
-your machine, separate from your project, that the read-only models kaibo
-consults never see or touch — by default `~/.local/state/kaibo/state.db`
-(`$XDG_STATE_HOME/kaibo/state.db` if you have that set).
+That's genuinely all of it — kaibo never snapshots your repository, and
+nothing beyond those two things is written down. A saved session does hold the
+questions and answers themselves, though, and those routinely quote source, cite
+`file:line` spans, and describe your architecture. So a named session is a
+record of a conversation about your project, and worth the same care as one.
 
-You never have to manage this file. It's a convenience cache, not a record
-you depend on: delete it any time and kaibo just starts fresh, nothing
-breaks. Prefer kaibo forgets everything between runs? `--no-persistence` (or
-`KAIBO_NO_PERSISTENCE`) turns it off entirely. Want it somewhere else?
-`--state-db FILE` (or `KAIBO_STATE_DB`) moves it. The full technical
-contract — exactly which fields are stored, what's deliberately left out,
-and the one platform-specific edge case — is in
+It lives in one small file on your machine, separate from your project — by
+default `~/.local/state/kaibo/state.db` (`$XDG_STATE_HOME/kaibo/state.db` if
+you have that set). The models can't read this file: it's never mounted in
+their sandbox, and kaibo refuses to put the state db inside any project it's
+allowed to read. Resuming a named session does replay that session's own turns
+back to the model, which is how it picks up where you left off, but no model
+can go browsing the file.
+
+kaibo never deletes this file, even on errors — cleanup is your call. Delete
+or move it and kaibo starts fresh: you lose named sessions and the batch
+handles it remembered for you, and nothing else breaks. Prefer kaibo forgets
+everything between runs? `--no-persistence` (or `KAIBO_NO_PERSISTENCE`) turns
+it off entirely. Want it somewhere else? `--state-db FILE` (or
+`KAIBO_STATE_DB`) moves it. The full technical contract — exactly which fields
+are stored, what's deliberately left out, and the one platform-specific edge
+case — is in
 [`docs/config.md`](docs/config.md#persistence-persistence).
 
 ## Configuration
@@ -342,16 +373,15 @@ example-config`** prints the annotated template verbatim — `kaibo example-conf
 Each tool is gated independently via `--no-<tool>`. All are on by default. A server with
 every tool off is refused at startup.
 
-### `consult` — hybrid agent that explores and synthesizes
+### `consult` — the full investigation
 
-Ask a model *outside your own family* about a codebase; get a grounded, cited answer.
-A capable model drives a fast explorer sub-agent and can fill in any gaps using its own
-`run_kaish` tool. The models have instructions to return a synthesized report at the
-end, leaving the noise from the consultation out of your context. Describe what you did
-or want to know in prose — kaibo reads the real, current source itself, so you don't
-need to paste a diff; optionally seed it with `context` (a change summary or pasted
-source), which it trusts as starting evidence while investigating for more. The answer
-carries a provenance footer naming the cast and models that produced it.
+Ask a model *outside your own family* about a codebase; get a grounded, cited answer —
+the synth-and-explorer investigation described [above](#how-consult-works), returning the
+report rather than the transcript. Describe what you did or want to know in prose — kaibo
+reads the real, current source itself, so you don't need to paste a diff; optionally
+seed it with `context` (a change summary or pasted source), which it trusts as starting
+evidence while investigating for more. The answer carries a provenance footer naming the
+cast and models that produced it.
 
 When an answer surprises you, pass `include_report: true` to get the explorer's raw
 findings back alongside it — the audit trail for how the consultation reached its
@@ -383,12 +413,12 @@ A deep consult can run minutes; `consult_submit` runs the same investigation in 
 background and hands back a job handle immediately, so your agent keeps working.
 `job_wait` parks until something finishes; `job_get` collects the answer.
 
-### `batch_submit` — frontier answers at half price
+### `batch_submit` — frontier answers on the discounted lane
 
 `oneshot`'s async sibling: fan self-contained prompts to a top-tier model on the
-provider's batch lane — offline, maximum thinking, roughly half the interactive
-price. The built-in `anthropic-batch` and `gemini-batch` casts put Claude Opus or
-Gemini Pro on your hardest questions cheaply; handles are durable across restarts.
+provider's batch lane — offline, maximum thinking, and discounted against the
+interactive rate. The built-in `anthropic-batch` and `gemini-batch` casts put Claude
+Opus or Gemini Pro on your hardest questions; handles are durable across restarts.
 A hosted OpenAI Platform backend can staff the lane too — declare `lane = "batch"`
 on its synth slot (`docs/config.example.toml`), and GPT joins the same handles,
 polling, and `deliberate` flow.
@@ -396,8 +426,8 @@ polling, and `deliberate` flow.
 ### `deliberate` — deep offline reasoning over a dossier
 
 An investigation assembles a cited dossier from your repo, then a frontier (or big
-local) model reasons over it offline on the batch lane — depth over speed, at batch
-prices.
+local) model reasons over it offline on the batch lane — depth over speed, at the
+batch discount.
 
 ### `run_kaish` — direct read-only shell
 
@@ -489,7 +519,7 @@ your agent ──stdio MCP──▶ kaibo
                             │  consult(question or request)
                             ▼
                     ┌───────────────────────────┐   ┌───────────────────────────┐
-                    │ synth model (capable)     │   │ explorer (lite)           │
+                    │ synth (capable model)     │   │ explorer (fast model)     │
                     │   • reads files via kaish │   │   • reads files via kaish │
                     │   • delegates to explorer │-> │                           │
                     │   • writes a summary      │ <-│   • summarizes results    │
@@ -499,13 +529,12 @@ your agent ──stdio MCP──▶ kaibo
                        back to your agent
 ```
 
-kaibo is an agent for your agent. kaibo's consult() agent drives the read-only
-`run_kaish` shell for working with the filesystem and transforming inputs. When using the
-consult() tool, it starts with a big model, which can delegate to a fast explorer
-sub-agent. The explorer/synthesis combination is meant to speed up execution and save token
-spend by having smaller and faster models do the bulk of tool calling operations before
-synthesis begins. (oneshot() skips all of that — a single direct call when you already
-have the context.)
+kaibo is an agent for your agent. Its models work the filesystem — and transform what
+they read — through kaish: it mounts your repository so they can read it, and has no
+write path, so nothing can change. Putting the bulk of that tool calling on a smaller,
+faster explorer is what keeps a consult quick and cheap — the big model spends its
+budget on the answer instead of the search. (oneshot() skips all of that — a single
+direct call when you already have the context.)
 
 It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)
@@ -516,7 +545,7 @@ comes as a rust crate and is embedded directly in kaibo, no exec() or repl shell
 ## Why not just use my agent's subagents?
 
 Subagents spawned by your agent are the same model family. They inherit the same
-correlated failures — same training, same blind spots. kaibo's consultants are usually
+correlated failures — same training, same blind spots. kaibo's agents usually run on
 **different models entirely**, bringing the benefits of diversity of experience.
 They're also read-only by construction, so you can point them at things where you
 might not trust a read-write subagent to behave.
@@ -532,6 +561,18 @@ only kaibo's provider clients dial out, to the model APIs you configure. The
 [`docs/sandbox-probes.md`](docs/sandbox-probes.md) runbook is how we live-test that
 boundary — write/external-command/read-escape batteries run against the shipped binary.
 
+**What actually leaves my machine?** Read-only covers modification; the other half is
+disclosure. To answer a question, kaibo sends the provider you chose whatever its models
+read while investigating: the spans they open, the shell output they get back, your
+question, and any files you `attach`. So treat everything inside the paths you allow as
+potentially provider-visible — if a tree holds `.env`, key material, or a customer dump,
+scope kaibo away from it (`--root` / `--allow-path`) rather than counting on the model
+not to look. kaibo never sends anything outside those paths, and it holds no credentials
+for anything but the model APIs you configured. Provider retention and training terms
+are the provider's, not kaibo's, so pick a backend whose policy you're happy with — and
+note kaibo asks OpenRouter for no-collection routing by default
+([`docs/config.md`](docs/config.md) has the specifics).
+
 **How long does a consult take?** It's a multi-step investigation, not a single API
 call — a deep one can run a few minutes, more with thinking on and a large repo to
 sweep. kaibo emits MCP progress notifications as the explorer and synth work, so a
@@ -540,13 +581,15 @@ up to your agent's UI, which kaibo can't control. If you'd rather not block on i
 `consult_submit` starts the same investigation in the background and `job_get` picks
 up the answer.
 
-**Can a runaway consultation melt my machine or my budget?** There are hard ceilings
-on both. Every kaish script is capped at 30s wall-clock, 64 KiB of output, and 64 MB of
-in-memory scratch (a write past the cap fails loudly rather than growing without
-bound), so a `while true; grep -r /` can't run away. The model loops are bounded too:
-the explorer sweep and the consult driver stop at a turn limit (100 and 200 by
-default), so a confused model can't loop forever burning tokens. All of these are
-configurable in `config.toml`.
+**Can a runaway consultation melt my machine or my budget?** Your machine, no — there
+are hard ceilings. Every kaish script is capped at 30s wall-clock, 64 KiB of output, and
+64 MB of in-memory scratch (a write past the cap fails loudly rather than growing
+without bound), so a `while true; grep -r /` can't run away. Spend has limits but no
+hard cap: the loops stop at a turn limit (100 and 200 by default) and each turn has an
+output-token ceiling, so a confused model can't loop forever burning tokens — but
+there's no dollar or total-token budget you can set, and kaibo won't stop a call partway
+through for cost. If you want a harder bound today, lower the turn limits or
+`max_tokens`. All of these are configurable in `config.toml`.
 
 **What providers are supported?** Anthropic, DeepSeek, and Gemini natively; OpenRouter
 as a keyed gateway that reaches every major model family through one key (`~author/
@@ -576,15 +619,15 @@ named as such rather than blamed on the provider. If a provider is reliably slow
 that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
 — tracked as an upstream `rig` contribution in [`docs/issues.md`](docs/issues.md).)
 
-**What's the cost?** `consult` spends tokens on the provider behind the chosen cast.
-A real reference point: the consult in [What it looks like](#what-it-looks-like) — a
-multi-minute investigation of this repo on the `deepseek` cast — cost **$0.02**,
-measured by account-balance delta (cache-warm; a cold run costs a few cents more).
-A family-mixing cast (cheap local explorer + hosted synth) keeps the broad,
-token-heavy sweeping cheap and pays the strong model only for the answer, and the
-agent conversations are set up to cache well on most providers — that caching is
-where numbers like two cents come from. For the strongest models, `batch_submit`
-rides the provider's batch lane at roughly half the interactive price.
+**What's the cost?** `consult` spends tokens on the provider behind the chosen cast,
+so the cast is what decides. A DeepSeek-class team is inexpensive enough to reach for
+without thinking about it; a frontier Anthropic or OpenAI cast adds up a good deal
+faster, especially with thinking on. Check your provider's current rates — they move,
+and kaibo won't guess at them for you. What kaibo does do is spend as little as the
+work allows: a family-mixing cast (cheap local explorer + hosted synth) keeps the
+broad, token-heavy sweeping off the expensive model and pays it only for the answer,
+and the agent conversations are set up to cache well on most providers. For the
+strongest models, `batch_submit` rides the provider's discounted batch lane.
 
 ---
 
