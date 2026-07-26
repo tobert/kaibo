@@ -67,9 +67,8 @@ Sources:
   - Known older chat families (`gpt-4*`, `gpt-3.5*`, `chatgpt-*`) keep sampling and do
     not receive `reasoning.effort`.
   - Unknown hosted OpenAI IDs get no extra params until probed or explicitly classified.
-- OpenAI Batch is supported by OpenAI's API, including `/v1/responses`, but kaibo has not
-  implemented that provider lane yet. The existing kaibo batch lane supports Anthropic and
-  Gemini; OpenAI's file/JSONL batch lifecycle is tracked as the next provider.
+- OpenAI Batch ships (`OpenaiBatch`, `src/batch.rs`) — Responses-only, file-based, live
+  probed 2026-07-26. See the shipped slice below.
 
 ## Direction
 
@@ -136,55 +135,59 @@ Sources:
 - [Latest OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 - [OpenAI model catalog](https://developers.openai.com/api/docs/models)
 
-## Remaining work plan
+### 3. OpenAI Batch
 
-### 1. Add OpenAI Batch
+`OpenaiBatch` (`src/batch.rs`) implements OpenAI's file-based lifecycle behind the same
+`BatchProvider` trait as Anthropic and Gemini: build the JSONL, upload it as a
+`purpose = "batch"` file, create a batch against it, poll, download the result files. The
+kaibo-facing shape is identical to the other providers — a `backend/provider-id` handle,
+`job_get`/`job_cancel`/`job_list`, toolless items at `BATCH_EFFORT`.
 
-OpenAI Batch is file-based: upload JSONL with purpose `batch`, create a batch against an
-endpoint, poll, then download output/error files. OpenAI's Batch API supports
-`/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/completions`, and
-`/v1/moderations`; GPT-5.6 Sol/Terra/Luna model pages list `v1/batch` as an endpoint.
+The three open questions resolved this way:
 
-That is a different body and lifecycle from Anthropic's and Gemini's current batch
-implementations, so this should be a dedicated provider adapter, not a thin flag on the
-interactive path.
+- **Responses-only.** Every item is a `POST /v1/responses`. That is also the interactive
+  hosted-GPT path, so batch and interactive share one body shape, one reasoning knob
+  (`reasoning.effort`), and one answer parser. A Chat Completions lane would be a second of
+  each for no model kaibo can reach today; if one is ever needed it's a new endpoint
+  constant plus its own body/answer pair, not a flag on this one.
+- **kaibo deletes nothing.** The input file is the only surviving record of what was
+  submitted — the store keeps the handle and label, never the prompts — and deleting an
+  output on poll would break re-polling a finished handle. OpenAI expires batch outputs
+  itself after 30 days. An opt-in cleanup flag is tracked in `docs/issues.md`.
+- **No model-steerable write path, because there is no local file.** The JSONL is built in
+  memory (`openai_batch_jsonl`) and streamed straight into the multipart upload; results
+  come back as strings. The only artifact lives in the caller's OpenAI account. Attachments
+  ride as native Responses parts inside that buffer: text under its `<file>` wrapper, an
+  image as a `data:` URL.
 
-The product shape should match the existing batch doctrine:
+The capability seam moved with it. `batch_supported` takes a `&Backend`, not a
+`ProviderKind`, because only OpenAI Platform serves `/v1/batches` — an `openai`-kind
+backend aimed at llama.cpp/Ollama/a gateway is refused at **config load**, naming the fix,
+rather than 404ing at submit time. Same `is_hosted_openai` seam the interactive Responses
+routing uses.
 
-- `batch_submit` stays tool-less. Each OpenAI batch item is one prompt plus shared
-  attachments, answered once from what it was handed. No kaish, no explorer, no tool loop.
-- `deliberate` is how OpenAI batch gets codebase understanding. An interactive explorer
-  builds the cited dossier first; the batch synth receives that dossier as text and reasons
-  over it offline.
-- Sol is a natural batch synth once the provider adapter exists. Pair it with a medium
-  dossier builder for deliberate rather than trying to give the batch request tools.
-
-Intended config shape after the adapter ships:
+Config shape (both casts live in `docs/config.example.toml`):
 
 ```toml
 [casts.gpt-batch]
-batch = true
-synth = "gpt/gpt-5.6-sol"
+synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 
 [casts.gpt-deliberate]
-explorer = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "medium" }
+explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
 synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 ```
 
-Open implementation questions:
-
-- whether kaibo deletes OpenAI output files by default or leaves them for audit/debug;
-- whether kaibo's first OpenAI batch adapter starts on `/v1/responses` only, or keeps a
-  fallback `/v1/chat/completions` body for older models;
-- how direct `batch_submit` image/file attachments are represented in OpenAI JSONL. For
-  `deliberate`, the synth should not receive images or tools directly; the explorer's
-  dossier is the handoff.
+Live probe 2026-07-26: a two-item batch on `gpt-5.6-sol` submitted, polled through
+`validating` → `in_progress` → `completed`, and returned both answers under their submit
+indices; `kaibo batch list` swept the new backend alongside Anthropic and Gemini.
 
 Source:
 
 - [OpenAI Batch API reference](https://platform.openai.com/docs/api-reference/batch/object?api-mode=responses)
 
-### 2. Probe optional OpenAI surfaces
+## Remaining work plan
+
+### 1. Probe optional OpenAI surfaces
 
 - Codex-specialized model slugs exposed to some accounts: useful candidate for review casts,
   but do not promote to the canonical example until probed through kaibo's Responses arm.
@@ -193,7 +196,7 @@ Source:
 - Persisted Responses/conversation state: likely not needed for kaibo's own bounded loops yet,
   and may complicate the read-only/account-state boundary.
 
-### 3. Security and privacy checks
+### 2. Security and privacy checks
 
 - Keep API keys out of config values; use env var names or key files only.
 - Document that OpenAI API data controls are Platform controls, not ChatGPT subscription

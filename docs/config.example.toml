@@ -382,7 +382,8 @@ synth    = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "med
 
 # --- A custom batch cast: the offline `batch_submit` lane (max thinking). `lane = "batch"`
 #     on the SYNTH SLOT declares it (lane is a per-slot property, not a cast-level one —
-#     it needs a synth slot on a batch-capable backend, Anthropic or Gemini). The built-in
+#     it needs a synth slot on a batch-capable backend: Anthropic, Gemini, or a hosted
+#     OpenAI Platform backend like `gpt` above). The built-in
 #     `batch = true` spelling below is backward-compat sugar for exactly this: it sets the
 #     synth slot's lane, nothing more. The built-in anthropic-batch / gemini-batch casts are
 #     the same shape and, like this one, run the synth alone (no explorer) — but that's a
@@ -394,9 +395,23 @@ synth    = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "med
 
 [casts.pro-batch]
 batch    = true
-synth    = "gemini/gemini-pro-latest"        # batch-capable synth (Anthropic | Gemini); Pro is batch-only
+synth    = "gemini/gemini-pro-latest"        # batch-capable synth; Pro is batch-only
 # Equivalent, spelled directly on the slot (no cast-level sugar):
 #   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+
+# Hosted GPT on the same lane. OpenAI's batch is file-based under the hood (kaibo uploads
+# the requests as a JSONL file in YOUR OpenAI account, then downloads the results) — the
+# kaibo-facing shape is identical to the others. It needs the HOSTED backend: the Batch API
+# is OpenAI Platform's, so `lane = "batch"` on a local OpenAI-compatible server is a load
+# error naming the fix. Pairing an interactive explorer with the offline synth is what makes
+# a cast `deliberate`-capable — Luna sweeps the repo live and builds the cited dossier, Sol
+# reasons over it offline at max effort.
+[casts.gpt-batch]
+synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
+
+[casts.gpt-deliberate]
+explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
+synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 #
 # OUTPUT BUDGET. Batch maxes the knobs: high effort + a 32768-token output-token FLOOR (it
 # never skimps on the cheap async lane). Reasoning bills against that same output budget, so a

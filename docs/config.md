@@ -276,7 +276,8 @@ a **per-slot** property, not a cast-level one: each carries a synth slot whose
 (`consult`/`oneshot`) refuse a cast whose synth is on an offline lane, and
 `batch_submit` refuses a cast whose synth isn't specifically `lane = "batch"`, so a
 big offline-tuned model is never run interactively by accident (and vice versa). A
-`batch`-lane synth must sit on a batch-capable backend (Anthropic or Gemini) —
+`batch`-lane synth must sit on a batch-capable backend (Anthropic, Gemini, or a
+hosted OpenAI Platform backend — a local OpenAI-compatible server has no Batch API) —
 declaring `lane = "batch"` on a slot elsewhere is a loud load error, and so is a
 lane on an *explorer* slot (the explorer always runs interactively). Because lane
 lives on the slot, a cast MAY pair an interactive explorer with an offline synth —

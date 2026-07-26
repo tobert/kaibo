@@ -378,6 +378,9 @@ background and hands back a job handle immediately, so your agent keeps working.
 provider's batch lane — offline, maximum thinking, roughly half the interactive
 price. The built-in `anthropic-batch` and `gemini-batch` casts put Claude Opus or
 Gemini Pro on your hardest questions cheaply; handles are durable across restarts.
+A hosted OpenAI Platform backend can staff the lane too — declare `lane = "batch"`
+on its synth slot (`docs/config.example.toml`), and GPT joins the same handles,
+polling, and `deliberate` flow.
 
 ### `deliberate` — deep offline reasoning over a dossier
 
