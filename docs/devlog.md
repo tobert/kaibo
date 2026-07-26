@@ -96,6 +96,42 @@ container-evaporation guard it must ship with, are in `issues.md`.
 
 ---
 
+## 2026-07-25 — hosted OpenAI moved onto Responses for current GPT
+
+After the OpenAI entitlement doc landed, Amy generated a Platform API key and we ran the
+hosted path through kaibo instead of guessing from the config. The first probe split the
+problem cleanly: the account and key were fine, but `gpt-5.6-sol` rejected the generic
+Chat Completions request because rig sent `max_tokens`. The fix was not a new credential
+story; it was a hosted-OpenAI request-shaping seam.
+
+We kept the product split explicit. `ProviderKind::Openai` still means the OpenAI-shaped
+wire protocol, so local llama.cpp/Ollama/LM Studio-style endpoints stay on the old
+permissive Chat Completions client. Only an exact hosted Platform endpoint
+(`https://api.openai.com/v1`) moves to rig's Responses client. That gives current GPT
+models the output-token mapping, image input, and tool-loop shape they expect without
+silently imposing hosted semantics on local gateways.
+
+The hosted seam is deliberately model-aware rather than just provider-aware. GPT-5-family
+slots send `reasoning.effort` and suppress sampling, because the live Sol probe rejected
+custom `temperature`. Older hosted chat models such as `gpt-4.1-mini` keep sampling and do
+not receive `reasoning.effort`, because a live probe rejected that field there. Unknown
+hosted OpenAI ids get no extra params until probed. `kaibo://config` now follows the same
+classification so an explicit per-slot `effort` or `temperature` is flagged inert only
+when that endpoint+model has no sink for it.
+
+The proof stack was live and offline. `gpt-5.6-sol` answered a text `oneshot`, read
+`docs/brand/banner-teal.png` through image attachment, and answered the same image question
+through `consult` + `view_image`; a `vision = false` synth refused the image locally before
+any provider call. `gpt-4.1-mini` stayed usable on the hosted Responses seam after the
+reasoning field was suppressed. Offline tests pin exact hosted endpoint detection, GPT-5.6
+Responses params, GPT-4.1 sampling behavior, and config-resource inert tunables.
+
+Config examples now show the intended consult pairing: `gpt-5.6-luna` as the fast,
+tool-capable explorer and `gpt-5.6-sol` as the flagship synth, with `gpt-5.6-terra` as a
+balanced alternative. OpenAI Batch is the next lane: OpenAI supports `/v1/batch` for
+`/v1/responses`, but kaibo still needs the file/JSONL provider adapter before Sol can be
+used offline the way Anthropic/Gemini batch casts are today.
+
 ## 2026-07-18 — Gemini's effort lever was silently disconnected
 
 Investigating batch truncation (#79, already fixed) turned up a *separate* correctness

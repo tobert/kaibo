@@ -313,20 +313,31 @@ pub(crate) fn render_config_resource(
                     // Resolve the slot's request shape so we can flag tunables it will
                     // never send (e.g. a budget on an effort-driven model) — making the
                     // invisible no-op visible rather than rendering it as if effective.
-                    let kind = config
+                    let backend = config
                         .resolve_backend(&slot.backend)
-                        .expect("a loaded cast's slot backend resolves")
-                        .kind;
-                    let shape =
-                        ModelShape::resolve(kind, &slot.id, thinking_style.unwrap_or_default());
+                        .expect("a loaded cast's slot backend resolves");
+                    let shape = ModelShape::resolve(
+                        backend.kind,
+                        &slot.id,
+                        thinking_style.unwrap_or_default(),
+                    );
+                    let hosted_openai = backend.is_hosted_openai();
                     let mut inert_tunables = Vec::new();
+                    let effort_sinks = shape.sinks_effort()
+                        || (hosted_openai
+                            && crate::consult::hosted_openai_accepts_reasoning(&slot.id));
+                    let sampling_sinks = if hosted_openai {
+                        crate::consult::hosted_openai_accepts_sampling(&slot.id)
+                    } else {
+                        shape.sinks_sampling()
+                    };
                     if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
                         inert_tunables.push("thinking_budget");
                     }
-                    if effort.is_some() && !shape.sinks_effort() {
+                    if effort.is_some() && !effort_sinks {
                         inert_tunables.push("effort");
                     }
-                    if temperature.is_some() && !shape.sinks_sampling() {
+                    if temperature.is_some() && !sampling_sinks {
                         inert_tunables.push("temperature");
                     }
                     (
@@ -541,6 +552,18 @@ mod tests {
             # Anthropic adaptive: takes output_config.effort, no budget.
             [casts.ant_adaptive]
             synth = { backend = "anthropic", id = "claude-opus-4-8", effort = "high", thinking_budget = 2048 }
+
+            [backends.gpt]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+
+            # Hosted GPT-5 reasoning family: sinks effort, not budget or sampling.
+            [casts.gpt_reasoning]
+            synth = { backend = "gpt", id = "gpt-5.6-sol", effort = "high", thinking_budget = 2048, temperature = 0.7 }
+
+            # Older hosted GPT chat family: sinks sampling, not reasoning effort or budget.
+            [casts.gpt_chat]
+            synth = { backend = "gpt", id = "gpt-4.1-mini", effort = "high", thinking_budget = 2048, temperature = 0.7 }
             "#,
         )
         .unwrap();
@@ -579,6 +602,16 @@ mod tests {
             inert("ant_adaptive", "synth"),
             vec!["thinking_budget"],
             "adaptive sinks effort but rejects a budget"
+        );
+        assert_eq!(
+            inert("gpt_reasoning", "synth"),
+            vec!["thinking_budget", "temperature"],
+            "hosted GPT reasoning sinks effort but rejects budget and sampling"
+        );
+        assert_eq!(
+            inert("gpt_chat", "synth"),
+            vec!["thinking_budget", "effort"],
+            "hosted GPT chat sinks sampling but rejects reasoning effort and budget"
         );
     }
 

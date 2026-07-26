@@ -36,24 +36,40 @@ Sources:
 
 ## Current state in kaibo
 
-- `ProviderKind::Openai` is the generic OpenAI-compatible wire path. It builds a
-  `rig::providers::openai::CompletionsClient` with the backend's `base_url`
-  (`src/consult/engine.rs`).
+- `ProviderKind::Openai` still covers generic OpenAI-compatible endpoints. The built-in
+  `openai-local` backend stays on rig's Chat Completions client so local llama.cpp/Ollama/
+  LM Studio-style servers keep the permissive `/v1/chat/completions` shape.
+- A backend whose kind is `openai` and whose resolved base URL is exactly
+  `https://api.openai.com/v1` is treated as hosted OpenAI. That arm uses rig's Responses
+  client for interactive calls (`oneshot`/`consult`) so current GPT models get the output
+  token mapping and multimodal/tool-loop shape they expect.
 - The built-in `openai-local` backend defaults to a local server URL and optional key;
-  hosted OpenAI already works by adding a new backend such as `gpt` with
+  hosted OpenAI works by adding a new backend such as `gpt` with
   `base_url = "https://api.openai.com/v1"` and `key_optional = false`
   (`docs/config.md`, `docs/config.example.toml`).
+- Live probes on 2026-07-25 confirmed the hosted path:
+  - `gpt-5.6-sol` text `oneshot` passed through the Responses arm.
+  - `gpt-5.6-sol` `oneshot --attach docs/brand/banner-teal.png` saw the PNG and answered
+    `kaibo`.
+  - `gpt-5.6-sol` `consult` answered an image question through the model loop and
+    `view_image` rewrite path.
+  - A `vision = false` synth refused the same image locally before any provider call.
+  - `gpt-4.1-mini` remains usable on the hosted Responses seam with sampling and without
+    `reasoning.effort`.
 - Vision is opt-in for generic `openai` slots. A hosted multimodal GPT slot must set
   `vision = true` until kaibo has a trustworthy OpenAI model-capability classifier.
 - `view_image` already handles the OpenAI transport mismatch: OpenAI-compatible wires do
   not carry image bytes in tool results, so kaibo rewrites viewed images onto a user image
   turn before resuming the model loop (`src/consult/shaping.rs`,
   `src/consult/engine.rs`).
-- Request shaping is incomplete for hosted OpenAI. `ProviderKind::Openai` currently maps
-  to `ThinkingStyle::None`, so reasoning-capable GPT models do not receive OpenAI
-  reasoning params. `docs/issues.md` already tracks this.
-- OpenAI batch is not implemented. The existing batch lane supports Anthropic and Gemini;
-  `docs/issues.md` tracks OpenAI's file-based batch shape as the next provider.
+- Hosted OpenAI shaping is model-aware but intentionally conservative:
+  - GPT-5-family models receive `reasoning.effort` and no sampling knobs.
+  - Known older chat families (`gpt-4*`, `gpt-3.5*`, `chatgpt-*`) keep sampling and do
+    not receive `reasoning.effort`.
+  - Unknown hosted OpenAI IDs get no extra params until probed or explicitly classified.
+- OpenAI Batch is supported by OpenAI's API, including `/v1/responses`, but kaibo has not
+  implemented that provider lane yet. The existing kaibo batch lane supports Anthropic and
+  Gemini; OpenAI's file/JSONL batch lifecycle is tracked as the next provider.
 
 ## Direction
 
@@ -70,11 +86,9 @@ The existing `kind = "openai"` can keep carrying both only if hosted-only featur
 gated by explicit backend/slot capability. If that becomes awkward, split a first-class
 `openai-hosted` kind rather than weakening the local-compatible path.
 
-## Work plan
+## Shipped implementation slice
 
-### 1. Document the hosted OpenAI config
-
-Add a short README/config example that is copy-pasteable:
+### 1. Hosted OpenAI config
 
 ```toml
 [backends.gpt]
@@ -84,90 +98,102 @@ api_key_env = "OPENAI_API_KEY"
 key_optional = false
 
 [casts.gpt]
-explorer = { backend = "gpt", id = "gpt-5.6-luna" }
-synth = { backend = "gpt", id = "gpt-5.6-terra", vision = true }
+explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
+synth    = { backend = "gpt", id = "gpt-5.6-sol",  vision = true, effort = "high" }
 ```
 
-Model IDs must be checked against current OpenAI docs when the implementation PR starts;
-provider defaults drift.
+The example pairs Sol with a fast/tool-capable Luna explorer for consult mode. OpenAI's
+current guidance describes Sol as the flagship model, Terra as the balanced model, and Luna
+as the efficient/high-volume model; all three are current GPT-5.6 Responses models with
+reasoning, vision input, and tool support.
 
-### 2. Probe hosted OpenAI with the current implementation
-
-With `OPENAI_API_KEY` set:
-
-- `oneshot` text-only call on the hosted cast.
-- `oneshot` with an image attachment on a `vision = true` synth.
-- `consult` that calls `view_image`, verifying the user-turn rewrite reaches the model.
-- Failure probe with `vision = false`, verifying kaibo refuses image input before a
-  provider call.
-- Trace check for `gen_ai.request.thinking`; expected today: absent for `openai`.
-
-Record results in `docs/devlog.md` if they drive a change.
-
-### 3. Add OpenAI reasoning shaping
+### 2. Responses shaping for current GPT
 
 Official current guidance for GPT-5.6 says to use the Responses API for reasoning,
 tool-calling, and multi-turn workflows, and to set `reasoning.effort` intentionally.
-OpenAI's API reference also exposes reasoning effort on modern response/chat shapes.
 
-Implementation choices to settle with tests:
+Implementation choices:
 
-- If staying on rig's Chat Completions client, verify whether `additional_params` can
-  safely carry `reasoning_effort` and the correct output-token field for current hosted
-  GPT models.
-- If moving hosted OpenAI to Responses, add a small direct client arm rather than forcing
-  Responses semantics through the generic OpenAI-compatible path.
-- Preserve kaibo's doctrine: reasoning on by default where the model supports it; explicit
-  opt-out per slot; no silent "reasoning absent" for a reasoning-capable hosted model.
+- Use rig's Responses client for exact hosted OpenAI Platform endpoints, leaving
+  `openai-local` and other OpenAI-compatible gateways on Chat Completions.
+- Keep reasoning on by default for GPT-5-family hosted slots through `reasoning.effort`.
+- Suppress custom sampling for current GPT reasoning models because the live provider probe
+  rejected `temperature` there.
+- Keep sampling for known older hosted chat models, and suppress `reasoning.effort` because
+  the live `gpt-4.1-mini` probe rejected it.
 
-Test shape:
+Tests pin:
 
-- `ModelShape::resolve(ProviderKind::Openai, "gpt-…")` emits the selected OpenAI reasoning
-  params.
-- `sinks_effort` / inert tunable rendering treat OpenAI reasoning-capable models as effort
-  sinks.
-- Non-reasoning/local OpenAI-compatible slots can remain no-reasoning by explicit shape or
-  backend capability.
+- exact hosted endpoint detection;
+- GPT-5.6 hosted arms using Responses params with `reasoning.effort`, no sampling, and no
+  legacy output-token field in `additional_params`;
+- GPT-4.1 hosted arms keeping sampling while omitting reasoning;
+- `kaibo://config` marking per-slot `effort`/`temperature` no-ops by endpoint and model,
+  not by provider alone.
 
 Sources:
 
 - [Latest OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
-- [Responses streaming reference: reasoning](https://platform.openai.com/docs/api-reference/responses-streaming/response/refusal/delta?lang=curl)
+- [OpenAI model catalog](https://developers.openai.com/api/docs/models)
 
-### 4. Re-evaluate Responses API for hosted OpenAI
+## Remaining work plan
 
-OpenAI's help recommends the Responses API unless it lacks a capability the older
-Completions APIs provide. For kaibo, the decision hinges on whether rig's current OpenAI
-provider preserves the features kaibo needs:
+### 1. Add OpenAI Batch
 
-- tool calling over repeated turns;
-- image input;
-- model reasoning controls;
-- output token caps with reasoning-token headroom;
-- usage reporting, especially reasoning tokens;
-- prompt caching controls if useful for long resident preambles.
+OpenAI Batch is file-based: upload JSONL with purpose `batch`, create a batch against an
+endpoint, poll, then download output/error files. OpenAI's Batch API supports
+`/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/completions`, and
+`/v1/moderations`; GPT-5.6 Sol/Terra/Luna model pages list `v1/batch` as an endpoint.
 
-If Responses wins, keep the direct client narrow and test it offline with scripted request
-serialization before any live probe.
+That is a different body and lifecycle from Anthropic's and Gemini's current batch
+implementations, so this should be a dedicated provider adapter, not a thin flag on the
+interactive path.
 
-### 5. Add OpenAI Batch after interactive hosted OpenAI is correct
+The product shape should match the existing batch doctrine:
 
-OpenAI Batch is file-based: upload JSONL, create a batch against an endpoint, poll, then
-download output/error files. That is a different body and lifecycle from Anthropic's and
-Gemini's current batch implementations.
+- `batch_submit` stays tool-less. Each OpenAI batch item is one prompt plus shared
+  attachments, answered once from what it was handed. No kaish, no explorer, no tool loop.
+- `deliberate` is how OpenAI batch gets codebase understanding. An interactive explorer
+  builds the cited dossier first; the batch synth receives that dossier as text and reasons
+  over it offline.
+- Sol is a natural batch synth once the provider adapter exists. Pair it with a medium
+  dossier builder for deliberate rather than trying to give the batch request tools.
 
-Open questions:
+Intended config shape after the adapter ships:
+
+```toml
+[casts.gpt-batch]
+batch = true
+synth = "gpt/gpt-5.6-sol"
+
+[casts.gpt-deliberate]
+explorer = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "medium" }
+synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
+```
+
+Open implementation questions:
 
 - whether kaibo deletes OpenAI output files by default or leaves them for audit/debug;
-- whether OpenAI batch starts on `/v1/responses`, `/v1/chat/completions`, or both;
-- how image/file attachments are represented in JSONL without creating a model-steerable
-  write path.
+- whether kaibo's first OpenAI batch adapter starts on `/v1/responses` only, or keeps a
+  fallback `/v1/chat/completions` body for older models;
+- how direct `batch_submit` image/file attachments are represented in OpenAI JSONL. For
+  `deliberate`, the synth should not receive images or tools directly; the explorer's
+  dossier is the handoff.
 
 Source:
 
 - [OpenAI Batch API reference](https://platform.openai.com/docs/api-reference/batch/object?api-mode=responses)
 
-### 6. Security and privacy checks
+### 2. Probe optional OpenAI surfaces
+
+- Codex-specialized model slugs exposed to some accounts: useful candidate for review casts,
+  but do not promote to the canonical example until probed through kaibo's Responses arm.
+- GPT-5.6 pro mode: possible fit for deliberate/deep review, but it changes latency and cost;
+  add only with explicit config/tests and a live comparison.
+- Persisted Responses/conversation state: likely not needed for kaibo's own bounded loops yet,
+  and may complicate the read-only/account-state boundary.
+
+### 3. Security and privacy checks
 
 - Keep API keys out of config values; use env var names or key files only.
 - Document that OpenAI API data controls are Platform controls, not ChatGPT subscription

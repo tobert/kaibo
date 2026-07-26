@@ -496,6 +496,16 @@ impl Backend {
             .unwrap_or_else(credentials::openai_base_url)
     }
 
+    /// True for a generic `openai` backend that is explicitly aimed at OpenAI
+    /// Platform. This is the narrow capability seam that lets kaibo use OpenAI's
+    /// first-party Responses shape for hosted GPT models while preserving the
+    /// local/OpenAI-compatible `/chat/completions` path for `openai-local` and
+    /// gateways that do not implement `/responses`.
+    pub fn is_hosted_openai(&self) -> bool {
+        self.kind == ProviderKind::Openai
+            && self.resolved_base_url().trim_end_matches('/') == credentials::HOSTED_OPENAI_BASE_URL
+    }
+
     /// Whether this backend has a usable credential, judged *without* committing to a
     /// network call or pulling the secret into the answer path — the non-fatal sibling
     /// of [`resolve_key`](Self::resolve_key). It mirrors the same precedence (env var,
@@ -3684,6 +3694,33 @@ mod tests {
         .unwrap();
         let b = cfg.backends.get("anthropic").unwrap();
         assert_eq!(b.base_url.as_deref(), Some("http://ai.example.ts.net"));
+    }
+
+    /// Hosted OpenAI is still `kind = "openai"`, but the first-party endpoint is
+    /// a capability signal: kaibo can use rig's Responses API there while leaving
+    /// local OpenAI-compatible servers on Chat Completions. Normalize a harmless
+    /// trailing slash; do not guess that any other OpenAI-compatible URL supports
+    /// `/responses`.
+    #[test]
+    fn hosted_openai_detection_is_endpoint_exact() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.gpt]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1/"
+
+            [backends.localish]
+            kind = "openai"
+            base_url = "http://localhost:13305/api/v1"
+
+            [casts.x]
+            synth = "gpt/gpt-5.6-sol"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.backends["gpt"].is_hosted_openai());
+        assert!(!cfg.backends["localish"].is_hosted_openai());
+        assert!(!cfg.backends["anthropic"].is_hosted_openai());
     }
 
     /// A backend name containing '/' is refused at load. Both the slot ref

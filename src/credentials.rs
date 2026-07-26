@@ -27,6 +27,11 @@ use anyhow::{anyhow, Context, Result};
 /// `OPENAI_BASE_URL` env var (see [`openai_base_url`]).
 pub const DEFAULT_OPENAI_BASE_URL: &str = "http://localhost:13305/api/v1";
 
+/// Hosted OpenAI Platform endpoint. A generic `openai` backend pointed here can
+/// use OpenAI's first-party API semantics (not just local `/chat/completions`
+/// compatibility), such as the Responses API used by current GPT reasoning models.
+pub const HOSTED_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
 /// A model provider. The keyed providers (Anthropic/DeepSeek/Gemini/OpenRouter) each
 /// speak their own wire protocol and require an API key. [`ProviderKind::Openai`] is
 /// the generic OpenAI-compatible endpoint: any base URL speaking that protocol, with

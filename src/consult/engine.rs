@@ -63,6 +63,7 @@ trait PhaseRunner: Send + Sync {
         &'a self,
         preamble: &'a str,
         max_tokens: u64,
+        temperature: Option<f64>,
         initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
@@ -92,6 +93,7 @@ where
         &'a self,
         preamble: &'a str,
         max_tokens: u64,
+        temperature: Option<f64>,
         initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
@@ -104,6 +106,7 @@ where
             &self.name,
             preamble,
             max_tokens,
+            temperature,
             initial_prompt,
             max_turns,
             params,
@@ -129,6 +132,11 @@ pub struct Arm {
     /// reasoning eats this budget — it sits well above the thinking budget baked
     /// into `params`, validated at config load.
     pub max_tokens: u64,
+    /// Optional typed temperature for providers whose current client reads it
+    /// from rig's core request field rather than flattened `additional_params`.
+    /// Today this is hosted OpenAI Responses only; the legacy/generic paths keep
+    /// their existing provider-shaped params.
+    pub temperature: Option<f64>,
     /// The resolved `additional_params` blob (thinking + sampling + effort), fit
     /// to this arm's model by [`ModelShape`]. `None` when nothing is sent.
     pub params: Option<Value>,
@@ -143,6 +151,7 @@ impl std::fmt::Debug for Arm {
         f.debug_struct("Arm")
             .field("model", &self.model)
             .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
             .field("params", &self.params)
             .field("caps", &self.caps)
             .finish_non_exhaustive()
@@ -185,6 +194,21 @@ impl Arm {
     where
         M: CompletionModel + 'static,
     {
+        Self::from_model_with_temperature(model_impl, model, max_tokens, None, params, caps)
+    }
+
+    /// Wrap a pre-built completion model with an optional typed temperature.
+    fn from_model_with_temperature<M>(
+        model_impl: M,
+        model: impl Into<String>,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        params: Option<Value>,
+        caps: ModelCaps,
+    ) -> Self
+    where
+        M: CompletionModel + 'static,
+    {
         let model = model.into();
         Self {
             runner: Arc::new(ModelArm {
@@ -193,6 +217,7 @@ impl Arm {
             }),
             model,
             max_tokens,
+            temperature,
             params,
             caps,
         }
@@ -237,6 +262,17 @@ impl Arm {
             Some(t.top_p),
             &t.effort,
         );
+        let hosted_openai = backend.is_hosted_openai();
+        let params = if hosted_openai {
+            super::shaping::hosted_openai_responses_params(&slot.id, Some(t.top_p), &t.effort)
+        } else {
+            params
+        };
+        let typed_temperature = if hosted_openai {
+            super::shaping::hosted_openai_responses_temperature(&slot.id, t.temperature)
+        } else {
+            None
+        };
         // OpenRouter drops rig's native `max_tokens` (see `inject_output_budget`), so
         // the budget must ride `additional_params` as `max_completion_tokens`. A no-op
         // for every other kind, whose `max_tokens` rig sends itself.
@@ -309,13 +345,30 @@ impl Arm {
                 // returns the configured key or a placeholder the server ignores.
                 let base_url = backend.resolved_base_url();
                 let key = backend.resolve_key()?;
-                let client = openai::CompletionsClient::builder()
-                    .api_key(&key)
-                    .base_url(&base_url)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
-                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                if hosted_openai {
+                    let client = openai::Client::builder()
+                        .api_key(&key)
+                        .base_url(&base_url)
+                        .http_client(http)
+                        .build()
+                        .map_err(|e| anyhow!("openai responses client init at {base_url}: {e}"))?;
+                    Ok(Self::from_model_with_temperature(
+                        client.completion_model(&slot.id),
+                        &slot.id,
+                        t.max_tokens,
+                        typed_temperature,
+                        params,
+                        caps,
+                    ))
+                } else {
+                    let client = openai::CompletionsClient::builder()
+                        .api_key(&key)
+                        .base_url(&base_url)
+                        .http_client(http)
+                        .build()
+                        .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
+                    Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                }
             }
         }
     }
@@ -361,6 +414,7 @@ impl Arm {
             .run_phase(
                 preamble,
                 self.max_tokens,
+                self.temperature,
                 initial_prompt,
                 max_turns,
                 self.params.as_ref(),
@@ -679,6 +733,7 @@ pub(crate) async fn run_phase<M, F>(
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
+    temperature: Option<f64>,
     initial_prompt: Message,
     max_turns: usize,
     thinking: Option<&Value>,
@@ -721,6 +776,7 @@ where
                 model,
                 preamble,
                 max_tokens,
+                temperature,
                 thinking,
                 make_tools()?,
                 full,
@@ -732,6 +788,9 @@ where
         let mut builder = AgentBuilder::new(model.clone())
             .preamble(preamble)
             .max_tokens(max_tokens);
+        if let Some(t) = temperature {
+            builder = builder.temperature(t);
+        }
         // Thinking on (both phases) where the provider takes a request-time toggle.
         if let Some(params) = thinking {
             builder = builder.additional_params(params.clone());
@@ -769,6 +828,7 @@ where
                     model,
                     preamble,
                     max_tokens,
+                    temperature,
                     thinking,
                     make_tools()?,
                     *chat_history,
@@ -802,6 +862,7 @@ async fn finalize_after_max_turns<M>(
     model: &M,
     preamble: &str,
     max_tokens: u64,
+    temperature: Option<f64>,
     thinking: Option<&Value>,
     tools: Vec<Box<dyn ToolDyn>>,
     chat_history: Vec<Message>,
@@ -815,6 +876,9 @@ where
         .preamble(preamble)
         .max_tokens(max_tokens)
         .tool_choice(ToolChoice::None);
+    if let Some(t) = temperature {
+        builder = builder.temperature(t);
+    }
     if let Some(params) = thinking {
         builder = builder.additional_params(params.clone());
     }
@@ -3280,6 +3344,100 @@ mod tests {
             arm.params.unwrap()["temperature"],
             defaults.explorer_temperature,
             "explorer role takes the explorer-side default"
+        );
+    }
+
+    /// A hosted OpenAI Platform backend is still configured as kind `openai`, but
+    /// it is not the same request shape as `openai-local`: current GPT reasoning
+    /// models need rig's Responses client, where effort lives in
+    /// `additional_params`, output budget maps to `max_output_tokens`, and
+    /// sampling is model-aware. This pins the arm-level split so a future cleanup
+    /// does not route hosted GPT back through the local-compatible Chat Completions
+    /// path that sends `max_tokens`.
+    #[test]
+    fn hosted_openai_arm_uses_responses_shape() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "gpt".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some(crate::credentials::HOSTED_OPENAI_BASE_URL.into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+        };
+        assert!(
+            backend.is_hosted_openai(),
+            "fixture must select the hosted seam"
+        );
+        let slot = ModelSlot {
+            vision: Some(true),
+            temperature: Some(0.4),
+            effort: Some("xhigh".into()),
+            ..ModelSlot::bare("gpt", "gpt-5.6-sol")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("hosted OpenAI arm builds offline with a placeholder key");
+        assert_eq!(arm.model, "gpt-5.6-sol");
+        assert_eq!(
+            arm.temperature, None,
+            "current GPT reasoning models reject custom temperature"
+        );
+        let params = arm.params.expect("hosted OpenAI sends Responses params");
+        assert_eq!(
+            params["reasoning"]["effort"], "xhigh",
+            "the slot effort reaches hosted OpenAI reasoning"
+        );
+        assert!(
+            params.get("temperature").is_none() && params.get("top_p").is_none(),
+            "current GPT reasoning models get no sampling knobs"
+        );
+        assert!(
+            params.get("max_tokens").is_none() && params.get("max_completion_tokens").is_none(),
+            "rig's Responses client maps core max_tokens to max_output_tokens"
+        );
+        assert!(
+            arm.caps.vision,
+            "the vision pin survives into the hosted arm"
+        );
+    }
+
+    /// Older hosted GPT chat models keep sampling: the same Responses seam is used,
+    /// but model-aware shaping routes temperature through rig's typed field and
+    /// `top_p` through Responses additional parameters.
+    #[test]
+    fn hosted_openai_arm_keeps_sampling_for_compatible_gpt_models() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "gpt".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some(crate::credentials::HOSTED_OPENAI_BASE_URL.into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+        };
+        let slot = ModelSlot {
+            temperature: Some(0.4),
+            ..ModelSlot::bare("gpt", "gpt-4.1-mini")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("hosted OpenAI GPT-4.1 arm builds offline");
+        assert_eq!(
+            arm.temperature,
+            Some(0.4),
+            "sampling-compatible GPT models keep typed temperature"
+        );
+        let params = arm.params.expect("hosted OpenAI sends Responses params");
+        assert!(
+            params.get("reasoning").is_none(),
+            "GPT-4.1 rejected reasoning.effort in the live probe"
+        );
+        assert_eq!(
+            params["top_p"], defaults.top_p,
+            "sampling-compatible GPT models keep top_p"
         );
     }
 

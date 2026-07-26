@@ -335,7 +335,7 @@ key_optional = true
 
 [casts.mixed]
 explorer = "llama/qwen2.5-coder-7b"     # sweeps stay local and free
-synth    = "gpt/gpt-5"                  # the answer gets the big model
+synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
 ```
 
 `cast = "mixed"`, `cast = "gpt"` (if you define it), and the built-in

@@ -418,6 +418,51 @@ pub fn request_params(
     )
 }
 
+/// Additional params for hosted OpenAI through rig's Responses API client.
+///
+/// This is deliberately *not* the generic `ProviderKind::Openai` shape. Local
+/// OpenAI-compatible servers and gateways commonly implement only
+/// `/chat/completions`, so they stay on [`ThinkingStyle::None`]. A backend whose
+/// resolved base URL is OpenAI Platform gets this first-party Responses shape.
+/// Reasoning and sampling are independent model-family capabilities: current GPT
+/// reasoning models (`gpt-5*`, including `gpt-5.6-sol`) take `reasoning.effort`
+/// and reject custom `temperature`; older GPT chat families (`gpt-4*`,
+/// `gpt-3.5*`, `chatgpt-*`) take sampling and reject `reasoning.effort`.
+pub fn hosted_openai_responses_params(
+    model: &str,
+    top_p: Option<f64>,
+    effort: &str,
+) -> Option<Value> {
+    let mut obj = serde_json::Map::new();
+    if hosted_openai_accepts_reasoning(model) {
+        obj.insert("reasoning".into(), json!({ "effort": effort }));
+    }
+    if hosted_openai_accepts_sampling(model) {
+        if let Some(p) = top_p {
+            obj.insert("top_p".into(), json!(p));
+        }
+    }
+    (!obj.is_empty()).then_some(Value::Object(obj))
+}
+
+/// The typed temperature rig's Responses client should receive for hosted OpenAI.
+/// `None` means "use the provider default". This is intentionally conservative:
+/// current GPT reasoning models reject `temperature`; known older chat families
+/// accept it. Unknown hosted model IDs omit sampling until a live probe proves the
+/// shape.
+pub fn hosted_openai_responses_temperature(model: &str, temperature: f64) -> Option<f64> {
+    hosted_openai_accepts_sampling(model).then_some(temperature)
+}
+
+pub fn hosted_openai_accepts_sampling(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("gpt-4") || m.starts_with("gpt-3.5") || m.starts_with("chatgpt-")
+}
+
+pub fn hosted_openai_accepts_reasoning(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("gpt-5")
+}
+
 /// Fold this arm's output-token budget into `params` where the provider needs it
 /// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig
 /// 0.38's `OpenrouterCompletionRequest` (openrouter/completion.rs) has no `max_tokens`
@@ -588,6 +633,60 @@ mod tests {
         assert!(
             params["reasoning"].get("effort").is_none(),
             "no effort string rides alongside the disable"
+        );
+    }
+
+    /// Hosted OpenAI uses rig's Responses client, whose native shape is
+    /// `reasoning.effort` plus typed `max_output_tokens` (from core max_tokens).
+    /// It is intentionally separate from the generic OpenAI-compatible
+    /// `/chat/completions` shape, which stays toggle-less for local servers.
+    #[test]
+    fn hosted_openai_responses_params_are_model_aware_about_sampling() {
+        let params = hosted_openai_responses_params("gpt-5.6-sol", Some(0.95), DEFAULT_EFFORT)
+            .expect("hosted OpenAI sends Responses params");
+        assert_eq!(
+            params["reasoning"]["effort"], "high",
+            "the per-role effort reaches OpenAI Responses"
+        );
+        assert!(
+            params.get("top_p").is_none(),
+            "current GPT reasoning models get no sampling knobs"
+        );
+        assert!(
+            hosted_openai_responses_temperature("gpt-5.6-sol", 0.4).is_none(),
+            "current GPT reasoning models reject temperature"
+        );
+        assert!(
+            params.get("max_tokens").is_none() && params.get("max_completion_tokens").is_none(),
+            "Responses maps core max_tokens to max_output_tokens itself"
+        );
+
+        let params = hosted_openai_responses_params("gpt-4.1-mini", Some(0.95), "low")
+            .expect("older chat GPT families keep sampling");
+        assert!(
+            params.get("reasoning").is_none(),
+            "older chat GPT families reject reasoning.effort"
+        );
+        assert_eq!(
+            params["top_p"], 0.95,
+            "known sampling-compatible GPT families keep top_p"
+        );
+        assert_eq!(
+            hosted_openai_responses_temperature("gpt-4.1-mini", 0.4),
+            Some(0.4),
+            "known sampling-compatible GPT families keep typed temperature"
+        );
+
+        let params = hosted_openai_responses_params("gpt-5.6-sol", None, "none").unwrap();
+        assert_eq!(
+            params["reasoning"]["effort"], "none",
+            "the explicit no-reasoning effort passes through to rig's Responses enum"
+        );
+        assert!(params.get("top_p").is_none());
+
+        assert!(
+            hosted_openai_responses_params("unknown-openai-model", Some(0.95), "high").is_none(),
+            "unknown hosted models get no guessed provider-specific params"
         );
     }
 

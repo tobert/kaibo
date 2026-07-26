@@ -13,9 +13,14 @@ the git log. Each later release appends a new section at the top.
 
 ### Added
 
+- **Hosted OpenAI Platform backends now use the Responses API for interactive GPT calls.**
+  A `kind = "openai"` backend pointed exactly at `https://api.openai.com/v1` can run
+  current GPT-5.6 models through `oneshot` and `consult`, including image attachment and
+  `view_image`; generic/local OpenAI-compatible backends stay on the Chat Completions path.
 - `docs/openai-api-plan.md`, a living plan for making hosted OpenAI a first-class kaibo
   backend and clarifying that kaibo's OpenAI model calls use OpenAI Platform API keys, not
-  Codex subscription entitlement.
+  Codex subscription entitlement. It also tracks OpenAI's `/v1/batch` support and the
+  kaibo provider adapter still needed before Sol can run on kaibo's offline batch lane.
 - **`consult`** — the headline tool: ask a model *outside your own family* about a
   codebase and get a grounded, cited answer. A capable model reads precise spans
   directly and delegates broad sweeps to a cheap explorer sub-agent, then synthesizes
@@ -408,6 +413,9 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- Hosted GPT examples now use the current GPT-5.6 family: a fast/tool-capable
+  `gpt-5.6-luna` explorer paired with `gpt-5.6-sol` as the flagship consult synth, plus
+  `gpt-5.6-terra` as a balanced alternative.
 - **The README earns its shop window.** A nine-model reader panel (personas played
   by DeepSeek, GLM, GPT, Kimi, Qwen, Gemini, Claude — full study in the PR) read the
   page cold and told us where it lost them, so it changed: a real worked example up

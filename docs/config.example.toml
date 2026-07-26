@@ -269,7 +269,7 @@ key_optional = true                          # keyless local default → placeho
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
-aliases = ["oai"]                            # now `oai/gpt-5` resolves to this backend
+aliases = ["oai"]                            # now `oai/gpt-5.6-sol` resolves to this backend
 key_optional = false
 
 # A second local llama.cpp server on another port, keyless. A slow local model
@@ -365,11 +365,20 @@ synth    = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", eff
 explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Quote exact numbered lines; never guess a path." }
 synth    = "claude/claude-sonnet-4-6"        # no per-model prompt → [prompts] or built-in
 
-# --- Hosted GPT end to end, both roles on the keyed backend above. ---
+# --- Hosted GPT end to end, both roles on the keyed backend above.
+#     Sol is the flagship synth; Luna is the fast/tool-capable explorer. Both slots
+#     pin vision because generic openai endpoints default blind until you say otherwise.
+#     Use `effort = "none"` / "low" / "medium" / "high" / "xhigh" / "max" per slot
+#     to trade latency/cost against reasoning depth on the GPT-5.6 family. ---
 
 [casts.gpt]
-explorer = "gpt/gpt-5-mini"
-synth    = "gpt/gpt-5"
+explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
+synth    = { backend = "gpt", id = "gpt-5.6-sol",  vision = true, effort = "high" }
+
+# A cheaper balanced hosted GPT cast: same fast explorer, Terra as the answerer.
+[casts.gpt-balanced]
+explorer = { backend = "gpt", id = "gpt-5.6-luna",  vision = true, effort = "low" }
+synth    = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "medium" }
 
 # --- A custom batch cast: the offline `batch_submit` lane (max thinking). `lane = "batch"`
 #     on the SYNTH SLOT declares it (lane is a per-slot property, not a cast-level one —
