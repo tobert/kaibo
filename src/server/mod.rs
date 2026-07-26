@@ -37,8 +37,8 @@ use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
-    consult, explore_with, oneshot, Arm, ConsultConfig, ExploreConfig, ModelCaps, PhaseContext,
-    PromptOverrides,
+    consult, explore_with, oneshot, sweep_evidence_block, Arm, ConsultConfig, ExploreConfig,
+    ModelCaps, PhaseContext, PromptOverrides,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
@@ -49,6 +49,7 @@ use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::{SessionStore, Sessions};
+use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
 
 mod config_resource;
 mod containment;
@@ -1465,25 +1466,66 @@ impl KaiboHandler {
             sandbox: self.config.sandbox.clone(),
             max_attachments: defaults.max_attachments,
         };
+        // The offline synth's resolved caps, without building a network client — pure
+        // and key-free, so this can run before the (bounded but real) dossier sweep,
+        // and it's valid for both lanes (batch and direct both require the synth
+        // slot). Lets the dossier sweep's `attach` gate on the synth's real vision
+        // cap instead of assuming blind.
+        let (synth_slot, _synth_backend, synth_caps) = self.batch_synth(&cast)?;
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: Arc::from(format!(
+                "the offline synth (`{}`) on cast `{}`",
+                synth_slot.id, cast.name
+            )),
+            vision: synth_caps.vision,
+        };
+        // Deliberate's dossier sweep does NOT dedupe against the caller's own attach
+        // list (an empty seed): a caller-attached file reaches the offline synth ONLY
+        // through what the explorer writes (it's a read-WHOLE directive here, never
+        // inlined), so deduping would silently strand it — see SweepAttachSink's doc.
+        let sink = (defaults.max_attachments > 0).then(|| {
+            Arc::new(SweepAttachSink::new(
+                defaults.max_attachments,
+                consumer.clone(),
+                std::collections::HashSet::new(),
+            ))
+        });
+
         let span = tracing::info_span!("deliberate.dossier", cast = %cast.name, explorer_model = %explorer_model);
         progress.emit(PhaseEvent::PhaseStarted {
             phase: "deliberate.dossier",
         });
-        // TODO(explorer-attach deliberate stage): route through a SweepAttachSink
-        // scoped to the offline synth (SweepConsumerKind::OfflineSynth) instead of
-        // `None` — the dossier stage is the one place `attach` should NOT dedupe
-        // against caller attachments (see `SweepAttachSink`'s doc).
-        let (dossier, dossier_usage) =
-            match explore_with(&input.question, root, &explorer, &cfg, &attachments, None)
-                .instrument(span)
-                .await
-            {
-                Ok(out) => out,
-                Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
-            };
+        let (mut dossier, dossier_usage) = match explore_with(
+            &input.question,
+            root,
+            &explorer,
+            &cfg,
+            &attachments,
+            sink.as_ref(),
+        )
+        .instrument(span)
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished {
             phase: "deliberate.dossier",
         });
+        // Stitch whatever the dossier sweep routed via `attach` into the dossier text
+        // itself (text bodies, notes, demotions); collect any routed images separately
+        // — they ride the synth's single turn as native parts, not as dossier text.
+        let images: Vec<crate::attach::Attachment> = match &sink {
+            Some(sink) => {
+                let delivery = sink.drain();
+                if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
+                    dossier.push_str(&block);
+                }
+                delivery.images()
+            }
+            None => Vec::new(),
+        };
 
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
         // and the handle; both share the offline-synth preamble (`batch_system_prompt`,
@@ -1497,6 +1539,7 @@ impl KaiboHandler {
                     &explorer_model,
                     &input.question,
                     &dossier,
+                    &images,
                     &system,
                     dossier_usage,
                 )
@@ -1507,6 +1550,7 @@ impl KaiboHandler {
                 &explorer_model,
                 &input.question,
                 &dossier,
+                &images,
                 &system,
                 dossier_usage,
             ),
@@ -1517,14 +1561,23 @@ impl KaiboHandler {
     /// (max thinking, half price) and hand back the durable `backend/provider-id` handle.
     /// The dossier phase already ran, so this is only the submit — reusing the same
     /// `batch::submitter` + shaping `batch_submit` uses, minus the vision gate (a
-    /// deliberate `attach` reaches the dossier stage as read-whole directives, so this
-    /// submit carries no attachment parts; the dossier is text in the item prompt).
+    /// deliberate caller `attach` reaches the dossier stage as read-whole directives,
+    /// so THAT never carries a submit-time attachment part; the dossier is text in
+    /// the item prompt). `images` here are different — anything the dossier SWEEP
+    /// routed via its own `attach` tool call, already vision-gated on the synth's
+    /// caps when the sink was built, so every image handed to `submit` is one this
+    /// synth can actually see.
+    #[allow(clippy::too_many_arguments)] // each arg is a distinct, named stage-2 input
     async fn deliberate_batch(
         &self,
         cast: &Cast,
         explorer_model: &str,
         question: &str,
         dossier: &str,
+        // Images the dossier sweep routed via `attach` — the batch builders already
+        // carry images natively (Anthropic/Gemini/OpenAI Responses), so this is a
+        // real submit-time attachment, not dossier text.
+        images: &[crate::attach::Attachment],
         system: &str,
         // The dossier stage's explorer tokens — real synchronous spend kaibo already
         // paid to build the dossier. The offline synth's own cost lands later on the
@@ -1545,7 +1598,7 @@ impl KaiboHandler {
         }];
         let span = tracing::info_span!("deliberate.batch", cast = %cast.name, model = %model);
         let provider_id = provider
-            .submit(system, &[], &items)
+            .submit(system, images, &items)
             .instrument(span)
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
@@ -1570,12 +1623,16 @@ impl KaiboHandler {
     /// lane, so the job stays `job-N` end to end (said loudly in the reply — a restart
     /// loses it, matching the standing no-daemon decision). Mirrors `consult_submit`'s
     /// spawn, but the background work is `deliberate_direct`, not the consult loop.
+    #[allow(clippy::too_many_arguments)] // each arg is a distinct, named stage-2 input
     fn deliberate_direct_job(
         &self,
         cast: &Cast,
         explorer_model: &str,
         question: &str,
         dossier: &str,
+        // Images the dossier sweep routed via `attach` — ride the synth's single
+        // turn as native parts (`user_turn_with_attachments`, shared with `oneshot`).
+        images: &[crate::attach::Attachment],
         system: &str,
         // The dossier stage's explorer tokens, summed into the final footer with the
         // synth's — the footer names both roles, so it counts both.
@@ -1607,12 +1664,13 @@ impl KaiboHandler {
         let explorer_model = explorer_model.to_string();
         let question = question.to_string();
         let dossier = dossier.to_string();
+        let images = images.to_vec();
         let system = system.to_string();
         let label = format!("cast `{cast_name}` deliberate (direct synth `{synth_model}`)");
 
         let job_id = self.jobs.submit(label, progress_log, async move {
             match crate::consult::deliberate_direct(
-                &question, &dossier, &synth, &system, deadline, &sink,
+                &question, &dossier, &images, &synth, &system, deadline, &sink,
             )
             .await
             {
@@ -4188,6 +4246,7 @@ mod tests {
                 "gem/some-lite",
                 "Is the retry safe?",
                 "DOSSIER: src/x.rs:1 fn retry",
+                &[],
                 "offline-synth-system",
                 dossier_usage,
             )

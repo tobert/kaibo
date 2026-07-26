@@ -1234,6 +1234,39 @@ impl Tool for RunExplore {
     }
 }
 
+/// Assemble a single user turn from `text` plus any image attachments — shared by
+/// [`oneshot`] and [`deliberate_direct`] (both are exactly-one-completion phases with
+/// no tool loop to fold an image into, so the image must ride the initial turn
+/// itself). No images → a bare `Message::user(text)`, byte-for-byte the pre-attach
+/// call. With images, the text rides as the first part (skipped when empty — an
+/// image-only turn shouldn't emit a pointless `{type:text,text:""}` block), then the
+/// images. `&[]` is byte-for-byte the old `Message::user(text)` either way.
+fn user_turn_with_attachments(attachments: &[Attachment], text: String) -> Message {
+    let image_parts: Vec<UserContent> = attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
+                data_b64.clone(),
+                ImageMediaType::from_mime_type(mime),
+                None,
+            )),
+            Attachment::Text { .. } => None,
+        })
+        .collect();
+    if image_parts.is_empty() {
+        Message::user(text)
+    } else {
+        let mut parts = Vec::with_capacity(image_parts.len() + 1);
+        if !text.is_empty() {
+            parts.push(UserContent::text(text));
+        }
+        parts.extend(image_parts);
+        Message::User {
+            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
+        }
+    }
+}
+
 /// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
 /// shell, no exploration. The thin counterpart to `consult` (prompt in, answer out)
 /// for when the caller already owns the context and just wants the model's take.
@@ -1261,33 +1294,7 @@ pub async fn oneshot(
     cfg: &PhaseContext,
 ) -> Result<(String, Usage)> {
     let user_prompt = crate::attach::with_text_context(attachments, prompt);
-    let image_parts: Vec<UserContent> = attachments
-        .iter()
-        .filter_map(|a| match a {
-            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
-                data_b64.clone(),
-                ImageMediaType::from_mime_type(mime),
-                None,
-            )),
-            Attachment::Text { .. } => None,
-        })
-        .collect();
-    // Assemble the single user turn here — multimodal awareness lives in oneshot, not the
-    // shared loop. No images → a bare `Message::user` (byte-for-byte the old call). With
-    // images, the text rides as the first part (skipped when empty — image-only with an
-    // empty prompt shouldn't emit a pointless `{type:text,text:""}` block), then the images.
-    let initial_prompt = if image_parts.is_empty() {
-        Message::user(user_prompt)
-    } else {
-        let mut parts = Vec::with_capacity(image_parts.len() + 1);
-        if !user_prompt.is_empty() {
-            parts.push(UserContent::text(user_prompt));
-        }
-        parts.extend(image_parts);
-        Message::User {
-            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
-        }
-    };
+    let initial_prompt = user_turn_with_attachments(attachments, user_prompt);
     with_call_deadline(
         cfg.call_deadline,
         "oneshot",
@@ -1476,24 +1483,27 @@ async fn with_call_deadline<T>(
 /// `call_deadline` — a slow local model gets its full patience without forcing the
 /// interactive ceiling high. The **batch** lane, by contrast, holds no in-process wait
 /// at all — its deliberation runs on the *provider's* queue.
+///
+/// `attachments` carries any images a delegated dossier sweep routed via `attach`
+/// (text attachments never reach here — they're already stitched into `dossier`'s
+/// text by `sweep_evidence_block`) — the single turn's own images, via the same
+/// [`user_turn_with_attachments`] helper [`oneshot`] uses. `&[]` is byte-for-byte the
+/// old `Message::user(...)` call.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named phase input
 pub async fn deliberate_direct(
     question: &str,
     dossier: &str,
+    attachments: &[Attachment],
     synth: &Arm,
     system: &str,
     deadline: Duration,
     progress: &Arc<dyn ProgressSink>,
 ) -> Result<(String, Usage)> {
+    let prompt = user_turn_with_attachments(attachments, deliberation_prompt(question, dossier));
     with_call_deadline(
         deadline,
         "deliberate",
-        synth.run(
-            system,
-            Message::user(deliberation_prompt(question, dossier)),
-            1,
-            progress.as_ref(),
-            &|| Ok(Vec::new()),
-        ),
+        synth.run(system, prompt, 1, progress.as_ref(), &|| Ok(Vec::new())),
     )
     .await
 }
@@ -3214,6 +3224,7 @@ mod tests {
         let (out, _usage) = deliberate_direct(
             "Is the retry path safe?",
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
+            &[],
             &arm(&client, SYNTH),
             "You are a capable model answering a hard question offline.",
             cfg.call_deadline,
@@ -3232,6 +3243,113 @@ mod tests {
             1,
             "one toolless completion"
         );
+    }
+
+    /// `deliberate`'s dossier stage: `explore_with` run with an attach sink returns
+    /// the RAW dossier text (unstitched — `explore_with` itself doesn't touch the
+    /// sink); the caller drains it and stitches `sweep_evidence_block` on top, the
+    /// exact composition `server::deliberate` performs. Proves that composition
+    /// works end to end at the engine layer, without the MCP server.
+    #[tokio::test]
+    async fn a_deliberate_dossier_sweep_routes_bytes_into_the_dossier() {
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("DOSSIER REPORT: src/foo.rs is the relevant module"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: Arc::from("the offline synth (`test-model`)"),
+            vision: false,
+        };
+        let sink = Arc::new(SweepAttachSink::new(
+            cfg.max_attachments,
+            consumer.clone(),
+            HashSet::new(),
+        ));
+
+        let (mut dossier, _usage) = explore_with(
+            "what's the relevant module?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[],
+            Some(&sink),
+        )
+        .await
+        .expect("scripted explore should succeed");
+
+        // explore_with itself doesn't stitch — the raw dossier is just the report.
+        assert!(
+            !dossier.contains("<file path=\"src/foo.rs\">"),
+            "explore_with returns the RAW dossier; stitching is the caller's job: {dossier:?}"
+        );
+
+        let delivery = sink.drain();
+        if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
+            dossier.push_str(&block);
+        }
+
+        assert!(
+            dossier.contains("DOSSIER REPORT")
+                && dossier.contains("<file path=\"src/foo.rs\">")
+                && dossier.contains("fn target_marker"),
+            "the stitched dossier must carry both the report and the routed file's \
+             numbered body: {dossier:?}"
+        );
+    }
+
+    /// `deliberate_direct`'s single turn carries a routed image as a native part —
+    /// the same `user_turn_with_attachments` seam `oneshot` uses, so a dossier
+    /// sweep's `attach`-routed image reaches the direct-lane synth even though the
+    /// synth itself never runs a tool loop.
+    #[tokio::test]
+    async fn deliberate_direct_carries_sweep_images_into_its_single_turn() {
+        const SYNTH: &str = "big-local-vision-synth";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                assert!(
+                    user_image_messages(&history) > 0,
+                    "the single turn must carry the routed image"
+                );
+                Ok(text_response("DELIBERATION: the diagram confirms it"))
+            })
+            .build();
+
+        let image = Attachment::Image {
+            path: "docs/arch.png".into(),
+            mime: "image/png",
+            data_b64: "ZmFrZQ==".into(),
+        };
+        let cfg = PhaseContext::default();
+        let (out, _usage) = deliberate_direct(
+            "Does the diagram confirm the design?",
+            "src/x.rs:1 DOSSIER",
+            &[image],
+            &vision_arm(&client, SYNTH),
+            "You are a capable model answering a hard question offline.",
+            cfg.call_deadline,
+            &cfg.progress,
+        )
+        .await
+        .expect("scripted direct deliberation should succeed");
+
+        assert!(out.contains("DELIBERATION"));
     }
 
     /// The wall-clock backstop: a wedged provider (a stopped/hung backend whose
@@ -3329,6 +3447,7 @@ mod tests {
             deliberate_direct(
                 "q",
                 "src/x.rs:1 DOSSIER",
+                &[],
                 &arm(&client, SYNTH),
                 "offline synth preamble",
                 Duration::from_millis(50),

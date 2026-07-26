@@ -38,7 +38,7 @@ pub(crate) use engine::run_phase;
 pub use prompts::{
     batch_preamble, batch_system_prompt, consult_preamble, consult_user_prompt,
     deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble,
-    ConsultAttachment, Phase, PromptOverrides,
+    sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides,
 };
 pub use shaping::{
     hosted_openai_accepts_reasoning, hosted_openai_accepts_sampling,
