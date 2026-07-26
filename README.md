@@ -21,8 +21,8 @@ last night, or any number of reasons. This happens with agents too. A new model 
 out, your model writes some bad code. It can't see the bug right in front of it.
 The solution for both humans and agents is the same: get a second opinion.
 
-kaibo is a suite of agents wrapped in an MCP server, and you point those agents at
-a model family that isn't the one asking. Biases tend to be shared across
+kaibo is a suite of agents wrapped in an MCP server — kaibo agents running on model
+families you choose, ideally not the one asking. Biases tend to be shared across
 a model lineage: the Claudes share them, the GPTs share them, and spawning more
 subagents from the same family repeats them. It's a bit like monoculture, leaving you
 vulnerable to blight. A reviewer whose mistakes don't line up with
@@ -36,13 +36,14 @@ Anthropic, Gemini, DeepSeek, OpenRouter (one key reaching every major model fami
 and any OpenAI-compatible endpoint, including local services like llama.cpp. It's a
 tool your *agent* uses — any MCP-capable client can drive it — and it's also a
 [CLI](#cli) for scripts, CI, and terminals that would rather shell out than speak
-MCP. Each agent is set up to mix small models for exploration with larger models
-for synthesis, to help keep your API spend down.
+MCP. Each of kaibo's agents is set up to mix small models for exploration with larger
+models for synthesis, to help keep your API spend down.
 
-The agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
+kaibo's agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
 shell. kaish has all of its commands built in and mounts your project through a
-virtual filesystem layer that is read-only, so the agents can read files in your
-workspace and write nowhere.
+virtual filesystem layer that is read-only, so a kaibo agent can read files in your
+workspace and write nowhere. That shell is the harness half of the agent — the half
+that decides what it can do to the world, and here the answer is *look, don't touch*.
 
 ## What it looks like
 
@@ -81,10 +82,10 @@ spurious-wakeup path and an optimization wrinkle we hadn't written down anywhere
 which is the point: a model that didn't make your model's mistakes, reading your
 real source, reporting back one summary.
 
-Note the `cast` in that call. **kaibo can't tell which family your agent belongs
-to, so choosing the outside view is yours to make** — pick a cast from a family
-that isn't the one asking. A call that names no cast falls back to the default,
-which ships as `anthropic`; that's a fine answer, but it isn't an *outside* one if
+Note the `cast` in that call — a cast names which models kaibo's agents run on.
+**kaibo can't tell which family your agent belongs to, so choosing the outside view
+is yours to make.** A call that names no cast falls back to the default, which ships
+as `anthropic`; that's a fine answer, but it isn't an *outside* one if
 Claude is what's asking. Set your default once at registration
 (`"args": ["--cast", "deepseek"]`) or in `config.toml`, and make sure that cast's
 key is the one you exported — that pairing is the most common first-run stumble.
@@ -497,7 +498,7 @@ your agent ──stdio MCP──▶ kaibo
                             │  consult(question or request)
                             ▼
                     ┌───────────────────────────┐   ┌───────────────────────────┐
-                    │ synth model (capable)     │   │ explorer (lite)           │
+                    │ synth (capable model)     │   │ explorer (fast model)     │
                     │   • reads files via kaish │   │   • reads files via kaish │
                     │   • delegates to explorer │-> │                           │
                     │   • writes a summary      │ <-│   • summarizes results    │
@@ -507,13 +508,15 @@ your agent ──stdio MCP──▶ kaibo
                        back to your agent
 ```
 
-kaibo is an agent for your agent. kaibo's consult() agent drives the read-only
-`run_kaish` shell for working with the filesystem and transforming inputs. When using the
-consult() tool, it starts with a big model, which can delegate to a fast explorer
-sub-agent. The explorer/synthesis combination is meant to speed up execution and save token
-spend by having smaller and faster models do the bulk of tool calling operations before
-synthesis begins. (oneshot() skips all of that — a single direct call when you already
-have the context.)
+kaibo is an agent for your agent. Two things make an agent: a model, and the harness it
+acts through — so a kaibo agent is a model you chose plus the read-only `run_kaish` shell
+it works the filesystem through. That pairing is the whole trust story: it can read your
+repository because the shell mounts it, and can't change anything because the shell has no
+way to. When using the consult() tool, it starts with a big model, which can delegate to
+a fast explorer sub-agent. The explorer/synthesis combination is meant to speed up
+execution and save token spend by having smaller and faster models do the bulk of tool
+calling operations before synthesis begins. (oneshot() skips all of that — a single
+direct call when you already have the context.)
 
 It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)
@@ -524,7 +527,7 @@ comes as a rust crate and is embedded directly in kaibo, no exec() or repl shell
 ## Why not just use my agent's subagents?
 
 Subagents spawned by your agent are the same model family. They inherit the same
-correlated failures — same training, same blind spots. kaibo's consultants are usually
+correlated failures — same training, same blind spots. kaibo's agents usually run on
 **different models entirely**, bringing the benefits of diversity of experience.
 They're also read-only by construction, so you can point them at things where you
 might not trust a read-write subagent to behave.
