@@ -21,8 +21,8 @@ last night, or any number of reasons. This happens with agents too. A new model 
 out, your model writes some bad code. It can't see the bug right in front of it.
 The solution for both humans and agents is the same: get a second opinion.
 
-kaibo is a suite of agents wrapped in an MCP server, and the agents run on a
-different model family than yours. Biases tend to be shared across
+kaibo is a suite of agents wrapped in an MCP server, and you point those agents at
+a model family that isn't the one asking. Biases tend to be shared across
 a model lineage: the Claudes share them, the GPTs share them, and spawning more
 subagents from the same family repeats them. It's a bit like monoculture, leaving you
 vulnerable to blight. A reviewer whose mistakes don't line up with
@@ -80,6 +80,14 @@ cold first run costs a few cents more). The full answer also surfaced a benign
 spurious-wakeup path and an optimization wrinkle we hadn't written down anywhere —
 which is the point: a model that didn't make your model's mistakes, reading your
 real source, reporting back one summary.
+
+Note the `cast` in that call. **kaibo can't tell which family your agent belongs
+to, so choosing the outside view is yours to make** — pick a cast from a family
+that isn't the one asking. A call that names no cast falls back to the default,
+which ships as `anthropic`; that's a fine answer, but it isn't an *outside* one if
+Claude is what's asking. Set your default once at registration
+(`"args": ["--cast", "deepseek"]`) or in `config.toml`, and make sure that cast's
+key is the one you exported — that pairing is the most common first-run stumble.
 
 ## Installation
 
@@ -281,19 +289,30 @@ and both are things you opted into by name:
   list` (or `job_list`) can find it again later — even after a restart —
   without you having to keep it written down somewhere.
 
-That's genuinely all of it: no chat history beyond a session you named, no
-file contents, nothing about your project. It lives in one small file on
-your machine, separate from your project, that the read-only models kaibo
-consults never see or touch — by default `~/.local/state/kaibo/state.db`
-(`$XDG_STATE_HOME/kaibo/state.db` if you have that set).
+That's genuinely all of it — kaibo never snapshots your repository, and
+nothing beyond those two things is written down. Be aware of what a saved
+session *is*, though: the questions and answers themselves, which routinely
+quote source, cite `file:line` spans, and describe your architecture. So a
+named session is a record of the conversation about your project, and worth
+the same care as any other. A one-off question with no session name keeps
+nothing.
 
-You never have to manage this file. It's a convenience cache, not a record
-you depend on: delete it any time and kaibo just starts fresh, nothing
-breaks. Prefer kaibo forgets everything between runs? `--no-persistence` (or
-`KAIBO_NO_PERSISTENCE`) turns it off entirely. Want it somewhere else?
-`--state-db FILE` (or `KAIBO_STATE_DB`) moves it. The full technical
-contract — exactly which fields are stored, what's deliberately left out,
-and the one platform-specific edge case — is in
+It lives in one small file on your machine, separate from your project — by
+default `~/.local/state/kaibo/state.db` (`$XDG_STATE_HOME/kaibo/state.db` if
+you have that set). The read-only shell kaibo hands its models can't reach
+it: the sandbox never mounts it, and kaibo refuses a state-db path that
+resolves inside a project it's allowed to read. Resuming a named session
+does replay that session's own turns back to the model — that's what
+continuing a conversation means — but no model can go browsing the file.
+
+This is your data, so kaibo treats it that way: it never deletes the file,
+under any error. Moving it aside is always your call, and if you do, kaibo
+starts fresh — you lose named-session history and the batch handles it was
+holding for you. Prefer kaibo forgets everything between runs?
+`--no-persistence` (or `KAIBO_NO_PERSISTENCE`) turns it off entirely. Want
+it somewhere else? `--state-db FILE` (or `KAIBO_STATE_DB`) moves it. The
+full technical contract — exactly which fields are stored, what's
+deliberately left out, and the one platform-specific edge case — is in
 [`docs/config.md`](docs/config.md#persistence-persistence).
 
 ## Configuration
@@ -521,6 +540,19 @@ only kaibo's provider clients dial out, to the model APIs you configure. The
 [`docs/sandbox-probes.md`](docs/sandbox-probes.md) runbook is how we live-test that
 boundary — write/external-command/read-escape batteries run against the shipped binary.
 
+**What actually leaves my machine?** Read-only is about *modification* — the other half
+is disclosure, and it's worth being plain about. To answer a question, kaibo sends the
+provider you chose whatever its models read while investigating: the spans they open,
+the shell output they get back, your question, and any files you `attach`. So treat
+everything inside the paths you allow as potentially provider-visible — if a tree holds
+`.env`, key material, or a customer dump, scope kaibo away from it (`--root` /
+`--allow-path`) rather than counting on the model not to look. What kaibo never sends is
+anything outside those paths, and it holds no credentials for anything but the model
+APIs you configured. Provider retention and training terms are the provider's, not
+kaibo's, so pick a backend whose policy you're happy with — and note kaibo asks
+OpenRouter for no-collection routing by default
+([`docs/config.md`](docs/config.md) has the specifics).
+
 **How long does a consult take?** It's a multi-step investigation, not a single API
 call — a deep one can run a few minutes, more with thinking on and a large repo to
 sweep. kaibo emits MCP progress notifications as the explorer and synth work, so a
@@ -529,13 +561,16 @@ up to your agent's UI, which kaibo can't control. If you'd rather not block on i
 `consult_submit` starts the same investigation in the background and `job_get` picks
 up the answer.
 
-**Can a runaway consultation melt my machine or my budget?** There are hard ceilings
-on both. Every kaish script is capped at 30s wall-clock, 64 KiB of output, and 64 MB of
-in-memory scratch (a write past the cap fails loudly rather than growing without
-bound), so a `while true; grep -r /` can't run away. The model loops are bounded too:
-the explorer sweep and the consult driver stop at a turn limit (100 and 200 by
-default), so a confused model can't loop forever burning tokens. All of these are
-configurable in `config.toml`.
+**Can a runaway consultation melt my machine or my budget?** Your machine, no — there
+are hard ceilings. Every kaish script is capped at 30s wall-clock, 64 KiB of output, and
+64 MB of in-memory scratch (a write past the cap fails loudly rather than growing
+without bound), so a `while true; grep -r /` can't run away. Spend is *bounded* rather
+than capped: the explorer sweep and the consult driver stop at a turn limit (100 and 200
+by default) and each turn has an output-token ceiling, so a confused model can't loop
+forever burning tokens — but kaibo has no dollar or total-token budget you can set, and
+it won't stop a call partway through for cost. A deep consult on a large repo is a few
+cents, not a few dollars; if you want a harder bound today, lower the turn limits or
+`max_tokens`. All of these are configurable in `config.toml`.
 
 **What providers are supported?** Anthropic, DeepSeek, and Gemini natively; OpenRouter
 as a keyed gateway that reaches every major model family through one key (`~author/
