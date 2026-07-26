@@ -28,21 +28,37 @@ subagents from the same family repeats them. It's a bit like monoculture, leavin
 vulnerable to blight. A reviewer whose mistakes don't line up with
 yours has a chance of catching what your model can't see. So you can bring that
 outside perspective into a code review, design session, or research: your agent calls
-`consult`, and a kaibo agent does its own exploration and synthesis, reporting a
-summary back.
+`consult`, and kaibo's agents investigate your project and report back.
 
 kaibo integrates as a stdio [MCP](https://modelcontextprotocol.io) server and supports
 Anthropic, Gemini, DeepSeek, OpenRouter (one key reaching every major model family),
 and any OpenAI-compatible endpoint, including local services like llama.cpp. It's a
 tool your *agent* uses — any MCP-capable client can drive it — and it's also a
-[CLI](#cli) for scripts, CI, and terminals that would rather shell out than speak
-MCP. Each of kaibo's agents is set up to mix small models for exploration with larger
-models for synthesis, to help keep your API spend down.
+[CLI](#cli) for scripts, CI, and terminals that would rather shell out than speak MCP.
 
 kaibo's agents reach your code through one tool: a [kaish](https://github.com/tobert/kaish)
 shell. kaish has all of its commands built in and mounts your project through a
 virtual filesystem layer that is read-only, so a kaibo agent can read files in your
 workspace and write nowhere.
+
+## How `consult` works
+
+You ask your agent for something. It calls `consult` with a question and a cast — the
+two-model team you picked, from whatever family you like.
+
+From there kaibo runs its own agents. The **synth** owns the investigation: it's the
+capable model, and it decides how to work. It reads spans through the read-only shell
+itself, and it can hand a broad sweep to the **explorer** — a cheaper, faster model that
+searches the repo and reports back what it found. Delegating is a tool call, and it's the
+synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
+writes the answer.
+
+So the chain runs: you → your agent → kaibo's synth → kaibo's explorer. If your agent
+spawned a subagent to do the work, that's one more link, and the inside is the same. Every
+link is a model plus the harness it acts through, working for the link above it, and every
+link hands back a summary instead of everything it saw. That's the whole idea: your agent
+gets one cited answer instead of an investigation, and the cheap model does most of the
+reading.
 
 ## What it looks like
 
@@ -58,9 +74,8 @@ consult({
 })
 ```
 
-kaibo's explorer sweeps the repo through the read-only shell, the synth reads the
-hot spans itself, and one synthesized review comes back — cited, with the
-investigation noise left out of your context:
+One synthesized review comes back — cited, with the investigation noise left out
+of your context:
 
 > **No.** The `absorb` closure is the sole return gate, and it's correct
 > (`src/mcp_log.rs:250-267`): `woke` is only set when a record meets `wake_floor` —
@@ -348,13 +363,11 @@ example-config`** prints the annotated template verbatim — `kaibo example-conf
 Each tool is gated independently via `--no-<tool>`. All are on by default. A server with
 every tool off is refused at startup.
 
-### `consult` — one agent that both explores and synthesizes
+### `consult` — the full investigation
 
-Ask a model *outside your own family* about a codebase; get a grounded, cited answer.
-kaibo's synth agent runs the investigation: it delegates broad sweeps to a fast explorer
-sub-agent and reads whatever else it needs through its own `run_kaish` tool. The models
-have instructions to return a synthesized report at the end, leaving the noise from the
-consultation out of your context. Describe what you did or want to know in prose — kaibo
+Ask a model *outside your own family* about a codebase; get a grounded, cited answer —
+the synth-and-explorer investigation described [above](#how-consult-works), returning the
+report rather than the transcript. Describe what you did or want to know in prose — kaibo
 reads the real, current source itself, so you don't need to paste a diff; optionally
 seed it with `context` (a change summary or pasted source), which it trusts as starting
 evidence while investigating for more. The answer carries a provenance footer naming the
@@ -506,13 +519,11 @@ your agent ──stdio MCP──▶ kaibo
                        back to your agent
 ```
 
-kaibo is an agent for your agent. A kaibo agent is a model you chose plus the read-only
-`run_kaish` shell. The shell mounts your repository, so the model can read it; the shell
-has no write path, so nothing can change. When using the consult() tool, it starts with
-a big model, which can delegate to a fast explorer sub-agent. The explorer/synthesis
-combination is meant to speed up execution and save token spend by having smaller and
-faster models do the bulk of tool calling operations before synthesis begins. (oneshot()
-skips all of that — a single direct call when you already have the context.)
+kaibo is an agent for your agent. The shell mounts your repository, so its models can
+read it; the shell has no write path, so nothing can change. Putting the bulk of the tool
+calling on a smaller, faster explorer is what keeps a consult quick and cheap — the big
+model spends its budget on the answer instead of the search. (oneshot() skips all of that
+— a single direct call when you already have the context.)
 
 It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)
