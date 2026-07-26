@@ -310,13 +310,26 @@ pub fn kaibo_instructions_with_scope(
         .map(|p| format!("  - `{}`", p.display()))
         .collect::<Vec<_>>()
         .join("\n");
+    // A linked git worktree of an allowed tree is in scope too — kaibo vouches for it
+    // by reading git's own link files, never by trusting the candidate's `.git`. Only
+    // said when the (default-on) feature is actually live, so a `--no-follow-worktrees`
+    // server doesn't claim a boundary it isn't enforcing. Dropped in the Unconfigured
+    // case: the setup banner already owns that budget (see `unconfigured_instructions_
+    // fit_claude_code_budget`), and a fresh install with no key isn't calling `consult`
+    // against a worktree yet anyway.
+    let worktree_note = if config.follow_worktrees && usability != CastUsability::Unconfigured {
+        " (a git worktree of one counts too)"
+    } else {
+        ""
+    };
 
     format!(
         "{setup}{lead}\n\n\
          {casts}\
          ## Scope\n\
          Read-only, always: kaibo never writes and cannot run external commands. A \
-         per-call `path` must canonicalize to at-or-under one of these allowed trees:\n\n\
+         per-call `path` must canonicalize to at-or-under one of these allowed \
+         trees{worktree_note}:\n\n\
          {root_line}\n\
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
