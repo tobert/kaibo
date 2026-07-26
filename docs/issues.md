@@ -347,6 +347,22 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
+### `RunExplore`'s image-bearing tool result arrives JSON-quoted to the driver
+When a sweep routes an image via `attach`, `RunExplore::call` returns the rig hybrid
+envelope `{"response": …, "parts": [...]}` (`Value`) instead of a plain `String` —
+required so rig's `from_tool_output` extracts the image part at all. rig then renders
+`response` via `Value::to_string()` (`rig-core-0.38.2` `completion/message.rs:921`),
+which re-serializes the already-text `response` field as a JSON string literal — so
+the driver sees its report text JSON-quoted/escaped (`\"` for `"`, `\n` for newlines)
+on exactly those sweeps, never on a text-only sweep (which still returns a bare
+`Value::String`, serializing identically to the old plain `String`). Cosmetic — the
+driver model still reads it fine, same as any escaped JSON string a capable model
+routinely un-escapes — but a `file:line` cite or a `<file>` wrapper with embedded
+quotes is uglier than it needs to be. No workaround inside kaibo without hand-rolling
+rig's tool-result serialization; tracked here in case a future rig release changes
+`from_tool_output`'s shape. Surfaced 2026-07-26 landing the explorer `attach` tool
+(`src/consult/engine.rs`, `RunExplore::call`).
+
 ### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
 The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
 tracker pointer. Direction settled 2026-06-25 (w/ Amy): **stay OSS / GitHub-native** —

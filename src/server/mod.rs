@@ -2837,6 +2837,12 @@ delivered per tool:
   (png/jpeg/gif/webp) ride as native image parts and want a vision-capable model
   (`kaibo://config` shows each slot's `vision`).
 
+The explorer can attach too, mid-sweep: a `consult`/`deliberate` investigator that finds a
+file where the whole thing IS the evidence can route its real bytes straight to whoever
+reads its report — the `consult` answer, or a `deliberate` dossier — without transcribing
+a span into its own report first. You never call this yourself; it's the explorer's own
+tool (`[defaults] max_attachments`, default 32 files per sweep, `0` turns it off).
+
 Prefer whole files to excerpts, and a prose summary of *intent* to a raw paste — your
 intent is the part kaibo can't recover from the source itself. **Reviewing a change?**
 Lead with the whole files it touched and describe what you did; the answering models tend
