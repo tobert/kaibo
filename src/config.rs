@@ -3735,7 +3735,7 @@ mod tests {
     }
 
     /// A new backend must declare a kind; redeclaring a different kind on an
-    /// existing one is a loud error; base_url is openai/anthropic-kind only.
+    /// existing one is a loud error; base_url is openai/anthropic/gemini-kind only.
     #[test]
     fn backend_stanza_validation_is_loud() {
         let err = Config::from_toml_str("[backends.mine]\nbase_url = \"http://x\"\n")
