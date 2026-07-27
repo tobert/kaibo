@@ -207,6 +207,13 @@ pub(crate) fn render_config_resource(
         /// absent on every other kind.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_collection: Option<&'static str>,
+        /// openai kind only: the *resolved* interactive request wire —
+        /// `"responses"` or `"chat"` (see [`crate::config::Backend::uses_responses_wire`]).
+        /// An explicit `wire` config value renders as itself; unset renders the
+        /// endpoint-exact heuristic's answer, so the effective shape is always
+        /// visible even when nothing was configured. Absent on every other kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wire: Option<&'static str>,
     }
 
     /// One cast slot: the `"backend/id"` ref plus its *resolved* capabilities
@@ -262,6 +269,7 @@ pub(crate) fn render_config_resource(
                 key_optional,
                 request_timeout,
                 data_collection,
+                wire: _,
             } = b;
             let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
                 Some(b.resolved_base_url())
@@ -281,6 +289,16 @@ pub(crate) fn render_config_resource(
                         crate::config::DataCollection::Deny => "deny",
                         crate::config::DataCollection::Allow => "allow",
                     }),
+                // Resolved, not raw: an unset `wire` still has an effective shape
+                // (the endpoint-exact heuristic), so render what the backend will
+                // actually do, not just what was configured.
+                wire: (*kind == crate::credentials::ProviderKind::Openai).then_some(
+                    if b.uses_responses_wire() {
+                        "responses"
+                    } else {
+                        "chat"
+                    },
+                ),
             };
             (name.clone(), doc)
         })
@@ -321,12 +339,17 @@ pub(crate) fn render_config_resource(
                         &slot.id,
                         thinking_style.unwrap_or_default(),
                     );
-                    let hosted_openai = backend.is_hosted_openai();
+                    // The interactive shape a slot's arm will actually build under
+                    // (`Arm::from_slot`) follows `uses_responses_wire`, not the
+                    // narrower `is_hosted_openai` platform gate — a responses-wire
+                    // gateway shapes its inert tunables the same way hosted OpenAI
+                    // Platform does, even though it isn't batch-eligible.
+                    let responses_wire = backend.uses_responses_wire();
                     let mut inert_tunables = Vec::new();
                     let effort_sinks = shape.sinks_effort()
-                        || (hosted_openai
+                        || (responses_wire
                             && crate::consult::hosted_openai_accepts_reasoning(&slot.id));
-                    let sampling_sinks = if hosted_openai {
+                    let sampling_sinks = if responses_wire {
                         crate::consult::hosted_openai_accepts_sampling(&slot.id)
                     } else {
                         shape.sinks_sampling()
@@ -612,6 +635,59 @@ mod tests {
             inert("gpt_chat", "synth"),
             vec!["thinking_budget", "effort"],
             "hosted GPT chat sinks sampling but rejects reasoning effort and budget"
+        );
+    }
+
+    /// `kaibo://config` renders each openai-kind backend's *resolved* wire — the
+    /// answer `uses_responses_wire` gives, not the raw configured value — so an
+    /// unset `wire` still shows an effective shape. Absent on every other kind.
+    #[test]
+    fn config_render_shows_resolved_wire_for_openai_backends() {
+        let config = Config::from_toml_str(
+            r#"
+            [backends.gpt]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+
+            [backends.gateway]
+            kind = "openai"
+            base_url = "https://llm-gateway.example.internal/v1"
+            wire = "responses"
+
+            [backends.onprem]
+            kind = "openai"
+            base_url = "http://localhost:13399/api/v1"
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let wire = |name: &str| -> Option<String> {
+            doc.get("backends")
+                .and_then(|b| b.get(name))
+                .and_then(|b| b.get("wire"))
+                .and_then(|w| w.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            wire("gpt").as_deref(),
+            Some("responses"),
+            "unset wire on OpenAI Platform's own endpoint resolves to responses"
+        );
+        assert_eq!(
+            wire("gateway").as_deref(),
+            Some("responses"),
+            "an explicit wire = \"responses\" renders as configured"
+        );
+        assert_eq!(
+            wire("onprem").as_deref(),
+            Some("chat"),
+            "unset wire on a local server resolves to chat"
+        );
+        assert_eq!(
+            wire("anthropic"),
+            None,
+            "wire is absent on every non-openai kind"
         );
     }
 

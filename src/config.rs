@@ -401,6 +401,38 @@ impl std::str::FromStr for DataCollection {
     }
 }
 
+/// Which request shape an `openai`-kind backend speaks for interactive calls:
+/// rig's Responses client (`/v1/responses`) or the OpenAI-compatible Chat
+/// Completions client (`/v1/chat/completions`). Optional per backend — unset
+/// falls back to the endpoint-exact heuristic
+/// ([`Backend::uses_responses_wire`]). Exists only on the `openai` kind (a load
+/// error elsewhere); see that method for the precedence rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenaiWire {
+    /// rig's Responses client. Needed behind an OpenAI-compatible gateway/proxy
+    /// that implements `/v1/responses` — current GPT-5.x reasoning models reject
+    /// Chat Completions' `max_tokens` outright (`unsupported_parameter`).
+    Responses,
+    /// The OpenAI-compatible Chat Completions client — the default shape for a
+    /// local server or a gateway that doesn't proxy `/v1/responses`.
+    Chat,
+}
+
+impl std::str::FromStr for OpenaiWire {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "responses" => Ok(Self::Responses),
+            "chat" => Ok(Self::Chat),
+            other => bail!(
+                "wire {other:?} is not a request shape — use \"responses\" (rig's \
+                 Responses client, for a backend that implements /v1/responses) or \
+                 \"chat\" (OpenAI-compatible Chat Completions)"
+            ),
+        }
+    }
+}
+
 /// A connection: how kaibo reaches one provider endpoint. The `kind` is the wire
 /// protocol (the closed [`ProviderKind`] enum — the one place "provider" still
 /// means something); everything else describes the wire: endpoint, key source,
@@ -436,6 +468,11 @@ pub struct Backend {
     /// Deny by default on every kind; only an openrouter-kind backend may set it,
     /// and only the openrouter arm reads it.
     pub data_collection: DataCollection,
+    /// `openai` kind only: an explicit override of which request shape this
+    /// backend's interactive calls use (see [`OpenaiWire`]). `None` (the common
+    /// case) defers to [`Backend::uses_responses_wire`]'s endpoint-exact
+    /// heuristic. Only an openai-kind backend may set it.
+    pub wire: Option<OpenaiWire>,
 }
 
 impl Backend {
@@ -497,13 +534,45 @@ impl Backend {
     }
 
     /// True for a generic `openai` backend that is explicitly aimed at OpenAI
-    /// Platform. This is the narrow capability seam that lets kaibo use OpenAI's
-    /// first-party Responses shape for hosted GPT models while preserving the
-    /// local/OpenAI-compatible `/chat/completions` path for `openai-local` and
-    /// gateways that do not implement `/responses`.
+    /// Platform's exact endpoint. This is the **batch/platform-lane gate**
+    /// (`batch.rs`'s `batch_supported`/`require_hosted`) — it stays endpoint-exact
+    /// and does *not* follow an explicit `wire` override, because a gateway that
+    /// faithfully proxies `/v1/responses` (see [`Backend::uses_responses_wire`])
+    /// does not thereby proxy `/v1/batches` or the Files API. The two predicates
+    /// share the same endpoint check (below) but answer different questions: this
+    /// one is "is this OpenAI Platform itself", `uses_responses_wire` is "which
+    /// interactive request shape does this backend want".
     pub fn is_hosted_openai(&self) -> bool {
-        self.kind == ProviderKind::Openai
-            && self.resolved_base_url().trim_end_matches('/') == credentials::HOSTED_OPENAI_BASE_URL
+        self.kind == ProviderKind::Openai && self.is_openai_platform_endpoint()
+    }
+
+    /// The shared endpoint-exact check both `is_hosted_openai` and
+    /// `uses_responses_wire`'s unset-`wire` fallback are built on: does this
+    /// backend's resolved base URL match OpenAI Platform's, trailing slash
+    /// normalized. Private — callers want one of the two capability questions
+    /// above it, not the raw endpoint comparison.
+    fn is_openai_platform_endpoint(&self) -> bool {
+        self.resolved_base_url().trim_end_matches('/') == credentials::HOSTED_OPENAI_BASE_URL
+    }
+
+    /// Whether this backend's interactive calls use rig's Responses client
+    /// (`/v1/responses`) rather than OpenAI-compatible Chat Completions. An
+    /// explicit `wire` wins — `"responses"` opts a gateway in, `"chat"` opts even
+    /// OpenAI Platform itself out (cheap, symmetric, no known use case blocked).
+    /// Unset falls back to the endpoint-exact heuristic: hosted OpenAI Platform
+    /// gets Responses, everything else gets Chat Completions — today's behavior,
+    /// preserved for anyone who hasn't set the knob. This is deliberately *not*
+    /// [`Backend::is_hosted_openai`]: that one gates batch eligibility and must
+    /// not follow an interactive-only override (see its doc).
+    pub fn uses_responses_wire(&self) -> bool {
+        if self.kind != ProviderKind::Openai {
+            return false;
+        }
+        match self.wire {
+            Some(OpenaiWire::Responses) => true,
+            Some(OpenaiWire::Chat) => false,
+            None => self.is_openai_platform_endpoint(),
+        }
     }
 
     /// Whether this backend has a usable credential, judged *without* committing to a
@@ -1547,6 +1616,8 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         // Deny is the only safe default: kaibo's prompts carry source code, and
         // routing them to a data-collecting host must be an explicit choice.
         data_collection: DataCollection::Deny,
+        // Unset defers to the endpoint-exact heuristic (`uses_responses_wire`).
+        wire: None,
     }
 }
 
@@ -1878,6 +1949,8 @@ struct RawBackend {
     key_optional: Option<bool>,
     request_timeout_secs: Option<u64>,
     data_collection: Option<String>,
+    /// `openai` kind only — see [`OpenaiWire`]. A load error on any other kind.
+    wire: Option<String>,
 }
 
 impl RawBackend {
@@ -1929,6 +2002,23 @@ impl RawBackend {
             b.data_collection = v.parse().with_context(|| {
                 format!("backend {:?} data_collection", b.name)
             })?;
+        }
+        if let Some(v) = &self.wire {
+            // The knob only exists on the openai kind — naming it anywhere else
+            // is a config mistake worth a loud error, same discipline as
+            // data_collection above.
+            if b.kind != ProviderKind::Openai {
+                bail!(
+                    "backend {:?} (kind {:?}) sets wire, but only the `openai` kind \
+                     has a configurable request wire (chat completions vs. responses)",
+                    b.name,
+                    b.kind
+                );
+            }
+            b.wire = Some(
+                v.parse()
+                    .with_context(|| format!("backend {:?} wire", b.name))?,
+            );
         }
         Ok(())
     }
@@ -3789,6 +3879,143 @@ mod tests {
         assert!(cfg.backends["gpt"].is_hosted_openai());
         assert!(!cfg.backends["localish"].is_hosted_openai());
         assert!(!cfg.backends["anthropic"].is_hosted_openai());
+    }
+
+    /// `wire` parses on the openai kind and sticks as the typed enum.
+    #[test]
+    fn wire_knob_parses_on_openai_kind() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.gateway]
+            kind = "openai"
+            base_url = "https://llm-gateway.example.internal/v1"
+            wire = "responses"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.backends["gateway"].wire,
+            Some(OpenaiWire::Responses),
+            "the knob must parse and stick on the backend"
+        );
+    }
+
+    /// `wire` only exists on the openai kind — setting it anywhere else is a
+    /// config mistake refused at load, same discipline as `data_collection`.
+    #[test]
+    fn wire_knob_is_openai_only() {
+        for kind in ["anthropic", "deepseek"] {
+            let err = Config::from_toml_str(&format!(
+                r#"
+                [backends.{kind}]
+                wire = "responses"
+                "#
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("wire") && msg.contains("openai"),
+                "kind {kind}, got: {msg}"
+            );
+        }
+    }
+
+    /// A `wire` value outside the two-value vocabulary is a loud load error naming
+    /// both legal spellings — a typo shouldn't silently fall back to the
+    /// endpoint-exact heuristic and leave the operator wondering why GPT-5.x still
+    /// fails.
+    #[test]
+    fn wire_knob_rejects_an_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.gateway]
+            kind = "openai"
+            base_url = "https://llm-gateway.example.internal/v1"
+            wire = "streaming"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("responses") && msg.contains("chat"),
+            "got: {msg}"
+        );
+    }
+
+    /// `uses_responses_wire`'s full precedence table: unset defers to the
+    /// endpoint-exact heuristic (trailing slash normalized either way); an
+    /// explicit `wire` overrides it in both directions — `"responses"` opts a
+    /// gateway in, `"chat"` opts even OpenAI Platform's own endpoint out; and a
+    /// non-openai kind is always false regardless of `wire` (which it can't set).
+    /// Mirrors `hosted_openai_detection_is_endpoint_exact`, but for the
+    /// interactive-wire predicate rather than the batch/platform gate.
+    #[test]
+    fn uses_responses_wire_precedence() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.gpt]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+
+            [backends.gpt-slash]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1/"
+
+            [backends.localish]
+            kind = "openai"
+            base_url = "http://localhost:13305/api/v1"
+
+            [backends.gateway]
+            kind = "openai"
+            base_url = "https://llm-gateway.example.internal/v1"
+            wire = "responses"
+
+            [backends.gpt-forced-chat]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+            wire = "chat"
+
+            [casts.x]
+            synth = "gpt/gpt-5.6-sol"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            cfg.backends["gpt"].uses_responses_wire(),
+            "unset + api.openai.com is Responses"
+        );
+        assert!(
+            cfg.backends["gpt-slash"].uses_responses_wire(),
+            "unset + api.openai.com/ (trailing slash) is still Responses"
+        );
+        assert!(
+            !cfg.backends["localish"].uses_responses_wire(),
+            "unset + a local server is Chat Completions"
+        );
+        assert!(
+            cfg.backends["gateway"].uses_responses_wire(),
+            "wire = \"responses\" opts a gateway in even though it isn't Platform"
+        );
+        assert!(
+            !cfg.backends["gpt-forced-chat"].uses_responses_wire(),
+            "wire = \"chat\" opts OpenAI Platform's own endpoint out"
+        );
+        assert!(
+            !cfg.backends["anthropic"].uses_responses_wire(),
+            "a non-openai kind is always false"
+        );
+
+        // The batch/platform gate (`is_hosted_openai`) must NOT follow the
+        // `wire` override: a responses-wire gateway is still not OpenAI Platform,
+        // and forcing chat on Platform's own endpoint doesn't relocate it either.
+        assert!(
+            !cfg.backends["gateway"].is_hosted_openai(),
+            "wire = \"responses\" must not make a gateway batch-eligible"
+        );
+        assert!(
+            cfg.backends["gpt-forced-chat"].is_hosted_openai(),
+            "wire = \"chat\" doesn't move OpenAI Platform's own endpoint"
+        );
     }
 
     /// A backend name containing '/' is refused at load. Both the slot ref

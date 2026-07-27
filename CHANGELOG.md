@@ -24,6 +24,15 @@ the git log. Each later release appends a new section at the top.
 
 ### Added
 
+- **GPT-5.x is now usable behind OpenAI-compatible gateways via `wire = "responses"`.**
+  A new per-backend `[backends.<name>]` knob (`openai` kind only) picks the interactive
+  request shape explicitly: `"responses"` for rig's Responses client, `"chat"` for
+  OpenAI-compatible Chat Completions. It's optional — unset still infers the shape from
+  the endpoint, exactly as before — and exists for a gateway/proxy that implements the
+  Responses API at `/v1/responses` (verified against a real gateway) without sitting at
+  OpenAI Platform's own URL: without it, current GPT-5.x reasoning models reject Chat
+  Completions' `max_tokens` outright. `wire` never affects batch eligibility, which stays
+  Platform-only.
 - **Hosted OpenAI Platform backends now use the Responses API for interactive GPT calls.**
   A `kind = "openai"` backend pointed exactly at `https://api.openai.com/v1` can run
   current GPT-5.6 models through `oneshot` and `consult`, including image attachment and

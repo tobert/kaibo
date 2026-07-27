@@ -480,6 +480,17 @@ in the module doc and `docs/devlog.md`. What's left:
   arm plus a hosted-ness predicate beside `is_hosted_openai`, not a refactor. Do it when the
   first such backend shows up, not before — the `anthropic` kind already permits a custom
   `base_url` (`AnthropicBatch::base_url`), so the predicate needs deciding, not discovering.
+- **Batch on a `wire = "responses"` gateway needs its own per-backend capability
+  decision.** Landed 2026-07-27 alongside the `wire` knob (`Backend::uses_responses_wire`,
+  `config.rs`): an openai-kind backend can now opt an OpenAI-compatible gateway into the
+  Responses shape for *interactive* calls without it sitting at OpenAI Platform's exact
+  URL. Deliberately kept separate from batch — `is_hosted_openai` (the
+  `batch_supported`/`require_hosted` gate) stays endpoint-exact and does not follow
+  `wire`, because a gateway proxying `/v1/responses` doesn't necessarily proxy
+  `/v1/batches` or the Files API. If a responses-wire gateway that *does* faithfully
+  proxy batch shows up, it needs its own opt-in (a `batch = true` on the backend,
+  say) rather than silently riding in on `wire = "responses"` — same "decide when the
+  backend shows up" posture as the `anthropic` note above.
 - **The many-casts fork.** `batch_submit` today is many-prompts/**one**-cast (one
   provider batch). The diverse-opinion panel — one question across **many** casts — is N
   provider batches under a composite handle; deferred. The provenance footer already

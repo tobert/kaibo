@@ -262,13 +262,19 @@ impl Arm {
             Some(t.top_p),
             &t.effort,
         );
-        let hosted_openai = backend.is_hosted_openai();
-        let params = if hosted_openai {
+        // Interactive wire selection: an explicit per-backend `wire` wins; unset
+        // falls back to the endpoint-exact heuristic (today's behavior). This is
+        // deliberately `uses_responses_wire`, not the narrower `is_hosted_openai` —
+        // that one gates batch eligibility and must stay endpoint-exact (see its
+        // doc in `config.rs`), while this call site only builds the interactive
+        // request shape.
+        let responses_wire = backend.uses_responses_wire();
+        let params = if responses_wire {
             super::shaping::hosted_openai_responses_params(&slot.id, Some(t.top_p), &t.effort)
         } else {
             params
         };
-        let typed_temperature = if hosted_openai {
+        let typed_temperature = if responses_wire {
             super::shaping::hosted_openai_responses_temperature(&slot.id, t.temperature)
         } else {
             None
@@ -345,7 +351,7 @@ impl Arm {
                 // returns the configured key or a placeholder the server ignores.
                 let base_url = backend.resolved_base_url();
                 let key = backend.resolve_key()?;
-                if hosted_openai {
+                if responses_wire {
                     let client = openai::Client::builder()
                         .api_key(&key)
                         .base_url(&base_url)
@@ -3315,6 +3321,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot {
             vision: Some(true),
@@ -3366,6 +3373,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         assert!(
             backend.is_hosted_openai(),
@@ -3403,6 +3411,54 @@ mod tests {
         );
     }
 
+    /// An OpenAI-compatible gateway that faithfully proxies `/v1/responses` (verified
+    /// against a real gateway) is not OpenAI Platform's own endpoint, so the
+    /// endpoint-exact heuristic alone would leave it on Chat Completions — starving
+    /// current GPT-5.x reasoning models, which reject `max_tokens` outright. An
+    /// explicit `wire = "responses"` on the backend opts it into the same
+    /// Responses-shaped arm hosted OpenAI Platform gets, without the gateway needing
+    /// to sit at Platform's exact URL.
+    #[test]
+    fn responses_wire_gateway_arm_uses_responses_shape() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "gateway".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some("https://llm-gateway.example.internal/v1".into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+            wire: Some(crate::config::OpenaiWire::Responses),
+        };
+        assert!(
+            !backend.is_hosted_openai(),
+            "fixture must NOT be OpenAI Platform itself — that's the whole point"
+        );
+        assert!(
+            backend.uses_responses_wire(),
+            "the explicit wire override selects the Responses shape"
+        );
+        let slot = ModelSlot {
+            effort: Some("high".into()),
+            ..ModelSlot::bare("gateway", "gpt-5.6-sol")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a responses-wire gateway arm builds offline with a placeholder key");
+        assert_eq!(arm.model, "gpt-5.6-sol");
+        let params = arm.params.expect("responses-wire gateway sends Responses params");
+        assert_eq!(
+            params["reasoning"]["effort"], "high",
+            "reasoning effort reaches the gateway the same way it reaches Platform"
+        );
+        assert!(
+            params.get("max_tokens").is_none() && params.get("max_completion_tokens").is_none(),
+            "the Responses client maps core max_tokens to max_output_tokens, not \
+             the Chat Completions field GPT-5.x rejects"
+        );
+    }
+
     /// Older hosted GPT chat models keep sampling: the same Responses seam is used,
     /// but model-aware shaping routes temperature through rig's typed field and
     /// `top_p` through Responses additional parameters.
@@ -3418,6 +3474,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot {
             temperature: Some(0.4),
@@ -3459,6 +3516,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot::bare("anthropic", "claude-sonnet-4-6");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
@@ -3496,6 +3554,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot {
             temperature: Some(0.3),
@@ -3543,6 +3602,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: crate::config::DataCollection::Allow,
+            wire: None,
         };
         let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
@@ -3578,6 +3638,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot {
             effort: Some("none".into()),
@@ -3655,6 +3716,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot::bare("anthropic", "claude-haiku-4-5");
         let err = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults)
@@ -3686,6 +3748,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
         if let Err(e) = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults) {
