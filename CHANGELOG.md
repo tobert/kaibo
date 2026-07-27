@@ -39,6 +39,13 @@ the git log. Each later release appends a new section at the top.
   judged per **backend** rather than per provider kind, because only OpenAI Platform serves
   `/v1/batches` — a `lane = "batch"` synth on a local OpenAI-compatible server is refused at
   config load with the fix named, instead of 404ing at submit time.
+- **The gemini backend can now dial a Gemini-API-compatible gateway/proxy.** Setting
+  `base_url` on a `kind = "gemini"` backend used to be a load error; it now works the
+  same way it already does on the anthropic kind — unset still resolves to Google's
+  own endpoint, set it points both interactive (`consult`/`oneshot`) and batch calls
+  at your gateway instead. The value is a host root (matching rig's own client and
+  the anthropic kind's convention), not a versioned path — kaibo appends the
+  `/v1beta` version segment the batch lane needs on its own.
 - `docs/openai-api-plan.md`, a living plan for making hosted OpenAI a first-class kaibo
   backend and clarifying that kaibo's OpenAI model calls use OpenAI Platform API keys, not
   Codex subscription entitlement.

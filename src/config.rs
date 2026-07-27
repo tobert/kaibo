@@ -1107,17 +1107,23 @@ impl Config {
                     b.name
                 );
             }
-            // A base_url on a keyed kind: rig fixes those endpoints — except Anthropic,
-            // which also accepts one (for an Anthropic-Messages-API-compatible
+            // A base_url on a keyed kind: rig fixes those endpoints — except Anthropic
+            // and Gemini, which also accept one (for an Anthropic/Gemini-API-compatible
             // gateway/proxy in front of the real backend), optionally: unset still
-            // dials rig's built-in https://api.anthropic.com.
+            // dials rig's built-in https://api.anthropic.com /
+            // https://generativelanguage.googleapis.com. Both contracts are a HOST
+            // ROOT — rig's `ClientBuilder::base_url` appends its own versioned path
+            // (`/v1beta/models/...` for Gemini) rather than taking one baked in; see
+            // `GeminiBatch::base_url` (`batch.rs`) for the batch lane's matching
+            // reconciliation.
             if b.kind != ProviderKind::Openai
                 && b.kind != ProviderKind::Anthropic
+                && b.kind != ProviderKind::Gemini
                 && b.base_url.is_some()
             {
                 bail!(
-                    "backend {:?} (kind {:?}) sets base_url, but only the `openai` and \
-                     `anthropic` kinds have a configurable endpoint",
+                    "backend {:?} (kind {:?}) sets base_url, but only the `openai`, \
+                     `anthropic`, and `gemini` kinds have a configurable endpoint",
                     b.name,
                     b.kind
                 );
@@ -1537,8 +1543,8 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         kind,
         // No base_url baked in: `resolved_base_url` supplies the default (or
         // OPENAI_BASE_URL, for the openai kind) at use-time, keeping construction
-        // pure. Every keyed kind except anthropic rejects an explicit base_url
-        // at load (see the validation loop above); anthropic's is optional.
+        // pure. Every keyed kind except anthropic and gemini rejects an explicit
+        // base_url at load (see the validation loop above); theirs is optional.
         base_url: None,
         api_key_env: Some(kind.env_var().to_string()),
         api_key_file: Some(format!("~/{}", kind.key_file_name())),
@@ -3742,18 +3748,22 @@ mod tests {
             .to_string();
         assert!(err.contains("already exists as kind"), "got: {err}");
 
-        // A keyed kind other than anthropic still rejects base_url — rig fixes
-        // that endpoint.
-        let err = Config::from_toml_str("[backends.gemini]\nbase_url = \"http://x\"\n")
+        // A keyed kind other than anthropic/gemini still rejects base_url — rig
+        // fixes that endpoint.
+        let err = Config::from_toml_str("[backends.deepseek]\nbase_url = \"http://x\"\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("only the `openai` and `anthropic` kinds"), "got: {err}");
+        assert!(
+            err.contains("only the `openai`, `anthropic`, and `gemini` kinds"),
+            "got: {err}"
+        );
     }
 
-    /// The anthropic kind, uniquely among the keyed kinds, may set base_url — for
-    /// an Anthropic-Messages-API-compatible gateway/proxy in front of the real
-    /// backend. Unset still resolves to rig's built-in api.anthropic.com (proven
-    /// by the builtin_anthropic_cast_and_backend-style tests having no base_url).
+    /// The anthropic kind, uniquely among the *original* keyed kinds, may set
+    /// base_url — for an Anthropic-Messages-API-compatible gateway/proxy in front
+    /// of the real backend. Unset still resolves to rig's built-in
+    /// api.anthropic.com (proven by the builtin_anthropic_cast_and_backend-style
+    /// tests having no base_url).
     #[test]
     fn anthropic_backend_accepts_a_base_url() {
         let cfg = Config::from_toml_str(
@@ -3762,6 +3772,25 @@ mod tests {
         .unwrap();
         let b = cfg.backends.get("anthropic").unwrap();
         assert_eq!(b.base_url.as_deref(), Some("http://ai.example.ts.net"));
+    }
+
+    /// The gemini kind may also set base_url — for a Gemini-API-compatible
+    /// gateway/proxy in front of the real backend (rig's Gemini `ClientBuilder`
+    /// exposes `.base_url(..)` the same as Anthropic's). Unset still resolves to
+    /// rig's built-in https://generativelanguage.googleapis.com. The contract is
+    /// a HOST ROOT, mirroring the anthropic kind and rig's own builder — not a
+    /// versioned path (see `GeminiBatch::base_url` in `batch.rs` for why).
+    #[test]
+    fn gemini_backend_accepts_a_base_url() {
+        let cfg = Config::from_toml_str(
+            "[backends.gemini]\nbase_url = \"https://llm-gateway.example.internal\"\n",
+        )
+        .unwrap();
+        let b = cfg.backends.get("gemini").unwrap();
+        assert_eq!(
+            b.base_url.as_deref(),
+            Some("https://llm-gateway.example.internal")
+        );
     }
 
     /// Hosted OpenAI is still `kind = "openai"`, but the first-party endpoint is

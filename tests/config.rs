@@ -614,17 +614,21 @@ fn alias_collisions_are_loud_at_each_level() {
 #[test]
 fn base_url_on_a_keyed_backend_is_rejected() {
     // rig fixes most keyed kinds' endpoints; a base_url there is a config mistake.
-    // (Anthropic is the one exception — see `anthropic_backend_accepts_a_base_url`.)
+    // (Anthropic and gemini are the exceptions — see
+    // `anthropic_backend_accepts_a_base_url` / `gemini_backend_accepts_a_base_url`.)
     let err = Config::from_toml_str(
         r#"
-        [backends.gemini]
+        [backends.deepseek]
         base_url = "https://example.test/v1"
         "#,
     )
     .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("base_url"), "got: {msg}");
-    assert!(msg.contains("only the `openai` and `anthropic` kinds"), "got: {msg}");
+    assert!(
+        msg.contains("only the `openai`, `anthropic`, and `gemini` kinds"),
+        "got: {msg}"
+    );
 }
 
 #[test]
@@ -640,6 +644,24 @@ fn anthropic_backend_accepts_a_base_url() {
     .unwrap();
     let b = cfg.backends.get("anthropic").unwrap();
     assert_eq!(b.base_url.as_deref(), Some("https://example.test/v1"));
+}
+
+#[test]
+fn gemini_backend_accepts_a_base_url() {
+    // Gemini may also point at a compatible gateway/proxy instead of
+    // generativelanguage.googleapis.com — a HOST ROOT, same contract as anthropic's.
+    let cfg = Config::from_toml_str(
+        r#"
+        [backends.gemini]
+        base_url = "https://llm-gateway.example.internal"
+        "#,
+    )
+    .unwrap();
+    let b = cfg.backends.get("gemini").unwrap();
+    assert_eq!(
+        b.base_url.as_deref(),
+        Some("https://llm-gateway.example.internal")
+    );
 }
 
 #[test]

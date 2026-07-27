@@ -72,10 +72,15 @@ Connection knobs only — models never live here:
   A *new* openai-kind backend must set it: the `OPENAI_BASE_URL`/local-default
   fallback belongs to the built-in `openai-local` backend alone, so a forgotten
   `base_url` is a load error, not a silent dial of the wrong server. It is also
-  meaningful — but *optional* — for `kind = "anthropic"`: unset still resolves to
-  rig's built-in `https://api.anthropic.com`; set, it points the Anthropic wire
-  protocol at any Anthropic-Messages-API-compatible gateway/proxy instead (a
-  corporate LLM gateway, say). For every *other* keyed kind rig fixes the
+  meaningful — but *optional* — for `kind = "anthropic"` and `kind = "gemini"`:
+  unset still resolves to rig's built-in `https://api.anthropic.com` /
+  `https://generativelanguage.googleapis.com`; set, it points that wire protocol
+  at an Anthropic/Gemini-API-compatible gateway/proxy instead (a corporate LLM
+  gateway, say). Both contracts are a HOST ROOT, not a versioned path — rig's own
+  `ClientBuilder` appends its provider-specific path (Gemini's
+  `/v1beta/models/...`) itself, and the batch lane's `GeminiBatch` versions a
+  configured host root with `/v1beta` the same way, so one address serves both
+  the interactive and batch paths. For every *other* keyed kind rig fixes the
   endpoint, so a `base_url` there is a config error, surfaced loudly — not
   silently ignored.
 - A backend resolves its key from `api_key_env` then `api_key_file` (env wins).
@@ -303,7 +308,7 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 |---|---|---|---|---|
 | `anthropic` | anthropic | — *(optional)* | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
 | `deepseek` | deepseek | — | `DEEPSEEK_API_KEY` / `~/.deepseek-key` | — |
-| `gemini` | gemini | — | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
+| `gemini` | gemini | — *(optional, host root)* | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
 | `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
 
@@ -886,9 +891,9 @@ operator) the full picture:
   per-slot values below read as deltas against it)
 - `backends` — each connection: its kind, `base_url` (the *resolved* value for the
   openai kind — env/local-default fallback applied; the raw configured value,
-  when set, for the anthropic kind; absent for every other kind), key source env
-  var name and key file path (never the resolved key value), `key_optional`, and
-  `request_timeout_secs`
+  when set, for the anthropic and gemini kinds; absent for every other kind), key
+  source env var name and key file path (never the resolved key value),
+  `key_optional`, and `request_timeout_secs`
 - `backend_aliases` / `cast_aliases` — alias → canonical name, built-in and
   file-declared both: every name a `cast` param, slot ref, or per-call backend
   override will resolve
