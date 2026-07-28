@@ -3559,6 +3559,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         };
         let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
