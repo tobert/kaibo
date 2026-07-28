@@ -21,6 +21,7 @@ pub mod config;
 pub mod consult;
 pub mod context;
 pub mod credentials;
+pub mod discover;
 pub mod explorer;
 pub mod jobs;
 pub mod kaish_syntax;

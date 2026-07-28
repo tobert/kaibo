@@ -1539,6 +1539,9 @@ impl Config {
         if disable.batch {
             self.tools.batch = false;
         }
+        if disable.list_models {
+            self.tools.list_models = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -1567,6 +1570,7 @@ pub struct ToolDisables {
     pub oneshot: bool,
     pub run_kaish: bool,
     pub batch: bool,
+    pub list_models: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -1926,6 +1930,7 @@ struct RawTools {
     oneshot: Option<bool>,
     run_kaish: Option<bool>,
     batch: Option<bool>,
+    list_models: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2383,6 +2388,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         batch: raw.batch.unwrap_or(d.batch),
+        list_models: raw.list_models.unwrap_or(d.list_models),
     }
 }
 
@@ -2453,6 +2459,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_BATCH") {
         tools.batch = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_LIST_MODELS") {
+        tools.list_models = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);

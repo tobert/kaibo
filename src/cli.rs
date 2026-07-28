@@ -27,6 +27,7 @@
 //! tool description, so the top-level `about` front-loads what kaibo is and every
 //! flag doc earns its line (the "Writing for models" discipline).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -126,6 +127,9 @@ pub enum Command {
     Kaish(KaishArgs),
     /// Provider batch lanes — submit a fan-out, get results, list live/recovered handles.
     Batch(BatchArgs),
+    /// List available models a backend's provider actually serves — read-only model
+    /// discovery via the backend's real /models endpoint, no cast/model in the loop.
+    Models(ModelsArgs),
     /// Print the resolved runtime configuration (the `kaibo://config` document).
     Config,
     /// Print the guided "set up my models" walkthrough — the CLI equivalent of the
@@ -233,6 +237,9 @@ pub struct ServeGates {
     /// Don't advertise `batch_submit`. The shared job verbs stay while `consult` is on.
     #[arg(long)]
     pub no_batch: bool,
+    /// Don't advertise the `list_models` tool.
+    #[arg(long)]
+    pub no_list_models: bool,
 }
 
 impl ServeGates {
@@ -245,6 +252,7 @@ impl ServeGates {
             oneshot: self.no_oneshot,
             run_kaish: self.no_run_kaish,
             batch: self.no_batch,
+            list_models: self.no_list_models,
         }
     }
 }
@@ -463,6 +471,21 @@ pub struct BatchListArgs {
     pub all: bool,
 
     /// Emit a JSON object (entries + recovered handles + per-backend errors) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo models` — read-only model discovery: ask a backend's provider "what models
+/// do you have" through kaibo's already-configured auth, instead of hand-rolling a curl.
+/// No cast, no model in the loop — a pure operator/config query.
+#[derive(Args, Debug)]
+pub struct ModelsArgs {
+    /// Which backend (name or alias) to query. Omit to sweep every configured backend.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
+
+    /// Emit a JSON object (per-backend models, normalized fields + raw passthrough)
+    /// instead of prose.
     #[arg(long)]
     pub json: bool,
 }
@@ -1652,6 +1675,76 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
         }
     }
     Ok(EXIT_OK)
+}
+
+/// Run `kaibo models` — read-only model discovery, no cast/model in the loop. Returns
+/// the process exit code: 2/3 for a pre-flight config/setup rejection, 4 only when
+/// *every* queried backend's discovery call failed (a per-backend error inside an
+/// otherwise-successful sweep is reported inline and is NOT fatal — matching `batch
+/// list`'s inline-error convention), else 0.
+pub async fn run_models(common: CommonArgs, args: ModelsArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+
+    // An explicit --backend scopes to that one name/alias (resolved to its canonical
+    // name so the results map keys consistently); omitted sweeps every configured
+    // backend, sorted (BTreeMap order) same as `batch list`.
+    let names: Vec<String> = match args.backend.as_deref() {
+        Some(name) => match resolver.config.resolve_backend(name) {
+            Ok(b) => vec![b.name.clone()],
+            Err(e) => return fail_preflight(args.json, "usage", e.to_string(), EXIT_USAGE),
+        },
+        None => resolver.config.backends.keys().cloned().collect(),
+    };
+    if names.is_empty() {
+        return fail_preflight(
+            args.json,
+            "setup",
+            "no backend is configured".to_string(),
+            EXIT_SETUP,
+        );
+    }
+
+    let mut results: BTreeMap<String, Result<Vec<crate::discover::DiscoveredModel>, String>> =
+        BTreeMap::new();
+    for name in &names {
+        // Each name above already resolved once; re-resolving here is cheap and
+        // avoids holding a borrow of `resolver.config` across the `.await` below.
+        let Ok(backend) = resolver.config.resolve_backend(name) else {
+            continue;
+        };
+        let fetcher = crate::discover::HttpModelListFetcher::new(backend.request_timeout);
+        let outcome = crate::discover::discover_models(backend, &fetcher)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        results.insert(name.clone(), outcome);
+    }
+
+    if args.json {
+        println!("{}", crate::discover::models_json_envelope(&results));
+    } else {
+        println!("{}", crate::discover::render_models(&results));
+    }
+
+    if results.values().all(Result::is_err) {
+        EXIT_CONSULT_FAILURE
+    } else {
+        EXIT_OK
+    }
 }
 
 #[cfg(test)]

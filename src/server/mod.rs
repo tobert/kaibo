@@ -146,6 +146,10 @@ pub struct ToolGating {
     /// they're one capability (you can't get or list without submit), so `--no-batch`
     /// drops them together rather than a flag apiece.
     pub batch: bool,
+    /// Read-only model discovery (`list_models`) — an operator/config surface, not a
+    /// model-driven tool: no cast, no tool loop, just a GET per backend. Its own gate,
+    /// independent of the model-backed tools above.
+    pub list_models: bool,
 }
 
 impl Default for ToolGating {
@@ -157,6 +161,7 @@ impl Default for ToolGating {
             oneshot: true,
             run_kaish: true,
             batch: true,
+            list_models: true,
         }
     }
 }
@@ -170,6 +175,7 @@ impl ToolGating {
             && !self.oneshot
             && !self.run_kaish
             && !self.batch
+            && !self.list_models
     }
 }
 
@@ -492,6 +498,18 @@ pub struct RunKaishInput {
     pub path: Option<String>,
 }
 
+/// Arguments to `list_models`: an operator/config-surface tool, not a model-driven one
+/// (no cast, no tool loop — see `discover.rs`'s module doc). Omit `backend` to sweep
+/// every configured backend.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListModelsInput {
+    /// Which backend (name or alias) to query. Omit to sweep every configured backend.
+    /// `kaibo://config` lists the known backends.
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
 /// kaibo's MCP handler. Cheap to clone (rmcp clones it per request).
 #[derive(Clone)]
 pub struct KaiboHandler {
@@ -667,6 +685,9 @@ impl KaiboHandler {
                 gating.batch || gating.consult || gating.deliberate,
                 "job_wait",
             ),
+            // Read-only model discovery — its own gate, independent of every
+            // model-driven tool above.
+            (gating.list_models, "list_models"),
         ] {
             if !enabled {
                 assert!(
@@ -1694,6 +1715,54 @@ impl KaiboHandler {
         Ok(CallToolResult::success(vec![Content::text(format_output(
             &out,
         ))]))
+    }
+
+    #[tool(
+        description = "List available models a backend's provider actually serves — \
+            model discovery, read-only: which models can I use, what's the context \
+            window, is a new model out yet. Queries the backend's real /models \
+            endpoint (DeepSeek, OpenRouter, Anthropic, Gemini, or any OpenAI-compatible \
+            endpoint) with kaibo's already-configured auth, no `curl` + hand-rolled \
+            headers needed. Omit `backend` to sweep every configured backend at once. \
+            No cast, no model in the loop — a pure operator/config query, like \
+            `kaibo://config`."
+    )]
+    async fn list_models(
+        &self,
+        Parameters(input): Parameters<ListModelsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let names: Vec<String> = match input.backend {
+            Some(name) => {
+                // Confirm the name resolves before spending a network call on it —
+                // an unknown backend is a usage error, not a per-backend sweep entry.
+                let backend = self
+                    .config
+                    .resolve_backend(&name)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                vec![backend.name.clone()]
+            }
+            None => self.config.backends.keys().cloned().collect(),
+        };
+
+        let mut results: std::collections::BTreeMap<String, Result<Vec<crate::discover::DiscoveredModel>, String>> =
+            std::collections::BTreeMap::new();
+        for name in names {
+            // A backend resolved above always resolves again here (nothing mutates
+            // the registry mid-call); skip defensively rather than panic if that
+            // invariant ever changes.
+            let Ok(backend) = self.config.resolve_backend(&name) else {
+                continue;
+            };
+            let fetcher = crate::discover::HttpModelListFetcher::new(backend.request_timeout);
+            let outcome = crate::discover::discover_models(backend, &fetcher)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            results.insert(name, outcome);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            crate::discover::render_models(&results),
+        )]))
     }
 
     /// Resolve a cast's synth slot for batch: its slot + backend, plus the model's
@@ -3857,6 +3926,7 @@ mod tests {
                 explore: true,
                 oneshot: true,
                 run_kaish: true,
+                list_models: true,
             };
             KaiboHandler::new(config).expect("handler builds")
         };

@@ -89,6 +89,7 @@ pub(crate) fn render_config_resource(
         oneshot: bool,
         run_kaish: bool,
         batch: bool,
+        list_models: bool,
     }
 
     /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
@@ -394,6 +395,7 @@ pub(crate) fn render_config_resource(
         oneshot,
         run_kaish,
         batch,
+        list_models,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -448,6 +450,7 @@ pub(crate) fn render_config_resource(
             oneshot,
             run_kaish,
             batch,
+            list_models,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),

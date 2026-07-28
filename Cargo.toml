@@ -60,7 +60,12 @@ rig-core = { version = "0.38", default-features = false, features = ["reqwest", 
 # ourselves. Like the rig `image` feature, it pulled ZERO new crates (verified
 # 2026-07-25) and is crypto-free, so the aws-lc-free tree is untouched. Re-verify with
 # `cargo tree -i aws-lc-rs` (must stay empty) if either feature moves.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "multipart"] }
+#
+# `query` is for read-only model discovery (`src/discover.rs`): Gemini's models-list
+# authenticates via a `?key=` query param, not a header, so `RequestBuilder::query` is
+# how that GET is built. It pulls in exactly one new dependency, `serde_urlencoded`
+# (pure Rust, no C/TLS), so the aws-lc-free tree stays untouched.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "multipart", "query"] }
 # The crypto provider behind rustls, chosen explicitly: ring, not aws-lc-rs. ring
 # builds with no C toolchain or cmake, so `x86_64-unknown-linux-musl` (and friends)
 # link fully static out of the box. reqwest pins rustls `default-features = false`,

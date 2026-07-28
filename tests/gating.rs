@@ -12,8 +12,9 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// `batch` each carry a `*_submit` under their own flag; the collect verbs `job_get`/
 /// `job_cancel`/`job_list`/`job_wait` are *shared* — they manage both kinds of handle
 /// and stay advertised as long as either capability is on, so they belong to neither
-/// flag.
-const ALL_TOOLS: [&str; 11] = [
+/// flag. `list_models` is its own gate — a read-only operator/config tool, no model in
+/// the loop, independent of everything else here.
+const ALL_TOOLS: [&str; 12] = [
     "batch_submit",
     "consult",
     "consult_submit",
@@ -23,6 +24,7 @@ const ALL_TOOLS: [&str; 11] = [
     "job_get",
     "job_list",
     "job_wait",
+    "list_models",
     "oneshot",
     "run_kaish",
 ];
@@ -46,7 +48,7 @@ fn each_flag_removes_exactly_its_own_tools() {
     // `job_get`/`job_cancel`/`job_list` belong to neither flag alone — gating one
     // capability leaves them because the other still needs them — so they appear in no
     // row's removed-set and are covered by the "every other tool remains" check below.
-    let cases: [(&[&str], ToolGating); 6] = [
+    let cases: [(&[&str], ToolGating); 7] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
             // `job_get`/`job_cancel`/`job_list` stay (batch still uses them).
@@ -94,6 +96,15 @@ fn each_flag_removes_exactly_its_own_tools() {
             &["batch_submit"],
             ToolGating {
                 batch: false,
+                ..Default::default()
+            },
+        ),
+        (
+            // `--no-list-models` drops only `list_models` — an operator/config tool
+            // with no model in the loop, independent of every other gate.
+            &["list_models"],
+            ToolGating {
+                list_models: false,
                 ..Default::default()
             },
         ),
@@ -166,6 +177,7 @@ fn all_disabled_is_detected() {
         oneshot: false,
         run_kaish: false,
         batch: false,
+        list_models: false,
     };
     assert!(none_on.all_disabled());
     // Any single tool on means it's a usable server, not the refused state.
@@ -177,6 +189,13 @@ fn all_disabled_is_detected() {
     // The batch capability alone is enough to be a usable server.
     assert!(!ToolGating {
         batch: true,
+        ..none_on
+    }
+    .all_disabled());
+    // list_models alone is a usable (if narrow) server — a read-only operator tool
+    // with no model in the loop still does something.
+    assert!(!ToolGating {
+        list_models: true,
         ..none_on
     }
     .all_disabled());
@@ -200,6 +219,7 @@ fn all_tools_disabled_refuses_to_start() {
             "--no-oneshot",
             "--no-run-kaish",
             "--no-batch",
+            "--no-list-models",
         ])
         .output()
         .expect("should be able to run the kaibo binary");
