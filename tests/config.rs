@@ -1246,6 +1246,44 @@ fn key_optional_backend_falls_back_to_placeholder() {
 }
 
 #[test]
+fn key_optional_gemini_backend_resolves_to_an_empty_query_key() {
+    // Gemini authenticates with a `?key=` QUERY param, not a bearer header. A
+    // keyless Gemini backend must resolve to the EMPTY string so rig emits a bare
+    // `?key=` — which an ambient-auth gateway accepts — rather than the non-empty
+    // "no-auth" placeholder, which such a gateway forwards to Google and Google
+    // rejects (`API_KEY_INVALID`). Guards the keyless-gateway fix.
+    let b = Backend {
+        name: "gw-gemini".into(),
+        kind: ProviderKind::Gemini,
+        base_url: Some("http://gateway.internal".into()),
+        api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
+        api_key_file: None,
+        key_optional: true,
+        request_timeout: Duration::from_secs(900),
+        data_collection: Default::default(),
+        wire: None,
+    };
+    assert_eq!(
+        b.resolve_key().unwrap(),
+        "",
+        "a keyless Gemini backend must send an empty query key, not the bearer placeholder"
+    );
+}
+
+#[test]
+fn key_optional_non_gemini_backend_keeps_the_nonempty_placeholder() {
+    // The other keyless kinds authenticate with a bearer/x-api-key HEADER, where an
+    // empty value is rejected by some clients/servers — they must keep the non-empty
+    // placeholder. Pins that the Gemini carve-out above didn't leak to header-auth kinds.
+    let b = local_backend(None, true);
+    assert_eq!(b.resolve_key().unwrap(), PLACEHOLDER_OPENAI_KEY);
+    assert!(
+        !b.resolve_key().unwrap().is_empty(),
+        "header-auth keyless backends need a non-empty bearer placeholder"
+    );
+}
+
+#[test]
 fn key_optional_backend_with_a_present_but_empty_key_file_errors() {
     // The no-silent-fallback invariant: a key file that's THERE but empty is a
     // mistake, not "keyless" — it must error, not quietly use the placeholder.

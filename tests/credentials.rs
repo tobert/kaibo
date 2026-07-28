@@ -3,7 +3,9 @@
 use std::fs;
 use std::str::FromStr;
 
-use kaibo::credentials::{resolve, resolve_base_url, ProviderKind, DEFAULT_OPENAI_BASE_URL};
+use kaibo::credentials::{
+    resolve, resolve_base_url, ProviderKind, DEFAULT_OPENAI_BASE_URL, PLACEHOLDER_OPENAI_KEY,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -78,6 +80,28 @@ fn only_openai_tolerates_a_missing_key() {
     assert!(!ProviderKind::Gemini.key_optional());
     // OpenRouter is a *keyed* gateway — a missing key is a hard error, not tolerated.
     assert!(!ProviderKind::OpenRouter.key_optional());
+}
+
+#[test]
+fn placeholder_key_is_empty_only_for_gemini() {
+    // Gemini's `?key=` query auth wants an EMPTY keyless stand-in (rig emits a bare
+    // `?key=` an ambient-auth gateway accepts); every header-auth kind keeps the
+    // non-empty bearer placeholder a keyless server ignores. Exhaustive so a new
+    // provider forces a keyless-transport decision rather than defaulting silently.
+    assert_eq!(ProviderKind::Gemini.placeholder_key(), "");
+    for kind in [
+        ProviderKind::Anthropic,
+        ProviderKind::DeepSeek,
+        ProviderKind::OpenRouter,
+        ProviderKind::Openai,
+    ] {
+        assert_eq!(
+            kind.placeholder_key(),
+            PLACEHOLDER_OPENAI_KEY,
+            "{kind:?} authenticates with a header and needs a non-empty keyless stand-in"
+        );
+        assert!(!kind.placeholder_key().is_empty());
+    }
 }
 
 // --- OpenRouter: a keyed gateway (one key, fixed endpoint) fronting every model.

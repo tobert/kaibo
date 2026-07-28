@@ -60,6 +60,34 @@ impl ProviderKind {
         matches!(self, ProviderKind::Openai)
     }
 
+    /// The stand-in credential a `key_optional` backend sends when no real key is
+    /// configured — transport-shaped, because "keyless" looks different per wire.
+    /// Header-bearer kinds (OpenAI `Authorization: Bearer`, Anthropic `x-api-key`)
+    /// want a well-formed NON-EMPTY token a keyless server ignores; an empty bearer
+    /// is rejected by some clients/servers, hence [`PLACEHOLDER_OPENAI_KEY`].
+    /// Gemini authenticates with a `?key=` QUERY param, so its keyless stand-in is
+    /// the EMPTY string: rig then emits a bare `?key=`, which an ambient-auth gateway
+    /// (e.g. one gated by network identity) accepts, where a non-empty dummy would be
+    /// forwarded upstream to Google and rejected (`API_KEY_INVALID`). This is only
+    /// reached when the backend is genuinely keyless; a real Gemini key (required by
+    /// Google itself) always resolves ahead of this.
+    pub fn placeholder_key(self) -> &'static str {
+        // Exhaustive on purpose (no `_`): a new provider kind must consciously
+        // choose its keyless stand-in by wire, not inherit a default.
+        match self {
+            // Query-param (`?key=`) auth: keyless == empty, so rig emits a bare
+            // `?key=` an ambient-auth gateway accepts.
+            ProviderKind::Gemini => "",
+            // Header-bearer auth (`Authorization: Bearer` / `x-api-key`): a keyless
+            // server ignores the value, but an empty one is rejected by some
+            // clients/servers, so send a well-formed non-empty stand-in.
+            ProviderKind::Anthropic
+            | ProviderKind::DeepSeek
+            | ProviderKind::OpenRouter
+            | ProviderKind::Openai => PLACEHOLDER_OPENAI_KEY,
+        }
+    }
+
     /// The canonical lower-case name of this kind — the wire-protocol id used in
     /// kind listings and error messages, and (for the keyed kinds) the name of the
     /// built-in backend and cast, so a bare `--cast anthropic` resolves to the
