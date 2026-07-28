@@ -9,6 +9,12 @@
 //! The client controls verbosity with `logging/setLevel`; that lives in a shared
 //! atomic the drain reads per record (see [`server`](crate::server)).
 //!
+//! `LoggingLevel` and `LoggingMessageNotificationParam` are SEP-2577-deprecated
+//! upstream, but the MCP `notifications/message` channel is still kaibo's live
+//! logging surface — there is no replacement yet. We `#[expect(deprecated)]` the
+//! whole module until a successor ships.
+#![expect(deprecated)]
+//!
 //! Shape: a [`McpBridgeLayer`] sits in the subscriber stack and forwards
 //! kaibo-target events into an unbounded channel; after `serve()` a [`drain`] task
 //! holds the one stdio peer and turns each record into a notification, gated by the
@@ -114,11 +120,8 @@ impl LogRecord {
             // Don't let a stray `message`/`target` field clobber the canonical ones.
             data.entry(k).or_insert(v);
         }
-        LoggingMessageNotificationParam {
-            level: self.level,
-            logger: Some(KAIBO_TARGET.to_string()),
-            data: Value::Object(data),
-        }
+        LoggingMessageNotificationParam::new(self.level, Value::Object(data))
+            .with_logger(KAIBO_TARGET)
     }
 }
 

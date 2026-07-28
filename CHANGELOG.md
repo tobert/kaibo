@@ -13,6 +13,17 @@ the git log. Each later release appends a new section at the top.
 
 ### Changed
 
+- **MCP SDK upgraded to rmcp 3.0.0-beta.5.** kaibo now builds against the
+  3.0 beta line of the Rust MCP SDK, fixing a "connection closed" failure
+  where some MCP clients (including Crush) could not complete the handshake
+  against the prior 0.16 release. The upgrade adopts the SDK's new type
+  names (`Content` → `ContentBlock`, `RawResource` → `Resource`, etc.),
+  the MRTR result enums (`ReadResourceResponse` / `GetPromptResponse`),
+  builder-pattern constructors for now-`#[non_exhaustive]` structs
+  (`ServerInfo`, `Implementation`, `PromptArgument`,
+  `ProgressNotificationParam`), and the `RequestMetaObject` split for
+  request `_meta`. No user-facing tool behavior or wire shape changed.
+
 - **Configure guidance now calls out host-agent sandboxes.** `/kaibo:configure`,
   `kaibo configure`, and the setup docs now tell agents that kaibo needs outbound network
   to configured model APIs, writable access to its XDG state dir for persistent MCP
