@@ -24,6 +24,19 @@ the git log. Each later release appends a new section at the top.
 
 ### Added
 
+- **`list_models` (MCP tool) and `kaibo models` (CLI) — read-only model discovery.**
+  Ask kaibo what models a configured backend's provider actually serves instead of
+  hand-rolling a `curl` with the right auth header: it queries the backend's real
+  `/models` endpoint (DeepSeek, OpenRouter, Anthropic, Gemini, or any OpenAI-compatible
+  endpoint) with kaibo's already-configured auth and base URL, paginating where the
+  provider requires it. Output is normalized fields (id, display name, context window,
+  created, and — where the provider advertises it — per-token pricing, kept as the
+  provider's own strings rather than rounded floats) plus the provider's raw per-model
+  object. Omit `backend` to sweep every configured backend at once; `--json`/
+  `--no-list-models` follow the same conventions as every other tool, and the MCP tool
+  now also returns the `--json` envelope as `structured_content` alongside the prose, so
+  a machine caller doesn't have to parse the human-readable listing. No cast, no model
+  in the loop — a pure operator/config query, like `kaibo://config` or `batch list`.
 - **GPT-5.x is now usable behind OpenAI-compatible gateways via `wire = "responses"`.**
   A new per-backend `[backends.<name>]` knob (`openai` kind only) picks the interactive
   request shape explicitly: `"responses"` for rig's Responses client, `"chat"` for
