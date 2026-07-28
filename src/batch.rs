@@ -2152,6 +2152,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            wire: None,
         }
     }
 
@@ -3224,6 +3225,20 @@ mod tests {
         }
     }
 
+    /// An OpenAI-compatible gateway that proxies `/v1/responses` (`wire = "responses"`),
+    /// so its interactive calls take the Responses shape — but has no `/v1/batches` or
+    /// Files API behind it, so it must stay refused here regardless.
+    fn responses_wire_gateway_backend() -> Backend {
+        Backend {
+            name: "gateway".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some("https://llm-gateway.example.internal/v1".into()),
+            key_optional: true,
+            wire: Some(crate::config::OpenaiWire::Responses),
+            ..anthropic_backend()
+        }
+    }
+
     /// The `openai` kind's batch verdict is a *backend* property, not a kind property:
     /// same kind, opposite answers, decided by the base URL. This is the regression that
     /// matters — a kind-keyed check would hand a local server a batch lane it can't serve.
@@ -3235,6 +3250,26 @@ mod tests {
         let mut slashed = hosted_openai_backend();
         slashed.base_url = Some(format!("{}/", crate::credentials::HOSTED_OPENAI_BASE_URL));
         assert!(batch_supported(&slashed));
+    }
+
+    /// `wire = "responses"` is an interactive-shape override, not a batch-eligibility
+    /// grant: `is_hosted_openai` — the gate `batch_supported`/`require_hosted` actually
+    /// check — stays endpoint-exact regardless of `wire`. A gateway that proxies
+    /// `/v1/responses` does not necessarily proxy `/v1/batches` or the Files API, so it
+    /// must still be refused a batch lane.
+    #[test]
+    fn responses_wire_gateway_is_not_batch_eligible() {
+        let backend = responses_wire_gateway_backend();
+        assert!(
+            backend.uses_responses_wire(),
+            "fixture must select the Responses shape for interactive calls"
+        );
+        assert!(
+            !batch_supported(&backend),
+            "wire = \"responses\" must not make a gateway batch-eligible"
+        );
+        assert!(OpenaiBatch::from_backend(&backend).is_err());
+        assert!(poller(&backend).is_err());
     }
 
     /// Refusing a local openai backend names the *fix* (Platform's URL), not just the gap —

@@ -78,6 +78,21 @@ Connection knobs only — models never live here:
   corporate LLM gateway, say). For every *other* keyed kind rig fixes the
   endpoint, so a `base_url` there is a config error, surfaced loudly — not
   silently ignored.
+- **`wire`** (`kind = "openai"` only) picks the interactive request shape: `"responses"`
+  for rig's Responses client, `"chat"` for OpenAI-compatible Chat Completions. Optional
+  and normally unset — kaibo infers it from the endpoint (OpenAI Platform's exact URL
+  gets Responses, everything else gets Chat Completions), which is why hosted GPT and
+  local Gemma both already worked without this knob. It exists for the case the
+  heuristic can't see: an OpenAI-compatible gateway/proxy that implements the Responses
+  API at `/v1/responses` (verified against a real gateway) but doesn't sit at Platform's
+  URL. Current GPT-5.x reasoning models *require* Responses — they reject Chat
+  Completions' `max_tokens` outright (`unsupported_parameter`) — so `wire = "responses"`
+  is what makes them usable behind such a gateway. `wire = "chat"` is the symmetric
+  opt-out, including on Platform's own endpoint. Either setting is **interactive-only**:
+  it never changes batch eligibility (the batch-lane discussion under Casts below),
+  which stays keyed to the endpoint-exact check alone — a gateway proxying
+  `/v1/responses` doesn't necessarily proxy `/v1/batches` or the Files API. A `wire` on
+  any other kind is a load error, same discipline as `data_collection` below.
 - A backend resolves its key from `api_key_env` then `api_key_file` (env wins).
   **Secrets never live inline in the TOML** — only the *name* of an env var or the
   *path* to a key file. A config you can commit or paste shouldn't leak a key.
@@ -306,6 +321,10 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 | `gemini` | gemini | — | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
 | `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
+
+None of the built-ins set `wire` — it only matters for a new openai-kind backend
+whose endpoint isn't OpenAI Platform's own but should still take the Responses
+shape (`docs/config.example.toml`'s `[backends.gateway]`).
 
 | cast | explorer | synth | synth lane |
 |---|---|---|---|

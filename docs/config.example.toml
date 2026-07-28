@@ -289,6 +289,22 @@ base_url = "http://localhost:8080/v1"
 key_optional = true
 request_timeout_secs = 1800
 
+# An OpenAI-compatible gateway/proxy that implements OpenAI's Responses API at
+# /v1/responses (verified against a real gateway) — not OpenAI Platform's own
+# endpoint, so kaibo can't infer this from the URL. `wire = "responses"` opts it
+# into rig's Responses client for interactive calls, the shape current GPT-5.x
+# reasoning models require (they reject Chat Completions' `max_tokens` outright).
+# `wire = "chat"` is the symmetric opt-out, including on OpenAI Platform's own
+# endpoint. Either way, batch stays Platform-only: a gateway proxying /v1/responses
+# doesn't necessarily proxy /v1/batches or the Files API, so `wire` never affects
+# `batch_submit` eligibility — only `[backends.gpt]` above (Platform's exact URL)
+# can staff a batch synth.
+[backends.gateway]
+kind = "openai"
+base_url = "https://llm-gateway.example.internal/v1"
+api_key_env = "GATEWAY_API_KEY"
+wire = "responses"
+
 # ---------------------------------------------------------------------------
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
 # what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
