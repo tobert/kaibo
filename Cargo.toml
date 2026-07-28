@@ -88,7 +88,7 @@ toml = "0.8"
 regex = "1"
 
 # MCP server (stdio only — never bind a socket; the FS is the boundary).
-rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.0.0-beta.5", features = ["server", "transport-io", "macros"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

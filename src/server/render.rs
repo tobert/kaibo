@@ -2,9 +2,14 @@
 //! turns a consult / job / batch outcome into a `CallToolResult` or a wire string:
 //! consult answers and their provenance footer, failure classification, and the
 //! job / batch / wait status views.
+//!
+//! `LoggingLevel` is SEP-2577-deprecated upstream (see `server::mod` for the
+//! rationale), but the logging channel is still live. `#[expect(deprecated)]`
+//! until a successor ships.
+#![expect(deprecated)]
 
 use rig_core::completion::Usage;
-use rmcp::model::{CallToolResult, Content, LoggingLevel};
+use rmcp::model::{CallToolResult, ContentBlock, LoggingLevel};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
 
@@ -22,7 +27,7 @@ pub(super) fn consult_result(
     report: String,
     include_report: bool,
 ) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(answer)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(answer)]);
     if include_report {
         result.structured_content = Some(json!({ "report": report }));
     }
@@ -103,7 +108,7 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 /// errors *before* the model call — unknown cast, an attachment outside the boundary, a
 /// missing key — stay `McpError`, since those are the caller's to fix.
 pub(super) fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(consultation_failure_text(
+    CallToolResult::error(vec![ContentBlock::text(consultation_failure_text(
         tool, cast, err,
     ))])
 }
@@ -149,7 +154,7 @@ fn running_beat(last_progress: &Option<(String, u64)>) -> String {
 /// agent reads the same thing whether it asked synchronously or collected a job.
 pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
     match snap.state {
-        JobState::Running => CallToolResult::success(vec![Content::text(format!(
+        JobState::Running => CallToolResult::success(vec![ContentBlock::text(format!(
             "Consultation `{id}` is still running — {} ({}s elapsed){}. No need to wait: go \
              do other work and `job_get` it again later.",
             snap.label,
@@ -164,8 +169,8 @@ pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
                 include_report,
             )
         }
-        JobState::Failed(text) => CallToolResult::error(vec![Content::text(text)]),
-        JobState::Canceled => CallToolResult::success(vec![Content::text(format!(
+        JobState::Failed(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
+        JobState::Canceled => CallToolResult::success(vec![ContentBlock::text(format!(
             "Consultation `{id}` was canceled."
         ))]),
     }

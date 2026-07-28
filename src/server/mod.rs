@@ -2,6 +2,13 @@
 //!
 //! stdio only — like kaish-mcp, kaibo must never bind a socket: it can read a
 //! user's filesystem, so the transport pipe is the security boundary.
+//!
+//! `LoggingLevel`, `SetLevelRequestParams`, `enable_logging()`,
+//! `notify_logging_message`, and `LoggingMessageNotificationParam` are
+//! SEP-2577-deprecated upstream, but the MCP logging channel is still kaibo's
+//! live logging surface — there is no replacement yet. We
+//! `#[expect(deprecated)]` the module until a successor ships.
+#![expect(deprecated)]
 
 use std::path::{Path, PathBuf};
 
@@ -14,12 +21,12 @@ use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, CallToolResult, Content, GetPromptRequestParams, GetPromptResult, Implementation,
+    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, Implementation,
     JsonObject, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, LoggingLevel,
-    Meta, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
-    PromptMessage, PromptMessageRole, ProtocolVersion, RawResource, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-    ServerInfo, SetLevelRequestParams,
+    MetaObject, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
+    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+    ReadResourceResponse, RequestMetaObject, ResourceContents, Resource, ResourceTemplate, Role,
+    ServerCapabilities, ServerInfo, SetLevelRequestParams, GetPromptResult,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -735,7 +742,7 @@ impl KaiboHandler {
         // the caller actually reaches for it. A no-op if `--no-consult` already
         // dropped the route.
         if let Some(route) = tool_router.map.get_mut("consult") {
-            let mut meta = Meta::new();
+            let mut meta = MetaObject::new();
             meta.insert(
                 "anthropic/alwaysLoad".to_string(),
                 serde_json::Value::Bool(true),
@@ -1069,7 +1076,7 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<ConsultInput>,
         peer: Peer<RoleServer>,
-        meta: Meta,
+        meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         // Resolve the cast, layer per-call model overrides onto the clone, then
@@ -1317,7 +1324,7 @@ impl KaiboHandler {
              `job_cancel {job_id}` stops it. Nothing to wait on now.",
             cast.name
         );
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -1333,7 +1340,7 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<ExploreInput>,
         peer: Peer<RoleServer>,
-        meta: Meta,
+        meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         // Resolve the cast, then layer a per-call explorer override onto the clone.
@@ -1386,7 +1393,7 @@ impl KaiboHandler {
         // The report IS the text (no structured_content). Provenance names the one arm
         // that produced it, so a cross-model study sees which explorer surveyed.
         let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)], &usage);
-        Ok(CallToolResult::success(vec![Content::text(report)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(report)]))
     }
 
     #[tool(
@@ -1404,7 +1411,7 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<DeliberateInput>,
         peer: Peer<RoleServer>,
-        meta: Meta,
+        meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         let mut cast = self.resolve_cast(input.cast)?;
@@ -1543,7 +1550,7 @@ impl KaiboHandler {
              with `job_cancel {handle}`. Nothing to wait on now.",
             cast.name
         );
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     /// Stage 2, direct lane: spawn a session-scoped `job-N` that runs the big LOCAL synth
@@ -1621,7 +1628,7 @@ impl KaiboHandler {
              server session only.",
             cast.name
         );
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -1637,7 +1644,7 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<OneshotInput>,
         peer: Peer<RoleServer>,
-        meta: Meta,
+        meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast)?;
         self.reject_offline_cast(&cast, "oneshot")?;
@@ -1678,7 +1685,7 @@ impl KaiboHandler {
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
         let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)], &usage);
-        Ok(CallToolResult::success(vec![Content::text(answer)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(answer)]))
     }
 
     #[tool(
@@ -1712,7 +1719,7 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format_output(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format_output(
             &out,
         ))]))
     }
@@ -1760,7 +1767,7 @@ impl KaiboHandler {
             results.insert(name, outcome);
         }
 
-        let mut result = CallToolResult::success(vec![Content::text(
+        let mut result = CallToolResult::success(vec![ContentBlock::text(
             crate::discover::render_models(&results),
         )]);
         // Mirror the CLI's `--json` face: a machine caller gets the same envelope a
@@ -1946,7 +1953,7 @@ impl KaiboHandler {
             cast.name,
             model
         );
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -1971,7 +1978,7 @@ impl KaiboHandler {
                 .await
                 .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
             let label = format!("{backend_name} · {provider_id}");
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 crate::batch::render_poll(&poll, &label),
             )]));
         }
@@ -2021,7 +2028,7 @@ impl KaiboHandler {
                 .instrument(span)
                 .await
                 .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Requested cancellation of batch `{}`. `job_get` it for the final \
                  per-item results.",
                 input.handle
@@ -2045,7 +2052,7 @@ impl KaiboHandler {
                 ));
             }
         };
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -2171,7 +2178,7 @@ impl KaiboHandler {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             sections.join("\n\n"),
         )]))
     }
@@ -2186,7 +2193,7 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<WaitInput>,
         peer: Peer<RoleServer>,
-        meta: Meta,
+        meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         // No silent clamp — a model picks its own block; only an absurd value is refused,
         // loudly. The client's tool-call timeout and the user's interrupt are the real
@@ -2242,16 +2249,15 @@ impl KaiboHandler {
                     // separate `sample_floor` tail collected inside `wait_drain_with`.
                     if let Some(token) = &token {
                         if crate::mcp_log::rank(rec.level) >= info_floor {
-                            let param = ProgressNotificationParam {
-                                progress_token: token.clone(),
-                                progress: seq.fetch_add(1, Ordering::Relaxed) as f64,
-                                total: None,
-                                message: Some(format!(
-                                    "[{}] {}",
-                                    wait_level_label(rec.level),
-                                    rec.message
-                                )),
-                            };
+                            let param = ProgressNotificationParam::new(
+                                token.clone(),
+                                seq.fetch_add(1, Ordering::Relaxed) as f64,
+                            )
+                            .with_message(format!(
+                                "[{}] {}",
+                                wait_level_label(rec.level),
+                                rec.message
+                            ));
                             let peer = peer.clone();
                             // Fire-and-forget, like `ProgressReporter`: don't make the drain
                             // loop await a notification it doesn't depend on.
@@ -2292,7 +2298,7 @@ impl KaiboHandler {
             batch_lines.push(line);
         }
 
-        Ok(CallToolResult::success(vec![Content::text(render_wait(
+        Ok(CallToolResult::success(vec![ContentBlock::text(render_wait(
             &records,
             &batch_lines,
             &self.jobs,
@@ -2337,9 +2343,8 @@ impl KaiboHandler {
 #[tool_handler]
 impl rmcp::ServerHandler for KaiboHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 // One prompt: `configure`, the guided "set up my models" flow (see
@@ -2351,29 +2356,26 @@ impl rmcp::ServerHandler for KaiboHandler {
                 // tune the floor with `logging/setLevel`.
                 .enable_logging()
                 .build(),
-            // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
-            server_info: Implementation {
-                name: "kaibo".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("kaibo (解剖)".to_string()),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            // Judge provider usability from the live environment so a fresh install
-            // (no key, no config) gets setup guidance in the handshake. Read once here,
-            // at initialize — the same point the rest of config is bound; reconnecting
-            // is what re-reads a newly-set key.
-            instructions: Some(kaibo_instructions_with_scope(
-                &self.config,
-                self.resolver.allowed_trees(),
-                self.resolver.default_root_ref(),
-                self.resolver.default_root_inferred(),
-                self.config
-                    .default_cast_usability(|k| std::env::var(k).ok()),
-                &self.config.usable_casts(|k| std::env::var(k).ok()),
-            )),
-        }
+        )
+        // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
+        .with_server_info(
+            Implementation::new("kaibo", env!("CARGO_PKG_VERSION"))
+                .with_title("kaibo (解剖)"),
+        )
+        .with_protocol_version(ProtocolVersion::LATEST)
+        // Judge provider usability from the live environment so a fresh install
+        // (no key, no config) gets setup guidance in the handshake. Read once here,
+        // at initialize — the same point the rest of config is bound; reconnecting
+        // is what re-reads a newly-set key.
+        .with_instructions(kaibo_instructions_with_scope(
+            &self.config,
+            self.resolver.allowed_trees(),
+            self.resolver.default_root_ref(),
+            self.resolver.default_root_inferred(),
+            self.config
+                .default_cast_usability(|k| std::env::var(k).ok()),
+            &self.config.usable_casts(|k| std::env::var(k).ok()),
+        ))
     }
 
     /// Honor `logging/setLevel`: record the client's chosen floor so the log-drain
@@ -2415,7 +2417,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         // Compute the runtime-derived worktree set here (it needs the handler's
         // allowed_set and reflects worktrees that exist *now*); the renderer is a
         // pure function of its inputs, so it can't reach back for this itself.
@@ -2446,20 +2448,17 @@ impl rmcp::ServerHandler for KaiboHandler {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
-        kaibo_prompt_messages(&request.name, request.arguments.as_ref())
+    ) -> Result<GetPromptResponse, McpError> {
+        kaibo_prompt_messages(&request.name, request.arguments.as_ref()).map(GetPromptResponse::Complete)
     }
 }
 
 /// A `text/markdown` resource at `uri` with `name`/`description`. Small helper so
 /// the listing reads as a table of what kaibo serves.
 fn markdown_resource(uri: &str, name: &str, description: &str) -> rmcp::model::Resource {
-    RawResource {
-        mime_type: Some("text/markdown".to_string()),
-        description: Some(description.to_string()),
-        ..RawResource::new(uri, name)
-    }
-    .no_annotation()
+    Resource::new(uri, name)
+        .with_mime_type("text/markdown")
+        .with_description(description)
 }
 
 /// The resources kaibo advertises: the runtime config, the read-only sandbox doc,
@@ -2471,32 +2470,24 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
         // The resolved runtime config: allowed paths, default cast, gated tools,
         // sandbox limits, backends (kind + key sources, never key values), and
         // casts with resolved slots. Read this to understand the server's posture.
-        RawResource {
-            mime_type: Some("application/toml".to_string()),
-            description: Some(
+        Resource::new(CONFIG_URI, "kaibo: runtime config")
+            .with_mime_type("application/toml")
+            .with_description(
                 "kaibo's resolved runtime configuration: allowed path trees, default \
                  cast, gated tools, sandbox limits, each backend with its kind and \
                  key sources, and each cast with its resolved slots. Read this to \
-                 understand the server's current posture before making calls."
-                    .to_string(),
+                 understand the server's current posture before making calls.",
             ),
-            ..RawResource::new(CONFIG_URI, "kaibo: runtime config")
-        }
-        .no_annotation(),
         // The annotated config template — every knob, commented, ready to copy to
         // ~/.config/kaibo/config.toml. The setup guidance on a fresh install points here.
-        RawResource {
-            mime_type: Some("application/toml".to_string()),
-            description: Some(
+        Resource::new(CONFIG_EXAMPLE_URI, "kaibo: config example")
+            .with_mime_type("application/toml")
+            .with_description(
                 "An annotated kaibo config template: every option with its default and a \
                  comment, plus example backends and casts. Copy to \
                  ~/.config/kaibo/config.toml and edit. Pairs with kaibo://config, which \
-                 shows the *resolved* runtime state."
-                    .to_string(),
+                 shows the *resolved* runtime state.",
             ),
-            ..RawResource::new(CONFIG_EXAMPLE_URI, "kaibo: config example")
-        }
-        .no_annotation(),
         markdown_resource(
             SANDBOX_URI,
             "kaibo read-only sandbox",
@@ -2640,17 +2631,14 @@ fn kaibo_prompts() -> Vec<Prompt> {
              config resources, asks which providers and models you have, and writes the \
              file. Pass an optional `goal` to steer the roster.",
         ),
-        Some(vec![PromptArgument {
-            name: "goal".to_string(),
-            title: Some("Setup goal".to_string()),
-            description: Some(
+        Some(vec![PromptArgument::new("goal")
+            .with_title("Setup goal")
+            .with_description(
                 "What you want from the setup, e.g. \"a local-only privacy cast\" or \
                  \"a cheap DeepSeek explorer with a Claude synth\". Optional — omit for a \
-                 general walk-through."
-                    .to_string(),
-            ),
-            required: Some(false),
-        }]),
+                 general walk-through.",
+            )
+            .with_required(false)]),
     )]
 }
 
@@ -2667,13 +2655,11 @@ fn kaibo_prompt_messages(
             // one gate both this MCP path and the CLI's `run_configure` go through), so
             // this just extracts the raw value.
             let goal = arguments.and_then(|a| a.get("goal")).and_then(|v| v.as_str());
-            Ok(GetPromptResult {
-                description: Some("Configure kaibo's models for this codebase".to_string()),
-                messages: vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    Role::User,
                     configure_prompt_text(goal),
-                )],
-            })
+                )])
+                .with_description("Configure kaibo's models for this codebase"))
         }
         other => Err(McpError::invalid_params(
             format!("unknown prompt {other:?}; kaibo offers: {CONFIGURE_PROMPT_NAME}"),
@@ -2723,31 +2709,19 @@ pub(crate) fn configure_prompt_text_cli(goal: Option<&str>) -> String {
 /// The URI templates kaibo advertises: per-builtin help and per-cast prompts, each
 /// addressed by name.
 fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
-    let builtin = RawResourceTemplate {
-        uri_template: BUILTIN_URI_TEMPLATE.to_string(),
-        name: "kaish builtin help".to_string(),
-        title: None,
-        description: Some(
+    let builtin = ResourceTemplate::new(BUILTIN_URI_TEMPLATE, "kaish builtin help")
+        .with_description(
             "Help for a single kaish builtin — parameters and examples. \
-             e.g. kaibo://kaish/builtin/grep"
-                .to_string(),
-        ),
-        mime_type: Some("text/markdown".to_string()),
-        icons: None,
-    };
-    let prompts = RawResourceTemplate {
-        uri_template: PROMPTS_CAST_URI_TEMPLATE.to_string(),
-        name: "kaibo: one cast's prompts".to_string(),
-        title: None,
-        description: Some(
+             e.g. kaibo://kaish/builtin/grep",
+        )
+        .with_mime_type("text/markdown");
+    let prompts = ResourceTemplate::new(PROMPTS_CAST_URI_TEMPLATE, "kaibo: one cast's prompts")
+        .with_description(
             "The system preamble each phase gets for a specific cast, its per-slot \
-             `preamble`s folded in as a live call resolves them. e.g. kaibo://prompts/deepseek"
-                .to_string(),
-        ),
-        mime_type: Some("text/markdown".to_string()),
-        icons: None,
-    };
-    vec![builtin.no_annotation(), prompts.no_annotation()]
+             `preamble`s folded in as a live call resolves them. e.g. kaibo://prompts/deepseek",
+        )
+        .with_mime_type("text/markdown");
+    vec![builtin, prompts]
 }
 
 /// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
@@ -3099,14 +3073,14 @@ fn read_kaibo_resource_with_config(
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
-) -> Result<ReadResourceResult, McpError> {
+) -> Result<ReadResourceResponse, McpError> {
     if uri == PROMPTS_URI {
-        return Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
+            ResourceContents::text(
                 render_prompts_resource(config, None),
                 uri,
-            )],
-        });
+            ),
+        ])));
     }
     if let Some(name) = uri.strip_prefix(PROMPTS_CAST_PREFIX) {
         // `kaibo://prompts/<cast>` — the cast's resolved framing (name or alias). An
@@ -3115,12 +3089,12 @@ fn read_kaibo_resource_with_config(
         let cast = config
             .resolve_cast(name)
             .map_err(|e| McpError::resource_not_found(format!("{e:#} (in {uri})"), None))?;
-        return Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
+            ResourceContents::text(
                 render_prompts_resource(config, Some(cast)),
                 uri,
-            )],
-        });
+            ),
+        ])));
     }
     if uri == CONFIG_URI {
         let body = render_config_resource(
@@ -3131,28 +3105,28 @@ fn read_kaibo_resource_with_config(
             followed_worktrees,
             persistence_active,
         );
-        return Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(body, uri)],
-        });
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
+            ResourceContents::text(body, uri),
+        ])));
     }
     if uri == CONFIG_EXAMPLE_URI {
         // Static, config-independent — the embedded template verbatim.
-        return Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(CONFIG_EXAMPLE_TOML, uri)],
-        });
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
+            ResourceContents::text(CONFIG_EXAMPLE_TOML, uri),
+        ])));
     }
     let body = render_resource(uri, schemas)
         .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
-    Ok(ReadResourceResult {
-        contents: vec![ResourceContents::text(body, uri)],
-    })
+    Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
+        ResourceContents::text(body, uri),
+    ])))
 }
 
 /// The MCP token the client attached for progress, if any. Per the spec, progress
 /// notifications are sent *only* when the client opted in by putting a
 /// `progressToken` in the request `_meta`; absent one, we stay silent. Pure so the
 /// opt-in/opt-out decision is testable without a live request.
-fn progress_token(meta: &Meta) -> Option<ProgressToken> {
+fn progress_token(meta: &RequestMetaObject) -> Option<ProgressToken> {
     meta.get_progress_token()
 }
 
@@ -3162,18 +3136,13 @@ fn progress_token(meta: &Meta) -> Option<ProgressToken> {
 /// stays `None` because a consult's step count isn't known up front. Pure — the
 /// counting and wiring live in [`ProgressReporter`]; this is just the shape.
 fn progress_param(token: ProgressToken, seq: u64, event: &PhaseEvent) -> ProgressNotificationParam {
-    ProgressNotificationParam {
-        progress_token: token,
-        progress: seq as f64,
-        total: None,
-        message: Some(event.message()),
-    }
+    ProgressNotificationParam::new(token, seq as f64).with_message(event.message())
 }
 
 /// Pick the sink for one tool call: a live [`ProgressReporter`] when the client
 /// asked for progress (sent a token), else [`NullSink`]. Gating at construction
 /// means the no-progress path never even allocates a counter or touches the peer.
-fn progress_sink(peer: Peer<RoleServer>, meta: &Meta) -> Arc<dyn ProgressSink> {
+fn progress_sink(peer: Peer<RoleServer>, meta: &RequestMetaObject) -> Arc<dyn ProgressSink> {
     match progress_token(meta) {
         Some(token) => Arc::new(ProgressReporter::new(peer, token)),
         None => Arc::new(NullSink),
@@ -3229,7 +3198,7 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{NumberOrString, PromptMessageContent};
+    use rmcp::model::{NumberOrString, ContentBlock};
     use rmcp::ServerHandler;
     use serde_json::json;
 
@@ -4518,14 +4487,14 @@ mod tests {
     /// silent self.)
     #[test]
     fn no_token_means_no_progress_token() {
-        assert!(progress_token(&Meta::default()).is_none());
+        assert!(progress_token(&RequestMetaObject::default()).is_none());
     }
 
     /// A token in `_meta` is the opt-in — we surface it so a reporter can be built.
     #[test]
     fn a_progress_token_in_meta_is_surfaced() {
         let token = ProgressToken(NumberOrString::Number(7));
-        let meta = Meta::with_progress_token(token.clone());
+        let meta = RequestMetaObject::with_progress_token(token.clone());
         assert_eq!(progress_token(&meta), Some(token));
     }
 
@@ -4579,7 +4548,7 @@ mod tests {
 
     #[test]
     fn lists_the_sandbox_doc_and_every_kaish_topic() {
-        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
         assert!(
             uris.iter().any(|u| u == SANDBOX_URI),
             "must advertise the sandbox doc, got {uris:?}"
@@ -4599,7 +4568,7 @@ mod tests {
         assert!(
             templates
                 .iter()
-                .any(|t| t.raw.uri_template == BUILTIN_URI_TEMPLATE),
+                .any(|t| t.uri_template == BUILTIN_URI_TEMPLATE),
             "must advertise the per-builtin URI template"
         );
     }
@@ -4643,9 +4612,10 @@ mod tests {
     fn configure_prompt_grounds_in_the_config_resources() {
         let result =
             kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, None).expect("configure must resolve");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(t) = &result.messages[0].content else {
             panic!("configure prompt must be a text message");
         };
+        let text = t.text.as_str();
         for needle in [
             CONFIG_EXAMPLE_URI, // read the annotated template
             CONFIG_URI,         // and the resolved live state
@@ -4668,9 +4638,10 @@ mod tests {
     fn configure_prompt_defaults_to_a_within_family_pair_not_a_chimera() {
         let result =
             kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, None).expect("configure must resolve");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(t) = &result.messages[0].content else {
             panic!("configure prompt must be a text message");
         };
+        let text = t.text.as_str();
         assert!(
             text.contains("both within it"),
             "the default must be explorer and synth within one family; body:\n{text}"
@@ -4692,9 +4663,10 @@ mod tests {
     fn configure_prompt_covers_host_sandbox_state_and_cas_access() {
         let result =
             kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, None).expect("configure must resolve");
-        let PromptMessageContent::Text { text } = &result.messages[0].content else {
+        let ContentBlock::Text(t) = &result.messages[0].content else {
             panic!("configure prompt must be a text message");
         };
+        let text = t.text.as_str();
         for needle in [
             "network_access",
             "writable_roots",
@@ -4718,9 +4690,10 @@ mod tests {
         let args = json!({ "goal": "a local-only privacy cast" });
         let with_goal = kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, args.as_object())
             .expect("configure must resolve");
-        let PromptMessageContent::Text { text } = &with_goal.messages[0].content else {
+        let ContentBlock::Text(t) = &with_goal.messages[0].content else {
             panic!("expected text");
         };
+        let text = t.text.as_str();
         assert!(
             text.contains("a local-only privacy cast"),
             "a supplied goal must appear in the prompt; body:\n{text}"
@@ -4729,9 +4702,10 @@ mod tests {
         let blank = json!({ "goal": "   " });
         let without = kaibo_prompt_messages(CONFIGURE_PROMPT_NAME, blank.as_object())
             .expect("configure must resolve");
-        let PromptMessageContent::Text { text } = &without.messages[0].content else {
+        let ContentBlock::Text(t) = &without.messages[0].content else {
             panic!("expected text");
         };
+        let text = t.text.as_str();
         assert!(
             !text.contains("My goal for this setup:"),
             "a blank goal must not append an empty goal line; body:\n{text}"
@@ -4818,6 +4792,10 @@ mod tests {
             false,
         )
         .expect("known uri must read");
+        let result = match result {
+            ReadResourceResponse::Complete(r) => r,
+            other => panic!("expected complete result, got {other:?}"),
+        };
         match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
@@ -4849,7 +4827,7 @@ mod tests {
     /// on a page that no longer answers the question the terse schema deferred.
     #[test]
     fn tools_doc_is_advertised_and_carries_the_moved_guidance() {
-        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
         assert!(
             uris.iter().any(|u| u == TOOLS_URI),
             "must advertise the tools doc, got {uris:?}"
@@ -4889,7 +4867,7 @@ mod tests {
             batch_preamble, consult_preamble, deliberation_prompt, oneshot_preamble,
             report_preamble,
         };
-        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
         assert!(
             uris.iter().any(|u| u == PROMPTS_URI),
             "must advertise the prompts doc, got {uris:?}"
@@ -5020,7 +4998,7 @@ mod tests {
     fn per_cast_prompts_template_advertised_and_unknown_cast_is_not_found() {
         let templates: Vec<String> = kaibo_resource_templates()
             .into_iter()
-            .map(|t| t.raw.uri_template)
+            .map(|t| t.uri_template)
             .collect();
         assert!(
             templates.iter().any(|t| t == PROMPTS_CAST_URI_TEMPLATE),
@@ -5100,7 +5078,7 @@ mod tests {
     /// errors when a fresh user copies it.
     #[test]
     fn config_example_resource_is_listed_readable_and_valid() {
-        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
         assert!(
             uris.iter().any(|u| u == CONFIG_EXAMPLE_URI),
             "kaibo_resources() must list kaibo://config/example, got {uris:?}"
@@ -5119,6 +5097,10 @@ mod tests {
             false,
         )
         .expect("example resource must be readable");
+        let result = match result {
+            ReadResourceResponse::Complete(r) => r,
+            other => panic!("expected complete result, got {other:?}"),
+        };
         let body = match &result.contents[0] {
             ResourceContents::TextResourceContents { text, .. } => text.clone(),
             other => panic!("expected text contents, got {other:?}"),
@@ -5140,7 +5122,7 @@ mod tests {
     /// `kaibo_resources()`.
     #[test]
     fn config_resource_is_listed() {
-        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.raw.uri).collect();
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
         assert!(
             uris.iter().any(|u| u == CONFIG_URI),
             "kaibo_resources() must list kaibo://config, got {uris:?}"
@@ -5148,10 +5130,10 @@ mod tests {
         // The resource entry for the config must also have a description.
         let config_res = kaibo_resources()
             .into_iter()
-            .find(|r| r.raw.uri == CONFIG_URI)
+            .find(|r| r.uri == CONFIG_URI)
             .expect("config resource must be listed");
         assert!(
-            config_res.raw.description.is_some(),
+            config_res.description.is_some(),
             "kaibo://config resource must have a description"
         );
     }
