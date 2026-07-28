@@ -322,9 +322,18 @@ impl Arm {
                 Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
             }
             ProviderKind::Gemini => {
+                // base_url is optional here (unlike the openai kind): unset dials
+                // rig's built-in https://generativelanguage.googleapis.com; set, it
+                // points at a Gemini-API-compatible gateway/proxy instead. Same
+                // pattern as the Anthropic arm above — the contract is a HOST ROOT,
+                // since rig's builder appends its own versioned path
+                // (`/v1beta/models/...`) rather than taking one baked in.
                 let key = backend.resolve_key()?;
-                let client = gemini::Client::builder()
-                    .api_key(&key)
+                let mut builder = gemini::Client::builder().api_key(&key);
+                if let Some(base_url) = backend.base_url.as_deref() {
+                    builder = builder.base_url(base_url);
+                }
+                let client = builder
                     .http_client(http)
                     .build()
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
@@ -3531,6 +3540,39 @@ mod tests {
         };
         Arm::from_slot(&default_backend, &slot, ModelRole::Synth, &defaults)
             .expect("a keyless anthropic arm with no base_url still builds offline");
+    }
+
+    /// A gemini-kind backend pointed at a custom `base_url` (a Gemini-API-compatible
+    /// gateway/proxy in front of the real backend) must build offline too — the
+    /// same conditional `.base_url(...)` pattern as the Anthropic arm above, now on
+    /// the Gemini arm of `Arm::from_slot`. The contract is a HOST ROOT (mirroring
+    /// rig's own Gemini `ClientBuilder`, which appends its own `/v1beta/...` path).
+    #[test]
+    fn arm_from_slot_builds_a_gemini_arm_with_a_custom_base_url() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "gemini".into(),
+            kind: ProviderKind::Gemini,
+            base_url: Some("https://llm-gateway.example.internal".into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+        };
+        let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyless gemini arm with a custom base_url builds offline");
+        assert_eq!(arm.model, "gemini-3.5-flash");
+
+        // A gemini backend with no base_url must still build (the default rig
+        // endpoint applies) — the conditional branch must not be required.
+        let default_backend = crate::config::Backend {
+            base_url: None,
+            ..backend
+        };
+        Arm::from_slot(&default_backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyless gemini arm with no base_url still builds offline");
     }
 
     /// The OpenRouter arm's full params assembly — `to_params` chained through

@@ -806,9 +806,10 @@ impl BatchProvider for AnthropicBatch {
 // --- Gemini provider -------------------------------------------------------
 
 /// Gemini's default API base, used when the backend sets no `base_url` of its own.
-/// The keyed Gemini backend cannot set one today (rig fixes the endpoint), unlike the
-/// anthropic kind — but [`GeminiBatch::base_url`] already reads `backend.base_url` in
-/// case that changes, the same pattern [`AnthropicBatch::base_url`] follows now.
+/// Already versioned — the batch calls append their paths (`/models/{model}:...`,
+/// `/{batch_id}`, ...) directly onto this. See [`GeminiBatch::base_url`] for how a
+/// *configured* `base_url` (a HOST ROOT, like rig's own Gemini `ClientBuilder`) gets
+/// versioned to match.
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 /// A reqwest client carrying the backend's per-request deadline — the shared
@@ -1148,11 +1149,24 @@ impl GeminiBatch {
         Ok(())
     }
 
+    /// The batch endpoint root: [`GEMINI_API_BASE`] (already `/v1beta`-versioned) when
+    /// the backend sets no `base_url`; otherwise the configured base_url versioned
+    /// with `/v1beta` here. The config contract is a HOST ROOT — matching rig's live
+    /// Gemini `ClientBuilder` (which appends its own `/v1beta/models/...` path rather
+    /// than taking one baked into `base_url`) and the anthropic kind's style — so a
+    /// gateway/proxy address configured for the live path just works for batch too.
+    /// A trailing slash, and a base_url someone pre-versioned with `/v1beta` (with or
+    /// without a trailing slash), are both normalized first so a reasonable config
+    /// never double-versions — the spirit of rig's `normalize_anthropic_base_url`.
     fn base_url(backend: &Backend) -> String {
-        backend
-            .base_url
-            .clone()
-            .unwrap_or_else(|| GEMINI_API_BASE.to_string())
+        match backend.base_url.as_deref() {
+            Some(configured) => {
+                let trimmed = configured.trim_end_matches('/');
+                let trimmed = trimmed.strip_suffix("/v1beta").unwrap_or(trimmed);
+                format!("{trimmed}/v1beta")
+            }
+            None => GEMINI_API_BASE.to_string(),
+        }
     }
 
     /// A submit-capable client: the cast's synth slot, shaped to batch's maxed knobs.
@@ -2485,6 +2499,54 @@ mod tests {
         default_backend.key_optional = true;
         let default_client = AnthropicBatch::from_backend(&default_backend).unwrap();
         assert_eq!(default_client.base_url, ANTHROPIC_API_BASE);
+    }
+
+    /// The Gemini batch lane's base URL contract: a configured `backend.base_url` is
+    /// a HOST ROOT (mirroring rig's live Gemini `ClientBuilder`, which appends its own
+    /// `/v1beta/...` path — see the engine-arm test of the same shape), so
+    /// `GeminiBatch::base_url` must version it with `/v1beta` itself rather than use it
+    /// verbatim, unlike `AnthropicBatch::base_url` (whose `/v1/messages/batches` suffix
+    /// is appended at call time, not baked into the stored base). A trailing slash is
+    /// trimmed, and a base_url the user already versioned (with or without a trailing
+    /// slash) is not double-versioned — the spirit of rig's own
+    /// `normalize_anthropic_base_url`. The unset fallback is untouched.
+    #[test]
+    fn gemini_batch_base_url_versions_a_configured_host_root() {
+        let mut b = anthropic_backend();
+        b.kind = ProviderKind::Gemini;
+        b.key_optional = true;
+
+        b.base_url = Some("https://llm-gateway.example.internal".to_string());
+        assert_eq!(
+            GeminiBatch::base_url(&b),
+            "https://llm-gateway.example.internal/v1beta"
+        );
+
+        // Trailing slash on the configured host root.
+        b.base_url = Some("https://llm-gateway.example.internal/".to_string());
+        assert_eq!(
+            GeminiBatch::base_url(&b),
+            "https://llm-gateway.example.internal/v1beta"
+        );
+
+        // Already pre-versioned — must not become .../v1beta/v1beta.
+        b.base_url = Some("https://llm-gateway.example.internal/v1beta".to_string());
+        assert_eq!(
+            GeminiBatch::base_url(&b),
+            "https://llm-gateway.example.internal/v1beta"
+        );
+
+        // Pre-versioned with a trailing slash too.
+        b.base_url = Some("https://llm-gateway.example.internal/v1beta/".to_string());
+        assert_eq!(
+            GeminiBatch::base_url(&b),
+            "https://llm-gateway.example.internal/v1beta"
+        );
+
+        // Unset still falls back to the default, unversioned by this logic (it's
+        // already baked into GEMINI_API_BASE).
+        b.base_url = None;
+        assert_eq!(GeminiBatch::base_url(&b), GEMINI_API_BASE);
     }
 
     #[test]
