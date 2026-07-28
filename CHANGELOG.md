@@ -545,6 +545,17 @@ the git log. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A keyless Gemini backend now authenticates against an ambient-auth gateway.** With
+  `base_url` on the gemini kind (above) pointed at a Gemini-API-compatible gateway that
+  gates access by network identity rather than an API key, a `key_optional` Gemini backend
+  used to fail every *interactive* call (`consult`/`oneshot`/`explore`): kaibo sent its
+  non-empty `"no-auth"` placeholder, rig put it in the `?key=` query param, and the gateway
+  forwarded that dummy key upstream to Google, which rejected it (`API_KEY_INVALID`). A
+  keyless Gemini backend now resolves to an *empty* query key, so kaibo emits a bare `?key=`
+  the gateway accepts via its own identity. The placeholder is transport-shaped: header-auth
+  kinds (OpenAI/Anthropic — and Gemini's own batch lane, which sends `x-goog-api-key` as a
+  header) keep the non-empty bearer stand-in a keyless server ignores. Real Google is
+  unaffected — it requires a real key, which always resolves ahead of the placeholder.
 - **The README described the state db wrongly** — a "convenience cache" holding "no file
   contents", when a named session holds your questions and answers, and deleting it drops
   your batch handles.

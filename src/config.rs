@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consult::{ModelCaps, ModelShape, PromptOverrides, ThinkingStyleOverride};
 use crate::context::ContextConfig;
-use crate::credentials::{self, ProviderKind, PLACEHOLDER_OPENAI_KEY};
+use crate::credentials::{self, ProviderKind};
 use crate::orientation::OrientationConfig;
 use crate::sandbox::SandboxConfig;
 use crate::server::ToolGating;
@@ -511,7 +511,12 @@ impl Backend {
 
         // No env, no existing file.
         if self.key_optional {
-            Ok(PLACEHOLDER_OPENAI_KEY.to_string())
+            // Transport-shaped stand-in: a non-empty bearer for header-auth kinds,
+            // the empty string for Gemini's `?key=` query auth (see
+            // `ProviderKind::placeholder_key`) — the latter is what lets a keyless
+            // Gemini gateway authenticate by ambient identity instead of a rejected
+            // dummy key.
+            Ok(self.kind.placeholder_key().to_string())
         } else {
             Err(anyhow!(
                 "backend {:?} has no API key: env {} unset and key file {} absent — \
