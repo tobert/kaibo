@@ -1727,7 +1727,7 @@ impl KaiboHandler {
             No cast, no model in the loop — a pure operator/config query, like \
             `kaibo://config`."
     )]
-    async fn list_models(
+    pub async fn list_models(
         &self,
         Parameters(input): Parameters<ListModelsInput>,
     ) -> Result<CallToolResult, McpError> {
@@ -1760,9 +1760,13 @@ impl KaiboHandler {
             results.insert(name, outcome);
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        let mut result = CallToolResult::success(vec![Content::text(
             crate::discover::render_models(&results),
-        )]))
+        )]);
+        // Mirror the CLI's `--json` face: a machine caller gets the same envelope a
+        // human gets as prose, so the two never drift on what a sweep looks like.
+        result.structured_content = Some(crate::discover::models_json_envelope(&results));
+        Ok(result)
     }
 
     /// Resolve a cast's synth slot for batch: its slot + backend, plus the model's

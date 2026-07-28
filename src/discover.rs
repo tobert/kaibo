@@ -69,6 +69,19 @@ pub struct DiscoveredModel {
     /// The provider's per-model object, untouched — the passthrough half of the
     /// contract, so a caller who needs a field we didn't normalize still has it.
     pub raw: Value,
+    /// Normalized per-token price, verbatim strings from the provider — `None` when
+    /// the endpoint doesn't advertise pricing on `/models` (only `Openai`-wire kinds
+    /// do today; see [`parse_openai_models`]).
+    pub pricing: Option<ModelPricing>,
+}
+
+/// Per-token price, kept as the provider's own string (fractional USD/token) rather
+/// than parsed to a float — this is money, and a `f64` round-trip can silently lose
+/// precision `.raw` would otherwise preserve exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelPricing {
+    pub input: Option<String>,
+    pub output: Option<String>,
 }
 
 /// One page's worth of a GET: the full URL, headers, and query params, fully
@@ -181,9 +194,38 @@ pub fn parse_openai_models(v: &Value) -> Vec<DiscoveredModel> {
             display_name: None,
             created: item.get("created").and_then(Value::as_i64),
             context_window: None,
+            pricing: parse_openai_pricing(item),
             raw: item.clone(),
         })
         .collect()
+}
+
+/// Extract a `pricing` object off an OpenAI-shaped model item, if present. Two field
+/// conventions in the wild: `input`/`output` (some gateways) and OpenRouter's
+/// `prompt`/`completion` — the latter is a fallback, checked only when the former is
+/// absent. String-typed only: a price is a fractional-USD-per-token string and we
+/// keep it verbatim (never parse to float — precision matters, and `.raw` already
+/// carries the original either way); a number-typed price (some providers send one)
+/// is left as `None` here rather than reformatted, since round-tripping a JSON number
+/// back to a string risks a representation that doesn't match what the provider would
+/// consider canonical — `.raw` still has it exactly as sent.
+/// `None` unless at least one of input/output is present — an all-empty pricing
+/// object would just be noise on every model line.
+fn parse_openai_pricing(item: &Value) -> Option<ModelPricing> {
+    let pricing = item.get("pricing")?;
+    let price = |primary: &str, fallback: &str| -> Option<String> {
+        pricing
+            .get(primary)
+            .or_else(|| pricing.get(fallback))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let input = price("input", "prompt");
+    let output = price("output", "completion");
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(ModelPricing { input, output })
 }
 
 /// Parse an Anthropic `{ data: [{id, display_name, created_at, max_input_tokens, ...}],
@@ -210,6 +252,8 @@ pub fn parse_anthropic_models(v: &Value) -> Vec<DiscoveredModel> {
                 .and_then(Value::as_str)
                 .and_then(rfc3339_to_epoch),
             context_window: item.get("max_input_tokens").and_then(Value::as_u64),
+            // Anthropic's `/v1/models` doesn't advertise pricing.
+            pricing: None,
             raw: item.clone(),
         })
         .collect()
@@ -233,6 +277,8 @@ pub fn parse_gemini_models(v: &Value) -> Vec<DiscoveredModel> {
                     .map(str::to_string),
                 created: None,
                 context_window: item.get("inputTokenLimit").and_then(Value::as_u64),
+                // Gemini's `/v1beta/models` doesn't advertise pricing.
+                pricing: None,
                 raw: item.clone(),
             }
         })
@@ -399,6 +445,18 @@ pub fn render_models(results: &BTreeMap<String, Result<Vec<DiscoveredModel>, Str
                     if let Some(ctx) = m.context_window {
                         line.push_str(&format!(" (context: {ctx})"));
                     }
+                    if let Some(p) = &m.pricing {
+                        let mut parts = Vec::new();
+                        if let Some(input) = &p.input {
+                            parts.push(format!("in ${input}/tok"));
+                        }
+                        if let Some(output) = &p.output {
+                            parts.push(format!("out ${output}/tok"));
+                        }
+                        if !parts.is_empty() {
+                            line.push_str(&format!(" [{}]", parts.join(", ")));
+                        }
+                    }
                     out.push_str(&line);
                     out.push('\n');
                 }
@@ -429,6 +487,10 @@ pub fn models_json_envelope(results: &BTreeMap<String, Result<Vec<DiscoveredMode
                             "display_name": m.display_name,
                             "created": m.created,
                             "context_window": m.context_window,
+                            "pricing": m.pricing.as_ref().map(|p| serde_json::json!({
+                                "input": p.input,
+                                "output": p.output,
+                            })),
                             "raw": m.raw,
                         }))
                         .collect::<Vec<_>>(),
@@ -890,6 +952,10 @@ mod tests {
                 display_name: Some("Model One".to_string()),
                 created: None,
                 context_window: Some(128_000),
+                pricing: Some(ModelPricing {
+                    input: Some("0.0000015".to_string()),
+                    output: Some("0.000006".to_string()),
+                }),
                 raw: serde_json::json!({"id": "m1"}),
             }]),
         );
@@ -902,6 +968,28 @@ mod tests {
         assert!(text.contains("`m1`"));
         assert!(text.contains("Model One"));
         assert!(text.contains("128000") || text.contains("128,000"));
+        assert!(
+            text.contains("[in $0.0000015/tok, out $0.000006/tok]"),
+            "expected a pricing suffix, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_models_omits_pricing_suffix_when_absent() {
+        let mut results: BTreeMap<String, Result<Vec<DiscoveredModel>, String>> = BTreeMap::new();
+        results.insert(
+            "ok-backend".to_string(),
+            Ok(vec![DiscoveredModel {
+                id: "m1".to_string(),
+                display_name: None,
+                created: None,
+                context_window: None,
+                pricing: None,
+                raw: serde_json::json!({"id": "m1"}),
+            }]),
+        );
+        let text = render_models(&results);
+        assert!(!text.contains('['), "no pricing means no bracketed suffix, got: {text}");
     }
 
     #[test]
@@ -920,6 +1008,10 @@ mod tests {
                 display_name: None,
                 created: Some(42),
                 context_window: None,
+                pricing: Some(ModelPricing {
+                    input: Some("0.000001".to_string()),
+                    output: None,
+                }),
                 raw: serde_json::json!({"id": "m1", "extra": "field"}),
             }]),
         );
@@ -936,6 +1028,8 @@ mod tests {
         assert_eq!(ok["models"][0]["id"], "m1");
         assert_eq!(ok["models"][0]["created"], 42);
         assert_eq!(ok["models"][0]["raw"]["extra"], "field");
+        assert_eq!(ok["models"][0]["pricing"]["input"], "0.000001");
+        assert!(ok["models"][0]["pricing"]["output"].is_null());
 
         let broken = backends
             .iter()
@@ -943,6 +1037,91 @@ mod tests {
             .unwrap();
         assert_eq!(broken["ok"], false);
         assert_eq!(broken["error"], "no key");
+    }
+
+    #[test]
+    fn json_envelope_pricing_is_null_not_an_empty_object_when_absent() {
+        let mut results: BTreeMap<String, Result<Vec<DiscoveredModel>, String>> = BTreeMap::new();
+        results.insert(
+            "ok-backend".to_string(),
+            Ok(vec![DiscoveredModel {
+                id: "m1".to_string(),
+                display_name: None,
+                created: None,
+                context_window: None,
+                pricing: None,
+                raw: serde_json::json!({"id": "m1"}),
+            }]),
+        );
+        let env = models_json_envelope(&results);
+        assert!(env["backends"][0]["models"][0]["pricing"].is_null());
+    }
+
+    // --- parse_openai_pricing: both field-name conventions, no unwrap on --------
+    // wrong-typed / missing input.
+
+    #[test]
+    fn parse_openai_shape_normalizes_input_output_pricing() {
+        let body = serde_json::json!({
+            "data": [
+                {"id": "m1", "pricing": {"input": "0.0000015", "output": "0.000006"}}
+            ]
+        });
+        let models = parse_openai_models(&body);
+        assert_eq!(
+            models[0].pricing,
+            Some(ModelPricing {
+                input: Some("0.0000015".to_string()),
+                output: Some("0.000006".to_string()),
+            })
+        );
+        // .raw keeps the original pricing object untouched.
+        assert_eq!(
+            models[0].raw["pricing"],
+            serde_json::json!({"input": "0.0000015", "output": "0.000006"})
+        );
+    }
+
+    #[test]
+    fn parse_openai_shape_falls_back_to_openrouter_prompt_completion_pricing() {
+        let body = serde_json::json!({
+            "data": [
+                {"id": "m1", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+            ]
+        });
+        let models = parse_openai_models(&body);
+        assert_eq!(
+            models[0].pricing,
+            Some(ModelPricing {
+                input: Some("0.000001".to_string()),
+                output: Some("0.000002".to_string()),
+            })
+        );
+        assert_eq!(
+            models[0].raw["pricing"],
+            serde_json::json!({"prompt": "0.000001", "completion": "0.000002"})
+        );
+    }
+
+    #[test]
+    fn parse_openai_shape_pricing_is_none_when_the_endpoint_reports_none() {
+        let body = serde_json::json!({ "data": [ {"id": "m1"} ] });
+        let models = parse_openai_models(&body);
+        assert_eq!(models[0].pricing, None);
+        assert!(models[0].raw.get("pricing").is_none());
+    }
+
+    #[test]
+    fn parse_openai_shape_pricing_is_none_not_some_when_the_object_is_all_empty() {
+        // An all-empty pricing object (neither convention present) is noise, not
+        // a Some(ModelPricing { None, None }).
+        let body = serde_json::json!({
+            "data": [ {"id": "m1", "pricing": {}} ]
+        });
+        let models = parse_openai_models(&body);
+        assert_eq!(models[0].pricing, None);
+        // .raw still carries the (empty) pricing object verbatim.
+        assert_eq!(models[0].raw["pricing"], serde_json::json!({}));
     }
 
 }
