@@ -257,3 +257,29 @@ toolset has drifted from the direct one and that's the bug.
   persistence store) not re-run live this pass — unaffected by a kaish-kernel bump
   and already covered by `tests/containment.rs`/`tests/store.rs` in that same green
   run.
+- **2026-07-29** — Full battery A–E, direct via `kaibo kaish`/`kaibo --state-db`
+  (built binary, commit `ffb0bdb`, pre-release checklist pass ahead of cutting real
+  v0.2.0 — five PRs had landed since the last full run: rmcp 3.0.0-beta.5, the
+  OpenAI batch lane, `list_models`, gemini `base_url`, the Homebrew tap). All clear:
+  Battery A — every write refused `permission denied: filesystem is read-only`,
+  `leftovers` grep empty, host `ls` clean. Battery B — every external command
+  `command not found` (exit 127). Battery C — `/etc/passwd`, `..`-traversal,
+  `~/.ssh/id_rsa`, and the adjacent-secret probe all `not found`; `env`/`kaish-vars`/
+  the key-var check all empty. **Noted for the record** (not a finding): `cd / && ls`
+  lists `dev`, `home`, `v` — these are synthetic VFS scaffolding, not host content:
+  `/dev/{null,random,urandom,zero}` are virtual devices, `/v` is kaish's own builtin
+  toolbox + ephemeral blob/job scratch (confirmed empty), and `/home` is an inert,
+  unwalkable stub (`ls /home`, `/home/atobey`, `/home/atobey/src` all `not found`) —
+  only the exact `--root`-resolved absolute path mounts real content, confirmed by
+  reading `$ROOT/Cargo.toml` through it. Battery D — all five `path` containment
+  cases matched the expected table exactly (`/etc` and the root's parent refused as
+  outside the allowed set, the `..`-injected path canonicalized to `/etc` then
+  refused, a real subdir succeeded, a file path refused as "not a directory").
+  Battery E — E1 refused the in-project `--state-db` loudly with no file created;
+  E2's real on-disk state db (4 KiB, existing session data) read back `not found`
+  through kaish; E3's `no_write_path` suite (11 tests) green. Full `cargo test`
+  (502 lib + full integration) and `--test containment --test sandbox
+  --test run_kaish_tool` (34 tests) all green on the same build. Immediately
+  followed by the `turso` 0.7.0 → 0.7.1 exact-pin bump (PR #106, merged as
+  `fae7a26`) — reviewed separately (cross-family, `src/store.rs`'s WAL-reopen
+  tests) since it doesn't touch this boundary.
