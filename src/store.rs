@@ -177,13 +177,14 @@ pub fn path_in_allowed_tree_hint(state_db_path: &Path) -> String {
     format!(
         "This usually means kaibo ran with no --root/--allow-path, so its default allowed \
          (read-only, model-reachable) tree is the launch directory — and that directory \
-         contains the state db's default XDG location. Three real fixes: narrow what kaibo \
-         mounts (--root <project-dir> or --allow-path <dir>), move the state db elsewhere \
-         (--state-db <path>, KAIBO_STATE_DB, or [persistence] path in config.toml), or skip \
-         persistence for this run (--no-persistence, KAIBO_NO_PERSISTENCE, or [persistence] \
-         enabled = false in config.toml). If the db really is corrupt, back it up and move it \
-         aside by hand — kaibo creates a fresh one on the next start. kaibo never deletes {} \
-         on its own: it holds your session history, which is model output you paid for.",
+         contains the state db's default XDG location. The db itself is fine; kaibo refused \
+         to even open it, before touching disk, because the path lands inside a project it \
+         must keep read-only. Three real fixes: narrow what kaibo mounts (--root \
+         <project-dir> or --allow-path <dir>), move the state db elsewhere (--state-db \
+         <path>, KAIBO_STATE_DB, or [persistence] path in config.toml), or skip persistence \
+         for this run (--no-persistence, KAIBO_NO_PERSISTENCE, or [persistence] enabled = \
+         false in config.toml). kaibo never deletes {} on its own: it holds your session \
+         history, which is model output you paid for.",
         state_db_path.display()
     )
 }
