@@ -4,12 +4,18 @@ All notable, user-facing changes to kaibo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); kaibo aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-`0.2.0` is the first tracked release — the point kaibo adopts a pull-request
-workflow and a maintained changelog. It captures the feature set as kaibo goes
-public rather than reconstructing the 0.1 development line; that history lives in
-the git log. Each later release appends a new section at the top.
+`0.2.0` is kaibo's first real public release — the point it's meant for other
+people to install and run, not just us. It's also the point kaibo adopts a
+pull-request workflow and this maintained changelog. The `0.2.0` entry captures
+the feature set as kaibo goes public rather than reconstructing the 0.1
+development line; that history lives in the git log, and it's noisy enough
+(iterative, exploratory, many small commits) that we may compress it into a
+shorter retrospective note later rather than leave it as the implicit "pre-0.2.0"
+record. Each later release appends a new section at the top.
 
-## [0.2.0] — unreleased
+## [Unreleased]
+
+## [0.2.0] — 2026-07-29
 
 ### Changed
 
@@ -706,4 +712,5 @@ the git log. Each later release appends a new section at the top.
   second wrapper. The line between an attachment and the prompt stays unambiguous across
   `oneshot` and batch.
 
+[Unreleased]: https://github.com/tobert/kaibo/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/tobert/kaibo/releases/tag/v0.2.0
