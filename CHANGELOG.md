@@ -35,6 +35,15 @@ the git log. Each later release appends a new section at the top.
 
 ### Added
 
+- **Homebrew install.** `brew install tobert/kaibo/kaibo` now installs kaibo from
+  the `tobert/homebrew-kaibo` tap, pulling the prebuilt, signed release binary for
+  macOS (Apple Silicon + Intel) and Linux (arm64 + x86_64). Installing through
+  Homebrew also sidesteps the macOS Gatekeeper quarantine prompt a browser download
+  triggers — `brew` doesn't attach `com.apple.quarantine`, so the binary runs without
+  the "cannot verify the developer" dialog. A `scripts/bump-tap.sh vX.Y.Z` helper
+  refreshes the tap formula from a published release's checksums as the last step of
+  cutting a release.
+
 - **`list_models` (MCP tool) and `kaibo models` (CLI) — read-only model discovery.**
   Ask kaibo what models a configured backend's provider actually serves instead of
   hand-rolling a `curl` with the right auth header: it queries the backend's real
