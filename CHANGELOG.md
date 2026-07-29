@@ -15,6 +15,20 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Fixed
+
+- **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
+  The state db's default path (`~/.local/state/kaibo/state.db`) can land inside
+  kaibo's default allowed tree when kaibo runs with no `--root`/`--allow-path`
+  and the launch directory is the home directory (or another ancestor of the
+  state dir) — startup then refuses to open the db, correctly, since a model
+  must never be able to reach kaibo's cross-project session store through a
+  read-only project mount. The refusal itself is unchanged and stays as strict
+  as ever; only the error message improves; it previously suggested only
+  `--state-db`/`--no-persistence`, leaving out the fix that's usually the right
+  one here — narrowing the allowed tree with `--root <project-dir>` or
+  `--allow-path <dir>` so it no longer contains the state db.
+
 ## [0.2.0] — 2026-07-29
 
 ### Changed

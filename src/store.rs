@@ -163,6 +163,32 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// The actionable hint appended to a [`StoreError::PathInAllowedTree`] startup failure
+/// (`main.rs`'s `serve`). Pure and side-effect-free — no I/O — so it's a small unit test
+/// rather than an integration one; the fix for this error is entirely in what the message
+/// says, never in weakening the containment check itself (that guard is the invariant this
+/// module's doc-comment describes, and stays exactly as strict).
+///
+/// The likely cause: with no `--root`/`--allow-path`, kaibo's default allowed (read-only,
+/// model-reachable) tree is the launch directory, and the state db's default XDG path
+/// (`~/.local/state/kaibo/state.db`) sits inside `~` — so starting kaibo unscoped from home
+/// (or any ancestor of the state dir) collides the two.
+pub fn path_in_allowed_tree_hint(state_db_path: &Path) -> String {
+    format!(
+        "This usually means kaibo ran with no --root/--allow-path, so its default allowed \
+         (read-only, model-reachable) tree is the launch directory — and that directory \
+         contains the state db's default XDG location. The db itself is fine; kaibo refused \
+         to even open it, before touching disk, because the path lands inside a project it \
+         must keep read-only. Three real fixes: narrow what kaibo mounts (--root \
+         <project-dir> or --allow-path <dir>), move the state db elsewhere (--state-db \
+         <path>, KAIBO_STATE_DB, or [persistence] path in config.toml), or skip persistence \
+         for this run (--no-persistence, KAIBO_NO_PERSISTENCE, or [persistence] enabled = \
+         false in config.toml). kaibo never deletes {} on its own: it holds your session \
+         history, which is model output you paid for.",
+        state_db_path.display()
+    )
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -847,4 +873,36 @@ fn validate_local_filesystem(dir: &Path) -> Result<()> {
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 fn validate_local_filesystem(_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gap this whole fix closes: a `PathInAllowedTree` failure at startup is very
+    /// often "kaibo ran unscoped from `~`, so the default allowed tree (launch dir) and
+    /// the default XDG state db path collide" — and `--root`/`--allow-path` (narrow the
+    /// mount) is the most natural fix, but the message this replaces never mentioned them,
+    /// only `--state-db`/`--no-persistence`. Assert all four survive together so a future
+    /// edit can't silently drop one.
+    #[test]
+    fn path_in_allowed_tree_hint_names_every_real_fix() {
+        let hint = path_in_allowed_tree_hint(Path::new("/home/amy/.local/state/kaibo/state.db"));
+        assert!(
+            hint.contains("--root"),
+            "hint should name --root as a fix (narrow the allowed tree): {hint}"
+        );
+        assert!(
+            hint.contains("--allow-path"),
+            "hint should name --allow-path as a fix (narrow the allowed tree): {hint}"
+        );
+        assert!(
+            hint.contains("--state-db"),
+            "hint should still name --state-db as a fix (move the db): {hint}"
+        );
+        assert!(
+            hint.contains("--no-persistence"),
+            "hint should still name --no-persistence as a fix (skip persistence): {hint}"
+        );
+    }
 }
