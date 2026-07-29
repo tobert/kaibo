@@ -311,7 +311,11 @@ even for a one-line doc fix.
   After the release publishes: run the README "Verify a download" commands against a
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't
-  verify is theater, so prove it the way a user would.
+  verify is theater, so prove it the way a user would. Then run `scripts/bump-tap.sh
+  vX.Y.Z` to point the Homebrew tap (`tobert/homebrew-kaibo`) at the new release — it
+  reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
+  there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
+  is the ritual's last step, not a workflow job.
 - **kaish pin.** Currently `kaish-kernel = "0.13.0"`. The `0.12.0 → 0.13.0` bump was
   again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
   full `cargo test` (598 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc`

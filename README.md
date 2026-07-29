@@ -105,10 +105,20 @@ the most common first-run stumble.
 
 ## Installation
 
-kaibo ships as a single self-contained binary per platform — download it, check the
-checksum, put it on your `PATH`, done. Linux builds are fully static musl and run on
-any distro; macOS (Apple silicon and Intel) and Windows binaries are self-contained
-too. Grab your platform's archive and its `.sha256` from the
+On macOS or Linux with [Homebrew](https://brew.sh):
+
+```sh
+brew install tobert/kaibo/kaibo
+```
+
+That taps [`tobert/homebrew-kaibo`](https://github.com/tobert/homebrew-kaibo) and
+installs the same signed release binary. On macOS it also avoids the Gatekeeper
+"cannot verify the developer" prompt — Homebrew's download isn't quarantined.
+
+Otherwise, kaibo ships as a single self-contained binary per platform — download it,
+check the checksum, put it on your `PATH`, done. Linux builds are fully static musl and
+run on any distro; macOS (Apple silicon and Intel) and Windows binaries are
+self-contained too. Grab your platform's archive and its `.sha256` from the
 [releases page](https://github.com/tobert/kaibo/releases):
 
 ```sh
