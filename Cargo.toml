@@ -95,7 +95,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.18"
 # Persistent session + batch-handle store (src/store.rs). turso is the pure-Rust
 # SQLite rewrite (ex-Limbo); the embedded `turso` crate, NOT libSQL or the cloud SDK.
-# EXACT-pinned (`=0.7.0`): the `.db-tshm` on-disk WAL format AND the API are declared
+# EXACT-pinned (`=0.7.1`): the `.db-tshm` on-disk WAL format AND the API are declared
 # unstable between releases (same discipline as the kaish-kernel pin) — a bump must be
 # a deliberate, tested port, never a silent `^` float. `default-features = false` is
 # MANDATORY: the defaults install `mimalloc` as the whole binary's global allocator via
@@ -104,7 +104,12 @@ lru = "0.18"
 # stdio-only + no-aws-lc invariants; the default `turso_sync_engine` weight carries no
 # transport without it. Verified aws-lc-rs/aws-lc-sys/openssl-sys/cmake-free via
 # `cargo tree -i` (see the store module doc-comment for the audit).
-turso = { version = "=0.7.0", default-features = false }
+# 0.7.0 -> 0.7.1: checked upstream's compare (9 commits) before pinning forward — the
+# only change touching the embedded engine (core/translate) is two query-planner
+# bugfixes (IN-LIST cost model, a missing-index-after-UPSERT case); everything else is
+# JS/serverless bindings and other-language SDKs kaibo doesn't use. No storage-format
+# or embedded-API change.
+turso = { version = "=0.7.1", default-features = false }
 # A typed store error wrapping `turso::Error` variants meaningfully (src/store.rs). The
 # rest of kaibo leans on anyhow, but a persistence library boundary wants a real error
 # enum callers can match on; thiserror is already in the tree (via kaish-kernel), so this
