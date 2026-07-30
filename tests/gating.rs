@@ -274,6 +274,79 @@ fn all_disabled_is_detected() {
     .all_disabled());
 }
 
+/// The zero-tool guard has to cover STAFFING, not just the flags.
+///
+/// `ToolGating::all_disabled()` runs before the handler is built and only reads the
+/// `--no-<tool>` flags, so it cannot see the other way the surface can empty out: every
+/// cast-taking tool flag-ON but unstaffable, with both castless tools (`run_kaish`,
+/// `list_models`) switched off. That server starts, advertises nothing, and says nothing
+/// — the silently-useless state the flag guard exists to refuse, reached by a different
+/// road. Narrow to arrive at (the keyless `openai-local` cast survives by default, so it
+/// takes an explicit `key_optional = false` plus an unreachable key file to kill it) but
+/// a real hole in a "crash rather than run useless" posture. Found by the DeepSeek
+/// cross-family review of this change.
+#[test]
+fn a_server_left_with_no_staffable_tools_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir for an isolated XDG_CONFIG_HOME");
+    let config_dir = dir.path().join("kaibo");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    // Every built-in backend unreachable — including the keyless one, which otherwise
+    // keeps a usable local cast alive and staffs consult/explore/oneshot.
+    std::fs::write(
+        config_dir.join("config.toml"),
+        r#"
+        [backends.anthropic]
+        api_key_file = "/nonexistent-kaibo-test/anthropic"
+        [backends.deepseek]
+        api_key_file = "/nonexistent-kaibo-test/deepseek"
+        [backends.gemini]
+        api_key_file = "/nonexistent-kaibo-test/gemini"
+        [backends.openrouter]
+        api_key_file = "/nonexistent-kaibo-test/openrouter"
+        [backends.openai-local]
+        key_optional = false
+        api_key_file = "/nonexistent-kaibo-test/openai"
+        "#,
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kaibo"))
+        .env("XDG_CONFIG_HOME", dir.path())
+        // Clear every provider key so the fixture's unreachable key files are the whole
+        // story — otherwise a developer's own environment re-staffs the casts.
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        // The two tools no cast can affect — off, so staffing decides everything.
+        .args(["--no-run-kaish", "--no-list-models"])
+        .output()
+        .expect("should be able to run the kaibo binary");
+
+    assert!(
+        !out.status.success(),
+        "a server whose every tool is unstaffable must exit non-zero, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Assert on the guard's OWN message, not merely a non-zero exit. This test is run
+    // with stdin closed, and a kaibo that got as far as serving exits non-zero anyway
+    // ("connection closed: initialize request") — so a bare status check passes whether
+    // or not the guard exists, which is exactly how it passed before the guard was
+    // written. Pinning the message is what makes this test able to fail.
+    assert!(
+        stderr.contains("no tools left to advertise"),
+        "must refuse with the empty-surface guard, not merely fail later at the \
+         transport; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("cast"),
+        "the refusal must point at the CAST configuration — an operator who disabled \
+         almost nothing needs to know why the surface is empty; stderr was: {stderr}"
+    );
+}
+
 /// The startup guard, end to end: launching with every `--no-*` flag must exit
 /// non-zero with a clear message, before binding the stdio transport. A supervisor
 /// has to be able to catch a zero-tool misconfiguration.

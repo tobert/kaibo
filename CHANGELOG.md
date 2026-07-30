@@ -36,6 +36,13 @@ record. Each later release appends a new section at the top.
   as unstaffable — "you disabled it" and "nothing can run it" are different answers and
   are kept apart.
 
+- **kaibo refuses to start when nothing is left to advertise.** It already refused a
+  server with every tool switched off; staffing opened a second road to the same useless
+  state (every cast-taking tool enabled but unstaffable, with `run_kaish` and
+  `list_models` disabled), which would previously have started and served an empty tool
+  list in silence. That now exits non-zero naming the cause, alongside the per-tool
+  warnings that say what each tool wanted.
+
 ### Fixed
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
