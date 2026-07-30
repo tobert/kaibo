@@ -200,6 +200,37 @@ scratch_limit_bytes = 67108864
 # headers = { authorization = "Bearer <token>" }
 
 # ---------------------------------------------------------------------------
+# [cas] — the media content-addressed store: where an artifact-producing tool writes
+# what it generated. There is NO enabled flag: the CAS exists exactly when such a tool
+# does, and those carry their own --no-<tool> gate plus the cast staffing gate, so a
+# second switch would only be a way for the two to disagree.
+#
+# It lives under the XDG *data* dir, deliberately NOT beside the state db: the session
+# store is reconstructible bookkeeping, while these are artifacts you spent real provider
+# credits on and may never be able to reproduce (the seed is recorded in a sidecar, but
+# not every operation has one). A backup tool should carry them.
+#
+# NO GC, on purpose. kaibo never prunes this store and never rewrites an object — the
+# address IS the content hash, so an "edit" is a new object. Every artifact gets a
+# <hex>.json sidecar (prompt, model, cast, timestamp, mime, seed) precisely so YOU can
+# prune intelligently: `find -mtime`, jq over the sidecars, restic. A TTL may come later.
+#
+# max_bytes is OPT-IN, and unset is not the same as a huge number. Enforcing a ceiling
+# means summing every file in the store, on the write path, for EVERY new object — over
+# a store that never deletes and is sharded two levels deep. That walk is O(objects) and
+# only slows as the store fills, so an operator who never asked for a ceiling pays none
+# of it. Set it and you opt into that cost; leave it and disk-full is the backstop (the
+# OS reports it honestly). A write past a configured cap is REFUSED loudly — kaibo never
+# evicts to make room, because eviction would quietly make "we never delete" a lie.
+# Env: KAIBO_CAS_DIR / KAIBO_CAS_MAX_BYTES. CLI: --cas-dir / --cas-max-bytes.
+# ---------------------------------------------------------------------------
+
+# [cas]
+# dir       = "~/.local/share/kaibo/cas"   # default: $XDG_DATA_HOME/kaibo/cas
+# max_bytes = 8589934592                   # 8 GiB. OMIT for no cap (the default);
+#                                          # 0 is a load error, not "refuse everything".
+
+# ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire protocol/rig client
 # (anthropic | deepseek | gemini | openai); the rest describes the wire (endpoint,
 # key source, per-request deadline). Models live on cast slots, never here.

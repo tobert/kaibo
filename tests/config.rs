@@ -917,7 +917,9 @@ fn cli_cast_wins_over_env_and_file() {
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
         false,  // --no-persistence not passed
-        None,   // no --state-db
+        None,   // no --state-db,
+        None, // --cas-dir
+        None, // --cas-max-bytes
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -950,6 +952,8 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         vec![],
         false,
         None,
+        None, // --cas-dir
+        None, // --cas-max-bytes
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1836,6 +1840,117 @@ fn persistence_env_disables_and_overrides_path() {
     );
 }
 
+// --- [cas]: the media content-addressed store -------------------------------
+
+/// The default posture: a dir under XDG *data* (not state — these are artifacts the user
+/// paid for), and **no size cap**. The absent cap is the load-bearing default, not an
+/// oversight: enforcing one means summing every file in the store on every write, over a
+/// store that never deletes.
+#[test]
+fn cas_defaults_to_the_xdg_data_dir_and_no_cap() {
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(
+        c.cas.max_bytes, None,
+        "the CAS ships uncapped — a cap costs an O(objects) walk per write, so it is opt-in"
+    );
+    let dir = c.cas.dir.expect("a default CAS dir resolves from XDG_DATA_HOME or HOME");
+    assert!(
+        dir.ends_with("kaibo/cas"),
+        "the default CAS dir is <data>/kaibo/cas, got {}",
+        dir.display()
+    );
+    assert!(
+        !dir.to_string_lossy().contains("/state/"),
+        "the CAS belongs in the DATA dir, not beside the disposable state db: {}",
+        dir.display()
+    );
+}
+
+/// The file layer sets both knobs, and `$VAR`/`~` in `dir` expand like every other path.
+#[test]
+fn cas_file_layer_sets_dir_and_cap() {
+    let c = Config::from_toml_str(
+        "[cas]\ndir = \"/srv/art\"\nmax_bytes = 1024\n",
+    )
+    .unwrap();
+    assert_eq!(c.cas.dir.unwrap(), std::path::PathBuf::from("/srv/art"));
+    assert_eq!(c.cas.max_bytes, Some(1024));
+}
+
+/// A zero ceiling is a loud load error, not a store that refuses every write. Nobody
+/// means "refuse everything" by `max_bytes = 0`; accepting it would produce a CAS that
+/// fails on first use with a capacity error no operator could explain.
+#[test]
+fn cas_zero_max_bytes_is_a_loud_load_error() {
+    let err = Config::from_toml_str("[cas]\nmax_bytes = 0\n")
+        .expect_err("max_bytes = 0 must be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("max_bytes") && msg.contains("> 0"),
+        "the error must name the knob and the rule, got: {msg}"
+    );
+    assert!(
+        msg.contains("Omit"),
+        "and it must say how to get the uncapped default, got: {msg}"
+    );
+}
+
+/// An unknown key under `[cas]` is refused — `deny_unknown_fields`, like every other
+/// section, so a typo'd knob is never silently ignored.
+#[test]
+fn cas_unknown_key_is_refused() {
+    assert!(
+        Config::from_toml_str("[cas]\nmax_size = 10\n").is_err(),
+        "a typo'd [cas] key must be a loud load error, not a silently-ignored knob"
+    );
+}
+
+/// Env overrides the file, per the standard naming rule (`max_bytes` ⇄ KAIBO_CAS_MAX_BYTES).
+#[test]
+fn cas_env_overrides_the_file() {
+    let env: HashMap<&str, &str> = [
+        ("KAIBO_CAS_DIR", "/from/env"),
+        ("KAIBO_CAS_MAX_BYTES", "4096"),
+    ]
+    .into_iter()
+    .collect();
+    let c = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.cas.dir.unwrap(), std::path::PathBuf::from("/from/env"));
+    assert_eq!(c.cas.max_bytes, Some(4096));
+}
+
+/// The CLI is the top layer, and an ABSENT flag never clobbers a lower layer — the same
+/// grammar every other optional flag here uses.
+#[test]
+fn cas_cli_wins_and_absent_flags_do_not_clobber() {
+    let mut c =
+        Config::from_toml_str("[cas]\ndir = \"/from/file\"\nmax_bytes = 111\n").unwrap();
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        false,
+        vec![],
+        vec![],
+        false,
+        None,
+        Some(std::path::PathBuf::from("/from/cli")), // --cas-dir
+        None,                                       // --cas-max-bytes NOT passed
+    );
+    assert_eq!(
+        c.cas.dir.unwrap(),
+        std::path::PathBuf::from("/from/cli"),
+        "--cas-dir wins over the file"
+    );
+    assert_eq!(
+        c.cas.max_bytes,
+        Some(111),
+        "an absent --cas-max-bytes must leave the file's value alone, not reset it"
+    );
+}
+
 /// The CLI is the top layer: `--no-persistence` and `--state-db` win over file/env.
 #[test]
 fn persistence_cli_wins_over_lower_layers() {
@@ -1853,6 +1968,8 @@ fn persistence_cli_wins_over_lower_layers() {
         vec![],
         true,                                           // --no-persistence
         Some(std::path::PathBuf::from("/from/cli.db")), // --state-db
+        None,                                           // --cas-dir
+        None,                                           // --cas-max-bytes
     );
     assert!(!c.persistence.enabled, "--no-persistence wins");
     assert_eq!(

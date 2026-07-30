@@ -52,12 +52,21 @@ fn provenance_round_trips_through_json_with_its_seed() {
     assert_eq!(back.seed.as_deref(), Some("9259671"));
 }
 
-/// A fresh CAS rooted under a temp dir plus the dir (kept alive by the caller), with a
-/// generous cap so most tests don't need to think about it.
+/// A fresh CAS rooted under a temp dir plus the dir (kept alive by the caller), capped
+/// at `max_bytes` — the tests that actually exercise the soft cap.
 fn open(max_bytes: u64) -> (Cas, TempDir) {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
-    let cas = Cas::open(&root, &[], max_bytes).expect("open cas");
+    let cas = Cas::open(&root, &[], Some(max_bytes)).expect("open cas");
+    (cas, dir)
+}
+
+/// A fresh UNCAPPED CAS — the default posture, and what most tests want: no cap means
+/// no size accounting at all, so they never have to think about a budget.
+fn open_uncapped() -> (Cas, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("cas");
+    let cas = Cas::open(&root, &[], None).expect("open cas");
     (cas, dir)
 }
 
@@ -134,7 +143,7 @@ fn digest_round_trips_through_hex() {
 fn open_refuses_path_inside_allowed_tree() {
     let project = TempDir::new().unwrap();
     let inside = project.path().join("sub/cas");
-    match Cas::open(&inside, &[project.path()], u64::MAX) {
+    match Cas::open(&inside, &[project.path()], None) {
         Err(CasError::PathInAllowedTree(_)) => {}
         Err(other) => panic!("wrong error: {other:?}"),
         Ok(_) => panic!("must refuse a cas dir inside an allowed tree"),
@@ -156,7 +165,7 @@ fn open_refuses_path_reaching_into_tree_via_symlink() {
     std::os::unix::fs::symlink(project.path().join("real"), &link).unwrap();
 
     let sneaky = link.join("cas");
-    match Cas::open(&sneaky, &[project.path()], u64::MAX) {
+    match Cas::open(&sneaky, &[project.path()], None) {
         Err(CasError::PathInAllowedTree(_)) => {}
         Err(other) => panic!("wrong error: {other:?}"),
         Ok(_) => panic!("must refuse a symlinked path that resolves inside an allowed tree"),
@@ -170,14 +179,14 @@ fn open_allows_path_outside_allowed_trees() {
     // Sanity: opening with an unrelated allowed tree present must not spuriously refuse.
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
-    assert!(Cas::open(&root, &[project.path()], u64::MAX).is_ok());
+    assert!(Cas::open(&root, &[project.path()], None).is_ok());
 }
 
 /// A db-style equal-to-tree edge case: the cas root itself equals an allowed tree.
 #[test]
 fn open_refuses_path_equal_to_an_allowed_tree() {
     let project = TempDir::new().unwrap();
-    match Cas::open(project.path(), &[project.path()], u64::MAX) {
+    match Cas::open(project.path(), &[project.path()], None) {
         Err(CasError::PathInAllowedTree(_)) => {}
         Err(other) => panic!("wrong error: {other:?}"),
         Ok(_) => panic!("a cas dir equal to an allowed tree must be refused"),
@@ -213,7 +222,7 @@ fn open_refuses_relative_path_that_absolutizes_into_an_allowed_tree() {
     let canon = project.path().canonicalize().unwrap();
     let _cwd = CwdGuard::set(&canon);
 
-    match Cas::open(Path::new("nonexistent_dir/cas"), &[&canon], u64::MAX) {
+    match Cas::open(Path::new("nonexistent_dir/cas"), &[&canon], None) {
         Err(CasError::PathInAllowedTree(_)) => {}
         Err(other) => panic!("wrong error for a relative in-cwd path: {other:?}"),
         Ok(_) => panic!("a relative path resolving inside the cwd allowed tree must be refused"),
@@ -401,6 +410,68 @@ fn writing_the_same_content_twice_is_a_noop_not_a_rewrite() {
 }
 
 // --- Soft cap: refuse loudly, never evict ------------------------------------
+
+/// The cap is OPT-IN, and an uncapped store never measures itself.
+///
+/// This is the load-bearing property, not a convenience: enforcing a cap means summing
+/// every file in the store, and `put` does that on the write path — for every new object,
+/// forever, over a store that by design never deletes anything. Two-level sharding means
+/// that walk is up to 65,536 `readdir`s plus a `metadata` per object, and it only gets
+/// slower as the store fills. So an operator who sets no cap pays none of it. The proof
+/// here is behavioral: with the store's own size accounting made impossible (the shard
+/// tree is replaced by a file, so any attempt to walk it errors), an uncapped `put` still
+/// succeeds — it never looked.
+#[test]
+#[cfg(unix)]
+fn an_uncapped_cas_never_walks_the_store_to_size_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (cas, _d) = open_uncapped();
+    let first = cas
+        .put(&[1u8; 32], Extension::Png, &prov())
+        .expect("first put");
+    assert!(cas.get(&first).unwrap().is_some());
+
+    // Sabotage the size walk WITHOUT touching the shard any write needs: a sibling
+    // top-level shard directory that exists but cannot be read. `read_dir` on it fails
+    // with EACCES, so summing the store is impossible — while `create_dir_all` and the
+    // object write, which only ever touch their own digest's shard, are unaffected.
+    let root = cas.root().to_path_buf();
+    let unreadable = root.join("zz");
+    std::fs::create_dir_all(&unreadable).expect("create a sibling shard");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+        .expect("make it unreadable");
+
+    // An uncapped put must not care, because it must never take the sizing path at all.
+    let second = cas
+        .put(&[2u8; 32], Extension::Png, &prov())
+        .expect("an uncapped put must not depend on being able to size the store");
+    assert_eq!(cas.get(&second).unwrap().unwrap(), vec![2u8; 32]);
+
+    // Prove the sabotage actually bites, so the success above means something: the SAME
+    // root opened WITH a cap must fail trying to walk it. Without this the test would
+    // still pass if `put` had simply stopped enforcing caps, or if the sabotage had
+    // quietly done nothing.
+    //
+    // The precondition is checked directly rather than by testing for uid 0: root (and
+    // anything holding CAP_DAC_OVERRIDE, or a filesystem mounted without permission
+    // enforcement) can still read the directory, and in that case there is no sabotage to
+    // observe. Asking whether the read actually fails is exact, needs no libc — which is
+    // a Linux-only dependency in this tree — and stays honest under every such case.
+    if std::fs::read_dir(&unreadable).is_err() {
+        let capped = Cas::open(&root, &[], Some(1 << 30)).expect("open the same root capped");
+        match capped.put(&[3u8; 32], Extension::Png, &prov()) {
+            Err(CasError::Io(msg)) => assert!(
+                msg.contains("scanning CAS size"),
+                "a capped put must fail IN the size walk, got: {msg}"
+            ),
+            other => panic!("the sabotage must break a capped put, got: {other:?}"),
+        }
+    }
+
+    // Leave the tree removable by the TempDir drop.
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).ok();
+}
 
 #[test]
 fn soft_cap_refuses_a_write_that_would_exceed_it() {

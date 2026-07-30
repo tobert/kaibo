@@ -102,11 +102,17 @@
 //! caller to handle a truncated/failed read as a first-class outcome — not carrying this
 //! module's verify-before-return contract over unexamined. Read this before adding one.
 //!
-//! # The soft cap refuses; it never evicts
+//! # The soft cap is opt-in; when set it refuses, and it never evicts
 //!
-//! [`Cas::open`] takes a `max_bytes` ceiling. A [`Cas::put`] that would push the store's
-//! total size over that ceiling is refused with [`CasError::CapacityExceeded`] — loudly,
-//! before any bytes are written. It never deletes anything to make room: eviction would
+//! [`Cas::open`] takes an **optional** `max_bytes` ceiling, and the default is `None` —
+//! no ceiling, and no size accounting whatsoever. Enforcing a ceiling means summing every
+//! file in the store on the *write* path, for every new object, over a store that never
+//! deletes and is sharded two levels deep; that walk is O(objects) and only slows down as
+//! the store fills. An operator who never asked for a ceiling should not pay it, so they
+//! do not. Cleanup is theirs to do (`find -mtime` over the sidecars); a TTL may come later.
+//!
+//! When a cap *is* set, a [`Cas::put`] that would push the store's total size over it is
+//! refused with [`CasError::CapacityExceeded`] — loudly, before any bytes are written. It never deletes anything to make room: eviction would
 //! quietly make "write-only" a lie (a lie exactly one write-time trust judgment away from
 //! looking corrupt), and disk-full-in-effect is precisely the crash-over-corrupt case
 //! kaibo's read-only posture already treats as correct. A dedup write of content already
@@ -331,13 +337,26 @@ pub struct Provenance {
 #[derive(Debug, Clone)]
 pub struct Cas {
     root: PathBuf,
-    max_bytes: u64,
+    /// The optional soft cap. `None` — the default — means no ceiling AND no size
+    /// accounting: [`Cas::put`] never walks the store. See [`Cas::open`].
+    max_bytes: Option<u64>,
 }
 
 impl Cas {
     /// Open (but do not yet create — see below) the CAS rooted at `dir`, refusing if
     /// `dir` resolves inside any `allowed_trees` entry (the read-only sandbox's project
-    /// roots). `max_bytes` is the soft cap enforced by every [`Cas::put`].
+    /// roots).
+    ///
+    /// `max_bytes` is an **optional** soft cap, and `None` (the default) is meaningfully
+    /// different from a very large number: it means [`Cas::put`] does no size accounting
+    /// at all. That matters because enforcing a cap requires summing every file in the
+    /// store, on the *write* path, for every new object — over a store that by design
+    /// never deletes anything, sharded two levels deep. That walk only gets slower as the
+    /// store fills, which is exactly the cost an operator who never asked for a ceiling
+    /// should not pay. Amy's call (2026-07-30): leave the accounting off until someone has
+    /// a problem that needs it. Disk-full is the real backstop and the OS reports it
+    /// honestly; pruning is `find -mtime` over the provenance sidecars (see the module
+    /// doc's "No GC here, on purpose").
     ///
     /// Unlike [`crate::store::SessionStore::open`], this does **not** create any
     /// directory — there is nothing to eagerly create. The root (and every shard
@@ -353,7 +372,7 @@ impl Cas {
     /// canonicalize the deepest *existing* ancestor of `dir` (following symlinks) and
     /// re-append the not-yet-created tail lexically, and refuse if that resolves inside
     /// any allowed tree.
-    pub fn open(dir: &Path, allowed_trees: &[&Path], max_bytes: u64) -> Result<Self> {
+    pub fn open(dir: &Path, allowed_trees: &[&Path], max_bytes: Option<u64>) -> Result<Self> {
         let dir = absolutize(dir)?;
         let resolved = resolve_existing_ancestor(&dir);
         for tree in allowed_trees {
@@ -432,9 +451,12 @@ impl Cas {
     }
 
     /// Recursively sum the size in bytes of every file currently in the store. Backs the
-    /// soft-cap check in [`Cas::put`]. A read-only directory walk — no writes, no
-    /// caching, no separate counter file to keep in sync (and thus no extra write site
-    /// this module would otherwise need).
+    /// soft-cap check in [`Cas::put`], and is called ONLY when a cap is configured — see
+    /// [`Cas::open`] for why an uncapped store must never pay for this. A read-only
+    /// directory walk: no writes, no caching, no separate counter file to keep in sync
+    /// (and thus no extra write site this module would otherwise need). The flip side of
+    /// holding no counter is that the cost is O(objects) per capped write, which is
+    /// precisely why the cap is opt-in rather than a default ceiling.
     fn total_bytes(&self) -> Result<u64> {
         fn walk(dir: &Path) -> std::io::Result<u64> {
             if !dir.is_dir() {
@@ -496,13 +518,15 @@ impl Cas {
                 ))
             })?;
             verify(&digest, existing)?;
-        } else {
-            // New content only: check the soft cap before growing the store at all.
+        } else if let Some(max_bytes) = self.max_bytes {
+            // New content, and a cap is configured: measure before growing the store at
+            // all. This is the ONLY call site that walks the store, and it is reached only
+            // when an operator opted into a ceiling — an uncapped CAS never sizes itself.
             let current = self.total_bytes()?;
             let incoming = bytes.len() as u64;
-            if current.saturating_add(incoming) > self.max_bytes {
+            if current.saturating_add(incoming) > max_bytes {
                 return Err(CasError::CapacityExceeded {
-                    max_bytes: self.max_bytes,
+                    max_bytes,
                     current_bytes: current,
                 });
             }

@@ -93,6 +93,8 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         common.user_context_file.clone(),
         common.no_persistence,
         common.state_db.clone(),
+        common.cas_dir.clone(),
+        common.cas_max_bytes,
     );
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else

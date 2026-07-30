@@ -594,6 +594,8 @@ fn allow_paths_cli_replaces_env_and_file() {
         vec![],
         false,
         None,
+        None, // --cas-dir
+        None, // --cas-max-bytes
     );
     assert_eq!(c.allow_paths.len(), 2);
     assert!(c

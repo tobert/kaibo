@@ -213,6 +213,17 @@ pub struct CommonArgs {
     /// / the default ($XDG_STATE_HOME/kaibo/state.db).
     #[arg(long = "state-db", value_name = "FILE", global = true)]
     pub state_db: Option<PathBuf>,
+
+    /// Directory for the media CAS (generated artifacts). Overrides KAIBO_CAS_DIR /
+    /// [cas] dir / the default ($XDG_DATA_HOME/kaibo/cas).
+    #[arg(long = "cas-dir", value_name = "DIR", global = true)]
+    pub cas_dir: Option<PathBuf>,
+
+    /// Soft cap on total media-CAS size, in bytes. Unset means NO cap and no size
+    /// accounting; setting one makes every new write first sum the whole store.
+    /// Overrides KAIBO_CAS_MAX_BYTES / [cas] max_bytes.
+    #[arg(long = "cas-max-bytes", value_name = "BYTES", global = true)]
+    pub cas_max_bytes: Option<u64>,
 }
 
 /// The per-tool `--no-<tool>` gates — serve-only (they only make sense for the
@@ -510,6 +521,8 @@ fn load_config(common: &CommonArgs) -> anyhow::Result<Config> {
         common.user_context_file.clone(),
         common.no_persistence,
         common.state_db.clone(),
+        common.cas_dir.clone(),
+        common.cas_max_bytes,
     );
     Ok(config)
 }

@@ -773,6 +773,39 @@ impl Default for PersistenceConfig {
     }
 }
 
+/// `[cas]` — the media content-addressed store where generated artifacts land.
+///
+/// There is no `enabled` flag here on purpose: the CAS exists exactly when a tool that
+/// writes to it does, and those tools carry their own `--no-<tool>` gates plus the cast
+/// staffing gate. A second on/off switch would just be a way for the two to disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CasConfig {
+    /// Where artifacts live. Defaults to `$XDG_DATA_HOME/kaibo/cas`, else
+    /// `~/.local/share/kaibo/cas` — the *data* dir, not the state dir the session db
+    /// uses, because these are artifacts the user paid for and may never be able to
+    /// reproduce (see `src/cas.rs`'s module doc). `None` only when neither
+    /// `$XDG_DATA_HOME` nor `$HOME` is set; a tool that needs the CAS then fails loudly
+    /// rather than inventing a path.
+    pub dir: Option<PathBuf>,
+    /// Optional soft cap on total store size. **Unset by default, and that is not the
+    /// same as a very large number**: a cap has to be enforced by summing every file in
+    /// the store on the write path, for every new object, over a store that by design
+    /// never deletes. That walk is O(objects) and only slows as the store fills, so an
+    /// operator who never asked for a ceiling pays nothing for it. Set it and you opt
+    /// into the accounting; leave it and disk-full is the backstop, with `find -mtime`
+    /// over the provenance sidecars as the cleanup story.
+    pub max_bytes: Option<u64>,
+}
+
+impl Default for CasConfig {
+    fn default() -> Self {
+        Self {
+            dir: crate::cas::default_cas_dir(),
+            max_bytes: None,
+        }
+    }
+}
+
 // --- The whole config ------------------------------------------------------
 
 /// kaibo's resolved configuration.
@@ -815,6 +848,8 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// Durable sessions + batch handles — on by default (see [`PersistenceConfig`]).
     pub persistence: PersistenceConfig,
+    /// `[cas]` — where generated media artifacts land, and an optional size ceiling.
+    pub cas: CasConfig,
     /// House-rules files spliced into each consultation tool's preamble (the
     /// `[context]` table). Defaults to reading `AGENTS.md` when present.
     pub context: ContextConfig,
@@ -1423,6 +1458,7 @@ impl Config {
         let infer_cwd = server.infer_cwd.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
+        let cas = merge_cas(raw.cas.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
@@ -1454,6 +1490,7 @@ impl Config {
             defaults,
             telemetry,
             persistence,
+            cas,
             context,
             prompts,
             orientation,
@@ -1494,6 +1531,8 @@ impl Config {
         user_context_files: Vec<PathBuf>,
         disable_persistence: bool,
         state_db: Option<PathBuf>,
+        cas_dir: Option<PathBuf>,
+        cas_max_bytes: Option<u64>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
@@ -1507,6 +1546,16 @@ impl Config {
         // shell; a path arrives concrete). Overrides file/env/default.
         if let Some(path) = state_db {
             self.persistence.path = Some(path);
+        }
+        // `--cas-dir` / `--cas-max-bytes` are the top layer over env/file/default. Note
+        // there is no CLI way to *clear* a configured cap back to "no ceiling" — the
+        // absence of the flag means "don't override", the same grammar every other
+        // optional flag here uses. Omit `max_bytes` from the file to run uncapped.
+        if let Some(dir) = cas_dir {
+            self.cas.dir = Some(dir);
+        }
+        if let Some(max) = cas_max_bytes {
+            self.cas.max_bytes = Some(max);
         }
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
         // never force it on over a `[server] follow_worktrees = false` in the file.
@@ -1769,6 +1818,7 @@ struct RawConfig {
     defaults: Option<RawDefaults>,
     telemetry: Option<RawTelemetry>,
     persistence: Option<RawPersistence>,
+    cas: Option<RawCas>,
     context: Option<RawContext>,
     prompts: Option<RawPrompts>,
     orientation: Option<RawOrientation>,
@@ -1804,6 +1854,16 @@ struct RawPersistence {
     /// `$VAR`/`~`-expanded like `root`/`allow_paths`, so `$XDG_STATE_HOME/kaibo.db` or
     /// `~/state.db` resolves per-environment rather than landing as a literal token.
     path: Option<String>,
+}
+
+/// `[cas]` as written in the file. `max_bytes` absent means *no cap* — see [`CasConfig`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCas {
+    /// `$VAR`/`~`-expanded like `root`/`allow_paths`, so `$XDG_DATA_HOME/art` resolves
+    /// per-environment rather than landing as a literal token.
+    dir: Option<String>,
+    max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2266,6 +2326,29 @@ fn merge_persistence(raw: RawPersistence) -> Result<PersistenceConfig> {
     Ok(PersistenceConfig { enabled, path })
 }
 
+/// Resolve `[cas]`. A missing `dir` falls back to the XDG data default; a missing
+/// `max_bytes` means **no cap at all**, which is the deliberate default (see
+/// [`CasConfig::max_bytes`]). An explicit `max_bytes = 0` is a loud load error rather
+/// than a store that refuses every write — a zero ceiling is never what anyone means,
+/// and silently accepting it would produce a CAS that fails on first use with a
+/// capacity error nobody could explain.
+fn merge_cas(raw: RawCas) -> Result<CasConfig> {
+    let dir = match raw.dir {
+        Some(d) => Some(expand_path(&d)?),
+        None => crate::cas::default_cas_dir(),
+    };
+    if raw.max_bytes == Some(0) {
+        bail!(
+            "[cas] max_bytes must be > 0 — a zero ceiling refuses every write. Omit it \
+             entirely for no cap (the default), or set a real byte budget."
+        );
+    }
+    Ok(CasConfig {
+        dir,
+        max_bytes: raw.max_bytes,
+    })
+}
+
 /// Resolve `[context]`. A *missing* `project_files` keeps the built-in
 /// `["AGENTS.md"]` default (vendor-neutral, opt-out by an explicit empty list);
 /// `user_files` default to empty and are `$VAR`/`~`-expanded here (via `expand_path`,
@@ -2567,6 +2650,18 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_STATE_DB") {
         persistence.path = Some(v);
+    }
+
+    // Media CAS: KAIBO_CAS_DIR / KAIBO_CAS_MAX_BYTES, straight from the naming rule
+    // (config key `foo_bar` ⇄ env `KAIBO_FOO_BAR`). There is no KAIBO_NO_CAS — the CAS
+    // isn't a capability you switch off, it's where an artifact-producing tool writes,
+    // and those tools carry their own `--no-<tool>` gates.
+    let cas = raw.cas.get_or_insert_with(Default::default);
+    if let Some(v) = get("KAIBO_CAS_DIR") {
+        cas.dir = Some(v);
+    }
+    if let Some(v) = get("KAIBO_CAS_MAX_BYTES") {
+        cas.max_bytes = Some(parse_env_int("KAIBO_CAS_MAX_BYTES", &v)?);
     }
     Ok(())
 }
