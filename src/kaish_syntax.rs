@@ -117,7 +117,7 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 /// `## Scope` — the menu of teams reads before scope, and both sit above the point a
 /// truncating host (Claude Code's 2048-char cap) would cut.
 fn kaibo_lead() -> &'static str {
-    "kaibo (解剖) — grounded, cited answers about a codebase from a model outside \
+    "kaibo — grounded, cited answers about a codebase from a model outside \
      your own family. DeepSeek, Gemini, Anthropic, OpenRouter, or a local model reads the \
      project READ-ONLY and answers with file:line citations. Say in prose what you \
      did or want to know — kaibo finds and reads the current code itself; no \
@@ -777,7 +777,7 @@ mod tests {
         );
         let casts_at = text.find("## Casts").expect("has a Casts section");
         let scope_at = text.find("## Scope").expect("has a Scope section");
-        let lead_at = text.find("kaibo (解剖)").expect("opens with the lead");
+        let lead_at = text.find("kaibo").expect("opens with the lead");
         assert!(
             lead_at < casts_at && casts_at < scope_at,
             "order must be lead → casts → scope (got lead={lead_at}, casts={casts_at}, \

@@ -81,7 +81,7 @@ EXIT CODES
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
 this table (0 ok, 126 blocked, 124 timed out).";
 
-/// kaibo (解剖) — read-only codebase consultation from a model outside your own
+/// kaibo — read-only codebase consultation from a model outside your own
 /// family. Ask a question; a capable model (DeepSeek, Gemini, Anthropic, OpenRouter,
 /// or local — pick with `--cast`) reads the project READ-ONLY and answers with
 /// `file:line` citations, never modifying anything. Bare `kaibo` is the MCP server

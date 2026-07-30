@@ -1,4 +1,4 @@
-# AGENTS.md — kaibo (解剖)
+# AGENTS.md — kaibo
 
 Kaibo is a stdio MCP server that provides an assistant agent **for other agents**.
 It augments a calling agent (Codex, Claude, Gemini, local agents, etc.) with a team of
