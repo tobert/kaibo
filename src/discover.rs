@@ -113,6 +113,17 @@ pub fn discovery_endpoint(backend: &Backend) -> Result<DiscoveryRequest> {
 pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Result<DiscoveryRequest> {
     let key = backend.resolve_key()?;
     match backend.kind {
+        // Stability publishes no model-listing endpoint in the `/models` shape this
+        // module speaks — its model set is the small fixed route family
+        // (`generate/{core,ultra,sd3}`), documented rather than enumerable. Refusing
+        // loudly beats inventing a URL that would 404, and beats returning an empty
+        // list that would read as "this backend serves no models".
+        ProviderKind::Stability => anyhow::bail!(
+            "backend {:?} is kind `stability`, which publishes no model-listing \
+             endpoint — its models are the documented generate routes (core, ultra, \
+             sd3), not a discoverable list",
+            backend.name
+        ),
         ProviderKind::Openai => {
             let base = backend.resolved_base_url();
             let base = base.trim_end_matches('/');
@@ -351,6 +362,10 @@ pub async fn discover_models(
     fetcher: &impl ModelListFetcher,
 ) -> Result<Vec<DiscoveredModel>> {
     match backend.kind {
+        // No listing endpoint — see `discovery_endpoint_page`. Same loud refusal, so
+        // `list_models` over a mixed backend set names the one it cannot enumerate
+        // instead of quietly omitting it.
+        ProviderKind::Stability => discovery_endpoint_page(backend, None).map(|_| Vec::new()),
         ProviderKind::Anthropic => discover_paginated(
             backend,
             fetcher,

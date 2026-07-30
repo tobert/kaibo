@@ -1840,6 +1840,96 @@ fn persistence_env_disables_and_overrides_path() {
     );
 }
 
+// --- the image role and the stability kind ----------------------------------
+
+/// An `image` slot parses and lands on the cast. Until this change `image = …` was a
+/// loud `deny_unknown_fields` error (986806f reduced the role set to explorer+synth);
+/// reviving it is what lets a cast staff an artifact-producing tool.
+#[test]
+fn a_cast_can_carry_an_image_slot() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "stability"
+
+        [casts.artist]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth    = "deepseek/deepseek-v4-pro"
+        image    = "sd/core"
+        "#,
+    )
+    .expect("an image slot must parse");
+    let cast = c.resolve_cast("artist").expect("cast resolves");
+    let slot = cast
+        .slot(kaibo::config::ModelRole::Image)
+        .expect("the image slot is present");
+    assert_eq!(slot.backend, "sd");
+    assert_eq!(slot.id, "core");
+}
+
+/// A REASONING slot pointed at a Stability backend is a loud LOAD error. There is no
+/// completion model behind an image API, so an arm built from one could only fail at
+/// request time — and by then the operator is reading a provider error instead of being
+/// told their config is wrong. Refuse at load, and name the fix.
+#[test]
+fn a_reasoning_slot_cannot_point_at_a_stability_backend() {
+    for role in ["explorer", "synth"] {
+        let toml = format!(
+            r#"
+            [backends.sd]
+            kind = "stability"
+
+            [casts.broken]
+            {role} = "sd/core"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a {role} slot on a stability backend must be refused at load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(role) && msg.contains("stability"),
+            "the error must name the offending slot and the kind, got: {msg}"
+        );
+        assert!(
+            msg.contains("image"),
+            "and it must point at the fix (the image slot), got: {msg}"
+        );
+    }
+}
+
+/// The mirror: an `image` slot on a chat backend is refused too. Asking a completion
+/// model to return pixels fails just as surely, and just as confusingly, at request time.
+#[test]
+fn an_image_slot_cannot_point_at_a_completion_backend() {
+    let err = Config::from_toml_str(
+        r#"
+        [casts.broken]
+        image = "deepseek/deepseek-v4-pro"
+        "#,
+    )
+    .expect_err("an image slot on a chat backend must be refused at load");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("image") && msg.contains("stability"),
+        "the error must name the slot and the kind it needs, got: {msg}"
+    );
+}
+
+/// No BUILT-IN cast carries an image slot, so a stock install can staff no image tool —
+/// the staffing gate then keeps that tool off the wire entirely, at zero resident cost
+/// for every user who never configures one. Pins the premise that argument rests on.
+#[test]
+fn no_builtin_cast_carries_an_image_slot() {
+    let c = Config::builtin();
+    for (name, cast) in &c.casts {
+        assert!(
+            cast.slot(kaibo::config::ModelRole::Image).is_none(),
+            "built-in cast {name:?} must not carry an image slot — image generation \
+             costs real money per call and has to be configured deliberately"
+        );
+    }
+}
+
 // --- [cas]: the media content-addressed store -------------------------------
 
 /// The default posture: a dir under XDG *data* (not state — these are artifacts the user

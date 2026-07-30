@@ -49,9 +49,33 @@ pub enum ProviderKind {
     /// Any OpenAI-compatible endpoint, addressed by base URL; key optional.
     /// Defaults to a local keyless server (Gemma via an OpenAI-compatible host).
     Openai,
+    /// Stability AI's v2beta image family — the one **production** wire kaibo speaks,
+    /// and the odd one out here in a way worth stating: every other kind is a chat
+    /// completion API driven through `rig`, while this one is an image API driven
+    /// through kaibo's own facade (`src/stability.rs`). It is therefore only ever valid
+    /// on an `image` cast slot ([`crate::config::ModelRole::Image`]); a reasoning slot
+    /// pointed at a Stability backend is a load error, because there is no completion
+    /// model behind it to resolve.
+    ///
+    /// Deliberately NOT in the built-in backend list: image generation costs real money
+    /// per call and needs a key, so it appears only when an operator writes the stanza.
+    Stability,
 }
 
 impl ProviderKind {
+    /// Every kind, in declaration order. Drives the "expected one of…" error text so a
+    /// new kind can never be accepted by `FromStr` while staying unlisted in the message
+    /// a user actually reads — a hand-maintained list in that string had already drifted
+    /// once (`openrouter` shipped before it was named there).
+    pub const ALL: [ProviderKind; 6] = [
+        Self::Anthropic,
+        Self::DeepSeek,
+        Self::Gemini,
+        Self::OpenRouter,
+        Self::Openai,
+        Self::Stability,
+    ];
+
     /// Whether a missing credential is tolerated rather than a hard error. Only
     /// the OpenAI-compatible provider is: its default endpoint is a local keyless
     /// server, so an absent key falls back to a placeholder bearer token
@@ -84,7 +108,11 @@ impl ProviderKind {
             ProviderKind::Anthropic
             | ProviderKind::DeepSeek
             | ProviderKind::OpenRouter
-            | ProviderKind::Openai => PLACEHOLDER_OPENAI_KEY,
+            | ProviderKind::Openai
+            // Never reached: Stability is not `key_optional`, so a missing key is a
+            // hard error long before a stand-in is wanted. It is a header-bearer wire,
+            // so it takes the same shape as the others if that ever changes.
+            | ProviderKind::Stability => PLACEHOLDER_OPENAI_KEY,
         }
     }
 
@@ -100,6 +128,7 @@ impl ProviderKind {
             ProviderKind::Gemini => "gemini",
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Openai => "openai",
+            ProviderKind::Stability => "stability",
         }
     }
 
@@ -125,6 +154,9 @@ impl ProviderKind {
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
             ProviderKind::Openai => "OPENAI_API_KEY",
+            // Reuses the constant `src/stability.rs` already resolves keys with, so the
+            // facade and the config layer can never disagree about which var to read.
+            ProviderKind::Stability => crate::stability::STABILITY_KEY_ENV_VAR,
         }
     }
 
@@ -138,6 +170,8 @@ impl ProviderKind {
             ProviderKind::Gemini => ".gemini-api-key",
             ProviderKind::OpenRouter => ".openrouter-key",
             ProviderKind::Openai => ".openai-key",
+            // Same constant `src/stability.rs` uses, for the same reason as `env_var`.
+            ProviderKind::Stability => crate::stability::STABILITY_KEY_FILE_NAME,
         }
     }
 
@@ -159,8 +193,14 @@ impl std::str::FromStr for ProviderKind {
             // The OpenAI-compatible endpoint. Also accept the names people reach
             // for when it points at the local keyless default (Gemma via Lemonade).
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
+            "stability" => Ok(ProviderKind::Stability),
             other => Err(anyhow!(
-                "unknown provider {other:?} (expected anthropic, deepseek, gemini, openrouter, or openai)"
+                "unknown provider {other:?} (expected one of: {})",
+                ProviderKind::ALL
+                    .iter()
+                    .map(|k| k.canonical_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }

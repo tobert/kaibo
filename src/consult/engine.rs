@@ -297,6 +297,18 @@ impl Arm {
         let http = crate::tls::https_client(backend.request_timeout)?;
 
         match backend.kind {
+            // A Stability backend has no completion model to build an arm from — it is
+            // an image API, reached through kaibo's own facade (`src/stability.rs`) on
+            // the `image` cast slot, never through rig. Config validation refuses a
+            // reasoning slot pointed at one, so this is the belt to that braces: if the
+            // two ever disagree, fail loudly here rather than construct a nonsense arm.
+            ProviderKind::Stability => anyhow::bail!(
+                "backend {:?} is kind `stability`, which generates images and cannot \
+                 staff a reasoning slot — point `explorer`/`synth` at a completion \
+                 backend, and use `image = \"{}/<model>\"` for generation",
+                backend.name,
+                backend.name
+            ),
             ProviderKind::Anthropic => {
                 // base_url is optional here (unlike the openai kind): unset dials
                 // rig's built-in https://api.anthropic.com; set, it points at an

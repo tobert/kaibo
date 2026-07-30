@@ -94,6 +94,11 @@ fn transport_supports_tool_result_images(kind: ProviderKind) -> bool {
         // Vision-blind on the wire; the value is unreached (no view_image attaches),
         // but "no tool-result image channel" is the honest answer.
         ProviderKind::DeepSeek => false,
+        // Never reached: `Stability` is an image-generation wire, not a completion
+        // wire — no reasoning slot may point at one, so no phase ever shapes a request
+        // for it. Answered explicitly rather than with a `_` arm so the next kind still
+        // has to make this choice consciously.
+        ProviderKind::Stability => false,
     }
 }
 
@@ -121,6 +126,11 @@ fn is_vision_capable(kind: ProviderKind, _model: &str) -> bool {
         // vision on, while its synth default (text-only `qwen3.7-max`) leaves the slot
         // `None` and lets this false stand.
         ProviderKind::OpenRouter => false,
+        // Never reached: no reasoning slot may point at a Stability backend (it is an
+        // image-generation wire, not a completion one), so nothing ever asks whether it
+        // can *read* an image. Stated rather than defaulted, so the next kind must
+        // choose consciously.
+        ProviderKind::Stability => false,
     }
 }
 
@@ -224,6 +234,10 @@ impl ModelShape {
             ProviderKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
             ProviderKind::OpenRouter => ThinkingStyle::OpenRouterEffort,
             ProviderKind::Openai => ThinkingStyle::None,
+            // An image API has no reasoning channel to configure, and no reasoning slot
+            // can name a Stability backend, so this is unreachable — `None` is the
+            // truthful value rather than a convenient one.
+            ProviderKind::Stability => ThinkingStyle::None,
         };
         let (sampling_under_thinking, sampling_placement) = match kind {
             ProviderKind::Anthropic => (false, SamplingPlacement::TopLevel),
@@ -233,6 +247,10 @@ impl ModelShape {
             ProviderKind::DeepSeek | ProviderKind::OpenRouter | ProviderKind::Openai => {
                 (true, SamplingPlacement::TopLevel)
             }
+            // Unreachable for the same reason as `thinking` above: no completion request
+            // is ever shaped for this kind. Stability's own sampling knobs (cfg_scale,
+            // seed) live on `StabilityRequest`, not here.
+            ProviderKind::Stability => (true, SamplingPlacement::TopLevel),
         };
         Self {
             thinking,

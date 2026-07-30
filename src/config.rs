@@ -170,29 +170,55 @@ impl Default for Defaults {
 
 // --- Roles ------------------------------------------------------------------
 
-/// The roles a cast's model slots can serve: the two agent phases. Explorer does the
-/// fast sweeps; synth answers. There are no output/production roles — kaibo reasons
-/// over a codebase and renders nothing. Perception (image input, audio-in later) is a
-/// slot *capability* (`ModelCaps` / the `vision` pin), not a role. A cast may omit a
-/// role: an absent slot means the capability is absent, not an error (the four
-/// interactive built-in casts carry explorer+synth; the batch built-ins carry synth
-/// only).
+/// The roles a cast's model slots can serve.
+///
+/// Explorer does the fast sweeps and synth answers — the two *reasoning* phases, and for
+/// most of kaibo's life the only two. `Image` is deliberately different in kind: it is a
+/// **production** role, the one place kaibo emits rather than reasons, and it exists
+/// because Amy reopened image generation on 2026-07-25 with the media CAS as the write
+/// surface that makes it acceptable (see `src/cas.rs`'s module doc for why the CAS is
+/// safe by *shape* rather than by policy).
+///
+/// It lives here, on a cast slot, rather than as a config concept of its own. That was
+/// Amy's call (2026-07-30) over the alternative of a standalone `[image]` section keyed
+/// straight to a backend, and it earns its place: the staffing gate, the per-tool `cast`
+/// enum, and the per-call `cast` argument all keep working unchanged, so an image tool
+/// is one `CAST_ENUM_RULES` row rather than a parallel mechanism. The cost is that
+/// "cast" now names a team that may include a non-reasoning member; the benefit is that
+/// there is exactly one way to say "which models answer this call".
+///
+/// Perception stays a slot *capability* (`ModelCaps` / the `vision` pin), not a role —
+/// reading an image is part of a reasoning slot's input, not a job of its own.
+///
+/// A cast may omit any role: an absent slot means the capability is absent, not an error
+/// (the interactive built-ins carry explorer+synth; the batch built-ins carry synth
+/// only; none carries an image slot, so no built-in cast can staff an image tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelRole {
     Explorer,
     Synth,
+    Image,
 }
 
 impl ModelRole {
     /// Every role, in table order — the source for "known roles" error text.
-    pub const ALL: [ModelRole; 2] = [Self::Explorer, Self::Synth];
+    pub const ALL: [ModelRole; 3] = [Self::Explorer, Self::Synth, Self::Image];
 
     /// The role's config-table key (`[casts.<name>]`).
     pub fn key(self) -> &'static str {
         match self {
             Self::Explorer => "explorer",
             Self::Synth => "synth",
+            Self::Image => "image",
         }
+    }
+
+    /// Whether this role runs a *reasoning* phase — an agent turn with a preamble, a
+    /// tool loop, and a thinking budget. `Image` does not: it is one request to an image
+    /// API, so the request-shaping machinery (`ModelShape`, effort, thinking style, turn
+    /// caps) neither applies to it nor should be resolved for it.
+    pub fn is_reasoning(self) -> bool {
+        matches!(self, Self::Explorer | Self::Synth)
     }
 }
 
@@ -1386,6 +1412,35 @@ impl Config {
                         t.max_tokens
                     );
                 }
+                // The role and the backend KIND have to agree about what kind of wire
+                // this is. `stability` is an image-generation API driven through
+                // kaibo's own facade, not a rig completion model, so it can staff the
+                // `image` slot and nothing else; conversely an image slot pointed at a
+                // chat backend would ask a completion model to return pixels. Both are
+                // load errors here rather than a baffling failure at request time, when
+                // the operator would be reading a provider error instead of a config
+                // mistake. This is the config half of the guard `Arm::from_slot` bails
+                // on — if the two ever disagree, both refuse rather than improvise.
+                if kind == ProviderKind::Stability && role.is_reasoning() {
+                    bail!(
+                        "cast {name:?}: the {} slot points at backend {:?} (kind \
+                         `stability`), which generates images and has no completion \
+                         model to reason with — point {} at a chat backend, and put the \
+                         stability backend on this cast's `image` slot instead",
+                        role.key(),
+                        slot.backend,
+                        role.key(),
+                    );
+                }
+                if *role == ModelRole::Image && kind != ProviderKind::Stability {
+                    bail!(
+                        "cast {name:?}: the image slot points at backend {:?} (kind \
+                         `{}`), which is a chat/completion wire and cannot generate an \
+                         image — an image slot needs a backend of kind `stability`",
+                        slot.backend,
+                        kind.canonical_name(),
+                    );
+                }
                 // A slot's lane needs a fitting role and backend, caught here rather
                 // than as a baffling refusal or a 400 at submit/deliberate time. The
                 // explorer always runs interactively (a `deliberate` cast pairs it with
@@ -1788,6 +1843,11 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
 /// (`provider-model-ids` memory).
 pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
     match kind {
+        // Stability seeds no built-in cast: it staffs only the `image` slot, which no
+        // built-in carries, and it has no explorer/synth to name. Returning empty ids
+        // rather than plausible-looking ones keeps a mistaken caller loud — an empty
+        // model id fails at request time instead of silently dialing a wrong model.
+        ProviderKind::Stability => ("", ""),
         ProviderKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
         ProviderKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
         ProviderKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
@@ -2116,6 +2176,8 @@ struct RawCast {
     batch: Option<bool>,
     explorer: Option<RawSlot>,
     synth: Option<RawSlot>,
+    /// The production slot — a text-to-image model. See [`ModelRole::Image`].
+    image: Option<RawSlot>,
 }
 
 impl RawCast {
@@ -2124,6 +2186,7 @@ impl RawCast {
         [
             (ModelRole::Explorer, &self.explorer),
             (ModelRole::Synth, &self.synth),
+            (ModelRole::Image, &self.image),
         ]
         .into_iter()
         .filter_map(|(role, slot)| slot.as_ref().map(|s| (role, s)))

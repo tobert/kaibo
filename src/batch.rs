@@ -1897,6 +1897,9 @@ pub fn batch_supported(backend: &Backend) -> bool {
         ProviderKind::Anthropic | ProviderKind::Gemini => true,
         ProviderKind::Openai => backend.is_hosted_openai(),
         ProviderKind::DeepSeek | ProviderKind::OpenRouter => false,
+        // Not a completion wire at all — an image API with no batch endpoint, and no
+        // reasoning slot can point at it (see `ProviderKind::Stability`).
+        ProviderKind::Stability => false,
     }
 }
 
