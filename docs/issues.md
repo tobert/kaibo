@@ -22,18 +22,6 @@ the model-facing surface pass + the full consultation ladder (arc closeout, #37�
 
 ## P1 — High-leverage features & robustness
 
-### `deliberate` cannot be staffed by any built-in cast — advertised but DOA
-`cast_can_deliberate` (`config.rs:846`) needs an **offline synth lane plus an explorer
-slot**. Of the built-in casts, only `anthropic-batch` and `gemini-batch` carry an offline
-lane, and both are **synth-only** — so every `deliberate` call on a stock install fails
-`cast "…" has no explorer slot`. The tool's own description points at `fable` /
-`gemini-deliberate` / `local-direct`, which live in `docs/config.example.toml` and are
-**not** built in, so the guidance names casts the user does not have. Either ship a
-deliberate-capable built-in (a Flash-Lite explorer beside the Pro batch synth is one line)
-or have the refusal say "no built-in cast can staff this; copy `gemini-deliberate` from
-`docs/config.example.toml`". Surfaced 2026-07-25 trying to run a `deliberate` design pass
-on the media CAS; worked around locally by adding the cast to the XDG config.
-
 ### Media spine — perception in, production REOPENED (2026-07-25)
 
 **Superseded in part.** The 2026-06-28 direction below removed `generate_image` and made
@@ -53,13 +41,36 @@ must land *together* with the first tool, because each is unsafe or dishonest al
   mounted will accept the prompt, **spend the user's provider credits**, verify and write
   the artifact, then destroy it on exit. Silently evaporating paid artifacts is exactly what
   a store that refuses to ever delete exists to prevent. Ranked the top remaining risk by
-  the Gemini design pass. Detect overlay/tmpfs backing and warn severely, or require an
-  explicit acknowledgement — never proceed quietly.
+  the Gemini design pass. **Decided (Amy, 2026-07-30): detect overlay/tmpfs backing and warn
+  severely, then proceed** — not a refusal gated on an acknowledgement flag. The container
+  path stays frictionless for someone who genuinely doesn't want persistence; what must not
+  happen is proceeding *quietly*.
 - **`AGENTS.md`'s opening paragraph** still says kaibo "produces no output artifacts." That
   is *true today* (nothing reachable produces anything) and becomes false the moment a tool
   lands. Rewrite it in that same change.
-- **The tool must be gated and auto-disabled** — see the next entry, which this shares a
-  mechanism with.
+- **Gating is done** — the staffing gate shipped 2026-07-30 (a tool no configured cast can
+  staff is not advertised, with the reason in the startup log and `kaibo://config`'s
+  `[runtime].unstaffable_tools`). An image tool inherits it by adding a `CAST_ENUM_RULES`
+  entry with an `cast_can_generate_image` predicate, so a user who configures no image cast
+  pays zero resident tokens for it. Nothing further to build here — just wire the rule.
+
+**Decided with Amy, 2026-07-30 — the shape of the first image tool:**
+- **The image model is a cast SLOT, not a separate config concept.** Revive
+  `ModelRole::Image` (undoing that part of `986806f`) so a cast reads
+  `[casts.artist] explorer = … / synth = … / image = "stability/core"`. Considered and
+  rejected: a standalone `[image]`/backend-only concept divorced from casts, on the argument
+  that a cast is a *reasoning* team. Amy's call went the other way, and it buys a real
+  simplification — the staffing gate, the `cast` enum, and the per-call `cast` argument all
+  keep working unchanged, with `cast_can_generate_image` sitting beside
+  `cast_can_deliberate` in exactly the same shape.
+- **The tool returns the digest and the path — not the bytes.** No inline image content
+  block: a multi-megabyte artifact should not land in the calling agent's context unless it
+  asks, and the caller may not even share kaibo's filesystem. A by-digest read verb can come
+  later if wanted (and see the egress-gateway note below, which already argues a by-digest
+  fetch leaks nothing).
+- Still open, not yet decided: whether `ProviderKind::Stability` is the right home for the
+  image backend (it is not a rig `CompletionModel`, so it does not slot into the existing
+  arm machinery), and the `[cas]` config surface (dir override, `max_bytes` cap).
 
 **Decided, so it isn't re-litigated:** audio and 3D are *not* refused on principle. The
 account-fleet argument that justifies image generation extends to them; the real constraint
@@ -108,30 +119,6 @@ file" — is the general escape hatch the invariant exists to refuse.
 
 **What must not weaken:** kaibo never touches the *project* — that is the user promise and
 egress-to-CAS does not touch it. And the model team still must not enumerate.
-
-### Never advertise a tool no configured cast can staff
-A single rule that fixes an existing bug and pre-empts a coming one. Tools are gated at
-startup by dropping routes from the `ToolRouter` (`server/mod.rs`, the `remove_route` loop),
-and `CAST_ENUM_RULES` already computes per-tool cast eligibility from live config
-(`cast_can_explore`, `cast_can_deliberate`, …). But eligibility currently only shapes the
-`cast` *enum* — it never removes the tool. `inject_cast_enum` even documents the near-miss:
-when no cast qualifies it *skips* injecting the enum, because an empty enum reads as "no
-valid value." So the tool ships advertised with no usable cast, which is precisely the
-`deliberate` DOA bug above.
-
-Fix: when a tool's eligible-cast list is empty, **remove the route** instead of skipping its
-enum. That repairs `deliberate` on stock installs, and gives image tools zero resident cost
-for the many users who configure no image cast — answering the resident-cost objection from
-the direction review with a mechanism rather than a caveat. It generalizes to `explore` and
-`batch_submit`, which have the same latent shape.
-
-Pair it with a **startup log line naming what was dropped and why** ("deliberate disabled:
-no configured cast pairs an explorer with an offline synth — see
-`docs/config.example.toml`"). Vanishing is right for the model's tool list and wrong for
-operator discoverability; the log plus `kaibo://config`'s roster keeps the operator informed
-without spending resident characters on the model. Amy agreed 2026-07-25; deliberately kept
-out of the media-CAS PR since it changes `deliberate`'s live behavior and deserves its own
-review.
 
 Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
 *unconditional* — no out-dir, no handler-side write, no write path of any kind. Image

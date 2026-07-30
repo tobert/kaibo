@@ -15,6 +15,27 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Changed
+
+- **kaibo no longer advertises a tool no configured cast can run.** A tool now has to
+  clear two gates to appear: its `--no-<tool>` flag, and a cast that can actually staff
+  it. The visible effect on a stock install is `deliberate`, which was advertised but
+  dead on arrival — it needs an explorer paired with an offline synth, and no built-in
+  cast has that shape, so every call failed `cast "…" has no explorer slot` while the
+  tool still cost resident tokens in every session. It now stays hidden until you
+  configure a cast that can run it (`docs/config.example.toml`'s DELIBERATE section,
+  where any of the three hosted batch providers or a big local model on the `direct`
+  lane will do). The same rule covers `explore`, `batch_submit`, `consult`/`oneshot`,
+  and the job-collect verbs, which follow whichever handle producers are live.
+
+  Because vanishing is right for the calling agent and wrong for the operator, kaibo
+  says so twice: a startup warning naming the cast *shape* that would bring each tool
+  back, and a `[runtime]` entry in `kaibo://config` — `advertised_tools` for what the
+  server really serves, `unstaffable_tools` for each tool held back plus what it wants.
+  A tool you turned off yourself is reported in `[tools]` as before and never appears
+  as unstaffable — "you disabled it" and "nothing can run it" are different answers and
+  are kept apart.
+
 ### Fixed
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**

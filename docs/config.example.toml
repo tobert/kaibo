@@ -78,8 +78,31 @@ log = "kaibo=info"
 
 # Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
 # All default true; a config that turns every one off is refused at startup.
+#
+# A tool clears TWO gates to be advertised: the flag below, AND a configured cast that can
+# actually staff it. A tool nothing can staff is not advertised at all — the calling agent
+# never sees a tool whose every call would fail, and an unusable tool stops costing
+# resident tokens in every session. Which cast shape staffs which tool:
+#
+#   consult / consult_submit / oneshot   a cast with an INTERACTIVE synth (no offline lane)
+#   explore                              a cast with an `explorer` slot
+#   batch_submit                         a cast with a synth on `lane = "batch"`
+#   deliberate                           a cast with an `explorer` AND an offline synth
+#                                        (`lane = "batch"` or `lane = "direct"`)
+#   job_get / job_cancel / job_list / job_wait   live while any handle producer is
+#   run_kaish / list_models              no cast at all — always available
+#
+# Out of the box this bites exactly one tool: no BUILT-IN cast pairs an explorer with an
+# offline synth, so `deliberate` is not advertised until you configure a cast that can run
+# one — see the DELIBERATE casts near the bottom of this file. When a tool is held back
+# this way kaibo logs a warning at startup naming the cast shape it wants, and
+# `kaibo://config`'s [runtime] section lists it under `unstaffable_tools` with the same
+# explanation. (A tool YOU switched off below is reported in [tools] instead — the two
+# reasons a tool can be missing are kept apart on purpose.)
 [server.tools]
 consult        = true
+explore        = true
+deliberate     = true      # ...but only advertised if a cast can staff it — see above
 oneshot        = true
 run_kaish      = true
 batch          = true
@@ -462,7 +485,15 @@ synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 #     The synth's lane picks the offline mechanism: `batch` (a provider batch, half price,
 #     durable handle) below, or `direct` (one long LOCAL completion) further down. Unlike the
 #     synth-only batch casts above, these carry BOTH slots — the explorer is what makes it a
-#     deliberate cast rather than a plain batch one. ---
+#     deliberate cast rather than a plain batch one.
+#
+#     THIS SECTION IS WHAT TURNS `deliberate` ON. No built-in cast has this shape (the
+#     built-in offline casts, anthropic-batch and gemini-batch, are synth-only), so on a
+#     stock install the `deliberate` tool is not advertised at all — see [server.tools]
+#     near the top. Uncomment or adapt any one cast below and it appears. All three hosted
+#     batch providers work here — Anthropic (`fable`), Gemini (`gemini-deliberate`), and
+#     hosted OpenAI Platform (`gpt-deliberate`, above) — and so does a big LOCAL model on
+#     the `direct` lane (`local-direct`, below), which needs no batch API at all. ---
 
 # Fable on the batch lane, with a Sonnet explorer building the dossier.
 [casts.fable]

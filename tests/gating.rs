@@ -29,17 +29,90 @@ const ALL_TOOLS: [&str; 12] = [
     "run_kaish",
 ];
 
+/// A config where every tool is *staffable*, so these tests measure the `--no-<tool>`
+/// flags and nothing else.
+///
+/// Since a tool no configured cast can staff is now dropped from the router entirely,
+/// flag-gating and cast-staffing both decide whether a route survives — and this file is
+/// about the flags. So the fixture supplies both cast shapes on one keyless backend (an
+/// interactive team, and an explorer paired with an offline synth, which covers
+/// `batch_submit` and `deliberate` at once) and neutralizes the built-in casts, whose
+/// usability would otherwise depend on which API keys the machine running the tests
+/// happens to have. `default_advertises_all_tools` guards the premise.
+const FULLY_STAFFED: &str = r#"
+    [backends.anthropic]
+    api_key_file = "/nonexistent-kaibo-test/anthropic"
+    [backends.deepseek]
+    api_key_file = "/nonexistent-kaibo-test/deepseek"
+    [backends.gemini]
+    api_key_file = "/nonexistent-kaibo-test/gemini"
+    [backends.openrouter]
+    api_key_file = "/nonexistent-kaibo-test/openrouter"
+    [backends.openai-local]
+    key_optional = false
+    api_key_file = "/nonexistent-kaibo-test/openai"
+
+    [backends.gem]
+    kind = "gemini"
+    key_optional = true
+
+    [casts.inter]
+    explorer = "gem/lite"
+    synth    = "gem/flash"
+
+    [casts.deep]
+    explorer = "gem/lite"
+    synth    = { backend = "gem", id = "pro", lane = "batch" }
+
+    [server]
+    cast = "inter"
+"#;
+
 fn advertised(gating: ToolGating) -> Vec<String> {
-    let mut config = Config::builtin();
+    let mut config = Config::from_toml_str(FULLY_STAFFED).expect("fixture config parses");
     config.tools = gating;
-    KaiboHandler::new(config)
+    // Empty credential environment: paired with the fixture's unreachable key files, the
+    // usable-cast roster is exactly `inter` + `deep`, on any machine.
+    KaiboHandler::new_with_env(config, |_| None)
         .expect("handler builds")
         .advertised_tools()
 }
 
+/// All flags on and every tool staffable ⇒ the full surface.
+///
+/// This is also the premise every other test in this file rests on. If a future tool
+/// arrives with a cast requirement `FULLY_STAFFED` can't meet, that tool vanishes from
+/// the router and the flag assertions below would quietly stop covering it — the
+/// `assert_eq!` against the complete list fails instead of silently narrowing.
 #[test]
 fn default_advertises_all_tools() {
     assert_eq!(advertised(ToolGating::default()), ALL_TOOLS);
+}
+
+/// The DOA bug, pinned at the integration level: kaibo's BUILT-IN casts cannot staff
+/// `deliberate` (it needs an explorer beside an offline synth, and the built-in offline
+/// casts are synth-only), so a stock install must not advertise the tool at all. It used
+/// to ship advertised-but-unusable — every call failed `cast "…" has no explorer slot`,
+/// while still costing resident tokens in every session.
+///
+/// Robust to the developer's own keys: adding credentials makes MORE built-in casts
+/// usable, but none of them gains an explorer beside an offline synth, so the verdict
+/// holds with a full keyring or an empty one.
+#[test]
+fn a_stock_install_does_not_advertise_deliberate() {
+    let tools = KaiboHandler::new(Config::builtin())
+        .expect("handler builds")
+        .advertised_tools();
+    assert!(
+        !tools.contains(&"deliberate".to_string()),
+        "no built-in cast pairs an explorer with an offline synth, so `deliberate` must \
+         not be advertised on a stock install; got {tools:?}"
+    );
+    assert!(
+        tools.contains(&"consult".to_string()),
+        "the rest of the surface must survive — this is a targeted drop, not a shutdown; \
+         got {tools:?}"
+    );
 }
 
 #[test]
