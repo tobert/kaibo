@@ -1361,11 +1361,11 @@ fn consult_tools(
     // The caller's own `consult` attachments already reach the driver another way
     // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
     // doesn't re-route what's already in front of the driver.
-    let already_delivered: HashSet<PathBuf> = cfg
-        .attachments
-        .iter()
-        .map(|a| root.join(a.path()))
-        .collect();
+    // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
+    // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
+    // a `..`, or a symlink, and the reader then receives the same bytes twice.
+    let already_delivered: HashSet<PathBuf> =
+        crate::sweep_attach::delivered_seed(root, cfg.attachments.iter().map(|a| Path::new(a.path())));
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explore.explorer_max_turns,

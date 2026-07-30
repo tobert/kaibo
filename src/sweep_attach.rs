@@ -146,6 +146,38 @@ pub struct SweepAttachSink {
     already_delivered: HashSet<PathBuf>,
 }
 
+/// Build the `already_delivered` seed for a sweep from the caller's own attachment
+/// paths, resolved the SAME way [`SweepAttach::attach_one`] resolves what the explorer
+/// asks for: joined against the root when relative, then **canonicalized**.
+///
+/// That canonicalize is the whole point. The sink compares against a canonical path
+/// (`reserve` is handed `canon`), so a seed built by plain `root.join(path)` silently
+/// fails to match whenever the caller's path isn't already in canonical form — a `./`
+/// segment, a `..`, a symlinked file, or a symlinked ancestor inside the root. The
+/// dedupe then misses and the explorer re-routes bytes the reader already has, which is
+/// exactly the duplicate spend seeding exists to prevent. It fails quietly and costs
+/// tokens rather than correctness, which is why it wants a named function with a test
+/// rather than a `.map()` at the call site. (Found by the Gemini Pro review of this PR.)
+///
+/// A path that cannot be canonicalized (deleted between resolution and here) falls back
+/// to the joined form: no worse than before, and the entry is inert either way.
+pub fn delivered_seed<'a>(
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> HashSet<PathBuf> {
+    paths
+        .into_iter()
+        .map(|p| {
+            let joined = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                root.join(p)
+            };
+            std::fs::canonicalize(&joined).unwrap_or(joined)
+        })
+        .collect()
+}
+
 impl SweepAttachSink {
     pub fn new(max: usize, consumer: SweepConsumer, already_delivered: HashSet<PathBuf>) -> Self {
         Self {
@@ -686,6 +718,69 @@ mod tests {
             "{receipt}"
         );
         assert!(sink.drain().attachments.is_empty(), "nothing delivered");
+    }
+
+    /// The seed must be built the way `attach_one` resolves paths — canonicalized —
+    /// or the dedupe misses whenever the caller's own path wasn't already canonical.
+    ///
+    /// This is the shape the bug took: `consult` seeded with a plain `root.join(path)`,
+    /// while `reserve` compares against a canonicalized path, so a caller attachment
+    /// written as `./README.md` (or through a symlink) failed to match and the explorer
+    /// re-routed bytes the driver already had. Silent, and it only cost tokens — which is
+    /// why it needs a test rather than trust. Each case here fails against a
+    /// join-only seed.
+    #[tokio::test]
+    async fn the_delivered_seed_dedupes_non_canonical_caller_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("README.md"), root.join("LINK.md")).unwrap();
+
+        // The caller's spellings: a `./` segment, a `..` round-trip, and (on unix) a
+        // symlink — all naming the one real file the explorer will ask for as README.md.
+        let mut spellings: Vec<&Path> = vec![Path::new("./README.md"), Path::new("sub/../README.md")];
+        #[cfg(unix)]
+        spellings.push(Path::new("LINK.md"));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        for spelling in spellings {
+            let seed = delivered_seed(&root, [spelling]);
+            let (t, sink) = tool(&root, 8, consult_driver(false), seed);
+            let receipt = t
+                .call(SweepAttachArgs {
+                    paths: vec!["README.md".into()],
+                    note: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                receipt.contains("already in front of your reader"),
+                "a caller path spelled {spelling:?} must still dedupe README.md, got: {receipt}"
+            );
+            assert!(
+                sink.drain().attachments.is_empty(),
+                "nothing may be delivered twice (spelling {spelling:?})"
+            );
+        }
+    }
+
+    /// An absolute caller path seeds correctly too, and a path that cannot be
+    /// canonicalized (deleted between resolution and seeding) falls back to the joined
+    /// form rather than panicking or dropping the entry.
+    #[test]
+    fn the_delivered_seed_handles_absolute_and_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+
+        let abs = root.join("a.txt");
+        let seed = delivered_seed(&root, [abs.as_path(), Path::new("gone.txt")]);
+        assert!(seed.contains(&std::fs::canonicalize(&abs).unwrap()));
+        assert!(
+            seed.contains(&root.join("gone.txt")),
+            "an uncanonicalizable path keeps its joined form — inert, but never dropped"
+        );
     }
 
     /// `deliberate` seeds an EMPTY `already_delivered` set (its no-dedupe decision —
