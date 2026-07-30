@@ -254,7 +254,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
     )
 }
 
-/// Like [`kaibo_instructions`] but with a **scope section** appended so the calling
+/// Build the MCP server instructions, with a **scope section** appended so the calling
 /// model always knows:
 /// - the default root (or that every call must pass one),
 /// - the allowed trees a per-call `path` must be at-or-under, and
@@ -777,11 +777,17 @@ mod tests {
         );
         let casts_at = text.find("## Casts").expect("has a Casts section");
         let scope_at = text.find("## Scope").expect("has a Scope section");
-        let lead_at = text.find("kaibo").expect("opens with the lead");
+        // Assert the lead actually OPENS the text, rather than merely finding the first
+        // "kaibo" somewhere before `## Casts` — the Casts section's own `kaibo://config`
+        // reference would satisfy a bare `find`, leaving this weaker than it reads.
         assert!(
-            lead_at < casts_at && casts_at < scope_at,
-            "order must be lead → casts → scope (got lead={lead_at}, casts={casts_at}, \
-             scope={scope_at}):\n{text}"
+            text.starts_with(kaibo_lead()),
+            "the instructions must open with the lead verbatim — it is the resident pitch \
+             and the tool-search retrieval index:\n{text}"
+        );
+        assert!(
+            casts_at < scope_at,
+            "order must be lead → casts → scope (got casts={casts_at}, scope={scope_at}):\n{text}"
         );
         assert!(
             !text.contains("The shell is kaish"),
