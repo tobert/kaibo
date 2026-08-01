@@ -28,6 +28,17 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **kaibo's models now work from a role, not a job description.** Every preamble opens
+  on who the model is on kaibo's team — "You are the synthesis agent", "You are the
+  explorer" — where it used to say "a capable model", and the obligation to finish rides
+  that identity: the synthesis agent's final turn *is* the answer, the explorer's last
+  turn *is* the report. This is the prompt-side half of a real failure — a consult that
+  stopped mid-investigation and handed back an empty answer as a success. The `consult`
+  driver is also told plainly why delegating a sweep pays (a trace caught one taking all
+  203 turns itself and never delegating), and the sweep that builds a `deliberate`
+  dossier is now told to read *holistically*: its offline synth never sees the code, so
+  whatever the dossier leaves out is missing for good.
+
 - **Batch treats `effort` as a floor, not an override.** Every other batch knob
   already worked this way: `max_tokens` and the thinking budget rise to a batch
   minimum but never undercut a slot that asked for more. `effort` alone was

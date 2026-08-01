@@ -634,7 +634,7 @@ impl Resolver {
     /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
     /// stage): read-WHOLE directives, never inlined bytes — budget 0, so no file is read
     /// here at all. Images are refused up front: the sweep toolset carries no `view_image`,
-    /// so naming one would send the investigator down a dead end (`cat` refuses binary).
+    /// so naming one would send the explorer down a dead end (`cat` refuses binary).
     /// Uses the resolver's own sandbox config for the read-only VFS.
     pub(crate) async fn resolve_sweep_attachments(
         &self,
@@ -647,7 +647,7 @@ impl Resolver {
         if let Some(img) = attachments.iter().find(|a| a.is_image()) {
             return Err(McpError::invalid_params(
                 format!(
-                    "attached file {} is an image, but {tool}'s investigator reads through \
+                    "attached file {} is an image, but {tool}'s explorer reads through \
                      the shell and can't view images — attach it to `consult` with a \
                      vision-capable cast instead",
                     img.path()

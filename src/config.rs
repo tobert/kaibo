@@ -132,7 +132,7 @@ impl Default for Defaults {
         // ConsultConfig::default + THINKING_BUDGET) so a config-less run is
         // byte-for-byte the prior behavior.
         Self {
-            // High on purpose: a capable model rarely wastes turns, and hitting the
+            // High on purpose: the synthesis agent rarely wastes turns, and hitting the
             // cap is no longer fatal — `run_phase` forces one final answer-now turn
             // from the partial transcript rather than discarding the work. So we'd
             // rather give the loop room (100 goes quickly in the explorer) than have

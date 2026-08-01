@@ -4,11 +4,11 @@
 //! a bounded tool loop. Every tool on the surface is that loop wearing different
 //! clothes:
 //!
-//! - [`consult`] — a capable model · `{run_kaish, explore′}` · optional context → a
-//!   cited answer. No rigid explorer→synth hand-off: the capable model decides when
+//! - [`consult`] — the synthesis agent · `{run_kaish, explore′}` · optional context → a
+//!   cited answer. No rigid explorer→synth hand-off: the synthesis agent decides when
 //!   to delegate a broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span
 //!   directly. The `explore′` sweep ([`report_preamble`]) is internal to this loop.
-//! - [`oneshot`] — a capable model · no tools · the caller's context → a direct
+//! - [`oneshot`] — the synthesis agent · no tools · the caller's context → a direct
 //!   answer. The thin counterpart: one upstream request, no codebase access.
 //!
 //! Each phase arrives as a resolved [`Arm`]: its own client (type-erased — the

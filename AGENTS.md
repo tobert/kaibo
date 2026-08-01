@@ -23,13 +23,13 @@ general write path; see the read-only invariant.)
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
 loop. Each consultation tool is that loop wearing different clothes:
 
-- **`consult`** — a capable model with `{run_kaish, explore′}` + optional caller
+- **`consult`** — the synthesis agent with `{run_kaish, explore′}` + optional caller
   `context`: it reads precise spans directly and delegates broad sweeps to a cheap
   explorer sub-agent, then answers. No rigid explorer→synth hand-off; the model
   chooses. Supplied context is trusted starting evidence — it investigates for
   *more*, not to re-verify. The `explore′` sweep (`report_preamble`) lives *inside*
   this loop now; it is not a standalone tool.
-- **`oneshot`** — a capable model with **no tools**: the caller owns the context, so
+- **`oneshot`** — the synthesis agent with **no tools**: the caller owns the context, so
   it's one upstream request, prompt in / answer out, no codebase access. The thin
   counterpart to `consult` — and the door to a model outside the caller's family.
 - **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
@@ -260,6 +260,17 @@ How kaibo talks to LLMs — project defaults, made local so any agent here inher
   reasoners capped low; the V4 hybrids advertise 384K output, so the cap is
   per-model — confirm before assuming). Interaction shape behind this: few
   high-value turns, not long chats — spend the budget on depth per turn.
+- **Start the model's narrative — a role, not a capability.** Every preamble opens on
+  who the model *is* on kaibo's team ("You are the synthesis agent…", "You are the
+  explorer…"), in the vocabulary the code already uses for the slots
+  (`ModelRole::Synth`/`Explorer`) — an identity is something a model acts *from*, where
+  "a capable model" only described it. Obligations ride that identity instead of
+  trailing a rule list: the synth's final turn *is* the answer, the explorer's last turn
+  *is* the report. And **no length estimates, word counts, or size targets, anywhere** —
+  a size cue is a *stopping* cue, and the failure we actually measured is a driver
+  stopping too early (a DeepSeek consult ended a turn at 16 of 200 with 14 output
+  tokens, no text, a `grep` as its last act — reported as success). Order and obligation
+  are what work: "lead with the conclusion … then let your reasoning build under it".
 - **Positive prompt framing.** In preambles, tool descriptions, and cheatsheets,
   reinforce the behavior we *want* resident in the weights — say it a few ways —
   rather than prohibiting what we don't: "ground every claim, cite the `file:line`"

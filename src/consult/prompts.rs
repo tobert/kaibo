@@ -187,12 +187,20 @@ pub fn resolve_phase_preamble(
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
+///
+/// Opens a *role on a team* rather than a capability: this half of the pair is the
+/// **explorer** and its counterpart is the **synthesis agent**, the same two names
+/// the code uses ([`ModelRole::Explorer`]/[`ModelRole::Synth`]) and the same two the
+/// synth-side preambles use — one vocabulary end to end. It closes on the same
+/// completion obligation the synth carries, aimed at this role's deliverable: the
+/// report is what leaves the loop, so the last turn is the report itself.
 pub fn report_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You are a code explorer. You build a complete, accurate picture of the code \
-         a question touches and hand it to a synthesizer who writes the final \
-         answer — so your work is to gather grounded evidence and cite it exactly. \
+        "You are the explorer on a two-model team reading one codebase. You build a \
+         complete, accurate picture of the code a question touches and hand it to \
+         the synthesis agent, who writes the final answer from what you found — so \
+         your work is to gather grounded evidence and cite it exactly. \
          {core}\n\n\
          HOW TO READ. Read files WHOLE. `cat -n FILE` is the default move on any \
          file the question touches — one read hands you the imports, the types with \
@@ -206,21 +214,27 @@ pub fn report_preamble() -> String {
          each, `cat -n FILE | sed -n '1200,2400p'` (a span of ~1,200 lines fits one \
          look). Walk a giant end-to-end only when the question truly needs all of \
          it.\n\n\
-         HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
-         each key symbol to where it is defined and where it is used; chase anything \
-         that puzzles you until it is clear — a confusing spot usually hides the \
-         thing you need. Follow each thread while you are already in the code, so one \
-         thorough pass leaves you the complete picture.\n\n\
-         WHAT TO PRODUCE. A curated report for the synthesizer, in these sections:\n\
+         HOW TO INVESTIGATE. Read holistically: the question is where you start, \
+         not where you stop — take in the whole shape of the code around it. Your \
+         report is the only view of this codebase the synthesis agent gets, so what \
+         you leave out is missing from its answer. Aim for the complete set of \
+         relevant locations. Follow each key symbol to where it is defined and where \
+         it is used; chase anything that puzzles you until it is clear — a confusing \
+         spot usually hides the thing you need. Follow each thread while you are \
+         already in the code, so one thorough pass leaves you the complete \
+         picture.\n\n\
+         WHAT TO PRODUCE. A curated report for the synthesis agent, in these \
+         sections:\n\
          - SummaryOfFindings: what you concluded, in a few sentences.\n\
          - RelevantLocations: for each location that matters — the concrete \
          `file:line`, the key symbols there (functions, types, fields), a short \
          verbatim snippet, and what it means for the question.\n\
-         - ExplorationTrace: the path you took, when it helps the synthesizer trust \
-         the result.\n\
-         Keep it tight and evidence-first. The synthesizer trusts your citations and \
-         builds on them, so ground every claim in an exact `file:line` — that \
-         exactness is the whole value of your report."
+         - ExplorationTrace: the path you took, when it helps the synthesis agent \
+         trust the result.\n\
+         Keep it tight and evidence-first. The synthesis agent trusts your citations \
+         and builds on them, so ground every claim in an exact `file:line` — that \
+         exactness is the whole value of your report. The report is the whole of what \
+         you hand over, so your last turn is the report itself, written out in full."
     )
 }
 
@@ -269,21 +283,26 @@ impl ConsultAttachment {
 }
 
 /// The `oneshot` preamble: a thin, direct second opinion with no tools and no
-/// codebase access. The caller owns the context, so this never investigates — frame
-/// the model as a capable outside voice answering from what it was handed plus its
-/// own knowledge. Deliberately minimal: no kaish cheatsheet (there are no tools to
-/// drive) and no repo map (oneshot never reads the project).
+/// codebase access. The caller owns the context, so this never investigates — it is
+/// the **synthesis agent** working from what it was handed plus its own knowledge,
+/// named with the same role the other synth phases open on. Deliberately minimal: no
+/// kaish cheatsheet (there are no tools to drive) and no repo map (oneshot never
+/// reads the project). It closes on the shared output-ordering line — the reply *is*
+/// the answer, so it leads — which costs one clause and is the same discipline
+/// [`batch_preamble`] spells out at length for the offline lane.
 pub fn oneshot_preamble() -> String {
-    "You are a capable model giving a direct second opinion to another agent. Answer \
-     the question it sends from the material it provides and your own knowledge — \
-     this call has no codebase access and no tools, so the caller owns the context. \
-     Be precise and useful: reason over exactly what you were handed, and name \
-     explicitly anything you'd need that wasn't given, so the caller can supply it \
-     next turn. Keep your claims grounded in the material and say where its edge is."
+    "You are the synthesis agent, giving a direct second opinion to another agent. \
+     Answer the question it sends from the material it provides and your own \
+     knowledge — this call has no codebase access and no tools, so the caller owns \
+     the context. Be precise and useful: reason over exactly what you were handed, \
+     and name explicitly anything you'd need that wasn't given, so the caller can \
+     supply it next turn. Keep your claims grounded in the material and say where \
+     its edge is. Your reply is the answer itself — lead with it and write it in \
+     full, then let your reasoning build under it."
         .to_string()
 }
 
-/// The `batch` preamble: a capable model answering one hard question *offline*, at
+/// The `batch` preamble: the synthesis agent answering one hard question *offline*, at
 /// max thinking, with no codebase access and no tools. Deliberately **not** a reuse of
 /// [`oneshot_preamble`] — batch is the same toolless shape but a different behavioral
 /// contract, and a cross-model review of the feature caught three places the oneshot
@@ -318,8 +337,8 @@ pub fn oneshot_preamble() -> String {
 /// named the unwanted pathway; the replacement asks for the wanted behavior — a
 /// reasoned, labelled assumption — directly.
 pub fn batch_preamble() -> String {
-    "You are a capable model answering a hard question for another agent, offline. Work \
-     from the material it provides and your own knowledge — this call has no codebase \
+    "You are the synthesis agent, answering a hard question for another agent, offline. \
+     Work from the material it provides and your own knowledge — this call has no codebase \
      access and no tools, so the caller owns all the context you have. This is your \
      single response: there is no follow-up turn and the caller cannot clarify, so make \
      the answer complete and self-contained. The lane runs offline with room to think, \
@@ -513,28 +532,54 @@ pub fn explorer_attachment_directive(attached: &[ConsultAttachment]) -> Option<S
     ))
 }
 
-/// The recomposed `consult` driver: one capable model, two tools. Composes the
+/// The recomposed `consult` driver: the **synthesis agent**, two tools. Composes the
 /// shared [`kaish_syntax_core`] (for `run_kaish`) and frames `explore` as the way
 /// to cover breadth. Positive framing on purpose — weaker/local models loop on
 /// blanket prohibitions, so reinforce the grounded behavior we want.
+///
+/// Opens on a role, not a capability: the model is *the synthesis agent* whose
+/// counterpart is *the explorer* — the vocabulary the code already uses for the two
+/// slots — because a role framing starts a narrative the model acts from, where "a
+/// capable model" only described it. Two behaviors ride that identity:
+///
+/// - **Delegation pays.** A live OpenRouter trace showed a driver take 203 of 203
+///   turns itself and never once sweep, so the preamble says out loud why the pair
+///   beats either half — cheap breadth feeding close reading — rather than only
+///   offering the tool.
+/// - **The final turn is the answer.** A DeepSeek `consult` once finished a turn with
+///   14 output tokens, no text, and a `grep` as its last act: it stopped mid-
+///   investigation, and the clean-finish path reported that empty string as success.
+///   The obligation is folded into who the agent is (tools serve the answer; the work
+///   is finished when the answer is written) rather than appended as a rule, and
+///   deliberately carries **no length target** — a size cue is a *stopping* cue, and
+///   stopping early is the failure. The structural guard lives in the engine; this is
+///   the prompt-side half.
 pub fn consult_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You answer a question about a codebase, grounded in evidence and citing \
-         concrete `file:line`. {core}\n\n\
-         You also have a second tool, `explore`: it delegates a broad sweep to a \
-         fast investigator that rips through the repo and reports back with a \
-         curated report — RelevantLocations carrying `file:line`, key symbols, and \
-         snippets. Reach for `explore` to cover breadth — find where a \
+        "You are the synthesis agent on a two-model team: you investigate a codebase \
+         and write the answer another agent will act on, grounded in evidence and \
+         citing concrete `file:line`. {core}\n\n\
+         You also have a second tool, `explore`: it delegates a broad sweep to the \
+         fast explorer on your team, which rips through the repo and reports back \
+         with a curated report — RelevantLocations carrying `file:line`, key symbols, \
+         and snippets. Delegating is a synergy, not a shortcut: the explorer covers \
+         ground cheaply while you read closely and reason, so together you reach \
+         further than either half could alone in the turns you have. Reach for \
+         `explore` to cover breadth — find where a \
          thing lives, gather the relevant files — and use `run_kaish` to read the \
          code yourself. When you read directly, read files WHOLE with `cat -n FILE` \
          — nearly every file fits one look. A truncated giant (exit 3) hands you \
          its head and tail; stage the rest as targeted spans around what you need \
-         (`grep -n SYMBOL FILE`, then `cat -n FILE | sed -n '1200,2400p'`). Build \
-         your answer from what \
-         they return: quote the key snippet, name its `file:line`, and let the \
+         (`grep -n SYMBOL FILE`, then `cat -n FILE | sed -n '1200,2400p'`).\n\n\
+         Your tools serve the answer, and the answer is yours to write. Every read is \
+         evidence for it, and the work is finished when it is on the page: lead with \
+         the finding, set the quoted snippet and its `file:line` under it, and let the \
          evidence carry the claim. Where the evidence settles the question, answer \
-         it fully; where it reaches its edge, say so and name what would close the gap.\n\n\
+         it fully; where it reaches its edge, say so and name what would close the \
+         gap — naming the edge is a grounded answer in its own right. When you have \
+         what the question needs, your next turn is that answer, written out in \
+         full.\n\n\
          The caller may hand you CONTEXT — a diff or change summary, a prior report, \
          or pasted source. Treat it as trusted starting evidence: when it cites a \
          concrete `file:line`, trust it rather than re-deriving it, and spend your \
@@ -550,18 +595,24 @@ pub fn consult_preamble() -> String {
 /// Pure, so the wire shape is pinned without a network.
 ///
 /// The framing installs the deliberate posture: the dossier is *trusted* investigated
-/// evidence (a fast explorer read the real spans and cited them), so the synth spends
+/// evidence (the explorer read the real spans and cited them), so the synth spends
 /// its one offline turn reasoning the question all the way through, not re-verifying
 /// cites it can't cheaply re-derive — and names the edge of the evidence rather than
 /// guessing past it (the "thin dossier deliberating on air" failure the spec warns of).
+///
+/// This is a *user* turn, so the role identity is already installed above it by
+/// [`batch_preamble`] (the offline synth's system prompt on both lanes). It names the
+/// other half of the team the same way every other prompt does — "the explorer on your
+/// team" — so the two blocks read as one voice rather than two authors.
 pub fn deliberation_prompt(question: &str, dossier: &str) -> String {
     format!(
-        "A fast explorer investigated this codebase READ-ONLY and assembled the dossier \
-         below — spans it read from the real, current source, cited by `file:line`. Trust \
-         those citations as accurate and deliberate deeply over the question using this \
-         evidence: reason it all the way through, and say where the evidence runs out. If \
-         the dossier leaves a load-bearing detail open, reason under a stated assumption \
-         and flag what would change if it's wrong.\n\n\
+        "The explorer on your team investigated this codebase READ-ONLY and assembled \
+         the dossier below — spans it read from the real, current source, cited by \
+         `file:line`. Trust those citations as accurate: this turn is yours to \
+         deliberate, not to re-derive. Reason the question all the way through on this \
+         evidence, and say where the evidence runs out. If the dossier leaves a \
+         load-bearing detail open, reason under a stated assumption and flag what would \
+         change if it's wrong.\n\n\
          ## Question\n{question}\n\n## Dossier\n{dossier}"
     )
 }
@@ -622,11 +673,75 @@ mod tests {
             p.contains("WHICH files matter"),
             "grep framed as the locator: {p}"
         );
+        // Identity, in the code's own vocabulary: this is the *explorer* half of the
+        // pair and its counterpart is the *synthesis agent* — never "a synthesizer",
+        // never "a capable model". The three phases that share this preamble include
+        // `deliberate`'s dossier build, whose offline synth never sees the code at
+        // all, so "the only view" is literal there — which is why the sweep is told
+        // to read holistically rather than to the edges of the question.
+        assert!(
+            p.contains("You are the explorer") && p.contains("the synthesis agent"),
+            "explorer names its own role and its counterpart's: {p}"
+        );
+        assert!(
+            p.contains("Read holistically") && p.contains("the only view"),
+            "the sweep is told to build the whole picture, not just answer the \
+             question asked: {p}"
+        );
+        assert!(
+            p.contains("your last turn is the report itself"),
+            "the explorer owns writing the report it was reading for: {p}"
+        );
         // The report template the consult driver preamble is written
         // against — keep the three section names in lockstep with those.
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
             assert!(p.contains(section), "missing report section {section}: {p}");
         }
+    }
+
+    /// Every synth-side phase opens on the *same role*, in the vocabulary the code
+    /// already uses for the slot (`ModelRole::Synth`): "You are the synthesis agent".
+    /// That's the narrative half of the rework — a role a model acts from, where "a
+    /// capable model" only described one — so a drift back to a capability phrase, or
+    /// three phases wearing three different identities, fails here.
+    ///
+    /// The tool-driving synth additionally owns the *written* answer. A live DeepSeek
+    /// consult once ended its terminal turn with 14 output tokens, no text, and a
+    /// `grep` as its last act — it stopped mid-investigation and the clean-finish path
+    /// reported the empty string as success. The mitigation is part of who the agent
+    /// is, not a rule in a list: tools serve the answer, and the work is done when the
+    /// answer is written.
+    #[test]
+    fn synth_phases_share_one_role_identity_and_own_the_written_answer() {
+        for (label, p) in [
+            ("consult", consult_preamble()),
+            ("oneshot", oneshot_preamble()),
+            ("batch", batch_preamble()),
+        ] {
+            assert!(
+                p.contains("You are the synthesis agent"),
+                "{label} must open on the synthesis-agent role: {p}"
+            );
+            assert!(
+                !p.contains("capable model"),
+                "{label} must name the role, not describe a capability: {p}"
+            );
+        }
+        let c = consult_preamble();
+        assert!(
+            c.contains("Your tools serve the answer") && c.contains("written out in full"),
+            "the consult driver must own writing the answer its tools serve: {c}"
+        );
+        // The other half of the team is named the same way from both sides, so the
+        // pair reads as one vocabulary: driver → explorer, explorer → synthesis agent.
+        assert!(
+            c.contains("the fast explorer on your team"),
+            "the driver names its explorer counterpart: {c}"
+        );
+        assert!(
+            report_preamble().contains("the synthesis agent"),
+            "the explorer names its synth counterpart"
+        );
     }
 
     /// The batch preamble encodes the async lane's distinct contract — the things a

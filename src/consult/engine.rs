@@ -1069,8 +1069,8 @@ impl Tool for RunExplore {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Delegate a broad sweep to a fast investigator that rips \
-                through the repo on a read-only kaish shell and reports back with \
+            description: "Delegate a broad sweep to the fast explorer on your team, \
+                which rips through the repo on a read-only kaish shell and reports back with \
                 concrete `file:line` citations. Give it a focused question; use it \
                 to cover breadth, and read the code yourself with `run_kaish`."
                 .to_string(),
@@ -1370,7 +1370,7 @@ pub async fn deliberate_direct(
 
 /// Run a `consult` over two resolved arms.
 ///
-/// One loop, two tools — no rigid explorer→synth hand-off. The capable model
+/// One loop, two tools — no rigid explorer→synth hand-off. The synthesis agent
 /// decides when to delegate a sweep to the cheap `explore′` vs. read a span
 /// directly with `run_kaish`. Each arm carries its own client and request shape,
 /// so a mixed cast routes each phase to its own backend through the same loop.
@@ -1650,7 +1650,7 @@ mod tests {
         );
         // Still the consult driver's own role framing — house rules append, not replace.
         assert!(
-            pre.contains("You answer a question about a codebase"),
+            pre.contains("You are the synthesis agent"),
             "base preamble must remain: {pre}"
         );
 
@@ -1672,7 +1672,7 @@ mod tests {
         let pre2 = reqs2[0].preamble.as_deref().unwrap_or("");
         assert!(!pre2.contains(MARKER), "no [context] → no marker: {pre2}");
         assert!(
-            pre2.contains("You answer a question about a codebase"),
+            pre2.contains("You are the synthesis agent"),
             "base preamble intact: {pre2}"
         );
     }
@@ -1742,7 +1742,7 @@ mod tests {
             "the nested explore′ sweep must carry the house rules too: {explorer_pre}"
         );
         assert!(
-            explorer_pre.contains("code explorer"),
+            explorer_pre.contains("You are the explorer"),
             "still the explorer's own role framing: {explorer_pre}"
         );
     }
@@ -1794,7 +1794,7 @@ mod tests {
         assert!(pre.contains(CUSTOM), "override prose missing: {pre}");
         // ...the built-in framing is fully replaced (full-replace, by decision)...
         assert!(
-            !pre.contains("You answer a question about a codebase"),
+            !pre.contains("You are the synthesis agent"),
             "override must REPLACE, not augment, the built-in: {pre}"
         );
         // ...and house rules still layer on top.
@@ -2130,7 +2130,7 @@ mod tests {
         );
 
         // And the routing held: the cheap model saw the *report* preamble (explorer
-        // role), the capable model saw the *consult* preamble (driver role).
+        // role), the synth model saw the *consult* preamble (driver role).
         let explorer_reqs = client.requests_for(EXPLORER);
         assert!(
             !explorer_reqs.is_empty(),
@@ -2141,7 +2141,7 @@ mod tests {
                 .preamble
                 .as_deref()
                 .unwrap_or("")
-                .contains("code explorer"),
+                .contains("You are the explorer"),
             "explorer got the report preamble: {:?}",
             explorer_reqs[0].preamble
         );
@@ -2358,7 +2358,7 @@ mod tests {
                 .preamble
                 .as_deref()
                 .unwrap_or("")
-                .contains("code explorer"),
+                .contains("You are the explorer"),
             "explorer got the report preamble: {:?}",
             reqs[0].preamble
         );
@@ -2499,7 +2499,7 @@ mod tests {
             "Is the retry path safe?",
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
             &arm(&client, SYNTH),
-            "You are a capable model answering a hard question offline.",
+            "You are the synthesis agent, answering a hard question offline.",
             cfg.call_deadline,
             &cfg.progress,
         )

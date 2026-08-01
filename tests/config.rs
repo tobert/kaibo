@@ -22,7 +22,7 @@ use kaibo::server::ToolGating;
 fn builtin_reproduces_the_historical_defaults() {
     let c = Config::builtin();
 
-    // Turn caps are set high on purpose (a capable model rarely wastes turns and a
+    // Turn caps are set high on purpose (the synthesis agent rarely wastes turns and a
     // cap-hit now degrades gracefully rather than failing) — see Defaults::default.
     assert_eq!(c.defaults.explorer_max_turns, 100);
     assert_eq!(c.defaults.synth_max_turns, 200);

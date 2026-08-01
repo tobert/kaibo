@@ -257,7 +257,7 @@ pub struct ConsultInput {
     #[serde(default)]
     pub explorer_backend: Option<String>,
 
-    /// Override the synthesizer (final-answer) model id. See `kaibo://tools` for override
+    /// Override the synthesis agent's (final-answer) model id. See `kaibo://tools` for override
     /// semantics (pair with `synth_backend` to also retarget).
     #[serde(default)]
     pub synth_model: Option<String>,
@@ -308,7 +308,7 @@ pub struct ExploreInput {
     /// locates and reads the real, current code itself and reports back with citations.
     pub question: String,
 
-    /// Workspace files (under the project root) central to the survey: the investigator
+    /// Workspace files (under the project root) central to the survey: the explorer
     /// is directed to read each one WHOLE as part of its sweep. Text only — it reads
     /// through the shell, so attach images to `consult` with a vision cast instead.
     #[serde(default)]
@@ -1257,9 +1257,9 @@ impl KaiboHandler {
     #[tool(
         description = "Ask a model outside your own family about a codebase — code review, \
             debugging, architecture, \"what does this change break\" — and get a grounded \
-            answer with `file:line` citations. A capable model (DeepSeek, Gemini, \
-            Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over the \
-            project: it reads the real, current source, delegates broad sweeps to a fast \
+            answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
+            Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
+            the project: it reads the real, current source, delegates broad sweeps to a fast \
             explorer, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
@@ -2106,7 +2106,7 @@ impl KaiboHandler {
                 prompt: p.clone(),
             })
             .collect();
-        // Batch is the oneshot *shape* (a capable model answering from what it was
+        // Batch is the oneshot *shape* (the synthesis agent answering from what it was
         // handed, no tools) but its own behavioral contract — one offline response, no
         // follow-up, spend on depth — so it carries a distinct preamble, overridable via
         // `[prompts].batch` OR the synth slot's own `preamble` (resolved together here).
@@ -2959,7 +2959,7 @@ delivered per tool:
   files a question centers on: `attach: [\"src/server.rs\", \"docs/architecture.png\"]`.
   An attached image opens via `view_image` and needs a vision-capable cast — kaibo
   refuses an image to a blind synth up front rather than name a file it could never open.
-- **`explore` — read-whole directives.** Its investigator reads through the shell, so
+- **`explore` — read-whole directives.** Its explorer reads through the shell, so
   attached text files become orders to read each one whole during the sweep. Text only;
   attach images to `consult` with a vision cast.
 - **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
@@ -3004,15 +3004,15 @@ the cast doesn't otherwise carry.
 
 ## Survey the code, or get an answer: `explore` vs `consult`
 
-`consult` hands back an *answer* — a capable model investigates and concludes. `explore`
+`consult` hands back an *answer* — a synthesis agent investigates and concludes. `explore`
 hands back the *evidence*: it's the fast, cheap explorer half of `consult`, run on its
 own, so you get the structured cited report — a summary of findings, the relevant
 `file:line` locations, and the trail the explorer followed — with no synthesis on top.
 Reach for `explore` to map unfamiliar code, or to assemble a grounded survey you'll reason
 over yourself (or hand to another model). It reads the repo itself, like `consult`, so the
 same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply, plus `attach`
-(text files the investigator is ordered to read whole during the sweep); no `context` or
-`session_id` — those belong to the synthesizing tools. Since it runs
+(text files the explorer is ordered to read whole during the sweep); no `context` or
+`session_id` — those belong to the tools that carry a synthesis agent. Since it runs
 *only* the explorer, its `cast` accepts any cast with an explorer — including `deliberate`/
 `direct` casts: point it at one to run that team's (often smarter, slower) explorer
 standalone, when you want a stronger sweep than your own fast one, or to size the explorer up.
