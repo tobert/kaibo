@@ -419,9 +419,13 @@ impl ModelShape {
                 // Unlike the other effort sinks this one is NOT a passthrough string: rig
                 // 0.38 models the level as a closed enum (`minimal|low|medium|high`), so
                 // `xhigh`/`max`/`none` are refused by rig's own converter before the
-                // request leaves the process. That ceiling is rig's, not Google's —
-                // [`EffortWire::Gemini`] names it and `Arm::from_slot` turns it into a
-                // legible error instead of a mid-call surprise.
+                // request leaves the process. [`EffortWire::Gemini`] names that, and
+                // `Arm::from_slot` turns it into a legible error rather than a mid-call
+                // surprise. Here rig's enum is *correct*, not a stale cap: Google's own
+                // schema refuses those three rungs too (`gemini_thinking_level_ladder_live`,
+                // 2026-08-01, protobuf enum error). `minimal` is Google's off-switch, and
+                // is itself per-model — gemini-pro-latest refuses even that
+                // (`gemini_pro_rejects_minimal_live`).
                 obj.insert(
                     "generationConfig".into(),
                     json!({ "thinkingConfig": { "thinkingLevel": effort, "includeThoughts": true } }),
@@ -432,6 +436,8 @@ impl ModelShape {
                 // (2026-08-01): `type:"enabled"` + `reasoning_effort:"none"` bills 160–253
                 // reasoning tokens — the explicit enable wins and the opt-out is a silent
                 // no-op the operator pays for. `type:"disabled"` alone is a true zero.
+                // Re-checked live by `deepseek_effort_none_needs_the_structural_disable_live`
+                // (tests/consult.rs), which also asserts this blob bills zero on the wire.
                 if is_effort_off(effort) {
                     obj.insert("thinking".into(), json!({ "type": "disabled" }));
                 } else {
@@ -510,7 +516,10 @@ pub fn request_params(
 /// deliberately encodes none of that: an operator gets to reach a rung OpenAI shipped
 /// this morning, and a wrong one comes back as OpenAI's own error naming the model's
 /// supported values. (rig's enum is a separate, *lower* ceiling that kaibo does report
-/// up front — see [`EffortWire`].)
+/// up front — see [`EffortWire`].) Measured and re-checkable:
+/// `openai_effort_ceiling_is_per_model_live` in `tests/consult.rs`, which also pins the
+/// trap that an off-schema sentinel reports the API's superset for every model — so the
+/// table can only be re-derived by posting the real rungs.
 pub fn hosted_openai_responses_params(
     model: &str,
     top_p: Option<f64>,
@@ -589,8 +598,11 @@ pub enum EffortWire {
     /// strictly against its own seven rungs, OpenRouter accepts all seven and normalizes
     /// each onto the upstream's native knob (proven 2026-08-01: `xhigh`/`max` reach
     /// `openai/gpt-5.1` through the gateway with reasoning billed, on ids that 400 those
-    /// rungs on OpenAI's direct API), and the toggle-less chat shape has no field to put
-    /// it in at all. "Passthrough" is a statement about *rig*, not about the far end.
+    /// rungs on OpenAI's direct API — the two halves are
+    /// `openrouter_clamps_rungs_the_direct_backend_refuses_live` and
+    /// `openai_effort_ceiling_is_per_model_live`), and the toggle-less chat shape has no
+    /// field to put it in at all. "Passthrough" is a statement about *rig*, not about the
+    /// far end.
     Passthrough,
 }
 

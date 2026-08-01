@@ -1504,37 +1504,23 @@ async fn openrouter_consult_round_trips() {
 }
 
 /// One minimal OpenRouter completion carrying kaibo's shaped params, with the
-/// gateway's usage accounting on. Returns the parsed response JSON.
+/// gateway's usage accounting on. Returns the parsed response JSON, and refuses a
+/// rejection — this is the "does kaibo's shape work" probe, so a 4xx is a failure.
+///
+/// Delegates to [`openrouter_probe_raw`] rather than building its own request: the
+/// ladder probes below need the same body with a *different* prompt and the ability to
+/// read a 400 body, and two copies of one request shape is how a probe and the thing it
+/// probes drift apart.
 #[cfg(test)]
 async fn openrouter_probe_completion(key: &str, model: &str, params: &Value) -> Value {
-    let mut body = json!({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": "How many prime numbers are there between 10 and 50? \
-                        Work it out carefully, then answer with just the count.",
-        }],
-        "max_completion_tokens": 8192,
-        "usage": {"include": true},
-    });
-    for (k, v) in params.as_object().expect("shaped params are an object") {
-        body[k] = v.clone();
-    }
-    let http = kaibo::tls::https_client(std::time::Duration::from_secs(120)).unwrap();
-    let resp = http
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await
-        .expect("openrouter request");
-    let status = resp.status();
-    let json: Value = resp.json().await.expect("openrouter response json");
-    assert!(
-        status.is_success(),
-        "openrouter rejected kaibo's shaped params ({status}): {json}"
-    );
-    json
+    openrouter_probe_completion_with(
+        key,
+        model,
+        params,
+        "How many prime numbers are there between 10 and 50? \
+         Work it out carefully, then answer with just the count.",
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1547,10 +1533,11 @@ async fn openrouter_reasoning_accounting_live() {
     // rides — with OpenRouter's usage accounting on, and reads what the gateway
     // actually billed: effort-on must show reasoning tokens, and the structural
     // disable (`effort = "none"` ⇒ `{"reasoning":{"enabled":false}}`) must not.
-    let key = match load(ProviderKind::OpenRouter) {
-        Ok(k) => k,
-        Err(e) => panic!("no OpenRouter credential for live test: {e}"),
-    };
+    // `live_key`, not `credentials::load`: an operator's key file needn't sit at the
+    // built-in default path, and here it doesn't — the config points at
+    // `~/.openrouter-key.txt` while `load` looks for `~/.openrouter-key`, so this probe
+    // was unrunnable on the machine that owns the key. See `live_key`.
+    let key = live_key(ProviderKind::OpenRouter);
     // The built-in cast's explorer alias — the slot the doctrine most needs to
     // hold on, since the explorer runs the most turns.
     let model = "~google/gemini-flash-latest";
@@ -1637,4 +1624,679 @@ async fn adaptive_only_anthropic_model_round_trips() {
         "answer should explain the read-only sandbox mechanism, got: {}",
         out.answer
     );
+}
+
+// ===========================================================================
+// Live effort-ladder probes — what each PROVIDER really accepts
+// ===========================================================================
+//
+// The other half of `tests/effort_wire.rs`. That suite is offline and asks rig:
+// what will the *client* let kaibo send? These are live and ask the provider:
+// what does the endpoint actually do with it? Both are needed, because rig's
+// ceiling and the provider's ceiling are different numbers on two wires, and
+// kaibo's docs used to assert one universal `none|low|…|max` ladder for
+// everyone — wrong in every direction at once. Gemini is narrower (four rungs,
+// and narrower still per model), OpenAI's ceiling AND floor are per-model, and
+// DeepSeek's `none` didn't turn reasoning off the way kaibo was sending it.
+//
+// Every assertion here was observed on the wire on 2026-08-01 by raw HTTP
+// against each provider's real endpoint — deliberately NOT through rig, whose
+// typed enums reject before the wire and would tell us nothing about the
+// provider. Each doc comment carries its dated measurement, so a later reader
+// can tell what was measured from what was assumed.
+//
+// They follow the `openrouter_reasoning_accounting_live` precedent above: post
+// raw, read the provider's own accounting back, and assert on the response
+// BODY, not just the status. A rung that is accepted-but-ignored looks exactly
+// like one that works unless you check whether reasoning actually happened.
+//
+// All `#[ignore]`d: they cost money and need network + keys.
+
+/// Rungs kaibo can put in a slot's `effort` — the widest set any provider takes,
+/// which is what a probe must try in order to discover a narrower one.
+const ALL_RUNGS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// A short arithmetic prompt: cheap, and every reasoning model spends *some*
+/// thinking on it, so "did reasoning happen" is a live signal rather than noise.
+const CHEAP_PROMPT: &str = "What is 1487 times 233? Give the number.";
+
+/// A prompt with enough depth that the ladder's rungs can actually separate.
+/// Used only where we assert *gradation*, never where we assert acceptance.
+const HARD_PROMPT: &str = "Prove or disprove: every integer n>1 that divides 2^n-2 \
+     must be composite or equal to 2. Reason carefully, then answer in one line.";
+
+/// The client every live probe here uses — kaibo's own rustls+ring stack, so a probe
+/// exercises the shipped TLS boundary too.
+fn probe_http() -> reqwest::Client {
+    kaibo::tls::https_client(std::time::Duration::from_secs(180)).expect("https client")
+}
+
+/// The API key a live probe should use for `kind`, resolved **the way kaibo itself
+/// resolves one**: the operator's config names the backend and where its key lives
+/// (`api_key_env` / `api_key_file`), and only when no configured backend of that kind
+/// exists do we fall back to the built-in `credentials::load` path.
+///
+/// Going through the config is not politeness, it's necessity in both directions. The
+/// `openai` kind is `key_optional` — a local llama.cpp server needs no key — so
+/// `credentials::load` refuses it outright and the hosted Platform key is reachable
+/// *only* through the backend that names it. And an operator's key file needn't sit at
+/// the built-in default path: on this machine OpenRouter's key is
+/// `~/.openrouter-key.txt` via config, while `load` looks for `~/.openrouter-key`.
+///
+/// Panics with the reason when no key resolves — an `#[ignore]`d probe that silently
+/// no-ops is worse than one that doesn't run.
+fn live_key(kind: ProviderKind) -> String {
+    if let Ok(cfg) = Config::load(None) {
+        let configured = cfg.backends.values().find(|b| {
+            b.kind == kind
+                // For the openai kind, only OpenAI Platform itself can answer a
+                // Platform probe; a local endpoint sharing the kind cannot.
+                && (kind != ProviderKind::Openai || b.is_hosted_openai())
+        });
+        if let Some(b) = configured {
+            match b.resolve_key() {
+                Ok(k) if k != kind.placeholder_key() => return k,
+                Ok(_) => {}
+                Err(e) => eprintln!("=== backend {:?} key did not resolve: {e}", b.name),
+            }
+        }
+    }
+    load(kind).unwrap_or_else(|e| panic!("no {kind:?} credential for live test: {e}"))
+}
+
+// --- DeepSeek --------------------------------------------------------------
+
+async fn deepseek_probe(key: &str, body: Value) -> (u16, Value) {
+    let resp = probe_http()
+        .post("https://api.deepseek.com/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .expect("deepseek request");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.expect("deepseek response json"))
+}
+
+fn deepseek_reasoning_tokens(j: &Value) -> u64 {
+    j["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// DeepSeek validates `reasoning_effort` strictly against a *seven*-rung ladder — it is
+/// the one provider whose accepted set is exactly the universal ladder kaibo's docs once
+/// claimed for everyone. Observed 2026-08-01 on `deepseek-v4-pro`: all seven HTTP 200,
+/// and a garbage value 400s with the ladder spelled out in the error.
+///
+/// That error text is the real oracle: it means a future DeepSeek ladder change fails
+/// this test loudly instead of drifting past `docs/config.md`'s per-provider table.
+#[tokio::test]
+#[ignore = "hits the DeepSeek API; run with --ignored and a key"]
+async fn deepseek_effort_ladder_live() {
+    let key = live_key(ProviderKind::DeepSeek);
+
+    for rung in ALL_RUNGS {
+        let (status, json) = deepseek_probe(
+            &key,
+            json!({
+                "model": "deepseek-v4-pro",
+                "max_tokens": 2048,
+                "thinking": { "type": "enabled" },
+                "reasoning_effort": rung,
+                "messages": [{ "role": "user", "content": CHEAP_PROMPT }],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "DeepSeek should accept effort={rung}, got {status}: {json}"
+        );
+    }
+
+    // The oracle: an off-ladder value is refused, and the refusal *enumerates* the
+    // ladder. If DeepSeek adds or drops a rung, this assertion is what notices.
+    let (status, json) = deepseek_probe(
+        &key,
+        json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 16,
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": "zzz",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "an off-ladder effort must be refused: {json}");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    for rung in ALL_RUNGS {
+        assert!(
+            msg.contains(rung),
+            "DeepSeek's rejection should still enumerate `{rung}` — the ladder moved: {msg}"
+        );
+    }
+}
+
+/// The provider behavior that forced kaibo's DeepSeek off-switch to be *structural*.
+///
+/// The off-switch on DeepSeek belongs to `thinking.type`, not to `reasoning_effort`.
+/// Observed 2026-08-01 on `deepseek-v4-pro`, one variable at a time:
+///
+/// | body                                              | reasoning tokens |
+/// |---------------------------------------------------|------------------|
+/// | `reasoning_effort: "none"` alone                   | 0                |
+/// | `thinking: {"type":"disabled"}` alone              | 0                |
+/// | `thinking: {"type":"enabled"}` + `effort: "none"`  | **160–253**      |
+///
+/// That third row is what kaibo used to send for `effort = "none"`: the explicit enable
+/// wins, so an operator's opt-out did nothing and they paid for the reasoning anyway —
+/// the silent-fallback shape this project refuses. `ThinkingStyle::DeepSeekEffort` now
+/// emits the structural disable instead (`src/consult/shaping.rs`), the way
+/// `OpenRouterEffort` already did.
+///
+/// So this test does two jobs. It pins the *provider* precedence that justifies the fix
+/// (if DeepSeek ever makes `effort` win, the fix is no longer load-bearing and the
+/// `none` guidance should be revisited), and it proves kaibo's own shaped params — the
+/// exact blob `ModelShape::to_params` builds — bill zero reasoning on the wire.
+#[tokio::test]
+#[ignore = "hits the DeepSeek API; run with --ignored and a key"]
+async fn deepseek_effort_none_needs_the_structural_disable_live() {
+    let key = live_key(ProviderKind::DeepSeek);
+    let base = |extra: Value| {
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 2048,
+            "messages": [{ "role": "user", "content": CHEAP_PROMPT }],
+        });
+        for (k, v) in extra.as_object().expect("object") {
+            body[k] = v.clone();
+        }
+        body
+    };
+
+    // Each lever alone: really off.
+    let (_, bare) = deepseek_probe(&key, base(json!({ "reasoning_effort": "none" }))).await;
+    assert_eq!(
+        deepseek_reasoning_tokens(&bare),
+        0,
+        "effort=none alone should suppress reasoning, got usage: {}",
+        bare["usage"]
+    );
+    let (_, disabled) =
+        deepseek_probe(&key, base(json!({ "thinking": { "type": "disabled" } }))).await;
+    assert_eq!(
+        deepseek_reasoning_tokens(&disabled),
+        0,
+        "thinking.type=disabled should suppress reasoning, got usage: {}",
+        disabled["usage"]
+    );
+
+    // The pairing kaibo used to send. `thinking: enabled` wins and reasoning bills.
+    let (_, both) = deepseek_probe(
+        &key,
+        base(json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "none" })),
+    )
+    .await;
+    assert!(
+        deepseek_reasoning_tokens(&both) > 0,
+        "documented provider precedence: thinking=enabled overrides effort=none. If this \
+         now reports 0, DeepSeek changed its precedence — the structural disable is no \
+         longer load-bearing and the `effort = \"none\"` guidance should be revisited. \
+         usage: {}",
+        both["usage"]
+    );
+
+    // And what kaibo sends TODAY: the shaped params, on the wire, billing nothing.
+    let shaped = ModelShape::resolve(
+        ProviderKind::DeepSeek,
+        "deepseek-v4-pro",
+        ThinkingStyleOverride::Auto,
+    )
+    .to_params(THINKING_BUDGET, None, None, "none")
+    .expect("deepseek always sends a thinking block");
+    let (status, kaibo_shape) = deepseek_probe(&key, base(shaped.clone())).await;
+    assert_eq!(
+        status, 200,
+        "kaibo's shaped params must be accepted: {kaibo_shape}"
+    );
+    assert_eq!(
+        deepseek_reasoning_tokens(&kaibo_shape),
+        0,
+        "kaibo's `effort = \"none\"` must actually stop the billing it names. sent {shaped}, \
+         got usage: {}",
+        kaibo_shape["usage"]
+    );
+}
+
+// --- Gemini ----------------------------------------------------------------
+
+async fn gemini_probe(key: &str, model: &str, level: &str, prompt: &str) -> (u16, Value) {
+    let url =
+        format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+    let resp = probe_http()
+        .post(url)
+        .header("x-goog-api-key", key)
+        .json(&json!({
+            "contents": [{ "parts": [{ "text": prompt }] }],
+            "generationConfig": {
+                "maxOutputTokens": 8192,
+                "thinkingConfig": { "thinkingLevel": level, "includeThoughts": true },
+            },
+        }))
+        .send()
+        .await
+        .expect("gemini request");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.expect("gemini response json"))
+}
+
+/// rig's four-variant `ThinkingLevel` (`minimal|low|medium|high`) is a CORRECT model of
+/// Google's API, not a stale cap like its OpenAI `ReasoningEffort` enum. Observed
+/// 2026-08-01 on `gemini-3.5-flash`: `none`, `xhigh` and `max` all 400 with a protobuf
+/// enum error naming `google.ai.generativelanguage.v1beta.ThinkingConfig.ThinkingLevel`.
+/// A schema-level refusal, so no Gemini model can take those rungs.
+///
+/// Consequence kaibo's docs now carry: `effort = "none"` cannot turn reasoning off on
+/// the gemini kind at all — `minimal` is Google's off-switch (proven below).
+#[tokio::test]
+#[ignore = "hits the Gemini API; run with --ignored and a key"]
+async fn gemini_thinking_level_ladder_live() {
+    let key = live_key(ProviderKind::Gemini);
+
+    for level in ["minimal", "low", "medium", "high"] {
+        let (status, json) = gemini_probe(&key, "gemini-3.5-flash", level, CHEAP_PROMPT).await;
+        assert_eq!(
+            status, 200,
+            "gemini-3.5-flash should accept thinkingLevel={level}: {json}"
+        );
+    }
+
+    for level in ["none", "xhigh", "max"] {
+        let (status, json) = gemini_probe(&key, "gemini-3.5-flash", level, CHEAP_PROMPT).await;
+        assert_eq!(
+            status, 400,
+            "Google's ThinkingLevel enum has no `{level}` rung — if this now succeeds, \
+             Google widened the enum and rig's four-variant cap became a stale ceiling \
+             kaibo must document: {json}"
+        );
+        let msg = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("thinking_level") || msg.contains("ThinkingLevel"),
+            "expected a thinking_level enum rejection for `{level}`, got: {msg}"
+        );
+    }
+}
+
+/// The Gemini ladder is narrower still *per model*: `gemini-pro-latest` refuses
+/// `minimal` with a distinct, human-worded error (not the protobuf enum error) — a
+/// model-capability refusal layered on top of the schema enum. Observed 2026-08-01.
+///
+/// So a cast pinning a Pro model has a three-rung ladder and no way to run thinking-off
+/// at all — which is why `docs/config.md` says Gemini's off-switch is model-dependent
+/// rather than just naming `minimal`.
+#[tokio::test]
+#[ignore = "hits the Gemini API; run with --ignored and a key"]
+async fn gemini_pro_rejects_minimal_live() {
+    let key = live_key(ProviderKind::Gemini);
+    let (status, json) = gemini_probe(&key, "gemini-pro-latest", "minimal", CHEAP_PROMPT).await;
+    assert_eq!(
+        status, 400,
+        "gemini-pro-latest is expected to refuse thinkingLevel=minimal: {json}"
+    );
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.to_lowercase().contains("minimal"),
+        "expected a model-capability refusal naming MINIMAL, got: {msg}"
+    );
+}
+
+/// Gemini's rungs are *graded*, not decorative: thinking tokens climb with the level,
+/// and `minimal` is genuinely thinking-off (no `thoughtsTokenCount` at all). Observed
+/// 2026-08-01 on gemini-3.5-flash with `HARD_PROMPT`: minimal=0, low=494, medium=1269,
+/// high=1974.
+///
+/// This is the accepted-and-reasoned vs accepted-but-ignored discriminator for the
+/// gemini kind, and it doubles as the evidence that `minimal` is the right off-switch to
+/// point operators at.
+#[tokio::test]
+#[ignore = "hits the Gemini API; run with --ignored and a key"]
+async fn gemini_thinking_level_is_graded_live() {
+    let key = live_key(ProviderKind::Gemini);
+    let thoughts = |j: &Value| {
+        j["usageMetadata"]["thoughtsTokenCount"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+
+    let mut seen = Vec::new();
+    for level in ["minimal", "low", "medium", "high"] {
+        let (status, json) = gemini_probe(&key, "gemini-3.5-flash", level, HARD_PROMPT).await;
+        assert_eq!(status, 200, "thinkingLevel={level}: {json}");
+        seen.push((level, thoughts(&json)));
+    }
+
+    assert_eq!(
+        seen[0].1, 0,
+        "thinkingLevel=minimal is Gemini's off-switch — it must spend no thinking \
+         tokens, got {seen:?}"
+    );
+    assert!(
+        seen[3].1 > seen[1].1,
+        "high must think measurably deeper than low, else the level is accepted but \
+         ignored: {seen:?}"
+    );
+}
+
+// --- OpenAI Platform -------------------------------------------------------
+
+async fn openai_probe(key: &str, model: &str, effort: &str) -> (u16, Value) {
+    let resp = probe_http()
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(key)
+        .json(&json!({
+            "model": model,
+            "input": CHEAP_PROMPT,
+            "max_output_tokens": 2048,
+            "reasoning": { "effort": effort },
+        }))
+        .send()
+        .await
+        .expect("openai request");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.expect("openai response json"))
+}
+
+/// The OpenAI ceiling is a **model** property, not a family property — and the *floor*
+/// moves too. Observed 2026-08-01 against `/v1/responses`:
+///
+/// | model     | rejects          | the model's own "Supported values"        |
+/// |-----------|------------------|-------------------------------------------|
+/// | gpt-5.6-* | (none of them)   | takes `xhigh` AND `max`                   |
+/// | gpt-5.2   | `max`            | none, low, medium, high, xhigh            |
+/// | gpt-5.1   | `xhigh`, `max`   | none, low, medium, high                   |
+/// | gpt-5     | `xhigh`, `max`   | minimal, low, medium, high  (no `none`!)  |
+///
+/// This is the measurement behind kaibo keeping **no** effort allowlist: any table we
+/// baked in would be wrong within a release, and it would be wrong per model id rather
+/// than per family, which is not a shape a classifier handles gracefully.
+///
+/// It also pins a trap for whoever re-derives this: validation is **two-layer**. An
+/// off-schema sentinel (`"zzz"`) returns the API's *superset* enum for every model,
+/// gpt-5 included — so the sentinel trick cannot reveal a model's real ladder. Only
+/// posting the actual rung surfaces the model-capability refusal.
+#[tokio::test]
+#[ignore = "hits the OpenAI Platform API; run with --ignored and a hosted-openai backend key"]
+async fn openai_effort_ceiling_is_per_model_live() {
+    let key = live_key(ProviderKind::Openai);
+
+    // The 5.6 line reaches the top of the ladder, cheap tier included — `max` is not
+    // reserved for the flagship.
+    for model in ["gpt-5.6-sol", "gpt-5.6-luna"] {
+        for effort in ["xhigh", "max"] {
+            let (status, json) = openai_probe(&key, model, effort).await;
+            assert_eq!(status, 200, "{model} should accept effort={effort}: {json}");
+            assert_eq!(
+                json["reasoning"]["effort"].as_str(),
+                Some(effort),
+                "{model} should echo the requested effort back: {json}"
+            );
+            assert!(
+                json["usage"]["output_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0,
+                "{model} at effort={effort} must actually bill reasoning tokens: {}",
+                json["usage"]
+            );
+        }
+    }
+
+    // Older ids cap lower. These refusals are why kaibo cannot ship one ladder for the
+    // whole `openai` kind — nor even for the `gpt-5*` family.
+    for (model, rejected) in [
+        ("gpt-5.2", vec!["max"]),
+        ("gpt-5.1", vec!["xhigh", "max"]),
+        ("gpt-5", vec!["xhigh", "max"]),
+    ] {
+        for effort in rejected {
+            let (status, json) = openai_probe(&key, model, effort).await;
+            assert_eq!(
+                status, 400,
+                "{model} is expected to refuse effort={effort}: {json}"
+            );
+            let msg = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("not supported with the") && msg.contains(model),
+                "expected a model-capability refusal naming {model}, got: {msg}"
+            );
+        }
+    }
+
+    // The two-layer trap, pinned: an off-schema value reports the superset, so it must
+    // not be mistaken for the model's ladder.
+    let (status, json) = openai_probe(&key, "gpt-5", "zzz").await;
+    assert_eq!(status, 400, "an off-schema effort must be refused: {json}");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("xhigh") && msg.contains("max"),
+        "the schema-level rejection is expected to list the superset even for a model \
+         that refuses those rungs — if this changed, the sentinel trick became usable \
+         for ladder discovery: {msg}"
+    );
+}
+
+// --- OpenRouter ------------------------------------------------------------
+
+/// One OpenRouter completion with the gateway's usage accounting on, returning whatever
+/// came back — including a rejection body. The ladder probes need both knobs the older
+/// `openrouter_probe_completion` lacked: a caller-chosen prompt (so rungs can separate
+/// on a hard question) and the ability to READ a 400 rather than panic on it, since the
+/// gateway's rejection text enumerates its ladder and that text is the oracle.
+#[cfg(test)]
+async fn openrouter_probe_raw(key: &str, model: &str, params: &Value, prompt: &str) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_completion_tokens": 8192,
+        "usage": { "include": true },
+    });
+    for (k, v) in params.as_object().expect("shaped params are an object") {
+        body[k] = v.clone();
+    }
+    probe_http()
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .expect("openrouter request")
+        .json()
+        .await
+        .expect("openrouter response json")
+}
+
+/// [`openrouter_probe_raw`] plus "and it must have worked" — the shape every probe that
+/// asserts *acceptance* wants. OpenRouter reports errors in the body with a 200-ish
+/// envelope as readily as a 4xx, so the check is on `error`, not the status.
+#[cfg(test)]
+async fn openrouter_probe_completion_with(
+    key: &str,
+    model: &str,
+    params: &Value,
+    prompt: &str,
+) -> Value {
+    let json = openrouter_probe_raw(key, model, params, prompt).await;
+    assert!(
+        json.get("error").is_none(),
+        "openrouter rejected the probe params: {json}"
+    );
+    json
+}
+
+/// OpenRouter really does expose the full seven-rung ladder, and `xhigh`/`max` are not
+/// decoration: reasoning tokens climb with the rung. Observed 2026-08-01 on
+/// `HARD_PROMPT` — `z-ai/glm-5.2` low=478, high=389, xhigh=809, max=1177;
+/// `~openai/gpt-latest` low=87, high=115, xhigh=127, max=142.
+///
+/// (Note low>high on GLM in that run: sampling noise at adjacent rungs is real, which is
+/// why the assertion below compares `max` against `high` — two rungs apart — rather than
+/// demanding a monotonic staircase a live probe can't promise.)
+///
+/// This is the probe behind the claim in `src/consult/shaping.rs` and `docs/config.md`
+/// that the openrouter kind reaches rungs the other kinds don't.
+#[tokio::test]
+#[ignore = "hits the OpenRouter API; run with --ignored and an OpenRouter key"]
+async fn openrouter_top_rungs_reach_deeper_live() {
+    let key = live_key(ProviderKind::OpenRouter);
+    let model = "z-ai/glm-5.2";
+
+    let mut seen = Vec::new();
+    for effort in ["high", "xhigh", "max"] {
+        let params = json!({ "reasoning": { "effort": effort }, "usage": { "include": true } });
+        let resp = openrouter_probe_completion_with(&key, model, &params, HARD_PROMPT).await;
+        let reasoning = resp["usage"]["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        assert!(
+            reasoning > 0,
+            "effort={effort} must bill reasoning tokens: {}",
+            resp["usage"]
+        );
+        seen.push((effort, reasoning));
+    }
+
+    assert!(
+        seen[2].1 > seen[0].1,
+        "`max` must reach deeper than `high`, else the extra rungs are accepted but \
+         ignored and the docs should stop advertising them: {seen:?}"
+    );
+
+    // And the ladder is validated, not free-form — the rejection enumerates it.
+    let params = json!({ "reasoning": { "effort": "zzz" } });
+    let resp = openrouter_probe_raw(&key, model, &params, "hi").await;
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    for rung in ALL_RUNGS {
+        assert!(
+            msg.contains(rung),
+            "OpenRouter's rejection should enumerate `{rung}` — the gateway ladder \
+             moved: {msg}"
+        );
+    }
+}
+
+/// The gateway asymmetry, settled: OpenRouter carries `xhigh` and `max` to upstream
+/// OpenAI models whose **direct** Platform API refuses those rungs. Observed 2026-08-01
+/// — `openai/gpt-5.1` and `openai/gpt-5` both succeed with reasoning tokens billed
+/// through OpenRouter, while the same rungs 400 against `api.openai.com` (see
+/// `openai_effort_ceiling_is_per_model_live`, which pins the other half).
+///
+/// So OpenRouter is NOT a passthrough for this field — it normalizes onto each
+/// upstream's native knob. That is the sentence `docs/config.md` and
+/// `EffortWire::Passthrough`'s doc now carry, and the operator-facing consequence is
+/// that the same `effort = "max"` is portable on the openrouter kind and model-gated on
+/// the gpt kind.
+#[tokio::test]
+#[ignore = "hits the OpenRouter API; run with --ignored and an OpenRouter key"]
+async fn openrouter_clamps_rungs_the_direct_backend_refuses_live() {
+    let key = live_key(ProviderKind::OpenRouter);
+
+    for model in ["openai/gpt-5.1", "openai/gpt-5"] {
+        for effort in ["xhigh", "max"] {
+            let params = json!({ "reasoning": { "effort": effort }, "usage": { "include": true } });
+            let resp = openrouter_probe_completion_with(&key, model, &params, CHEAP_PROMPT).await;
+            assert_eq!(
+                resp["model"].as_str(),
+                Some(model),
+                "OpenRouter should serve the pinned upstream, not silently reroute: {resp}"
+            );
+            assert!(
+                resp["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0,
+                "the gateway is expected to translate effort={effort} into something the \
+                 upstream honors, billing reasoning tokens: {}",
+                resp["usage"]
+            );
+        }
+    }
+}
+
+// --- Anthropic — the one unprobed cell -------------------------------------
+
+/// UNVERIFIED. This probe is written and has never been observed to pass or fail on its
+/// own logic, because the key available on 2026-08-01 was unfunded: every request to
+/// `api.anthropic.com` returned HTTP 400 "Your credit balance is too low to access the
+/// Anthropic API" — on `/v1/messages` AND on the otherwise-free
+/// `/v1/messages/count_tokens`. The billing check runs *before* body validation, so
+/// there is no free path to validate `output_config.effort` on an unfunded account.
+/// Anthropic's adaptive ladder is the one cell of the provider matrix still unknown.
+///
+/// The credit-balance assertion below is deliberately the FIRST thing checked and is a
+/// hard failure, not a skip: an unfunded run must be impossible to mistake for a result.
+/// This test failing on billing means "we still don't know", which is the honest answer;
+/// silently passing would launder an unpaid bill into evidence.
+///
+/// OpenRouter's Anthropic route settles nothing here either — the gateway is proven
+/// above to accept rungs its upstream refuses, so an OpenRouter 200 on `~anthropic/…` at
+/// `max` is evidence about OpenRouter, not about Anthropic.
+///
+/// Run this with a funded key to settle two documents that currently disagree:
+/// `docs/config.example.toml` ships `effort = "max"` on an Opus slot, while
+/// `src/batch.rs` calls `high` "the proven-accepted top for the Anthropic adaptive
+/// tier". Exactly one of those is right. Both are deliberately left as they are until
+/// this probe can answer.
+#[tokio::test]
+#[ignore = "UNVERIFIED: needs a FUNDED Anthropic key; run with --ignored"]
+async fn anthropic_adaptive_effort_ladder_live() {
+    let key = live_key(ProviderKind::Anthropic);
+
+    for rung in ALL_RUNGS {
+        let resp = probe_http()
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 2048,
+                "thinking": { "type": "adaptive" },
+                "output_config": { "effort": rung },
+                "messages": [{ "role": "user", "content": CHEAP_PROMPT }],
+            }))
+            .send()
+            .await
+            .expect("anthropic request");
+        let status = resp.status();
+        let json: Value = resp.json().await.expect("anthropic response json");
+
+        let err = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !err.contains("credit balance is too low"),
+            "the Anthropic account is unfunded, so this probe cannot distinguish an \
+             unsupported rung from an unpaid bill — the ladder is still UNKNOWN, not \
+             disproven. Fund the key and re-run. (effort={rung}, {status}: {err})"
+        );
+
+        // Record, don't presume. Both outcomes are findings: a 400 names the real
+        // ceiling, a 200 with thinking blocks proves the rung reaches the model.
+        if status.is_success() {
+            let thinking: usize = json["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| b["type"] == "thinking")
+                        .filter_map(|b| b["thinking"].as_str())
+                        .map(str::len)
+                        .sum()
+                })
+                .unwrap_or(0);
+            eprintln!(
+                "=== effort={rung} ACCEPTED thinking_chars={thinking} usage={}",
+                json["usage"]
+            );
+        } else {
+            eprintln!("=== effort={rung} REJECTED ({status}): {}", json["error"]);
+        }
+    }
 }

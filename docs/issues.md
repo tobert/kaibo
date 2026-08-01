@@ -495,10 +495,18 @@ in the module doc and `docs/devlog.md`. What's left:
   provider batch). The diverse-opinion panel — one question across **many** casts — is N
   provider batches under a composite handle; deferred. The provenance footer already
   makes each result self-labelling, so the rendering is mostly there.
-- **Effort tier.** Batch forces `BATCH_EFFORT = "high"` (== `DEFAULT_EFFORT`, the
-  proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
-  is ever confirmed by probe for a batch backend, lift it there — the constant is the
-  one knob to change.
+- **Anthropic's effort ladder is still unknown, and two of our own documents disagree
+  about it.** `docs/config.example.toml` ships `effort = "max"` on an Opus slot;
+  `BATCH_EFFORT`'s doc treats `high` as the top. The probe that settles it is written and
+  in the tree — `anthropic_adaptive_effort_ladder_live` (`tests/consult.rs`) — but cannot
+  run on an unfunded key: Anthropic's billing check precedes body validation, so every
+  rung returns the same credit-balance 400 and a rejection proves nothing about the rung.
+  The test fails loudly on that message rather than skipping, so an unfunded run can't be
+  mistaken for a result. Run it with a funded key, then fix whichever document is wrong.
+  Every other provider's ladder is now measured (see the sibling live probes and the
+  table in `docs/config.md`); this is the one empty cell. Lower stakes than it was, since
+  batch's `effort` is a floor rather than a force — a cast that pins a deeper rung already
+  reaches the provider, so only kaibo's *default* rides on the answer.
 - **`FileRef` / Gemini File API for *batch* is bigger than "a variant beside `Image`"
   — and may be the wrong shape.** Re-scoped after checking gpal + Google's docs (2026-06-22):
   - **gpal's batch is inline-only** (`create_batch` → `InlinedRequest(contents=prompt)`,

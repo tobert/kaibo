@@ -241,7 +241,11 @@ The `[defaults]` knobs themselves:
   | DeepSeek | all seven (`none` … `max`), strictly validated. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
   | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
   | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
-  | Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. |
+  | Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured** — see `docs/issues.md`. |
+
+  Every row above except the Anthropic one was measured against the live endpoint, and
+  each is re-checkable: `tests/consult.rs` carries an `#[ignore]`d probe per provider
+  that fails if a ladder moves, rather than letting this table quietly rot.
 
   **rig's client is a second, lower ceiling on two wires**, independent of the provider:
   rig 0.38 parses kaibo's params into a typed struct for Gemini and for OpenAI's

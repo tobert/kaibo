@@ -60,9 +60,15 @@ use crate::credentials::ProviderKind;
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 
 /// The reasoning depth batch *floors* every item at. Equal to
-/// [`crate::consult::DEFAULT_EFFORT`] today (the proven-accepted top for the Anthropic
-/// adaptive tier); kept a separate constant so batch's "spend, it's async" intent
-/// survives a change to the interactive default.
+/// [`crate::consult::DEFAULT_EFFORT`] today — `high` is *observed-accepted* on the
+/// Anthropic adaptive tier (every live consult rides it); whether it is that tier's
+/// **top** is genuinely unknown, since the probe that would settle it
+/// (`anthropic_adaptive_effort_ladder_live`, `tests/consult.rs`) cannot run on an
+/// unfunded key: Anthropic's billing check precedes body validation, so a 400 there
+/// says nothing about the rung. `docs/config.example.toml` ships `effort = "max"` on an
+/// Opus slot on the other assumption; exactly one of these is right, and both stay put
+/// until the probe answers. Kept a separate constant either way, so batch's
+/// "spend, it's async" intent survives a change to the interactive default.
 ///
 /// A floor, matching every other batch knob — see [`batch_effort`] for why the direction
 /// matters and how an unrankable rung is handled.
