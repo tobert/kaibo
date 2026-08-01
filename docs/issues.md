@@ -508,10 +508,18 @@ in the module doc and `docs/devlog.md`. What's left:
   provider batch). The diverse-opinion panel — one question across **many** casts — is N
   provider batches under a composite handle; deferred. The provenance footer already
   makes each result self-labelling, so the rendering is mostly there.
-- **Effort tier.** Batch forces `BATCH_EFFORT = "high"` (== `DEFAULT_EFFORT`, the
-  proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
-  is ever confirmed by probe for a batch backend, lift it there — the constant is the
-  one knob to change.
+- **Anthropic's effort ladder is still unknown, and two of our own documents disagree
+  about it.** `docs/config.example.toml` ships `effort = "max"` on an Opus slot;
+  `BATCH_EFFORT`'s doc treats `high` as the top. The probe that settles it is written and
+  in the tree — `anthropic_adaptive_effort_ladder_live` (`tests/consult.rs`) — but cannot
+  run on an unfunded key: Anthropic's billing check precedes body validation, so every
+  rung returns the same credit-balance 400 and a rejection proves nothing about the rung.
+  The test fails loudly on that message rather than skipping, so an unfunded run can't be
+  mistaken for a result. Run it with a funded key, then fix whichever document is wrong.
+  Every other provider's ladder is now measured (see the sibling live probes and the
+  table in `docs/config.md`); this is the one empty cell. Lower stakes than it was, since
+  batch's `effort` is a floor rather than a force — a cast that pins a deeper rung already
+  reaches the provider, so only kaibo's *default* rides on the answer.
 - **`FileRef` / Gemini File API for *batch* is bigger than "a variant beside `Image`"
   — and may be the wrong shape.** Re-scoped after checking gpal + Google's docs (2026-06-22):
   - **gpal's batch is inline-only** (`create_batch` → `InlinedRequest(contents=prompt)`,
@@ -560,12 +568,6 @@ failures and a truncated page are surfaced, not hidden). Still open:
   progress string to know whether it's looking at a status or its answers. A structured
   status token (or distinct content shape) would let the caller branch without reading
   prose.
-- **Forced effort vs. a floor.** `max_tokens` is already a floor (never undercuts a
-  richer slot), but effort is *force-clobbered* to `BATCH_EFFORT` — lossy for legitimate
-  bulk-classification / short-extraction batches where high effort is wasted spend.
-  Consider making effort a default-on floor the cast/caller can lower, the way
-  `max_tokens` already is. (Distinct from the "lift the tier" bullet above — that's the
-  ceiling, this is the override.)
 - **Shared `attach` duplicates per item — bounded by the inlined-batch payload cap.**
   Attachments are shared across the batch but inlined *per item*: `anthropic_content`/
   `gemini_parts` (`batch.rs`) re-encode every attachment into every item's request, so a
@@ -662,27 +664,16 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
   thinking maximized by default**, opt-*out* per slot, never silently absent. The
   fix wants model-aware shaping on the openai wire — e.g. emit `reasoning_effort`
   for OpenAI-compatible reasoners, OpenRouter's unified `reasoning` param when the
-  backend is OpenRouter — landing with the first-class OpenRouter work.
+  backend is OpenRouter — landing with the first-class OpenRouter work. No longer
+  *silent*, at least: an `effort` the operator wrote onto this wire is now a startup
+  warning plus an `inert_tunables` entry (`Config::effort_diagnostics`), and
+  `tests/effort_wire.rs` pins the drop against a real serialized request body. Audible
+  is not fixed — reasoning is still off on that wire.
 - **`thinking_style` is missing from the `inert_tunables` render** (GLM review,
   2026-07-03): `kaibo://config` flags an inert `thinking_budget`/`effort`/
   `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
   slot whose kind ignores the override (anything non-Anthropic) renders as if
   effective. Display accuracy only; add it to the inert check alongside the others.
-- **The `inert_tunables` render is lane-blind** (or-gpt review, 2026-07-18): it
-  resolves only the model *shape*, not the slot's `lane`, so a **batch** slot renders
-  `effort` and `temperature` as effective even though `batch_shaping` forces
-  `BATCH_EFFORT` (ignoring the slot's `effort`) and passes `None` sampling. A configured
-  `effort = "low"` on a `lane = "batch"` slot is a silent no-op the render doesn't flag.
-  Same display-accuracy class as the `thinking_style` gap above; make the inert check
-  lane-aware — mark batch `effort` as overridden and batch sampling as inert.
-- **The `inert_tunables` render resolves the shape differently from validation**
-  (deepseek review, 2026-07-18): the render resolves `thinking_style` via
-  `unwrap_or_default()` (→ `Auto`), while the validation/`slot.tunables` path uses the
-  `defaults.thinking_style` fallback — so a `[defaults].thinking_style = "adaptive"` set
-  without a per-slot override is missed by the render, which can mislabel a
-  `thinking_budget`'s inertness on an actually-adaptive Anthropic slot. Display-only,
-  no wire effect. The clean fix for this whole render-accuracy cluster: resolve the
-  slot's shape in the render exactly as `slot.tunables` does.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.

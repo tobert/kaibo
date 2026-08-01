@@ -158,3 +158,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Request-body capture in `tests/effort_wire.rs`: rig's `HttpClientExt` trait is
+# typed in `bytes::Bytes`, so implementing a fake transport needs the type by name.
+# Already in the tree via reqwest/rig-core — zero new crates.
+bytes = "1"

@@ -15,7 +15,34 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+
+- **New MCP resource: `kaibo://config/guide`** — the full configuration manual
+  (`docs/config.md`), embedded in the binary the way the annotated template already is.
+  An agent configuring kaibo over MCP has no access to kaibo's own `docs/`, so until now
+  every explanation had to be smuggled into `config.toml`'s comments, where it cost bytes
+  on every read. The three config resources now split by job: `kaibo://config/example` is
+  the template you copy, `kaibo://config` is the resolved live state, and
+  `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
+  all three.
+
 ### Changed
+
+- **Batch treats `effort` as a floor, not an override.** Every other batch knob
+  already worked this way: `max_tokens` and the thinking budget rise to a batch
+  minimum but never undercut a slot that asked for more. `effort` alone was
+  clobbered in both directions, so a cast deliberately tuned to `xhigh`/`max` for the
+  offline lane was quietly demoted to `high`. Now a slot asking deeper than the batch
+  floor keeps its rung, a shallower one is still lifted (batch is the lane that
+  spends), and a rung kaibo doesn't recognize passes through untouched rather than
+  being replaced.
+
+- **`effort = "none"` survives the batch lane.** The floor raises reasoning *depth*,
+  and "off" isn't a depth — so a `batch_submit` fan-out you turned reasoning off for
+  stays off, instead of being lifted to `high` and billing thinking on every item. That
+  matters most exactly where batch is cheapest: bulk extraction and classification over
+  many prompts.
+
 
 - **kaibo no longer advertises a tool no configured cast can run.** A tool now has to
   clear two gates to appear: its `--no-<tool>` flag, and a cast that can actually staff
@@ -43,18 +70,6 @@ record. Each later release appends a new section at the top.
   list in silence. That now exits non-zero naming the cause, alongside the per-tool
   warnings that say what each tool wanted.
 
-### Added
-
-- **New MCP resource: `kaibo://config/guide`** — the full configuration manual
-  (`docs/config.md`), embedded in the binary the way the annotated template already is.
-  An agent configuring kaibo over MCP has no access to kaibo's own `docs/`, so until now
-  every explanation had to be smuggled into `config.toml`'s comments, where it cost bytes
-  on every read. The three config resources now split by job: `kaibo://config/example` is
-  the template you copy, `kaibo://config` is the resolved live state, and
-  `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
-  all three.
-
-### Changed
 
 - **`docs/config.example.toml` is leaner, and `docs/config.md` reads as a reference
   manual.** The template had been accumulating explanation that belongs in the manual —
@@ -78,6 +93,52 @@ record. Each later release appends a new section at the top.
   behavior, flags, or tool names changed.
 
 ### Fixed
+
+- **A reasoning `effort` your provider client can't accept now fails with a message
+  you can act on.** Two request shapes — Gemini and OpenAI's Responses API — go
+  through a typed builder in the underlying `rig` client whose reasoning levels are a
+  closed set: Gemini takes only `minimal`/`low`/`medium`/`high`, and Responses stops
+  at `xhigh` even though OpenAI's own API accepts `max`. A rung outside those used to
+  die mid-call with a bare ``unknown variant `max` `` naming neither the cast nor the
+  slot that asked for it. kaibo now checks the same builder up front and refuses with
+  the cast, the role, the backend, the model, whose ceiling it is, and the rungs that
+  path *does* take. kaibo still keeps **no allowlist of its own** — that list is read
+  back out of the client, so a rung a provider (or a client upgrade) makes available
+  works immediately, with no kaibo release.
+
+- **`[defaults] synth_effort = "xhigh"` no longer quietly breaks every Gemini cast.**
+  The shipped example config invited exactly that value; on Gemini it produced a
+  failed call with an opaque message. The docs now carry the real per-provider
+  ladders — including that OpenAI's rungs differ **per model** (`gpt-5.6` reaches
+  `max`, `gpt-5.2` stops at `xhigh`, `gpt-5.1` at `high`) — instead of implying one
+  universal ladder.
+
+- **`effort = "none"` on a DeepSeek slot now actually turns reasoning off.** kaibo
+  was sending "reasoning enabled" alongside "zero effort"; the enable won, so the
+  opt-out did nothing and still billed reasoning tokens (160–253 on a probe). It now
+  sends DeepSeek's structural disable, matching how the same setting already worked
+  on OpenRouter.
+
+- **An `effort` that lands nowhere is now said out loud.** Anthropic's budget-tier
+  models and any OpenAI-compatible chat endpoint (local llama.cpp/Ollama, most
+  gateways) have no reasoning parameter at all, so the setting was dropped in
+  silence. If you *wrote* one — on a slot, in `[defaults]`, or via `KAIBO_*_EFFORT` —
+  kaibo now warns at startup naming the cast and slot, and `kaibo://config` lists it
+  under that slot's `inert_tunables`. The inherited built-in default stays quiet, so
+  an ordinary local cast doesn't nag.
+
+- **`kaibo://config` reports inert tunables the way the request is actually built.**
+  It previously ignored a `[defaults].thinking_style` (mislabelling whether a
+  `thinking_budget` was live), ignored `[defaults]`-sourced effort entirely, and was
+  blind to `lane = "batch"` — rendering a batch slot's `effort` and `temperature` as
+  effective when batch sends no sampling at all and floors the effort.
+
+- **The startup warning and `kaibo://config` can no longer disagree about an effort.**
+  They answer from one shared rule now, so a value the batch lane lifts is reported by
+  both (it used to be flagged in the resource and stay silent at startup), and the
+  warning says *which* thing happened — dropped by a wire with no reasoning parameter,
+  or raised to the batch floor — since those want different fixes.
+
 
 - **Corrected several configuration-manual claims that did not match the code.** Found by
   pointing kaibo's own `consult` at the rewrite (cast `or-gpt`, GPT-5.6 luna in both

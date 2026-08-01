@@ -130,6 +130,55 @@ impl Resolver {
             }
         };
 
+        // Say it out loud, once, where both front doors pass: an `effort` the operator
+        // WROTE that doesn't ship as written. Not fatal, deliberately — the inherited
+        // default lands on a toggle-less wire in every ordinary local cast, and the
+        // *rule* (`Config::effort_diagnostics`) is what keeps this to the cases someone
+        // chose. The rule is shared with the `kaibo://config` render rather than
+        // restated, so the two can never tell an operator different stories.
+        //
+        // Grouped by (fate, source, value): one `[defaults]` line lands on every cast at
+        // once, and ten near-identical warnings for one mistyped setting reads as noise —
+        // which is how a warning gets tuned out. One line per thing the operator wrote,
+        // and the fate decides what the line says, since "dropped entirely" and "raised
+        // to the batch floor" want different fixes.
+        let mut grouped: std::collections::BTreeMap<
+            (crate::config::EffortFate, &'static str, String),
+            Vec<String>,
+        > = std::collections::BTreeMap::new();
+        for d in config.effort_diagnostics() {
+            grouped
+                .entry((
+                    d.disposition.fate,
+                    d.disposition.source.as_str(),
+                    d.disposition.configured,
+                ))
+                .or_default()
+                .push(format!("{}/{} ({})", d.cast, d.role, d.model));
+        }
+        for ((fate, source, effort), slots) in grouped {
+            let detail = match fate {
+                crate::config::EffortFate::NoSink => {
+                    "these models' wires carry no reasoning parameter, so it is dropped \
+                     before the request is built and the setting does nothing. Set it on \
+                     a slot whose provider takes one, or drop it."
+                }
+                _ => {
+                    "the batch lane floors reasoning depth, so this shallower value is \
+                     raised to kaibo's batch floor and never runs as written. Batch is \
+                     the lane that spends; use `effort = \"none\"` to turn reasoning off \
+                     there instead."
+                }
+            };
+            tracing::warn!(
+                effort = %effort,
+                source = %source,
+                slots = %slots.join(", "),
+                "configured effort does not reach the provider as written: {detail} \
+                 See kaibo://config (inert_tunables)."
+            );
+        }
+
         Ok(Self {
             config,
             allowed_set: Arc::new(allowed),
@@ -390,8 +439,11 @@ impl Resolver {
             .config
             .resolve_backend(&slot.backend)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Name the cast on the way out: `from_slot` knows the backend, the role and the
+        // model, but not which team pulled them together — and "which cast do I edit?" is
+        // the first thing an operator needs from a shaping refusal.
         Arm::from_slot(backend, slot, role, &self.config.defaults)
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+            .map_err(|e| McpError::internal_error(format!("cast {:?}: {e:#}", cast.name), None))
     }
 
     /// Assemble the operator's house rules for this call against the resolved `root`:
@@ -657,5 +709,78 @@ impl Resolver {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelRole;
+
+    /// A per-call `model=` override deliberately drops the configured slot's `effort`
+    /// along with its other tunables — `override_model` builds a **bare** slot, because
+    /// the override names a *different* model and a depth pinned for the old one has no
+    /// claim on the new one. The effective effort then falls back to `[defaults]`.
+    ///
+    /// Behavior is unchanged and intentional (see this method's doc); it just wasn't
+    /// pinned anywhere, and it interacts with the effort-provenance work — a dropped
+    /// `effort = "xhigh"` must not leave an explicit-provenance ghost that then reports
+    /// itself inert against a model nobody wrote it for. Now a future change here has to
+    /// be deliberate.
+    #[test]
+    fn a_per_call_model_override_drops_the_configured_slot_effort() {
+        let config = std::sync::Arc::new(
+            crate::config::Config::from_toml_str(
+                r#"
+                [casts.pinned]
+                synth = { backend = "anthropic", id = "claude-opus-4-8", effort = "xhigh", max_tokens = 99 }
+                "#,
+            )
+            .expect("fixture config loads"),
+        );
+        let resolver = Resolver::from_config(config.clone()).expect("resolver builds");
+        let mut cast = config.resolve_cast("pinned").expect("cast exists").clone();
+        assert_eq!(
+            cast.require_slot(ModelRole::Synth)
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some("xhigh"),
+            "fixture pins an effort on the configured slot"
+        );
+
+        resolver
+            .override_model(&mut cast, ModelRole::Synth, "claude-sonnet-4-6", None)
+            .expect("a per-call model override applies");
+
+        let slot = cast.require_slot(ModelRole::Synth).unwrap();
+        assert_eq!(slot.id, "claude-sonnet-4-6");
+        assert_eq!(
+            slot.effort, None,
+            "the configured model's effort does not ride along to a different model"
+        );
+        assert_eq!(slot.max_tokens, None, "nor its other tunables");
+
+        let t = slot.tunables(ModelRole::Synth, &config.defaults);
+        assert_eq!(
+            t.effort,
+            crate::consult::DEFAULT_EFFORT,
+            "the override falls back to [defaults]"
+        );
+        assert!(
+            !t.effort_explicit,
+            "and inherits [defaults]' provenance, not the discarded slot's — nobody wrote \
+             an effort for THIS model, so nothing should be reported about it"
+        );
+
+        // The other half of the same fallback: a `[defaults]` effort DOES apply to an
+        // overridden model, provenance included, because it was written for every cast
+        // rather than for the id that got replaced.
+        let mut defaults = config.defaults.clone();
+        defaults.synth_effort = "low".into();
+        defaults.synth_effort_explicit = true;
+        let t = slot.tunables(ModelRole::Synth, &defaults);
+        assert_eq!(t.effort, "low");
+        assert!(t.effort_explicit);
     }
 }

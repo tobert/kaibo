@@ -288,6 +288,31 @@ impl Arm {
         // config opt-in. A no-op for every other kind.
         let params =
             super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
+        // Preflight the blob through rig's OWN request builder for this wire. Two of the
+        // six wires parse it into a typed struct whose reasoning rungs are a closed enum,
+        // so an effort rig can't name dies *inside rig* at call time with a bare serde
+        // line ("unknown variant `max`") that says nothing about which slot of which cast
+        // asked for it. Asking here — the single live construction point — turns that into
+        // a boundary error naming the slot and the rungs that wire does take. It stays a
+        // preflight, not a policy: the accepted list is read back out of rig, so a rig bump
+        // that adds a rung needs no kaibo change, and effort stays a passthrough string
+        // everywhere rig lets it be one.
+        let wire = super::shaping::EffortWire::resolve(backend.kind, responses_wire);
+        if let Err(detail) = super::shaping::preflight_params(wire, params.as_ref()) {
+            return Err(anyhow!(
+                "model {:?} (backend {:?}, {} slot): effort {:?} is refused by rig's {} \
+                 request builder before the request leaves kaibo. That ceiling is \
+                 rig-core's typed client, not the provider's API — this wire accepts {}. \
+                 Set the slot's `effort` (or `[defaults]`) to one of those, or point the \
+                 slot at a backend whose wire passes effort through. (rig: {detail})",
+                slot.id,
+                backend.name,
+                role.key(),
+                t.effort,
+                wire.label(),
+                super::shaping::accepted_efforts(wire).join(" | "),
+            ));
+        }
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -3417,6 +3442,88 @@ mod tests {
         assert!(
             arm.caps.vision,
             "the vision pin survives into the hosted arm"
+        );
+    }
+
+    /// An effort rig's typed request builder can't name fails **here**, at arm
+    /// construction, with a message an operator can act on — not mid-consult as a bare
+    /// `unknown variant \`max\``.
+    ///
+    /// Two wires parse kaibo's blob into a typed struct with a closed rung set (rig's
+    /// Gemini `ThinkingLevel`, its Responses `ReasoningEffort`), and that ceiling is
+    /// rig's client rather than the provider's API — OpenAI's own endpoint takes `"max"`.
+    /// kaibo keeps no allowlist of its own, so the refusal comes from asking rig's
+    /// converter, and the rungs it offers are read back out of rig too
+    /// (`tests/effort_wire.rs` pins both against real request bodies). What this test
+    /// owns is the *message*: the model, the backend, the role, the value that failed,
+    /// whose ceiling it is, and what to type instead.
+    #[test]
+    fn a_rig_refused_effort_fails_at_arm_construction_with_an_actionable_message() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "google".into(),
+            kind: ProviderKind::Gemini,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+            wire: None,
+        };
+        // `docs/config.example.toml` used to invite exactly this, and it broke every
+        // Gemini cast the moment a call was made.
+        let slot = ModelSlot {
+            effort: Some("xhigh".into()),
+            ..ModelSlot::bare("google", "gemini-3.5-flash")
+        };
+        let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect_err("rig's Gemini builder refuses xhigh")
+            .to_string();
+        assert!(err.contains("gemini-3.5-flash"), "names the model: {err}");
+        assert!(err.contains("google"), "names the backend: {err}");
+        assert!(err.contains("synth"), "names the role: {err}");
+        assert!(err.contains("xhigh"), "names the value that failed: {err}");
+        assert!(
+            err.contains("rig-core"),
+            "says whose ceiling this is, so the operator doesn't go hunting in \
+             Google's docs for a limit that isn't theirs: {err}"
+        );
+        assert!(
+            err.contains("minimal | low | medium | high"),
+            "offers the rungs this wire does take: {err}"
+        );
+
+        // A rung the wire accepts builds normally — the preflight adds no ceiling of
+        // its own, it only reports rig's.
+        let slot = ModelSlot {
+            effort: Some("low".into()),
+            ..ModelSlot::bare("google", "gemini-3.5-flash")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("an accepted rung builds offline with a placeholder key");
+        assert_eq!(
+            arm.params.expect("gemini sends a thinking block")["generationConfig"]
+                ["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+
+        // And a passthrough wire keeps passing anything through — the preflight must not
+        // quietly become a global allowlist.
+        let backend = crate::config::Backend {
+            name: "deepseek".into(),
+            kind: ProviderKind::DeepSeek,
+            ..backend
+        };
+        let slot = ModelSlot {
+            effort: Some("ludicrous".into()),
+            ..ModelSlot::bare("deepseek", "deepseek-v4-pro")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a passthrough wire carries an unknown rung to the provider");
+        assert_eq!(
+            arm.params.expect("deepseek sends a thinking block")["reasoning_effort"],
+            "ludicrous"
         );
     }
 

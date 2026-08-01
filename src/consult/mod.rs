@@ -41,7 +41,9 @@ pub use prompts::{
     ConsultAttachment, Phase, PromptOverrides,
 };
 pub use shaping::{
-    hosted_openai_accepts_reasoning, hosted_openai_accepts_sampling,
-    hosted_openai_responses_params, inject_provider_prefs, request_params, thinking_params,
-    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
+    accepted_efforts, effort_rank, effort_sinks, hosted_openai_accepts_reasoning,
+    hosted_openai_accepts_sampling, hosted_openai_responses_params, inject_provider_prefs,
+    is_effort_off, known_efforts, preflight_params, request_params, thinking_params, EffortWire,
+    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, EFFORT_LADDER, EFFORT_OFF,
+    THINKING_BUDGET,
 };
