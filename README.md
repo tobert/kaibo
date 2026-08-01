@@ -362,12 +362,14 @@ agents don't share history or generated artifacts. Codex commonly has a stricter
 sandbox default than Claude Code, so its setup may need explicit network and writable
 root entries where Claude Code just works.
 
-The prompt leans on two MCP resources kaibo serves, which you can also read directly:
+The prompt leans on MCP resources kaibo serves, which you can also read directly:
 
 - **`kaibo://config/example`** — the fully annotated `config.toml` template, every
   knob with its default and a comment, embedded in the binary.
 - **`kaibo://config`** — the *resolved* runtime state: which casts and backends are
   live, what's gated, where each key is sourced from.
+- **`kaibo://config/guide`** — the full configuration reference (`docs/config.md`),
+  also embedded, for when the template's comments leave a question open.
 
 Prompts and resources are plain MCP — any client that surfaces them can use them. If
 yours doesn't render `configure` as a command, or you're driving kaibo purely through

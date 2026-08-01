@@ -37,10 +37,14 @@ loop. Each consultation tool is that loop wearing different clothes:
 Both model-driven tools name their cast + answering model(s) in a provenance footer
 (`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
 
-Each tool is independently gated by a `--no-<tool>` flag (all on by default; the
-all-off server is refused at startup). Multi-provider over `rig-core`: a
-**`ProviderKind`** is the wire protocol (keyed Anthropic / DeepSeek / Gemini, plus
-**`openai`** for any OpenAI-compatible endpoint). A **`[backends.<name>]`**
+Seven `--no-<tool>` capability flags gate the surface (all on by default; `consult` also
+gates `consult_submit`, `batch` gates `batch_submit`, and the `job_*` verbs follow their
+live producers). A tool also needs a cast that can **staff** it, or its route is dropped;
+a server left with nothing advertised is refused at startup, by either road. See
+`CAST_ENUM_RULES` and `live_tools` in `server.rs`, and "Tool gating" in `docs/config.md`.
+Multi-provider over `rig-core`: a **`ProviderKind`** is the wire protocol (keyed
+Anthropic / DeepSeek / Gemini / OpenRouter, plus **`openai`** for any OpenAI-compatible
+endpoint). A **`[backends.<name>]`**
 (`config.rs`) is a *named connection* of a kind with its own base URL and key source —
 so two `openai` backends (hosted GPT and a local Gemma/llama.cpp server, say) can be
 live at once. A **`[casts.<name>]`** is a model team mapping each reasoning role
@@ -216,6 +220,20 @@ Two audiences are optimized differently:
   of thousands to millions of tokens. Here verbosity is *licensed where it shapes
   behavior*: say it a few ways, frame positively, be explicit (see **Driving the
   models**). Verbose to install behavior, never verbose by default.
+- **Operator-facing docs** — `docs/config.example.toml`, `docs/config.md`, `README.md`.
+  The first two are **embedded in the binary** (`include_str!`) and served as
+  `kaibo://config/example` and `kaibo://config/guide`, so a model reads them as often as
+  a person does. They are shipped product, not repo notes. Write them as **technical
+  reference**: state the rule, name the default, show the shape. Declarative sentences
+  over conversational asides; a table or labelled list over a paragraph that buries three
+  facts in a clause chain. No em-dash pile-ups, no rhetorical questions, no voice.
+  Someone skimming for one key should find it without reading the prose around it, and a
+  non-native English reader should not have to parse an idiom to get a default value.
+  Split the two by job: the **template** says what to type (a knob, its default, one line
+  on what it does, a pointer for the rest); the **guide** explains semantics and
+  interactions. Detail that isn't a knob belongs in the guide — the template is read
+  start to finish by whoever is configuring kaibo, so every line there is a line they pay
+  for.
 
 ## Driving the models
 
