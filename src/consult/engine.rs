@@ -1525,8 +1525,8 @@ mod tests {
 
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
-        has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
+        has_tool, is_finalize_turn, provider_error, reasoning_response, text_response,
+        tool_call_response, transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
     };
     use std::fs;
     use std::num::NonZeroUsize;
@@ -2952,6 +2952,213 @@ mod tests {
             finalize.transcript.contains("target_marker"),
             "finalize turn must replay the accumulated tool work, got transcript: {:?}",
             finalize.transcript
+        );
+    }
+
+    // --- the silent-empty-answer battery (GH: consult returns just the footer) -------
+    //
+    // Reported 2026-08-01: a `consult_submit` on cast `deepseek` burned 16,801 output
+    // tokens and returned an EMPTY answer body — just the provenance footer — while the
+    // same question on `or-kimi` returned a full cited review. The generation happened;
+    // nothing reached the caller. These four tests pin the shapes that produce an empty
+    // final answer with **no error**, which is the worst possible failure: the calling
+    // agent merges on a review that silently did not happen.
+    //
+    // All four are RED on purpose until the guard lands. The fix is *not* to make the
+    // loop invent text — it is to fail the call loudly with the diagnostics attached,
+    // exactly as the batch lane already does (`batch.rs::finish_gated_answer`, GH #75).
+
+    /// **The DeepSeek repro.** A reasoning-only terminal turn: `reasoning_content` with
+    /// an empty `content`. rig's deepseek converter drops the empty text block and emits
+    /// a choice holding only `AssistantContent::Reasoning`
+    /// (`rig-core/src/providers/deepseek.rs:400,:420`); rig sees no tool calls, so it
+    /// takes the clean-finish branch and extracts text with `assistant_text_from_choice`,
+    /// which filters to `Text` and yields `""`
+    /// (`rig-core/src/agent/prompt_request/mod.rs:569`, `:887`, `:918`). `run_phase`
+    /// passes that straight through (`engine.rs:862`), and every layer above — the
+    /// provenance footer, the job result — happily renders an empty answer.
+    ///
+    /// A consult that produced no answer must be an error naming what it burned, never a
+    /// successful empty.
+    #[tokio::test]
+    async fn a_reasoning_only_terminal_turn_fails_loudly_instead_of_answering_empty() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        let client = ScriptedClient::builder()
+            // Sweep once (so real work and real tokens are on the record), then "answer"
+            // with reasoning only — the exact wire shape that produced the empty body.
+            .on_model(SYNTH, |req| {
+                if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(with_usage(
+                        reasoning_response(
+                            "The review is complete. Now I will write it out... \
+                             (16,801 tokens of reasoning that never became content)",
+                        ),
+                        usage(1_164_958, 16_801),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .err()
+        .expect(
+            "a consult whose synth delivered no answer text must FAIL — a silent empty \
+             answer is a review the caller merges on that never happened",
+        );
+
+        let msg = format!("{err:#}");
+        // The diagnostics Amy asked to ride along: what was burned, and by whom.
+        assert!(
+            msg.contains("16801") || msg.contains("16,801"),
+            "the error must carry the output-token count so the caller can see the \
+             generation happened: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("empty") || msg.to_lowercase().contains("no answer"),
+            "the error must say the model returned no answer text: {msg}"
+        );
+    }
+
+    /// The same hole through the *other* door: a terminal turn whose text block is
+    /// present but empty. rig normalizes that to "no assistant output"
+    /// (`is_empty_assistant_turn`, `prompt_request/mod.rs:561`) and still returns
+    /// `Ok` with `output == ""` — rig's own
+    /// `prompt_request_stops_cleanly_on_empty_terminal_turn` test pins that as intended
+    /// upstream behavior. So kaibo cannot delegate this check to rig; the guard has to
+    /// live at `run_phase`'s `Ok` arm. A provider-independent shape: any model that
+    /// finishes with no text lands here.
+    #[tokio::test]
+    async fn an_empty_text_terminal_turn_fails_loudly_instead_of_answering_empty() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |_req| {
+                Ok(with_usage(text_response("   \n  "), usage(1000, 9000)))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let err = consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .err()
+        .expect("a whitespace-only answer is no answer — it must fail, not succeed empty");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no answer"),
+            "the error must name the empty answer: {msg}"
+        );
+    }
+
+    /// Amy's candidate 1, checked at the place it actually bites. `run_phase` *does*
+    /// recover from a turn cap — it runs a forced finalize turn
+    /// (`finalize_after_max_turns`, `engine.rs:901`) rather than returning the last
+    /// message blindly. But that turn's answer is extracted the same way
+    /// (`engine.rs:935`), so a finalize turn that produces only reasoning is *also* a
+    /// silent empty — and the turn-cap hit itself never reaches the caller (it's a
+    /// progress beat only, `engine.rs:812,:866`). Burning the whole budget and
+    /// delivering nothing must be loud, and must name the cap.
+    #[tokio::test]
+    async fn a_reasoning_only_finalize_turn_after_the_turn_cap_fails_loudly() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(with_usage(
+                        reasoning_response("still thinking about how to start..."),
+                        usage(500_000, 12_000),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t",
+                        "run_kaish",
+                        json!({ "script": "cat src/foo.rs" }),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            synth_max_turns: 2,
+            ..ConsultConfig::default()
+        };
+        let err = consult_with(
+            "a question the model never finishes answering",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .err()
+        .expect(
+            "spending the whole turn budget and then delivering no text must be an \
+             error, not an empty success",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains('2'),
+            "the error must name the turn cap that was hit: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("empty") || msg.to_lowercase().contains("no answer"),
+            "the error must name the empty answer: {msg}"
+        );
+    }
+
+    /// The fourth door, which the report shape hides: the **explorer** phase. The
+    /// top-level `explore` tool returns its report verbatim, so a reasoning-only
+    /// explorer turn ships a report body that is just the footer — same silent shape,
+    /// different tool. (Inside `consult` this lands as an empty `explore′` tool result,
+    /// which is arguably worse: the driver reasons on a blank sweep and never learns
+    /// the sweep failed.)
+    #[tokio::test]
+    async fn a_reasoning_only_explorer_report_fails_loudly_instead_of_reporting_empty() {
+        const EXPLORER: &str = "deepseek-v4-flash";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |_req| {
+                Ok(with_usage(
+                    reasoning_response("I have surveyed the repo and concluded..."),
+                    usage(200_000, 4_000),
+                ))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let err = explore_with(
+            "where does the cast live?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &ExploreConfig::default(),
+            &[],
+        )
+        .await
+        .err()
+        .expect("an explorer that reported nothing must fail, not return an empty report");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no answer") || msg.contains("no report"),
+            "the error must name the empty report: {msg}"
         );
     }
 
