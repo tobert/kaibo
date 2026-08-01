@@ -1,6 +1,6 @@
 <p align="center">
   <!-- Kaile, the kaibo mascot. Brand assets + generator live in docs/brand/. -->
-  <img src="docs/brand/banner-teal.png" alt="kaibo（解剖）" width="820">
+  <img src="docs/brand/banner-teal.png" alt="kaibo" width="820">
 </p>
 
 <p align="center">
@@ -362,12 +362,14 @@ agents don't share history or generated artifacts. Codex commonly has a stricter
 sandbox default than Claude Code, so its setup may need explicit network and writable
 root entries where Claude Code just works.
 
-The prompt leans on two MCP resources kaibo serves, which you can also read directly:
+The prompt leans on MCP resources kaibo serves, which you can also read directly:
 
 - **`kaibo://config/example`** — the fully annotated `config.toml` template, every
   knob with its default and a comment, embedded in the binary.
 - **`kaibo://config`** — the *resolved* runtime state: which casts and backends are
   live, what's gated, where each key is sourced from.
+- **`kaibo://config/guide`** — the full configuration reference (`docs/config.md`),
+  also embedded, for when the template's comments leave a question open.
 
 Prompts and resources are plain MCP — any client that surfaces them can use them. If
 yours doesn't render `configure` as a command, or you're driving kaibo purely through
@@ -654,10 +656,17 @@ work, and [`docs/devlog.md`](docs/devlog.md) for the shipped-work record.
 ## Name
 
 Originally @tobert was combining 'kai' (会) with different words to find a name for this
-tool. kai + [aibo](https://jisho.org/word/%E7%9B%B8%E6%A3%92) sounded nice to align with
+tool. kai + [aibo](https://jisho.org/word/%E7%9B%B8%E6%A3%92) — overlapping the shared
+`ai` — sounded nice to align with
 [gpal](https://github.com/tobert/gpal)/[dpal](https://github.com/tobert/dpal)/[cpal](https://github.com/tobert/cpal).
 It turns out kaibo ([解剖](https://jisho.org/word/%E8%A7%A3%E5%89%96)) means
 dissection, autopsy, or postmortem examination and that was that.
+
+That reading is a happy coincidence rather than the actual name, so it doesn't ride
+along with it: kaibo introduces itself as plain **kaibo** everywhere it speaks — the MCP
+handshake, `--help`, the docs. The kanji stays here, where it's the story being told,
+and in the brand wordmark, where it's deliberate lettering rather than a claim about
+what the tool is called.
 
 ## License
 

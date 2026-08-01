@@ -15,6 +15,17 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+
+- **New MCP resource: `kaibo://config/guide`** — the full configuration manual
+  (`docs/config.md`), embedded in the binary the way the annotated template already is.
+  An agent configuring kaibo over MCP has no access to kaibo's own `docs/`, so until now
+  every explanation had to be smuggled into `config.toml`'s comments, where it cost bytes
+  on every read. The three config resources now split by job: `kaibo://config/example` is
+  the template you copy, `kaibo://config` is the resolved live state, and
+  `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
+  all three.
+
 ### Changed
 
 - **Batch treats `effort` as a floor, not an override.** Every other batch knob
@@ -31,6 +42,55 @@ record. Each later release appends a new section at the top.
   stays off, instead of being lifted to `high` and billing thinking on every item. That
   matters most exactly where batch is cheapest: bulk extraction and classification over
   many prompts.
+
+
+- **kaibo no longer advertises a tool no configured cast can run.** A tool now has to
+  clear two gates to appear: its `--no-<tool>` flag, and a cast that can actually staff
+  it. The visible effect on a stock install is `deliberate`, which was advertised but
+  dead on arrival — it needs an explorer paired with an offline synth, and no built-in
+  cast has that shape, so every call failed `cast "…" has no explorer slot` while the
+  tool still cost resident tokens in every session. It now stays hidden until you
+  configure a cast that can run it (`docs/config.example.toml`'s DELIBERATE section,
+  where any of the three hosted batch providers or a big local model on the `direct`
+  lane will do). The same rule covers `explore`, `batch_submit`, `consult`/`oneshot`,
+  and the job-collect verbs, which follow whichever handle producers are live.
+
+  Because vanishing is right for the calling agent and wrong for the operator, kaibo
+  says so twice: a startup warning naming the cast *shape* that would bring each tool
+  back, and a `[runtime]` entry in `kaibo://config` — `advertised_tools` for what the
+  server really serves, `unstaffable_tools` for each tool held back plus what it wants.
+  A tool you turned off yourself is reported in `[tools]` as before and never appears
+  as unstaffable — "you disabled it" and "nothing can run it" are different answers and
+  are kept apart.
+
+- **kaibo refuses to start when nothing is left to advertise.** It already refused a
+  server with every tool switched off; staffing opened a second road to the same useless
+  state (every cast-taking tool enabled but unstaffable, with `run_kaish` and
+  `list_models` disabled), which would previously have started and served an empty tool
+  list in silence. That now exits non-zero naming the cause, alongside the per-tool
+  warnings that say what each tool wanted.
+
+
+- **`docs/config.example.toml` is leaner, and `docs/config.md` reads as a reference
+  manual.** The template had been accumulating explanation that belongs in the manual —
+  a whole hand-copied table of the staffing rules above, for instance, which the running
+  server already reports for your actual config. That detail moved to the guide's new
+  "Tool gating" section and the template points at it, so the file you read while editing
+  your config is mostly the knobs you're editing. The guide itself was rewritten in
+  technical-reference style throughout: settings in tables with their defaults and
+  constraints, rules stated plainly, and the design-history essay dropped in favour of
+  `docs/casts.md`, which is the design record. No behavior changed and no rule was
+  dropped.
+
+- **`docs/config.example.toml` documents four knobs it had been missing** —
+  `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`. The
+  resource description promised "every option with its default"; now that is true.
+- **The tool is plain "kaibo" now.** The 解剖 kanji no longer rides along with the
+  name in the MCP handshake, the CLI `--help` banner, the example config, or the
+  docs — that reading is a coincidence of how the name was built (kai + aibo), not
+  the name itself, and repeating it everywhere implied otherwise. The README's
+  `## Name` section keeps the story and is now the one place it appears. No
+  behavior, flags, or tool names changed.
 
 ### Fixed
 
@@ -78,6 +138,29 @@ record. Each later release appends a new section at the top.
   both (it used to be flagged in the resource and stay silent at startup), and the
   warning says *which* thing happened — dropped by a wire with no reasoning parameter,
   or raised to the batch floor — since those want different fixes.
+
+
+- **Corrected several configuration-manual claims that did not match the code.** Found by
+  pointing kaibo's own `consult` at the rewrite (cast `or-gpt`, GPT-5.6 luna in both
+  roles) and verifying each finding against the source. The ones that would have misled
+  someone configuring kaibo:
+
+  - A synth slot's `preamble` **does** reach the offline `batch` and `deliberate` phases.
+    The manual said it did not. It is load-bearing that it does: on a batch or deliberate
+    cast the synth slot *is* the offline synth, so the opposite rule would make a slot
+    preamble do nothing on exactly the casts built for that lane.
+  - `explore` accepts a cast whose synth is on an offline lane — it runs only the
+    explorer arm. The lane rules had been generalized to "the interactive tools".
+  - A missing or broken key file, and a missing `[context] user_files` entry, are
+    **call-time** errors, not startup errors. Keys and context files both resolve lazily.
+  - Hosted OpenAI `gpt-5*` models **do** consume `effort` (as `reasoning.effort` on the
+    Responses shape). Only generic/local Chat Completions endpoints ignore it.
+  - `[context]` house rules and the `[orientation]` map reach standalone `explore` and
+    `deliberate`'s dossier explorer too, not only the `consult` driver and its sweep.
+  - The state db stores the caller's **questions** alongside the models' answers.
+  - In `kaibo://config`, `tools` is the configured flags; `runtime.advertised_tools` is
+    what the server actually serves. The distinction is new in this release, so the
+    manual now points at the right one.
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
   The state db's default path (`~/.local/state/kaibo/state.db`) can land inside

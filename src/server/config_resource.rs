@@ -33,6 +33,28 @@ pub(crate) fn render_config_resource(
     use serde::Serialize;
     use std::collections::BTreeMap;
 
+    // Which cast-taking tools nothing can staff right now, and the cast shape each one
+    // wants. Computed through the same `eligible_casts_by_tool` the router gated on, so
+    // the explanation can't drift from the decision. A tool the OPERATOR turned off is
+    // deliberately absent here — `[tools]` already reports that, and conflating "you
+    // disabled it" with "nothing can run it" is exactly the confusion this section exists
+    // to remove.
+    let usable: Vec<String> = config
+        .usable_casts(|k| std::env::var(k).ok())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let unstaffable: BTreeMap<String, String> = super::eligible_casts_by_tool(config, &usable)
+        .into_iter()
+        .filter(|(tool, casts)| casts.is_empty() && config.tools.enabled(tool))
+        .map(|(tool, _)| {
+            let requirement = super::cast_requirement_for(tool)
+                .expect("a tool in the eligibility map has a rule")
+                .to_string();
+            (tool.to_string(), requirement)
+        })
+        .collect();
+
     // Dedicated render-only shapes — plain Serialize structs that carry exactly what
     // the resource must expose and nothing more. Keeps the contract explicit.
 
@@ -97,10 +119,22 @@ pub(crate) fn render_config_resource(
     /// `allowed_paths` right now — git worktrees of an already-allowed repo,
     /// resolved by reading git's link files. Recomputed on each read, so a worktree
     /// added mid-session shows up here without a reconnect.
+    ///
+    /// `advertised_tools` and `unstaffable_tools` are the observed answer to "why can't I
+    /// see that tool?" — the question the staffing gate would otherwise leave an operator
+    /// guessing at, since a tool no configured cast can staff is removed from the router
+    /// outright rather than shipped with an empty `cast` enum. `[tools]` above says what
+    /// the operator *asked for* (the `--no-<tool>` flags); these say what the server
+    /// actually ended up advertising and, for each tool held back by its cast roster
+    /// rather than by a flag, the cast shape that would bring it back. Keeping the two
+    /// apart is the same `[runtime]` rule the worktree fields follow: what kaibo
+    /// *discovered*, never what the operator *chose*.
     #[derive(Serialize)]
     struct RuntimeDoc {
         follow_worktrees: bool,
         followed_worktrees: Vec<String>,
+        advertised_tools: Vec<String>,
+        unstaffable_tools: BTreeMap<String, String>,
     }
 
     #[derive(Serialize)]
@@ -472,6 +506,11 @@ pub(crate) fn render_config_resource(
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            advertised_tools: super::live_tools(config, &usable)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            unstaffable_tools: unstaffable,
         },
         tools: ToolsDoc {
             consult,
@@ -580,6 +619,70 @@ mod tests {
         assert!(
             body.contains("/tmp/the-repo-feature"),
             "runtime section must list the followed worktree:\n{body}"
+        );
+    }
+
+    /// The body of TOML section `header` — up to the next `[` at column 0. A
+    /// `BTreeMap` field renders as its own nested table (`[runtime.unstaffable_tools]`)
+    /// rather than inline, so a test that wants one has to ask for it by name.
+    fn section<'a>(body: &'a str, header: &str) -> &'a str {
+        body.split(&format!("\n{header}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no `{header}` section in:\n{body}"))
+            .split("\n[")
+            .next()
+            .expect("the section's own body")
+    }
+
+    /// `[runtime]` answers "why can't I see that tool?" for the case an operator cannot
+    /// otherwise diagnose: the tool is gone because nothing can staff it, not because
+    /// they turned it off. On the built-in config that's `deliberate` — no built-in cast
+    /// pairs an explorer with an offline synth — so it must be absent from
+    /// `advertised_tools` AND named in `[runtime.unstaffable_tools]` with the cast shape
+    /// that would fix it. Without both halves the tool just vanishes, which is the
+    /// confusing failure this reporting exists to prevent.
+    #[test]
+    fn config_resource_runtime_explains_a_tool_no_cast_can_staff() {
+        let body = render_config_resource(&Config::builtin(), &[], None, false, vec![], false);
+        let runtime = section(&body, "[runtime]");
+        assert!(
+            !runtime.contains("\"deliberate\""),
+            "deliberate can't be staffed by any built-in cast, so it must not appear in \
+             advertised_tools:\n{runtime}"
+        );
+        // A targeted drop, not a shutdown — the staffable surface is still advertised.
+        assert!(
+            runtime.contains("\"consult\"") && runtime.contains("\"run_kaish\""),
+            "advertised_tools must list the surviving surface:\n{runtime}"
+        );
+
+        let unstaffable = section(&body, "[runtime.unstaffable_tools]");
+        assert!(
+            unstaffable.contains("deliberate = "),
+            "unstaffable_tools must name deliberate:\n{unstaffable}"
+        );
+        assert!(
+            unstaffable.to_lowercase().contains("offline synth"),
+            "the entry must say what shape of cast would bring the tool back, not just \
+             that it is missing:\n{unstaffable}"
+        );
+    }
+
+    /// The other half: a tool the OPERATOR disabled is not reported as unstaffable.
+    /// Conflating "you switched it off" with "nothing can run it" would send an operator
+    /// hunting for a cast to fix a flag they set themselves.
+    #[test]
+    fn config_resource_does_not_blame_casts_for_an_operator_disabled_tool() {
+        let mut config = Config::builtin();
+        config.tools.deliberate = false;
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        assert!(
+            !section(&body, "[runtime.unstaffable_tools]").contains("deliberate"),
+            "a flag-disabled tool belongs to [tools], not unstaffable_tools:\n{body}"
+        );
+        assert!(
+            section(&body, "[tools]").contains("deliberate = false"),
+            "[tools] must still report the operator's own choice:\n{body}"
         );
     }
 

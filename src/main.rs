@@ -1,4 +1,4 @@
-//! kaibo (解剖) — read-only codebase consultation, as a stdio MCP server and a CLI.
+//! kaibo — read-only codebase consultation, as a stdio MCP server and a CLI.
 //!
 //! Bare `kaibo` (and `kaibo serve`) is the MCP server: ask `consult` a question about
 //! a codebase; kaibo explores it read-only through kaish and returns a cited answer.
@@ -185,6 +185,23 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     let persistence = config.persistence.clone();
     let session_capacity = config.defaults.session_capacity;
     let handler = KaiboHandler::new(config)?.with_notifications(notifications);
+
+    // The other road to a zero-tool server. `all_disabled()` above catches the operator
+    // switching everything off, but it runs before the handler exists and reads only the
+    // `--no-<tool>` flags — so it cannot see the second way the surface empties out: every
+    // cast-taking tool left ON but unstaffable, with `run_kaish` and `list_models` (the two
+    // tools no cast can affect) disabled. That server starts, advertises nothing, and is
+    // exactly as useless as the state we already refuse, so refuse it the same way and for
+    // the same reason: crashing beats running silently useless. The per-tool warnings above
+    // have already named what each tool wanted; this says the surface came out empty.
+    anyhow::ensure!(
+        !handler.advertised_tools().is_empty(),
+        "no tools left to advertise — every tool is either disabled by a --no-<tool> flag \
+         or has no configured cast that can staff it (the warnings above name what each one \
+         needs). Fix by configuring a cast with a working provider key, or by re-enabling a \
+         tool that needs no cast at all (`run_kaish`, `list_models`). `kaibo config` shows \
+         the resolved casts and the per-tool verdict."
+    );
 
     // Stand up the durable session/batch store when persistence is enabled. Opening it is
     // fallible (a bad path, a locked db, a network mount). A failure is a LOUD startup error
