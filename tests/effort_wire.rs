@@ -40,8 +40,8 @@ use rig_core::OneOrMany;
 use serde_json::Value;
 
 use kaibo::consult::{
-    accepted_efforts, hosted_openai_responses_params, preflight_params, EffortWire, ModelShape,
-    ThinkingStyleOverride, EFFORT_LADDER,
+    accepted_efforts, hosted_openai_responses_params, known_efforts, preflight_params, EffortWire,
+    ModelShape, ThinkingStyleOverride,
 };
 use kaibo::credentials::ProviderKind;
 
@@ -283,7 +283,7 @@ async fn on_the_wire(path: Path, effort: &str) -> Result<Option<Value>, String> 
 }
 
 /// A rung kaibo will never find on any ladder — an operator's typo, or a provider name
-/// newer than [`EFFORT_LADDER`]. Both look the same from here, and both must behave the
+/// newer than kaibo's ladder. Both look the same from here, and both must behave the
 /// same: passed through where the wire is passthrough, refused where rig is typed.
 const UNRANKED: &str = "ludicrous";
 
@@ -296,7 +296,7 @@ const UNRANKED: &str = "ludicrous";
 async fn rig_effort_ladders_are_pinned() {
     for path in Path::ALL {
         let mut accepted = Vec::new();
-        for rung in EFFORT_LADDER {
+        for rung in known_efforts() {
             if on_the_wire(path, rung).await.is_ok() {
                 accepted.push(rung);
             }
@@ -312,7 +312,7 @@ async fn rig_effort_ladders_are_pinned() {
             }
             // `#[serde(flatten)]` all the way down: kaibo can express anything and the
             // provider is the one that answers for it.
-            EffortWire::Passthrough => EFFORT_LADDER.to_vec(),
+            EffortWire::Passthrough => known_efforts(),
         };
         assert_eq!(
             accepted, expected,
@@ -340,7 +340,7 @@ async fn rig_effort_ladders_are_pinned() {
 #[tokio::test]
 async fn kaibo_preflight_agrees_with_rig() {
     for path in Path::ALL {
-        for rung in EFFORT_LADDER.iter().copied().chain([UNRANKED]) {
+        for rung in known_efforts().into_iter().chain([UNRANKED]) {
             let rig_accepts = on_the_wire(path, rung).await.is_ok();
             let kaibo_accepts = preflight_params(path.wire(), path.shaped(rung).as_ref()).is_ok();
             assert_eq!(
@@ -359,7 +359,7 @@ async fn kaibo_preflight_agrees_with_rig() {
 async fn the_error_message_lists_what_the_wire_really_takes() {
     for path in Path::ALL {
         let mut actual = Vec::new();
-        for rung in EFFORT_LADDER {
+        for rung in known_efforts() {
             if on_the_wire(path, rung).await.is_ok() {
                 actual.push(rung);
             }

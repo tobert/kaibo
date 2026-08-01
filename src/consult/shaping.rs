@@ -25,27 +25,58 @@ pub const THINKING_BUDGET: u64 = 8192;
 /// itself rather than restating it here.
 pub const DEFAULT_EFFORT: &str = "high";
 
-/// The reasoning rungs kaibo knows how to *order*, shallow → deep. Used for exactly
-/// one thing: comparing two efforts when a lane needs a floor (`batch.rs`). It is a
-/// ranking, never a gate — an effort outside this list is still shaped and sent, and
-/// a comparison against it simply defers to the operator's value.
-pub const EFFORT_LADDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// The reasoning **depths** kaibo knows how to order, shallow → deep. Used for exactly
+/// one thing: comparing two efforts when a lane needs a floor
+/// ([`batch_effort`](crate::batch::batch_effort)). It is a ranking, never a gate — an
+/// effort outside this list is still shaped and sent, and a comparison against it simply
+/// defers to the operator's value.
+///
+/// **[`EFFORT_OFF`] is deliberately not on this ladder.** "Off" is not the shallowest
+/// depth; it is a different kind of answer. Ranking it as rung 0 let a *depth* floor
+/// silently switch reasoning back **on** — see [`EFFORT_OFF`] and [`is_effort_off`],
+/// which are the other half of this pair. Anything that ranks an effort has to decide
+/// what it does about the off-switch first.
+pub const EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// Where `effort` sits on [`EFFORT_LADDER`], or `None` for a rung kaibo can't order
-/// (a provider's new name, an operator's typo — both look the same from here, and
-/// both mean "don't second-guess it"). Case- and whitespace-insensitive.
+/// The reasoning **opt-out** — a sentinel beside [`EFFORT_LADDER`], not a rung on it.
+///
+/// Two providers ship a structural off-switch (DeepSeek's `thinking:{"type":"disabled"}`,
+/// OpenRouter's `reasoning:{"enabled":false}`) and both mishandle a "zero effort" string
+/// riding beside an explicit enable — DeepSeek bills 160–253 reasoning tokens for exactly
+/// that pairing (probed 2026-08-01). So `none` is answered by *shape*, not by value:
+/// [`ModelShape::to_params`] routes it through [`is_effort_off`].
+///
+/// Keeping it off the ladder is the same distinction one level up. A floor that raises
+/// *depth* (batch) must leave an operator's "off" alone, because turning reasoning back
+/// on isn't "more depth" — it's ignoring the setting, and billing them for it.
+pub const EFFORT_OFF: &str = "none";
+
+/// Where `effort` sits on [`EFFORT_LADDER`], or `None` for anything that isn't an
+/// orderable depth: [`EFFORT_OFF`] (ask [`is_effort_off`] instead — off is not a depth),
+/// a provider's newer rung, or an operator's typo. The last two look identical from here
+/// and both mean "don't second-guess it". Case- and whitespace-insensitive.
 pub fn effort_rank(effort: &str) -> Option<usize> {
     let e = effort.trim().to_ascii_lowercase();
     EFFORT_LADDER.iter().position(|rung| *rung == e)
 }
 
-/// Is this effort the reasoning **opt-out**? The bottom rung is special on the providers
-/// that ship a structural off-switch: DeepSeek and OpenRouter both have one, and both
-/// ignore (or bill) a "zero effort" string that rides beside an explicit enable. Asking
-/// here rather than at each call site keeps the two branches from drifting, and keeps
-/// `"None"` from quietly meaning "on".
-fn is_effort_off(effort: &str) -> bool {
-    effort.trim().eq_ignore_ascii_case("none")
+/// Is this effort the reasoning opt-out ([`EFFORT_OFF`])? The counterpart to
+/// [`effort_rank`]: that one orders depths and returns `None` here; this one answers the
+/// question ranking can't. **Public because the batch lane must ask it** — a depth floor
+/// consulting only the ladder would see `none` as unrankable, and an earlier version that
+/// ranked it as rung 0 lifted it to `BATCH_EFFORT`, quietly billing reasoning on every
+/// item of a fan-out the operator had switched off.
+///
+/// Case- and whitespace-insensitive, so `"None"` can never quietly mean "on".
+pub fn is_effort_off(effort: &str) -> bool {
+    effort.trim().eq_ignore_ascii_case(EFFORT_OFF)
+}
+
+/// Every effort spelling kaibo knows by name — the off-switch, then the depth ladder.
+/// For *probing* and *presenting* ("what does this wire accept?"), never for gating: an
+/// effort absent from this list is still shaped and sent.
+pub fn known_efforts() -> Vec<&'static str> {
+    std::iter::once(EFFORT_OFF).chain(EFFORT_LADDER).collect()
 }
 
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
@@ -620,17 +651,16 @@ pub fn preflight_params(
     }
 }
 
-/// The effort rungs `wire` accepts today, read back out of rig by probing each rung of
-/// [`EFFORT_LADDER`] through [`preflight_params`]. Derived, never declared — so the list
+/// The effort values `wire` accepts today, read back out of rig by probing each of
+/// [`known_efforts`] through [`preflight_params`]. Derived, never declared — so the list
 /// an error message shows an operator is rig's current truth even after a rig bump, and
 /// kaibo never grows a second ladder to drift from it.
 pub fn accepted_efforts(wire: EffortWire) -> Vec<&'static str> {
     if wire == EffortWire::Passthrough {
-        return EFFORT_LADDER.to_vec();
+        return known_efforts();
     }
-    EFFORT_LADDER
-        .iter()
-        .copied()
+    known_efforts()
+        .into_iter()
         .filter(|rung| {
             let probe = match wire {
                 EffortWire::Gemini => {

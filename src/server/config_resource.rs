@@ -248,12 +248,12 @@ pub(crate) fn render_config_resource(
         /// an Anthropic slot drops under thinking: each load-validates and would otherwise
         /// render as if effective. Absent when every knob in play has a sink.
         ///
-        /// `effort` is judged on the **effective** value, not just a per-slot override:
-        /// a `[defaults]`/env effort lands on every cast, so a lane-blind per-slot-only
-        /// check missed the case that bites hardest. The shape is resolved through
-        /// [`Config::slot_effort_sinks`](crate::config::Config::slot_effort_sinks) — the
-        /// same fallbacks `slot.tunables` uses, lane included — so the render can't
-        /// disagree with the wire.
+        /// `effort` is judged on the **effective** value, not just a per-slot override —
+        /// a `[defaults]`/env effort lands on every cast, so a per-slot-only check missed
+        /// the case that bites hardest — and it is judged by
+        /// [`Config::effort_disposition`](crate::config::Config::effort_disposition), the
+        /// single implementation of that policy, which the startup warning reads too.
+        /// Two copies of this rule diverged once already; there is now only one.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         inert_tunables: Vec<&'static str>,
     }
@@ -360,16 +360,14 @@ pub(crate) fn render_config_resource(
                         backend.uses_responses_wire()
                     };
                     let mut inert_tunables = Vec::new();
-                    let effort_sinks = crate::consult::effort_sinks(
-                        backend.kind,
-                        &slot.id,
-                        t.thinking_style,
-                        responses_wire,
-                    );
-                    // Batch floors the effort, so a rung at or below `BATCH_EFFORT` is
-                    // lifted and the configured value never ships as written.
-                    let effort_lands = effort_sinks
-                        && (!batch_lane || crate::batch::batch_effort(&t.effort) == t.effort);
+                    // Whether the effort ships is a policy with exactly one implementation
+                    // — `Config::effort_disposition`. The render asks it rather than
+                    // re-deriving (drop? batch lift? off-switch?), which is what keeps this
+                    // and the startup warning from ever telling an operator different
+                    // stories about the same slot.
+                    let disposition = config
+                        .effort_disposition(slot, *role)
+                        .expect("a loaded cast's slot backend resolves");
                     // Batch hands the provider no sampling at all (`None`/`None`), so a
                     // `temperature` on a batch slot is inert regardless of the model.
                     let sampling_sinks = if batch_lane {
@@ -386,7 +384,7 @@ pub(crate) fn render_config_resource(
                     // `[defaults]`/env effort lands on every cast, and one that lands
                     // nowhere deserves the same flag. Inherited built-in defaults stay
                     // quiet — see `Defaults::explorer_effort_explicit`.
-                    if t.effort_explicit && !effort_lands {
+                    if disposition.explicit && !disposition.ships_as_configured() {
                         inert_tunables.push("effort");
                     }
                     if temperature.is_some() && !sampling_sinks {
@@ -758,6 +756,95 @@ mod tests {
             "a batch slot deeper than the floor keeps its effort: {:?}",
             inert("bat_deep", "synth")
         );
+    }
+
+    /// The startup warning and the `kaibo://config` render must give the same verdict on
+    /// the same slot. They are two audiences for one policy, and when they were two
+    /// implementations they diverged inside a single commit: the render already knew a
+    /// batch-lane lift meant the configured value never runs, while the startup scan only
+    /// asked "does this wire have a reasoning field?" and stayed silent — so an operator
+    /// who set `effort = "low"` on a batch slot saw it flagged in the resource and never
+    /// heard a word at startup.
+    ///
+    /// Asserting *agreement* rather than either verdict is deliberate: it fails for any
+    /// future divergence, not just this one. `Config::effort_disposition` is the single
+    /// implementation both now read.
+    #[test]
+    fn the_startup_scan_and_the_config_render_agree_slot_for_slot() {
+        let config = Config::from_toml_str(
+            r#"
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            # The case that diverged: an effort-carrying wire, but the batch depth floor
+            # lifts this shallower value, so `low` never runs.
+            [casts.bat_low]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low" }
+
+            # Deeper than the floor: ships as written, nobody should complain.
+            [casts.bat_deep]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "xhigh" }
+
+            # Reasoning off on the batch lane: a depth floor must not raise it, so it
+            # ships as configured and is NOT a diagnostic.
+            [casts.bat_off]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "none" }
+
+            # No reasoning field at all — the drop.
+            [casts.lab_cast]
+            synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+
+            # Carries it fine.
+            [casts.ds]
+            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let render_flags = |cast: &str, role: &str| -> bool {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().any(|v| v.as_str() == Some("effort")))
+                .unwrap_or(false)
+        };
+        let warned: std::collections::BTreeSet<(String, &str)> = config
+            .effort_diagnostics()
+            .into_iter()
+            .map(|d| (d.cast, d.role))
+            .collect();
+
+        for cast in ["bat_low", "bat_deep", "bat_off", "lab_cast", "ds"] {
+            assert_eq!(
+                warned.contains(&(cast.to_string(), "synth")),
+                render_flags(cast, "synth"),
+                "cast {cast}: the startup scan and the kaibo://config render disagree \
+                 about whether this slot's effort ships"
+            );
+        }
+
+        // And the verdicts themselves, so "they agree" can't be satisfied by both being
+        // wrong in the same direction.
+        assert!(
+            render_flags("bat_low", "synth"),
+            "a lifted effort is flagged"
+        );
+        assert!(
+            render_flags("lab_cast", "synth"),
+            "a dropped effort is flagged"
+        );
+        assert!(!render_flags("bat_deep", "synth"), "a deeper effort ships");
+        assert!(
+            !render_flags("bat_off", "synth"),
+            "the off-switch survives a depth floor, so it ships as configured"
+        );
+        assert!(!render_flags("ds", "synth"), "deepseek carries the effort");
     }
 
     /// `kaibo://config` renders each openai-kind backend's *resolved* wire — the

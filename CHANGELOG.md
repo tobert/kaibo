@@ -26,6 +26,12 @@ record. Each later release appends a new section at the top.
   spends), and a rung kaibo doesn't recognize passes through untouched rather than
   being replaced.
 
+- **`effort = "none"` survives the batch lane.** The floor raises reasoning *depth*,
+  and "off" isn't a depth — so a `batch_submit` fan-out you turned reasoning off for
+  stays off, instead of being lifted to `high` and billing thinking on every item. That
+  matters most exactly where batch is cheapest: bulk extraction and classification over
+  many prompts.
+
 ### Fixed
 
 - **A reasoning `effort` your provider client can't accept now fails with a message
@@ -66,6 +72,12 @@ record. Each later release appends a new section at the top.
   `thinking_budget` was live), ignored `[defaults]`-sourced effort entirely, and was
   blind to `lane = "batch"` — rendering a batch slot's `effort` and `temperature` as
   effective when batch sends no sampling at all and floors the effort.
+
+- **The startup warning and `kaibo://config` can no longer disagree about an effort.**
+  They answer from one shared rule now, so a value the batch lane lifts is reported by
+  both (it used to be flagged in the resource and stay silent at startup), and the
+  warning says *which* thing happened — dropped by a wire with no reasoning parameter,
+  or raised to the batch floor — since those want different fixes.
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
   The state db's default path (`~/.local/state/kaibo/state.db`) can land inside

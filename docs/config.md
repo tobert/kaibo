@@ -238,7 +238,7 @@ The `[defaults]` knobs themselves:
   | provider | rungs |
   | --- | --- |
   | Gemini | `minimal` `low` `medium` `high` — Google's own schema rejects `none`/`xhigh`/`max`. `minimal` is the off-switch, itself model-dependent (`gemini-3.5-flash` takes it, `gemini-pro-latest` refuses it). |
-  | DeepSeek | all seven (`none` … `max`), strictly validated. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway. |
+  | DeepSeek | all seven (`none` … `max`), strictly validated. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
   | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
   | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
   | Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. |
@@ -251,6 +251,13 @@ The `[defaults]` knobs themselves:
   backend and the rungs that wire *does* take, rather than letting a bare
   ``unknown variant `max` `` surface mid-consult. That list is read back out of rig, so
   a rig upgrade widens it with no kaibo change.
+
+  **`"none"` is an off-switch, not the shallowest rung.** kaibo treats it as a sentinel
+  beside the ladder rather than a depth: where a provider ships a structural disable
+  (DeepSeek, OpenRouter) the request carries that rather than a zero-effort string, and
+  the batch lane's depth *floor* leaves it alone — a cheap bulk fan-out you turned
+  reasoning off for stays off instead of being lifted to `high` and billing thinking on
+  every item.
 
   **An effort with nowhere to land is said out loud.** Budget-tier Anthropic and the
   generic OpenAI `/chat/completions` wire (every local llama.cpp / Ollama / gateway

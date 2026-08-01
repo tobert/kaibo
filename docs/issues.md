@@ -645,7 +645,7 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
   for OpenAI-compatible reasoners, OpenRouter's unified `reasoning` param when the
   backend is OpenRouter — landing with the first-class OpenRouter work. No longer
   *silent*, at least: an `effort` the operator wrote onto this wire is now a startup
-  warning plus an `inert_tunables` entry (`Config::inert_efforts`), and
+  warning plus an `inert_tunables` entry (`Config::effort_diagnostics`), and
   `tests/effort_wire.rs` pins the drop against a real serialized request body. Audible
   is not fixed — reasoning is still off on that wire.
 - **`thinking_style` is missing from the `inert_tunables` render** (GLM review,

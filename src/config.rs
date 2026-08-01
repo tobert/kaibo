@@ -80,7 +80,7 @@ pub struct Defaults {
     /// *every* local cast inherits `high` onto one of them. Warning about the inherited
     /// default would fire on every ordinary local setup; warning about a value the
     /// operator typed is the signal they actually asked for. See
-    /// [`Config::inert_efforts`].
+    /// [`Config::effort_diagnostics`].
     pub explorer_effort_explicit: bool,
     pub synth_effort_explicit: bool,
     /// Force the Anthropic thinking style (`auto`/`adaptive`/`budget`) instead of the
@@ -385,16 +385,72 @@ impl EffortSource {
     }
 }
 
-/// One configured slot whose written `effort` has no sink on its wire — see
-/// [`Config::inert_efforts`].
+/// Why a slot's configured `effort` does or doesn't ship as written. The "why" half of
+/// [`EffortDisposition`] — every outcome kaibo's effort plumbing can produce, named, so a
+/// caller explains the same thing everywhere.
+// `Ord` so a caller can group diagnostics by fate deterministically (see the startup
+// warning in `server::resolver`); the order itself carries no meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EffortFate {
+    /// Ships exactly as configured: an orderable depth this wire carries.
+    Sent,
+    /// Ships as configured, and it is the reasoning **off-switch**
+    /// ([`crate::consult::EFFORT_OFF`]) — the request structurally disables thinking.
+    /// Called out separately because "off" is not a depth: the batch depth floor
+    /// deliberately leaves it alone, and a reader who sees `none` shipped should know
+    /// that was a decision rather than an oversight.
+    SentAsOff,
+    /// Ships as configured, but kaibo can't rank it — a rung newer than
+    /// [`crate::consult::EFFORT_LADDER`], or a typo. Passed through on purpose (kaibo
+    /// keeps no allowlist); the provider is the one that answers for it.
+    SentUnranked,
+    /// The batch lane floored a shallower depth up to
+    /// [`crate::batch::BATCH_EFFORT`], so the configured value is not what runs.
+    LiftedToBatchFloor,
+    /// This wire has no reasoning field at all, so the value is dropped before the
+    /// request is built and nothing downstream fails.
+    NoSink,
+}
+
+/// What actually happens to one slot's `effort`: what the operator wrote, what the
+/// request carries, and why those differ. Produced by
+/// [`Config::effort_disposition`](Config::effort_disposition) — the single implementation
+/// of that policy, shared by the `kaibo://config` render and the startup scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InertEffort {
+pub struct EffortDisposition {
+    /// The effective value after the slot → `[defaults]` fallback.
+    pub configured: String,
+    /// What the request actually carries — `None` when this wire sends no effort at all.
+    pub sent: Option<String>,
+    pub fate: EffortFate,
+    /// Did a human write this, or is it the inherited built-in
+    /// [`crate::consult::DEFAULT_EFFORT`]? See [`Defaults::explorer_effort_explicit`].
+    pub explicit: bool,
+    /// Where they wrote it. Meaningful only when `explicit`.
+    pub source: EffortSource,
+}
+
+impl EffortDisposition {
+    /// Does the configured value reach the provider as written? False exactly when the
+    /// knob reads as effective and isn't — the condition both the `inert_tunables` render
+    /// and the startup warning key on, so they cannot disagree.
+    pub fn ships_as_configured(&self) -> bool {
+        matches!(
+            self.fate,
+            EffortFate::Sent | EffortFate::SentAsOff | EffortFate::SentUnranked
+        )
+    }
+}
+
+/// One configured slot whose *written* `effort` doesn't ship as written — see
+/// [`Config::effort_diagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortDiagnostic {
     pub cast: String,
     pub role: &'static str,
     /// The slot's `"backend/model-id"` ref, so the message names both halves.
     pub model: String,
-    pub effort: String,
-    pub source: EffortSource,
+    pub disposition: EffortDisposition,
 }
 
 /// A slot's effective request-shaping knobs after the per-role fallback (see
@@ -1135,66 +1191,103 @@ impl Config {
         Ok(ModelCaps::resolve(backend.kind, &slot.id, slot.vision))
     }
 
-    /// Does this slot's `effort` reach the wire? The one answer the render, the startup
-    /// scan, and (through [`crate::consult::effort_sinks`]) the arm all read — resolving
-    /// the shape exactly as [`ModelSlot::tunables`] does, `[defaults].thinking_style`
-    /// fallback included, so display can't disagree with what actually ships.
+    /// What actually happens to this slot's `effort` on the way to the provider — the
+    /// **one** implementation of that policy. `kaibo://config`'s `inert_tunables`, the
+    /// startup warning, and anything else that wants to explain an effort all consume
+    /// this; there is deliberately no second copy of the rule to drift from. (There was
+    /// one, briefly, and it drifted inside a single commit: the render already knew a
+    /// batch lift meant the configured value didn't ship, and the startup scan didn't.)
     ///
-    /// Lane-aware: a `lane = "batch"` slot never touches the interactive wire, and batch's
-    /// hosted-OpenAI shape is gated on the endpoint-exact `is_hosted_openai` rather than
-    /// the configurable `uses_responses_wire`.
-    pub fn slot_effort_sinks(&self, slot: &ModelSlot, role: ModelRole) -> Result<bool> {
+    /// The shape is resolved exactly as [`ModelSlot::tunables`] resolves it —
+    /// `[defaults].thinking_style` fallback included — so what is displayed can't disagree
+    /// with what ships. Lane-aware: a `lane = "batch"` slot never builds an interactive
+    /// arm, and batch's hosted-OpenAI shape is gated on the endpoint-exact
+    /// `is_hosted_openai` rather than the configurable `uses_responses_wire`.
+    pub fn effort_disposition(
+        &self,
+        slot: &ModelSlot,
+        role: ModelRole,
+    ) -> Result<EffortDisposition> {
         let backend = self.resolve_backend(&slot.backend)?;
         let t = slot.tunables(role, &self.defaults);
-        let responses = match slot.lane {
-            Some(Lane::Batch) => backend.is_hosted_openai(),
-            _ => backend.uses_responses_wire(),
+        let batch_lane = slot.lane == Some(Lane::Batch);
+        let responses = if batch_lane {
+            backend.is_hosted_openai()
+        } else {
+            backend.uses_responses_wire()
         };
-        Ok(crate::consult::effort_sinks(
-            backend.kind,
-            &slot.id,
-            t.thinking_style,
-            responses,
-        ))
+        let sinks =
+            crate::consult::effort_sinks(backend.kind, &slot.id, t.thinking_style, responses);
+        let source = if slot.effort.is_some() {
+            EffortSource::Slot
+        } else {
+            EffortSource::Defaults
+        };
+        // The batch lane floors DEPTH; `batch_effort` is the authority on what that does
+        // to this value (including leaving the off-switch alone). Judge the outcome by
+        // RANK, not by string. Today `batch_effort` returns the operator's own spelling
+        // whenever the depths match, so the two agree — but they are separate decisions,
+        // and the string comparison was wrong the moment the floor normalized a tie: a
+        // `" HIGH "` came back as `"high"` and got reported as not-shipping when it ships
+        // untouched. Comparing depth to depth means "did the floor change what runs?" is
+        // answered independently of how `batch_effort` resolves ties.
+        let shipped = if batch_lane {
+            crate::batch::batch_effort(&t.effort).to_string()
+        } else {
+            t.effort.clone()
+        };
+        let fate = if !sinks {
+            EffortFate::NoSink
+        } else if crate::consult::effort_rank(&shipped) != crate::consult::effort_rank(&t.effort) {
+            EffortFate::LiftedToBatchFloor
+        } else if crate::consult::is_effort_off(&t.effort) {
+            EffortFate::SentAsOff
+        } else if crate::consult::effort_rank(&t.effort).is_none() {
+            EffortFate::SentUnranked
+        } else {
+            EffortFate::Sent
+        };
+        Ok(EffortDisposition {
+            configured: t.effort,
+            sent: sinks.then_some(shipped),
+            fate,
+            explicit: t.effort_explicit,
+            source,
+        })
     }
 
-    /// Every configured cast slot where the operator *wrote* an `effort` that this
-    /// slot's wire has no place to put — the silent drop, made loud.
+    /// Every configured cast slot where the operator *wrote* an `effort` that doesn't ship
+    /// as written — the silent divergences, made loud.
     ///
-    /// Two wires carry no reasoning knob at all: Anthropic's legacy budget tier (Haiku
-    /// 4.5 and older, which express depth as `budget_tokens`) and the generic OpenAI
-    /// `/chat/completions` shape every local llama.cpp/Ollama/gateway backend speaks. An
-    /// `effort` aimed at either evaporates in `to_params`, and nothing downstream fails —
-    /// exactly the silent fallback kaibo refuses everywhere else.
+    /// Two kinds, both from [`effort_disposition`](Self::effort_disposition) so this can't
+    /// disagree with the `kaibo://config` render: a wire with no reasoning field at all
+    /// (Anthropic's legacy budget tier; the generic OpenAI `/chat/completions` shape every
+    /// local llama.cpp/Ollama/gateway backend speaks) drops the value in `to_params` with
+    /// nothing downstream failing, and the batch lane lifts a below-floor depth. Either
+    /// way the knob reads as effective and isn't — exactly the silent fallback kaibo
+    /// refuses everywhere else.
     ///
     /// Only *explicit* efforts are reported (see [`Defaults::explorer_effort_explicit`]):
     /// every local cast inherits the built-in `high` onto a toggle-less wire, so a warning
     /// there would be noise on every ordinary setup and would train operators to ignore
     /// the one that matters. Returned rather than logged so the rule is unit-testable and
-    /// both front doors (and the `kaibo://config` render) share one answer; the caller
-    /// decides how to say it. Slots whose backend doesn't resolve are skipped — a broken
-    /// ref is someone else's louder error.
-    pub fn inert_efforts(&self) -> Vec<InertEffort> {
+    /// the caller decides how to say it. Slots whose backend doesn't resolve are skipped —
+    /// a broken ref is someone else's louder error.
+    pub fn effort_diagnostics(&self) -> Vec<EffortDiagnostic> {
         let mut out = Vec::new();
         for (cast_name, cast) in &self.casts {
             for (role, slot) in &cast.slots {
-                let t = slot.tunables(*role, &self.defaults);
-                if !t.effort_explicit {
+                let Ok(disposition) = self.effort_disposition(slot, *role) else {
+                    continue;
+                };
+                if !disposition.explicit || disposition.ships_as_configured() {
                     continue;
                 }
-                if self.slot_effort_sinks(slot, *role).unwrap_or(true) {
-                    continue;
-                }
-                out.push(InertEffort {
+                out.push(EffortDiagnostic {
                     cast: cast_name.clone(),
                     role: role.key(),
                     model: slot.qualified(),
-                    effort: t.effort,
-                    source: if slot.effort.is_some() {
-                        EffortSource::Slot
-                    } else {
-                        EffortSource::Defaults
-                    },
+                    disposition,
                 });
             }
         }
@@ -3823,7 +3916,7 @@ mod tests {
     /// inherited value would fire on every ordinary setup and teach operators to tune the
     /// warning out. Flagging what they typed is the signal they asked for.
     #[test]
-    fn inert_efforts_reports_a_written_effort_and_stays_quiet_about_the_inherited_one() {
+    fn effort_diagnostics_report_a_written_effort_and_stay_quiet_about_the_inherited_one() {
         // A local (openai-chat) cast with no effort written anywhere: the built-in `high`
         // lands nowhere, and that is normal — silence.
         let cfg = Config::from_toml_str(
@@ -3839,9 +3932,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            cfg.inert_efforts().is_empty(),
+            cfg.effort_diagnostics().is_empty(),
             "an inherited default on a toggle-less wire is ordinary, not a warning: {:?}",
-            cfg.inert_efforts()
+            cfg.effort_diagnostics()
         );
 
         // The same cast, with the effort written on the slot: now it is a claim the
@@ -3858,14 +3951,19 @@ mod tests {
             "#,
         )
         .unwrap();
-        let inert = cfg.inert_efforts();
+        let inert = cfg.effort_diagnostics();
         assert_eq!(inert.len(), 1, "one slot, one report: {inert:?}");
         assert_eq!(inert[0].cast, "zorak");
         assert_eq!(inert[0].role, "synth");
         assert_eq!(inert[0].model, "lab/gemma");
-        assert_eq!(inert[0].effort, "xhigh");
+        assert_eq!(inert[0].disposition.configured, "xhigh");
+        assert_eq!(inert[0].disposition.fate, EffortFate::NoSink);
+        assert!(
+            inert[0].disposition.sent.is_none(),
+            "nothing reaches the wire"
+        );
         assert_eq!(
-            inert[0].source,
+            inert[0].disposition.source,
             EffortSource::Slot,
             "the message must point at the line to edit"
         );
@@ -3887,21 +3985,21 @@ mod tests {
             "#,
         )
         .unwrap();
-        let inert = cfg.inert_efforts();
+        let inert = cfg.effort_diagnostics();
         let zorak: Vec<_> = inert.iter().filter(|i| i.cast == "zorak").collect();
         assert_eq!(
             zorak.len(),
             1,
             "the defaults effort is reported too: {inert:?}"
         );
-        assert_eq!(zorak[0].effort, "low");
-        assert_eq!(zorak[0].source, EffortSource::Defaults);
+        assert_eq!(zorak[0].disposition.configured, "low");
+        assert_eq!(zorak[0].disposition.source, EffortSource::Defaults);
     }
 
     /// A written effort on a wire that *does* carry one is never reported — the flag has
     /// to discriminate, or it is noise. One slot per effort-carrying wire kaibo ships.
     #[test]
-    fn inert_efforts_stays_quiet_where_the_effort_actually_lands() {
+    fn effort_diagnostics_stay_quiet_where_the_effort_actually_lands() {
         let cfg = Config::from_toml_str(
             r#"
             [casts.spread]
@@ -3911,10 +4009,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            cfg.inert_efforts().iter().all(|i| i.cast != "spread"),
+            cfg.effort_diagnostics().iter().all(|i| i.cast != "spread"),
             "DeepSeek's reasoning_effort and Anthropic adaptive's output_config.effort \
              both carry the value: {:?}",
-            cfg.inert_efforts()
+            cfg.effort_diagnostics()
         );
 
         // The budget tier is the Anthropic half that does NOT: depth there is
@@ -3926,7 +4024,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let inert = cfg.inert_efforts();
+        let inert = cfg.effort_diagnostics();
         assert!(
             inert.iter().any(|i| i.cast == "haiku"),
             "the budget tier has no effort sink: {inert:?}"
@@ -3945,9 +4043,124 @@ mod tests {
         )
         .unwrap();
         assert!(
-            cfg.inert_efforts().iter().all(|i| i.cast != "haiku"),
+            cfg.effort_diagnostics().iter().all(|i| i.cast != "haiku"),
             "forced adaptive gives the effort a sink: {:?}",
-            cfg.inert_efforts()
+            cfg.effort_diagnostics()
+        );
+    }
+
+    /// Whether the configured value "ships as written" is a question about **depth**, not
+    /// about spelling. `batch_effort` returns the operator's own string when the depths
+    /// match — kaibo never normalizes a value on its way to a provider — so a padded or
+    /// upper-cased `" HIGH "` compares unequal to `"high"` while meaning exactly the same
+    /// thing. Comparing by string reported that slot as not-shipping and told the operator
+    /// to go fix a setting that was already correct.
+    #[test]
+    fn effort_disposition_compares_depth_by_rank_not_by_spelling() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.padded]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = " HIGH " }
+
+            [casts.padded_low]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = " LoW " }
+            "#,
+        )
+        .unwrap();
+        let slot = |cast: &str| {
+            cfg.resolve_cast(cast)
+                .unwrap()
+                .require_slot(ModelRole::Synth)
+                .unwrap()
+                .clone()
+        };
+
+        // Same depth as the batch floor, different spelling: it ships, untouched.
+        let d = cfg
+            .effort_disposition(&slot("padded"), ModelRole::Synth)
+            .unwrap();
+        assert_eq!(d.fate, EffortFate::Sent, "same depth as the floor: {d:?}");
+        assert!(
+            d.ships_as_configured(),
+            "a spelling difference is not a lift: {d:?}"
+        );
+        assert_eq!(
+            d.sent.as_deref(),
+            Some(" HIGH "),
+            "and the operator's own string is what goes out — kaibo doesn't normalize"
+        );
+
+        // Genuinely shallower, however it was spelled: that IS a lift.
+        let d = cfg
+            .effort_disposition(&slot("padded_low"), ModelRole::Synth)
+            .unwrap();
+        assert_eq!(d.fate, EffortFate::LiftedToBatchFloor, "{d:?}");
+        assert!(!d.ships_as_configured(), "{d:?}");
+        assert_eq!(d.sent.as_deref(), Some(crate::batch::BATCH_EFFORT));
+    }
+
+    /// The whole fate table on one wire, so a reader can see what kaibo can say about an
+    /// effort — and so the two "it ships, but you should know why" cases don't quietly
+    /// collapse into plain `Sent`.
+    #[test]
+    fn effort_disposition_names_why_a_value_ships_or_does_not() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            [casts.plain]
+            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "xhigh" }
+
+            [casts.off]
+            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "none" }
+
+            [casts.newer]
+            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "ludicrous" }
+
+            [casts.lifted]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low" }
+
+            [casts.dropped]
+            synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        let fate = |cast: &str| {
+            let slot = cfg
+                .resolve_cast(cast)
+                .unwrap()
+                .require_slot(ModelRole::Synth)
+                .unwrap();
+            cfg.effort_disposition(slot, ModelRole::Synth).unwrap().fate
+        };
+        assert_eq!(fate("plain"), EffortFate::Sent);
+        assert_eq!(
+            fate("off"),
+            EffortFate::SentAsOff,
+            "off ships, and a reader must be told it was a decision, not an oversight"
+        );
+        assert_eq!(
+            fate("newer"),
+            EffortFate::SentUnranked,
+            "kaibo keeps no allowlist: a rung it can't order still goes to the provider"
+        );
+        assert_eq!(fate("lifted"), EffortFate::LiftedToBatchFloor);
+        assert_eq!(fate("dropped"), EffortFate::NoSink);
+
+        // Only the last two are things the operator needs to hear about.
+        let diagnosed: Vec<String> = cfg
+            .effort_diagnostics()
+            .into_iter()
+            .map(|d| d.cast)
+            .filter(|c| ["plain", "off", "newer", "lifted", "dropped"].contains(&c.as_str()))
+            .collect();
+        assert_eq!(
+            diagnosed,
+            vec!["dropped".to_string(), "lifted".to_string()],
+            "only the two that don't ship as written are diagnostics (BTreeMap cast order)"
         );
     }
 

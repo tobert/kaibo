@@ -69,26 +69,46 @@ const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 pub const BATCH_EFFORT: &str = "high";
 
 /// The reasoning depth one batch item runs at: the deeper of the slot's `effort` and
-/// [`BATCH_EFFORT`], with an unrankable rung deferring to the slot.
+/// [`BATCH_EFFORT`] — a floor on **depth**, which is why the reasoning off-switch is the
+/// first thing it asks about.
 ///
 /// Batch floors its knobs rather than fixing them, and effort was the one exception —
 /// force-clobbered in *both* directions. Lifting a thin slot is the intent ("a cast tuned
 /// down for flaky interactive use still batches hot"); demoting a slot that deliberately
-/// asked for `xhigh`/`max` was collateral, and silent. So:
+/// asked for `xhigh`/`max` was collateral, and silent. So, in order:
 ///
-/// - the slot ranks **deeper** than the floor → the slot wins (never cap a richer slot,
-///   the same promise `max_tokens` and the thinking budget already make);
-/// - the slot ranks **shallower** → the floor wins (the deliberate lift, unchanged);
-/// - either rung is **outside** [`EFFORT_LADDER`] → the slot wins. kaibo keeps no effort
+/// - the slot is [`EFFORT_OFF`](crate::consult::EFFORT_OFF) → the slot wins and reasoning
+///   stays off. **A depth floor has no business switching reasoning on.** `none` is a
+///   sentinel, not the shallowest rung of
+///   [`EFFORT_LADDER`](crate::consult::EFFORT_LADDER) — it used to sit there, and this
+///   function lifted it to `BATCH_EFFORT`, billing reasoning on every item of a fan-out.
+///   A cheap bulk-extraction batch is exactly where an operator turns reasoning off, and
+///   exactly where the per-item cost multiplies.
+/// - the slot ranks **shallower** than the floor → the floor wins (the deliberate lift).
+/// - the slot ranks **deeper** → the slot wins (never cap a richer slot, the same promise
+///   `max_tokens` and the thinking budget already make).
+/// - either value sits **outside** the ladder → the slot wins. kaibo keeps no effort
 ///   allowlist, so a rung it can't order is an operator reaching for something newer than
-///   this table — trusting it is what keeps that passthrough real, and silently replacing
-///   it with "high" would be exactly the override this function exists to retire.
+///   this table; trusting it is what keeps that passthrough real, and quietly replacing it
+///   with "high" would be exactly the override this function exists to retire.
+///
+/// Equal depths return the slot's own string, spelling included — kaibo never normalizes
+/// an operator's value on its way to a provider. A caller deciding whether the configured
+/// value "ships as written" must therefore compare by
+/// [`effort_rank`](crate::consult::effort_rank), not by string; see
+/// [`Config::effort_disposition`](crate::config::Config::effort_disposition), which is
+/// the single place that judgement lives.
 pub fn batch_effort(slot_effort: &str) -> &str {
+    // Off first, and before any ranking: `is_effort_off` answers the question
+    // `effort_rank` structurally cannot, which is the whole reason it is public.
+    if crate::consult::is_effort_off(slot_effort) {
+        return slot_effort;
+    }
     match (
         crate::consult::effort_rank(slot_effort),
         crate::consult::effort_rank(BATCH_EFFORT),
     ) {
-        (Some(slot), Some(floor)) if slot <= floor => BATCH_EFFORT,
+        (Some(slot), Some(floor)) if slot < floor => BATCH_EFFORT,
         _ => slot_effort,
     }
 }
@@ -2273,11 +2293,70 @@ mod tests {
         );
     }
 
+    /// The reasoning **off-switch** survives the batch depth floor. `none` is not the
+    /// shallowest rung — it is a different kind of answer — and a floor that raises
+    /// *depth* has no business switching reasoning back on.
+    ///
+    /// It used to. `EFFORT_LADDER` carried `"none"` at index 0, so `batch_effort` ranked
+    /// it below `BATCH_EFFORT` and lifted it to `"high"`, quietly billing reasoning on
+    /// every item of a fan-out the operator had turned it off for — and a fan-out is
+    /// exactly where a bulk-extraction batch turns reasoning off, and exactly where the
+    /// per-item cost multiplies. Two reviewers read the same code and reached opposite
+    /// conclusions about this, because `effort_rank` and `is_effort_off` each acted as
+    /// though the other didn't exist.
+    #[test]
+    fn batch_effort_floor_leaves_the_reasoning_off_switch_alone() {
+        assert_eq!(
+            batch_effort(crate::consult::EFFORT_OFF),
+            crate::consult::EFFORT_OFF,
+            "a DEPTH floor must not turn reasoning on — off is not a shallow depth"
+        );
+        assert_eq!(batch_effort("NONE"), "NONE", "however it was spelled");
+        assert_eq!(batch_effort(" none "), " none ", "however it was spaced");
+        assert!(
+            crate::consult::effort_rank(crate::consult::EFFORT_OFF).is_none(),
+            "the off-switch must not be rankable — ranking it is what let a floor lift it"
+        );
+
+        // And it reaches the wire as the structural disable, not as a lifted depth: the
+        // shaping half of the same contract.
+        let (_max, params) = batch_shaping(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-pro",
+            &tunables("none", 100),
+        );
+        let params = params.expect("deepseek carries a thinking block");
+        assert_eq!(
+            params["thinking"]["type"], "disabled",
+            "a batch item with reasoning off must actually run with it off: {params}"
+        );
+        assert!(params.get("reasoning_effort").is_none(), "{params}");
+    }
+
+    /// `batch_effort`'s floor only exists if `BATCH_EFFORT` is rankable. Set it to
+    /// anything absent from `EFFORT_LADDER` — a typo, a provider's newer rung, or the
+    /// off-switch — and the wildcard arm returns the slot's value for *every* input,
+    /// silently disabling the floor with no test noticing. This is the guard: the
+    /// constant has to be a depth kaibo can order, and it must not be the off-switch.
+    #[test]
+    fn batch_effort_floor_constant_is_a_rankable_depth() {
+        assert!(
+            crate::consult::effort_rank(BATCH_EFFORT).is_some(),
+            "BATCH_EFFORT {BATCH_EFFORT:?} is not on EFFORT_LADDER {:?} — the batch floor \
+             would silently do nothing at all",
+            crate::consult::EFFORT_LADDER
+        );
+        assert!(
+            !crate::consult::is_effort_off(BATCH_EFFORT),
+            "BATCH_EFFORT is a floor on depth; the off-switch is not a depth"
+        );
+    }
+
     /// The floor rule itself, isolated from any provider shape — every direction in one
     /// place so a future edit to `batch_effort` can't quietly flip one of them.
     #[test]
     fn batch_effort_is_a_floor_not_an_override() {
-        assert_eq!(batch_effort("none"), BATCH_EFFORT, "lifted");
+        assert_eq!(batch_effort("minimal"), BATCH_EFFORT, "lifted");
         assert_eq!(batch_effort("low"), BATCH_EFFORT, "lifted");
         assert_eq!(
             batch_effort(BATCH_EFFORT),
@@ -2287,6 +2366,8 @@ mod tests {
         assert_eq!(batch_effort("xhigh"), "xhigh", "deeper wins");
         assert_eq!(batch_effort("max"), "max", "deeper wins");
         assert_eq!(batch_effort("ludicrous"), "ludicrous", "unranked defers");
+        // The off-switch is not a rung and is not lifted — its own test above owns why.
+        assert_eq!(batch_effort("none"), "none", "off stays off");
         // Ranking is case/whitespace tolerant, but the slot's own spelling is what ships —
         // kaibo never normalizes an operator's string on its way to a provider.
         assert_eq!(

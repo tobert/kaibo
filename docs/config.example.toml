@@ -478,7 +478,9 @@ synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 # output floor (it never skimps on the cheap async lane), and a slot that asks for MORE keeps
 # it — `effort = "xhigh"` on a batch synth reaches the provider as written, which also means
 # the provider's ladder applies (a Gemini batch slot still takes only minimal/low/medium/high,
-# so `xhigh` there is now the provider's error rather than a silent demotion). Reasoning bills
+# so `xhigh` there is now the provider's error rather than a silent demotion). The floor is on
+# DEPTH, so `effort = "none"` survives it: a cheap bulk-extraction fan-out stays reasoning-off
+# rather than being lifted to "high" and billing thinking on every item. Reasoning bills
 # against that same output budget, so a big attached-file review at max thinking can spend the
 # budget thinking and truncate the answer — kaibo flags such a result INCOMPLETE with its
 # finishReason rather than passing off the cut-off fragment as a clean answer. Give batch more
