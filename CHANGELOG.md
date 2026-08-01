@@ -15,6 +15,15 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Changed
+
+- **The tool is plain "kaibo" now.** The 解剖 kanji no longer rides along with the
+  name in the MCP handshake, the CLI `--help` banner, the example config, or the
+  docs — that reading is a coincidence of how the name was built (kai + aibo), not
+  the name itself, and repeating it everywhere implied otherwise. The README's
+  `## Name` section keeps the story and is now the one place it appears. No
+  behavior, flags, or tool names changed.
+
 ### Fixed
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**

@@ -1,6 +1,6 @@
 <p align="center">
   <!-- Kaile, the kaibo mascot. Brand assets + generator live in docs/brand/. -->
-  <img src="docs/brand/banner-teal.png" alt="kaibo（解剖）" width="820">
+  <img src="docs/brand/banner-teal.png" alt="kaibo" width="820">
 </p>
 
 <p align="center">
@@ -654,10 +654,17 @@ work, and [`docs/devlog.md`](docs/devlog.md) for the shipped-work record.
 ## Name
 
 Originally @tobert was combining 'kai' (会) with different words to find a name for this
-tool. kai + [aibo](https://jisho.org/word/%E7%9B%B8%E6%A3%92) sounded nice to align with
+tool. kai + [aibo](https://jisho.org/word/%E7%9B%B8%E6%A3%92) — overlapping the shared
+`ai` — sounded nice to align with
 [gpal](https://github.com/tobert/gpal)/[dpal](https://github.com/tobert/dpal)/[cpal](https://github.com/tobert/cpal).
 It turns out kaibo ([解剖](https://jisho.org/word/%E8%A7%A3%E5%89%96)) means
 dissection, autopsy, or postmortem examination and that was that.
+
+That reading is a happy coincidence rather than the actual name, so it doesn't ride
+along with it: kaibo introduces itself as plain **kaibo** everywhere it speaks — the MCP
+handshake, `--help`, the docs. The kanji stays here, where it's the story being told,
+and in the brand wordmark, where it's deliberate lettering rather than a claim about
+what the tool is called.
 
 ## License
 
