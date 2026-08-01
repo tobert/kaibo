@@ -89,6 +89,14 @@ const CONFIG_URI: &str = "kaibo://config";
 /// user copies to `~/.config/kaibo/config.toml`. Most useful on a fresh install,
 /// where the setup guidance points at it.
 const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
+/// The full configuration reference manual (`docs/config.md`). The third config
+/// resource: `kaibo://config` is the resolved state, `kaibo://config/example` the
+/// copyable template, and this the explanatory prose behind both — precedence,
+/// backend/cast design, tool gating, containment, persistence. It exists so the
+/// template can stay a *template*: an agent configuring kaibo over MCP has no access to
+/// this repo's `docs/`, so without it every explanation had to be smuggled into the
+/// example's comments, where it costs bytes on every read and drifts from the code.
+const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
 /// Long-form "how to wield the tools well" guidance — attachments, cast/model
 /// selection, the sync↔async pairs and their handles, and the read-only shell's
 /// idioms. The tool schemas stay terse and point here, so the repetition and positive
@@ -114,6 +122,11 @@ const PROMPTS_CAST_URI_TEMPLATE: &str = "kaibo://prompts/{cast}";
 /// `pub(crate)` so `kaibo example-config` (`cli.rs`) can print the exact same string
 /// the `kaibo://config/example` resource serves — one source, no drift.
 pub(crate) const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.example.toml");
+
+/// `docs/config.md`, embedded for the same reason as the template above: `cargo install
+/// kaibo` lays down no docs, so a runtime file read would 404 exactly when someone is
+/// trying to configure the thing.
+const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
 
 /// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
 /// its wall-clock backstop: the per-request reqwest deadline should fire first (a
@@ -2669,6 +2682,15 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
                  ~/.config/kaibo/config.toml and edit. Pairs with kaibo://config, which \
                  shows the *resolved* runtime state.",
             ),
+        // The reference manual behind the other two: what each knob means and why.
+        markdown_resource(
+            CONFIG_GUIDE_URI,
+            "kaibo: configuration guide",
+            "The full configuration reference: precedence across call/CLI/env/file, the \
+             backend + cast model, tool gating (why a tool may not be advertised), path \
+             containment, persistence, telemetry, house rules, and prompt overrides. Read \
+             this when kaibo://config/example's comments leave a question open.",
+        ),
         markdown_resource(
             SANDBOX_URI,
             "kaibo read-only sandbox",
@@ -2714,10 +2736,11 @@ models it uses.
 
 Work through these steps:
 
-1. Read kaibo's two config resources first (they're MCP resources — no tool turn spent):
+1. Read kaibo's config resources first (they're MCP resources — no tool turn spent):
    • `kaibo://config/example` — the annotated config.toml template, every knob explained.
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
+   • `kaibo://config/guide` — the full reference manual, if a question stays open.
 ";
 
 /// Steps 2-6, channel-neutral (which provider, what roster shape, keeping secrets out
@@ -3102,6 +3125,10 @@ with the `[prompts]` table, or per cast with a slot's `preamble` (the two axes a
 fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     if uri == SANDBOX_URI {
         return Some(kaibo_sandbox_doc());
+    }
+    if uri == CONFIG_GUIDE_URI {
+        // Static and config-independent — the embedded manual verbatim.
+        return Some(CONFIG_GUIDE_MD.to_string());
     }
     if uri == TOOLS_URI {
         return Some(TOOLS_DOC.to_string());
@@ -5513,6 +5540,51 @@ mod tests {
         );
         crate::config::Config::from_toml_str(&body)
             .expect("the embedded config example must parse as a valid Config");
+    }
+
+    // --- kaibo://config/guide resource tests ----------------------------------
+
+    /// The embedded configuration manual is listed and readable. It carries the detail
+    /// the template deliberately no longer inlines, so an agent configuring kaibo over
+    /// MCP (no access to this repo's `docs/`) can still reach it.
+    #[test]
+    fn config_guide_resource_is_listed_and_readable() {
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
+        assert!(
+            uris.iter().any(|u| u == CONFIG_GUIDE_URI),
+            "kaibo_resources() must list kaibo://config/guide, got {uris:?}"
+        );
+
+        let body = render_resource(CONFIG_GUIDE_URI, &[]).expect("guide must render");
+        assert!(
+            body.starts_with("# kaibo configuration"),
+            "guide must be docs/config.md verbatim:\n{}",
+            &body[..body.len().min(200)]
+        );
+    }
+
+    /// The pointer the trimmed template makes — "full table: kaibo://config/guide,
+    /// 'Tool gating'" — must actually land somewhere. This is the drift guard for
+    /// moving that content out of the example: delete or rename the section and the
+    /// template becomes a dead reference, so fail here instead.
+    #[test]
+    fn config_guide_carries_the_tool_gating_section_the_template_points_at() {
+        let guide = render_resource(CONFIG_GUIDE_URI, &[]).expect("guide must render");
+        assert!(
+            guide.contains("## Tool gating"),
+            "docs/config.md must keep the section config.example.toml points at"
+        );
+        assert!(
+            CONFIG_EXAMPLE_TOML.contains(CONFIG_GUIDE_URI),
+            "the template must point at the guide it defers its detail to"
+        );
+        // Each cast-gated tool is named where an operator would look up why it vanished.
+        for tool in ["consult", "explore", "batch_submit", "deliberate"] {
+            assert!(
+                guide.contains(tool),
+                "the gating section must account for `{tool}`"
+            );
+        }
     }
 
     // --- kaibo://config resource tests ---------------------------------------

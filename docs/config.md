@@ -1,35 +1,20 @@
 # kaibo configuration
 
-Status: **implemented** (`src/config.rs`, tested in `tests/config.rs`). This doc is
-the rationale and reference; the code is ground truth. The design record for the
-backends/casts split is `docs/casts.md`.
+The reference manual for kaibo's configuration surface: every key, its default, and
+what it does. Implemented in `src/config.rs`, tested in `tests/config.rs`. The code is
+ground truth where this document and the code disagree.
 
-## Why
+**Related material**
 
-The config surface was carved in two passes, each splitting a fused selector.
+| where | what |
+|---|---|
+| `docs/config.example.toml` | the copyable annotated template (also `kaibo://config/example`, `kaibo example-config`) |
+| `kaibo://config` | the *resolved* runtime state of a running server (also `kaibo config`) |
+| `kaibo://config/guide` | this document, embedded in the binary |
+| `docs/casts.md` | the design record for the backends/casts split |
 
-**Pass one** (kinds and profiles) was driven by three things:
-
-1. **One `openai` endpoint per process.** The original `Provider` enum fused *which
-   wire protocol* with *which endpoint, key, and models* — so "openai" resolved a
-   single `OPENAI_BASE_URL` + key, and hosted GPT **and** local Gemma couldn't both
-   be selectable in one run.
-2. **Model ids drift and live in code.** Hardcoded explorer/synth ids rot (we ate a
-   `claude-3-5-haiku-latest` 404). They want to live in data.
-3. **Three config surfaces don't line up.** CLI flags, env vars, and a pile of
-   hardcoded constants each grew independently. A folk who prefers a file had
-   nowhere to put anything.
-
-The fix was to split the enum: a *kind* is the wire protocol, a *profile* a named
-instance of one.
-
-**Pass two** found the same disease one floor up. A profile still fused two
-selectors — *which connection* and *which model serves which role*. A profile is
-one `kind`, so a team was locked to one family: a chimera (a cheap local deepseek
-explorer feeding a claude synth) was inexpressible, and "profile" meant
-*connection* in one position and *team* in another. So the profile split too —
-into **backends** and **casts** — and `[profiles]` is deleted, not deprecated. The
-full rationale is `docs/casts.md`.
+**Configuration is optional.** With no config file, kaibo runs on a built-in registry
+of backends and casts. A missing file at the default path is not an error.
 
 ## The model: backends, roles, casts
 
@@ -40,284 +25,310 @@ Cast         = { name, role → ModelSlot }                  (freely spans backe
 ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
 ```
 
-Three concepts, each owning exactly one idea:
+Each concept owns one idea:
 
-- **backend** — a *connection*: `kind` (the closed `ProviderKind` enum — the one
-  place "provider" still means something; it picks the rig client and the request
-  shape), `base_url`, key source, `request_timeout`. "How do I reach Gemini."
-- **role** — a *job* a model serves: `explorer` and `synth`, the two agent
-  phases (there are no output/production roles — kaibo reasons over code and
-  renders nothing). A slot that reads images carries a `vision` pin; perception
-  is a slot capability, not a role.
-- **cast** — a *composition*: a named assignment of models to roles. This is what
-  the `cast` call param selects.
+- **backend** — a *connection*. Carries `kind` (the closed `ProviderKind` enum; it
+  selects the rig client and the request shape), `base_url`, a key source, and
+  `request_timeout`. Answers "how do I reach Gemini".
+- **role** — a *job* a model serves. Two exist: `explorer` and `synth`, the two agent
+  phases. There are no output or production roles, because kaibo reasons over code and
+  renders nothing. Image input is a slot capability (the `vision` pin), not a role.
+- **cast** — a *composition*. A named assignment of models to roles. This is what the
+  `cast` call parameter selects.
 
-**Selection rule:** calls pick casts; backends are reachable *only through* a
-cast's slots. Calls choose a composition, compositions choose connections. A slot
-ref borrows the backend's connection only — it never follows another cast — so
-chains and cycles are structurally impossible.
+**Selection rule.** Calls pick casts. Backends are reachable only through a cast's
+slots: calls choose a composition, compositions choose connections. A slot reference
+borrows its backend's connection and never resolves another cast, so reference chains
+and cycles cannot be expressed.
 
 ### Backends: `[backends.<name>]`
 
-Connection knobs only — models never live here:
+Connection settings only. Models are never declared here.
 
-- **`kind`** selects the rig client and request shaping. It is closed — adding a
-  kind means adding a client arm in code, not a config line. A *new* backend must
-  declare its kind (it seeds that kind's default key sources); re-listing an
-  existing backend with a *different* kind is a loud error — you don't change a
-  connection's protocol by re-declaring it.
-- **`base_url`** is meaningful for `kind = "openai"` (the generic OpenAI-compatible
-  path) — this is what lets any number of openai-kind backends (hosted GPT, two
-  local llama.cpp servers, an Ollama box) be live at once, each its own name.
-  A *new* openai-kind backend must set it: the `OPENAI_BASE_URL`/local-default
-  fallback belongs to the built-in `openai-local` backend alone, so a forgotten
-  `base_url` is a load error, not a silent dial of the wrong server. It is also
-  meaningful — but *optional* — for `kind = "anthropic"` and `kind = "gemini"`:
-  unset still resolves to rig's built-in `https://api.anthropic.com` /
-  `https://generativelanguage.googleapis.com`; set, it points that wire protocol
-  at an Anthropic/Gemini-API-compatible gateway/proxy instead (a corporate LLM
-  gateway, say). Both contracts are a HOST ROOT, not a versioned path — rig's own
-  `ClientBuilder` appends its provider-specific path (Gemini's
-  `/v1beta/models/...`) itself, and the batch lane's `GeminiBatch` versions a
-  configured host root with `/v1beta` the same way, so one address serves both
-  the interactive and batch paths. For every *other* keyed kind rig fixes the
-  endpoint, so a `base_url` there is a config error, surfaced loudly — not
-  silently ignored.
-- **`wire`** (`kind = "openai"` only) picks the interactive request shape: `"responses"`
-  for rig's Responses client, `"chat"` for OpenAI-compatible Chat Completions. Optional
-  and normally unset — kaibo infers it from the endpoint (OpenAI Platform's exact URL
-  gets Responses, everything else gets Chat Completions), which is why hosted GPT and
-  local Gemma both already worked without this knob. It exists for the case the
-  heuristic can't see: an OpenAI-compatible gateway/proxy that implements the Responses
-  API at `/v1/responses` (verified against a real gateway) but doesn't sit at Platform's
-  URL. Current GPT-5.x reasoning models *require* Responses — they reject Chat
-  Completions' `max_tokens` outright (`unsupported_parameter`) — so `wire = "responses"`
-  is what makes them usable behind such a gateway. `wire = "chat"` is the symmetric
-  opt-out, including on Platform's own endpoint. Either setting is **interactive-only**:
-  it never changes batch eligibility (the batch-lane discussion under Casts below),
-  which stays keyed to the endpoint-exact check alone — a gateway proxying
-  `/v1/responses` doesn't necessarily proxy `/v1/batches` or the Files API. A `wire` on
-  any other kind is a load error, same discipline as `data_collection` below.
-- A backend resolves its key from `api_key_env` then `api_key_file` (env wins).
-  **Secrets never live inline in the TOML** — only the *name* of an env var or the
-  *path* to a key file. A config you can commit or paste shouldn't leak a key.
-- `key_optional = true` falls back to a placeholder bearer token when no key is
-  found (the keyless local-server case). Defaults to `true` for `kind = "openai"`,
-  `false` otherwise. A key file that's *present but broken* (empty, unreadable) is
-  a loud error even for a keyless backend — there-but-wrong is a mistake, not
-  "keyless".
-- **`kind = "openrouter"`** is a keyed gateway, not a wire protocol of its own: one
-  `OPENROUTER_API_KEY` reaches every upstream model family through a fixed endpoint
-  (`base_url` there is the same loud load error as on the other keyed kinds).
-  Reasoning is **on by default on every slot** — OpenRouter's unified
-  `{"reasoning":{"effort":…}}` request field, which the gateway translates into
-  each upstream provider's native knob and drops silently where the pinned model
-  has none, so emitting it unconditionally never breaks a non-reasoning model. The
-  per-role `effort` (see [defaults] below) passes through verbatim, reaching
-  OpenRouter-only rungs (`xhigh`, `max`) deeper than the other kinds expose. No
-  `batch` lane. One slug routes across competing upstream *hosts* whose data
-  policies differ, so every request pins **no-collection routing by default**
-  (`provider.data_collection = "deny"` — kaibo's prompts carry your source, and
-  shipping it to a host that retains or trains on prompts must be a choice, never
-  a default). A model whose only hosts collect (most `:free` variants) fails
-  loudly instead of leaking quietly. `data_collection = "allow"` on the backend
-  is the explicit opt-in — kaibo then emits no restriction and your OpenRouter
-  account settings govern. The knob exists only on this kind (a load error
-  elsewhere), and `kaibo://config` renders the active policy per openrouter
-  backend so the posture is always visible.
-- **`request_timeout_secs`** (default from `[defaults]`, 900 = 15 min) is the
-  wall-clock ceiling on a *single* completion call. rig's prompt loop is
-  non-streaming and has no native timeout, so a provider that connects but never
-  responds would otherwise hang the whole tool call (it once waited ~29 min on a
-  wedged local server). It's per-backend because a slow local model legitimately
-  wants a longer leash than a hosted API. **Caveat:** a non-streaming call can't
-  tell *wedged* from *slow-but-working* — keep it above your slowest legitimate
-  single completion. `0` is rejected at load (it would time out every call
-  instantly).
+| key | type | default | notes |
+|---|---|---|---|
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` | required on a new backend | closed enum; selects client + request shape |
+| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini`; load error elsewhere |
+| `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
+| `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
+| `api_key_file` | path | seeded from `kind` | file source, checked second |
+| `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
+| `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` only; load error elsewhere |
+| `request_timeout_secs` | integer > 0 | `[defaults]` value (900) | per-single-completion ceiling |
 
-  **Failure policy (no retry, by design).** kaibo does not retry a failed provider
-  call — there is no backoff and no `max_retries` knob. A 429/503/529 overload, a
-  connection reset, a partial stream, or a wedged backend that hits `request_timeout`
-  all fail the single completion, and `consult`/`oneshot` surface that as a **clean
-  tool-result error** (`is_error`) naming the cast and the underlying detail. The
-  rationale: a consult is an *optional* augmentation, so the calling agent should read
-  the failure and proceed without the second opinion (or call again) rather than have
-  its own tool call fail at the protocol layer. The message is classified so the agent
-  can drive the right next step: a *transient* condition (overload / rate-limit /
-  timeout / reset) invites a manual retry, a non-transient one (auth / bad request) does
-  not, and a kaibo-side failure is named as such. (Classification is a heuristic on the
-  provider's error *vocabulary*, not the HTTP status — rig surfaces the response body,
-  not the code.) Retrying is the caller's decision; for a reliably-slow backend, raise
-  its `request_timeout_secs` rather than expecting kaibo to paper over it. Automatic retry/backoff belongs in the shared HTTP layer (rig already
-  ships an `ExponentialBackoff`, wired only into its streaming path today) — landing it
-  for the non-streaming completion path is tracked as an upstream contribution in
-  `docs/issues.md`, not hand-rolled here.
+#### `kind`
+
+Closed: adding a kind requires a client arm in code, not a config line. A new backend
+must declare one, which seeds that kind's default key sources. Re-declaring an existing
+backend with a *different* kind is a load error; a connection's protocol is not changed
+by re-declaration.
+
+#### `base_url`
+
+- **`kind = "openai"`** — required on a new backend. This is what allows several
+  openai-kind backends (hosted GPT, two local llama.cpp servers, an Ollama box) to be
+  live at once under different names. The `OPENAI_BASE_URL` / local-default fallback
+  belongs to the built-in `openai-local` backend alone, so a missing `base_url` is a
+  load error rather than a silent dial of the wrong server.
+- **`kind = "anthropic"` / `kind = "gemini"`** — optional. Unset resolves to rig's
+  built-in `https://api.anthropic.com` / `https://generativelanguage.googleapis.com`.
+  Set, it points that wire protocol at a compatible gateway or proxy.
+- **Every other kind** — a load error. rig fixes those endpoints.
+
+The value is a **host root**, not a versioned path. rig's `ClientBuilder` appends the
+provider-specific path (Gemini's `/v1beta/models/...`), and the batch lane's
+`GeminiBatch` versions a configured host root with `/v1beta` the same way, so one
+address serves both the interactive and batch paths.
+
+#### `wire`
+
+Picks the interactive request shape: `"responses"` for rig's Responses client, `"chat"`
+for OpenAI-compatible Chat Completions. Normally unset — kaibo infers it from the
+endpoint, giving OpenAI Platform's exact URL the Responses shape and everything else
+Chat Completions. Hosted GPT and local Gemma both work without this knob.
+
+Set it when the heuristic cannot see the truth: an OpenAI-compatible gateway that
+implements the Responses API at `/v1/responses` but does not sit at Platform's URL.
+Current GPT-5.x reasoning models require Responses — they reject Chat Completions'
+`max_tokens` with `unsupported_parameter` — so `wire = "responses"` is what makes them
+usable behind such a gateway. `wire = "chat"` is the symmetric opt-out, including on
+Platform's own endpoint.
+
+**Interactive-only.** `wire` never changes batch eligibility, which stays keyed to the
+endpoint-exact check alone. A gateway proxying `/v1/responses` does not necessarily
+proxy `/v1/batches` or the Files API.
+
+#### Key resolution
+
+A backend resolves its key from `api_key_env`, then `api_key_file`. Env wins.
+
+**Secrets never appear inline in the TOML** — only the *name* of an env var or the
+*path* to a key file. A config file should be safe to commit or paste.
+
+`key_optional = true` substitutes a placeholder bearer token when no key is found,
+which is the keyless local-server case. A key file that is *present but broken* (empty,
+unreadable) is a load error even on a keyless backend: present-but-wrong is a mistake,
+not "keyless".
+
+#### `kind = "openrouter"` specifics
+
+OpenRouter is a keyed gateway rather than a wire protocol of its own. One
+`OPENROUTER_API_KEY` reaches every upstream model family through a fixed endpoint.
+
+- **Reasoning is on for every slot.** kaibo emits OpenRouter's unified
+  `{"reasoning":{"effort":…}}` field. The gateway translates it into each upstream
+  provider's native knob and drops it where the pinned model has none, so emitting it
+  unconditionally is safe for non-reasoning models. The per-role `effort` passes
+  through verbatim, which is where the deeper `xhigh` and `max` rungs are reachable.
+- **No `batch` lane.**
+- **`data_collection` defaults to `deny`.** One slug routes across competing upstream
+  hosts whose data policies differ, and kaibo's prompts carry your source, so
+  no-collection routing is pinned on every request. A model whose only hosts collect
+  (most `:free` variants) fails loudly instead of leaking quietly. `data_collection =
+  "allow"` is the explicit opt-in: kaibo then emits no restriction and your OpenRouter
+  account settings govern. `kaibo://config` renders the active policy per backend.
+
+#### `request_timeout_secs`
+
+Wall-clock ceiling on a *single* completion call. Default 900 (15 min), from
+`[defaults]`. `0` is rejected at load, since it would time out every call instantly.
+
+rig's prompt loop is non-streaming and has no native timeout, so without this a provider
+that connects but never responds hangs the whole tool call. The setting is per-backend
+because a slow local model legitimately wants a longer leash than a hosted API.
+
+A non-streaming call cannot distinguish *wedged* from *slow but working*, so keep the
+value above your slowest legitimate single completion.
+
+#### Failure policy: no retry
+
+kaibo does not retry a failed provider call. There is no backoff and no `max_retries`
+knob. A 429/503/529 overload, a connection reset, a partial stream, or a backend that
+hits `request_timeout` all fail the single completion, and `consult`/`oneshot` surface
+that as a clean tool-result error (`is_error`) naming the cast and the underlying
+detail.
+
+The reasoning: a consult is an *optional* augmentation. The calling agent should read
+the failure and proceed without the second opinion, or call again, rather than have its
+own tool call fail at the protocol layer.
+
+Failures are classified so the caller can pick a next step:
+
+| class | examples | retry advice |
+|---|---|---|
+| transient | overload, rate limit, timeout, connection reset | a manual retry may succeed |
+| non-transient | auth failure, bad request | fix the config or the call |
+| kaibo-side | named as such | not a provider problem |
+
+Classification is a heuristic over the provider's error *vocabulary*, not the HTTP
+status, because rig surfaces the response body rather than the code. For a reliably slow
+backend, raise its `request_timeout_secs`. Automatic retry and backoff belong in the
+shared HTTP layer — rig ships an `ExponentialBackoff` wired only into its streaming path
+today — and landing it for the non-streaming completion path is tracked as an upstream
+contribution in `docs/issues.md`.
 
 ### Casts: `[casts.<name>]`
 
-A role table. Each slot is a `"backend/model-id"` string (the common case — the
-*first* `/` splits, so HuggingFace-style `org/model` ids keep their inner slash)
-or a table when the slot needs pins or tunables:
+A role table. Each slot takes one of two forms:
+
+- **String** — `"backend/model-id"`, the common case. The *first* `/` splits, so
+  HuggingFace-style `org/model` ids keep their inner slash.
+- **Table** — when the slot needs capability pins or per-slot tunables.
 
 ```toml
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — local/cheap family
-synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
+synth    = "claude/claude-sonnet-4-6"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables
 # synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
-# explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }  # per-model prompt
+# explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
-- **Known roles:** `explorer`, `synth`. A typo'd role (or a typo'd per-slot knob)
-  is a loud load error, not a silent no-op. A cast may omit roles — the four
-  interactive built-ins carry explorer+synth, the batch built-ins carry synth
-  only; a user cast that omits a role is valid config, and the tool that needs the
-  missing role fails loudly *at call time*, naming the gap ("cast `lite` has no
-  synth slot"). Absent = capability absent. (There are no output/production roles:
-  kaibo reasons over a codebase and renders nothing, so image/tts-style "make an
-  artifact" roles don't exist. Perception — image input, audio-in later — is a
-  slot's `vision`/`ModelCaps` capability, below, not a role.)
-- **An unknown backend in a slot is a load error** naming the known backends; an
-  empty model id is rejected at load (it would surface as a baffling provider 404
-  mid-call otherwise).
-- **`vision` pins the slot's vision capability** (accepts image parts in model
-  context), overriding the built-in classifier. The classifier runs against the
-  *slot's backend kind*: Anthropic and Gemini completion models are multimodal-in;
-  DeepSeek chat/reasoner are text-only; a generic `openai` endpoint is vision-off
-  until its config says otherwise (kaibo can't know what's behind an arbitrary id —
-  opt in, don't guess). Resolved caps (not raw config) are what `kaibo://config`
-  reports, and they will gate toolset assembly when vision-in lands.
-- Backends *and* casts both take a file-level `aliases = [...]` list. An alias
-  that collides with a real name at its level, or that two names both claim, is a
-  loud load error.
+**Roles.** `explorer` and `synth`. A misspelled role, or a misspelled per-slot key, is
+a load error rather than a silent no-op.
+
+A cast may omit a role. The interactive built-ins carry both; the batch built-ins carry
+`synth` only. A user cast that omits a role is valid config, and the tool needing the
+missing role fails at call time naming the gap (`cast "lite" has no synth slot`). Absent
+means the capability is absent.
+
+**Slot references.** An unknown backend in a slot is a load error naming the known
+backends. An empty model id is rejected at load, since it would otherwise surface as an
+unexplained provider 404 mid-call.
+
+**`vision`** pins the slot's vision capability (whether it accepts image parts in model
+context), overriding the built-in classifier. The classifier keys on the slot's backend
+kind:
+
+| kind | classifier default |
+|---|---|
+| `anthropic`, `gemini` | vision on |
+| `deepseek` | vision off (text-only models) |
+| `openai`, `openrouter` | vision off until pinned |
+
+A generic endpoint is vision-off until its config says otherwise, because kaibo cannot
+know what serves an arbitrary model id. `kaibo://config` reports the *resolved*
+capability, not the raw config.
+
+**Aliases.** Backends and casts both take a file-level `aliases = [...]` list. An alias
+that collides with a real name at its level, or that two names both claim, is a load
+error.
 
 ### Tunables: what lives where
 
-The split un-straddles the knobs. **Connection knobs ride the backend** (key
-source, `base_url`, `request_timeout_secs` — they describe the wire).
-**Model-tracking knobs ride the slot** (`max_tokens`, `thinking_budget`,
-`temperature`, `effort`, `thinking_style`, the `vision` pin, and `preamble` — they
-describe the model), each falling back to its per-role `[defaults]` value when
-omitted (`explorer` slots inherit the `explorer_*` defaults; `synth` inherits the
-`synth_*` side). A profile-level `max_tokens` awkwardly shared by
-two models no longer exists. The `preamble` knob is the per-model system prompt —
-its own fallback chain (it has no `[defaults]` entry) is documented under
-[System prompts](#system-prompts-prompts) below.
+| knob group | lives on | keys |
+|---|---|---|
+| connection | the **backend** | key source, `base_url`, `wire`, `request_timeout_secs` |
+| model-tracking | the **slot** | `max_tokens`, `thinking_budget`, `temperature`, `effort`, `thinking_style`, `vision`, `preamble` |
 
-The `[defaults]` knobs themselves:
+A slot knob falls back to its per-role `[defaults]` value when omitted: `explorer` slots
+inherit the `explorer_*` defaults, `synth` slots the `synth_*` side.
 
-- **`max_tokens` / `thinking_budget`** (16384 / 8192): output headroom and
-  reasoning budget. Reasoning eats the *completion* budget, so `max_tokens` must
-  sit well above `thinking_budget` — for a slot whose model actually *sends* a
-  budget (Anthropic's legacy `budget_tokens` tier) an inverted pair is rejected at
-  load on the slot's *resolved* values (Anthropic would 400 on it mid-call). A slot
-  with no budget sink (Gemini takes a `thinkingLevel`, Anthropic's adaptive tier an
-  effort) carries an inert `thinking_budget`, so the pair isn't checked there.
-- **`explorer_temperature` / `synth_temperature` / `top_p`** (0.1 / 0.3 / 0.95):
-  sampling per role — the explorer gathers exact citations, so it runs cold; the
-  synth composes the answer, so it gets a touch more room. Sent where a model
-  accepts them (top-level for DeepSeek/OpenAI, under `generationConfig` for
-  Gemini). **Anthropic drops sampling whenever thinking is on** (every Anthropic
-  slot, by default): the Messages API 400s on a custom `temperature` under
-  thinking, and thinking is the higher-value default, so it wins. Temperature must
-  be in `[0.0, 2.0]` and `top_p` in `(0.0, 1.0]` — at the `[defaults]` level *and*
-  per slot, an out-of-range value is rejected at load, not clamped.
-- **`explorer_effort` / `synth_effort`** (`"high"` both): reasoning depth for the
-  models that take an effort param — Anthropic's adaptive tier
-  (→ `output_config.effort`), DeepSeek (→ `reasoning_effort`), Gemini
-  (→ `thinkingLevel`: the values align, `"minimal"`/`"low"`/`"medium"`/`"high"`),
-  and OpenRouter (→ its unified `{"reasoning":{"effort":…}}`, forwarded verbatim to
-  whatever the pinned model actually supports). A passthrough string the provider
-  validates (like a model id), so a new level lands without a code change — set a synth
-  slot's `effort = "max"`/`"xhigh"` for heavier runs; OpenRouter is where those
-  deeper rungs are actually reachable today. Ignored by models with no effort
-  sink (budget-tier Anthropic, OpenAI).
-- **`thinking_style`** (`auto` | `adaptive` | `budget`, default `auto`) forces the
-  Anthropic thinking shape instead of the built-in classifier. `auto` picks
-  adaptive for Opus 4.6+/Sonnet 4.6/Fable 5 and enabled-budget for older models +
-  Haiku 4.5; set `adaptive` or `budget` when a new or misclassified model ships. A
-  no-op for non-Anthropic kinds. An unknown value is a loud load error.
-- **`request_timeout_secs`** seeds every backend (see above).
-- **`call_deadline_secs`** (default 3600 = 1 h, must be > 0) is the whole-*call*
-  wall-clock ceiling on an interactive `consult`/`explore`/`oneshot` — the backstop
-  for when the per-request `request_timeout` doesn't fire (a stalled response body, a
-  pooled keep-alive to a wedged backend). Past it the call aborts with a clean
-  tool-result error instead of hanging your session. Keep it **above the largest
-  `request_timeout` a call can reach** so it never cuts a legitimately slow single
-  completion — operators running a >30-min local model should raise it. It bounds the
-  interactive loop tools — `consult`/`explore`/`oneshot` and async `consult_submit`.
-  Two in-process paths sit outside it *by nature*: `deliberate`'s direct lane is one
-  long completion bounded instead by its synth backend's `request_timeout` (+ a small
-  margin) — so a slow local `deliberate` gets its full patience *without* forcing this
-  interactive ceiling up to hours; and the **batch** lane holds no in-process wait at
-  all (the work runs on the provider's queue, collected by polling `job_get`).
-- **`explorer_max_turns` / `synth_max_turns`** (100 / 200) stay in `[defaults]`
-  only (plus per-call): they bound the *loop*, not the model.
-- **`session_capacity`** (128, must be > 0): max multi-turn consult sessions held
-  in memory (LRU, capacity-evicted, no TTL).
-- **`job_capacity`** (64, must be > 0): max async-`consult` jobs (`consult_submit`)
-  held in memory — running plus finished-but-uncollected (LRU, capacity-evicted, no
-  TTL; evicting a still-running job aborts it). Its own knob, smaller than
-  `session_capacity` because a held job result is heavier than a session's Q&A pair.
-- **`inline_attach_budget`** (262144 = 256 KiB; `0` is legal): cumulative byte budget
-  for inlining `consult` text attachments into the driver prompt (caller order,
-  greedy). A text attachment past the remaining budget is *demoted* — named in the
-  prompt with a read-it-WHOLE directive instead of its bytes — loudly, never dropped.
-  `0` inlines nothing (every text attachment becomes a directive): the escape hatch
-  for a small-context cast, e.g. a 4K-ctx local model that chokes on inlined bytes a
-  hosted model shrugs at. Inlined bytes ride every turn of the driver loop, so this
-  bounds resident prompt cost, not just one request. The tool-less tools
-  (`oneshot`/`batch_submit`) are unaffected — with no shell to fall back on, they
-  keep their own hard per-file/per-call caps.
+`preamble` is the exception — it has no `[defaults]` entry and its own fallback chain,
+documented under [System prompts](#system-prompts-prompts).
+
+### `[defaults]`
+
+Global tunables every slot falls back to. Per-slot overrides are documented above;
+`request_timeout_secs` seeds every backend.
+
+| key | default | constraint |
+|---|---|---|
+| `max_tokens` | 16384 | must exceed `thinking_budget` on a budget-tier slot |
+| `thinking_budget` | 8192 | — |
+| `explorer_temperature` | 0.1 | `[0.0, 2.0]` |
+| `synth_temperature` | 0.3 | `[0.0, 2.0]` |
+| `top_p` | 0.95 | `(0.0, 1.0]` |
+| `explorer_effort` / `synth_effort` | `"high"` | passthrough string |
+| `thinking_style` | `"auto"` | `auto` \| `adaptive` \| `budget` |
+| `request_timeout_secs` | 900 | > 0 |
+| `call_deadline_secs` | 3600 | > 0 |
+| `explorer_max_turns` | 100 | — |
+| `synth_max_turns` | 200 | — |
+| `session_capacity` | 128 | > 0 |
+| `job_capacity` | 64 | > 0 |
+| `inline_attach_budget` | 262144 (256 KiB) | `0` is legal |
+
+Out-of-range values are rejected at load, not clamped. This applies at the `[defaults]`
+level and per slot.
+
+**`max_tokens` / `thinking_budget`.** Output headroom and reasoning budget. Reasoning
+bills against the completion budget, so `max_tokens` must sit well above
+`thinking_budget`. On a slot whose model actually *sends* a budget (Anthropic's legacy
+`budget_tokens` tier) an inverted pair is rejected at load on the slot's resolved
+values, because Anthropic would 400 on it mid-call. A slot with no budget sink (Gemini
+takes a `thinkingLevel`, Anthropic's adaptive tier an effort) carries an inert
+`thinking_budget` and the pair is not checked.
+
+**Sampling.** The explorer gathers exact citations and runs cold; the synth composes the
+answer and gets slightly more room. Sent where a model accepts them: top-level for
+DeepSeek and OpenAI, under `generationConfig` for Gemini. **Anthropic drops sampling
+whenever thinking is on**, which is every Anthropic slot by default — the Messages API
+400s on a custom `temperature` under thinking, and thinking is the higher-value default.
+
+**`effort`.** Reasoning depth for models that take an effort parameter:
+
+| kind | field |
+|---|---|
+| anthropic (adaptive tier) | `output_config.effort` |
+| deepseek | `reasoning_effort` |
+| gemini | `thinkingLevel` (values align: `minimal`/`low`/`medium`/`high`) |
+| openrouter | `{"reasoning":{"effort":…}}`, forwarded verbatim |
+
+The value is a passthrough string the provider validates, like a model id, so a new
+level lands without a code change. Set a synth slot's `effort = "max"` or `"xhigh"` for
+heavier runs; OpenRouter is where those deeper rungs are reachable today. Ignored by
+models with no effort sink (budget-tier Anthropic, OpenAI).
+
+**`thinking_style`.** Forces the Anthropic thinking shape instead of the built-in
+classifier. `auto` picks adaptive for Opus 4.6+, Sonnet 4.6, and Fable 5, and
+enabled-budget for older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or
+misclassified model ships. A no-op for non-Anthropic kinds; an unknown value is a load
+error.
+
+**`call_deadline_secs`.** Whole-call wall-clock ceiling on an interactive
+`consult`/`explore`/`oneshot`, and the backstop for when the per-request
+`request_timeout` does not fire (a stalled response body, a pooled keep-alive to a
+wedged backend). Past it the call aborts with a clean tool-result error. Keep it above
+the largest `request_timeout` a call can reach so it never cuts a legitimately slow
+single completion; operators running a >30-minute local model should raise it.
+
+It bounds `consult`, `explore`, `oneshot`, and async `consult_submit`. Two in-process
+paths sit outside it by nature:
+
+- **`deliberate`'s direct lane** is one long completion, bounded instead by its synth
+  backend's `request_timeout` plus a small margin. A slow local `deliberate` gets its
+  full patience without forcing the interactive ceiling up to hours.
+- **The batch lane** holds no in-process wait at all. The work runs on the provider's
+  queue and is collected by polling `job_get`.
+
+**`explorer_max_turns` / `synth_max_turns`.** Available in `[defaults]` and per call
+only. They bound the loop, not the model.
+
+**`session_capacity` / `job_capacity`.** Both LRU, capacity-evicted, no TTL.
+`session_capacity` caps multi-turn consult sessions held in memory. `job_capacity` caps
+async-`consult` jobs (`consult_submit`), running plus finished-but-uncollected; evicting
+a still-running job aborts it. It is smaller because a held job result is heavier than a
+session's question/answer pair.
+
+**`inline_attach_budget`.** Cumulative byte budget for inlining `consult` text
+attachments into the driver prompt, consumed greedily in caller order. A text attachment
+past the remaining budget is *demoted*: named in the prompt with a read-it-whole
+directive instead of its bytes. Demotion is loud; nothing is dropped.
+
+`0` inlines nothing, turning every text attachment into a directive. That is the escape
+hatch for a small-context cast, such as a 4K-context local model that chokes on inlined
+bytes a hosted model absorbs without trouble.
+
+Inlined bytes ride every turn of the driver loop, so this bounds resident prompt cost,
+not just one request. The toolless tools (`oneshot`, `batch_submit`) are unaffected;
+with no shell to fall back on, they keep their own per-file and per-call caps.
 
 ### Built-in registry (the defaults)
 
-Five backends and five same-named single-backend casts ship **in code** and
-reproduce kaibo's historical behavior exactly, so a **missing config file is not
-an error**. The `openrouter` built-in defaults to **Qwen** — a family kaibo can't
-reach directly (DeepSeek, Gemini, and Anthropic each have their own keyed backend),
-so the gateway earns its keep with a distinct lineage for a genuine cross-family
-read. OpenRouter serves no `~qwen/*-latest` router alias (only anthropic / google /
-moonshotai / openai / x-ai get those), so the built-in pins the **undated** family
-ids — the most rot-resistant Qwen ids available, each tracking the newest
-point-release until the next `.x` bump. Explorer is the cheap multimodal
-`qwen/qwen3.6-flash`, with `vision` pinned on (the classifier defaults an
-`openrouter` slot to vision-off, since the gateway fronts blind and sighted models
-alike, but the flash is multimodal-in per OpenRouter's own catalog); synth is the
-flagship reasoner `qwen/qwen3.7-max`, which is **text-only**, so its slot takes no
-vision pin. (To keep vision on the synth, swap in the multimodal plus tier
-`qwen/qwen3.7-plus` and pin its vision on — a weaker reasoner, ~4.5× cheaper.) Two
-extra built-in casts ship for the
-offline batch lane —
-`gemini-batch` (synth Gemini Pro) and `anthropic-batch` (synth Claude Opus). Lane is
-a **per-slot** property, not a cast-level one: each carries a synth slot whose
-`lane = "batch"`, which staffs `batch_submit` *only*: the interactive tools
-(`consult`/`oneshot`) refuse a cast whose synth is on an offline lane, and
-`batch_submit` refuses a cast whose synth isn't specifically `lane = "batch"`, so a
-big offline-tuned model is never run interactively by accident (and vice versa). A
-`batch`-lane synth must sit on a batch-capable backend (Anthropic, Gemini, or a
-hosted OpenAI Platform backend — a local OpenAI-compatible server has no Batch API) —
-declaring `lane = "batch"` on a slot elsewhere is a loud load error, and so is a
-lane on an *explorer* slot (the explorer always runs interactively). Because lane
-lives on the slot, a cast MAY pair an interactive explorer with an offline synth —
-the built-in batch casts stay synth-only by choice (batch is toolless, so an
-explorer would be dead weight), not by a rule. `batch = true` at the cast level is
-backward-compat sugar: it sets the synth slot's `lane = "batch"`, nothing more —
-there's exactly one internal representation of lane (the slot field). The TOML
-*merges over* this registry by name: set one field on a built-in to retarget it (a
-slot's `lane` is sticky across a bare re-declaration of its model — retuning
-`gemini-batch`'s id leaves it batch), or add brand-new backends and casts. The
-built-in alias names register at **both** levels — as cast aliases (so
-`cast = "claude"` resolves) and backend aliases (so a slot ref `claude/<id>`
-resolves) — and are reserved: naming a new backend or cast after one is a loud
-collision error.
-
-A second offline lane, `lane = "direct"`, is also validated and rendered: one long
-completion kaibo drives itself against a big *local* model — no async provider API,
-just a slower plain call. It's reserved for offline deliberation over a model too
-slow for a live tool loop; no tool routes to a `direct` synth yet, so declaring one
-today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submit`.
+Five backends and five same-named single-backend casts ship in code, plus two batch
+casts. This is why a missing config file is not an error.
 
 | backend | kind | base_url | key env / file | aliases |
 |---|---|---|---|---|
@@ -327,9 +338,9 @@ today is forward-looking, not yet callable from `consult`/`oneshot`/`batch_submi
 | `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
 
-None of the built-ins set `wire` — it only matters for a new openai-kind backend
-whose endpoint isn't OpenAI Platform's own but should still take the Responses
-shape (`docs/config.example.toml`'s `[backends.gateway]`).
+No built-in sets `wire`. It matters only for a new openai-kind backend whose endpoint is
+not OpenAI Platform's own but should still take the Responses shape; see
+`[backends.gateway]` in `docs/config.example.toml`.
 
 | cast | explorer | synth | synth lane |
 |---|---|---|---|
@@ -341,10 +352,61 @@ shape (`docs/config.example.toml`'s `[backends.gateway]`).
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
 | `anthropic-batch` | — | `anthropic/claude-opus-4-8` | `batch` |
 
-### The chimera payoff
+**Why the `openrouter` built-in points at Qwen.** DeepSeek, Gemini, and Anthropic each
+have their own keyed backend, so the gateway earns its place by reaching a family kaibo
+cannot reach directly. OpenRouter serves no `~qwen/*-latest` router alias — only
+anthropic, google, moonshotai, openai, and x-ai get those — so the built-in pins undated
+family ids, which are the most rot-resistant Qwen ids available and track the newest
+point release until the next `.x` bump.
 
-The thing the fused profile couldn't say: each role on the backend that serves it
-best, selected as one name. Two extra openai-kind connections, one composed cast:
+The explorer `qwen/qwen3.6-flash` has `vision` pinned on: the classifier defaults an
+`openrouter` slot to vision-off because the gateway fronts blind and sighted models
+alike, but the flash is multimodal-in per OpenRouter's catalog. The synth
+`qwen/qwen3.7-max` is text-only and takes no vision pin. To keep vision on the synth,
+swap in `qwen/qwen3.7-plus` and pin its vision on — a weaker reasoner, roughly 4.5×
+cheaper.
+
+**Merging.** The TOML merges over this registry by name. Set one field on a built-in to
+retarget it, or add new backends and casts. A slot's `lane` is sticky across a bare
+re-declaration of its model, so retuning `gemini-batch`'s id leaves it on the batch lane.
+
+**Reserved aliases.** Built-in alias names register at both levels — as cast aliases, so
+`cast = "claude"` resolves, and as backend aliases, so a slot reference `claude/<id>`
+resolves. Naming a new backend or cast after one is a collision error.
+
+### Lanes
+
+`lane` is a **per-slot** property, not a cast-level one.
+
+| lane | meaning | staffs |
+|---|---|---|
+| *(unset)* | interactive | `consult`, `explore`, `oneshot`, `consult_submit` |
+| `batch` | a provider batch API job | `batch_submit`, `deliberate` |
+| `direct` | one long completion kaibo drives itself | `deliberate` |
+
+Rules:
+
+- The interactive tools refuse a cast whose synth is on an offline lane, and
+  `batch_submit` refuses a cast whose synth is not specifically `lane = "batch"`. A big
+  offline-tuned model is never run interactively by accident, and the reverse.
+- A `batch`-lane synth must sit on a batch-capable backend: Anthropic, Gemini, or a
+  hosted OpenAI Platform backend. A local OpenAI-compatible server has no Batch API, so
+  declaring `lane = "batch"` on a slot elsewhere is a load error.
+- A lane on an `explorer` slot is a load error. The explorer always runs interactively.
+- Because lane lives on the slot, a cast may pair an interactive explorer with an
+  offline synth. That shape is what staffs `deliberate`. The built-in batch casts stay
+  synth-only by choice, since batch is toolless and an explorer would be dead weight.
+- `batch = true` at the cast level is backward-compatible sugar. It sets the synth
+  slot's `lane = "batch"` and nothing else; there is one internal representation of lane.
+
+`lane = "direct"` runs one long completion against a big local model with no async
+provider API involved, for offline deliberation over a model too slow for a live tool
+loop.
+
+### Cross-backend casts
+
+Each role on the backend that serves it best, selected under one name. Two extra
+openai-kind connections and one composed cast:
 
 ```toml
 [backends.gpt]
@@ -363,30 +425,33 @@ explorer = "llama/qwen2.5-coder-7b"     # sweeps stay local and free
 synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
 ```
 
-`cast = "mixed"`, `cast = "gpt"` (if you define it), and the built-in
-`cast = "anthropic"` all walk the same resolution: each slot becomes an *arm* —
-client on the slot's backend, request shape fit to the slot's model and tunables —
-so a cast whose explorer and synth straddle any capability line (different kinds,
-even) is fit per-arm by construction.
+Every cast resolves the same way: each slot becomes an *arm*, with a client on the
+slot's backend and a request shape fit to the slot's model and tunables. A cast whose
+explorer and synth straddle a capability line, or sit on different kinds entirely, is fit
+per arm by construction.
 
-## Three surfaces that line up
+## Precedence and the three surfaces
 
-Precedence, highest wins:
+Highest wins:
 
 ```
 MCP per-call input  >  CLI flag  >  env var  >  config file  >  built-in default
 ```
 
-Per-call input is the `cast` / `*_model` / `*_backend` / `*_max_turns` tool args —
-the config supplies the *defaults those override*. A per-call model override is a
-model id sent *verbatim* (an id containing `/`, HuggingFace-style, is still one
-id — it is never parsed for a backend, so an org prefix matching a backend alias
-can't silently retarget the call); it swaps the id within the configured slot,
-dropping its pins and per-slot tunables — they described the configured model;
-the new id classifies fresh. The matching backend arg (`explorer_backend` /
-`synth_backend` on consult, `backend` on oneshot) retargets the slot
-to another backend (a call-time chimera: aliases resolve, and it works even on a
-role the cast doesn't carry). The naming rule for everything else is mechanical:
+**Per-call input** is the `cast`, `*_model`, `*_backend`, and `*_max_turns` tool
+arguments. The config supplies the defaults those override.
+
+**A per-call model override** sends the model id verbatim. An id containing `/`
+(HuggingFace style) is still one id: it is never parsed for a backend, so an org prefix
+matching a backend alias cannot silently retarget the call. The override swaps the id
+within the configured slot and drops that slot's pins and tunables, which described the
+configured model; the new id classifies fresh.
+
+**A per-call backend override** (`explorer_backend` / `synth_backend` on consult,
+`backend` on oneshot) retargets the slot to another backend. Aliases resolve, and it
+works even on a role the cast does not carry.
+
+Everything else follows one naming rule:
 
 > config key `foo_bar`  ⇄  env `KAIBO_FOO_BAR`  ⇄  CLI `--foo-bar`
 
@@ -436,22 +501,21 @@ role the cast doesn't carry). The naming rule for everything else is mechanical:
 | consult system prompt | `prompts.consult` *(file-only — full replace)* | — | — |
 | oneshot system prompt | `prompts.oneshot` *(file-only — full replace)* | — | — |
 
-**Two deliberate exceptions to the rule:**
+**Two exceptions to the naming rule:**
 
 - **Provider key vars stay native.** `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
-  `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` are *not* renamed to
-  `KAIBO_*` — people and CI expect those names. A backend points at one via
+  `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `OPENAI_API_KEY` are not renamed to
+  `KAIBO_*`, because people and CI expect those names. A backend points at one via
   `api_key_env`.
-- **`OPENAI_BASE_URL` is kept** as a back-compat override for any openai-kind
-  backend that doesn't set an explicit `base_url` (it's what's wired today). New
-  backends use the `base_url` config key instead.
+- **`OPENAI_BASE_URL` is kept** as a backward-compatible override for any openai-kind
+  backend with no explicit `base_url`. New backends use the `base_url` config key.
 
-`RUST_LOG` is kept (tracing's own convention) and takes precedence; `KAIBO_LOG` and
-the `server.log` config key are the lower-precedence ways to set the same filter.
+`RUST_LOG` follows tracing's own convention and takes precedence. `KAIBO_LOG` and the
+`server.log` config key set the same filter at lower precedence.
 
 ### Tombstones (the `provider` spellings)
 
-The rename map ships as loud errors, never silent reinterpretation:
+The rename map ships as load errors, never silent reinterpretation:
 
 | old spelling | what happens now |
 |---|---|
@@ -461,11 +525,54 @@ The rename map ships as loud errors, never silent reinterpretation:
 | `--provider` | rejected by clap (unknown flag) |
 | call arg `provider` | unknown-field error (`deny_unknown_fields`) — the alias is gone |
 
-The call-arg `provider` alias was the one survivor for a single cycle after the
-rename: serde drops unknown fields, so without it a client still sending
-`provider` would have been *silently ignored* into the default cast — a textbook
-silent fallback. That cycle is over; the alias is removed and a stale `provider`
-is now a loud invalid-params error like every other tombstone above.
+The call-argument `provider` alias survived one cycle after the rename. serde drops
+unknown fields, so without the alias a client still sending `provider` would have been
+silently ignored into the default cast. That cycle is over: the alias is removed, and a
+stale `provider` is now an invalid-params error like every other tombstone above.
+
+## Tool gating
+
+A tool clears **two** gates to be advertised: the `[server.tools]` flag (equivalently
+`--no-<tool>` or `KAIBO_NO_<TOOL>`), and a configured cast that can **staff** it.
+
+A tool nothing can staff has its route removed rather than shipping unusable. The calling
+agent never sees a tool whose every call would fail, and an unusable tool stops costing
+resident tokens in every session.
+
+Which cast shape staffs which tool:
+
+| tool | needs |
+|---|---|
+| `consult`, `consult_submit`, `oneshot` | a cast whose synth answers **interactively** (no offline lane) |
+| `explore` | a cast with an `explorer` slot |
+| `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
+| `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
+| `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
+| `run_kaish`, `list_models` | no cast at all; always advertised |
+
+**Default installs.** This affects one tool. No built-in cast pairs an explorer with an
+offline synth — the two built-in offline casts, `anthropic-batch` and `gemini-batch`, are
+synth-only — so `deliberate` is not advertised until you configure a cast carrying both
+slots. The DELIBERATE casts section of `docs/config.example.toml` is the worked example.
+Any of the three hosted batch providers serves, as does a big local model on the `direct`
+lane, which needs no batch API.
+
+The eligibility predicates live in one table in `src/server/mod.rs` (`CAST_ENUM_RULES`),
+which also feeds each surviving tool's `cast` enum. The tools advertised and the casts they
+offer are one computation, so they cannot disagree.
+
+### Finding out why a tool is missing
+
+Removing the route is right for the model's tool list and wrong for the operator, so the
+reason is reported twice:
+
+- **A startup warning** names the cast shape that would bring the tool back.
+- **`kaibo://config`'s `[runtime]` section** lists `advertised_tools` (what the server
+  serves) and `unstaffable_tools` (each held-back tool mapped to the same requirement
+  text).
+
+`unstaffable_tools` omits tools the operator switched off. "You disabled it" and "nothing
+can run it" are different answers, and `[tools]` already reports the first.
 
 ## File location & loading
 
@@ -478,30 +585,32 @@ $XDG_CONFIG_HOME/kaibo/config.toml      # default
 ~/.config/kaibo/config.toml             # when XDG_CONFIG_HOME unset
 ```
 
-Loading rules, in the spirit of "crashing beats silent corruption":
+Loading rules follow "crash rather than corrupt":
 
-- **Missing file → built-in defaults, no error.** kaibo works out of the box.
-- **Malformed TOML, an unknown key (including a typo'd role or per-slot knob), a
-  `base_url` on a keyed kind, an unknown backend in a slot, an empty model id, an
-  out-of-range sampling value, an inverted `thinking_budget`/`max_tokens` pair on
-  a thinking-kind slot, an alias collision, or an unresolvable `server.cast` →
-  hard error at startup**, non-zero exit, before `serve()`. We do not silently
-  drop a setting the user clearly meant — a typo'd knob that quietly does nothing
-  is the failure mode we refuse.
-- **An explicit `--config`/`KAIBO_CONFIG` path that doesn't exist → hard error.**
-  Only the *default* XDG path is allowed to be absent.
-- Keys are still resolved **lazily at call time** (a missing key for an unused
-  backend isn't fatal at startup). Startup validation of *which backends are
-  usable* is tracked separately in `docs/issues.md`.
+| condition | result |
+|---|---|
+| default XDG path absent | built-in defaults, no error |
+| explicit `--config` / `KAIBO_CONFIG` path absent | hard error at startup |
+| malformed TOML, or any validation failure below | hard error at startup, non-zero exit, before `serve()` |
+| missing key for an unused backend | not fatal; keys resolve lazily at call time |
 
-Project-local layering (a repo-root `.kaibo.toml` merged over the user config) is a
-plausible later layer — noted, not in this cut.
+Validation failures that abort startup: an unknown key, including a misspelled role or
+per-slot knob; a `base_url` on a keyed kind; an unknown backend in a slot; an empty
+model id; an out-of-range sampling value; an inverted `thinking_budget`/`max_tokens`
+pair on a thinking-kind slot; an alias collision; an unresolvable `server.cast`.
+
+A setting the operator clearly meant is never silently dropped. A misspelled knob that
+quietly does nothing is the failure mode these rules exist to prevent.
+
+Startup validation of *which backends are usable* is tracked separately in
+`docs/issues.md`. Project-local layering (a repo-root `.kaibo.toml` merged over the user
+config) is a plausible later addition, not implemented.
 
 ## Telemetry (OpenTelemetry traces)
 
-**Off by default, and that default is load-bearing.** kaibo reads a private
-codebase, and the spans `rig-core` emits carry prompts, completions, and source
-snippets. A default run must ship *nothing* off-box, so `[telemetry]` is opt-in:
+**Off by default.** kaibo reads a private codebase, and the spans `rig-core` emits carry
+prompts, completions, and source snippets. A default run ships nothing off-box, so
+`[telemetry]` is opt-in.
 
 ```toml
 [telemetry]
@@ -512,33 +621,37 @@ service_name = "kaibo"                             # service.name on the trace R
 headers = { authorization = "Bearer <token>" }     # file-only; values are secrets
 ```
 
-What you get is the GenAI trace tree rig already produces — a tool call →
-`run_phase` per phase → `invoke_agent` → a `chat` span per model turn (with
-`gen_ai.request.model` and every `gen_ai.usage.*` token count). On top of that,
-kaibo adds the named parent spans (`consult` / `oneshot` /
-`run_kaish`) that root each trace, **and a `tool` span per tool invocation**
-(`tool_span.rs`) carrying `gen_ai.tool.name` and an ok/err `outcome` — so you can
-query *which* tool the model actually called (`run_kaish`, `view_image`, the nested
-`explore′`), not just that a turn happened. rig's own per-tool instrumentation
-isn't reliably queryable across backends, so this is kaibo's, on kaibo's tools. The
-exporter ships the rest. Transport is OTLP/HTTP + protobuf (the `/v1/traces` path),
-reusing kaibo's `reqwest` — no gRPC, no second HTTP stack.
+**What you get.** The GenAI trace tree rig produces — a tool call → `run_phase` per
+phase → `invoke_agent` → a `chat` span per model turn, carrying `gen_ai.request.model`
+and every `gen_ai.usage.*` token count. kaibo adds:
 
-**The boundary this draws.** Enabling opens an **outbound** OTLP connection to
-`endpoint`. That's allowed under kaibo's stdio-only invariant — kaibo can read a
-filesystem, so it must never *bind* a socket, but reaching *out* to a collector is
-not binding. Keep `endpoint` local (the default `localhost:4318`) unless you mean
-to send traces — with full content — to a remote. Header **values** are secrets and
-never appear in the `kaibo://config` render (only the header *names* do, like an
-API-key env-var name). Logs continue to ride the `tracing` → stderr + MCP
-`notifications/message` path regardless; telemetry adds the *traces* signal only.
+- The named parent spans (`consult`, `oneshot`, `run_kaish`) that root each trace.
+- A `tool` span per tool invocation (`tool_span.rs`) carrying `gen_ai.tool.name` and an
+  ok/err `outcome`, so a query can name *which* tool the model called (`run_kaish`,
+  `view_image`, the nested `explore′`), not just that a turn happened. rig's own
+  per-tool instrumentation is not reliably queryable across backends.
+
+Transport is OTLP/HTTP with protobuf on the `/v1/traces` path, reusing kaibo's
+`reqwest`. No gRPC and no second HTTP stack.
+
+**Boundary.** Enabling opens an **outbound** OTLP connection to `endpoint`. This is
+allowed under kaibo's stdio-only invariant: kaibo can read a filesystem, so it must never
+*bind* a socket, but reaching out to a collector is not binding. Keep `endpoint` local
+(the default `localhost:4318`) unless you intend to send traces, with full content, to a
+remote.
+
+Header **values** are secrets and never appear in the `kaibo://config` render; only the
+header *names* do, like an API-key env-var name.
+
+Logs continue to ride the `tracing` → stderr + MCP `notifications/message` path
+regardless. Telemetry adds the traces signal only.
 
 ## Persistence: `[persistence]`
 
-**On by default.** kaibo keeps a small state db so a `consult` session thread and the
-provider batch handles you launch **survive a server restart** and are shared across
-front doors (start a session over MCP, continue it from the CLI). It lives at a fixed
-XDG state path, never a path a model controls:
+**On by default.** kaibo keeps a small state db so `consult` session threads and
+provider batch handles survive a server restart and are shared across front doors — a
+session started over MCP continues from the CLI. It lives at a fixed XDG state path,
+never a path a model controls.
 
 ```toml
 [persistence]
@@ -550,57 +663,60 @@ CLI/env: `--no-persistence` / `KAIBO_NO_PERSISTENCE` disable it (in-memory, like
 `--state-db <FILE>` / `KAIBO_STATE_DB` move the db. `path` is `$VAR`/`~`-expanded like
 `root`/`allow_paths`.
 
-**What persists:** the lean `(question, answer)` turns of each session (capacity-evicted,
-no TTL — same as the in-memory store), and the `{backend, provider-id, label}` of each
-batch you submit (so `job_list` can re-surface a handle after a restart). **What never
-persists:** background *consult/deliberate* job handles (`job-N` — in-memory, session-only
-by design) and exploration reports (ephemeral by design — they'd be stale bloat). Its
-content is model output, never anything the calling model steers onto disk — and because
-that output is **what you paid for**, kaibo treats the db as your data: it never removes
-the file, under any error, so moving it aside is always your decision.
+**Contents.**
 
-**Read-only toward your project is unchanged.** The store is handler-side, at the XDG
-path — kaish's read-only sandbox never sees it, kaibo still writes nothing into any
-project, and `open` **refuses a state-db path that resolves inside an allowed tree** (so
-it can't be pointed into a repo). See the "Read-only is the product" invariant in
-AGENTS.md.
+| persists | never persists |
+|---|---|
+| the `(question, answer)` turns of each session (capacity-evicted, no TTL, same as the in-memory store) | background consult/deliberate job handles (`job-N`), which are in-memory and session-only by design |
+| the `{backend, provider-id, label}` of each submitted batch, so `job_list` can re-surface a handle after a restart | exploration reports, which would be stale bloat |
 
-**Host-agent sandboxes still matter.** kaibo's inner model-facing shell is read-only, but
-your MCP client or calling agent may also sandbox the kaibo process itself. If that host
-sandbox blocks network, model-backed tools cannot reach providers. If it blocks writes to
-the XDG state dir, a long-lived MCP server with persistence enabled fails during startup.
+Everything stored is model output. Nothing the calling model steers reaches disk. Because
+that output is what you paid for, kaibo treats the db as your data and never removes the
+file under any error; moving it aside is your decision.
+
+**Read-only toward your project is unchanged.** The store is handler-side at the XDG
+path. kaish's read-only sandbox never sees it, kaibo writes nothing into any project, and
+`open` refuses a state-db path that resolves inside an allowed tree, so it cannot be
+pointed into a repo. See the "Read-only is the product" invariant in AGENTS.md.
+
+**Host-agent sandboxes.** kaibo's inner model-facing shell is read-only, but your MCP
+client or calling agent may also sandbox the kaibo process itself.
+
+- A host sandbox that blocks network prevents model-backed tools from reaching providers.
+- A host sandbox that blocks writes to the XDG state dir fails a long-lived MCP server
+  during startup when persistence is enabled.
+
 Grant the host sandbox outbound network and a narrow writable root for kaibo's state dir,
-or move the db with `--state-db` / `KAIBO_STATE_DB` / `[persistence] path`. For multi-agent
-setups, a per-client state db is often cleaner than sharing one history file across Claude
-Code, Codex, and other agents. Apply the same judgment to the media CAS when an
-artifact-producing tool is enabled: the default XDG data path is convenient for sharing
-generated artifacts across agents, while a per-client CAS keeps those artifacts separated.
+or move the db with `--state-db` / `KAIBO_STATE_DB` / `[persistence] path`. In
+multi-agent setups a per-client state db is often cleaner than sharing one history file
+across Claude Code, Codex, and other agents. The same judgment applies to the media CAS
+when an artifact-producing tool is enabled: the default XDG data path is convenient for
+sharing generated artifacts across agents, while a per-client CAS keeps them separated.
 
-**Loud on failure, never a silent fallback.** If the store can't open (a bad path, a db
-inside a project, a network mount — turso's multiprocess mode is 64-bit-Unix + local-fs
-only), kaibo **fails to start** with an error naming the escape hatch and leaving the db
-untouched — rather than quietly dropping to memory and losing your sessions on the next
-restart.
+**Failure is loud.** If the store cannot open — a bad path, a db inside a project, a
+network mount (turso's multiprocess mode is 64-bit Unix plus local filesystem only) —
+kaibo fails to start with an error naming the escape hatch, leaving the db untouched. It
+does not drop to memory and lose your sessions at the next restart.
 
-**One exception, Windows only.** On Windows (and other non-64-bit-Unix targets) the store
-is single-process. A *second* kaibo opening the same db — a second editor window — would,
-under an MCP client that auto-restarts its servers, crash-loop if this were fatal. So that
-one case (`SingleProcessLocked`) is the deliberate carve-out: kaibo **warns loudly and
-serves with in-memory sessions** for that run instead of crashing. It's not silent — the
-startup log says so, and `kaibo://config` shows `persistence.active = false` (with
-`enabled = true`) so the calling model can see durability is off. Close the other kaibo,
-point `--state-db` elsewhere, or `--no-persistence` to make it explicit. Every *other*
-open failure stays fatal.
+**One exception, Windows only.** On Windows and other non-64-bit-Unix targets the store is
+single-process. A second kaibo opening the same db, such as a second editor window, would
+crash-loop under an MCP client that auto-restarts its servers. So `SingleProcessLocked` is
+the one carve-out: kaibo warns and serves with in-memory sessions for that run.
+
+It is not silent. The startup log says so, and `kaibo://config` shows `persistence.active
+= false` alongside `enabled = true`, so the calling model can see that durability is off.
+Close the other kaibo, point `--state-db` elsewhere, or pass `--no-persistence` to make it
+explicit. Every other open failure stays fatal.
 
 ## House rules: `[context]`
 
-kaibo's models are *for other agents*, so it helps when they inherit the calling
-agent's conventions. `[context]` names files whose contents are spliced into each
-consultation tool's preamble (the system prompt) as standing guidance — an
-`AGENTS.md`, a shared user guidance file, whatever you call yours. **Vendor-
-neutral:** no filename is hardcoded in the product; the only default is the
-emerging cross-tool `AGENTS.md` convention, and that's just a config default you
-can change or turn off.
+kaibo's models work for other agents, so they benefit from inheriting the calling agent's
+conventions. `[context]` names files whose contents are spliced into each consultation
+tool's preamble (the system prompt) as standing guidance: an `AGENTS.md`, a shared user
+guidance file, or whatever your project uses.
+
+No filename is hardcoded in the product. The only default is the cross-tool `AGENTS.md`
+convention, and that is a config default you can change or turn off.
 
 ```toml
 [context]
@@ -613,37 +729,42 @@ project_files = ["AGENTS.md", "docs/CONVENTIONS.md"]
 user_files = ["~/.config/kaibo/agent-guidance.md"]
 ```
 
-Two lists, two deliberately different failure semantics:
+Two lists with different failure semantics:
 
-- **`project_files`** are root-relative and **read-if-present**: a repo with no
-  `AGENTS.md` is the normal case, not an error. Each is joined to the resolved
-  project root and canonicalize-checked to stay *within* it — a configured `../`
-  or an out-of-tree symlink is refused, so the same containment that bounds the
-  read-only shell bounds what gets injected.
-- **`user_files`** are **read-required**: you named the file on purpose, so a
-  missing one is a loud error rather than a silent skip that ships an answer
-  missing the guidance you were counting on.
+| list | paths | missing file |
+|---|---|---|
+| `project_files` | root-relative | normal; read if present |
+| `user_files` | absolute or `~` | startup-visible error |
 
-**The trust boundary** (why `user_files` may sit outside the allowed set): these
-files are read in trusted server-side Rust at the tool handler — the same trust
-level as `config.toml` itself — and only their *contents* reach the model, never
-the path. The read-only kaish shell still cannot reach the user guidance path; the model's
-read scope is *not* widened. That's the distinction from `[server] allow_paths`
-below: `allow_paths` widens what the *model* can explore, `[context]` injects
-fixed operator text the model never navigates to.
+`project_files` are joined to the resolved project root and canonicalize-checked to stay
+within it. A configured `../` or an out-of-tree symlink is refused, so the containment
+that bounds the read-only shell also bounds what gets injected. A repo with no `AGENTS.md`
+is the normal case.
 
-Injected into the codebase-reading phases — the `consult` driver *and* its nested
-`explore′` sweep — so the cheap explorer orients on the same `AGENTS.md`/user guidance
-while it searches, not just at answer time (the block names where things live and
-what matters). Precedence is the usual per-call > CLI > env > file > built-in: a
-CLI `--project-context-file` replaces lower layers additively (the CLI can't
-express "empty"; opt out with an empty `[context] project_files = []` or
-`KAIBO_PROJECT_FILES=`).
+`user_files` are read-required: you named the file on purpose, so a missing one is an
+error rather than a silent skip that ships an answer without the guidance you counted on.
+
+**Trust boundary.** `user_files` may sit outside the allowed set because these files are
+read in trusted server-side Rust at the tool handler, at the same trust level as
+`config.toml` itself, and only their *contents* reach the model, never the path. The
+read-only kaish shell still cannot reach the user guidance path; the model's read scope is
+not widened.
+
+This is the distinction from `[server] allow_paths` below. `allow_paths` widens what the
+*model* can explore; `[context]` injects fixed operator text the model never navigates to.
+
+**Where it lands.** The codebase-reading phases — the `consult` driver and its nested
+`explore′` sweep — so the cheap explorer orients on the same guidance while it searches,
+not only at answer time.
+
+**Precedence** is the usual per-call > CLI > env > file > built-in. A CLI
+`--project-context-file` replaces lower layers additively. The CLI cannot express "empty";
+opt out with `[context] project_files = []` or `KAIBO_PROJECT_FILES=`.
 
 ## System prompts: `[prompts]`
 
-Where `[context]` *adds* project guidance, `[prompts]` *replaces* the built-in
-role framing — the system prompt each phase runs under. One override per phase:
+`[context]` *adds* project guidance. `[prompts]` *replaces* the built-in role framing,
+which is the system prompt each phase runs under. One override per phase:
 
 ```toml
 [prompts]
@@ -663,34 +784,34 @@ Prefer architectural answers; name the file:line that carries each claim.
 | `oneshot` | `oneshot_preamble` | the thin, toolless `oneshot` |
 | `batch` | `batch_preamble` | the offline, max-thinking `batch_submit` |
 
-**Full replace, by decision.** An override *is* the role framing, verbatim — kaibo
-does not re-wrap it. That's safe because the kaish operating contract (how to drive
-the read-only shell, the exit-code meanings, the `cat -n`/`grep -rn` idioms) rides the
-`run_kaish` *tool description* independently, so the model keeps the shell contract
-even when you rewrite the prose. What an override *does* drop is the tuned role
-framing kaibo ships — the explorer's "report, don't conclude", the synth's "trust a
-grounded citation, reach for more", the positive-framing discipline weak/local
-models lean on. That's yours to own when you override.
+**Full replace.** An override *is* the role framing, verbatim; kaibo does not re-wrap it.
+This is safe because the kaish operating contract — how to drive the read-only shell, the
+exit-code meanings, the `cat -n` and `grep -rn` idioms — rides the `run_kaish` tool
+description independently, so the model keeps the shell contract even when you rewrite the
+prose.
 
-**Orthogonal to `[context]`.** House rules still append on top of an override:
-`[prompts]` sets the *role*, `[context]` adds the *project's* conventions, and both
-land in the final system prompt. Layering order is `override-or-built-in` →
-`+ house rules`.
+An override does drop the tuned role framing kaibo ships: the explorer's "report, don't
+conclude", the synth's "trust a grounded citation, reach for more", and the
+positive-framing discipline that weaker and local models depend on. That becomes yours to
+own.
 
-**File-only, and operator-only.** Multiline prose has no clean env/CLI form (the
-same call `telemetry.headers` makes), so overrides live only in `config.toml`. They
-are *not* a per-call tool argument — a calling agent can't inject a system prompt;
-only the operator who owns the config can. An empty or whitespace-only override is
-a **loud load error** (a blank system prompt is never intended) — remove the key to
-fall back to the built-in.
+**Orthogonal to `[context]`.** House rules still append on top of an override.
+`[prompts]` sets the role, `[context]` adds the project's conventions, and both land in
+the final system prompt. Layering order is `override-or-built-in` → `+ house rules`.
+
+**File-only and operator-only.** Multiline prose has no clean env or CLI form, the same
+constraint `telemetry.headers` has, so overrides live only in `config.toml`. They are not
+a per-call tool argument: a calling agent cannot inject a system prompt, only the operator
+who owns the config can. An empty or whitespace-only override is a load error, since a
+blank system prompt is never intended. Remove the key to fall back to the built-in.
 
 ### Per-model overrides (the slot `preamble`)
 
-`[prompts]` is keyed by *phase* (the job). A prompt can also be keyed by *model*,
-because the same phase may run different models — a local Gemma explorer wants
-different framing than a Claude Haiku one (kaibo's request shaping is already
-model-aware; the prose is too). The per-model knob is `preamble` on the cast's
-**slot**, beside `effort`/`thinking_style`:
+`[prompts]` is keyed by *phase*, meaning the job. A prompt can also be keyed by *model*,
+because the same phase may run different models: a local Gemma explorer wants different
+framing than a Claude Haiku one. kaibo's request shaping is already model-aware, and the
+prose can be too. The per-model knob is `preamble` on the cast's **slot**, beside
+`effort` and `thinking_style`:
 
 ```toml
 [casts.local]
@@ -698,31 +819,32 @@ explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "You ar
 synth    = "anthropic/claude-sonnet-4-6"   # no per-model prompt; uses [prompts] or built-in
 ```
 
-**Precedence, per phase:** `slot.preamble` → `[prompts].<phase>` → built-in. The
-slot (most specific — *this* model in *this* cast) wins, the same way `effort`
-overrides the `[defaults]` effort. Set neither and the built-in runs.
+**Precedence, per phase:** `slot.preamble` → `[prompts].<phase>` → built-in. The slot is
+most specific (this model in this cast) and wins, the same way a slot `effort` overrides
+the `[defaults]` effort. Set neither and the built-in runs.
 
-**One model, two synth jobs.** The synth slot's model plays *both* the `consult`
-driver and the toolless `oneshot`, so its `preamble` feeds both — but each phase
-resolves under its own key, so they stay **independently overridable**: a copy today
-(both the synth slot's voice), free to diverge by setting `[prompts].consult` and
-`[prompts].oneshot` separately. `slot.preamble` = "this model's voice"; the phase
-keys = "this job's framing." The explorer has one job, so no ambiguity. A per-call
-model override (a bare slot) carries no `preamble` — overriding the model doesn't
-drag the configured slot's framing along. Same loud-on-empty rule as `[prompts]`.
+**One model, two synth jobs.** The synth slot's model runs both the `consult` driver and
+the toolless `oneshot`, so its `preamble` feeds both. Each phase resolves under its own
+key, so they remain independently overridable: identical by default, free to diverge by
+setting `[prompts].consult` and `[prompts].oneshot` separately. Read `slot.preamble` as
+"this model's voice" and the phase keys as "this job's framing". The explorer has one job,
+so no ambiguity arises.
 
-`batch_submit` runs the synth model too, but deliberately does **not** inherit the
-synth slot's `preamble`: its lane has a distinct behavioral contract (one offline
-response, no follow-up, spend on depth) that a slot preamble written for interactive
-synth would silently replace. Tune batch through `[prompts].batch` (or accept the
-built-in `batch_preamble`); the slot preamble stays scoped to the interactive phases.
+A per-call model override (a bare slot) carries no `preamble`. Overriding the model does
+not drag the configured slot's framing along. The empty-value load error applies here too.
+
+**`batch_submit` does not inherit the slot `preamble`.** It runs the synth model, but its
+lane has a distinct behavioral contract — one offline response, no follow-up, spend on
+depth — that a slot preamble written for interactive synth would silently replace. Tune
+batch through `[prompts].batch`, or accept the built-in `batch_preamble`. The slot
+preamble stays scoped to the interactive phases.
 
 ## Repo orientation: `[orientation]`
 
-A static, computed-once **file map** injected into the exploring preamble, so a
-model starts *knowing* the project's files instead of spending its first turns on
-`glob`/`ls`/`find` to discover the layout (the structure-first lesson from
-Agentless/Aider, made free — no model in the loop).
+A static, computed-once file map injected into the exploring preamble, so a model starts
+knowing the project's files instead of spending its first turns on `glob`, `ls`, and
+`find` to discover the layout. This is the structure-first approach from Agentless and
+Aider, with no model in the loop.
 
 ```toml
 [orientation]
@@ -731,63 +853,68 @@ full_list_max_files = 256    # ≤ this → inject the full file list; above →
 tree_max_depth = 4           # how deep the fallback directory map descends
 ```
 
-How it works: the server runs the kernel's **own** `glob -a --json '**/*'` server-side
-per `explore`/`consult` call — the *same* ignore-aware enumeration the model's shell
-would get (same VFS, same ignore rules), so the map can't disagree with what the
-explorer's own `glob`/`grep` sees. `-a` includes hidden config (`.github/`, `.cargo/`);
-the ignore filter still drops `.git`/`target`.
+**How it is built.** The server runs the kernel's own `glob -a --json '**/*'`
+server-side per `explore` and `consult` call. This is the same ignore-aware enumeration
+the model's shell would get, on the same VFS under the same ignore rules, so the map
+cannot disagree with what the explorer's own `glob` and `grep` see. `-a` includes hidden
+config such as `.github/` and `.cargo/`; the ignore filter still drops `.git` and
+`target`.
 
-Size-gated, with a graceful descent — orientation is an *enhancement* (the model always
-has `glob`/`grep`/`explore′`), so its absence is never fatal and the call is never refused
-for being large:
-- **≤ `full_list_max_files`** → the complete file list is spliced in.
-- **above it** → a **directory map**: the same files folded into a depth-limited tree of
-  `dir/  N files` lines, descending `tree_max_depth` levels (deeper files stay counted at
-  the deepest shown directory). The names are traded for structure; the model recovers them
-  with `glob 'DIR/**/*'` / `grep -rn`.
-- **above it *and* the directory map would itself exceed `full_list_max_files` lines** (a very
-  large or very wide repo) → a short **discover-as-you-go note** naming the discovery tools.
-  Skipped maps are logged (`tracing::warn`), not silent.
+**Size gating.** Orientation is an enhancement — the model always has `glob`, `grep`, and
+`explore′` — so its absence is never fatal and no call is refused for being large.
 
-`full_list_max_files = 0` is a load error (it would refuse every repo — disable instead), as is
-`tree_max_depth = 0` (it would render an empty map).
+| repo size | injected |
+|---|---|
+| ≤ `full_list_max_files` | the complete file list |
+| above it | a directory map: the same files folded into a depth-limited tree of `dir/  N files` lines, descending `tree_max_depth` levels |
+| above it, and the directory map would itself exceed `full_list_max_files` lines | a short discover-as-you-go note naming the discovery tools |
 
-It rides the **exploring** phases only — the `consult` driver and its nested
-`explore′` sweep. The toolless `oneshot` reads no project, so it gets no map. Like
-`[context]`, the block re-sends each turn, which the size gate
-keeps bounded. Whether it actually erases the discovery turns is measurable via the
-per-tool `tool` spans (see Telemetry).
+In the directory map, files deeper than `tree_max_depth` stay counted at the deepest shown
+directory. Names are traded for structure, and the model recovers them with `glob
+'DIR/**/*'` or `grep -rn`. A skipped map is logged at `warn`, not silent.
+
+`full_list_max_files = 0` is a load error, since it would refuse every repo; disable the
+block instead. `tree_max_depth = 0` is a load error, since it would render an empty map.
+
+**Scope.** The exploring phases only: the `consult` driver and its nested `explore′`
+sweep. The toolless `oneshot` reads no project and gets no map. Like `[context]`, the
+block re-sends each turn, which the size gate keeps bounded. Whether it erases discovery
+turns in practice is measurable through the per-tool `tool` spans (see Telemetry).
 
 ## Path containment
 
-**Always on.** Every tool call's `path` argument (or the default root when `path`
-is omitted) is resolved — `std::fs::canonicalize` expands symlinks and collapses `..`
-— and then checked against the **allowed set**. A path that doesn't fall at-or-under
-one of the allowed trees is `invalid_params`, naming the allowed trees and the three
-knobs that widen them.
+**Always on.** Every tool call's `path` argument, or the default root when `path` is
+omitted, is resolved with `std::fs::canonicalize` (expanding symlinks and collapsing
+`..`) and then checked against the **allowed set**. A path that does not fall at or under
+one of the allowed trees is `invalid_params`, naming the allowed trees and the three knobs
+that widen them.
 
-**The allowed set** is constructed at startup from the canonicalized `--root` plus
-every canonicalized `--allow-path`, plus the canonicalized launch cwd — unless `--root`
-named a project, or `--no-cwd` opted out. MCP clients start stdio servers with cwd =
-workspace, so the zero-config case scopes itself to the project naturally, without any
-operator action.
+**The allowed set** is constructed at startup from the canonicalized `--root`, every
+canonicalized `--allow-path`, and the canonicalized launch cwd — the last unless `--root`
+named a project or `--no-cwd` opted out. MCP clients start stdio servers with cwd set to
+the workspace, so the zero-config case scopes itself to the project with no operator
+action.
 
-**`--allow-path` is additive.** It widens the boundary and never narrows it: adding one
-does *not* cost you the cwd, because reaching one more tree should never evict the
-workspace your question is about. Naming a `--root` is different — that is you choosing
-the project, so the cwd is not added beside it. When you want the allowed set to be
-exactly what you named, say so with `--no-cwd` (`KAIBO_NO_CWD`, `[server] infer_cwd =
-false`); every call must then pass its own `path`. The default isn't silent: the resolved allowed set is reported in a startup
-log line and in the `## Scope` section of the server's MCP `instructions` (visible in
-every `initialize` response), and at `kaibo://config`.
+**`--allow-path` is additive.** It widens the boundary and never narrows it. Adding one
+does not cost you the cwd, because reaching one more tree should not evict the workspace
+the question is about. `--root` behaves differently: naming it is choosing the project, so
+the cwd is not added beside it.
 
-**The default root** is what a call resolves to when it omits `path`: an explicit
-`--root`, or — when none is set — the launch cwd, *inferred*. So the common
-single-workspace case needs no `--root`: kaibo already knows the workspace from its cwd
-and uses it for both bounding and defaulting. The inferred case is labelled as such in
-the `## Scope` handshake and at `kaibo://config` (`default_root_inferred`). Only
-`--no-cwd` leaves you without a default root, and then an omitted `path` is a clear
-parameter error rather than a guess.
+To make the allowed set exactly what you named, use `--no-cwd` (`KAIBO_NO_CWD`, `[server]
+infer_cwd = false`). Every call must then pass its own `path`.
+
+The resolved allowed set is reported in three places: a startup log line, the `## Scope`
+section of the server's MCP `instructions` (visible in every `initialize` response), and
+`kaibo://config`.
+
+**The default root** is what a call resolves to when it omits `path`. It is an explicit
+`--root`, or, when none is set, the launch cwd, inferred. The common single-workspace case
+therefore needs no `--root`: kaibo knows the workspace from its cwd and uses it for both
+bounding and defaulting. The inferred case is labelled as such in the `## Scope` handshake
+and at `kaibo://config` (`default_root_inferred`).
+
+Only `--no-cwd` leaves you with no default root, and an omitted `path` is then a parameter
+error rather than a guess.
 
 **Widening the boundary:**
 
@@ -805,32 +932,35 @@ KAIBO_ALLOW_PATHS=~/src:/data/fixtures kaibo
 kaibo --allow-path ~/src --allow-path /data/fixtures
 ```
 
-A non-empty CLI `--allow-path` set replaces the env/file layer entirely (same
-precedence rule as `--root`) — that is *layer* precedence, not narrowing: whichever
-layer wins still sits alongside the inferred cwd. To lift all limits: `--allow-path /`.
+A non-empty CLI `--allow-path` set replaces the env and file layers entirely, the same
+precedence rule as `--root`. That is layer precedence, not narrowing: whichever layer wins
+still sits alongside the inferred cwd. `--allow-path /` lifts all limits.
 
-`--root` is deliberately **not** repeatable — it names *the* project a path-less call
-defaults to, and there can only be one; the parser refuses a second occurrence rather
-than silently picking. `--allow-path` is the repeatable knob.
+`--root` is not repeatable. It names *the* project a path-less call defaults to, and there
+can be only one, so the parser refuses a second occurrence rather than picking silently.
+`--allow-path` is the repeatable knob.
 
-**Set it once.** Putting your whole workspace tree in `allow_paths`
-(`["~/src"]`) means every project under it is in-bounds, and because the client's
-cwd/workspace lands inside that tree, kaibo infers it as the [default root](#path-containment)
-automatically — so you configure access once and never pass `path` per call.
+**Configure access once.** Putting your whole workspace tree in `allow_paths` (`["~/src"]`)
+puts every project under it in bounds, and because the client's workspace cwd lands inside
+that tree, kaibo infers it as the default root automatically. You then never pass `path`
+per call.
 
-**Path expansion.** In `root` / `allow_paths`, the file and env layers expand a leading
-`~` to `$HOME` *and* `$VAR` / `${VAR}` from the environment; the CLI relies on your shell's
-own expansion instead. Paths with no `~`/`$` are taken as written. A variable that is unset,
-**set but empty**, or non-UTF-8 is a loud load error rather than a silent gap that would
-misplace the boundary — an empty value matters because `$EMPTY/scratch` would collapse to
-`/scratch` and `$EMPTY/` to `/` (the whole filesystem). Write `$$` for a literal `$`; a
-stray `$` that begins no reference is itself an error, so a typo can't slip through as a
-literal segment. (A directory literally named `$foo` is written `$$foo`.)
+**Path expansion.** In `root` and `allow_paths`, the file and env layers expand a leading
+`~` to `$HOME`, and `$VAR` / `${VAR}` from the environment. The CLI relies on your shell's
+expansion instead. Paths with no `~` or `$` are taken as written.
 
-**Reading a scratch / temp space.** kaibo reads only what's in the allowed set and never
-writes anywhere — so to let it read artifacts a workflow drops in a temp dir (a diff, a
-generated file, a log), add that dir to `allow_paths`. Write it portably with the env var
-rather than a host-specific literal, so it resolves on whatever machine kaibo runs on:
+A variable that is unset, set but empty, or non-UTF-8 is a load error rather than a silent
+gap that would misplace the boundary. The empty case matters because `$EMPTY/scratch`
+collapses to `/scratch` and `$EMPTY/` to `/`, the whole filesystem.
+
+Write `$$` for a literal `$`; a directory literally named `$foo` is written `$$foo`. A
+stray `$` that begins no reference is an error, so a typo cannot slip through as a literal
+segment.
+
+**Reading a scratch or temp space.** kaibo reads only what is in the allowed set and never
+writes anywhere, so to let it read artifacts a workflow drops in a temp dir (a diff, a
+generated file, a log), add that dir to `allow_paths`. Use the env var rather than a
+host-specific literal so it resolves on whatever machine kaibo runs on:
 
 ```toml
 [server]
@@ -838,37 +968,40 @@ allow_paths = ["~/src", "$TMPDIR", "$XDG_RUNTIME_DIR/kaibo"]
 ```
 
 `$TMPDIR` (POSIX) and `$XDG_RUNTIME_DIR` (XDG) land on the per-user scratch dir on macOS
-and sandboxed Linux respectively, where a bare `/tmp` would be wrong. This is an opt-in:
-widening to a shared, world-writable space like `/tmp` is a real (read-only) boundary
-move, so kaibo never adds it for you.
+and sandboxed Linux respectively, where a bare `/tmp` would be wrong. This is opt-in:
+widening to a shared, world-writable space like `/tmp` is a real boundary move, even a
+read-only one, so kaibo never adds it for you.
 
-**When defaulting does *not* happen.** If `--allow-path` is set to a tree that does
-not contain the launch cwd and no `--root` is given, there is no default root: the
-cwd is outside the boundary, so adopting it would point the default at a path
-containment rejects. An omitted `path` then errors ("no `path` provided and the
-server has no default root …") — `invalid_params`, surfaced where the caller can read
-it. Pass an explicit `--root` (inside an allowed tree) to restore a default.
+**When no default root exists.** If `--allow-path` names a tree that does not contain the
+launch cwd and no `--root` is given, there is no default root. The cwd is outside the
+boundary, so adopting it would point the default at a path containment rejects. An omitted
+`path` then returns `invalid_params` ("no `path` provided and the server has no default
+root …"). Pass an explicit `--root` inside an allowed tree to restore a default.
 
-**Resolution.** `resolve_root` (`src/server.rs`) returns the *canonicalized* path,
-so the kaish VFS mount target is always resolved. A nonexistent or non-directory
-entry in `--root` / `--allow-path` is a loud construction error at startup.
+**Resolution.** `resolve_root` (`src/server.rs`) returns the canonicalized path, so the
+kaish VFS mount target is always resolved. A nonexistent or non-directory entry in
+`--root` or `--allow-path` is a construction error at startup.
 
-**Following git worktrees (on by default).** When a call's `path` misses the allowed
-set, kaibo doesn't reject it outright if it's a *linked git worktree of a repo
-already in the set* — it admits it. So a feature branch you check out in a sibling
-directory (`git worktree add ../proj-feature …`), even one created mid-session, is
-reachable without touching `allow_paths`. This is *narrower* than widening to the
-parent (`--allow-path ~/src` would grant read of everything under it); follow admits
-exactly the worktrees of an already-allowed repo and nothing else.
+### Following git worktrees
 
-kaibo resolves this by **reading git's own link files** — a worktree's `.git` file,
-the repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git` (the
-binary isn't in the build; see [the sandbox probe runbook](sandbox-probes.md)). Trust flows only
-outward from the allowed repo: kaibo enumerates the worktrees the *allowed* repo's
-common git dir vouches for and admits a candidate only if it falls inside one. It
-never consults the candidate's own `.git`, so a foreign directory with a forged
-`gitdir:` pointer can't admit itself. The check runs only on the (rare)
-containment-miss path — the normal in-bounds call is untouched.
+On by default. When a call's `path` misses the allowed set, kaibo admits it if it is a
+linked git worktree of a repo already in the set. A feature branch checked out in a
+sibling directory (`git worktree add ../proj-feature …`), including one created
+mid-session, is reachable without touching `allow_paths`.
+
+This is narrower than widening to the parent: `--allow-path ~/src` would grant read of
+everything under it, while follow admits exactly the worktrees of an already-allowed repo
+and nothing else.
+
+kaibo resolves this by reading git's own link files — a worktree's `.git` file and the
+repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git`, which is not
+in the build (see [the sandbox probe runbook](sandbox-probes.md)).
+
+Trust flows outward from the allowed repo only. kaibo enumerates the worktrees the
+*allowed* repo's common git dir vouches for and admits a candidate only if it falls inside
+one. It never consults the candidate's own `.git`, so a foreign directory with a forged
+`gitdir:` pointer cannot admit itself. The check runs only on the containment-miss path;
+a normal in-bounds call is untouched.
 
 Turn it off to keep the boundary strictly static:
 
@@ -888,53 +1021,53 @@ reconnect.
 
 ## kaibo://config
 
-An MCP resource at the URI `kaibo://config` (`application/toml`) exposes the server's
-resolved runtime state. Reading it before making calls tells the calling model (or an
-operator) the full picture:
+An MCP resource at `kaibo://config` (`application/toml`) exposing the server's resolved
+runtime state. Read it before making calls to see the full picture.
 
-- `allowed_paths` — the canonicalized trees a per-call path must be at-or-under
-- `default_root` — the `--root` value, if set
-- `default_cast` — which cast is used when a call omits `cast`
-- `runtime` — state *computed at read time*, kept distinct from the configured
-  knobs above so a reader can tell "what kaibo discovered" from "what the operator
-  set". Currently `follow_worktrees` (the knob's effective value) and
-  `followed_worktrees` (the git worktrees admitted beyond `allowed_paths` right
-  now; recomputed each read, so a worktree added mid-session appears without a
-  reconnect)
-- `tools` — which tools are currently advertised (`consult`, `oneshot`,
-  `run_kaish`)
-- `sandbox` — exec timeout, output cap, scratch (`/` MemoryFs) cap, and any extra disabled builtins
-- `kaish.ignore` — the resolved ignore policy the file-walking builtins honor:
-  `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope`
-- `defaults` — the global tunables every slot falls back to (rendered so the
-  per-slot values below read as deltas against it)
-- `backends` — each connection: its kind, `base_url` (the *resolved* value for the
-  openai kind — env/local-default fallback applied; the raw configured value,
-  when set, for the anthropic and gemini kinds; absent for every other kind), key
-  source env var name and key file path (never the resolved key value),
-  `key_optional`, and `request_timeout_secs`
-- `backend_aliases` / `cast_aliases` — alias → canonical name, built-in and
-  file-declared both: every name a `cast` param, slot ref, or per-call backend
-  override will resolve
-- `casts` — each composition's slots as `model = "backend/id"` (canonical backend
-  name) with the *resolved* `vision` capability (slot pin applied, else the
-  classifier) and only the per-slot tunables actually set
+| section | contents |
+|---|---|
+| `allowed_paths` | the canonicalized trees a per-call path must be at or under |
+| `default_root` | the `--root` value, if set |
+| `default_cast` | the cast used when a call omits `cast` |
+| `runtime` | state computed at read time (see below) |
+| `tools` | which tools are currently advertised |
+| `sandbox` | exec timeout, output cap, scratch (`/` MemoryFs) cap, any extra disabled builtins |
+| `kaish.ignore` | the resolved ignore policy the file-walking builtins honor: `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope` |
+| `defaults` | the global tunables every slot falls back to, rendered so per-slot values read as deltas |
+| `backends` | each connection: kind, `base_url`, key source names, `key_optional`, `request_timeout_secs` |
+| `backend_aliases` / `cast_aliases` | alias → canonical name, built-in and file-declared, covering every name a `cast` param, slot reference, or per-call backend override resolves |
+| `casts` | each composition's slots as `model = "backend/id"`, with the resolved `vision` capability and only the per-slot tunables actually set |
 
-**Secret-safety contract:** `kaibo://config` includes key *source metadata* — the
-env var name and file path an operator configured — but never the resolved key value.
-Keys are resolved lazily at call time and never cached in the `Config` struct, so the
-render function has no field that holds a secret. The render destructures `Backend`,
-`ModelSlot`, `Defaults`, `ToolGating`, and `SandboxConfig` exhaustively, so a new
-field is a compile error at the render site — an explicit render-or-skip (and
-secret-review) decision, not a silent omission. The
-`api_key_env` and `api_key_file` names are included deliberately: an operator
-debugging a missing-key error needs to see what source the backend is pointing at.
+**`runtime`** is kept distinct from the configured knobs so a reader can tell what kaibo
+discovered from what the operator set. It carries `follow_worktrees` (the knob's effective
+value), `followed_worktrees` (the git worktrees admitted beyond `allowed_paths` right now,
+recomputed each read so a mid-session worktree appears without a reconnect), and the
+`advertised_tools` / `unstaffable_tools` pair described under [Tool gating](#tool-gating).
 
-See `docs/config.example.toml` for the full, commented surface, and `docs/casts.md`
-for the design record of the backends/casts split (including how a cast resolves
-into per-phase arms).
+**`backends.base_url`** renders the *resolved* value for the openai kind, with the env and
+local-default fallback applied; the raw configured value, when set, for the anthropic and
+gemini kinds; and nothing for every other kind.
 
-All three "help me set up models" surfaces have a CLI mirror, for a caller with no MCP
-client at all: `kaibo config` prints this resolved state, `kaibo example-config`
-prints the annotated template, and `kaibo configure [goal]` prints the same guided
-walkthrough as the `configure` MCP prompt.
+**Secret-safety contract.** `kaibo://config` includes key *source metadata* — the env var
+name and file path an operator configured — and never the resolved key value. Keys resolve
+lazily at call time and are never cached in the `Config` struct, so the render function has
+no field holding a secret.
+
+The render destructures `Backend`, `ModelSlot`, `Defaults`, `ToolGating`, and
+`SandboxConfig` exhaustively, so a new field is a compile error at the render site. That
+makes rendering a field an explicit decision, subject to secret review, rather than a
+silent omission.
+
+`api_key_env` and `api_key_file` are included on purpose: an operator debugging a
+missing-key error needs to see which source the backend points at.
+
+## CLI mirrors
+
+Every "help me set up models" surface has a CLI equivalent, for a caller with no MCP
+client:
+
+| MCP | CLI |
+|---|---|
+| `kaibo://config` | `kaibo config` |
+| `kaibo://config/example` | `kaibo example-config` |
+| `configure` prompt | `kaibo configure [goal]` |

@@ -43,6 +43,30 @@ record. Each later release appends a new section at the top.
   list in silence. That now exits non-zero naming the cause, alongside the per-tool
   warnings that say what each tool wanted.
 
+### Added
+
+- **New MCP resource: `kaibo://config/guide`** — the full configuration manual
+  (`docs/config.md`), embedded in the binary the way the annotated template already is.
+  An agent configuring kaibo over MCP has no access to kaibo's own `docs/`, so until now
+  every explanation had to be smuggled into `config.toml`'s comments, where it cost bytes
+  on every read. The three config resources now split by job: `kaibo://config/example` is
+  the template you copy, `kaibo://config` is the resolved live state, and
+  `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
+  all three.
+
+### Changed
+
+- **`docs/config.example.toml` is leaner, and `docs/config.md` reads as a reference
+  manual.** The template had been accumulating explanation that belongs in the manual —
+  a whole hand-copied table of the staffing rules above, for instance, which the running
+  server already reports for your actual config. That detail moved to the guide's new
+  "Tool gating" section and the template points at it, so the file you read while editing
+  your config is mostly the knobs you're editing. The guide itself was rewritten in
+  technical-reference style throughout: settings in tables with their defaults and
+  constraints, rules stated plainly, and the design-history essay dropped in favour of
+  `docs/casts.md`, which is the design record. No behavior changed and no rule was
+  dropped.
+
 ### Fixed
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
