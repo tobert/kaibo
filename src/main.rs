@@ -1,4 +1,4 @@
-//! kaibo (解剖) — read-only codebase consultation, as a stdio MCP server and a CLI.
+//! kaibo — read-only codebase consultation, as a stdio MCP server and a CLI.
 //!
 //! Bare `kaibo` (and `kaibo serve`) is the MCP server: ask `consult` a question about
 //! a codebase; kaibo explores it read-only through kaish and returns a cited answer.

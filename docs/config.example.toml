@@ -1,4 +1,4 @@
-# kaibo (解剖) — example configuration.
+# kaibo — example configuration.
 #
 # Copy to $XDG_CONFIG_HOME/kaibo/config.toml (default ~/.config/kaibo/config.toml),
 # or point at it with --config <path> / KAIBO_CONFIG.

@@ -70,6 +70,12 @@ record. Each later release appends a new section at the top.
 - **`docs/config.example.toml` documents four knobs it had been missing** —
   `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`. The
   resource description promised "every option with its default"; now that is true.
+- **The tool is plain "kaibo" now.** The 解剖 kanji no longer rides along with the
+  name in the MCP handshake, the CLI `--help` banner, the example config, or the
+  docs — that reading is a coincidence of how the name was built (kai + aibo), not
+  the name itself, and repeating it everywhere implied otherwise. The README's
+  `## Name` section keeps the story and is now the one place it appears. No
+  behavior, flags, or tool names changed.
 
 ### Fixed
 

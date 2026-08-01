@@ -2554,7 +2554,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
         .with_server_info(
             Implementation::new("kaibo", env!("CARGO_PKG_VERSION"))
-                .with_title("kaibo (解剖)"),
+                .with_title("kaibo"),
         )
         .with_protocol_version(ProtocolVersion::LATEST)
         // Judge provider usability from the live environment so a fresh install

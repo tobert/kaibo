@@ -1,6 +1,6 @@
 # kaibo — Known Issues & Open Work
 
-解剖（かいぼう）'s punch list. kaibo is an assistant agent for other agents — a team
+kaibo's punch list. kaibo is an assistant agent for other agents — a team
 of models offering *consultation* (read-only, cited codebase answers). This file is
 where we record what's missing, what's fragile, and what we'd improve. Evidence-first
 — name the file, the line, the *why*, and how it surfaced.
