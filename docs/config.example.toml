@@ -79,8 +79,11 @@ cast = "anthropic"
 # tracing/EnvFilter directive used when RUST_LOG is unset.
 log = "kaibo=info"
 
-# Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
-# All default true; a config that turns every one off is refused at startup.
+# Tool gating — seven capability flags (the --no-<tool> flags), all default true. They
+# are not one-per-tool: `consult` also gates consult_submit, `batch` gates batch_submit,
+# and the job_* verbs follow whichever handle producers are live. A config that leaves
+# nothing advertised is refused at startup, whether by turning every flag off or by
+# staffing (below) removing what remains.
 #
 # A tool also needs a cast that can STAFF it. One nothing can staff is not advertised at
 # all, so it costs no resident tokens and no call of it can fail. Out of the box that
@@ -148,6 +151,37 @@ call_deadline_secs = 3600
 
 session_capacity = 128       # max multi-turn consult sessions held in memory (LRU,
                              # capacity-evicted, no TTL); must be > 0
+job_capacity     = 64        # max async-consult jobs held in memory, running plus
+                             # uncollected; evicting a running one aborts it; must be > 0
+
+# Byte budget for inlining consult text attachments into the driver prompt (greedy, in
+# caller order). Past it an attachment is DEMOTED to a read-it-whole directive, loudly,
+# never dropped. 0 inlines nothing — the escape hatch for a small-context local cast.
+inline_attach_budget = 262144   # 256 KiB
+
+# ---------------------------------------------------------------------------
+# [orientation] — a computed-once file map injected into the exploring phases, so a
+# model starts knowing the layout instead of spending turns on glob/ls/find. Built
+# from the kernel's own ignore-aware enumeration, so it can't disagree with what the
+# explorer's shell sees. Omit the stanza to keep the defaults.
+# ---------------------------------------------------------------------------
+[orientation]
+enabled = true               # false turns the map off entirely
+full_list_max_files = 256    # <= this injects the full file list; above, a directory
+                             # map; 0 is a load error (disable instead)
+tree_max_depth = 4           # how deep the fallback directory map descends; 0 is a
+                             # load error (it would render an empty map)
+
+# ---------------------------------------------------------------------------
+# [persistence] — the state db, ON by default, so consult sessions and batch handles
+# survive a restart and are shared across front doors (start over MCP, continue from
+# the CLI). Fixed XDG path, never one a model controls; refused if it resolves inside
+# an allowed tree. Failure to open is fatal, not a silent drop to memory.
+# ---------------------------------------------------------------------------
+[persistence]
+enabled = true               # false = in-memory only (--no-persistence, KAIBO_NO_PERSISTENCE)
+# Move the db (--state-db FILE, KAIBO_STATE_DB). $VAR/~-expanded like root/allow_paths.
+# path = "$XDG_STATE_HOME/kaibo/state.db"
 
 # ---------------------------------------------------------------------------
 # [sandbox] — the read-only execution limits (see src/sandbox.rs)

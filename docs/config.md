@@ -105,10 +105,16 @@ A backend resolves its key from `api_key_env`, then `api_key_file`. Env wins.
 **Secrets never appear inline in the TOML** — only the *name* of an env var or the
 *path* to a key file. A config file should be safe to commit or paste.
 
-`key_optional = true` substitutes a placeholder bearer token when no key is found,
-which is the keyless local-server case. A key file that is *present but broken* (empty,
-unreadable) is a load error even on a keyless backend: present-but-wrong is a mistake,
-not "keyless".
+`key_optional = true` substitutes a placeholder when no key is found, which is the
+keyless local-server case. The placeholder fits the auth style: an empty query key for
+Gemini, a non-empty bearer for header-auth backends (`src/credentials.rs`).
+
+A key file that is *present but broken* (empty, unreadable, a directory) is a loud error
+even on a keyless backend, because present-but-wrong is a mistake rather than "keyless".
+Only a genuinely absent file falls back.
+
+**Timing.** Keys resolve lazily, when the backend is first used to build a client, not at
+config load. A missing or broken key on a backend no call touches never surfaces.
 
 #### `kind = "openrouter"` specifics
 
@@ -276,10 +282,13 @@ whenever thinking is on**, which is every Anthropic slot by default — the Mess
 | gemini | `thinkingLevel` (values align: `minimal`/`low`/`medium`/`high`) |
 | openrouter | `{"reasoning":{"effort":…}}`, forwarded verbatim |
 
-The value is a passthrough string the provider validates, like a model id, so a new
-level lands without a code change. Set a synth slot's `effort = "max"` or `"xhigh"` for
-heavier runs; OpenRouter is where those deeper rungs are reachable today. Ignored by
-models with no effort sink (budget-tier Anthropic, OpenAI).
+Hosted OpenAI Platform reasoning models (`gpt-5*`) also take it, as `reasoning.effort` on
+the Responses shape. Generic and local OpenAI-compatible endpoints on Chat Completions do
+not, and neither does budget-tier Anthropic, which uses `thinking_budget` instead.
+
+The value is a passthrough string the provider validates, like a model id, so a new level
+lands without a code change. Set a synth slot's `effort = "max"` or `"xhigh"` for heavier
+runs; OpenRouter is where those deeper rungs are reachable today.
 
 **`thinking_style`.** Forces the Anthropic thinking shape instead of the built-in
 classifier. `auto` picks adaptive for Opus 4.6+, Sonnet 4.6, and Fable 5, and
@@ -386,9 +395,13 @@ resolves. Naming a new backend or cast after one is a collision error.
 
 Rules:
 
-- The interactive tools refuse a cast whose synth is on an offline lane, and
-  `batch_submit` refuses a cast whose synth is not specifically `lane = "batch"`. A big
-  offline-tuned model is never run interactively by accident, and the reverse.
+- The interactive *answering* tools — `consult`, `consult_submit`, `oneshot` — refuse a
+  cast whose synth is on an offline lane, and `batch_submit` refuses a cast whose synth
+  is not specifically `lane = "batch"`. A big offline-tuned model is never run
+  interactively by accident, and the reverse.
+- `explore` is exempt: it runs only the explorer arm, which is always interactive, so a
+  deliberate or direct cast's explorer is valid there. It needs an `explorer` slot and
+  nothing more.
 - A `batch`-lane synth must sit on a batch-capable backend: Anthropic, Gemini, or a
   hosted OpenAI Platform backend. A local OpenAI-compatible server has no Batch API, so
   declaring `lane = "batch"` on a slot elsewhere is a load error.
@@ -399,9 +412,10 @@ Rules:
 - `batch = true` at the cast level is backward-compatible sugar. It sets the synth
   slot's `lane = "batch"` and nothing else; there is one internal representation of lane.
 
-`lane = "direct"` runs one long completion against a big local model with no async
-provider API involved, for offline deliberation over a model too slow for a live tool
-loop.
+`lane = "direct"` runs one long completion kaibo drives itself, with no async provider API
+involved, for offline deliberation over a model too slow for a live tool loop. A big local
+model is the intended case, but this is not enforced: unlike `batch`, the `direct` lane
+applies no backend capability check, so any backend that resolves may carry one.
 
 ### Cross-backend casts
 
@@ -500,6 +514,7 @@ Everything else follows one naming rule:
 | explorer system prompt | `prompts.explorer` *(file-only — full replace)* | — | — |
 | consult system prompt | `prompts.consult` *(file-only — full replace)* | — | — |
 | oneshot system prompt | `prompts.oneshot` *(file-only — full replace)* | — | — |
+| batch system prompt | `prompts.batch` *(file-only — full replace)* | — | — |
 
 **Two exceptions to the naming rule:**
 
@@ -535,6 +550,10 @@ stale `provider` is now an invalid-params error like every other tombstone above
 A tool clears **two** gates to be advertised: the `[server.tools]` flag (equivalently
 `--no-<tool>` or `KAIBO_NO_<TOOL>`), and a configured cast that can **staff** it.
 
+The seven flags are *capability* switches, not one per MCP tool. `consult` gates both
+`consult` and `consult_submit`; `batch` gates `batch_submit`; the `job_*` verbs have no
+flag of their own and follow whichever handle producers are live.
+
 A tool nothing can staff has its route removed rather than shipping unusable. The calling
 agent never sees a tool whose every call would fail, and an unusable tool stops costing
 resident tokens in every session.
@@ -548,7 +567,7 @@ Which cast shape staffs which tool:
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
-| `run_kaish`, `list_models` | no cast at all; always advertised |
+| `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
 **Default installs.** This affects one tool. No built-in cast pairs an explorer with an
 offline synth — the two built-in offline casts, `anthropic-batch` and `gemini-batch`, are
@@ -667,12 +686,13 @@ CLI/env: `--no-persistence` / `KAIBO_NO_PERSISTENCE` disable it (in-memory, like
 
 | persists | never persists |
 |---|---|
-| the `(question, answer)` turns of each session (capacity-evicted, no TTL, same as the in-memory store) | background consult/deliberate job handles (`job-N`), which are in-memory and session-only by design |
+| the `(question, answer)` turns of each session, caller question included (capacity-evicted, no TTL, same as the in-memory store) | background consult/deliberate job handles (`job-N`), which are in-memory and session-only by design |
 | the `{backend, provider-id, label}` of each submitted batch, so `job_list` can re-surface a handle after a restart | exploration reports, which would be stale bloat |
 
-Everything stored is model output. Nothing the calling model steers reaches disk. Because
-that output is what you paid for, kaibo treats the db as your data and never removes the
-file under any error; moving it aside is your decision.
+Stored content is the caller's questions, the models' answers, and batch-handle metadata.
+Nothing the *inner model team* steers reaches disk: the store is handler-side, and kaish
+has no write path to it. Because those answers are what you paid for, kaibo treats the db
+as your data and never removes the file under any error; moving it aside is your decision.
 
 **Read-only toward your project is unchanged.** The store is handler-side at the XDG
 path. kaish's read-only sandbox never sees it, kaibo writes nothing into any project, and
@@ -734,14 +754,17 @@ Two lists with different failure semantics:
 | list | paths | missing file |
 |---|---|---|
 | `project_files` | root-relative | normal; read if present |
-| `user_files` | absolute or `~` | startup-visible error |
+| `user_files` | absolute or `~` | error when a call assembles its prompt |
+
+Both are read when a consultation phase builds its preamble, not at config load, so a
+broken `user_files` entry surfaces on the first call that needs it rather than at startup.
 
 `project_files` are joined to the resolved project root and canonicalize-checked to stay
 within it. A configured `../` or an out-of-tree symlink is refused, so the containment
 that bounds the read-only shell also bounds what gets injected. A repo with no `AGENTS.md`
 is the normal case.
 
-`user_files` are read-required: you named the file on purpose, so a missing one is an
+`user_files` are read-required: you named the file on purpose, so a missing one is a loud
 error rather than a silent skip that ships an answer without the guidance you counted on.
 
 **Trust boundary.** `user_files` may sit outside the allowed set because these files are
@@ -753,9 +776,10 @@ not widened.
 This is the distinction from `[server] allow_paths` below. `allow_paths` widens what the
 *model* can explore; `[context]` injects fixed operator text the model never navigates to.
 
-**Where it lands.** The codebase-reading phases — the `consult` driver and its nested
-`explore′` sweep — so the cheap explorer orients on the same guidance while it searches,
-not only at answer time.
+**Where it lands.** Every codebase-reading phase: the `consult` driver and its nested
+`explore′` sweep, standalone `explore`, and `deliberate`'s dossier explorer. The cheap
+explorer therefore orients on the same guidance while it searches, not only at answer
+time. The toolless `oneshot` and the offline batch synth read no project and get none.
 
 **Precedence** is the usual per-call > CLI > env > file > built-in. A CLI
 `--project-context-file` replaces lower layers additively. The CLI cannot express "empty";
@@ -833,11 +857,15 @@ so no ambiguity arises.
 A per-call model override (a bare slot) carries no `preamble`. Overriding the model does
 not drag the configured slot's framing along. The empty-value load error applies here too.
 
-**`batch_submit` does not inherit the slot `preamble`.** It runs the synth model, but its
-lane has a distinct behavioral contract — one offline response, no follow-up, spend on
-depth — that a slot preamble written for interactive synth would silently replace. Tune
-batch through `[prompts].batch`, or accept the built-in `batch_preamble`. The slot
-preamble stays scoped to the interactive phases.
+**The offline synth phases inherit it too.** A synth slot's `preamble` feeds `batch` and
+`deliberate` alongside `consult` and `oneshot` (`Cast::resolved_prompts` in
+`src/config.rs`). This is load-bearing rather than incidental: on a batch or deliberate
+cast, the synth slot *is* the offline synth, so its voice has to reach the offline phase
+or the slot preamble would do nothing on exactly the casts built for that lane.
+
+Each phase still resolves under its own key, so `[prompts].batch` overrides the built-in
+`batch_preamble` for the batch phase alone. To give the offline lane a different voice
+from the interactive one on the same cast, set the phase key rather than the slot.
 
 ## Repo orientation: `[orientation]`
 
@@ -871,14 +899,16 @@ config such as `.github/` and `.cargo/`; the ignore filter still drops `.git` an
 
 In the directory map, files deeper than `tree_max_depth` stay counted at the deepest shown
 directory. Names are traded for structure, and the model recovers them with `glob
-'DIR/**/*'` or `grep -rn`. A skipped map is logged at `warn`, not silent.
+'DIR/**/*'` or `grep -rn`. An oversized directory map that gets skipped is logged at
+`warn`; an enumeration failure or an empty result degrades to no map without one.
 
 `full_list_max_files = 0` is a load error, since it would refuse every repo; disable the
 block instead. `tree_max_depth = 0` is a load error, since it would render an empty map.
 
-**Scope.** The exploring phases only: the `consult` driver and its nested `explore′`
-sweep. The toolless `oneshot` reads no project and gets no map. Like `[context]`, the
-block re-sends each turn, which the size gate keeps bounded. Whether it erases discovery
+**Scope.** The exploring phases: the `consult` driver and its nested `explore′` sweep,
+standalone `explore`, and `deliberate`'s dossier explorer. The toolless `oneshot` reads no
+project and gets no map. Like `[context]`, the block re-sends each turn, which the size
+gate keeps bounded. Whether it erases discovery
 turns in practice is measurable through the per-tool `tool` spans (see Telemetry).
 
 ## Path containment
@@ -1027,10 +1057,10 @@ runtime state. Read it before making calls to see the full picture.
 | section | contents |
 |---|---|
 | `allowed_paths` | the canonicalized trees a per-call path must be at or under |
-| `default_root` | the `--root` value, if set |
+| `default_root` | the effective default root, explicit or inferred; `default_root_inferred` distinguishes them |
 | `default_cast` | the cast used when a call omits `cast` |
 | `runtime` | state computed at read time (see below) |
-| `tools` | which tools are currently advertised |
+| `tools` | the **configured** flags — what the operator enabled, not what is served; see `runtime.advertised_tools` for the live surface |
 | `sandbox` | exec timeout, output cap, scratch (`/` MemoryFs) cap, any extra disabled builtins |
 | `kaish.ignore` | the resolved ignore policy the file-walking builtins honor: `files`, `defaults`, `auto_gitignore`, `global_gitignore`, `scope` |
 | `defaults` | the global tunables every slot falls back to, rendered so per-slot values read as deltas |

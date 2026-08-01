@@ -334,6 +334,32 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
+### Stale code comments + test assertions that predate the 5th backend / the direct lane
+Surfaced by a kaibo `or-gpt` (gpt-5.6-luna) review of PR #110, verified against the code.
+Three spots still describe a world with four built-ins and no tool routing to `direct`.
+None affects behavior; all three are places a reader (or a future us) would be misled, and
+the test one could let a real regression pass:
+
+- **`tests/config.rs`** (~:35) — "Four built-in backends + four single-backend casts", and
+  the loop below it iterates only Anthropic/DeepSeek/Gemini/Openai. `openrouter` is a real
+  built-in (`config.rs::builtin_registry`), so removing it would keep this test green.
+  Same undercount in a `src/server/config_resource.rs` test (~:831).
+- **`src/config.rs`** (~:225) — a doc-comment still says the `direct` lane has no tool
+  route. `deliberate` routes to it now (`config.rs::cast_can_deliberate`,
+  `server/mod.rs::CAST_ENUM_RULES`).
+
+Fix is mechanical; kept out of PR #110 because that one is a docs PR and this touches
+tests. Do it with the next change that lands in `tests/config.rs`.
+
+### Shipped config template omits four knobs its own resource description promises
+`kaibo://config/example`'s description said "every option with its default"; the template
+was missing `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`.
+Added in PR #110, so the claim is true again — **the open work is the guard**: nothing
+tests that the template covers the config surface, so the next new knob can silently
+reintroduce the gap. A test walking `RawConfig`'s field names against
+`CONFIG_EXAMPLE_TOML` would close it, in the spirit of the `no_write_path.rs` pinned-count
+guard. (The example's *parse* test exists already; coverage is the missing half.)
+
 ### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
 The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
 tracker pointer. Direction settled 2026-06-25 (w/ Amy): **stay OSS / GitHub-native** —

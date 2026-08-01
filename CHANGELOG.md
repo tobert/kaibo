@@ -67,7 +67,33 @@ record. Each later release appends a new section at the top.
   `docs/casts.md`, which is the design record. No behavior changed and no rule was
   dropped.
 
+- **`docs/config.example.toml` documents four knobs it had been missing** —
+  `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`. The
+  resource description promised "every option with its default"; now that is true.
+
 ### Fixed
+
+- **Corrected several configuration-manual claims that did not match the code.** Found by
+  pointing kaibo's own `consult` at the rewrite (cast `or-gpt`, GPT-5.6 luna in both
+  roles) and verifying each finding against the source. The ones that would have misled
+  someone configuring kaibo:
+
+  - A synth slot's `preamble` **does** reach the offline `batch` and `deliberate` phases.
+    The manual said it did not. It is load-bearing that it does: on a batch or deliberate
+    cast the synth slot *is* the offline synth, so the opposite rule would make a slot
+    preamble do nothing on exactly the casts built for that lane.
+  - `explore` accepts a cast whose synth is on an offline lane — it runs only the
+    explorer arm. The lane rules had been generalized to "the interactive tools".
+  - A missing or broken key file, and a missing `[context] user_files` entry, are
+    **call-time** errors, not startup errors. Keys and context files both resolve lazily.
+  - Hosted OpenAI `gpt-5*` models **do** consume `effort` (as `reasoning.effort` on the
+    Responses shape). Only generic/local Chat Completions endpoints ignore it.
+  - `[context]` house rules and the `[orientation]` map reach standalone `explore` and
+    `deliberate`'s dossier explorer too, not only the `consult` driver and its sweep.
+  - The state db stores the caller's **questions** alongside the models' answers.
+  - In `kaibo://config`, `tools` is the configured flags; `runtime.advertised_tools` is
+    what the server actually serves. The distinction is new in this release, so the
+    manual now points at the right one.
 
 - **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
   The state db's default path (`~/.local/state/kaibo/state.db`) can land inside
