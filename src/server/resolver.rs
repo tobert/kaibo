@@ -130,6 +130,37 @@ impl Resolver {
             }
         };
 
+        // Say it out loud, once, where both front doors pass: an `effort` the operator
+        // WROTE that this slot's wire has no place to put. Anthropic's budget tier and
+        // the generic OpenAI chat shape drop it in `to_params` and nothing downstream
+        // fails, so without this the knob just quietly does nothing — the silent
+        // fallback kaibo refuses. Not fatal, deliberately: the inherited default lands
+        // on a toggle-less wire in every ordinary local cast, and the *rule* (see
+        // `Config::inert_efforts`) is what keeps this to the cases someone chose.
+        //
+        // Grouped by (source, value): one `[defaults]` line lands on every cast at once,
+        // and ten near-identical warnings for one mistyped setting reads as noise —
+        // which is how a warning gets tuned out. One line per thing the operator wrote.
+        let mut grouped: std::collections::BTreeMap<(&'static str, String), Vec<String>> =
+            std::collections::BTreeMap::new();
+        for inert in config.inert_efforts() {
+            grouped
+                .entry((inert.source.as_str(), inert.effort))
+                .or_default()
+                .push(format!("{}/{} ({})", inert.cast, inert.role, inert.model));
+        }
+        for ((source, effort), slots) in grouped {
+            tracing::warn!(
+                effort = %effort,
+                source = %source,
+                slots = %slots.join(", "),
+                "effort has no sink on these models' wires — it is dropped before the \
+                 request is built, so the setting does nothing there. Set it on a slot \
+                 whose provider takes a reasoning param, or drop it. See kaibo://config \
+                 (inert_tunables)."
+            );
+        }
+
         Ok(Self {
             config,
             allowed_set: Arc::new(allowed),
@@ -390,8 +421,11 @@ impl Resolver {
             .config
             .resolve_backend(&slot.backend)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Name the cast on the way out: `from_slot` knows the backend, the role and the
+        // model, but not which team pulled them together — and "which cast do I edit?" is
+        // the first thing an operator needs from a shaping refusal.
         Arm::from_slot(backend, slot, role, &self.config.defaults)
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+            .map_err(|e| McpError::internal_error(format!("cast {:?}: {e:#}", cast.name), None))
     }
 
     /// Assemble the operator's house rules for this call against the resolved `root`:

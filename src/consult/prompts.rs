@@ -295,9 +295,12 @@ pub fn oneshot_preamble() -> String {
 ///   next turn) but wrong here — stopping at "I'd need X" burns the caller's one shot
 ///   for nothing. The batch contract is *state the assumption, answer under it, flag
 ///   what would change* — both the answer and the diagnostic, in one pass.
-/// - **Depth is free.** The lane forces high effort + a generous token floor precisely
+/// - **Depth is free.** The lane floors reasoning depth and the token budget precisely
 ///   because the latency is already accepted. The prompt says so out loud — spend the
-///   room on depth — rather than leaving that intent only in the knobs.
+///   room on depth — rather than leaving that intent only in the knobs. It says it
+///   *without naming a rung*: effort is a floor a cast can raise (see
+///   [`batch_effort`](crate::batch::batch_effort)), so a preamble promising "high"
+///   would be quietly wrong on a slot tuned deeper.
 /// - **The written answer comes before the depth (GH #75).** Reasoning and answer draw
 ///   on one shared output budget, so a big attached-file review at max thinking can spend
 ///   the whole budget thinking and get truncated *before* the answer is written — the
@@ -319,8 +322,8 @@ pub fn batch_preamble() -> String {
      from the material it provides and your own knowledge — this call has no codebase \
      access and no tools, so the caller owns all the context you have. This is your \
      single response: there is no follow-up turn and the caller cannot clarify, so make \
-     the answer complete and self-contained. The lane gives you room and high effort — \
-     spend it on depth, but spend it on the *written* answer: lead with the conclusion \
+     the answer complete and self-contained. The lane runs offline with room to think, \
+     so depth is free — spend it on the *written* answer: lead with the conclusion \
      (the findings, the verdict, the recommendation) and write it in full, then let your \
      reasoning build under it. Your thinking and your answer draw on one shared output \
      budget, so land the deliverable the caller can act on first — don't reason at length \

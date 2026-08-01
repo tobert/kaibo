@@ -113,8 +113,9 @@ Connection knobs only — models never live here:
   `{"reasoning":{"effort":…}}` request field, which the gateway translates into
   each upstream provider's native knob and drops silently where the pinned model
   has none, so emitting it unconditionally never breaks a non-reasoning model. The
-  per-role `effort` (see [defaults] below) passes through verbatim, reaching
-  OpenRouter-only rungs (`xhigh`, `max`) deeper than the other kinds expose. No
+  per-role `effort` (see [defaults] below) reaches the gateway verbatim; OpenRouter
+  accepts all seven rungs on every model and normalizes each onto the upstream's own
+  knob, so `xhigh`/`max` land here even on models that refuse them direct. No
   `batch` lane. One slug routes across competing upstream *hosts* whose data
   policies differ, so every request pins **no-collection routing by default**
   (`provider.data_collection = "deny"` — kaibo's prompts carry your source, and
@@ -226,13 +227,39 @@ The `[defaults]` knobs themselves:
 - **`explorer_effort` / `synth_effort`** (`"high"` both): reasoning depth for the
   models that take an effort param — Anthropic's adaptive tier
   (→ `output_config.effort`), DeepSeek (→ `reasoning_effort`), Gemini
-  (→ `thinkingLevel`: the values align, `"minimal"`/`"low"`/`"medium"`/`"high"`),
-  and OpenRouter (→ its unified `{"reasoning":{"effort":…}}`, forwarded verbatim to
-  whatever the pinned model actually supports). A passthrough string the provider
-  validates (like a model id), so a new level lands without a code change — set a synth
-  slot's `effort = "max"`/`"xhigh"` for heavier runs; OpenRouter is where those
-  deeper rungs are actually reachable today. Ignored by models with no effort
-  sink (budget-tier Anthropic, OpenAI).
+  (→ `thinkingLevel`), OpenRouter (→ its unified `{"reasoning":{"effort":…}}`), and
+  hosted GPT-5.x (→ `reasoning.effort`). A passthrough string, like a model id:
+  **kaibo keeps no allowlist**, so a rung a provider ships tomorrow works today.
+
+  **There is no universal ladder.** A `[defaults]` effort lands on every cast at once,
+  so a rung that suits one provider can be invalid on another — prefer a deep rung on
+  the *slot* that can use it. Measured 2026-08-01:
+
+  | provider | rungs |
+  | --- | --- |
+  | Gemini | `minimal` `low` `medium` `high` — Google's own schema rejects `none`/`xhigh`/`max`. `minimal` is the off-switch, itself model-dependent (`gemini-3.5-flash` takes it, `gemini-pro-latest` refuses it). |
+  | DeepSeek | all seven (`none` … `max`), strictly validated. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway. |
+  | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
+  | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
+  | Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. |
+
+  **rig's client is a second, lower ceiling on two wires**, independent of the provider:
+  rig 0.38 parses kaibo's params into a typed struct for Gemini and for OpenAI's
+  Responses API, and those enums stop at `high` and `xhigh` respectively — so `max`
+  fails for a hosted GPT slot even though OpenAI's own API accepts it. kaibo asks rig's
+  converter before each call and refuses with a message naming the cast, the slot, the
+  backend and the rungs that wire *does* take, rather than letting a bare
+  ``unknown variant `max` `` surface mid-consult. That list is read back out of rig, so
+  a rig upgrade widens it with no kaibo change.
+
+  **An effort with nowhere to land is said out loud.** Budget-tier Anthropic and the
+  generic OpenAI `/chat/completions` wire (every local llama.cpp / Ollama / gateway
+  backend) have no reasoning field, so the value is dropped. When *you wrote* the effort
+  — on a slot, in `[defaults]`, or via `KAIBO_*_EFFORT` — kaibo logs a startup warning
+  naming the cast and slot, and `kaibo://config` lists `effort` under that slot's
+  `inert_tunables`. The inherited built-in `"high"` stays quiet: every local cast
+  inherits it onto a toggle-less wire, so warning there would be noise on every ordinary
+  setup.
 - **`thinking_style`** (`auto` | `adaptive` | `budget`, default `auto`) forces the
   Anthropic thinking shape instead of the built-in classifier. `auto` picks
   adaptive for Opus 4.6+/Sonnet 4.6/Fable 5 and enabled-budget for older models +

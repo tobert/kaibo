@@ -13,12 +13,13 @@
 //! tool loop. So batch is built on the `oneshot` *shape* (a single capable model
 //! answering from what it was handed), never `consult`.
 //!
-//! **Max the knobs by default.** Batch is the cheap/async lane, so it spends: it
-//! floors `max_tokens` at [`BATCH_MAX_TOKENS_FLOOR`] and forces thinking on at
-//! [`BATCH_EFFORT`] regardless of how the cast's synth slot was tuned for interactive
-//! use. The latency that makes max-thinking painful synchronously is free here — the
-//! caller already accepted "come back later." This is the lane for asking the best
-//! model the hard question and waiting.
+//! **Floor the knobs by default.** Batch is the cheap/async lane, so it spends: every
+//! knob rises to a batch minimum — `max_tokens` to [`BATCH_MAX_TOKENS_FLOOR`], the
+//! thinking budget to [`BATCH_THINKING_BUDGET`], reasoning depth to [`BATCH_EFFORT`] —
+//! and none of them is ever *capped*. A slot tuned thin for flaky interactive use still
+//! batches hot; a slot that already asks for more keeps it. The latency that makes deep
+//! thinking painful synchronously is free here — the caller already accepted "come back
+//! later." This is the lane for asking the best model the hard question and waiting.
 //!
 //! **Per-provider HTTP seam.** rig-core has no batch path, so each provider is
 //! hand-rolled behind the [`BatchProvider`] trait (one trait, per-provider impls, honest
@@ -58,12 +59,39 @@ use crate::credentials::ProviderKind;
 /// see [`AnthropicBatch::base_url`]).
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 
-/// The effort batch runs every item at — the maxed knob. Equal to
+/// The reasoning depth batch *floors* every item at. Equal to
 /// [`crate::consult::DEFAULT_EFFORT`] today (the proven-accepted top for the Anthropic
 /// adaptive tier); kept a separate constant so batch's "spend, it's async" intent
-/// survives a change to the interactive default. Forced regardless of the slot's
-/// configured `effort` — a cast tuned down for flaky interactive use still batches hot.
+/// survives a change to the interactive default.
+///
+/// A floor, matching every other batch knob — see [`batch_effort`] for why the direction
+/// matters and how an unrankable rung is handled.
 pub const BATCH_EFFORT: &str = "high";
+
+/// The reasoning depth one batch item runs at: the deeper of the slot's `effort` and
+/// [`BATCH_EFFORT`], with an unrankable rung deferring to the slot.
+///
+/// Batch floors its knobs rather than fixing them, and effort was the one exception —
+/// force-clobbered in *both* directions. Lifting a thin slot is the intent ("a cast tuned
+/// down for flaky interactive use still batches hot"); demoting a slot that deliberately
+/// asked for `xhigh`/`max` was collateral, and silent. So:
+///
+/// - the slot ranks **deeper** than the floor → the slot wins (never cap a richer slot,
+///   the same promise `max_tokens` and the thinking budget already make);
+/// - the slot ranks **shallower** → the floor wins (the deliberate lift, unchanged);
+/// - either rung is **outside** [`EFFORT_LADDER`] → the slot wins. kaibo keeps no effort
+///   allowlist, so a rung it can't order is an operator reaching for something newer than
+///   this table — trusting it is what keeps that passthrough real, and silently replacing
+///   it with "high" would be exactly the override this function exists to retire.
+pub fn batch_effort(slot_effort: &str) -> &str {
+    match (
+        crate::consult::effort_rank(slot_effort),
+        crate::consult::effort_rank(BATCH_EFFORT),
+    ) {
+        (Some(slot), Some(floor)) if slot <= floor => BATCH_EFFORT,
+        _ => slot_effort,
+    }
+}
 
 /// Floor for a batch item's completion budget. Thinking eats the completion budget, so
 /// a thin `max_tokens` starves the answer; batch is async and cheap, so it never skimps.
@@ -154,21 +182,21 @@ pub trait BatchProvider: Send + Sync {
 
 // --- Request shaping (pure, offline-testable) ------------------------------
 
-/// Batch's maxed request shape for one (kind, model): the floored completion budget and
-/// the forced thinking block, at [`BATCH_EFFORT`]. Threads `BATCH_EFFORT` *explicitly*
+/// Batch's request shape for one (kind, model): the floored completion budget and the
+/// forced-on thinking block at the floored effort. Threads the effort *explicitly*
 /// through [`ModelShape::to_params`](crate::consult::ModelShape::to_params) rather than
 /// the public [`thinking_params`](crate::consult::thinking_params) helper (which would
-/// bake in `consult`'s interactive `DEFAULT_EFFORT`) — so batch's effort stays decoupled
+/// bake in `consult`'s interactive `DEFAULT_EFFORT`) — so batch's depth stays decoupled
 /// from the interactive default, the way the [`BATCH_EFFORT`] doc promises.
 ///
-/// Every knob is *floored*, never capped: `max_tokens` and the thinking budget both rise
-/// to the batch floor but keep a slot's already-higher value — that's the "max the knobs"
-/// promise (batch spends even when the cast was tuned thin for interactive use), and it
-/// can't *undercut* a slot that already asks for more. The budget is held strictly under
-/// `max_tokens` (Anthropic requires `budget_tokens < max_tokens`; the adaptive tier
-/// ignores the budget and expresses depth as `output_config.effort`). Sampling is left
-/// to the provider default — `None`/`None` here — since batch maxes thinking, and the
-/// adaptive tier rejects sampling under thinking anyway.
+/// Every knob is a *floor*, never a cap: `max_tokens`, the thinking budget, and the
+/// effort ([`batch_effort`]) each rise to the batch minimum but keep a slot's
+/// already-higher value — the "spend, it's async" promise in the direction that helps,
+/// without undercutting a cast that deliberately asked for more. The budget is held
+/// strictly under `max_tokens` (Anthropic requires `budget_tokens < max_tokens`; the
+/// adaptive tier ignores the budget and expresses depth as `output_config.effort`).
+/// Sampling is left to the provider default — `None`/`None` here — since batch runs
+/// thinking deep, and the adaptive tier rejects sampling under thinking anyway.
 pub fn batch_shaping(
     kind: ProviderKind,
     model: &str,
@@ -182,7 +210,7 @@ pub fn batch_shaping(
         .max(BATCH_THINKING_BUDGET)
         .min(max_tokens.saturating_sub(1));
     let params = crate::consult::ModelShape::resolve(kind, model, tunables.thinking_style)
-        .to_params(budget, None, None, BATCH_EFFORT);
+        .to_params(budget, None, None, batch_effort(&tunables.effort));
     (max_tokens, params)
 }
 
@@ -1291,19 +1319,22 @@ const OPENAI_COMPLETION_WINDOW: &str = "24h";
 /// so it says who made it.
 const OPENAI_INPUT_FILENAME: &str = "kaibo-batch-input.jsonl";
 
-/// Batch's maxed request shape for a *hosted* OpenAI slot — the Responses-flavored sibling
-/// of [`batch_shaping`]. It can't go through [`ModelShape`](crate::consult::ModelShape):
+/// Batch's request shape for a *hosted* OpenAI slot — the Responses-flavored sibling of
+/// [`batch_shaping`]. It can't go through [`ModelShape`](crate::consult::ModelShape):
 /// that classifier maps the whole `openai` kind to [`ThinkingStyle::None`] on purpose
 /// (a local llama.cpp/Ollama server takes no reasoning params), and hosted-ness is a
 /// property of the *backend*, not the kind. So this reuses the same model-aware classifier
-/// the interactive hosted arm uses, at [`BATCH_EFFORT`] instead of the interactive default.
+/// the interactive hosted arm uses, at the batch-floored effort instead of the interactive
+/// default.
 ///
-/// `max_tokens` is floored exactly like [`batch_shaping`] (never undercut a slot that asks
-/// for more). Sampling is left to the provider default — `top_p = None` — matching the
-/// other providers' batch shape; only the reasoning knob is forced.
+/// `max_tokens` and the effort are floored exactly like [`batch_shaping`] — same
+/// [`batch_effort`] rule, so the two lanes can't drift apart on which direction wins.
+/// Sampling is left to the provider default — `top_p = None` — matching the other
+/// providers' batch shape.
 pub fn openai_batch_shaping(model: &str, tunables: &SlotTunables) -> (u64, Option<Value>) {
     let max_tokens = tunables.max_tokens.max(BATCH_MAX_TOKENS_FLOOR);
-    let params = crate::consult::hosted_openai_responses_params(model, None, BATCH_EFFORT);
+    let params =
+        crate::consult::hosted_openai_responses_params(model, None, batch_effort(&tunables.effort));
     (max_tokens, params)
 }
 
@@ -2177,15 +2208,18 @@ mod tests {
             temperature: 1.0,
             top_p: 1.0,
             effort: effort.to_string(),
+            effort_explicit: true,
             thinking_style: crate::consult::ThinkingStyleOverride::Auto,
         }
     }
 
-    /// Batch maxes the knobs: even a slot tuned thin for interactive use (tiny
-    /// max_tokens, low effort) is floored and forced to the batch effort. The adaptive
-    /// tier expresses that as `output_config.effort: "high"`.
+    /// Batch floors the knobs: a slot tuned thin for interactive use (tiny max_tokens,
+    /// `low` effort) is lifted to the batch budget and the batch effort. The adaptive
+    /// tier expresses that as `output_config.effort: "high"`. This is the direction that
+    /// was always the intent — a cast tuned down for flaky interactive use still batches
+    /// hot — and it must survive effort becoming a floor rather than an override.
     #[test]
-    fn shaping_floors_tokens_and_forces_high_effort_adaptive() {
+    fn shaping_floors_tokens_and_lifts_thin_effort_adaptive() {
         let (max_tokens, params) = batch_shaping(
             ProviderKind::Anthropic,
             "claude-sonnet-4-6",
@@ -2202,8 +2236,65 @@ mod tests {
         // dead-constant bug the cross-family review caught).
         assert_eq!(
             params["output_config"]["effort"], BATCH_EFFORT,
-            "batch must force BATCH_EFFORT regardless of the slot's configured effort: {params}"
+            "a shallower slot effort must be lifted to the batch floor: {params}"
         );
+    }
+
+    /// The other two directions of the effort floor, which the old force-in-both-directions
+    /// shaping got wrong: a slot asking **deeper** than `BATCH_EFFORT` keeps its value (the
+    /// same never-cap-a-richer-slot promise `max_tokens` and the thinking budget already
+    /// make — a cast pinned to `xhigh` for the offline lane was being silently demoted),
+    /// and a rung kaibo can't rank defers to the operator (effort is a passthrough string;
+    /// quietly replacing an unrecognized rung with "high" is the override this retires).
+    #[test]
+    fn shaping_effort_floor_keeps_a_deeper_slot_and_defers_to_an_unranked_rung() {
+        let (_max, params) = batch_shaping(
+            ProviderKind::Anthropic,
+            "claude-sonnet-4-6",
+            &tunables("xhigh", 100),
+        );
+        let params = params.expect("an adaptive Anthropic model carries a thinking block");
+        assert_eq!(
+            params["output_config"]["effort"], "xhigh",
+            "a slot deeper than the batch floor must keep its effort: {params}"
+        );
+
+        // A rung outside EFFORT_LADDER — a provider's newer name, or a typo; from here
+        // they look identical, and trusting the operator is what keeps passthrough real.
+        let (_max, params) = batch_shaping(
+            ProviderKind::Anthropic,
+            "claude-sonnet-4-6",
+            &tunables("ludicrous", 100),
+        );
+        let params = params.expect("an adaptive Anthropic model carries a thinking block");
+        assert_eq!(
+            params["output_config"]["effort"], "ludicrous",
+            "an unrankable rung passes through untouched: {params}"
+        );
+    }
+
+    /// The floor rule itself, isolated from any provider shape — every direction in one
+    /// place so a future edit to `batch_effort` can't quietly flip one of them.
+    #[test]
+    fn batch_effort_is_a_floor_not_an_override() {
+        assert_eq!(batch_effort("none"), BATCH_EFFORT, "lifted");
+        assert_eq!(batch_effort("low"), BATCH_EFFORT, "lifted");
+        assert_eq!(
+            batch_effort(BATCH_EFFORT),
+            BATCH_EFFORT,
+            "equal stays equal"
+        );
+        assert_eq!(batch_effort("xhigh"), "xhigh", "deeper wins");
+        assert_eq!(batch_effort("max"), "max", "deeper wins");
+        assert_eq!(batch_effort("ludicrous"), "ludicrous", "unranked defers");
+        // Ranking is case/whitespace tolerant, but the slot's own spelling is what ships —
+        // kaibo never normalizes an operator's string on its way to a provider.
+        assert_eq!(
+            batch_effort(" LOW "),
+            BATCH_EFFORT,
+            "ranked case-insensitively"
+        );
+        assert_eq!(batch_effort("XHIGH"), "XHIGH", "deeper keeps its spelling");
     }
 
     /// The thinking budget is a *floor*, not a cap: a budget-tier slot already asking
@@ -2692,11 +2783,14 @@ mod tests {
         );
     }
 
-    /// A 3-line id takes `thinkingLevel`, forced to BATCH_EFFORT — the per-role effort
-    /// lever, not a token budget — even when the slot asked for a shallower "low". (The
+    /// A 3-line id takes `thinkingLevel` — the per-role effort lever, not a token budget —
+    /// lifted to BATCH_EFFORT when the slot asked for a shallower "low". (The
     /// `gemini-batch` cast synths `gemini-pro-latest`, also a level-tier id now that the
     /// whole Gemini 3-line takes a level; every Gemini id runs this one path through
-    /// `batch_shaping`.)
+    /// `batch_shaping`.) Note the ladder above `high` is Google's to answer for on this
+    /// wire: batch POSTs its own JSON (no rig converter in the path), so a slot pinned
+    /// deeper than `high` reaches Google verbatim and Google decides — the passthrough
+    /// contract, applied honestly rather than quietly clamped back to `high`.
     #[test]
     fn gemini_3_line_uses_thinking_level_at_batch_effort() {
         let (_max, params) = batch_shaping(
@@ -3349,10 +3443,12 @@ mod tests {
         );
     }
 
-    /// Batch maxes the knobs on hosted OpenAI too: a slot tuned thin and low-effort for
-    /// interactive use is floored to the batch budget and forced to `BATCH_EFFORT`.
+    /// Batch floors the knobs on hosted OpenAI too, and by the *same* rule as every other
+    /// provider — the two shaping functions can't drift on which direction wins. A thin,
+    /// `low`-effort slot is lifted to the batch budget and `BATCH_EFFORT`; a slot that
+    /// asked deeper keeps its rung; an unrankable rung defers to the operator.
     #[test]
-    fn openai_shaping_floors_tokens_and_forces_high_effort() {
+    fn openai_shaping_floors_tokens_and_treats_effort_as_a_floor() {
         let (max_tokens, params) = openai_batch_shaping("gpt-5.6-sol", &tunables("low", 100));
         assert!(
             max_tokens >= BATCH_MAX_TOKENS_FLOOR,
@@ -3361,7 +3457,7 @@ mod tests {
         assert_eq!(
             params.as_ref().unwrap()["reasoning"]["effort"],
             json!(BATCH_EFFORT),
-            "the slot's `low` is overridden by the batch effort"
+            "the slot's shallower `low` is lifted to the batch effort"
         );
         assert!(
             params.as_ref().unwrap().get("top_p").is_none(),
@@ -3370,6 +3466,20 @@ mod tests {
         // A slot already asking for more keeps it — floored, never capped.
         let (bigger, _) = openai_batch_shaping("gpt-5.6-sol", &tunables("low", 1 << 20));
         assert_eq!(bigger, 1 << 20);
+
+        let (_, params) = openai_batch_shaping("gpt-5.6-sol", &tunables("xhigh", 100));
+        assert_eq!(
+            params.as_ref().unwrap()["reasoning"]["effort"],
+            json!("xhigh"),
+            "a deeper slot effort survives the batch lane instead of being demoted"
+        );
+
+        let (_, params) = openai_batch_shaping("gpt-5.6-sol", &tunables("ludicrous", 100));
+        assert_eq!(
+            params.as_ref().unwrap()["reasoning"]["effort"],
+            json!("ludicrous"),
+            "an unrankable rung passes through — kaibo holds no effort allowlist"
+        );
     }
 
     /// The model-aware half: an older chat family takes no `reasoning` block at all, so

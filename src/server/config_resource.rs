@@ -242,11 +242,18 @@ pub(crate) fn render_config_resource(
         /// means interactive. Only ever set on a synth slot (load-validated).
         #[serde(skip_serializing_if = "Option::is_none")]
         lane: Option<&'static str>,
-        /// Per-slot tunables that *are* set here but this slot's resolved request shape
-        /// will never send — the honest no-op flag. A `thinking_budget` on an
-        /// effort-driven or toggle-less model, an `effort` on a budget model, a
-        /// `temperature` an Anthropic slot drops under thinking: each load-validates and
-        /// would otherwise render as if effective. Absent when every set knob has a sink.
+        /// Tunables in effect for this slot that its resolved request shape will never
+        /// send — the honest no-op flag. A `thinking_budget` on an effort-driven or
+        /// toggle-less model, an `effort` on a budget/toggle-less model, a `temperature`
+        /// an Anthropic slot drops under thinking: each load-validates and would otherwise
+        /// render as if effective. Absent when every knob in play has a sink.
+        ///
+        /// `effort` is judged on the **effective** value, not just a per-slot override:
+        /// a `[defaults]`/env effort lands on every cast, so a lane-blind per-slot-only
+        /// check missed the case that bites hardest. The shape is resolved through
+        /// [`Config::slot_effort_sinks`](crate::config::Config::slot_effort_sinks) — the
+        /// same fallbacks `slot.tunables` uses, lane included — so the render can't
+        /// disagree with the wire.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         inert_tunables: Vec<&'static str>,
     }
@@ -335,22 +342,39 @@ pub(crate) fn render_config_resource(
                     let backend = config
                         .resolve_backend(&slot.backend)
                         .expect("a loaded cast's slot backend resolves");
-                    let shape = ModelShape::resolve(
+                    // Resolve through `slot.tunables` — the same fallbacks the wire path
+                    // takes, so a `[defaults].thinking_style` (which the old
+                    // `unwrap_or_default()` here silently ignored) can't make the render
+                    // disagree with what actually ships.
+                    let t = slot.tunables(*role, &config.defaults);
+                    let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
+                    // Lane-aware: a `lane = "batch"` slot never builds an interactive arm.
+                    // Batch POSTs its own body and gates the Responses shape on the
+                    // endpoint-exact `is_hosted_openai`; the interactive arm follows the
+                    // configurable `uses_responses_wire` (a responses-wire gateway shapes
+                    // like Platform even though it isn't batch-eligible).
+                    let batch_lane = matches!(lane, Some(Lane::Batch));
+                    let responses_wire = if batch_lane {
+                        backend.is_hosted_openai()
+                    } else {
+                        backend.uses_responses_wire()
+                    };
+                    let mut inert_tunables = Vec::new();
+                    let effort_sinks = crate::consult::effort_sinks(
                         backend.kind,
                         &slot.id,
-                        thinking_style.unwrap_or_default(),
+                        t.thinking_style,
+                        responses_wire,
                     );
-                    // The interactive shape a slot's arm will actually build under
-                    // (`Arm::from_slot`) follows `uses_responses_wire`, not the
-                    // narrower `is_hosted_openai` platform gate — a responses-wire
-                    // gateway shapes its inert tunables the same way hosted OpenAI
-                    // Platform does, even though it isn't batch-eligible.
-                    let responses_wire = backend.uses_responses_wire();
-                    let mut inert_tunables = Vec::new();
-                    let effort_sinks = shape.sinks_effort()
-                        || (responses_wire
-                            && crate::consult::hosted_openai_accepts_reasoning(&slot.id));
-                    let sampling_sinks = if responses_wire {
+                    // Batch floors the effort, so a rung at or below `BATCH_EFFORT` is
+                    // lifted and the configured value never ships as written.
+                    let effort_lands = effort_sinks
+                        && (!batch_lane || crate::batch::batch_effort(&t.effort) == t.effort);
+                    // Batch hands the provider no sampling at all (`None`/`None`), so a
+                    // `temperature` on a batch slot is inert regardless of the model.
+                    let sampling_sinks = if batch_lane {
+                        false
+                    } else if responses_wire {
                         crate::consult::hosted_openai_accepts_sampling(&slot.id)
                     } else {
                         shape.sinks_sampling()
@@ -358,7 +382,11 @@ pub(crate) fn render_config_resource(
                     if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
                         inert_tunables.push("thinking_budget");
                     }
-                    if effort.is_some() && !effort_sinks {
+                    // The *effective* effort, not just a per-slot override: a
+                    // `[defaults]`/env effort lands on every cast, and one that lands
+                    // nowhere deserves the same flag. Inherited built-in defaults stay
+                    // quiet — see `Defaults::explorer_effort_explicit`.
+                    if t.effort_explicit && !effort_lands {
                         inert_tunables.push("effort");
                     }
                     if temperature.is_some() && !sampling_sinks {
@@ -414,6 +442,10 @@ pub(crate) fn render_config_resource(
         top_p,
         explorer_effort,
         synth_effort,
+        // Provenance, not a knob: it decides whether an inert effort is worth flagging
+        // (below and at startup), and the render already shows the effective values.
+        explorer_effort_explicit: _,
+        synth_effort_explicit: _,
         thinking_style,
         request_timeout,
         call_deadline,
@@ -638,6 +670,93 @@ mod tests {
             inert("gpt_chat", "synth"),
             vec!["thinking_budget", "effort"],
             "hosted GPT chat sinks sampling but rejects reasoning effort and budget"
+        );
+    }
+
+    /// The three blind spots that let an inert knob render as effective, closed together
+    /// because they share one cause — the render used to resolve a slot's shape by its
+    /// own rules instead of asking the same question the wire asks.
+    ///
+    /// 1. **`[defaults]`-sourced effort.** The check keyed on a per-*slot* `effort`, so a
+    ///    `[defaults].synth_effort` — which lands on every cast at once — rendered as
+    ///    effective on a wire that drops it. The effective value is what matters.
+    /// 2. **`[defaults].thinking_style`.** The render resolved the style with
+    ///    `unwrap_or_default()` (→ `Auto`) while the wire uses the `[defaults]` fallback,
+    ///    so a forced `adaptive` moved the sinks on the wire and not in the render.
+    /// 3. **Lane-blindness.** A `lane = "batch"` slot never builds an interactive arm:
+    ///    batch hands the provider no sampling at all, and floors the effort — so a rung
+    ///    at or below `BATCH_EFFORT` is lifted and the configured value never ships.
+    #[test]
+    fn config_render_resolves_inert_tunables_the_way_the_wire_does() {
+        let config = Config::from_toml_str(
+            r#"
+            [defaults]
+            # Lands on every synth slot below; effective, not per-slot.
+            synth_effort = "medium"
+            # The wire honors this fallback; the render used to ignore it.
+            thinking_style = "adaptive"
+
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            # Toggle-less wire: the defaults effort lands nowhere and must be flagged.
+            [casts.lab_cast]
+            synth = "lab/gemma"
+
+            # Forced adaptive gives Haiku an effort sink and takes away its budget one —
+            # the opposite of what the classifier alone would say.
+            [casts.forced]
+            synth = { backend = "anthropic", id = "claude-haiku-4-5", thinking_budget = 2048 }
+
+            # A batch slot: sampling is never sent, and `low` is below the batch floor.
+            [casts.bat]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low", temperature = 0.4 }
+
+            # Same lane, a rung deeper than the floor: it ships as written now that batch
+            # floors rather than overrides, so it is NOT inert.
+            [casts.bat_deep]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let inert = |cast: &str, role: &str| -> Vec<String> {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .map(|a| {
+                    a.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            inert("lab_cast", "synth"),
+            vec!["effort"],
+            "a [defaults] effort on a toggle-less wire is just as inert as a slot one"
+        );
+        assert_eq!(
+            inert("forced", "synth"),
+            vec!["thinking_budget"],
+            "[defaults].thinking_style = adaptive moves both sinks — the render must \
+             resolve it the way slot.tunables does"
+        );
+        assert_eq!(
+            inert("bat", "synth"),
+            vec!["effort", "temperature"],
+            "batch lifts a below-floor effort and sends no sampling at all"
+        );
+        assert!(
+            inert("bat_deep", "synth").is_empty(),
+            "a batch slot deeper than the floor keeps its effort: {:?}",
+            inert("bat_deep", "synth")
         );
     }
 

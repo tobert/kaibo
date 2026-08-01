@@ -66,10 +66,23 @@ pub struct Defaults {
     /// Per-role reasoning effort for the models that take one as a request param
     /// (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`,
     /// Gemini's `thinkingLevel`, OpenRouter's unified `reasoning.effort`). A passthrough
-    /// string — the provider validates it. Default `"high"` both roles; bump a synth
-    /// slot's `effort` to `"max"`/`"xhigh"` for heavier synth runs.
+    /// string — kaibo keeps no allowlist. Default `"high"` both roles; bump a synth
+    /// slot's `effort` for heavier synth runs. **The ladder is per-provider**, not
+    /// universal — see `docs/config.md` and [`crate::consult::EffortWire`].
     pub explorer_effort: String,
     pub synth_effort: String,
+    /// Did the operator *write* the per-role effort (config file, `KAIBO_*_EFFORT`), or
+    /// is it the inherited built-in [`crate::consult::DEFAULT_EFFORT`]?
+    ///
+    /// The distinction is what lets kaibo be loud about an effort that lands nowhere
+    /// without crying wolf: two wires have no reasoning knob at all (Anthropic's budget
+    /// tier, the generic OpenAI `/chat/completions` shape) and drop it silently, and
+    /// *every* local cast inherits `high` onto one of them. Warning about the inherited
+    /// default would fire on every ordinary local setup; warning about a value the
+    /// operator typed is the signal they actually asked for. See
+    /// [`Config::inert_efforts`].
+    pub explorer_effort_explicit: bool,
+    pub synth_effort_explicit: bool,
     /// Force the Anthropic thinking style (`auto`/`adaptive`/`budget`) instead of the
     /// built-in classifier — the escape hatch for a new or misclassified model.
     /// Server-wide default; overridable per slot. A no-op for non-Anthropic kinds.
@@ -139,6 +152,9 @@ impl Default for Defaults {
             // run is unchanged. `Auto` classifies the thinking style from the model id.
             explorer_effort: crate::consult::DEFAULT_EFFORT.to_string(),
             synth_effort: crate::consult::DEFAULT_EFFORT.to_string(),
+            // Inherited, not asked for — see the field docs.
+            explorer_effort_explicit: false,
+            synth_effort_explicit: false,
             thinking_style: ThinkingStyleOverride::Auto,
             // 15 min. A single completion that takes longer is pathological for a
             // hosted API and a generous ceiling for a slow local model. It's the
@@ -319,14 +335,19 @@ impl ModelSlot {
     /// wins, else the per-role `[defaults]` value. The single fallback point — the
     /// per-arm request shaping in `consult.rs` reads only the result.
     pub fn tunables(&self, role: ModelRole, defaults: &Defaults) -> SlotTunables {
-        let (default_temperature, default_effort) = match role {
+        let (default_temperature, default_effort, default_effort_explicit) = match role {
             ModelRole::Explorer => (
                 defaults.explorer_temperature,
                 defaults.explorer_effort.as_str(),
+                defaults.explorer_effort_explicit,
             ),
             // Synth and (future) media roles take the synth-side defaults: the
             // answer-composing posture is the general-purpose one.
-            _ => (defaults.synth_temperature, defaults.synth_effort.as_str()),
+            _ => (
+                defaults.synth_temperature,
+                defaults.synth_effort.as_str(),
+                defaults.synth_effort_explicit,
+            ),
         };
         SlotTunables {
             max_tokens: self.max_tokens.unwrap_or(defaults.max_tokens),
@@ -337,9 +358,43 @@ impl ModelSlot {
                 .effort
                 .clone()
                 .unwrap_or_else(|| default_effort.to_string()),
+            // Explicit either way an operator can write it: on the slot, or in the
+            // `[defaults]`/env layer this slot inherits from.
+            effort_explicit: self.effort.is_some() || default_effort_explicit,
             thinking_style: self.thinking_style.unwrap_or(defaults.thinking_style),
         }
     }
+}
+
+/// Where an operator wrote the `effort` that turned out to be inert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortSource {
+    /// On the cast slot itself (`effort = "…"` in the role table).
+    Slot,
+    /// In `[defaults].explorer_effort` / `synth_effort`, or the matching `KAIBO_*_EFFORT`.
+    Defaults,
+}
+
+impl EffortSource {
+    /// Where to go edit it — a short token, since this rides a structured log field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::Defaults => "[defaults]/env",
+        }
+    }
+}
+
+/// One configured slot whose written `effort` has no sink on its wire — see
+/// [`Config::inert_efforts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InertEffort {
+    pub cast: String,
+    pub role: &'static str,
+    /// The slot's `"backend/model-id"` ref, so the message names both halves.
+    pub model: String,
+    pub effort: String,
+    pub source: EffortSource,
 }
 
 /// A slot's effective request-shaping knobs after the per-role fallback (see
@@ -351,6 +406,10 @@ pub struct SlotTunables {
     pub temperature: f64,
     pub top_p: f64,
     pub effort: String,
+    /// True when `effort` came from something the operator wrote (a slot `effort =`, the
+    /// `[defaults]` table, a `KAIBO_*_EFFORT` env) rather than the built-in
+    /// [`crate::consult::DEFAULT_EFFORT`]. See [`Defaults::explorer_effort_explicit`].
+    pub effort_explicit: bool,
     pub thinking_style: ThinkingStyleOverride,
 }
 
@@ -1074,6 +1133,72 @@ impl Config {
     pub fn slot_caps(&self, slot: &ModelSlot) -> Result<ModelCaps> {
         let backend = self.resolve_backend(&slot.backend)?;
         Ok(ModelCaps::resolve(backend.kind, &slot.id, slot.vision))
+    }
+
+    /// Does this slot's `effort` reach the wire? The one answer the render, the startup
+    /// scan, and (through [`crate::consult::effort_sinks`]) the arm all read — resolving
+    /// the shape exactly as [`ModelSlot::tunables`] does, `[defaults].thinking_style`
+    /// fallback included, so display can't disagree with what actually ships.
+    ///
+    /// Lane-aware: a `lane = "batch"` slot never touches the interactive wire, and batch's
+    /// hosted-OpenAI shape is gated on the endpoint-exact `is_hosted_openai` rather than
+    /// the configurable `uses_responses_wire`.
+    pub fn slot_effort_sinks(&self, slot: &ModelSlot, role: ModelRole) -> Result<bool> {
+        let backend = self.resolve_backend(&slot.backend)?;
+        let t = slot.tunables(role, &self.defaults);
+        let responses = match slot.lane {
+            Some(Lane::Batch) => backend.is_hosted_openai(),
+            _ => backend.uses_responses_wire(),
+        };
+        Ok(crate::consult::effort_sinks(
+            backend.kind,
+            &slot.id,
+            t.thinking_style,
+            responses,
+        ))
+    }
+
+    /// Every configured cast slot where the operator *wrote* an `effort` that this
+    /// slot's wire has no place to put — the silent drop, made loud.
+    ///
+    /// Two wires carry no reasoning knob at all: Anthropic's legacy budget tier (Haiku
+    /// 4.5 and older, which express depth as `budget_tokens`) and the generic OpenAI
+    /// `/chat/completions` shape every local llama.cpp/Ollama/gateway backend speaks. An
+    /// `effort` aimed at either evaporates in `to_params`, and nothing downstream fails —
+    /// exactly the silent fallback kaibo refuses everywhere else.
+    ///
+    /// Only *explicit* efforts are reported (see [`Defaults::explorer_effort_explicit`]):
+    /// every local cast inherits the built-in `high` onto a toggle-less wire, so a warning
+    /// there would be noise on every ordinary setup and would train operators to ignore
+    /// the one that matters. Returned rather than logged so the rule is unit-testable and
+    /// both front doors (and the `kaibo://config` render) share one answer; the caller
+    /// decides how to say it. Slots whose backend doesn't resolve are skipped — a broken
+    /// ref is someone else's louder error.
+    pub fn inert_efforts(&self) -> Vec<InertEffort> {
+        let mut out = Vec::new();
+        for (cast_name, cast) in &self.casts {
+            for (role, slot) in &cast.slots {
+                let t = slot.tunables(*role, &self.defaults);
+                if !t.effort_explicit {
+                    continue;
+                }
+                if self.slot_effort_sinks(slot, *role).unwrap_or(true) {
+                    continue;
+                }
+                out.push(InertEffort {
+                    cast: cast_name.clone(),
+                    role: role.key(),
+                    model: slot.qualified(),
+                    effort: t.effort,
+                    source: if slot.effort.is_some() {
+                        EffortSource::Slot
+                    } else {
+                        EffortSource::Defaults
+                    },
+                });
+            }
+        }
+        out
     }
 
     /// Validate `[sandbox].disable_builtins` against the set of builtins actually
@@ -2200,6 +2325,10 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
         explorer_temperature: raw.explorer_temperature.unwrap_or(d.explorer_temperature),
         synth_temperature: raw.synth_temperature.unwrap_or(d.synth_temperature),
         top_p: raw.top_p.unwrap_or(d.top_p),
+        // `raw` already carries the env layer folded in (`apply_env`), so `is_some` is
+        // "the operator wrote this" for both the config file and `KAIBO_*_EFFORT`.
+        explorer_effort_explicit: raw.explorer_effort.is_some(),
+        synth_effort_explicit: raw.synth_effort.is_some(),
         explorer_effort: raw.explorer_effort.unwrap_or(d.explorer_effort),
         synth_effort: raw.synth_effort.unwrap_or(d.synth_effort),
         thinking_style: match raw.thinking_style {
@@ -3681,6 +3810,145 @@ mod tests {
             ..ModelSlot::bare("openai-local", "llava")
         };
         assert!(cfg.slot_caps(&pinned).unwrap().vision);
+    }
+
+    // --- inert effort -----------------------------------------------------------
+
+    /// An `effort` the operator WROTE onto a wire with no reasoning knob is reported;
+    /// the inherited built-in default on the same wire is not.
+    ///
+    /// This is the whole explicit-vs-inherited distinction. Anthropic's budget tier and
+    /// the generic OpenAI chat shape drop the effort in `to_params` and nothing fails —
+    /// but *every* local cast inherits `high` onto that second wire, so flagging the
+    /// inherited value would fire on every ordinary setup and teach operators to tune the
+    /// warning out. Flagging what they typed is the signal they asked for.
+    #[test]
+    fn inert_efforts_reports_a_written_effort_and_stays_quiet_about_the_inherited_one() {
+        // A local (openai-chat) cast with no effort written anywhere: the built-in `high`
+        // lands nowhere, and that is normal — silence.
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            [casts.zorak]
+            synth = "lab/gemma"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            cfg.inert_efforts().is_empty(),
+            "an inherited default on a toggle-less wire is ordinary, not a warning: {:?}",
+            cfg.inert_efforts()
+        );
+
+        // The same cast, with the effort written on the slot: now it is a claim the
+        // operator made, and it goes nowhere.
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            [casts.zorak]
+            synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        let inert = cfg.inert_efforts();
+        assert_eq!(inert.len(), 1, "one slot, one report: {inert:?}");
+        assert_eq!(inert[0].cast, "zorak");
+        assert_eq!(inert[0].role, "synth");
+        assert_eq!(inert[0].model, "lab/gemma");
+        assert_eq!(inert[0].effort, "xhigh");
+        assert_eq!(
+            inert[0].source,
+            EffortSource::Slot,
+            "the message must point at the line to edit"
+        );
+
+        // And via `[defaults]` — the case a per-slot-only check missed entirely, since a
+        // defaults effort lands on every cast at once.
+        let cfg = Config::from_toml_str(
+            r#"
+            [defaults]
+            synth_effort = "low"
+
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            [casts.zorak]
+            synth = "lab/gemma"
+            "#,
+        )
+        .unwrap();
+        let inert = cfg.inert_efforts();
+        let zorak: Vec<_> = inert.iter().filter(|i| i.cast == "zorak").collect();
+        assert_eq!(
+            zorak.len(),
+            1,
+            "the defaults effort is reported too: {inert:?}"
+        );
+        assert_eq!(zorak[0].effort, "low");
+        assert_eq!(zorak[0].source, EffortSource::Defaults);
+    }
+
+    /// A written effort on a wire that *does* carry one is never reported — the flag has
+    /// to discriminate, or it is noise. One slot per effort-carrying wire kaibo ships.
+    #[test]
+    fn inert_efforts_stays_quiet_where_the_effort_actually_lands() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.spread]
+            explorer = { backend = "deepseek", id = "deepseek-v4-pro", effort = "low" }
+            synth = { backend = "anthropic", id = "claude-sonnet-4-6", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        assert!(
+            cfg.inert_efforts().iter().all(|i| i.cast != "spread"),
+            "DeepSeek's reasoning_effort and Anthropic adaptive's output_config.effort \
+             both carry the value: {:?}",
+            cfg.inert_efforts()
+        );
+
+        // The budget tier is the Anthropic half that does NOT: depth there is
+        // `budget_tokens`, so an effort beside it evaporates.
+        let cfg = Config::from_toml_str(
+            r#"
+            [casts.haiku]
+            synth = { backend = "anthropic", id = "claude-haiku-4-5", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        let inert = cfg.inert_efforts();
+        assert!(
+            inert.iter().any(|i| i.cast == "haiku"),
+            "the budget tier has no effort sink: {inert:?}"
+        );
+
+        // ...and the `thinking_style` escape hatch moves the answer, resolved through the
+        // same `slot.tunables` fallback the wire uses — a `[defaults]` style must count.
+        let cfg = Config::from_toml_str(
+            r#"
+            [defaults]
+            thinking_style = "adaptive"
+
+            [casts.haiku]
+            synth = { backend = "anthropic", id = "claude-haiku-4-5", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        assert!(
+            cfg.inert_efforts().iter().all(|i| i.cast != "haiku"),
+            "forced adaptive gives the effort a sink: {:?}",
+            cfg.inert_efforts()
+        );
     }
 
     /// A model id with an inner slash (HuggingFace style) survives the string
