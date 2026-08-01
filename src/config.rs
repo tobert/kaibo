@@ -395,10 +395,17 @@ pub enum EffortFate {
     /// Ships exactly as configured: an orderable depth this wire carries.
     Sent,
     /// Ships as configured, and it is the reasoning **off-switch**
-    /// ([`crate::consult::EFFORT_OFF`]) — the request structurally disables thinking.
-    /// Called out separately because "off" is not a depth: the batch depth floor
-    /// deliberately leaves it alone, and a reader who sees `none` shipped should know
-    /// that was a decision rather than an oversight.
+    /// ([`crate::consult::EFFORT_OFF`]). Called out separately because "off" is not a
+    /// depth: the batch depth floor deliberately leaves it alone, and a reader who sees
+    /// `none` shipped should know that was a decision rather than an oversight.
+    ///
+    /// "Ships" means kaibo puts it in the params blob — it does *not* promise the wire
+    /// takes it. On DeepSeek and OpenRouter it becomes a structural disable
+    /// (`thinking:{"type":"disabled"}` / `reasoning:{"enabled":false}`); on Gemini,
+    /// whose `thinkingLevel` has no off variant at all, it is refused by the preflight
+    /// (`consult::preflight_params`) before a request is built, naming the slot and the
+    /// rungs that wire does take. This fate answers "what did kaibo do with the value",
+    /// and the preflight answers "will this wire accept it" — two questions on purpose.
     SentAsOff,
     /// Ships as configured, but kaibo can't rank it — a rung newer than
     /// [`crate::consult::EFFORT_LADDER`], or a typo. Passed through on purpose (kaibo
@@ -1236,6 +1243,12 @@ impl Config {
         } else {
             t.effort.clone()
         };
+        // Order is load-bearing, and two of these arms shadow each other if swapped:
+        // `EFFORT_OFF` and an unrankable rung BOTH answer `None` to `effort_rank`, so
+        // `SentAsOff` has to be asked before `SentUnranked` or every reasoning-off would
+        // be reported as "a rung kaibo can't order". `is_effort_off` is the only thing
+        // that tells them apart — the same reason it exists beside `effort_rank` rather
+        // than inside it. The fate-table test pins each arm against a real cast.
         let fate = if !sinks {
             EffortFate::NoSink
         } else if crate::consult::effort_rank(&shipped) != crate::consult::effort_rank(&t.effort) {
@@ -4123,6 +4136,9 @@ mod tests {
             [casts.lifted]
             synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low" }
 
+            [casts.batch-off]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "none" }
+
             [casts.dropped]
             synth = { backend = "lab", id = "gemma", effort = "xhigh" }
             "#,
@@ -4148,6 +4164,16 @@ mod tests {
             "kaibo keeps no allowlist: a rung it can't order still goes to the provider"
         );
         assert_eq!(fate("lifted"), EffortFate::LiftedToBatchFloor);
+        // The combination that broke before: `none` on a BATCH slot. The depth floor
+        // lifts a shallow rung, and `none` used to be the shallowest rung, so an
+        // operator's reasoning-off silently became `high` and billed on every item.
+        // Regressing `EFFORT_OFF` back onto `EFFORT_LADDER` makes this read
+        // `LiftedToBatchFloor` and fails here.
+        assert_eq!(
+            fate("batch-off"),
+            EffortFate::SentAsOff,
+            "a DEPTH floor must leave an explicit reasoning-off alone on the batch lane too"
+        );
         assert_eq!(fate("dropped"), EffortFate::NoSink);
 
         // Only the last two are things the operator needs to hear about.
@@ -4155,7 +4181,9 @@ mod tests {
             .effort_diagnostics()
             .into_iter()
             .map(|d| d.cast)
-            .filter(|c| ["plain", "off", "newer", "lifted", "dropped"].contains(&c.as_str()))
+            .filter(|c| {
+                ["plain", "off", "newer", "lifted", "dropped", "batch-off"].contains(&c.as_str())
+            })
             .collect();
         assert_eq!(
             diagnosed,
