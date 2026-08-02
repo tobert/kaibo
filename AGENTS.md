@@ -219,7 +219,16 @@ Two audiences are optimized differently:
   instructions, read by the commercial models *we* drive, with windows in the hundreds
   of thousands to millions of tokens. Here verbosity is *licensed where it shapes
   behavior*: say it a few ways, frame positively, be explicit (see **Driving the
-  models**). Verbose to install behavior, never verbose by default.
+  models**). Verbose to install behavior, never verbose by default. **Plain, literal
+  English**: declarative sentences, roughly one instruction each, concrete nouns, no
+  idiom, no metaphor, no em-dash clause chains. The reason is the roster — most of our
+  synths are not English-first (DeepSeek, GLM, Qwen, Kimi) and the small local models
+  already fixate on odd phrasing — so figurative English is a comprehension tax charged
+  to exactly the models we most need to work well. This is the clarity half of the
+  operator-docs bullet below, and it applies here with *more* force, not less. Plain is
+  not terse: keep the repetition that installs an obligation, drop the decoration around
+  it. `built_in_preambles_are_written_without_em_dash_clause_chains` holds the
+  mechanical half.
 - **Operator-facing docs** — `docs/config.example.toml`, `docs/config.md`, `README.md`.
   The first two are **embedded in the binary** (`include_str!`) and served as
   `kaibo://config/example` and `kaibo://config/guide`, so a model reads them as often as

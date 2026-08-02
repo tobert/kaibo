@@ -39,6 +39,13 @@ record. Each later release appends a new section at the top.
   dossier is now told to read *holistically*: its offline synth never sees the code, so
   whatever the dossier leaves out is missing for good.
 
+- **kaibo's prompts are now written in plain, literal English.** Every preamble, the
+  kaish cheatsheet, and the attachment directives were rewritten as declarative
+  sentences: no idiom, no metaphor, no em-dash clause chains. Most of the models kaibo
+  drives are not English-first, and the small local models already fixate on odd
+  phrasing, so a figurative instruction costs them attention that should go to the code.
+  Expect this to show up most on the DeepSeek, GLM, Qwen, Kimi, and local casts.
+
 - **Batch treats `effort` as a floor, not an override.** Every other batch knob
   already worked this way: `max_tokens` and the thinking budget rise to a batch
   minimum but never undercut a slot that asked for more. `effort` alone was
