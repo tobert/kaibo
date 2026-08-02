@@ -10,17 +10,13 @@
 //! deliberately no base64/attach input: if a genuinely-never-a-file image ever needs
 //! viewing, that's added then (see the media-spine entry in `docs/issues.md`).
 //!
-//! **The image part is declared, not sniffed.** Through rig 0.38 this tool returned a
-//! hybrid JSON envelope (`{"response":…, "parts":[{"type":"image",…}]}`) that rig's
-//! `ToolResultContent::from_tool_output` re-parsed out of the tool's *string* output
-//! to discover the image. rig 0.41 removed that guessing — "Rig never reparses strings
-//! to infer rich content" — so a tool that still returned the envelope would hand the
-//! model base64 text labelled JSON and no image at all, silently. The output is now a
-//! typed [`ToolOutput`] carrying a [`ToolResultContent::Text`] note and a
-//! [`ToolResultContent::Image`] block, which is both the supported multimodal path and
-//! a stronger one: the image block that reaches the transcript is the one this tool
-//! constructed, so [`run_phase`](crate::consult)'s user-turn rewrite reads a real
-//! `Image` rather than a JSON shape two crates have to agree on.
+//! **The image part is declared, not sniffed.** The output is a typed [`ToolOutput`]
+//! carrying a [`ToolResultContent::Text`] note and a [`ToolResultContent::Image`]
+//! block. rig does not inspect a tool's text output looking for rich content in it, so
+//! an image described by some JSON convention instead of declared would reach the model
+//! as a wall of base64 — no image, and no error. Declaring it also means
+//! [`run_phase`](crate::consult)'s user-turn rewrite reads the very block this tool
+//! constructed, rather than a shape two crates have to keep agreeing on.
 //!
 //! The tool is only ever placed in a phase's toolset when that phase's [`Arm`]'s
 //! resolved caps say the model is vision-capable (`consult.rs`), so a blind model
@@ -135,10 +131,8 @@ impl ViewImage {
 
     /// The core: resolve → read through the VFS → size-check → sniff → encode → typed
     /// content. Split out of [`Tool::call`] so it's directly testable. Returns a
-    /// [`ToolOutput`] — *not* a `String` or a `Value`: rig 0.41 renders an ordinary
-    /// serializable output as text or JSON and never re-reads it looking for rich
-    /// content, so the image has to be a declared [`ToolResultContent::Image`] block or
-    /// it does not reach the model as an image at all.
+    /// [`ToolOutput`] — *not* a `String` or a `Value`, which rig would render as text or
+    /// JSON; only a declared [`ToolResultContent::Image`] reaches the model as an image.
     async fn view(&self, path_arg: &str) -> Result<ToolOutput, ViewImageError> {
         let canon = self.resolve_in_workspace(path_arg)?;
         // Read at most one byte past the limit: a file swapped to something enormous
@@ -230,14 +224,12 @@ impl Tool for ViewImage {
 
     /// Keep the failure text model-visible.
     ///
-    /// rig 0.41's default (`ToolExecutionError::from_error`) redacts an arbitrary
-    /// source error down to a stable kind-level string — the model would read "the
-    /// tool failed" and nothing else. That is the right default for a tool whose
-    /// errors may carry secrets; it is the wrong one here, because every `ViewImageError` is written *for*
-    /// the model — it names the file, the workspace, and the fix (copy it in, crop it,
-    /// use run_kaish instead), and a model that cannot read it cannot retry correctly.
-    /// The explicit constructor keeps the message model-visible while `with_source`
-    /// preserves the concrete error for operator diagnostics and downcasting.
+    /// rig's default redacts an arbitrary tool error to a kind-level string — the model
+    /// reads "the tool failed" and nothing more. Right for errors that may carry
+    /// secrets, wrong here: every `ViewImageError` is written *for* the model, naming
+    /// the file, the workspace, and the fix (copy it in, crop it, use run_kaish
+    /// instead). A model that can't read it can't retry correctly. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
         ToolExecutionError::other(error.to_string()).with_source(error)
     }
@@ -341,10 +333,9 @@ mod tests {
         let tool = ViewImage::new(worker_over(&root), &root);
         let out = tool.view("shot.png").await.expect("view should succeed");
 
-        // A declared image block, not a JSON shape rig has to recognize. This is the
-        // assertion that fails if the output ever regresses to the old envelope: rig
-        // 0.41 would carry that to the model as JSON text, and a vision model would
-        // receive base64 instead of a picture.
+        // A declared image block, not a JSON shape rig has to recognize — this is the
+        // assertion that fails if the output ever regresses to describing an image
+        // instead of declaring one, which a vision model receives as base64 text.
         let blocks: Vec<_> = out.as_content().iter().cloned().collect();
         assert_eq!(blocks.len(), 2, "one text note plus one image: {out:?}");
         let note = blocks
@@ -399,11 +390,10 @@ mod tests {
         assert!(msg.contains("cp "), "suggests copying it in: {msg}");
         assert!(msg.contains("workspace"), "{msg}");
 
-        // …and the model actually reads it. rig 0.41 redacts an arbitrary tool error
-        // down to a stable kind-level string ("the tool failed") unless the tool
-        // overrides `map_error` — which would leave every fix-it message above visible
-        // only to an operator reading a log. These messages exist so the *model* can
-        // act on them, so assert the presentation, not just the `Display`.
+        // …and the model actually reads it. Without `map_error`, rig shows the model a
+        // kind-level "the tool failed" and every fix-it message above is visible only
+        // to an operator reading a log. These messages exist so the *model* can act on
+        // them, so assert the presentation, not just the `Display`.
         let mapped = tool.map_error(err);
         assert_eq!(
             mapped.model_feedback(),

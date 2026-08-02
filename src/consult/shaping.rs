@@ -417,7 +417,7 @@ impl ModelShape {
                 // silently ignore a slot's `effort = "low"`.
                 //
                 // Unlike the other effort sinks this one is NOT a passthrough string: rig
-                // 0.38 models the level as a closed enum (`minimal|low|medium|high`), so
+                // models the level as a closed enum (`minimal|low|medium|high`), so
                 // `xhigh`/`max`/`none` are refused by rig's own converter before the
                 // request leaves the process. [`EffortWire::Gemini`] names that, and
                 // `Arm::from_slot` turns it into a legible error rather than a mid-call
@@ -579,10 +579,9 @@ pub fn effort_sinks(
 /// body, so whatever an operator writes reaches the provider and the *provider* decides.
 /// Two paths don't: rig deserializes the blob into a typed struct first, and a typed
 /// struct has a closed set of reasoning rungs. That ceiling belongs to **rig's client**,
-/// not the provider's API, and it moves on rig's release schedule: rig 0.38's
-/// `ReasoningEffort` stopped at `xhigh` while OpenAI already accepted `effort = "max"`
-/// (probed live 2026-08-01, 200 + echoed); rig 0.41 added the rung and the two are now
-/// level. Gemini's `ThinkingLevel` ceiling is the provider's own and has not moved.
+/// not the provider's API, and the two can disagree in either direction — rig has
+/// trailed OpenAI's own ladder by a rung before. Gemini's is the exception: its
+/// `ThinkingLevel` mirrors a limit Google actually enforces.
 ///
 /// Naming the wire lets kaibo ask rig *before* the call (see [`preflight_params`]) and
 /// report the ceiling honestly instead of surfacing a bare serde message mid-consult.
@@ -688,9 +687,9 @@ pub fn accepted_efforts(wire: EffortWire) -> Vec<&'static str> {
 }
 
 /// Fold this arm's output-token budget into `params` where the provider needs it
-/// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig
-/// 0.38's `OpenrouterCompletionRequest` (openrouter/completion.rs) has no `max_tokens`
-/// field and its `TryFrom` never reads `CompletionRequest.max_tokens`, so
+/// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig's
+/// OpenRouter request (`openrouter/completion.rs`) never reads
+/// `CompletionRequest.max_tokens`, so
 /// `AgentBuilder::max_tokens()` is silently a no-op for that provider — the answer
 /// would run on OpenRouter's own default budget, starving a thinking-on completion.
 /// `additional_params` *is* `#[serde(flatten)]`-merged into the body, so we inject the
@@ -1046,16 +1045,11 @@ mod tests {
     /// bump, re-read rig's `openrouter/completion.rs`, retire (or deliberately keep)
     /// the injection, then advance the version prefix here.
     ///
-    /// **Audit log — 0.38.2 → 0.41.0 (2026-08-01): the defect persists; the injection
-    /// stays.** rig 0.40 collapsed OpenRouter onto the shared
-    /// `GenericCompletionModel<OpenRouterExt>` (rig PR #2054), which was the plausible
-    /// moment for it to inherit the OpenAI path's native `max_tokens`. It did not.
-    /// Measured rather than read: a real 0.41 `openrouter::CompletionModel` driven
-    /// through a capture transport with `CompletionRequest.max_tokens = Some(4096)`
-    /// serialized a body whose only keys were `messages`, `model`, and `reasoning` —
-    /// no `max_tokens`, no `max_completion_tokens`. So a thinking-on OpenRouter answer
-    /// still runs on the gateway's default budget unless kaibo injects the ceiling
-    /// itself. Re-run that probe, don't re-derive this from the source, on the next bump.
+    /// **Audit log.** 0.38.2 → 0.41.0 (2026-08-01): defect persists, injection stays.
+    /// Measured, not read — a real `openrouter::CompletionModel` driven through a
+    /// capture transport with `max_tokens = Some(4096)` serialized a body whose only
+    /// keys were `messages`, `model`, `reasoning`. Run that probe again on the next
+    /// bump rather than re-deriving the answer from rig's source.
     #[test]
     fn rig_bump_reaudits_the_openrouter_budget_workaround() {
         let lock = include_str!("../../Cargo.lock");

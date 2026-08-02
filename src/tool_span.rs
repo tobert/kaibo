@@ -16,21 +16,13 @@
 //! slice — the read-size question the explorer A/Bs turn on.
 //!
 //! It's *our* span on *our* tools, independent of what rig or a given provider
-//! instruments, so it lands the same on every backend. The wrapper sits at rig's
-//! **erased dispatch seam** — a [`DynamicTool`], where the call still carries raw JSON
-//! args — so it can summarize the call; it is otherwise transparent: name,
-//! description, parameters, output, and errors all pass straight through.
-//!
-//! rig 0.41 removed the public `ToolDyn` trait, so [`traced`] now *performs* the
-//! erasure instead of layering over rig's: it reads the typed tool's definition
-//! eagerly (0.41's `description`/`parameters` are synchronous, where the old
-//! `definition` was `async`), then owns the arg-parse → call → output/error
-//! normalization that rig's private `ErasedTool` blanket impl does for a registered
-//! typed tool. Two consequences worth naming: a malformed-args refusal is now *inside*
-//! the span (so `outcome = error` covers it, which is the honest reading of "did this
-//! call work"), and the arg summary is taken from the re-serialized JSON value rig
-//! hands a dynamic tool rather than the model's original string — same content,
-//! normalized whitespace.
+//! instruments, so it lands the same on every backend. [`traced`] is where a typed
+//! tool becomes the erased [`DynamicTool`] rig dispatches — the seam that still sees
+//! raw JSON args, so it can summarize the call — and it is otherwise transparent:
+//! name, description, parameters, output, and errors all pass straight through.
+//! Because the erasure is ours, the arg-parse happens inside the span too, so a
+//! malformed-args refusal is reported as `outcome = error` rather than never
+//! appearing — the honest reading of "did this call work".
 
 use std::sync::Arc;
 
@@ -43,10 +35,9 @@ use tracing::{field, info_span, Instrument, Span};
 
 /// Parse a dynamic tool's JSON args into the wrapped tool's typed `Args`.
 ///
-/// Mirrors rig's own `parse_tool_args`, including the part that matters in practice:
-/// a no-argument tool is routinely called with `null` rather than `{}`, and both must
-/// mean "no arguments". Getting this wrong would surface as a tool that fails only for
-/// the models that spell an empty argument list the other way.
+/// `null` and `{}` both mean "no arguments" — a no-argument tool is routinely called
+/// either way, so treating only one as valid yields a tool that fails for some models
+/// and not others.
 fn parse_args<A>(args: Value) -> Result<A, ToolExecutionError>
 where
     A: for<'de> serde::Deserialize<'de>,
@@ -76,10 +67,9 @@ pub(crate) fn record_kaish_result(exit_code: i64, output_bytes: usize) {
 }
 
 /// Erase a typed tool into a span-wrapped [`DynamicTool`] — the toolset-assembly
-/// drop-in, so every tool in a phase's toolset is traced uniformly.
-///
-/// The definition is read once, here, and the returned tool is what rig registers and
-/// dispatches; the span brackets exactly the work rig attributes to this call.
+/// drop-in, so every tool in a phase's toolset is traced uniformly. The returned tool
+/// is what rig registers and dispatches, so the span brackets exactly the work rig
+/// attributes to this call.
 pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
     let definition = tool_definition(&tool);
     let name = definition.name.clone();
@@ -120,9 +110,9 @@ pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
 }
 
 /// The erased call itself: parse, dispatch, then normalize both halves of the typed
-/// result the way rig does for a registered typed tool — output through
-/// [`IntoToolOutput`](rig_agent::tool::IntoToolOutput), error through the tool's own
-/// `map_error`, so a tool that classifies its failures keeps that classification.
+/// result — output through [`IntoToolOutput`](rig_agent::tool::IntoToolOutput), error
+/// through the tool's own `map_error`, so a tool that classifies its failures keeps
+/// that classification.
 async fn run_traced<T: Tool>(
     tool: &T,
     context: &mut ToolContext,
@@ -171,8 +161,8 @@ mod tests {
     use tracing_subscriber::Layer;
 
     /// Dispatch a span-wrapped tool the way rig does — through a registered
-    /// [`ToolSet`], the public execution surface. rig 0.41 made the erased `call` it
-    /// used to expose private, so this *is* the production path, not a stand-in.
+    /// [`ToolSet`], the public execution surface. This is the production path, not a
+    /// stand-in: rig's erased `call` is private.
     async fn dispatch(tool: DynamicTool, args: &str) -> ToolResult {
         let name = tool.name().to_string();
         let tools = ToolSet::from_dynamic_tools(vec![tool]);
@@ -415,9 +405,8 @@ mod tests {
     }
 
     /// Malformed args are refused *inside* the span, so the trace shows the attempt
-    /// and tags it `outcome = error` rather than dropping it. rig 0.41 moved the
-    /// arg-parse into [`traced`]'s own erasure, and this is the seam where that could
-    /// silently start reporting a failed call as a success.
+    /// and tags it `outcome = error`. [`traced`] owns the arg-parse, which is where a
+    /// failed call could quietly start being reported as a success.
     #[test]
     fn malformed_args_are_refused_inside_the_span() {
         serialized_capture(async {
@@ -489,7 +478,7 @@ mod tests {
             let _g = tracing::subscriber::set_default(sub);
 
             // `null` args, not `{}` — a no-argument tool is routinely called that way,
-            // and the erasure `traced` now owns has to mean the same thing by it.
+            // and [`parse_args`] has to mean the same thing by both.
             let result = dispatch(traced(TruncatedRead), "null").await;
             assert!(result.is_success(), "null args mean no args: {result:?}");
 

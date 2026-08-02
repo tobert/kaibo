@@ -38,18 +38,20 @@ anyhow = "1"
 # that trait, so an `image` cast slot can reach them for free. Turned off by 986806f
 # when image generation was removed; back on with the media CAS.
 rig-core = { version = "0.41", default-features = false, features = ["reqwest", "derive", "image"] }
-# The agent/tool loop, which rig 0.41 split out of `rig-core` into its own crate
-# (rig PR #2197). kaibo takes `rig-core` + `rig-agent` **directly** rather than the
-# `rig` facade, and that is a TLS decision as much as an ergonomic one: the facade's
-# `rustls` feature fans out to the vector-store companions
+# The agent/tool loop, which rig ships as its own crate beside `rig-core`.
+#
+# DO NOT collapse these two onto the `rig` facade crate. It looks tidier and it is a
+# trap: the facade's `rustls` feature fans out to the vector-store companions
 # (`rig-fastembed?/hf-hub-rustls-tls`, `rig-helixdb?/rustls`, `rig-lancedb?/rig-rustls`,
-# `rig-milvus?/rustls`), which would be a *fourth* route for aws-lc into the tree beside
-# the three named in this file. Naming the two crates we actually use keeps the TLS
-# surface exactly as documented: `rig-agent` itself depends on `rig-core` with
-# `default-features = false`, so the "drop rig's default rustls" reasoning above stays
-# true and complete. Its `rmcp` feature is off (kaibo wraps kaish as an in-process rig
-# Tool, not over MCP), and `image` is forwarded so a tool can return image content.
-# Verified aws-lc-free with `cargo tree -i aws-lc-rs` on host and musl targets.
+# `rig-milvus?/rustls`) — a *fourth* route for aws-lc into the tree, beside the three
+# named in this file, and one that breaks the static musl build silently. Depending on
+# the two crates we actually use keeps the TLS surface exactly as documented above:
+# `rig-agent` takes `rig-core` with `default-features = false`, so the "drop rig's
+# default rustls" reasoning still covers the whole tree. Verify with
+# `cargo tree -i aws-lc-rs` on host *and* musl; both must be empty.
+#
+# `rmcp` is off (kaibo wraps kaish as an in-process rig Tool, not over MCP); `image` is
+# forwarded so a tool can return image content.
 rig-agent = { version = "0.41", default-features = false, features = ["derive", "image"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no

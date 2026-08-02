@@ -188,8 +188,8 @@ pub struct ScriptedModel {
 pub struct NoStream;
 
 impl GetTokenUsage for NoStream {
-    // rig 0.41 dropped the `Option`: a zero-valued `Usage` is the documented sentinel
-    // for "the provider reported none", so there is one shape instead of two.
+    // A zero-valued `Usage` is rig's documented sentinel for "the provider reported
+    // none" — there is no separate absent case.
     fn token_usage(&self) -> Usage {
         Usage::new()
     }
@@ -199,9 +199,9 @@ impl GetTokenUsage for NoStream {
 ///
 /// The failure is the point: everything under test is already decided by the time rig
 /// hands the request to the transport, so no network, no key, and no canned response
-/// are needed. This is how a unit test asks "what would kaibo actually have sent?" —
-/// the only honest question once a provider option stops being a readable field on
-/// rig's model and becomes a transformation of the outgoing body.
+/// are needed. This is how a unit test asks "what would kaibo actually have sent?",
+/// which is the only honest form of the question for a provider option that shows up
+/// as a transformation of the outgoing body rather than a readable field.
 #[derive(Clone, Debug, Default)]
 pub struct CaptureHttp(Arc<Mutex<Vec<serde_json::Value>>>);
 

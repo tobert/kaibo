@@ -64,15 +64,10 @@ impl Tool for RunKaish {
     type Args = RunKaishArgs;
     type Output = String;
 
-    /// Keep the failure text model-visible.
-    ///
-    /// rig 0.41's default (`ToolExecutionError::from_error`) redacts an arbitrary
-    /// source error down to a stable kind-level string — the model would read "the
-    /// tool failed" and nothing else. That is the right default for a tool whose
-    /// errors may carry secrets; it is the wrong one here, because this message names what the shell
-    /// refused and is the only thing telling the model how to reshape its script.
-    /// The explicit constructor keeps the message model-visible while `with_source`
-    /// preserves the concrete error for operator diagnostics and downcasting.
+    /// Keep the failure text model-visible: rig's default would redact it to a
+    /// kind-level "the tool failed", and this message names what the shell refused —
+    /// the only thing telling the model how to reshape its script. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
         ToolExecutionError::other(error.to_string()).with_source(error)
     }

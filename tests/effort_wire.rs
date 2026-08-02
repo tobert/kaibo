@@ -7,8 +7,7 @@
 //! call. rig parses the blob into a typed struct on two of the six wires, and those
 //! structs have a **closed** set of rungs — a ceiling that is *rig's client*, not the
 //! provider's API, and that moves on rig's release schedule rather than the provider's.
-//! rig 0.38 stopped at `xhigh` on the OpenAI Responses wire while OpenAI itself already
-//! accepted `"max"`; rig 0.41 closed that gap. Gemini's ceiling is real and stays.
+//! The two have disagreed before, in both directions.
 //!
 //! So this suite closes the loop with no key and no network: a fake `HttpClientExt`
 //! records the body rig builds, and the test drives a real `CompletionModel` for each
@@ -185,8 +184,8 @@ fn request(params: Option<Value>) -> CompletionRequest {
         tool_choice: None,
         additional_params: params,
         output_schema: None,
-        // rig 0.41 added this: local observability policy, never serialized into a
-        // provider payload, so it cannot affect what this suite measures.
+        // Local observability policy, never serialized into a provider payload, so it
+        // cannot affect what this suite measures.
         record_telemetry_content: false,
     }
 }
@@ -291,26 +290,22 @@ async fn on_the_wire(path: Path, effort: &str) -> Result<Option<Value>, String> 
 /// same: passed through where the wire is passthrough, refused where rig is typed.
 const UNRANKED: &str = "ludicrous";
 
-/// The ceilings, pinned. rig 0.41.0 parses the blob into a typed struct on exactly two
-/// wires, and this is what each accepts today. The list is not a claim about the
-/// providers — it is a claim about *rig*, which is the thing that can refuse a rung
-/// before the request is ever sent. A rig bump that moves either ladder lands here
-/// first, which is the whole point: the last time one moved, we found out from a
-/// failed consult.
+/// The ceilings, pinned. rig parses the blob into a typed struct on exactly two wires,
+/// and this is what each accepts today. The list is not a claim about the providers —
+/// it is a claim about *rig*, the thing that can refuse a rung before the request is
+/// ever sent. A bump that moves either ladder lands here first, which is the whole
+/// point: the last time one moved, we found out from a failed consult.
 ///
-/// **Moved on the 0.38.2 → 0.41.0 bump (2026-08-01): `max` opened on the Responses
-/// wire.** This pin previously stopped at `xhigh` and the comment recorded the gap as
-/// rig's, not OpenAI's — OpenAI's Responses endpoint took `"max"` (probed live
-/// 2026-08-01: 200, echoed back) while `responses_api::ReasoningEffort` did not have
-/// the variant. rig 0.41 added it (`Max`, "supported by the GPT-5.6 model family", rig
-/// PR #2106), so the ladder here is now exactly [`known_efforts`] — kaibo's top rung
-/// reaches hosted GPT-5.6 with no kaibo logic change, because `accepted_efforts`
-/// derives the list by probing rig instead of declaring one. That derivation is why
-/// this test failing was the *only* work the bump needed on this surface.
+/// **Audit log.** 0.38.2 → 0.41.0 (2026-08-01): `max` opened on the Responses wire.
+/// rig had trailed OpenAI by a rung — the endpoint took `"max"` (probed live: 200,
+/// echoed back) while rig's enum lacked the variant — and 0.41 closed the gap, so the
+/// ladder is now exactly [`known_efforts`]. Updating this pin was the *only* work the
+/// bump needed here, because `accepted_efforts` derives the list by probing rig rather
+/// than declaring one.
 ///
 /// Gemini did not move, and should not: `thinkingLevel` is a closed protobuf enum and
-/// Google rejects `none`/`xhigh`/`max` (verified live). A future bump that "widens"
-/// Gemini here is a rig bug, not a feature.
+/// Google rejects `none`/`xhigh`/`max` (verified live). A bump that "widens" Gemini
+/// here is a rig bug, not a feature.
 #[tokio::test]
 async fn rig_effort_ladders_are_pinned() {
     for path in Path::ALL {
@@ -325,8 +320,7 @@ async fn rig_effort_ladders_are_pinned() {
             // This is the landmine: `[defaults] synth_effort = "xhigh"` broke every
             // Gemini cast, and every offline test stayed green.
             EffortWire::Gemini => vec!["minimal", "low", "medium", "high"],
-            // rig's `responses_api::ReasoningEffort` — as of 0.41, level with OpenAI's
-            // own ladder, `max` included.
+            // rig's `responses_api::ReasoningEffort` — level with OpenAI's own ladder.
             EffortWire::OpenaiResponses => {
                 vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"]
             }

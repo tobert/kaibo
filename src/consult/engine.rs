@@ -427,9 +427,8 @@ impl Arm {
     /// `from_slot` must route through here.
     ///
     /// Generic over the HTTP backend so a test can drive it with a capture transport
-    /// and read the marker off the serialized body. rig 0.41 made the caching flag a
-    /// private field, so the wire is the only place left that can answer whether this
-    /// constructor did its job — and it was always the better question.
+    /// and read the marker off the serialized body — the only place that answers
+    /// whether this constructor did its job, since rig exposes no readable flag.
     fn openrouter_completion_model<H>(
         client: &openrouter::Client<H>,
         id: &str,
@@ -565,12 +564,6 @@ const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the nex
 /// triggering turn into the transcript and the stop returns it complete. Disabled
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
 /// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
-///
-/// rig 0.41 made hooks non-generic (`AgentHook`, no `M`, so one hook can serve agents
-/// on different providers) and replaced the single `HookAction` with one action type
-/// per event. The decision here is unchanged — `ToolResultAction::Keep` is the old
-/// `cont()` on the observing side, `CompletionCallAction::Stop` the old `terminate` —
-/// but the compiler now rejects a stop from an event that cannot honour one.
 #[derive(Clone)]
 struct ViewImageBreakHook {
     enabled: bool,
@@ -858,12 +851,10 @@ where
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
-        // `AgentRunner` (rig 0.41's only managed execution path — the `Prompt` trait
-        // and its `.extended_details()` opt-in are gone) always yields a
-        // `PromptResponse` carrying the token `usage` the provider reported, summed
-        // across every turn of *this* run. The clean `Ok` path is the common case —
-        // one run, the full count. The two exceptional exits below (turn cap,
-        // view_image break) undercount: rig hands back no usage on
+        // The run yields a `PromptResponse` carrying the token `usage` the provider
+        // reported, summed across every turn of *this* run. The clean `Ok` path is the
+        // common case — one run, the full count. The two exceptional exits below (turn
+        // cap, view_image break) undercount: rig hands back no usage on
         // `MaxTurnsError`/`PromptCancelled`, so the turns spent in a capped or broken
         // run are lost and only the finalize/resumed run's usage survives. Deliberate —
         // recovering it would mean summing per-completion through a hook; documented as
@@ -1084,16 +1075,11 @@ impl Tool for RunExplore {
     type Args = RunExploreArgs;
     type Output = String;
 
-    /// Keep the failure text model-visible.
-    ///
-    /// rig 0.41's default (`ToolExecutionError::from_error`) redacts an arbitrary
-    /// source error down to a stable kind-level string — the model would read "the
-    /// tool failed" and nothing else. That is the right default for a tool whose
-    /// errors may carry secrets; it is the wrong one here, because a sweep that dies is something the
-    /// driver must *see* to recover from — it answers from its own direct reads instead
-    /// of retrying blind, and it can only make that choice if the failure reaches it.
-    /// The explicit constructor keeps the message model-visible while `with_source`
-    /// preserves the concrete error for operator diagnostics and downcasting.
+    /// Keep the failure text model-visible: rig's default would redact it to a
+    /// kind-level "the tool failed", and a dead sweep is something the driver must
+    /// *see* to recover from — it answers from its own direct reads instead of retrying
+    /// blind, and can only choose that if the failure reaches it. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
         ToolExecutionError::other(error.to_string()).with_source(error)
     }
@@ -3858,12 +3844,10 @@ mod tests {
     /// them), and implicit-caching upstreams ignore the marker. `from_slot` routes
     /// through this constructor — so this pins the wiring, not an internal default.
     ///
-    /// **Asserted on the wire, not on a field.** Through rig 0.38 the flag was a public
-    /// field and this test read it. rig 0.41 made it private, and rather than delete the
-    /// guard we moved it one layer out to where it actually matters: the serialized
-    /// request body, captured from a fake transport. That is strictly better teeth — a
-    /// future rig release could keep `with_prompt_caching()` compiling while changing
-    /// what it emits, and the old field read would have stayed green through it.
+    /// **Asserted on the wire, not on a flag.** What matters is the serialized request
+    /// body, so that is what a fake transport captures here: rig could keep
+    /// `with_prompt_caching()` compiling while changing what it emits, and any check
+    /// short of the body would stay green through that.
     #[tokio::test]
     async fn openrouter_arm_enables_prompt_caching() {
         async fn system_block(model: openrouter::CompletionModel<CaptureHttp>, http: &CaptureHttp) -> Value {
