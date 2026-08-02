@@ -1781,10 +1781,9 @@ impl KaiboHandler {
         let deadline = deliberate_direct_deadline(synth_backend);
         // Same progress plumbing as consult_submit: a job has no live peer, so route
         // liveness onto `tracing` and let the ProgressLog remember the latest beat for
-        // `job_get`/`job_list`. The sink handed to the phase is the same Arc the job
-        // snapshots, so what it reads is what the completion emitted.
+        // `job_get`/`job_list`. The direct lane is a single completion with no tools, so
+        // it emits no beats of its own — the log carries the job's own start/finish.
         let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
-        let sink: Arc<dyn ProgressSink> = progress_log.clone();
         let cast_name = cast.name.clone();
         let explorer_model = explorer_model.to_string();
         let question = question.to_string();
@@ -1793,10 +1792,8 @@ impl KaiboHandler {
         let label = format!("cast `{cast_name}` deliberate (direct synth `{synth_model}`)");
 
         let job_id = self.jobs.submit(label, progress_log, async move {
-            match crate::consult::deliberate_direct(
-                &question, &dossier, &synth, &system, deadline, &sink,
-            )
-            .await
+            match crate::consult::deliberate_direct(&question, &dossier, &synth, &system, deadline)
+                .await
             {
                 Ok((answer, synth_usage)) => Ok(JobResult {
                     answer: with_provenance(
