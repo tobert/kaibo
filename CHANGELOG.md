@@ -122,31 +122,15 @@ record. Each later release appends a new section at the top.
 ### Fixed
 
 - **A consultation that produced no answer no longer comes back as a successful empty
-  one.** A `consult` could return a body containing nothing but the provenance footer —
-  no error, no partial, no signal that the review had not happened. Caught on a reasoning
-  model whose final turn came back as reasoning with no answer text: the underlying `rig`
-  client treats a textless final turn as a clean finish and hands kaibo an empty string,
-  which kaibo then dressed in a footer with real token counts and returned as success.
-  That is the worst failure shape there is, because the caller merges on it.
-
-  kaibo now checks every phase's answer at the one place they all run through, so
-  `consult`, `explore`, `oneshot`, and `deliberate` are covered together. What you see
-  depends on what the model had in hand:
-
-  - If it had already gathered evidence and simply stopped before writing, kaibo asks it
-    once — and only once — to write up what it found. This usually recovers the answer
-    you paid for, and the tokens from both attempts are counted in the footer.
-  - If it had gathered nothing, kaibo fails the call instead of asking again. Pressing a
-    model with no evidence to "answer anyway" is how you get a confident review with
-    nothing behind it, which is worse than an error on a tool whose whole product is
-    grounded citation.
-
-  Either way the failure names what it cost — turns used against the cap, input/output/
-  cached tokens — and says plainly that the provider's finish reason was *not* available
-  rather than implying it was checked. A delegated `explore` sweep that returns nothing
-  is now a visible failure to the model driving it, instead of a blank result it would
-  have quietly reasoned over. Batch results already worked this way; the interactive
-  lanes now match.
+  one.** A reasoning model's final turn can carry reasoning but no answer text, and
+  kaibo would dress that empty string in a provenance footer and return it as success —
+  no error, no signal that the review had not happened. Every phase (`consult`,
+  `explore`, `oneshot`, `deliberate`) now checks its answer: if the model had already
+  gathered evidence, kaibo asks it once to write up what it found, which usually
+  recovers the answer (both attempts' tokens counted in the footer); if it had gathered
+  nothing, the call fails with its diagnostics attached (turns used, token counts, and
+  the provider's own finish reason when it reported one) rather than pressing an
+  evidence-free model into an ungrounded answer.
 
 - **A vision model still sees the image after the `rig` 0.41 upgrade.** rig 0.41 stopped
   inspecting a tool's text output to discover rich content in it, which would have

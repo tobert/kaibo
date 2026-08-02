@@ -566,9 +566,10 @@ pub struct ConsultOutput {
 const FINALIZE_NOTE: &str = "\
 STOP — you have reached your research limit and may not call any more tools. Using \
 only the evidence you have already gathered in this conversation, write your \
-COMPLETE final response now, with its concrete `file:line` citations. Do not call \
-any tool. Do not ask to continue. Write the full answer (or curated report) from \
-what you already have — right now.";
+COMPLETE final response now, with its concrete `file:line` citations. Where the \
+evidence runs out, say so plainly: naming what you do not know is part of a complete \
+answer. Do not call any tool. Do not ask to continue. Write the full answer (or \
+curated report) from what you already have.";
 
 /// The forced-finish instruction for a phase that **stopped early** without writing
 /// its answer — distinct from [`FINALIZE_NOTE`], which is about running out of turns.
@@ -579,8 +580,10 @@ const EMPTY_ANSWER_NOTE: &str = "\
 Your last turn contained no answer text — the response came back empty. You have \
 already gathered evidence in this conversation, so nothing more needs investigating. \
 Using only that evidence, write your COMPLETE final response now, with its concrete \
-`file:line` citations. Do not call any tool. Do not ask to continue. Write the full \
-answer (or curated report) from what you already have — right now.";
+`file:line` citations. Where the evidence runs out, say so plainly: naming what you \
+do not know is part of a complete answer, not a reason to keep investigating. Do not \
+call any tool. Do not ask to continue. Write the full answer (or curated report) from \
+what you already have.";
 
 /// Build the forced final turn from a partial transcript.
 ///
@@ -655,25 +658,30 @@ fn transcript_has_tool_results(history: &[Message]) -> bool {
 /// (`crate::batch`'s `finish_gated_answer`: "a completed-but-empty answer is no
 /// answer") — one concept, one wording, two lanes.
 ///
-/// `finish_reason` is named as *unavailable* rather than omitted: rig parses the
-/// provider's finish reason and then drops it converting to its own response type
-/// (e.g. `rig-core/src/providers/deepseek.rs:386-460`), and `PromptResponse` carries no
-/// raw response, so kaibo genuinely cannot see it here. Saying so beats implying it
-/// was checked and came back clean.
+/// `finish_reason` comes off the phase's [`CompletionLog`] — the provider's own word
+/// for how its last completion ended, read from the raw response the [`Watched`]
+/// wrapper records. `None` means the provider reported none, and that is stated as
+/// absence rather than implied to be a clean stop: on some wires (OpenAI's Responses
+/// API) reporting nothing *is* the normal completion signal, so absence carries no
+/// verdict either way.
 fn empty_answer_error(
     model: &str,
     turns: usize,
     max_turns: usize,
     usage: &Usage,
+    finish_reason: Option<&str>,
     detail: &str,
 ) -> anyhow::Error {
+    let reason = match finish_reason {
+        Some(r) => format!("finish_reason \"{r}\" reported by the provider"),
+        None => "no finish_reason reported by the provider (normal on some wires)".to_string(),
+    };
     anyhow!(
         "model {model} returned an EMPTY answer — {detail}. It is not a result: a \
          completed-but-empty answer is no answer, and returning it would hand you a \
          review that never happened. Diagnostics: {turns} of {max_turns} turns used, \
          {} input tokens ({} cached), {} output tokens, {} reasoning tokens reported; \
-         finish_reason unavailable (rig drops it on this wire, so kaibo cannot report \
-         it). Retry, or try the same question on a different cast.",
+         {reason}. Retry, or try the same question on a different cast.",
         usage.input_tokens,
         usage.cached_input_tokens,
         usage.output_tokens,
@@ -1007,6 +1015,8 @@ where
     }
     let result = run_phase_loop(
         &watched(model.clone(), log.clone()),
+        log,
+        model_name,
         preamble,
         max_tokens,
         temperature,
@@ -1032,6 +1042,8 @@ where
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 async fn run_phase_loop<M, F>(
     model: &Watched<M>,
+    log: &CompletionLog,
+    model_name: &str,
     preamble: &str,
     max_tokens: u64,
     temperature: Option<f64>,
@@ -1068,6 +1080,7 @@ where
             full.push(prompt);
             return finalize_after_max_turns(
                 model,
+                log,
                 model_name,
                 preamble,
                 max_tokens,
@@ -1140,6 +1153,7 @@ where
                         turns,
                         max_turns,
                         &spent,
+                        log.last_finish_reason().as_deref(),
                         "it stopped without answering, and its transcript holds no tool \
                          results to write up — asking it to answer anyway would invite an \
                          ungrounded review",
@@ -1185,6 +1199,7 @@ where
                         turns + 1,
                         max_turns,
                         &usage,
+                        log.last_finish_reason().as_deref(),
                         "it was asked once to write the answer it owed and came back empty \
                          again",
                     ));
@@ -1197,6 +1212,7 @@ where
                 progress.emit(PhaseEvent::TurnCapReached);
                 return finalize_after_max_turns(
                     model,
+                    log,
                     model_name,
                     preamble,
                     max_tokens,
@@ -1282,6 +1298,7 @@ where
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
 async fn finalize_after_max_turns<M>(
     model: &M,
+    log: &CompletionLog,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1317,6 +1334,7 @@ where
             max_turns,
             max_turns,
             &usage,
+            log.last_finish_reason().as_deref(),
             "it used every turn and then wrote nothing when forced to conclude",
         ));
     }
@@ -1399,6 +1417,22 @@ where
             _ => None,
         })
         .collect::<String>();
+    // The single-shot lanes are toolless by definition, so an empty answer here can
+    // never satisfy the evidence gate the loop's recovery runs on — there is nothing
+    // gathered to write up, and no re-ask that wouldn't invite an ungrounded answer.
+    // Fail with the same diagnostics vocabulary as the loop, finish reason included
+    // (this path reads it off its own log).
+    if answer.trim().is_empty() {
+        return Err(empty_answer_error(
+            model_name,
+            1,
+            1,
+            &response.usage,
+            log.last_finish_reason().as_deref(),
+            "the single toolless completion returned no answer text, and a lane with \
+             no tools has no gathered evidence to write up, so kaibo does not re-ask",
+        ));
+    }
     Ok((answer, response.usage))
 }
 
@@ -3726,11 +3760,16 @@ mod tests {
         const SYNTH: &str = "deepseek-v4-pro";
         let client = ScriptedClient::builder()
             // Straight to a reasoning-only turn: no tool calls, so no tool results, so
-            // nothing to write up.
+            // nothing to write up. The raw payload carries the provider's own
+            // finish_reason, the way a real deepseek response would — the error must
+            // surface it.
             .on_model(SYNTH, |_req| {
-                Ok(with_usage(
-                    reasoning_response("Hmm, where should I even start..."),
-                    usage(6_342, 199),
+                Ok(with_raw(
+                    with_usage(
+                        reasoning_response("Hmm, where should I even start..."),
+                        usage(6_342, 199),
+                    ),
+                    serde_json::json!({"choices": [{"finish_reason": "stop"}]}),
                 ))
             })
             .build();
@@ -3763,8 +3802,8 @@ mod tests {
             "the error must carry the output-token count: {msg}"
         );
         assert!(
-            msg.contains("finish_reason unavailable"),
-            "the error must be honest that finish_reason could not be checked: {msg}"
+            msg.contains("finish_reason \"stop\""),
+            "the error must name the provider's own finish_reason: {msg}"
         );
     }
 
@@ -3979,14 +4018,12 @@ mod tests {
             "oneshot must fail with the shared empty-answer error: {err:#}"
         );
 
-        let progress: Arc<dyn ProgressSink> = Arc::new(RecordingSink::default());
         let err = deliberate_direct(
             "q",
             "the dossier",
             &arm(&client, MODEL),
             "system",
             Duration::from_secs(30),
-            &progress,
         )
         .await
         .expect_err("deliberate_direct must not return an empty answer as a success");

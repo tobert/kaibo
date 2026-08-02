@@ -343,7 +343,7 @@ pub fn text_response(text: impl Into<String>) -> CompletionResponse<Value> {
 /// its text extraction (`assistant_text_from_choice`) filters to `Text`, yielding `""` —
 /// an `Ok` response with an empty `output`. The offline stand-in for the
 /// generated-but-undelivered answer.
-pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse<()> {
+pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse<Value> {
     response(OneOrMany::one(AssistantContent::reasoning(reasoning)))
 }
 
