@@ -17,6 +17,7 @@ pub mod attach;
 pub mod batch;
 pub mod cas;
 pub mod cli;
+pub mod completion_watch;
 pub mod config;
 pub mod consult;
 pub mod context;

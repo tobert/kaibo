@@ -56,7 +56,7 @@ use serde_json::Value;
 /// How the mock answers one request for one model: branch on the request's content
 /// and return a response, or an error to exercise the failure paths.
 pub type Responder = Arc<
-    dyn Fn(&CompletionRequest) -> Result<CompletionResponse<()>, CompletionError> + Send + Sync,
+    dyn Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError> + Send + Sync,
 >;
 
 /// A snapshot of one inbound completion request, captured for post-hoc assertions.
@@ -83,6 +83,12 @@ pub struct RecordedRequest {
     pub max_tokens: Option<u64>,
     /// `Some(ToolChoice::None)` marks the forced finalize turn after a turn-cap hit.
     pub tool_choice: Option<ToolChoice>,
+    /// The **whole** request as rig built it, serialized. The distilled fields above
+    /// answer "did the preamble/history/params reach the model"; this one answers
+    /// "are two requests the *same* request" — which is the only honest way to prove a
+    /// hand-rolled direct completion is equivalent to the one the agent loop produced,
+    /// field for field, including the ones no accessor above names.
+    pub raw: Value,
 }
 
 impl RecordedRequest {
@@ -96,6 +102,7 @@ impl RecordedRequest {
             additional_params: req.additional_params.clone(),
             max_tokens: req.max_tokens,
             tool_choice: req.tool_choice.clone(),
+            raw: serde_json::to_value(req).unwrap_or(Value::Null),
         }
     }
 }
@@ -146,7 +153,7 @@ impl ScriptedBuilder {
     /// and returns a response (or an error, to drive a failure path).
     pub fn on_model<F>(mut self, id: impl Into<String>, responder: F) -> Self
     where
-        F: Fn(&CompletionRequest) -> Result<CompletionResponse<()>, CompletionError>
+        F: Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError>
             + Send
             + Sync
             + 'static,
@@ -266,7 +273,13 @@ impl CompletionClient for ScriptedClient {
 }
 
 impl CompletionModel for ScriptedModel {
-    type Response = ();
+    /// The **raw provider response**, as free-form JSON. A real provider's raw payload
+    /// is its own struct; here it is a `Value` a responder can shape into whatever
+    /// wire form the test is about — an Anthropic `stop_reason`, a Gemini
+    /// `candidates[].finishReason` — which is what lets the offline harness drive
+    /// [`Watched`](crate::completion_watch::Watched), whose whole job is reading that
+    /// payload. `Value::Null` is the default: a response that reports nothing.
+    type Response = Value;
     type StreamingResponse = NoStream;
     type Client = ScriptedClient;
 
@@ -318,7 +331,7 @@ impl CompletionModel for ScriptedModel {
 // ---- response builders -----------------------------------------------------
 
 /// A final text answer — ends the tool loop.
-pub fn text_response(text: impl Into<String>) -> CompletionResponse<()> {
+pub fn text_response(text: impl Into<String>) -> CompletionResponse<Value> {
     response(OneOrMany::one(AssistantContent::text(text)))
 }
 
@@ -327,7 +340,7 @@ pub fn tool_call_response(
     id: impl Into<String>,
     name: impl Into<String>,
     args: Value,
-) -> CompletionResponse<()> {
+) -> CompletionResponse<Value> {
     response(OneOrMany::one(AssistantContent::tool_call(id, name, args)))
 }
 
@@ -335,7 +348,7 @@ pub fn tool_call_response(
 /// that calls `view_image` alongside `run_kaish`). rig runs them together and folds
 /// all their results into a single user turn, which is exactly the shape the
 /// view_image turn-boundary break must tolerate without orphaning a `tool_use`.
-pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse<()> {
+pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse<Value> {
     let contents: Vec<AssistantContent> = calls
         .into_iter()
         .map(|(id, name, args)| AssistantContent::tool_call(id, name, args))
@@ -343,13 +356,24 @@ pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionRespons
     response(OneOrMany::many(contents).expect("at least one tool call"))
 }
 
-fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<()> {
+fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<Value> {
     CompletionResponse {
         choice,
         usage: Usage::new(),
-        raw_response: (),
+        // Nothing reported — the default a test that doesn't care about the provider's
+        // own payload gets. Shape one with [`with_raw`] when the payload is the point.
+        raw_response: Value::Null,
         message_id: None,
     }
+}
+
+/// Stamp a **raw provider payload** onto a scripted response — the untouched JSON a
+/// real provider would return alongside the parsed choice. This is what
+/// [`Watched`](crate::completion_watch::Watched) reads, so a test that cares how a
+/// turn *ended* (`finish_reason` / `stop_reason` / `finishReason`) shapes it here.
+pub fn with_raw(mut resp: CompletionResponse<Value>, raw: Value) -> CompletionResponse<Value> {
+    resp.raw_response = raw;
+    resp
 }
 
 /// A [`Usage`] a scripted provider "reports" for one completion, `input`/`output`
@@ -369,7 +393,7 @@ pub fn usage(input: u64, output: u64) -> Usage {
 
 /// Stamp a reported [`usage`] onto a scripted response. `text_response`/`tool_call_response`
 /// default to `Usage::new()` (nothing reported); wrap them here to drive the accounting.
-pub fn with_usage(mut resp: CompletionResponse<()>, usage: Usage) -> CompletionResponse<()> {
+pub fn with_usage(mut resp: CompletionResponse<Value>, usage: Usage) -> CompletionResponse<Value> {
     resp.usage = usage;
     resp
 }

@@ -17,6 +17,16 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **Traces now say how each model turn *ended*.** A `run_phase` span carries
+  `gen_ai.response.finish_reason` — the provider's own word for why generation stopped
+  (`end_turn`, `max_tokens`, `content_filter`, Gemini's `MAX_TOKENS`, OpenAI Responses'
+  `max_output_tokens`). Providers have always reported it; rig's agent layer discarded it
+  before kaibo could look, which is why a consult that came back empty was
+  indistinguishable from one that was truncated or refused by a classifier. kaibo now
+  observes every completion on its way past — the turns *inside* the tool loop included —
+  with no per-provider code, and an unfamiliar response shape simply reports nothing
+  rather than breaking the call.
+
 - **`effort = "max"` now reaches hosted GPT-5.6.** kaibo has always accepted `max` as a
   rung and always sent it faithfully; the wall was rig's, whose typed OpenAI Responses
   request stopped one rung short of OpenAI's own API and refused `max` before the
@@ -37,6 +47,13 @@ record. Each later release appends a new section at the top.
   all three.
 
 ### Changed
+
+- **`oneshot` and `deliberate`'s direct lane are now one literal request.** Both are
+  toolless by definition — the caller owns the context — but both reached the provider
+  through the managed tool loop carrying an empty toolset, arriving at the same place by
+  a longer road. They now ask the model directly. Same preamble, same params, same
+  answer, same token accounting; the request that goes out is proven request-for-request
+  identical to the one the loop built.
 
 - **Batch treats `effort` as a floor, not an override.** Every other batch knob
   already worked this way: `max_tokens` and the thinking budget rise to a batch

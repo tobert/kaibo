@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::attach::Attachment;
+use crate::completion_watch::{watched, CompletionLog, Watched};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
@@ -75,6 +76,19 @@ trait PhaseRunner: Send + Sync {
         make_tools: ToolFactory<'a>,
         break_on_view_image: bool,
     ) -> PhaseFuture<'a>;
+
+    /// One completion, straight to the provider — no agent, no tool loop. The
+    /// single-shot phases (`oneshot`, `deliberate`'s direct lane) are exactly one
+    /// upstream request by definition, so they say so instead of asking a tool loop
+    /// to arrive at the same place with an empty toolset. See [`run_completion`].
+    fn complete<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        prompt: Message,
+        params: Option<&'a Value>,
+    ) -> PhaseFuture<'a>;
 }
 
 /// The concrete pre-built completion model behind the [`PhaseRunner`] vtable.
@@ -118,6 +132,29 @@ where
             make_tools,
             break_on_view_image,
         ))
+    }
+
+    fn complete<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        prompt: Message,
+        params: Option<&'a Value>,
+    ) -> PhaseFuture<'a> {
+        Box::pin(async move {
+            run_completion(
+                &self.model,
+                &self.name,
+                &CompletionLog::new(),
+                preamble,
+                max_tokens,
+                temperature,
+                prompt,
+                params,
+            )
+            .await
+        })
     }
 }
 
@@ -474,6 +511,27 @@ impl Arm {
             )
             .await
     }
+
+    /// Ask this arm one question and take its answer: a single completion with this
+    /// arm's params and `max_tokens`, no tools and no loop. The single-shot seam
+    /// behind `oneshot` and `deliberate`'s direct lane — prompt in, answer out, one
+    /// upstream request. Returns the answer paired with the provider's reported
+    /// [`Usage`] (zero-valued when it reported none), exactly as [`run`](Self::run) does.
+    pub(crate) async fn complete(
+        &self,
+        preamble: &str,
+        prompt: Message,
+    ) -> Result<(String, Usage)> {
+        self.runner
+            .complete(
+                preamble,
+                self.max_tokens,
+                self.temperature,
+                prompt,
+                self.params.as_ref(),
+            )
+            .await
+    }
 }
 
 /// The result of a consult: the final answer, the explorer's report (kept so
@@ -758,8 +816,64 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// ([`rewrite_view_image_history`]) and re-enter the loop with the remaining turn
 /// budget. The model now sees the image in user content, the one channel every
 /// provider accepts. When unset the hook is inert and this is the old single call.
+///
+/// **Seeing how each turn ended.** This is [`run_phase_logged`] with a log nobody
+/// keeps — reach for that one when the phase's per-turn finish reasons are the point.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+pub(crate) async fn run_phase<M, F>(
+    model: &M,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
+    make_tools: F,
+    break_on_view_image: bool,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
+    run_phase_logged(
+        &CompletionLog::new(),
+        model,
+        model_name,
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        make_tools,
+        break_on_view_image,
+    )
+    .await
+}
+
+/// [`run_phase`] with the per-turn completion record kept.
+///
+/// rig's agent layer hands back only what its medium-neutral hook event carries —
+/// content and usage — so a phase that stopped early, got truncated, or was refused
+/// by a classifier looks identical to one that finished. The provider *did* say which
+/// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
+/// `CompletionResponse::raw_response`, which the loop discards. Wrapping the model in
+/// [`Watched`] puts the record on the one path every completion takes — **including
+/// the turns inside the tool loop and the forced final turn**, which no hook reaches —
+/// and `log` is the caller's slot for it, readable after this returns whether the
+/// phase succeeded or failed.
+///
+/// The log is per call, never global: a phase makes its own, so concurrent consults
+/// never mix. It holds plain data and crosses `.await` freely — nothing to do with the
+/// `!Send` kaish kernel, which stays on its `KaishWorker` thread as always.
+///
+/// [`run_phase`] is this with a log nobody keeps; the *last* turn's finish reason is
+/// recorded on the span either way, so the phase's ending is visible in telemetry
+/// today.
 #[allow(clippy::too_many_arguments)]
-// each arg is a distinct, named loop input
 // A named parent for rig's GenAI spans: rig's `invoke_agent` checks the current
 // span and nests under this one, so a phase's whole model loop (every `chat` turn,
 // every `tool` call) hangs off one `run_phase` span carrying the model. Inert
@@ -776,11 +890,63 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
         // known non-None, so a `None` (toggle-less) provider records nothing and
         // telemetry-off stays a no-op.
         gen_ai.request.thinking = tracing::field::Empty,
+        // How the phase's LAST completion ended, in the provider's own words. Empty
+        // when the provider reported none (or nothing ran), so it exports only when
+        // there's something to say.
+        gen_ai.response.finish_reason = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_phase<M, F>(
+pub(crate) async fn run_phase_logged<M, F>(
+    log: &CompletionLog,
     model: &M,
     model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
+    make_tools: F,
+    break_on_view_image: bool,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
+    // Surface the exact reasoning/sampling params this phase ships (constant across the
+    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
+    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
+    let result = run_phase_loop(
+        &watched(model.clone(), log.clone()),
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        make_tools,
+        break_on_view_image,
+    )
+    .await;
+    // Read the ending off the log — after the loop, on every exit path, so a failed
+    // phase reports how its last completion ended too.
+    if let Some(reason) = log.last_finish_reason() {
+        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    result
+}
+
+/// The bounded tool loop itself, driving whatever model it's handed — in production a
+/// [`Watched`] wrapper, so every turn below (main loop, view_image resume, forced
+/// finalize) records on its way past.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+async fn run_phase_loop<M, F>(
+    model: &Watched<M>,
     preamble: &str,
     max_tokens: u64,
     temperature: Option<f64>,
@@ -803,13 +969,6 @@ where
     // the transcript and re-enters here (holistic review, Gemini Pro 2026-06-22).
     let mut prompt: Message = initial_prompt;
     let mut history: Vec<Message> = Vec::new();
-
-    // Surface the exact reasoning/sampling params this phase ships (constant across the
-    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
-    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
-    if let Some(t) = thinking {
-        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
-    }
 
     loop {
         // Outer turn budget: rig's `max_turns` resets each resume, so subtract the
@@ -948,6 +1107,85 @@ where
                  also failed to conclude: {e}"
             )
         })
+}
+
+/// One completion, no agent and no loop — the single-shot phases said plainly.
+///
+/// `oneshot` and `deliberate`'s direct lane are each *one* upstream request by
+/// definition: the caller owns the context, there is nothing to explore, and there are
+/// no tools to call. Running them through the managed tool loop with an empty toolset
+/// arrived at the same place by a longer road; this asks the provider directly.
+///
+/// **Byte-identical to what the agent built.** rig's agent prepares its request with
+/// the same [`CompletionRequestBuilder`](rig_core::completion::CompletionRequestBuilder)
+/// this uses, and `build()` is what turns a preamble into the leading
+/// `Message::System` — so preamble placement, params, `max_tokens`, temperature, the
+/// empty tool list, and the absent `tool_choice` all land exactly as before. Using
+/// rig's own builder rather than a hand-written literal is deliberate: a rig bump that
+/// changes how a request is assembled moves both paths together.
+///
+/// The answer text is the assistant turn's text content concatenated, which is how
+/// rig's runner builds `PromptResponse::output`; `usage` is the provider's report for
+/// this one call, zero-valued when it reported none.
+///
+/// `log` records how the completion ended, the same seam [`run_phase_logged`] gives
+/// the loop.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named request input
+#[tracing::instrument(
+    name = "run_phase",
+    skip_all,
+    fields(
+        model = %model_name,
+        // Honest, not decorative: this phase *is* one turn.
+        max_turns = 1,
+        gen_ai.request.thinking = tracing::field::Empty,
+        gen_ai.response.finish_reason = tracing::field::Empty,
+    )
+)]
+pub(crate) async fn run_completion<M>(
+    model: &M,
+    model_name: &str,
+    log: &CompletionLog,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    prompt: Message,
+    thinking: Option<&Value>,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+{
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
+    let mut builder = watched(model.clone(), log.clone())
+        .completion_request(prompt)
+        .preamble(preamble.to_string())
+        .max_tokens(max_tokens);
+    if let Some(t) = temperature {
+        builder = builder.temperature(t);
+    }
+    if let Some(params) = thinking {
+        builder = builder.additional_params(params.clone());
+    }
+    // `send()` is `model.completion(builder.build())` — the one provider call.
+    let response = builder.send().await;
+    if let Some(reason) = log.last_finish_reason() {
+        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    // "model call failed" keeps this on the provider side of `classify_failure`
+    // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
+    // overload or rate limit here is still worth a caller retry.
+    let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
+    let answer = response
+        .choice
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    Ok((answer, response.usage))
 }
 
 /// Run the explorer phase once and return its cited report. The explorer [`Arm`]
@@ -1150,15 +1388,14 @@ impl Tool for RunExplore {
 /// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
 /// shell, no exploration. The thin counterpart to `consult` (prompt in, answer out)
 /// for when the caller already owns the context and just wants the model's take.
-/// Built on the one loop primitive with an empty toolset and a single turn, so it is
-/// exactly one upstream request. Neither orientation nor operator house rules are
-/// spliced — both are project guidance, and oneshot reads no project.
+/// Exactly one upstream request, and now literally so: [`Arm::complete`] asks the
+/// provider directly rather than routing a toolless single turn through the managed
+/// loop. Neither orientation nor operator house rules are spliced — both are project
+/// guidance, and oneshot reads no project.
 ///
-/// Safe-by-accident note: a vision synth arm carries `break_on_view_image = true`
-/// (via `Arm::rewrites_view_image`), but the empty toolset has no `view_image` tool,
-/// so the break hook can never fire and the single turn always completes cleanly. If
-/// you ever give oneshot a tool, revisit this — a live break would consume the turn
-/// and land in the turn-cap finalize path.
+/// Give oneshot a tool one day and this is the line to revisit: a direct completion
+/// has nowhere to dispatch a tool call to, so a toolful oneshot belongs back on
+/// [`run_phase`], not here.
 ///
 /// `attachments` are caller-named workspace files inlined as context (the `attach` arg),
 /// resolved server-side so their bytes never transit the calling agent's context — the
@@ -1204,7 +1441,7 @@ pub async fn oneshot(
     with_call_deadline(
         cfg.call_deadline,
         "oneshot",
-        arm.run(
+        arm.complete(
             &resolve_phase_preamble(
                 Phase::Oneshot,
                 &cfg.prompts,
@@ -1212,9 +1449,6 @@ pub async fn oneshot(
                 cfg.house_rules.as_deref(),
             ),
             initial_prompt,
-            1,
-            cfg.progress.as_ref(),
-            &|| Ok(Vec::new()),
         ),
     )
     .await
@@ -1374,17 +1608,13 @@ pub async fn deliberate_direct(
     synth: &Arm,
     system: &str,
     deadline: Duration,
-    progress: &Arc<dyn ProgressSink>,
 ) -> Result<(String, Usage)> {
     with_call_deadline(
         deadline,
         "deliberate",
-        synth.run(
+        synth.complete(
             system,
             Message::user(deliberation_prompt(question, dossier)),
-            1,
-            progress.as_ref(),
-            &|| Ok(Vec::new()),
         ),
     )
     .await
@@ -1548,7 +1778,7 @@ mod tests {
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, usage, with_usage, CaptureHttp, RecordingSink, ScriptedClient,
+        transcript_text, usage, with_raw, with_usage, CaptureHttp, RecordingSink, ScriptedClient,
     };
     use rig_core::completion::CompletionRequest;
     use std::fs;
@@ -2046,6 +2276,162 @@ mod tests {
         );
     }
 
+    /// `oneshot` is now one *literal* upstream request — a direct completion, no agent
+    /// and no tool loop — and it must ask for exactly what the loop used to ask for.
+    ///
+    /// The proof is a side-by-side: the same preamble, params, `max_tokens`, and prompt
+    /// go down the old road (`Arm::run` with an empty toolset and a single turn) and the
+    /// new one (`oneshot` → `Arm::complete`), on two scripted models sharing one request
+    /// log. The two serialized [`CompletionRequest`]s must be identical — every field,
+    /// including the ones no accessor names: preamble placement (rig turns it into the
+    /// leading `System` message), the empty `tools`/`documents`, the absent
+    /// `tool_choice`, `additional_params`. Comparing whole requests is the point: a
+    /// spot-check of a few fields would pass while a dropped one changed the call.
+    #[tokio::test]
+    async fn oneshot_asks_exactly_what_the_agent_loop_asked() {
+        const VIA_LOOP: &str = "via-agent-loop";
+        const VIA_DIRECT: &str = "via-direct-call";
+        let client = ScriptedClient::builder()
+            .on_model(VIA_LOOP, |_req| Ok(text_response("done")))
+            .on_model(VIA_DIRECT, |_req| Ok(text_response("done")))
+            .build();
+        // A real params blob, so the thinking toggle rides both paths.
+        let params = Some(json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}));
+        let cfg = PhaseContext::default();
+        let preamble = resolve_phase_preamble(
+            Phase::Oneshot,
+            &cfg.prompts,
+            cfg.orientation.as_deref(),
+            cfg.house_rules.as_deref(),
+        );
+
+        // The pre-change path, reproduced: the managed loop, one turn, no tools.
+        let (loop_answer, loop_usage) = arm_with(&client, VIA_LOOP, params.clone())
+            .run(
+                &preamble,
+                Message::user("what changed?"),
+                1,
+                cfg.progress.as_ref(),
+                &|| Ok(Vec::new()),
+            )
+            .await
+            .expect("the agent-loop path answers");
+
+        // The shipped path.
+        let (direct_answer, direct_usage) = oneshot(
+            "what changed?",
+            &[],
+            &arm_with(&client, VIA_DIRECT, params),
+            &cfg,
+        )
+        .await
+        .expect("the direct path answers");
+
+        assert_eq!(direct_answer, loop_answer, "same answer text");
+        assert_eq!(direct_usage, loop_usage, "same usage accounting");
+
+        let looped = client.requests_for(VIA_LOOP);
+        let direct = client.requests_for(VIA_DIRECT);
+        assert_eq!(
+            looped.len(),
+            1,
+            "the loop made one request to compare against"
+        );
+        assert_eq!(
+            direct.len(),
+            1,
+            "oneshot is exactly ONE upstream request, got {}",
+            direct.len()
+        );
+        assert_eq!(
+            direct[0].raw, looped[0].raw,
+            "the direct completion must be request-for-request what the agent built"
+        );
+    }
+
+    /// The whole reason the wrapper exists: a phase's completion record reaches
+    /// [`run_phase_logged`]'s caller **including the turns inside the tool loop** — the
+    /// ones rig's agent hook can only see in its medium-neutral form, with no
+    /// `raw_response` and so no finish reason.
+    ///
+    /// Two turns here: the driver calls `run_kaish` (a provider reporting
+    /// `finish_reason: "tool_calls"`, nested under `choices[]` the OpenAI way), then
+    /// answers (an Anthropic-shaped top-level `stop_reason: "end_turn"`). Both land in
+    /// the log, in order, each with the reason its own payload gave — two spellings
+    /// through one extractor, from inside one real loop.
+    #[tokio::test]
+    async fn the_completion_log_carries_every_turn_including_inside_the_tool_loop() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                if transcript_text(req).contains("TOOL_RAN") {
+                    // The answering turn: Anthropic's top-level spelling.
+                    Ok(with_raw(
+                        text_response("the answer"),
+                        json!({"stop_reason": "end_turn"}),
+                    ))
+                } else {
+                    // A turn INSIDE the loop: the OpenAI-compatible spelling, nested.
+                    Ok(with_raw(
+                        tool_call_response("c1", "run_kaish", json!({"script": "echo TOOL_RAN"})),
+                        json!({"choices": [{"index": 0, "finish_reason": "tool_calls"}]}),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let log = CompletionLog::new();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase_logged(
+            &log,
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            4,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        )
+        .await
+        .expect("the scripted loop answers");
+
+        assert_eq!(answer, "the answer");
+        let turns = log.turns();
+        assert_eq!(
+            turns.len(),
+            2,
+            "every completion is recorded, tool turn included: {turns:?}"
+        );
+        assert_eq!(
+            turns[0].finish_reason.as_deref(),
+            Some("tool_calls"),
+            "the turn inside the loop — the one no hook can reach"
+        );
+        assert_eq!(turns[0].tool_calls, 1);
+        assert_eq!(turns[0].text_chars, 0);
+        assert_eq!(
+            turns[1].finish_reason.as_deref(),
+            Some("end_turn"),
+            "a different provider spelling, same extractor"
+        );
+        assert_eq!(
+            log.last_finish_reason().as_deref(),
+            Some("end_turn"),
+            "the phase's ending is one call away"
+        );
+    }
+
     /// oneshot carries the provider's reported token usage back out — the thin
     /// single-turn seam threads `PromptResponse.usage` the same as the loop does.
     #[tokio::test]
@@ -2524,7 +2910,6 @@ mod tests {
             &arm(&client, SYNTH),
             "You are a capable model answering a hard question offline.",
             cfg.call_deadline,
-            &cfg.progress,
         )
         .await
         .expect("scripted direct deliberation should succeed");
@@ -2638,7 +3023,6 @@ mod tests {
                 &arm(&client, SYNTH),
                 "offline synth preamble",
                 Duration::from_millis(50),
-                &(Arc::new(crate::progress::NullSink) as Arc<dyn ProgressSink>),
             ),
         )
         .await
