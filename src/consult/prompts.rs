@@ -23,11 +23,11 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
         Some(rules) => format!(
             "{base}\n\n\
              --- Operator house rules for this codebase ---\n\
-             The agent you're helping configured the guidance below — project \
-             conventions and working preferences for this repository. Treat it as \
-             trusted standing context: honor it as you investigate and when you write \
-             your answer. It's background about how this codebase works, not the \
-             question you're answering.\n\n{rules}"
+             The agent you're helping configured the guidance below. It holds the \
+             project conventions and working preferences for this repository. Treat it \
+             as trusted standing context: honor it as you investigate and when you \
+             write your answer. It is background about how this codebase works, not \
+             the question you are answering.\n\n{rules}"
         ),
     }
 }
@@ -779,6 +779,14 @@ mod tests {
             ("oneshot", oneshot_preamble()),
             ("batch", batch_preamble()),
             ("deliberation", deliberation_prompt("Q", "D")),
+            // Not a preamble of its own, but model-facing all the same: this framing is
+            // spliced onto whichever preamble is in play whenever `[context]` names a
+            // house-rules file, which on a configured install is every call. It sat
+            // outside this guard through the first pass and kept its em-dash.
+            (
+                "house rules",
+                with_house_rules(String::new(), Some("RULES")),
+            ),
         ] {
             let ours = text.replace(core, "");
             assert!(
