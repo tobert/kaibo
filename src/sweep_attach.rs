@@ -502,7 +502,7 @@ impl Tool for SweepAttach {
     }
 
     fn description(&self) -> String {
-        let (_, max) = self.sink.usage();
+        let max = self.sink.max_attachments();
         format!(
             "Aim a file past yourself at whoever reads your report. `attach` routes a \
              workspace file's full bytes ALONGSIDE your report to {}, without ever \
