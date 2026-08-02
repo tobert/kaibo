@@ -121,6 +121,17 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A consultation that produced no answer no longer comes back as a successful empty
+  one.** A reasoning model's final turn can carry reasoning but no answer text, and
+  kaibo would dress that empty string in a provenance footer and return it as success —
+  no error, no signal that the review had not happened. Every phase (`consult`,
+  `explore`, `oneshot`, `deliberate`) now checks its answer: if the model had already
+  gathered evidence, kaibo asks it once to write up what it found, which usually
+  recovers the answer (both attempts' tokens counted in the footer); if it had gathered
+  nothing, the call fails with its diagnostics attached (turns used, token counts, and
+  the provider's own finish reason when it reported one) rather than pressing an
+  evidence-free model into an ungrounded answer.
+
 - **A vision model still sees the image after the `rig` 0.41 upgrade.** rig 0.41 stopped
   inspecting a tool's text output to discover rich content in it, which would have
   silently turned every `view_image` result into base64 text labelled JSON — the model

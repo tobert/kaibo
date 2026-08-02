@@ -335,6 +335,18 @@ pub fn text_response(text: impl Into<String>) -> CompletionResponse<Value> {
     response(OneOrMany::one(AssistantContent::text(text)))
 }
 
+/// A **reasoning-only** terminal turn — the shape a DeepSeek reasoner produces when it
+/// returns `reasoning_content` with an empty/whitespace `content`. rig's deepseek
+/// converter drops the empty text block outright and pushes only
+/// `AssistantContent::Reasoning` (`providers/deepseek.rs:400`/`:420`), so the choice
+/// carries no `Text` and no `ToolCall`. rig then treats it as a clean terminal turn and
+/// its text extraction (`assistant_text_from_choice`) filters to `Text`, yielding `""` —
+/// an `Ok` response with an empty `output`. The offline stand-in for the
+/// generated-but-undelivered answer.
+pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse<Value> {
+    response(OneOrMany::one(AssistantContent::reasoning(reasoning)))
+}
+
 /// A single tool call — drives one more loop turn.
 pub fn tool_call_response(
     id: impl Into<String>,
