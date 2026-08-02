@@ -16,62 +16,46 @@
 //! slice — the read-size question the explorer A/Bs turn on.
 //!
 //! It's *our* span on *our* tools, independent of what rig or a given provider
-//! instruments, so it lands the same on every backend. The wrapper sits at the
-//! `ToolDyn` seam (where `call` carries the raw JSON args) so it can summarize the
-//! call; it is otherwise transparent — name, definition, output, and errors pass
-//! straight through.
+//! instruments, so it lands the same on every backend. [`traced`] is where a typed
+//! tool becomes the erased [`DynamicTool`] rig dispatches — the seam that still sees
+//! raw JSON args, so it can summarize the call — and it is otherwise transparent:
+//! name, description, parameters, output, and errors all pass straight through.
+//! Because the erasure is ours, the arg-parse happens inside the span too, so a
+//! malformed-args refusal is reported as `outcome = error` rather than never
+//! appearing — the honest reading of "did this call work".
 
-use rig_core::completion::ToolDefinition;
-use rig_core::tool::{Tool, ToolDyn, ToolError};
+use std::sync::Arc;
+
+use rig_agent::tool::{
+    tool_definition, DynamicTool, IntoToolOutput, Tool, ToolContext, ToolExecutionError, ToolOutput,
+};
 use rig_core::wasm_compat::WasmBoxedFuture;
+use serde_json::Value;
 use tracing::{field, info_span, Instrument, Span};
 
-/// Wraps a boxed [`ToolDyn`], emitting a `tool` span per `call`. Delegates the rest.
-pub struct Traced {
-    inner: Box<dyn ToolDyn>,
-}
-
-impl ToolDyn for Traced {
-    fn name(&self) -> String {
-        self.inner.name()
-    }
-
-    fn definition<'a>(&'a self, prompt: String) -> WasmBoxedFuture<'a, ToolDefinition> {
-        self.inner.definition(prompt)
-    }
-
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        let name = self.inner.name();
-        // Summarize before the args are moved into the call. `outcome` is filled
-        // after, so one span carries which tool, with what, and whether it worked;
-        // the span's start/end bracket the latency.
-        let summary = arg_summary(&args);
-        Box::pin(async move {
-            let span = info_span!(
-                "tool",
-                "gen_ai.tool.name" = %name,
-                "gen_ai.tool.arguments" = %summary,
-                outcome = field::Empty,
-                // Filled by `run_kaish` (via `record_kaish_result`) from inside the
-                // instrumented call — `Span::current()` is this span there. Every other
-                // tool leaves them empty, so they don't export.
-                "kaish.exit_code" = field::Empty,
-                "kaish.output_bytes" = field::Empty,
-            );
-            async {
-                let result = self.inner.call(args).await;
-                Span::current().record("outcome", if result.is_ok() { "ok" } else { "error" });
-                result
-            }
-            .instrument(span)
-            .await
-        })
-    }
+/// Parse a dynamic tool's JSON args into the wrapped tool's typed `Args`.
+///
+/// `null` and `{}` both mean "no arguments" — a no-argument tool is routinely called
+/// either way, so treating only one as valid yields a tool that fails for some models
+/// and not others.
+fn parse_args<A>(args: Value) -> Result<A, ToolExecutionError>
+where
+    A: for<'de> serde::Deserialize<'de>,
+{
+    let args = if args.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        args
+    };
+    serde_json::from_value(args).map_err(|error| {
+        ToolExecutionError::invalid_args(format!("failed to parse tool arguments: {error}"))
+            .with_source(error)
+    })
 }
 
 /// Record a `run_kaish` script's result onto the enclosing `tool` span — its exit
 /// code and delivered stdout size. Called from inside [`RunKaish::call`](crate::explorer),
-/// which runs under the [`Traced`] wrapper's span, so [`Span::current`] is that span
+/// which runs under the [`traced`] wrapper's span, so [`Span::current`] is that span
 /// and its pre-declared `kaish.*` fields fill in. Off the wrapped path (e.g. a direct
 /// worker call with no `tool` span current) this is a harmless no-op — best-effort
 /// observability, never load-bearing. The field names live *here*, with their
@@ -82,12 +66,63 @@ pub(crate) fn record_kaish_result(exit_code: i64, output_bytes: usize) {
     span.record("kaish.output_bytes", output_bytes as u64);
 }
 
-/// Box a tool as a span-wrapped [`ToolDyn`] — the toolset-assembly drop-in for
-/// `Box::new(tool)`, so every tool in a phase's toolset is traced uniformly.
-pub fn traced<T: Tool + 'static>(tool: T) -> Box<dyn ToolDyn> {
-    Box::new(Traced {
-        inner: Box::new(tool),
-    })
+/// Erase a typed tool into a span-wrapped [`DynamicTool`] — the toolset-assembly
+/// drop-in, so every tool in a phase's toolset is traced uniformly. The returned tool
+/// is what rig registers and dispatches, so the span brackets exactly the work rig
+/// attributes to this call.
+pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
+    let definition = tool_definition(&tool);
+    let name = definition.name.clone();
+    let tool = Arc::new(tool);
+    DynamicTool::new(
+        definition.name,
+        definition.description,
+        definition.parameters,
+        move |context: &mut ToolContext, args: Value| {
+            let tool = Arc::clone(&tool);
+            let name = name.clone();
+            // Summarize before the args are moved into the call. `outcome` is filled
+            // after, so one span carries which tool, with what, and whether it worked;
+            // the span's start/end bracket the latency.
+            let summary = arg_summary(&args.to_string());
+            Box::pin(async move {
+                let span = info_span!(
+                    "tool",
+                    "gen_ai.tool.name" = %name,
+                    "gen_ai.tool.arguments" = %summary,
+                    outcome = field::Empty,
+                    // Filled by `run_kaish` (via `record_kaish_result`) from inside the
+                    // instrumented call — `Span::current()` is this span there. Every
+                    // other tool leaves them empty, so they don't export.
+                    "kaish.exit_code" = field::Empty,
+                    "kaish.output_bytes" = field::Empty,
+                );
+                async move {
+                    let result = run_traced(tool.as_ref(), context, args).await;
+                    Span::current().record("outcome", if result.is_ok() { "ok" } else { "error" });
+                    result
+                }
+                .instrument(span)
+                .await
+            }) as WasmBoxedFuture<'_, Result<ToolOutput, ToolExecutionError>>
+        },
+    )
+}
+
+/// The erased call itself: parse, dispatch, then normalize both halves of the typed
+/// result — output through [`IntoToolOutput`](rig_agent::tool::IntoToolOutput), error
+/// through the tool's own `map_error`, so a tool that classifies its failures keeps
+/// that classification.
+async fn run_traced<T: Tool>(
+    tool: &T,
+    context: &mut ToolContext,
+    args: Value,
+) -> Result<ToolOutput, ToolExecutionError> {
+    let args = parse_args::<T::Args>(args)?;
+    match tool.call(context, args).await {
+        Ok(output) => output.into_tool_output(),
+        Err(error) => Err(tool.map_error(error)),
+    }
 }
 
 /// A short, span-friendly summary of a tool call's JSON args: the most informative
@@ -117,12 +152,23 @@ fn arg_summary(args: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::serialized_capture;
+    use rig_agent::tool::{ToolResult, ToolSet};
     use serde::Deserialize;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::registry::LookupSpan;
     use tracing_subscriber::Layer;
+
+    /// Dispatch a span-wrapped tool the way rig does — through a registered
+    /// [`ToolSet`], the public execution surface. This is the production path, not a
+    /// stand-in: rig's erased `call` is private.
+    async fn dispatch(tool: DynamicTool, args: &str) -> ToolResult {
+        let name = tool.name().to_string();
+        let tools = ToolSet::from_dynamic_tools(vec![tool]);
+        let mut context = ToolContext::default();
+        tools.execute(&name, args, &mut context).await
+    }
 
     /// A trivial tool to wrap: echoes its `msg`, or errors on "boom".
     struct Echo;
@@ -143,14 +189,13 @@ mod tests {
         type Error = EchoErr;
         type Args = EchoArgs;
         type Output = String;
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: "echo".into(),
-                description: "echo".into(),
-                parameters: json!({}),
-            }
+        fn description(&self) -> String {
+            "echo".into()
         }
-        async fn call(&self, args: Self::Args) -> Result<String, EchoErr> {
+        fn parameters(&self) -> serde_json::Value {
+            json!({})
+        }
+        async fn call(&self, _ctx: &mut ToolContext, args: Self::Args) -> Result<String, EchoErr> {
             if args.msg == "boom" {
                 Err(EchoErr)
             } else {
@@ -313,8 +358,9 @@ mod tests {
             let sub = tracing_subscriber::registry().with(cap.clone());
             let _g = tracing::subscriber::set_default(sub);
 
-            let tool = traced(Echo);
-            let out = tool.call(r#"{"msg":"hi"}"#.to_string()).await.unwrap();
+            let result = dispatch(traced(Echo), r#"{"msg":"hi"}"#).await;
+            assert!(result.is_success(), "echo succeeded: {result:?}");
+            let out = result.output().render();
             assert!(out.contains("hi"), "output passes through: {out}");
 
             drop(_g);
@@ -344,8 +390,8 @@ mod tests {
             let sub = tracing_subscriber::registry().with(cap.clone());
             let _g = tracing::subscriber::set_default(sub);
 
-            let tool = traced(Echo);
-            assert!(tool.call(r#"{"msg":"boom"}"#.to_string()).await.is_err());
+            let result = dispatch(traced(Echo), r#"{"msg":"boom"}"#).await;
+            assert!(result.is_error(), "the tool's own failure: {result:?}");
 
             drop(_g);
             let spans = cap.0.lock().unwrap().clone();
@@ -354,6 +400,34 @@ mod tests {
                     .iter()
                     .any(|s| s.name == "tool" && s.tool == "echo" && s.outcome == "error"),
                 "a `tool` span tagged outcome=error"
+            );
+        });
+    }
+
+    /// Malformed args are refused *inside* the span, so the trace shows the attempt
+    /// and tags it `outcome = error`. [`traced`] owns the arg-parse, which is where a
+    /// failed call could quietly start being reported as a success.
+    #[test]
+    fn malformed_args_are_refused_inside_the_span() {
+        serialized_capture(async {
+            let cap = Capture::default();
+            let sub = tracing_subscriber::registry().with(cap.clone());
+            let _g = tracing::subscriber::set_default(sub);
+
+            // `msg` is required and an integer is not a string.
+            let result = dispatch(traced(Echo), r#"{"msg":7}"#).await;
+            assert!(
+                result.is_error(),
+                "unparseable args fail the call: {result:?}"
+            );
+
+            drop(_g);
+            let spans = cap.0.lock().unwrap().clone();
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.name == "tool" && s.tool == "echo" && s.outcome == "error"),
+                "the refused call still emits its span, tagged outcome=error"
             );
         });
     }
@@ -382,14 +456,17 @@ mod tests {
             type Error = Never;
             type Args = NoArgs;
             type Output = String;
-            async fn definition(&self, _prompt: String) -> ToolDefinition {
-                ToolDefinition {
-                    name: "run_kaish".into(),
-                    description: "run_kaish".into(),
-                    parameters: json!({}),
-                }
+            fn description(&self) -> String {
+                "run_kaish".into()
             }
-            async fn call(&self, _args: Self::Args) -> Result<String, Never> {
+            fn parameters(&self) -> serde_json::Value {
+                json!({})
+            }
+            async fn call(
+                &self,
+                _ctx: &mut ToolContext,
+                _args: Self::Args,
+            ) -> Result<String, Never> {
                 super::record_kaish_result(3, 4321);
                 Ok("exit: 3\n".into())
             }
@@ -400,8 +477,10 @@ mod tests {
             let sub = tracing_subscriber::registry().with(cap.clone());
             let _g = tracing::subscriber::set_default(sub);
 
-            let tool = traced(TruncatedRead);
-            tool.call("{}".to_string()).await.unwrap();
+            // `null` args, not `{}` — a no-argument tool is routinely called that way,
+            // and [`parse_args`] has to mean the same thing by both.
+            let result = dispatch(traced(TruncatedRead), "null").await;
+            assert!(result.is_success(), "null args mean no args: {result:?}");
 
             drop(_g);
             let spans = cap.0.lock().unwrap().clone();
@@ -441,11 +520,13 @@ mod tests {
             let sub = tracing_subscriber::registry().with(cap.clone());
             let _g = tracing::subscriber::set_default(sub);
 
-            let tool = traced(RunKaish::new(worker));
-            let out = tool
-                .call(r#"{"script":"cat -n big.txt"}"#.to_string())
-                .await
-                .unwrap();
+            let result = dispatch(
+                traced(RunKaish::new(worker)),
+                r#"{"script":"cat -n big.txt"}"#,
+            )
+            .await;
+            assert!(result.is_success(), "the script ran: {result:?}");
+            let out = result.output().render();
             assert!(out.contains("exit: 3"), "the read truncated: {out}");
 
             drop(_g);

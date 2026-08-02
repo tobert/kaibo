@@ -90,6 +90,14 @@ const CONFIG_URI: &str = "kaibo://config";
 /// user copies to `~/.config/kaibo/config.toml`. Most useful on a fresh install,
 /// where the setup guidance points at it.
 const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
+/// The full configuration reference manual (`docs/config.md`). The third config
+/// resource: `kaibo://config` is the resolved state, `kaibo://config/example` the
+/// copyable template, and this the explanatory prose behind both — precedence,
+/// backend/cast design, tool gating, containment, persistence. It exists so the
+/// template can stay a *template*: an agent configuring kaibo over MCP has no access to
+/// this repo's `docs/`, so without it every explanation had to be smuggled into the
+/// example's comments, where it costs bytes on every read and drifts from the code.
+const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
 /// Long-form "how to wield the tools well" guidance — attachments, cast/model
 /// selection, the sync↔async pairs and their handles, and the read-only shell's
 /// idioms. The tool schemas stay terse and point here, so the repetition and positive
@@ -115,6 +123,11 @@ const PROMPTS_CAST_URI_TEMPLATE: &str = "kaibo://prompts/{cast}";
 /// `pub(crate)` so `kaibo example-config` (`cli.rs`) can print the exact same string
 /// the `kaibo://config/example` resource serves — one source, no drift.
 pub(crate) const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.example.toml");
+
+/// `docs/config.md`, embedded for the same reason as the template above: `cargo install
+/// kaibo` lays down no docs, so a runtime file read would 404 exactly when someone is
+/// trying to configure the thing.
+const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
 
 /// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
 /// its wall-clock backstop: the per-request reqwest deadline should fire first (a
@@ -175,6 +188,26 @@ impl Default for ToolGating {
 }
 
 impl ToolGating {
+    /// Whether the operator left tool `name` enabled — the raw `--no-<tool>` answer,
+    /// *before* the staffing gate in [`KaiboHandler::new`] has its say. Used to tell the
+    /// two reasons a tool can vanish apart: a flag-off tool is the operator's own choice
+    /// and needs no explanation, while a flag-ON tool no cast can staff earns a startup
+    /// warning. `consult_submit` shares `consult`'s flag (one capability, two shapes).
+    /// A name with no flag of its own reads as enabled — the castless tools
+    /// (`run_kaish`, `list_models`) are gated directly, never through this.
+    pub fn enabled(&self, name: &str) -> bool {
+        match name {
+            "consult" | "consult_submit" => self.consult,
+            "explore" => self.explore,
+            "deliberate" => self.deliberate,
+            "oneshot" => self.oneshot,
+            "run_kaish" => self.run_kaish,
+            "batch_submit" => self.batch,
+            "list_models" => self.list_models,
+            _ => true,
+        }
+    }
+
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
         !self.consult
@@ -567,9 +600,21 @@ pub struct KaiboHandler {
     batch_providers: Arc<dyn crate::batch::BatchProviderFactory>,
 }
 
-/// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, and the predicate
-/// (a `Config::cast_is_*`/`cast_can_*`) that decides which usable casts they advertise.
-type CastEnumRule = (&'static [&'static str], fn(&Config, &str) -> bool);
+/// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, the predicate
+/// (a `Config::cast_is_*`/`cast_can_*`) that decides which usable casts they advertise,
+/// and a plain-language statement of the cast *shape* the predicate wants.
+///
+/// That third field is operator-facing text, not decoration: when a rule matches nothing
+/// the tools are dropped entirely (see [`KaiboHandler::new`]), and vanishing silently is
+/// right for the model's tool list but wrong for the operator — so the startup warning
+/// says what a cast would have to look like to bring the tool back. Keeping it in this
+/// table rather than at the log site is what stops the message from drifting away from
+/// the predicate it describes.
+type CastEnumRule = (
+    &'static [&'static str],
+    fn(&Config, &str) -> bool,
+    &'static str,
+);
 
 /// The single source mapping each cast-taking tool to the predicate that decides which
 /// *usable* casts its `cast` enum advertises — keyed on the cast's shape (synth lane +
@@ -577,6 +622,11 @@ type CastEnumRule = (&'static [&'static str], fn(&Config, &str) -> bool);
 /// injects the enums straight from this table. A cast may match more than one rule (a
 /// deliberate-shaped batch cast like `fable` serves both `batch_submit` and `deliberate`);
 /// the rules are independent filters, not a partition.
+///
+/// This table also decides whether a tool is advertised **at all**: a rule matching no
+/// usable cast means nothing can staff its tools, so [`KaiboHandler::new`] removes their
+/// routes instead of shipping a tool whose every call would fail. See that function for
+/// why removal beats an empty enum.
 ///
 /// Two tests guard it: `cast_enum_never_advertises_a_gated_cast` (no enum offers a cast its
 /// tool's gate — `reject_offline_cast`/`require_batch_cast`/`require_deliberate_cast` —
@@ -589,13 +639,28 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["consult", "consult_submit", "oneshot"],
         Config::cast_is_interactive,
+        "a cast whose synth answers interactively (any cast without an offline synth lane)",
     ),
     // `explore` runs only the explorer, so it advertises *any* cast with one — including
     // `deliberate`/`direct` casts, whose (often smarter) explorers are useful standalone.
     // Its own rule, broader than the interactive tools' (which also need an interactive synth).
-    (&["explore"], Config::cast_can_explore),
-    (&["batch_submit"], Config::cast_is_batch),
-    (&["deliberate"], Config::cast_can_deliberate),
+    (
+        &["explore"],
+        Config::cast_can_explore,
+        "a cast with an `explorer` slot",
+    ),
+    (
+        &["batch_submit"],
+        Config::cast_is_batch,
+        "a cast whose synth runs on the batch lane (`lane = \"batch\"`, or the `batch = true` \
+         sugar) — Anthropic, Gemini, or a hosted OpenAI Platform backend",
+    ),
+    (
+        &["deliberate"],
+        Config::cast_can_deliberate,
+        "a cast pairing an `explorer` slot with an OFFLINE synth (`lane = \"batch\"` or \
+         `lane = \"direct\"`) — see the DELIBERATE casts in docs/config.example.toml",
+    ),
 ];
 
 /// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
@@ -610,6 +675,115 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
 /// reach a model), because an empty `enum` reads as "no valid value" to a strict
 /// client and would wrongly forbid the field, which is optional. A gated-off tool
 /// is already absent from `router`, so the lookups simply skip it.
+/// Which of `usable` can staff each cast-taking tool, keyed by tool name — the one
+/// computation behind both the staffing gate (an empty list ⇒ the route is dropped) and
+/// the `cast` enum each surviving tool advertises.
+///
+/// A tool absent from the returned map takes no `cast` at all (`run_kaish`,
+/// `list_models`, the collect verbs), so no roster can make it unusable. Shared with
+/// `kaibo://config`'s `[runtime]` section so the resource explains the *same* verdict the
+/// router acted on, rather than a second implementation that could drift from it.
+pub(crate) fn eligible_casts_by_tool(
+    config: &Config,
+    usable: &[String],
+) -> std::collections::HashMap<&'static str, Vec<String>> {
+    CAST_ENUM_RULES
+        .iter()
+        .flat_map(|(tools, is_eligible, _)| {
+            let casts: Vec<String> = usable
+                .iter()
+                .filter(|n| is_eligible(config, n))
+                .cloned()
+                .collect();
+            tools.iter().map(move |&t| (t, casts.clone()))
+        })
+        .collect()
+}
+
+/// The plain-language cast shape tool `name` needs, from its `CAST_ENUM_RULES` entry.
+/// `None` for a tool that takes no cast. The operator-facing half of the staffing gate:
+/// both the startup warning and `kaibo://config` explain a missing tool with this text.
+pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
+    CAST_ENUM_RULES
+        .iter()
+        .find(|(tools, _, _)| tools.contains(&name))
+        .map(|(_, _, requirement)| *requirement)
+}
+
+/// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
+/// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
+/// tool method fails the build rather than leaving a gate quietly inert.
+pub(crate) const ALL_TOOL_NAMES: [&str; 12] = [
+    "consult",
+    "consult_submit",
+    "explore",
+    "deliberate",
+    "oneshot",
+    "run_kaish",
+    "batch_submit",
+    "job_get",
+    "job_cancel",
+    "job_list",
+    "job_wait",
+    "list_models",
+];
+
+/// Which tools this config actually advertises: the operator's `--no-<tool>` flags AND
+/// a cast that can staff each one.
+///
+/// The single source for that decision. `KaiboHandler::new` filters the router through
+/// it, and `kaibo://config` reports it — including from the CLI, which renders the
+/// resource with no router in existence. Deriving the answer twice is how the resource
+/// would come to describe a surface the server doesn't actually serve, so it is derived
+/// once, here.
+///
+/// Two tools don't take a `cast` and so can't be unstaffable: `run_kaish` (the shell, no
+/// model at all) and `list_models` (an operator query). The four collect verbs are a
+/// third shape — castless too, but they exist only to collect handles, so they follow
+/// their *producers*: live while any of `consult_submit`, `batch_submit`, or
+/// `deliberate` is live, dropped once none is.
+pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str> {
+    let eligible = eligible_casts_by_tool(config, usable);
+    let can_staff = |name: &str| eligible.get(name).is_none_or(|c| !c.is_empty());
+    let gating = &config.tools;
+
+    let consult_live = gating.consult && can_staff("consult");
+    let explore_live = gating.explore && can_staff("explore");
+    let deliberate_live = gating.deliberate && can_staff("deliberate");
+    let oneshot_live = gating.oneshot && can_staff("oneshot");
+    let batch_live = gating.batch && can_staff("batch_submit");
+    let jobs_live = consult_live || batch_live || deliberate_live;
+
+    [
+        (consult_live, "consult"),
+        // `consult_submit` is the async sibling of `consult` — same capability, a
+        // submit/collect surface rather than a blocking one — so it shares the `consult`
+        // flag and the same interactive-cast requirement. (docs/issues.md tracks a
+        // dedicated flag if anyone needs only one shape.)
+        (consult_live, "consult_submit"),
+        // The single-phase explorer sweep — its own gate, and the broadest cast rule
+        // (any cast with an explorer, interactive or not).
+        (explore_live, "explore"),
+        (deliberate_live, "deliberate"),
+        (oneshot_live, "oneshot"),
+        // No cast, no model: the read-only shell is always staffable.
+        (gating.run_kaish, "run_kaish"),
+        (batch_live, "batch_submit"),
+        // The collect verbs follow their producers — see the fn doc. "Live" folds the
+        // flag AND staffing together, so a producer nothing can staff keeps them no more
+        // than a producer the operator switched off does: neither mints a handle.
+        (jobs_live, "job_get"),
+        (jobs_live, "job_cancel"),
+        (jobs_live, "job_list"),
+        (jobs_live, "job_wait"),
+        // Read-only model discovery — an operator/config query, no cast in sight.
+        (gating.list_models, "list_models"),
+    ]
+    .into_iter()
+    .filter_map(|(live, name)| live.then_some(name))
+    .collect()
+}
+
 fn inject_cast_enum(router: &mut ToolRouter<KaiboHandler>, tools: &[&str], casts: &[String]) {
     if casts.is_empty() {
         return;
@@ -646,91 +820,111 @@ impl KaiboHandler {
     /// or non-directory entry in root / allow_paths is a loud construction error —
     /// a path that can't be canonicalized can't bound anything.
     pub fn new(config: Config) -> Result<Self> {
+        Self::new_with_env(config, |k| std::env::var(k).ok())
+    }
+
+    /// [`new`](Self::new) with the credential lookup injected — the seam that makes the
+    /// staffing gate testable.
+    ///
+    /// Which casts are *usable* depends on which keys resolve, and the built-in cast
+    /// registry merges under every config, so a test that built a handler from a fixture
+    /// TOML was really testing "my fixture **plus** whatever keys happen to be in the
+    /// developer's environment." That passes on CI and fails on the maintainer's laptop
+    /// (or the reverse) — the flakiest kind of test, and it hid real behavior here: the
+    /// gate correctly dropped `deliberate` everywhere, but `explore`/`batch_submit`
+    /// looked ungated because ambient keys made a built-in cast usable. Tests pass a
+    /// closure that answers for exactly the keys the fixture means to have; production
+    /// passes the real environment. Deliberately a closure rather than `set_var`, which
+    /// is unsafe and process-global — the same reasoning `stability.rs` and
+    /// `config_resource.rs` already record.
+    pub fn new_with_env(config: Config, get_env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let gating = config.tools;
         // `#[tool_router]` gathers every #[tool] method at compile time; gating is a
         // runtime choice, so build the full router and drop the disabled routes by
         // name. (The methods stay compiled — no dead code — they're just not
         // advertised or callable.)
         let mut tool_router = Self::tool_router();
-        // `remove_route` silently no-ops on an unknown name, so a renamed #[tool]
-        // method would leave its --no-<tool> flag quietly inert. Assert the route
-        // exists before dropping it — a stale name is a build-time bug we want loud.
-        for (enabled, name) in [
-            (gating.consult, "consult"),
-            // `consult_submit` is the async sibling of `consult` — same capability, a
-            // submit/collect surface rather than a blocking one — so it shares the
-            // `consult` gate. (docs/issues.md tracks a dedicated flag if anyone needs
-            // only one shape.) The verbs that *collect* its handles (`job_get`/
-            // `job_cancel`/`job_list`) are shared with batch and gated below.
-            (gating.consult, "consult_submit"),
-            // The single-phase explorer sweep — its own gate.
-            (gating.explore, "explore"),
-            // `deliberate` starts an offline deliberation; its own gate. The collect
-            // verbs it hands off to (batch or job) live below, gated by their capability.
-            (gating.deliberate, "deliberate"),
-            (gating.oneshot, "oneshot"),
-            (gating.run_kaish, "run_kaish"),
-            // `--no-batch` drops `batch_submit`; the shared collect verbs live below.
-            (gating.batch, "batch_submit"),
-            // `job_get`/`job_cancel`/`job_list`/`job_wait` manage *both* batch and
-            // consult handles — and now `deliberate` handles too (batch on its batch
-            // lane, `job-N` on its direct lane) — so they stay as long as *any* of the
-            // three producers is on, and drop only when all are gated off. Routing by
-            // handle shape inside each verb refuses a handle whose producer is disabled.
-            (
-                gating.batch || gating.consult || gating.deliberate,
-                "job_get",
-            ),
-            (
-                gating.batch || gating.consult || gating.deliberate,
-                "job_cancel",
-            ),
-            (
-                gating.batch || gating.consult || gating.deliberate,
-                "job_list",
-            ),
-            (
-                gating.batch || gating.consult || gating.deliberate,
-                "job_wait",
-            ),
-            // Read-only model discovery — its own gate, independent of every
-            // model-driven tool above.
-            (gating.list_models, "list_models"),
-        ] {
-            if !enabled {
-                assert!(
-                    tool_router.has_route(name),
-                    "gating: no tool route named {name:?} — did a #[tool] method get renamed?"
-                );
-                tool_router.remove_route(name);
+
+        // The live cast roster, resolved once here (the same startup moment the handshake
+        // resolves its list; a reconnect re-reads it). It feeds BOTH the staffing gate
+        // just below and the `cast` enum injection further down.
+        let usable: Vec<String> = config
+            .usable_casts(&get_env)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        // Per-tool eligible casts, straight from `CAST_ENUM_RULES`.
+        let eligible = eligible_casts_by_tool(&config, &usable);
+        // A tool nothing can staff is not advertised. `inject_cast_enum` documents the
+        // near-miss this closes: faced with an empty roster it *skipped* injecting the
+        // enum (an empty `enum` reads as "no valid value" to a strict client), so the tool
+        // shipped looking usable while every call would fail its own gate — exactly the
+        // `deliberate`-on-a-stock-install bug. Dropping the route is the honest answer:
+        // the model never sees a tool it cannot use, and an unusable tool stops billing
+        // resident tokens against every session. Tools take no `cast` are unaffected.
+
+        // Vanishing is right for the model's tool list and wrong for operator
+        // discoverability — so say so, once per rule, naming the cast shape that would
+        // bring the tool back. Only for tools the operator left ON: a `--no-<tool>` drop
+        // is already the operator's own choice and needs no explanation.
+        for (tools, _, requirement) in CAST_ENUM_RULES {
+            if !eligible.get(tools[0]).is_some_and(Vec::is_empty) {
+                continue;
             }
+            let on: Vec<&str> = tools
+                .iter()
+                .copied()
+                .filter(|t| gating.enabled(t))
+                .collect();
+            if on.is_empty() {
+                continue;
+            }
+            tracing::warn!(
+                tools = on.join(", "),
+                "disabled: no configured cast can staff it — needs {requirement}. \
+                 Configured casts are listed at kaibo://config."
+            );
+        }
+
+        // Which tools actually survive: the operator's flags AND a cast that can staff
+        // each. `live_tools` is the single source — `kaibo://config` reports the same
+        // decision, so the resource can never describe a surface this router doesn't serve.
+        let live = live_tools(&config, &usable);
+        // `remove_route` silently no-ops on an unknown name, so a renamed #[tool] method
+        // would leave its gate quietly inert. Assert the route exists before dropping it —
+        // a stale name is a build-time bug we want loud.
+        for name in ALL_TOOL_NAMES {
+            if live.contains(&name) {
+                continue;
+            }
+            assert!(
+                tool_router.has_route(name),
+                "gating: no tool route named {name:?} — did a #[tool] method get renamed?"
+            );
+            tool_router.remove_route(name);
         }
 
         // Stamp the live cast roster onto the consultation tools' `cast` param as a
         // JSON-Schema `enum`, so an agent choosing a team reads the menu off the tool
         // schema it already fills arguments from — not only the handshake prose, which
-        // a host may truncate (the failure that motivated this). Env is read once here,
-        // the same startup moment the handshake resolves its list; reconnect re-reads.
-        let usable: Vec<String> = config
-            .usable_casts(|k| std::env::var(k).ok())
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        // Advertise each tool's `cast` enum from the one `CAST_ENUM_RULES` table: a cast's
-        // shape (synth lane + explorer) decides which tools it serves, and each rule is an
-        // independent filter (the batch and deliberate views OVERLAP — a deliberate-shaped
-        // batch cast like `fable` serves both). Routing every enum through this table (and
-        // cross-checking it against the gates in the consistency test) is what keeps the
-        // advertised menu and the call-time gate from drifting apart. The `cast` enum is the
-        // one authoritative per-lane roster — the resident-prose roster this used to also
+        // a host may truncate (the failure that motivated this).
+        //
+        // Same `eligible` map the staffing gate above used — a cast's shape (synth lane +
+        // explorer) decides which tools it serves, and each rule is an independent filter
+        // (the batch and deliberate views OVERLAP — a deliberate-shaped batch cast like
+        // `fable` serves both). Routing every enum through this table (and cross-checking
+        // it against the gates in the consistency test) is what keeps the advertised menu
+        // and the call-time gate from drifting apart. The `cast` enum is the one
+        // authoritative per-lane roster — the resident-prose roster this used to also
         // append (`append_cast_roster`) was dropped as redundant; see `docs/devlog.md`.
-        for (tools, eligible) in CAST_ENUM_RULES {
-            let casts: Vec<String> = usable
-                .iter()
-                .filter(|n| eligible(&config, n))
-                .cloned()
-                .collect();
-            inject_cast_enum(&mut tool_router, tools, &casts);
+        //
+        // Every empty roster here now belongs to a route the gate already removed, so
+        // `inject_cast_enum`'s empty-list skip is a belt-and-braces guard rather than the
+        // load-bearing behavior it used to be.
+        for (tools, _, _) in CAST_ENUM_RULES {
+            let casts = eligible.get(tools[0]).expect("every rule seeded the map");
+            inject_cast_enum(&mut tool_router, tools, casts);
         }
 
         // Pin `consult` resident under Claude Code's tool-schema deferral: a host may
@@ -1656,10 +1850,9 @@ impl KaiboHandler {
         let deadline = deliberate_direct_deadline(synth_backend);
         // Same progress plumbing as consult_submit: a job has no live peer, so route
         // liveness onto `tracing` and let the ProgressLog remember the latest beat for
-        // `job_get`/`job_list`. The sink handed to the phase is the same Arc the job
-        // snapshots, so what it reads is what the completion emitted.
+        // `job_get`/`job_list`. The direct lane is a single completion with no tools, so
+        // it emits no beats of its own — the log carries the job's own start/finish.
         let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
-        let sink: Arc<dyn ProgressSink> = progress_log.clone();
         let cast_name = cast.name.clone();
         let explorer_model = explorer_model.to_string();
         let question = question.to_string();
@@ -1670,7 +1863,7 @@ impl KaiboHandler {
 
         let job_id = self.jobs.submit(label, progress_log, async move {
             match crate::consult::deliberate_direct(
-                &question, &dossier, &images, &synth, &system, deadline, &sink,
+                &question, &dossier, &images, &synth, &system, deadline,
             )
             .await
             {
@@ -2430,7 +2623,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
         .with_server_info(
             Implementation::new("kaibo", env!("CARGO_PKG_VERSION"))
-                .with_title("kaibo (解剖)"),
+                .with_title("kaibo"),
         )
         .with_protocol_version(ProtocolVersion::LATEST)
         // Judge provider usability from the live environment so a fresh install
@@ -2558,6 +2751,15 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
                  ~/.config/kaibo/config.toml and edit. Pairs with kaibo://config, which \
                  shows the *resolved* runtime state.",
             ),
+        // The reference manual behind the other two: what each knob means and why.
+        markdown_resource(
+            CONFIG_GUIDE_URI,
+            "kaibo: configuration guide",
+            "The full configuration reference: precedence across call/CLI/env/file, the \
+             backend + cast model, tool gating (why a tool may not be advertised), path \
+             containment, persistence, telemetry, house rules, and prompt overrides. Read \
+             this when kaibo://config/example's comments leave a question open.",
+        ),
         markdown_resource(
             SANDBOX_URI,
             "kaibo read-only sandbox",
@@ -2603,10 +2805,11 @@ models it uses.
 
 Work through these steps:
 
-1. Read kaibo's two config resources first (they're MCP resources — no tool turn spent):
+1. Read kaibo's config resources first (they're MCP resources — no tool turn spent):
    • `kaibo://config/example` — the annotated config.toml template, every knob explained.
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
+   • `kaibo://config/guide` — the full reference manual, if a question stays open.
 ";
 
 /// Steps 2-6, channel-neutral (which provider, what roster shape, keeping secrets out
@@ -2997,6 +3200,10 @@ with the `[prompts]` table, or per cast with a slot's `preamble` (the two axes a
 fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     if uri == SANDBOX_URI {
         return Some(kaibo_sandbox_doc());
+    }
+    if uri == CONFIG_GUIDE_URI {
+        // Static and config-independent — the embedded manual verbatim.
+        return Some(CONFIG_GUIDE_MD.to_string());
     }
     if uri == TOOLS_URI {
         return Some(TOOLS_DOC.to_string());
@@ -3551,6 +3758,21 @@ mod tests {
             .expect("handler builds")
     }
 
+    /// `handler_from_toml` with an EMPTY credential environment, so the usable-cast
+    /// roster is exactly what the fixture declares. The built-in cast registry merges
+    /// under every config, so without this a fixture's roster silently includes every
+    /// built-in cast whose key happens to be set in the developer's shell — which is how
+    /// a staffing test can pass on CI and fail on a maintainer's laptop. Fixtures that
+    /// want a usable cast declare a `key_optional = true` backend (no credential needed);
+    /// everything else resolves to `Unconfigured` and drops out.
+    fn hermetic_handler_from_toml(toml: &str) -> KaiboHandler {
+        KaiboHandler::new_with_env(
+            Config::from_toml_str(toml).expect("config parses"),
+            |_| None,
+        )
+        .expect("handler builds")
+    }
+
     /// The joined text of a successful `CallToolResult` — for asserting on a handler's
     /// reply message.
     fn result_text(r: CallToolResult) -> String {
@@ -3821,7 +4043,7 @@ mod tests {
         };
 
         let mut checked = 0;
-        for &(tools, _) in CAST_ENUM_RULES {
+        for &(tools, _, _) in CAST_ENUM_RULES {
             for &tool in tools {
                 let advertised = enum_of(tool);
                 assert!(
@@ -3845,6 +4067,210 @@ mod tests {
         assert!(checked > 0, "the guard checked nothing");
     }
 
+    /// Renders every BUILT-IN cast unusable, so a staffing fixture's roster is exactly
+    /// the casts it declares.
+    ///
+    /// The built-in registry merges under every config, and a built-in cast counts as
+    /// usable the moment its backend resolves a credential — from the environment *or*
+    /// from a key file on disk. So the keyed backends get an `api_key_file` that cannot
+    /// exist (mirroring `config.rs`'s `NO_KEY_FILES`, whose comment records why: Amy
+    /// keeps real key files, so a naive fixture passes on her box and fails in CI). The
+    /// keyless `openai-local` needs the extra `key_optional = false`: without a required
+    /// credential it resolves to a *placeholder* and stays `LocalUnverified`, which counts
+    /// as usable — and that is what kept `explore` looking ungated even under an empty
+    /// environment, since the built-in local casts all carry explorer slots.
+    const NO_BUILTIN_CASTS: &str = r#"
+        [backends.anthropic]
+        api_key_file = "/nonexistent-kaibo-test/anthropic"
+        [backends.deepseek]
+        api_key_file = "/nonexistent-kaibo-test/deepseek"
+        [backends.gemini]
+        api_key_file = "/nonexistent-kaibo-test/gemini"
+        [backends.openrouter]
+        api_key_file = "/nonexistent-kaibo-test/openrouter"
+        [backends.openai-local]
+        key_optional = false
+        api_key_file = "/nonexistent-kaibo-test/openai"
+    "#;
+
+    /// A cast fixture with an interactive team and nothing else — so `explore` has an
+    /// explorer, `consult`/`oneshot` have an interactive synth, and NOTHING can staff
+    /// `batch_submit` or `deliberate` (both need an offline synth lane).
+    /// `NO_BUILTIN_CASTS` followed by `rest`. A plain concatenation rather than
+    /// `format!`, because these fixtures contain TOML inline tables — every `{` and `}`
+    /// in a slot like `synth = { backend = "gem", ... }` would have to be doubled to
+    /// survive a format string, which is a silent trap for the next fixture.
+    fn with_no_builtin_casts(rest: &str) -> String {
+        format!("{NO_BUILTIN_CASTS}\n{rest}")
+    }
+
+    fn only_interactive() -> String {
+        with_no_builtin_casts(
+            r#"
+        [backends.gem]
+        kind = "gemini"
+        key_optional = true
+
+        [casts.inter]
+        explorer = "gem/lite"
+        synth    = "gem/flash"
+
+        [server]
+        cast = "inter"
+    "#,
+        )
+    }
+
+    /// The staffing gate, `deliberate`'s case — the bug this whole mechanism exists to
+    /// fix. `deliberate` needs an offline synth PLUS an explorer; a config carrying only
+    /// interactive casts can't staff one, so the tool must not be advertised at all
+    /// rather than shipping with an empty `cast` enum and failing at call time.
+    #[test]
+    fn deliberate_is_not_advertised_when_no_cast_can_staff_it() {
+        let h = hermetic_handler_from_toml(&only_interactive());
+        assert!(
+            !h.advertised_tools().iter().any(|t| t == "deliberate"),
+            "deliberate must be dropped when no configured cast pairs an explorer with an \
+             offline synth — advertising it costs resident tokens for a tool that can only \
+             fail. Advertised: {:?}",
+            h.advertised_tools()
+        );
+    }
+
+    /// The other half: a cast that CAN staff it keeps the tool. Without this, "drop the
+    /// route" could be satisfied by dropping it unconditionally.
+    #[test]
+    fn deliberate_is_advertised_when_a_cast_can_staff_it() {
+        let h = hermetic_handler_from_toml(&with_no_builtin_casts(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.inter]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+
+            [casts.deep]                                   # explorer + OFFLINE synth
+            explorer = "gem/lite"
+            synth    = { backend = "gem", id = "pro", lane = "batch" }
+
+            [server]
+            cast = "inter"
+        "#,
+        ));
+        assert!(
+            h.advertised_tools().iter().any(|t| t == "deliberate"),
+            "deliberate must survive when a cast pairs an explorer with an offline synth. \
+             Advertised: {:?}",
+            h.advertised_tools()
+        );
+    }
+
+    /// Generalized: the same rule covers `batch_submit`. A config with no batch-lane cast
+    /// must not advertise the batch submit verb.
+    #[test]
+    fn batch_submit_is_not_advertised_without_a_batch_cast() {
+        let h = hermetic_handler_from_toml(&only_interactive());
+        assert!(
+            !h.advertised_tools().iter().any(|t| t == "batch_submit"),
+            "batch_submit must be dropped when no cast runs a synth on the batch lane. \
+             Advertised: {:?}",
+            h.advertised_tools()
+        );
+    }
+
+    /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
+    /// tool cannot run.
+    #[test]
+    fn explore_is_not_advertised_without_an_explorer_slot() {
+        let h = hermetic_handler_from_toml(&with_no_builtin_casts(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.synth_only]
+            synth = "gem/flash"
+
+            [server]
+            cast = "synth_only"
+        "#,
+        ));
+        let tools = h.advertised_tools();
+        assert!(
+            !tools.iter().any(|t| t == "explore"),
+            "explore must be dropped when no cast carries an explorer slot. Advertised: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|t| t == "consult"),
+            "consult must SURVIVE here — its interactive synth can staff it, and the driver \
+             carries its own explorer. Advertised: {tools:?}"
+        );
+    }
+
+    /// The collect verbs are shared by three producers (`consult_submit`, `batch_submit`,
+    /// `deliberate`), so they must key off *effective* liveness, not the raw `--no-*`
+    /// flags: with batch and deliberate unstaffable but consult live, the job verbs stay
+    /// (consult_submit still mints `job-N` handles).
+    #[test]
+    fn job_verbs_survive_on_the_one_staffed_producer() {
+        let h = hermetic_handler_from_toml(&only_interactive());
+        let tools = h.advertised_tools();
+        for verb in ["job_get", "job_cancel", "job_list", "job_wait"] {
+            assert!(
+                tools.iter().any(|t| t == verb),
+                "{verb} must survive while consult_submit can still produce handles. \
+                 Advertised: {tools:?}"
+            );
+        }
+    }
+
+    /// ...and drop when NO producer can be staffed. A synth-only cast with `--no-consult`
+    /// leaves nothing that can mint a handle, so the collect verbs are dead weight.
+    #[test]
+    fn job_verbs_drop_when_no_producer_can_be_staffed() {
+        let h = hermetic_handler_from_toml(&with_no_builtin_casts(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.synth_only]
+            synth = "gem/flash"
+
+            [server]
+            cast = "synth_only"
+
+            [server.tools]
+            consult = false
+        "#,
+        ));
+        let tools = h.advertised_tools();
+        for verb in ["job_get", "job_cancel", "job_list", "job_wait"] {
+            assert!(
+                !tools.iter().any(|t| t == verb),
+                "{verb} must drop when no producer is live: consult is flag-off, and neither \
+                 batch_submit nor deliberate can be staffed. Advertised: {tools:?}"
+            );
+        }
+    }
+
+    /// A tool that takes NO cast is never touched by the staffing gate — `run_kaish` runs
+    /// the shell with no model at all, so no cast roster can make it unusable.
+    #[test]
+    fn castless_tools_are_untouched_by_the_staffing_gate() {
+        let h = hermetic_handler_from_toml(&only_interactive());
+        let tools = h.advertised_tools();
+        for tool in ["run_kaish", "list_models"] {
+            assert!(
+                tools.iter().any(|t| t == tool),
+                "{tool} takes no cast — the staffing gate must not reach it. \
+                 Advertised: {tools:?}"
+            );
+        }
+    }
+
     /// The completeness half of the single source: every advertised tool that TAKES a
     /// `cast` argument must be covered by a `CAST_ENUM_RULES` entry — otherwise a future
     /// cast-taking tool would ship with a silently-empty `cast` enum (never advertising its
@@ -3856,7 +4282,7 @@ mod tests {
         let h = handler();
         let ruled: std::collections::HashSet<&str> = CAST_ENUM_RULES
             .iter()
-            .flat_map(|(tools, _)| tools.iter().copied())
+            .flat_map(|(tools, _, _)| tools.iter().copied())
             .collect();
         let mut cast_taking = 0;
         for tool in h.advertised_tools() {
@@ -5190,6 +5616,51 @@ mod tests {
         );
         crate::config::Config::from_toml_str(&body)
             .expect("the embedded config example must parse as a valid Config");
+    }
+
+    // --- kaibo://config/guide resource tests ----------------------------------
+
+    /// The embedded configuration manual is listed and readable. It carries the detail
+    /// the template deliberately no longer inlines, so an agent configuring kaibo over
+    /// MCP (no access to this repo's `docs/`) can still reach it.
+    #[test]
+    fn config_guide_resource_is_listed_and_readable() {
+        let uris: Vec<String> = kaibo_resources().into_iter().map(|r| r.uri).collect();
+        assert!(
+            uris.iter().any(|u| u == CONFIG_GUIDE_URI),
+            "kaibo_resources() must list kaibo://config/guide, got {uris:?}"
+        );
+
+        let body = render_resource(CONFIG_GUIDE_URI, &[]).expect("guide must render");
+        assert!(
+            body.starts_with("# kaibo configuration"),
+            "guide must be docs/config.md verbatim:\n{}",
+            &body[..body.len().min(200)]
+        );
+    }
+
+    /// The pointer the trimmed template makes — "full table: kaibo://config/guide,
+    /// 'Tool gating'" — must actually land somewhere. This is the drift guard for
+    /// moving that content out of the example: delete or rename the section and the
+    /// template becomes a dead reference, so fail here instead.
+    #[test]
+    fn config_guide_carries_the_tool_gating_section_the_template_points_at() {
+        let guide = render_resource(CONFIG_GUIDE_URI, &[]).expect("guide must render");
+        assert!(
+            guide.contains("## Tool gating"),
+            "docs/config.md must keep the section config.example.toml points at"
+        );
+        assert!(
+            CONFIG_EXAMPLE_TOML.contains(CONFIG_GUIDE_URI),
+            "the template must point at the guide it defers its detail to"
+        );
+        // Each cast-gated tool is named where an operator would look up why it vanished.
+        for tool in ["consult", "explore", "batch_submit", "deliberate"] {
+            assert!(
+                guide.contains(tool),
+                "the gating section must account for `{tool}`"
+            );
+        }
     }
 
     // --- kaibo://config resource tests ---------------------------------------

@@ -31,17 +31,21 @@ pub use engine::{
     RunExploreError, Session,
 };
 // `run_phase` is the offline-testable loop primitive; re-exported at crate scope so
-// `crate::consult::run_phase` (referenced in module docs) resolves. No in-crate `use`
-// imports it by that path today, so silence the re-export's unused-import lint.
+// `crate::consult::run_phase` (referenced in module docs) resolves. `run_phase_logged`
+// is that same loop with the per-turn completion record kept — the seam to reach for
+// when *how* a turn ended is the question (see [`crate::completion_watch`]). No in-crate
+// `use` imports either by that path today, so silence the unused-import lint.
 #[allow(unused_imports)]
-pub(crate) use engine::run_phase;
+pub(crate) use engine::{run_phase, run_phase_logged};
 pub use prompts::{
     batch_preamble, batch_system_prompt, consult_preamble, consult_user_prompt,
     deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble,
     sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides,
 };
 pub use shaping::{
-    hosted_openai_accepts_reasoning, hosted_openai_accepts_sampling,
-    hosted_openai_responses_params, inject_provider_prefs, request_params, thinking_params,
-    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
+    accepted_efforts, effort_rank, effort_sinks, hosted_openai_accepts_reasoning,
+    hosted_openai_accepts_sampling, hosted_openai_responses_params, inject_provider_prefs,
+    is_effort_off, known_efforts, preflight_params, request_params, thinking_params, EffortWire,
+    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, EFFORT_LADDER, EFFORT_OFF,
+    THINKING_BUDGET,
 };

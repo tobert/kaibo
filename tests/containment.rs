@@ -66,9 +66,13 @@ async fn path_outside_allowed_set_is_rejected() {
 
     let handler = handler_with_allowed(Some(allowed.path()), &[]);
 
-    let err = try_run(&handler, &outside.path().to_string_lossy(), "cat secret.txt")
-        .await
-        .expect_err("a path outside the allowed set must be an MCP error");
+    let err = try_run(
+        &handler,
+        &outside.path().to_string_lossy(),
+        "cat secret.txt",
+    )
+    .await
+    .expect_err("a path outside the allowed set must be an MCP error");
 
     // The error must name the allowed trees so the caller knows where the boundary is.
     assert!(
@@ -78,7 +82,9 @@ async fn path_outside_allowed_set_is_rejected() {
     );
     // And it must mention how to widen it.
     assert!(
-        err.contains("--allow-path") || err.contains("KAIBO_ALLOW_PATHS") || err.contains("allow_paths"),
+        err.contains("--allow-path")
+            || err.contains("KAIBO_ALLOW_PATHS")
+            || err.contains("allow_paths"),
         "the rejection must name a widening knob, got: {err}"
     );
 }
@@ -176,7 +182,10 @@ async fn omitted_path_with_root_set_uses_root() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(out.contains("hi"), "root-based call should read file, got: {out}");
+    assert!(
+        out.contains("hi"),
+        "root-based call should read file, got: {out}"
+    );
 }
 
 // --- (e) no root and no allow_paths: allowed set is the cwd ------------------
@@ -381,7 +390,10 @@ async fn explicit_root_does_not_pull_in_the_cwd() {
     let handler = handler_with_allowed(Some(root.path()), &[]);
 
     let canon_root = std::fs::canonicalize(root.path()).unwrap();
-    assert_eq!(handler.default_root().as_deref(), Some(canon_root.as_path()));
+    assert_eq!(
+        handler.default_root().as_deref(),
+        Some(canon_root.as_path())
+    );
     assert!(
         !handler.default_root_inferred(),
         "an explicit root is configured, not inferred"
@@ -536,8 +548,14 @@ fn allow_paths_from_toml_file() {
     )
     .unwrap();
     assert_eq!(c.allow_paths.len(), 2);
-    assert!(c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/a")));
-    assert!(c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/b")));
+    assert!(c
+        .allow_paths
+        .iter()
+        .any(|p| p == std::path::Path::new("/tmp/a")));
+    assert!(c
+        .allow_paths
+        .iter()
+        .any(|p| p == std::path::Path::new("/tmp/b")));
 }
 
 /// `KAIBO_ALLOW_PATHS` env var (colon-separated) overrides file.
@@ -550,26 +568,29 @@ fn allow_paths_from_env_overrides_file() {
     let env: HashMap<&str, &str> = [("KAIBO_ALLOW_PATHS", "/tmp/env-a:/tmp/env-b")]
         .into_iter()
         .collect();
-    let c = kaibo::config::Config::load_with(
-        None,
-        Some(path),
-        |k| env.get(k).map(|s| s.to_string()),
-    )
-    .unwrap();
+    let c =
+        kaibo::config::Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string()))
+            .unwrap();
     // env replaces file (non-empty CLI list replaces lower layers; env follows same rule).
     assert!(
-        c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/env-a")),
+        c.allow_paths
+            .iter()
+            .any(|p| p == std::path::Path::new("/tmp/env-a")),
         "env KAIBO_ALLOW_PATHS must override file, got {:?}",
         c.allow_paths
     );
     assert!(
-        c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/env-b")),
+        c.allow_paths
+            .iter()
+            .any(|p| p == std::path::Path::new("/tmp/env-b")),
         "both colon-separated paths must be present, got {:?}",
         c.allow_paths
     );
     // File-only value must NOT be present (env replaces, not appends).
     assert!(
-        !c.allow_paths.iter().any(|p| p == std::path::Path::new("/tmp/file-only")),
+        !c.allow_paths
+            .iter()
+            .any(|p| p == std::path::Path::new("/tmp/file-only")),
         "env replace must not include file-only values, got {:?}",
         c.allow_paths
     );
@@ -855,8 +876,10 @@ async fn sibling_reachable_when_rooted_at_linked_worktree() {
 
 use kaibo::progress::NullSink;
 use kaibo::sandbox::KaishWorker;
-use kaibo::sweep_attach::{SweepAttach, SweepAttachArgs, SweepAttachSink, SweepConsumer, SweepConsumerKind};
-use rig_core::tool::Tool;
+use kaibo::sweep_attach::{
+    SweepAttach, SweepAttachArgs, SweepAttachSink, SweepConsumer, SweepConsumerKind,
+};
+use rig_agent::tool::{Tool, ToolContext};
 use std::sync::Arc;
 
 fn attach_tool_over(root: &Path) -> SweepAttach {
@@ -888,10 +911,13 @@ async fn sweep_attach_refuses_a_path_outside_the_project_root() {
 
     let tool = attach_tool_over(&root);
     let receipt = tool
-        .call(SweepAttachArgs {
-            paths: vec![stray.to_string_lossy().to_string()],
-            note: None,
-        })
+        .call(
+            &mut ToolContext::new(),
+            SweepAttachArgs {
+                paths: vec![stray.to_string_lossy().to_string()],
+                note: None,
+            },
+        )
         .await
         .expect("attach itself never hard-errors on a bad path — refusal rides the receipt");
 
@@ -915,10 +941,13 @@ async fn sweep_attach_refuses_a_symlink_escape() {
 
     let tool = attach_tool_over(&root);
     let receipt = tool
-        .call(SweepAttachArgs {
-            paths: vec!["escape/secret.txt".to_string()],
-            note: None,
-        })
+        .call(
+            &mut ToolContext::new(),
+            SweepAttachArgs {
+                paths: vec!["escape/secret.txt".to_string()],
+                note: None,
+            },
+        )
         .await
         .expect("attach itself never hard-errors on a bad path — refusal rides the receipt");
 

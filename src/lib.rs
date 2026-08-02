@@ -1,4 +1,4 @@
-//! kaibo (解剖) — an assistant agent *for other agents*.
+//! kaibo — an assistant agent *for other agents*.
 //!
 //! kaibo augments a calling agent (Claude, etc.) with a team of models, lending one
 //! kind of help over MCP: **consultation** — grounded, cited answers about a codebase.
@@ -17,6 +17,7 @@ pub mod attach;
 pub mod batch;
 pub mod cas;
 pub mod cli;
+pub mod completion_watch;
 pub mod config;
 pub mod consult;
 pub mod context;

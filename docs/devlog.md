@@ -1,6 +1,6 @@
 # kaibo — Devlog
 
-解剖（かいぼう）'s shipped-work record: the *why* behind landed changes, newest
+kaibo's shipped-work record: the *why* behind landed changes, newest
 first. This is the curated narrative git can't carry — what we chose, what we
 rejected, what a live probe proved, how the shipped surface drifted from the plan.
 

@@ -9,24 +9,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rig_core::agent::{AgentBuilder, HookAction, PromptHook};
+use rig_agent::agent::hook::{
+    AgentHook, CompletionCall, CompletionCallAction, HookContext, ToolResultAction, ToolResultEvent,
+};
+use rig_agent::agent::AgentBuilder;
+use rig_agent::completion::PromptError;
+use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
+    ToolResultContent, UserContent,
 };
-// Only referenced from the offline-loop tests below (constructing a scripted
-// `view_image`/co-tool-call assistant turn) — the generalized rewrite (`the_result`,
-// not the tool call) no longer needs it in production code.
-#[cfg(test)]
-use rig_core::completion::message::AssistantContent;
-use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition, Usage};
+use rig_core::completion::{CompletionModel, Message, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
-use rig_core::tool::{Tool, ToolDyn};
 use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::attach::Attachment;
+use crate::completion_watch::{watched, CompletionLog, Watched};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
@@ -50,7 +51,7 @@ use super::shaping::{ModelCaps, ModelShape};
 
 /// The toolset factory a phase loop rebuilds its tools from (once for the main
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
-type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<Box<dyn ToolDyn>>> + Send + Sync);
+type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<DynamicTool>> + Send + Sync);
 
 /// The eventual `(answer, usage)` a phase loop yields, boxed `Send` for the
 /// [`PhaseRunner`] vtable: the model's answer paired with the token [`Usage`] the
@@ -78,6 +79,19 @@ trait PhaseRunner: Send + Sync {
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
         break_on_tool_images: bool,
+    ) -> PhaseFuture<'a>;
+
+    /// One completion, straight to the provider — no agent, no tool loop. The
+    /// single-shot phases (`oneshot`, `deliberate`'s direct lane) are exactly one
+    /// upstream request by definition, so they say so instead of asking a tool loop
+    /// to arrive at the same place with an empty toolset. See [`run_completion`].
+    fn complete<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        prompt: Message,
+        params: Option<&'a Value>,
     ) -> PhaseFuture<'a>;
 }
 
@@ -122,6 +136,29 @@ where
             make_tools,
             break_on_tool_images,
         ))
+    }
+
+    fn complete<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        prompt: Message,
+        params: Option<&'a Value>,
+    ) -> PhaseFuture<'a> {
+        Box::pin(async move {
+            run_completion(
+                &self.model,
+                &self.name,
+                &CompletionLog::new(),
+                preamble,
+                max_tokens,
+                temperature,
+                prompt,
+                params,
+            )
+            .await
+        })
     }
 }
 
@@ -296,6 +333,31 @@ impl Arm {
         // config opt-in. A no-op for every other kind.
         let params =
             super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
+        // Preflight the blob through rig's OWN request builder for this wire. Two of the
+        // six wires parse it into a typed struct whose reasoning rungs are a closed enum,
+        // so an effort rig can't name dies *inside rig* at call time with a bare serde
+        // line ("unknown variant `max`") that says nothing about which slot of which cast
+        // asked for it. Asking here — the single live construction point — turns that into
+        // a boundary error naming the slot and the rungs that wire does take. It stays a
+        // preflight, not a policy: the accepted list is read back out of rig, so a rig bump
+        // that adds a rung needs no kaibo change, and effort stays a passthrough string
+        // everywhere rig lets it be one.
+        let wire = super::shaping::EffortWire::resolve(backend.kind, responses_wire);
+        if let Err(detail) = super::shaping::preflight_params(wire, params.as_ref()) {
+            return Err(anyhow!(
+                "model {:?} (backend {:?}, {} slot): effort {:?} is refused by rig's {} \
+                 request builder before the request leaves kaibo. That ceiling is \
+                 rig-core's typed client, not the provider's API — this wire accepts {}. \
+                 Set the slot's `effort` (or `[defaults]`) to one of those, or point the \
+                 slot at a backend whose wire passes effort through. (rig: {detail})",
+                slot.id,
+                backend.name,
+                role.key(),
+                t.effort,
+                wire.label(),
+                super::shaping::accepted_efforts(wire).join(" | "),
+            ));
+        }
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -402,13 +464,19 @@ impl Arm {
     /// instead of full input price every turn; implicit-caching upstreams
     /// (DeepSeek/GLM/Kimi/Gemini/OpenAI) ignore the marker. The growing
     /// transcript is not marked — an upstream rig limitation, tracked in
-    /// docs/issues.md. Kept as a named seam so the construction is unit-testable:
-    /// rig exposes the caching flag as a public field, and `from_slot` must
-    /// route through here.
-    fn openrouter_completion_model(
-        client: &openrouter::Client,
+    /// docs/issues.md. Kept as a named seam so the construction is unit-testable, and
+    /// `from_slot` must route through here.
+    ///
+    /// Generic over the HTTP backend so a test can drive it with a capture transport
+    /// and read the marker off the serialized body — the only place that answers
+    /// whether this constructor did its job, since rig exposes no readable flag.
+    fn openrouter_completion_model<H>(
+        client: &openrouter::Client<H>,
         id: &str,
-    ) -> openrouter::CompletionModel {
+    ) -> openrouter::CompletionModel<H>
+    where
+        openrouter::Client<H>: CompletionClient<CompletionModel = openrouter::CompletionModel<H>>,
+    {
         client.completion_model(id).with_prompt_caching()
     }
 
@@ -444,6 +512,27 @@ impl Arm {
                 progress,
                 make_tools,
                 self.rewrites_tool_images(),
+            )
+            .await
+    }
+
+    /// Ask this arm one question and take its answer: a single completion with this
+    /// arm's params and `max_tokens`, no tools and no loop. The single-shot seam
+    /// behind `oneshot` and `deliberate`'s direct lane — prompt in, answer out, one
+    /// upstream request. Returns the answer paired with the provider's reported
+    /// [`Usage`] (zero-valued when it reported none), exactly as [`run`](Self::run) does.
+    pub(crate) async fn complete(
+        &self,
+        preamble: &str,
+        prompt: Message,
+    ) -> Result<(String, Usage)> {
+        self.runner
+            .complete(
+                preamble,
+                self.max_tokens,
+                self.temperature,
+                prompt,
+                self.params.as_ref(),
             )
             .await
     }
@@ -527,22 +616,21 @@ const TOOL_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the nex
 /// [`run_phase`] can move the image onto the **user-turn** channel for a transport
 /// that can't carry it in a tool result (an OpenAI VLM).
 ///
-/// **Why flag now, terminate next — not mid-turn.** A single assistant turn can call
-/// `view_image` *and* `run_kaish` together; terminating the instant `view_image`
-/// returns would drop the other tool's result and orphan its `tool_use`. And rig's
-/// `on_tool_result` Terminate hands back a transcript snapshotted *before* the turn's
-/// results are folded into `new_messages` (`prompt_request/mod.rs` ~:928), so it
-/// wouldn't even carry the image we came for. So we only *set a flag* on
-/// `on_tool_result`, and terminate on the **next** `on_completion_call` — the point
-/// where rig has written every tool result of the triggering turn into `new_messages`
-/// and `Terminate` returns the complete transcript (`:670`). Disabled
+/// **Why flag now, stop next — not mid-turn.** A single assistant turn can call
+/// `view_image` *and* `run_kaish` together; stopping the instant `view_image` returns
+/// would drop the other tool's result and orphan its `tool_use`. And a stop from
+/// `on_tool_result` hands back a transcript snapshotted *before* the turn's results are
+/// folded into the run's messages, so it wouldn't even carry the image we came for. So
+/// we only *set a flag* on `on_tool_result`, and stop on the **next**
+/// `on_completion_call` — the point where rig has written every tool result of the
+/// triggering turn into the transcript and the stop returns it complete. Disabled
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
 /// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
 #[derive(Clone)]
 struct ToolImageBreakHook {
     enabled: bool,
     /// Set once a `view_image` tool result lands this turn; read at the next
-    /// completion call. Interior mutability because `PromptHook`'s callbacks are `&self`
+    /// completion call. Interior mutability because `AgentHook`'s callbacks are `&self`
     /// and rig runs a turn's tools concurrently.
     saw_tool_image: Arc<AtomicBool>,
 }
@@ -556,53 +644,43 @@ impl ToolImageBreakHook {
     }
 }
 
-impl<M: CompletionModel> PromptHook<M> for ToolImageBreakHook {
+impl AgentHook for ToolImageBreakHook {
     async fn on_tool_result(
         &self,
-        _tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        _args: &str,
-        result: &str,
-    ) -> HookAction {
-        if self.enabled && tool_result_carries_image(result) {
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        if self.enabled && tool_output_carries_image(event.presentation) {
             self.saw_tool_image.store(true, Ordering::SeqCst);
         }
-        HookAction::cont()
+        ToolResultAction::Keep
     }
 
-    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        _event: CompletionCall<'_>,
+    ) -> CompletionCallAction {
         if self.enabled && self.saw_tool_image.load(Ordering::SeqCst) {
-            HookAction::terminate(TOOL_IMAGE_BREAK)
+            CompletionCallAction::Stop(TOOL_IMAGE_BREAK.to_string())
         } else {
-            HookAction::cont()
+            CompletionCallAction::Continue
         }
     }
 }
 
-/// Does this tool result (rig's raw serialized `Tool::Output`) carry an image part?
-/// Keys the break hook on the RESULT, not the tool's name — fully general, so the
-/// next image-bearing tool (`view_image` today, and a sweep's `explore` result
-/// carrying a routed image) needs no new `if`. A cheap substring guard first (every
-/// non-image-bearing result, the overwhelming majority, never pays the parse), then
-/// a real JSON confirm that `parts[]` actually holds an image — rig hands the raw
-/// serialized output straight to this hook (`rig-core` `agent/prompt_request/mod.rs`),
-/// which is exactly the hybrid envelope [`crate::view_image::ViewImage`] and
-/// [`crate::consult::RunExplore`] both emit.
-fn tool_result_carries_image(result: &str) -> bool {
-    if !result.contains("\"type\":\"image\"") {
-        return false;
-    }
-    serde_json::from_str::<Value>(result)
-        .ok()
-        .and_then(|v| {
-            v.get("parts")?.as_array().map(|parts| {
-                parts
-                    .iter()
-                    .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"))
-            })
-        })
-        .unwrap_or(false)
+/// Does this tool output carry an image part? Keys the break hook on the RESULT, not
+/// the tool's name — fully general, so the next image-bearing tool (`view_image`
+/// today, and a sweep's `explore` result carrying a routed image) needs no new `if`.
+/// Typed, not sniffed: rig 0.41 hands the hook the model-visible [`ToolOutput`]
+/// whole, so the check reads the declared content parts — the same declared-image
+/// contract [`crate::view_image::ViewImage`] and [`crate::consult::RunExplore`] emit
+/// on.
+fn tool_output_carries_image(output: &ToolOutput) -> bool {
+    output
+        .as_content()
+        .iter()
+        .any(|c| matches!(c, ToolResultContent::Image(_)))
 }
 
 /// Rewrite a transcript so every image-bearing tool result rides the **user-turn**
@@ -733,7 +811,7 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// surface — `oneshot` ({} — no tools), the recomposed `consult`
 /// ({run_kaish, explore′}), and its nested `explore′` ({run_kaish}). The factory matters because of the
 /// turn-cap recovery below: a fresh toolset is built for the forced final turn, and
-/// `Box<dyn ToolDyn>` can't be cloned, so we rebuild rather than share. Each call
+/// A `DynamicTool` toolset is consumed by the builder, so we rebuild rather than share. Each call
 /// spawns its own `KaishWorker`(s); the caller owns their lifetime.
 ///
 /// **Turn-cap recovery.** When the model uses every turn without concluding, rig
@@ -753,8 +831,64 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// remaining turn budget. The model now sees the image in user content, the one
 /// channel every provider accepts. When unset the hook is inert and this is the old
 /// single call.
+///
+/// **Seeing how each turn ended.** This is [`run_phase_logged`] with a log nobody
+/// keeps — reach for that one when the phase's per-turn finish reasons are the point.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+pub(crate) async fn run_phase<M, F>(
+    model: &M,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
+    make_tools: F,
+    break_on_tool_images: bool,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
+    run_phase_logged(
+        &CompletionLog::new(),
+        model,
+        model_name,
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        make_tools,
+        break_on_tool_images,
+    )
+    .await
+}
+
+/// [`run_phase`] with the per-turn completion record kept.
+///
+/// rig's agent layer hands back only what its medium-neutral hook event carries —
+/// content and usage — so a phase that stopped early, got truncated, or was refused
+/// by a classifier looks identical to one that finished. The provider *did* say which
+/// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
+/// `CompletionResponse::raw_response`, which the loop discards. Wrapping the model in
+/// [`Watched`] puts the record on the one path every completion takes — **including
+/// the turns inside the tool loop and the forced final turn**, which no hook reaches —
+/// and `log` is the caller's slot for it, readable after this returns whether the
+/// phase succeeded or failed.
+///
+/// The log is per call, never global: a phase makes its own, so concurrent consults
+/// never mix. It holds plain data and crosses `.await` freely — nothing to do with the
+/// `!Send` kaish kernel, which stays on its `KaishWorker` thread as always.
+///
+/// [`run_phase`] is this with a log nobody keeps; the *last* turn's finish reason is
+/// recorded on the span either way, so the phase's ending is visible in telemetry
+/// today.
 #[allow(clippy::too_many_arguments)]
-// each arg is a distinct, named loop input
 // A named parent for rig's GenAI spans: rig's `invoke_agent` checks the current
 // span and nests under this one, so a phase's whole model loop (every `chat` turn,
 // every `tool` call) hangs off one `run_phase` span carrying the model. Inert
@@ -771,9 +905,14 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
         // known non-None, so a `None` (toggle-less) provider records nothing and
         // telemetry-off stays a no-op.
         gen_ai.request.thinking = tracing::field::Empty,
+        // How the phase's LAST completion ended, in the provider's own words. Empty
+        // when the provider reported none (or nothing ran), so it exports only when
+        // there's something to say.
+        gen_ai.response.finish_reason = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_phase<M, F>(
+pub(crate) async fn run_phase_logged<M, F>(
+    log: &CompletionLog,
     model: &M,
     model_name: &str,
     preamble: &str,
@@ -788,7 +927,54 @@ pub(crate) async fn run_phase<M, F>(
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
-    F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
+    // Surface the exact reasoning/sampling params this phase ships (constant across the
+    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
+    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
+    let result = run_phase_loop(
+        &watched(model.clone(), log.clone()),
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        make_tools,
+        break_on_tool_images,
+    )
+    .await;
+    // Read the ending off the log — after the loop, on every exit path, so a failed
+    // phase reports how its last completion ended too.
+    if let Some(reason) = log.last_finish_reason() {
+        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    result
+}
+
+/// The bounded tool loop itself, driving whatever model it's handed — in production a
+/// [`Watched`] wrapper, so every turn below (main loop, view_image resume, forced
+/// finalize) records on its way past.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+async fn run_phase_loop<M, F>(
+    model: &Watched<M>,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
+    make_tools: F,
+    break_on_tool_images: bool,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+    F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Loop state across view_image-break resumes. The caller hands us the *assembled*
     // first user turn — a bare `Message::user(prompt)` for every tool-driven phase, or a
@@ -798,13 +984,6 @@ where
     // the transcript and re-enters here (holistic review, Gemini Pro 2026-06-22).
     let mut prompt: Message = initial_prompt;
     let mut history: Vec<Message> = Vec::new();
-
-    // Surface the exact reasoning/sampling params this phase ships (constant across the
-    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
-    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
-    if let Some(t) = thinking {
-        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
-    }
 
     loop {
         // Outer turn budget: rig's `max_turns` resets each resume, so subtract the
@@ -840,27 +1019,26 @@ where
         if let Some(params) = thinking {
             builder = builder.additional_params(params.clone());
         }
-        let agent = builder.tools(make_tools()?).build();
+        let agent = builder.dynamic_tools(make_tools()?).build();
 
         // A fresh hook per loop iteration is load-bearing: its `saw_tool_image` flag
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
-        // `.extended_details()` swaps rig's plain-`String` result for a
-        // `PromptResponse` carrying the token `usage` the provider reported, summed
-        // across every turn of *this* run (rig aggregates `usage += resp.usage` per
-        // completion). The clean `Ok` path is the common case — one run, the full
-        // count. The two exceptional exits below (turn cap, view_image break) undercount:
-        // rig hands back no usage on `MaxTurnsError`/`PromptCancelled`, so the turns
-        // spent in a capped or broken run are lost and only the finalize/resumed run's
-        // usage survives. Deliberate — recovering it would mean summing per-completion
-        // through a hook; documented as a known undercount rather than silently exact.
+        // The run yields a `PromptResponse` carrying the token `usage` the provider
+        // reported, summed across every turn of *this* run. The clean `Ok` path is the
+        // common case — one run, the full count. The two exceptional exits below (turn
+        // cap, view_image break) undercount: rig hands back no usage on
+        // `MaxTurnsError`/`PromptCancelled`, so the turns spent in a capped or broken
+        // run are lost and only the finalize/resumed run's usage survives. Deliberate —
+        // recovering it would mean summing per-completion through a hook; documented as
+        // a known undercount rather than silently exact.
         let result = agent
-            .prompt(prompt.clone())
-            .with_history(history.clone())
-            .with_hook(ToolImageBreakHook::new(break_on_tool_images))
+            .runner(prompt.clone())
+            .history(history.clone())
+            .add_hook(ToolImageBreakHook::new(break_on_tool_images))
             .max_turns(remaining)
-            .extended_details()
+            .run()
             .await;
 
         match result {
@@ -909,7 +1087,7 @@ async fn finalize_after_max_turns<M>(
     max_tokens: u64,
     temperature: Option<f64>,
     thinking: Option<&Value>,
-    tools: Vec<Box<dyn ToolDyn>>,
+    tools: Vec<DynamicTool>,
     chat_history: Vec<Message>,
     max_turns: usize,
 ) -> Result<(String, Usage)>
@@ -927,15 +1105,15 @@ where
     if let Some(params) = thinking {
         builder = builder.additional_params(params.clone());
     }
-    let agent = builder.tools(tools).build();
+    let agent = builder.dynamic_tools(tools).build();
     // max_turns(1): one constrained completion. With tools forbidden the model can't
     // loop, so a single round is enough — and if a provider ignores ToolChoice::None
     // and still calls a tool, we surface that rather than recurse.
     agent
-        .prompt(prompt)
-        .with_history(history)
+        .runner(prompt)
+        .history(history)
         .max_turns(1)
-        .extended_details()
+        .run()
         .await
         .map(|resp| (resp.output, resp.usage))
         .map_err(|e| {
@@ -944,6 +1122,85 @@ where
                  also failed to conclude: {e}"
             )
         })
+}
+
+/// One completion, no agent and no loop — the single-shot phases said plainly.
+///
+/// `oneshot` and `deliberate`'s direct lane are each *one* upstream request by
+/// definition: the caller owns the context, there is nothing to explore, and there are
+/// no tools to call. Running them through the managed tool loop with an empty toolset
+/// arrived at the same place by a longer road; this asks the provider directly.
+///
+/// **Byte-identical to what the agent built.** rig's agent prepares its request with
+/// the same [`CompletionRequestBuilder`](rig_core::completion::CompletionRequestBuilder)
+/// this uses, and `build()` is what turns a preamble into the leading
+/// `Message::System` — so preamble placement, params, `max_tokens`, temperature, the
+/// empty tool list, and the absent `tool_choice` all land exactly as before. Using
+/// rig's own builder rather than a hand-written literal is deliberate: a rig bump that
+/// changes how a request is assembled moves both paths together.
+///
+/// The answer text is the assistant turn's text content concatenated, which is how
+/// rig's runner builds `PromptResponse::output`; `usage` is the provider's report for
+/// this one call, zero-valued when it reported none.
+///
+/// `log` records how the completion ended, the same seam [`run_phase_logged`] gives
+/// the loop.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named request input
+#[tracing::instrument(
+    name = "run_phase",
+    skip_all,
+    fields(
+        model = %model_name,
+        // Honest, not decorative: this phase *is* one turn.
+        max_turns = 1,
+        gen_ai.request.thinking = tracing::field::Empty,
+        gen_ai.response.finish_reason = tracing::field::Empty,
+    )
+)]
+pub(crate) async fn run_completion<M>(
+    model: &M,
+    model_name: &str,
+    log: &CompletionLog,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    prompt: Message,
+    thinking: Option<&Value>,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+{
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
+    let mut builder = watched(model.clone(), log.clone())
+        .completion_request(prompt)
+        .preamble(preamble.to_string())
+        .max_tokens(max_tokens);
+    if let Some(t) = temperature {
+        builder = builder.temperature(t);
+    }
+    if let Some(params) = thinking {
+        builder = builder.additional_params(params.clone());
+    }
+    // `send()` is `model.completion(builder.build())` — the one provider call.
+    let response = builder.send().await;
+    if let Some(reason) = log.last_finish_reason() {
+        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    // "model call failed" keeps this on the provider side of `classify_failure`
+    // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
+    // overload or rate limit here is still worth a caller retry.
+    let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
+    let answer = response
+        .choice
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    Ok((answer, response.usage))
 }
 
 /// Run the explorer phase once and return its cited report. The explorer [`Arm`]
@@ -994,9 +1251,9 @@ pub(crate) async fn run_explore_phase(
         Message::user(question.to_string()),
         max_turns,
         progress.as_ref(),
-        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
+        &|| -> Result<Vec<DynamicTool>> {
             let worker = KaishWorker::spawn_with(&root, sandbox.clone())?;
-            let mut tools: Vec<Box<dyn ToolDyn>> = vec![traced(RunKaish::with_progress(
+            let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
                 worker.clone(),
                 progress.clone(),
             ))];
@@ -1117,35 +1374,48 @@ impl Tool for RunExplore {
     const NAME: &'static str = "explore";
     type Error = RunExploreError;
     type Args = RunExploreArgs;
-    /// `Value`, not `String`: no attachment → `Value::String(report)`, byte-identical
-    /// on the wire to today's plain `String` (both serialize to a bare JSON string).
-    /// With a routed image → the rig hybrid envelope `{"response":…,"parts":[…]}`,
-    /// exactly what [`crate::view_image::ViewImage::view`] emits — verified against
-    /// rig's `from_tool_output`, which only extracts image parts from that shape.
-    type Output = Value;
+    /// [`ToolOutput`], not `String`: no attachment → `ToolOutput::text(report)`,
+    /// exactly the plain report the driver always read. With a routed image → the
+    /// text plus one *declared* `Image` block per routed image, the same typed
+    /// contract [`crate::view_image::ViewImage::view`] emits — rig 0.41 only routes
+    /// images a tool declares, never ones it might discover inside text output.
+    type Output = ToolOutput;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Delegate a broad sweep to a fast investigator that rips \
-                through the repo on a read-only kaish shell and reports back with \
-                concrete `file:line` citations. Give it a focused question; use it \
-                to cover breadth, and read the code yourself with `run_kaish`."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "the question or sub-question to investigate"
-                    }
-                },
-                "required": ["question"]
-            }),
-        }
+    /// Keep the failure text model-visible: rig's default would redact it to a
+    /// kind-level "the tool failed", and a dead sweep is something the driver must
+    /// *see* to recover from — it answers from its own direct reads instead of retrying
+    /// blind, and can only choose that if the failure reaches it. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string()).with_source(error)
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn description(&self) -> String {
+        "Delegate a broad sweep to a fast investigator that rips \
+         through the repo on a read-only kaish shell and reports back with \
+         concrete `file:line` citations. Give it a focused question; use it \
+         to cover breadth, and read the code yourself with `run_kaish`."
+            .to_string()
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "the question or sub-question to investigate"
+                }
+            },
+            "required": ["question"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _ctx: &mut rig_agent::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // Bracket the delegation: the start carries the sub-question, the finish fires
         // on both success and failure (the `?` below short-circuits, so emit it before
         // unwrapping the result).
@@ -1212,24 +1482,25 @@ impl Tool for RunExplore {
             }
             None => (report, Vec::new()),
         };
-        // No image → a bare JSON string, byte-for-byte the pre-attach wire shape (see
-        // the `Output` doc). With one or more → the rig hybrid envelope, one `parts`
-        // entry per routed image, same shape `view_image` emits for one.
+        // No image → plain text, exactly the pre-attach tool result (see the `Output`
+        // doc). With one or more → the text followed by a declared `Image` block per
+        // routed image, the same typed blocks `view_image` emits for one.
         if images.is_empty() {
-            Ok(Value::String(text))
+            Ok(ToolOutput::text(text))
         } else {
-            let parts: Vec<Value> = images
-                .iter()
-                .filter_map(|a| match a {
-                    Attachment::Image { mime, data_b64, .. } => Some(json!({
-                        "type": "image",
-                        "data": data_b64,
-                        "mimeType": mime,
-                    })),
-                    Attachment::Text { .. } => None,
-                })
-                .collect();
-            Ok(json!({ "response": text, "parts": parts }))
+            let mut parts: Vec<ToolResultContent> = vec![ToolResultContent::text(text)];
+            parts.extend(images.iter().filter_map(|a| match a {
+                Attachment::Image { mime, data_b64, .. } => Some(ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64(data_b64.clone()),
+                    media_type: ImageMediaType::from_mime_type(mime),
+                    detail: None,
+                    additional_params: None,
+                })),
+                Attachment::Text { .. } => None,
+            }));
+            Ok(ToolOutput::content(
+                OneOrMany::many(parts).expect("the text part is always present"),
+            ))
         }
     }
 }
@@ -1270,15 +1541,14 @@ fn user_turn_with_attachments(attachments: &[Attachment], text: String) -> Messa
 /// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
 /// shell, no exploration. The thin counterpart to `consult` (prompt in, answer out)
 /// for when the caller already owns the context and just wants the model's take.
-/// Built on the one loop primitive with an empty toolset and a single turn, so it is
-/// exactly one upstream request. Neither orientation nor operator house rules are
-/// spliced — both are project guidance, and oneshot reads no project.
+/// Exactly one upstream request, and now literally so: [`Arm::complete`] asks the
+/// provider directly rather than routing a toolless single turn through the managed
+/// loop. Neither orientation nor operator house rules are spliced — both are project
+/// guidance, and oneshot reads no project.
 ///
-/// Safe-by-accident note: a vision synth arm carries `break_on_tool_images = true`
-/// (via `Arm::rewrites_tool_images`), but the empty toolset has no `view_image` tool,
-/// so the break hook can never fire and the single turn always completes cleanly. If
-/// you ever give oneshot a tool, revisit this — a live break would consume the turn
-/// and land in the turn-cap finalize path.
+/// Give oneshot a tool one day and this is the line to revisit: a direct completion
+/// has nowhere to dispatch a tool call to, so a toolful oneshot belongs back on
+/// [`run_phase`], not here.
 ///
 /// `attachments` are caller-named workspace files inlined as context (the `attach` arg),
 /// resolved server-side so their bytes never transit the calling agent's context — the
@@ -1298,7 +1568,7 @@ pub async fn oneshot(
     with_call_deadline(
         cfg.call_deadline,
         "oneshot",
-        arm.run(
+        arm.complete(
             &resolve_phase_preamble(
                 Phase::Oneshot,
                 &cfg.prompts,
@@ -1306,9 +1576,6 @@ pub async fn oneshot(
                 cfg.house_rules.as_deref(),
             ),
             initial_prompt,
-            1,
-            cfg.progress.as_ref(),
-            &|| Ok(Vec::new()),
         ),
     )
     .await
@@ -1325,7 +1592,7 @@ fn consult_tools(
     reports: Arc<Mutex<Vec<String>>>,
     explore_usage: Arc<Mutex<Usage>>,
     synth: &Arm,
-) -> Result<Vec<Box<dyn ToolDyn>>> {
+) -> Result<Vec<DynamicTool>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
     let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
@@ -1379,7 +1646,7 @@ fn consult_tools(
         cfg.explore.max_attachments,
         Arc::new(already_delivered),
     );
-    let mut tools: Vec<Box<dyn ToolDyn>> = vec![
+    let mut tools: Vec<DynamicTool> = vec![
         traced(RunKaish::with_progress(
             worker.clone(),
             cfg.explore.phase.progress.clone(),
@@ -1497,15 +1764,9 @@ pub async fn deliberate_direct(
     synth: &Arm,
     system: &str,
     deadline: Duration,
-    progress: &Arc<dyn ProgressSink>,
 ) -> Result<(String, Usage)> {
     let prompt = user_turn_with_attachments(attachments, deliberation_prompt(question, dossier));
-    with_call_deadline(
-        deadline,
-        "deliberate",
-        synth.run(system, prompt, 1, progress.as_ref(), &|| Ok(Vec::new())),
-    )
-    .await
+    with_call_deadline(deadline, "deliberate", synth.complete(system, prompt)).await
 }
 
 /// Run a `consult` over two resolved arms.
@@ -1666,8 +1927,9 @@ mod tests {
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
+        transcript_text, usage, with_raw, with_usage, CaptureHttp, RecordingSink, ScriptedClient,
     };
+    use rig_core::completion::CompletionRequest;
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::Path;
@@ -2176,6 +2438,162 @@ mod tests {
             text_parts.load(Ordering::SeqCst),
             0,
             "an empty prompt must not add an empty text part beside the image"
+        );
+    }
+
+    /// `oneshot` is now one *literal* upstream request — a direct completion, no agent
+    /// and no tool loop — and it must ask for exactly what the loop used to ask for.
+    ///
+    /// The proof is a side-by-side: the same preamble, params, `max_tokens`, and prompt
+    /// go down the old road (`Arm::run` with an empty toolset and a single turn) and the
+    /// new one (`oneshot` → `Arm::complete`), on two scripted models sharing one request
+    /// log. The two serialized [`CompletionRequest`]s must be identical — every field,
+    /// including the ones no accessor names: preamble placement (rig turns it into the
+    /// leading `System` message), the empty `tools`/`documents`, the absent
+    /// `tool_choice`, `additional_params`. Comparing whole requests is the point: a
+    /// spot-check of a few fields would pass while a dropped one changed the call.
+    #[tokio::test]
+    async fn oneshot_asks_exactly_what_the_agent_loop_asked() {
+        const VIA_LOOP: &str = "via-agent-loop";
+        const VIA_DIRECT: &str = "via-direct-call";
+        let client = ScriptedClient::builder()
+            .on_model(VIA_LOOP, |_req| Ok(text_response("done")))
+            .on_model(VIA_DIRECT, |_req| Ok(text_response("done")))
+            .build();
+        // A real params blob, so the thinking toggle rides both paths.
+        let params = Some(json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}));
+        let cfg = PhaseContext::default();
+        let preamble = resolve_phase_preamble(
+            Phase::Oneshot,
+            &cfg.prompts,
+            cfg.orientation.as_deref(),
+            cfg.house_rules.as_deref(),
+        );
+
+        // The pre-change path, reproduced: the managed loop, one turn, no tools.
+        let (loop_answer, loop_usage) = arm_with(&client, VIA_LOOP, params.clone())
+            .run(
+                &preamble,
+                Message::user("what changed?"),
+                1,
+                cfg.progress.as_ref(),
+                &|| Ok(Vec::new()),
+            )
+            .await
+            .expect("the agent-loop path answers");
+
+        // The shipped path.
+        let (direct_answer, direct_usage) = oneshot(
+            "what changed?",
+            &[],
+            &arm_with(&client, VIA_DIRECT, params),
+            &cfg,
+        )
+        .await
+        .expect("the direct path answers");
+
+        assert_eq!(direct_answer, loop_answer, "same answer text");
+        assert_eq!(direct_usage, loop_usage, "same usage accounting");
+
+        let looped = client.requests_for(VIA_LOOP);
+        let direct = client.requests_for(VIA_DIRECT);
+        assert_eq!(
+            looped.len(),
+            1,
+            "the loop made one request to compare against"
+        );
+        assert_eq!(
+            direct.len(),
+            1,
+            "oneshot is exactly ONE upstream request, got {}",
+            direct.len()
+        );
+        assert_eq!(
+            direct[0].raw, looped[0].raw,
+            "the direct completion must be request-for-request what the agent built"
+        );
+    }
+
+    /// The whole reason the wrapper exists: a phase's completion record reaches
+    /// [`run_phase_logged`]'s caller **including the turns inside the tool loop** — the
+    /// ones rig's agent hook can only see in its medium-neutral form, with no
+    /// `raw_response` and so no finish reason.
+    ///
+    /// Two turns here: the driver calls `run_kaish` (a provider reporting
+    /// `finish_reason: "tool_calls"`, nested under `choices[]` the OpenAI way), then
+    /// answers (an Anthropic-shaped top-level `stop_reason: "end_turn"`). Both land in
+    /// the log, in order, each with the reason its own payload gave — two spellings
+    /// through one extractor, from inside one real loop.
+    #[tokio::test]
+    async fn the_completion_log_carries_every_turn_including_inside_the_tool_loop() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                if transcript_text(req).contains("TOOL_RAN") {
+                    // The answering turn: Anthropic's top-level spelling.
+                    Ok(with_raw(
+                        text_response("the answer"),
+                        json!({"stop_reason": "end_turn"}),
+                    ))
+                } else {
+                    // A turn INSIDE the loop: the OpenAI-compatible spelling, nested.
+                    Ok(with_raw(
+                        tool_call_response("c1", "run_kaish", json!({"script": "echo TOOL_RAN"})),
+                        json!({"choices": [{"index": 0, "finish_reason": "tool_calls"}]}),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let log = CompletionLog::new();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase_logged(
+            &log,
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            4,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        )
+        .await
+        .expect("the scripted loop answers");
+
+        assert_eq!(answer, "the answer");
+        let turns = log.turns();
+        assert_eq!(
+            turns.len(),
+            2,
+            "every completion is recorded, tool turn included: {turns:?}"
+        );
+        assert_eq!(
+            turns[0].finish_reason.as_deref(),
+            Some("tool_calls"),
+            "the turn inside the loop — the one no hook can reach"
+        );
+        assert_eq!(turns[0].tool_calls, 1);
+        assert_eq!(turns[0].text_chars, 0);
+        assert_eq!(
+            turns[1].finish_reason.as_deref(),
+            Some("end_turn"),
+            "a different provider spelling, same extractor"
+        );
+        assert_eq!(
+            log.last_finish_reason().as_deref(),
+            Some("end_turn"),
+            "the phase's ending is one call away"
         );
     }
 
@@ -3269,7 +3687,6 @@ mod tests {
             &arm(&client, SYNTH),
             "You are a capable model answering a hard question offline.",
             cfg.call_deadline,
-            &cfg.progress,
         )
         .await
         .expect("scripted direct deliberation should succeed");
@@ -3385,7 +3802,6 @@ mod tests {
             &vision_arm(&client, SYNTH),
             "You are a capable model answering a hard question offline.",
             cfg.call_deadline,
-            &cfg.progress,
         )
         .await
         .expect("scripted direct deliberation should succeed");
@@ -3492,7 +3908,6 @@ mod tests {
                 &arm(&client, SYNTH),
                 "offline synth preamble",
                 Duration::from_millis(50),
-                &(Arc::new(crate::progress::NullSink) as Arc<dyn ProgressSink>),
             ),
         )
         .await
@@ -4322,6 +4737,88 @@ mod tests {
         );
     }
 
+    /// An effort rig's typed request builder can't name fails **here**, at arm
+    /// construction, with a message an operator can act on — not mid-consult as a bare
+    /// `unknown variant \`max\``.
+    ///
+    /// Two wires parse kaibo's blob into a typed struct with a closed rung set (rig's
+    /// Gemini `ThinkingLevel`, its Responses `ReasoningEffort`), and that ceiling is
+    /// rig's client rather than the provider's API — OpenAI's own endpoint takes `"max"`.
+    /// kaibo keeps no allowlist of its own, so the refusal comes from asking rig's
+    /// converter, and the rungs it offers are read back out of rig too
+    /// (`tests/effort_wire.rs` pins both against real request bodies). What this test
+    /// owns is the *message*: the model, the backend, the role, the value that failed,
+    /// whose ceiling it is, and what to type instead.
+    #[test]
+    fn a_rig_refused_effort_fails_at_arm_construction_with_an_actionable_message() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "google".into(),
+            kind: ProviderKind::Gemini,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+            wire: None,
+        };
+        // `docs/config.example.toml` used to invite exactly this, and it broke every
+        // Gemini cast the moment a call was made.
+        let slot = ModelSlot {
+            effort: Some("xhigh".into()),
+            ..ModelSlot::bare("google", "gemini-3.5-flash")
+        };
+        let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect_err("rig's Gemini builder refuses xhigh")
+            .to_string();
+        assert!(err.contains("gemini-3.5-flash"), "names the model: {err}");
+        assert!(err.contains("google"), "names the backend: {err}");
+        assert!(err.contains("synth"), "names the role: {err}");
+        assert!(err.contains("xhigh"), "names the value that failed: {err}");
+        assert!(
+            err.contains("rig-core"),
+            "says whose ceiling this is, so the operator doesn't go hunting in \
+             Google's docs for a limit that isn't theirs: {err}"
+        );
+        assert!(
+            err.contains("minimal | low | medium | high"),
+            "offers the rungs this wire does take: {err}"
+        );
+
+        // A rung the wire accepts builds normally — the preflight adds no ceiling of
+        // its own, it only reports rig's.
+        let slot = ModelSlot {
+            effort: Some("low".into()),
+            ..ModelSlot::bare("google", "gemini-3.5-flash")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("an accepted rung builds offline with a placeholder key");
+        assert_eq!(
+            arm.params.expect("gemini sends a thinking block")["generationConfig"]
+                ["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+
+        // And a passthrough wire keeps passing anything through — the preflight must not
+        // quietly become a global allowlist.
+        let backend = crate::config::Backend {
+            name: "deepseek".into(),
+            kind: ProviderKind::DeepSeek,
+            ..backend
+        };
+        let slot = ModelSlot {
+            effort: Some("ludicrous".into()),
+            ..ModelSlot::bare("deepseek", "deepseek-v4-pro")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a passthrough wire carries an unknown rung to the provider");
+        assert_eq!(
+            arm.params.expect("deepseek sends a thinking block")["reasoning_effort"],
+            "ludicrous"
+        );
+    }
+
     /// An OpenAI-compatible gateway that faithfully proxies `/v1/responses` (verified
     /// against a real gateway) is not OpenAI Platform's own endpoint, so the
     /// endpoint-exact heuristic alone would leave it on Chat Completions — starving
@@ -4613,30 +5110,74 @@ mod tests {
     /// The OpenRouter arm rides with rig's explicit prompt caching ON: Anthropic-
     /// upstream slugs need `cache_control` breakpoints to bill cache-read rates
     /// (2026-07-03: a consult re-billed its full growing prefix every turn without
-    /// them), and implicit-caching upstreams ignore the marker. rig exposes the
-    /// flag as a public field, and `from_slot` routes through this constructor —
-    /// so this pins the wiring, not an internal default.
-    #[test]
-    fn openrouter_arm_enables_prompt_caching() {
-        // Built through kaibo's one TLS client-build site (ring installed there) —
-        // a bare reqwest builder panics under `rustls-no-provider` unless another
-        // test happened to install the provider first.
-        let http = crate::tls::https_client(Duration::from_secs(30)).unwrap();
+    /// them), and implicit-caching upstreams ignore the marker. `from_slot` routes
+    /// through this constructor — so this pins the wiring, not an internal default.
+    ///
+    /// **Asserted on the wire, not on a flag.** What matters is the serialized request
+    /// body, so that is what a fake transport captures here: rig could keep
+    /// `with_prompt_caching()` compiling while changing what it emits, and any check
+    /// short of the body would stay green through that.
+    #[tokio::test]
+    async fn openrouter_arm_enables_prompt_caching() {
+        async fn system_block(model: openrouter::CompletionModel<CaptureHttp>, http: &CaptureHttp) -> Value {
+            let request = CompletionRequest {
+                model: None,
+                preamble: Some("ground every claim".into()),
+                chat_history: OneOrMany::one(Message::user("hi")),
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: Some(4096),
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            // The capture transport always errors; the body is already built by then.
+            let _ = model.completion(request).await;
+            http.recorded()
+                .expect("rig serialized a request body")
+                .pointer("/messages/0")
+                .cloned()
+                .expect("the system message leads the body")
+        }
+
+        let http = CaptureHttp::default();
         let client = openrouter::Client::builder()
             .api_key("sk-or-test")
-            .http_client(http)
+            .http_client(http.clone())
             .build()
             .expect("offline openrouter client construction");
-        let plain = client.completion_model("~anthropic/claude-sonnet-latest");
+
+        let plain_http = CaptureHttp::default();
+        let plain_client = openrouter::Client::builder()
+            .api_key("sk-or-test")
+            .http_client(plain_http.clone())
+            .build()
+            .expect("offline openrouter client construction");
+        let plain = system_block(
+            plain_client.completion_model("~anthropic/claude-sonnet-latest"),
+            &plain_http,
+        )
+        .await;
         assert!(
-            !plain.prompt_caching,
-            "rig defaults the flag off — the arm constructor below is load-bearing"
+            !plain.to_string().contains("cache_control"),
+            "rig marks no breakpoint by default — the arm constructor is load-bearing: \
+             {plain}"
         );
-        let armed =
-            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest");
+
+        let armed = system_block(
+            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest"),
+            &http,
+        )
+        .await;
         assert!(
-            armed.prompt_caching,
-            "the OpenRouter arm must build its model with prompt caching enabled"
+            armed.to_string().contains(r#""cache_control""#),
+            "the OpenRouter arm must put a cache breakpoint on the system prompt: {armed}"
+        );
+        assert!(
+            armed.to_string().contains("ephemeral"),
+            "the breakpoint is the ephemeral kind OpenRouter bills against: {armed}"
         );
     }
 
@@ -5024,7 +5565,7 @@ mod tests {
         )
         .expect("building the consult toolset should succeed");
 
-        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "run_kaish"),
             "missing run_kaish, got {names:?}"
@@ -5060,7 +5601,7 @@ mod tests {
         )
         .expect("building the consult toolset should succeed");
 
-        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "view_image"),
             "a vision synth must get view_image, got {names:?}"
@@ -5091,7 +5632,7 @@ mod tests {
             &blind_synth,
         )
         .expect("blind toolset builds");
-        let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
+        let blind_names: Vec<String> = blind.iter().map(|t| t.name().to_string()).collect();
         assert!(blind_names.iter().any(|n| n == "run_kaish"));
         assert!(blind_names.iter().any(|n| n == "explore"));
         assert!(
@@ -5102,7 +5643,7 @@ mod tests {
         let seeing_synth = vision_arm(&client, "synth-model");
         let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, &seeing_synth)
             .expect("vision toolset builds");
-        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
+        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name().to_string()).collect();
         assert!(
             seeing_names.iter().any(|n| n == "view_image"),
             "view_image present with vision, got {seeing_names:?}"
@@ -5182,7 +5723,7 @@ mod tests {
     }
 
     /// A `view_image` tool result: the load note (text) *and* the image part — the
-    /// hybrid shape rig's `from_tool_output` produces.
+    /// two typed content blocks `ViewImage` returns.
     fn vi_result(id: &str) -> UserContent {
         UserContent::ToolResult(ToolResult {
             id: id.to_string(),
@@ -5422,29 +5963,39 @@ mod tests {
         }
     }
 
-    /// The break keys on the parsed envelope, never the raw substring: a *text*
-    /// result that happens to contain the literal `"type":"image"` — an explorer
-    /// cat-ing this very file, a JSON fixture, a grep hit — must not trip the
-    /// break/rewrite machinery. The substring check is only the cheap pre-filter;
-    /// serde confirms `parts[]` actually holds an image. (Pins the gate the Gemini
-    /// review assumed was missing, 2026-07-26.)
+    /// The break keys on the DECLARED content parts, never on text: a *text* result
+    /// that happens to quote image-looking JSON — an explorer cat-ing this very
+    /// file, a JSON fixture, a grep hit — must not trip the break/rewrite machinery.
+    /// On rig 0.41 the gate reads typed [`ToolOutput`] parts (no sniffing), so the
+    /// false positive the Gemini review worried about (2026-07-26) is impossible by
+    /// construction; this pins it against a regression to string matching.
     #[test]
     fn a_text_result_containing_the_image_literal_does_not_carry_an_image() {
         // A run_kaish-style plain string result quoting envelope-shaped JSON.
         let grep_hit = r#"exit:0
 src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data": b64}]})"#;
-        assert!(!tool_result_carries_image(grep_hit));
+        assert!(!tool_output_carries_image(&ToolOutput::text(grep_hit)));
 
-        // Even a String OUTPUT that serializes envelope-looking text stays a JSON
-        // string on the wire — parsing yields a String, not an object with parts[].
-        let stringified =
-            serde_json::to_string(&json!({"response": "r", "parts": [{"type":"image"}]}).to_string())
-                .unwrap();
-        assert!(!tool_result_carries_image(&stringified));
-
-        // The genuine hybrid envelope, serialized as rig hands it over, does carry.
+        // JSON output shaped like the old hybrid envelope is still just JSON — only
+        // a declared Image part counts.
         let envelope = json!({"response": "r", "parts": [{"type": "image", "data": "ZmFrZQ=="}]});
-        assert!(tool_result_carries_image(&envelope.to_string()));
+        assert!(!tool_output_carries_image(&ToolOutput::json(envelope)));
+
+        // A genuinely declared image part — the block `view_image` and a routed
+        // `explore` result emit — does carry.
+        let with_image = ToolOutput::content(
+            OneOrMany::many([
+                ToolResultContent::text("note"),
+                ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                    media_type: ImageMediaType::from_mime_type("image/png"),
+                    detail: None,
+                    additional_params: None,
+                }),
+            ])
+            .expect("two blocks is never empty"),
+        );
+        assert!(tool_output_carries_image(&with_image));
     }
 
     /// The outer turn budget is derived from the transcript (rig carries no

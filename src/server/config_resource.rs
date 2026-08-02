@@ -33,6 +33,28 @@ pub(crate) fn render_config_resource(
     use serde::Serialize;
     use std::collections::BTreeMap;
 
+    // Which cast-taking tools nothing can staff right now, and the cast shape each one
+    // wants. Computed through the same `eligible_casts_by_tool` the router gated on, so
+    // the explanation can't drift from the decision. A tool the OPERATOR turned off is
+    // deliberately absent here — `[tools]` already reports that, and conflating "you
+    // disabled it" with "nothing can run it" is exactly the confusion this section exists
+    // to remove.
+    let usable: Vec<String> = config
+        .usable_casts(|k| std::env::var(k).ok())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let unstaffable: BTreeMap<String, String> = super::eligible_casts_by_tool(config, &usable)
+        .into_iter()
+        .filter(|(tool, casts)| casts.is_empty() && config.tools.enabled(tool))
+        .map(|(tool, _)| {
+            let requirement = super::cast_requirement_for(tool)
+                .expect("a tool in the eligibility map has a rule")
+                .to_string();
+            (tool.to_string(), requirement)
+        })
+        .collect();
+
     // Dedicated render-only shapes — plain Serialize structs that carry exactly what
     // the resource must expose and nothing more. Keeps the contract explicit.
 
@@ -97,10 +119,22 @@ pub(crate) fn render_config_resource(
     /// `allowed_paths` right now — git worktrees of an already-allowed repo,
     /// resolved by reading git's link files. Recomputed on each read, so a worktree
     /// added mid-session shows up here without a reconnect.
+    ///
+    /// `advertised_tools` and `unstaffable_tools` are the observed answer to "why can't I
+    /// see that tool?" — the question the staffing gate would otherwise leave an operator
+    /// guessing at, since a tool no configured cast can staff is removed from the router
+    /// outright rather than shipped with an empty `cast` enum. `[tools]` above says what
+    /// the operator *asked for* (the `--no-<tool>` flags); these say what the server
+    /// actually ended up advertising and, for each tool held back by its cast roster
+    /// rather than by a flag, the cast shape that would bring it back. Keeping the two
+    /// apart is the same `[runtime]` rule the worktree fields follow: what kaibo
+    /// *discovered*, never what the operator *chose*.
     #[derive(Serialize)]
     struct RuntimeDoc {
         follow_worktrees: bool,
         followed_worktrees: Vec<String>,
+        advertised_tools: Vec<String>,
+        unstaffable_tools: BTreeMap<String, String>,
     }
 
     #[derive(Serialize)]
@@ -243,11 +277,18 @@ pub(crate) fn render_config_resource(
         /// means interactive. Only ever set on a synth slot (load-validated).
         #[serde(skip_serializing_if = "Option::is_none")]
         lane: Option<&'static str>,
-        /// Per-slot tunables that *are* set here but this slot's resolved request shape
-        /// will never send — the honest no-op flag. A `thinking_budget` on an
-        /// effort-driven or toggle-less model, an `effort` on a budget model, a
-        /// `temperature` an Anthropic slot drops under thinking: each load-validates and
-        /// would otherwise render as if effective. Absent when every set knob has a sink.
+        /// Tunables in effect for this slot that its resolved request shape will never
+        /// send — the honest no-op flag. A `thinking_budget` on an effort-driven or
+        /// toggle-less model, an `effort` on a budget/toggle-less model, a `temperature`
+        /// an Anthropic slot drops under thinking: each load-validates and would otherwise
+        /// render as if effective. Absent when every knob in play has a sink.
+        ///
+        /// `effort` is judged on the **effective** value, not just a per-slot override —
+        /// a `[defaults]`/env effort lands on every cast, so a per-slot-only check missed
+        /// the case that bites hardest — and it is judged by
+        /// [`Config::effort_disposition`](crate::config::Config::effort_disposition), the
+        /// single implementation of that policy, which the startup warning reads too.
+        /// Two copies of this rule diverged once already; there is now only one.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         inert_tunables: Vec<&'static str>,
     }
@@ -336,22 +377,37 @@ pub(crate) fn render_config_resource(
                     let backend = config
                         .resolve_backend(&slot.backend)
                         .expect("a loaded cast's slot backend resolves");
-                    let shape = ModelShape::resolve(
-                        backend.kind,
-                        &slot.id,
-                        thinking_style.unwrap_or_default(),
-                    );
-                    // The interactive shape a slot's arm will actually build under
-                    // (`Arm::from_slot`) follows `uses_responses_wire`, not the
-                    // narrower `is_hosted_openai` platform gate — a responses-wire
-                    // gateway shapes its inert tunables the same way hosted OpenAI
-                    // Platform does, even though it isn't batch-eligible.
-                    let responses_wire = backend.uses_responses_wire();
+                    // Resolve through `slot.tunables` — the same fallbacks the wire path
+                    // takes, so a `[defaults].thinking_style` (which the old
+                    // `unwrap_or_default()` here silently ignored) can't make the render
+                    // disagree with what actually ships.
+                    let t = slot.tunables(*role, &config.defaults);
+                    let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
+                    // Lane-aware: a `lane = "batch"` slot never builds an interactive arm.
+                    // Batch POSTs its own body and gates the Responses shape on the
+                    // endpoint-exact `is_hosted_openai`; the interactive arm follows the
+                    // configurable `uses_responses_wire` (a responses-wire gateway shapes
+                    // like Platform even though it isn't batch-eligible).
+                    let batch_lane = matches!(lane, Some(Lane::Batch));
+                    let responses_wire = if batch_lane {
+                        backend.is_hosted_openai()
+                    } else {
+                        backend.uses_responses_wire()
+                    };
                     let mut inert_tunables = Vec::new();
-                    let effort_sinks = shape.sinks_effort()
-                        || (responses_wire
-                            && crate::consult::hosted_openai_accepts_reasoning(&slot.id));
-                    let sampling_sinks = if responses_wire {
+                    // Whether the effort ships is a policy with exactly one implementation
+                    // — `Config::effort_disposition`. The render asks it rather than
+                    // re-deriving (drop? batch lift? off-switch?), which is what keeps this
+                    // and the startup warning from ever telling an operator different
+                    // stories about the same slot.
+                    let disposition = config
+                        .effort_disposition(slot, *role)
+                        .expect("a loaded cast's slot backend resolves");
+                    // Batch hands the provider no sampling at all (`None`/`None`), so a
+                    // `temperature` on a batch slot is inert regardless of the model.
+                    let sampling_sinks = if batch_lane {
+                        false
+                    } else if responses_wire {
                         crate::consult::hosted_openai_accepts_sampling(&slot.id)
                     } else {
                         shape.sinks_sampling()
@@ -359,7 +415,11 @@ pub(crate) fn render_config_resource(
                     if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
                         inert_tunables.push("thinking_budget");
                     }
-                    if effort.is_some() && !effort_sinks {
+                    // The *effective* effort, not just a per-slot override: a
+                    // `[defaults]`/env effort lands on every cast, and one that lands
+                    // nowhere deserves the same flag. Inherited built-in defaults stay
+                    // quiet — see `Defaults::explorer_effort_explicit`.
+                    if disposition.explicit && !disposition.ships_as_configured() {
                         inert_tunables.push("effort");
                     }
                     if temperature.is_some() && !sampling_sinks {
@@ -415,6 +475,10 @@ pub(crate) fn render_config_resource(
         top_p,
         explorer_effort,
         synth_effort,
+        // Provenance, not a knob: it decides whether an inert effort is worth flagging
+        // (below and at startup), and the render already shows the effective values.
+        explorer_effort_explicit: _,
+        synth_effort_explicit: _,
         thinking_style,
         request_timeout,
         call_deadline,
@@ -444,6 +508,11 @@ pub(crate) fn render_config_resource(
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+            advertised_tools: super::live_tools(config, &usable)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            unstaffable_tools: unstaffable,
         },
         tools: ToolsDoc {
             consult,
@@ -556,6 +625,70 @@ mod tests {
         );
     }
 
+    /// The body of TOML section `header` — up to the next `[` at column 0. A
+    /// `BTreeMap` field renders as its own nested table (`[runtime.unstaffable_tools]`)
+    /// rather than inline, so a test that wants one has to ask for it by name.
+    fn section<'a>(body: &'a str, header: &str) -> &'a str {
+        body.split(&format!("\n{header}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no `{header}` section in:\n{body}"))
+            .split("\n[")
+            .next()
+            .expect("the section's own body")
+    }
+
+    /// `[runtime]` answers "why can't I see that tool?" for the case an operator cannot
+    /// otherwise diagnose: the tool is gone because nothing can staff it, not because
+    /// they turned it off. On the built-in config that's `deliberate` — no built-in cast
+    /// pairs an explorer with an offline synth — so it must be absent from
+    /// `advertised_tools` AND named in `[runtime.unstaffable_tools]` with the cast shape
+    /// that would fix it. Without both halves the tool just vanishes, which is the
+    /// confusing failure this reporting exists to prevent.
+    #[test]
+    fn config_resource_runtime_explains_a_tool_no_cast_can_staff() {
+        let body = render_config_resource(&Config::builtin(), &[], None, false, vec![], false);
+        let runtime = section(&body, "[runtime]");
+        assert!(
+            !runtime.contains("\"deliberate\""),
+            "deliberate can't be staffed by any built-in cast, so it must not appear in \
+             advertised_tools:\n{runtime}"
+        );
+        // A targeted drop, not a shutdown — the staffable surface is still advertised.
+        assert!(
+            runtime.contains("\"consult\"") && runtime.contains("\"run_kaish\""),
+            "advertised_tools must list the surviving surface:\n{runtime}"
+        );
+
+        let unstaffable = section(&body, "[runtime.unstaffable_tools]");
+        assert!(
+            unstaffable.contains("deliberate = "),
+            "unstaffable_tools must name deliberate:\n{unstaffable}"
+        );
+        assert!(
+            unstaffable.to_lowercase().contains("offline synth"),
+            "the entry must say what shape of cast would bring the tool back, not just \
+             that it is missing:\n{unstaffable}"
+        );
+    }
+
+    /// The other half: a tool the OPERATOR disabled is not reported as unstaffable.
+    /// Conflating "you switched it off" with "nothing can run it" would send an operator
+    /// hunting for a cast to fix a flag they set themselves.
+    #[test]
+    fn config_resource_does_not_blame_casts_for_an_operator_disabled_tool() {
+        let mut config = Config::builtin();
+        config.tools.deliberate = false;
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        assert!(
+            !section(&body, "[runtime.unstaffable_tools]").contains("deliberate"),
+            "a flag-disabled tool belongs to [tools], not unstaffable_tools:\n{body}"
+        );
+        assert!(
+            section(&body, "[tools]").contains("deliberate = false"),
+            "[tools] must still report the operator's own choice:\n{body}"
+        );
+    }
+
     /// A per-slot tunable that the slot's resolved request shape will never send is
     /// flagged `inert_tunables` in the render, so the operator sees the no-op instead of
     /// a knob that looks effective. The matrix: a budget on an effort-driven model
@@ -642,6 +775,182 @@ mod tests {
             vec!["thinking_budget", "effort"],
             "hosted GPT chat sinks sampling but rejects reasoning effort and budget"
         );
+    }
+
+    /// The three blind spots that let an inert knob render as effective, closed together
+    /// because they share one cause — the render used to resolve a slot's shape by its
+    /// own rules instead of asking the same question the wire asks.
+    ///
+    /// 1. **`[defaults]`-sourced effort.** The check keyed on a per-*slot* `effort`, so a
+    ///    `[defaults].synth_effort` — which lands on every cast at once — rendered as
+    ///    effective on a wire that drops it. The effective value is what matters.
+    /// 2. **`[defaults].thinking_style`.** The render resolved the style with
+    ///    `unwrap_or_default()` (→ `Auto`) while the wire uses the `[defaults]` fallback,
+    ///    so a forced `adaptive` moved the sinks on the wire and not in the render.
+    /// 3. **Lane-blindness.** A `lane = "batch"` slot never builds an interactive arm:
+    ///    batch hands the provider no sampling at all, and floors the effort — so a rung
+    ///    at or below `BATCH_EFFORT` is lifted and the configured value never ships.
+    #[test]
+    fn config_render_resolves_inert_tunables_the_way_the_wire_does() {
+        let config = Config::from_toml_str(
+            r#"
+            [defaults]
+            # Lands on every synth slot below; effective, not per-slot.
+            synth_effort = "medium"
+            # The wire honors this fallback; the render used to ignore it.
+            thinking_style = "adaptive"
+
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            # Toggle-less wire: the defaults effort lands nowhere and must be flagged.
+            [casts.lab_cast]
+            synth = "lab/gemma"
+
+            # Forced adaptive gives Haiku an effort sink and takes away its budget one —
+            # the opposite of what the classifier alone would say.
+            [casts.forced]
+            synth = { backend = "anthropic", id = "claude-haiku-4-5", thinking_budget = 2048 }
+
+            # A batch slot: sampling is never sent, and `low` is below the batch floor.
+            [casts.bat]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low", temperature = 0.4 }
+
+            # Same lane, a rung deeper than the floor: it ships as written now that batch
+            # floors rather than overrides, so it is NOT inert.
+            [casts.bat_deep]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let inert = |cast: &str, role: &str| -> Vec<String> {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .map(|a| {
+                    a.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            inert("lab_cast", "synth"),
+            vec!["effort"],
+            "a [defaults] effort on a toggle-less wire is just as inert as a slot one"
+        );
+        assert_eq!(
+            inert("forced", "synth"),
+            vec!["thinking_budget"],
+            "[defaults].thinking_style = adaptive moves both sinks — the render must \
+             resolve it the way slot.tunables does"
+        );
+        assert_eq!(
+            inert("bat", "synth"),
+            vec!["effort", "temperature"],
+            "batch lifts a below-floor effort and sends no sampling at all"
+        );
+        assert!(
+            inert("bat_deep", "synth").is_empty(),
+            "a batch slot deeper than the floor keeps its effort: {:?}",
+            inert("bat_deep", "synth")
+        );
+    }
+
+    /// The startup warning and the `kaibo://config` render must give the same verdict on
+    /// the same slot. They are two audiences for one policy, and when they were two
+    /// implementations they diverged inside a single commit: the render already knew a
+    /// batch-lane lift meant the configured value never runs, while the startup scan only
+    /// asked "does this wire have a reasoning field?" and stayed silent — so an operator
+    /// who set `effort = "low"` on a batch slot saw it flagged in the resource and never
+    /// heard a word at startup.
+    ///
+    /// Asserting *agreement* rather than either verdict is deliberate: it fails for any
+    /// future divergence, not just this one. `Config::effort_disposition` is the single
+    /// implementation both now read.
+    #[test]
+    fn the_startup_scan_and_the_config_render_agree_slot_for_slot() {
+        let config = Config::from_toml_str(
+            r#"
+            [backends.lab]
+            kind = "openai"
+            base_url = "http://127.0.0.1:8080/v1"
+            key_optional = true
+
+            # The case that diverged: an effort-carrying wire, but the batch depth floor
+            # lifts this shallower value, so `low` never runs.
+            [casts.bat_low]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low" }
+
+            # Deeper than the floor: ships as written, nobody should complain.
+            [casts.bat_deep]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "xhigh" }
+
+            # Reasoning off on the batch lane: a depth floor must not raise it, so it
+            # ships as configured and is NOT a diagnostic.
+            [casts.bat_off]
+            synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "none" }
+
+            # No reasoning field at all — the drop.
+            [casts.lab_cast]
+            synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+
+            # Carries it fine.
+            [casts.ds]
+            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "xhigh" }
+            "#,
+        )
+        .unwrap();
+
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let render_flags = |cast: &str, role: &str| -> bool {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().any(|v| v.as_str() == Some("effort")))
+                .unwrap_or(false)
+        };
+        let warned: std::collections::BTreeSet<(String, &str)> = config
+            .effort_diagnostics()
+            .into_iter()
+            .map(|d| (d.cast, d.role))
+            .collect();
+
+        for cast in ["bat_low", "bat_deep", "bat_off", "lab_cast", "ds"] {
+            assert_eq!(
+                warned.contains(&(cast.to_string(), "synth")),
+                render_flags(cast, "synth"),
+                "cast {cast}: the startup scan and the kaibo://config render disagree \
+                 about whether this slot's effort ships"
+            );
+        }
+
+        // And the verdicts themselves, so "they agree" can't be satisfied by both being
+        // wrong in the same direction.
+        assert!(
+            render_flags("bat_low", "synth"),
+            "a lifted effort is flagged"
+        );
+        assert!(
+            render_flags("lab_cast", "synth"),
+            "a dropped effort is flagged"
+        );
+        assert!(!render_flags("bat_deep", "synth"), "a deeper effort ships");
+        assert!(
+            !render_flags("bat_off", "synth"),
+            "the off-switch survives a depth floor, so it ships as configured"
+        );
+        assert!(!render_flags("ds", "synth"), "deepseek carries the effort");
     }
 
     /// `kaibo://config` renders each openai-kind backend's *resolved* wire — the

@@ -1,4 +1,4 @@
-# kaibo (解剖) — example configuration.
+# kaibo — example configuration.
 #
 # Copy to $XDG_CONFIG_HOME/kaibo/config.toml (default ~/.config/kaibo/config.toml),
 # or point at it with --config <path> / KAIBO_CONFIG.
@@ -34,9 +34,12 @@
 # Prefer another provider? Pass cast="<backend-or-cast>" per call, or set
 # `cast` below.
 #
-# kaibo serves two resources you can read from your MCP client, no tool turn spent:
+# kaibo serves three config resources you can read from your MCP client, no tool turn
+# spent:
 #   kaibo://config          the *resolved* runtime state (key sources, never values)
 #   kaibo://config/example  this annotated template, embedded in the binary
+#   kaibo://config/guide    the full reference manual — every key, precedence, cast
+#                           design, tool gating, containment, persistence
 
 # ---------------------------------------------------------------------------
 # [server] — process-level defaults (the things --root / --cast / --no-* set)
@@ -76,10 +79,22 @@ cast = "anthropic"
 # tracing/EnvFilter directive used when RUST_LOG is unset.
 log = "kaibo=info"
 
-# Tool gating — true advertises the tool, false drops it (the --no-<tool> flags).
-# All default true; a config that turns every one off is refused at startup.
+# Tool gating — seven capability flags (the --no-<tool> flags), all default true. They
+# are not one-per-tool: `consult` also gates consult_submit, `batch` gates batch_submit,
+# and the job_* verbs follow whichever handle producers are live. A config that leaves
+# nothing advertised is refused at startup, whether by turning every flag off or by
+# staffing (below) removing what remains.
+#
+# A tool also needs a cast that can STAFF it. One nothing can staff is not advertised at
+# all, so it costs no resident tokens and no call of it can fail. Out of the box that
+# affects `deliberate`: no built-in cast pairs an explorer with an offline synth, so it
+# stays dark until you configure one (see DELIBERATE casts below). kaibo warns at startup
+# naming the cast shape it wants, and kaibo://config's [runtime].unstaffable_tools reports
+# it live. Full table: kaibo://config/guide, "Tool gating".
 [server.tools]
 consult        = true
+explore        = true
+deliberate     = true      # ...and needs a deliberate-shaped cast; see below
 oneshot        = true
 run_kaish      = true
 batch          = true
@@ -105,8 +120,31 @@ synth_temperature    = 0.3
 top_p                = 0.95
 
 # Reasoning depth, per role, for the models that take an effort param (Anthropic
-# adaptive tier, DeepSeek, Gemini's thinkingLevel, OpenRouter). A passthrough string
-# the provider validates — bump synth_effort to "max"/"xhigh" for heavier runs.
+# adaptive tier, DeepSeek, Gemini's thinkingLevel, OpenRouter, hosted GPT-5.x).
+# A passthrough string — kaibo keeps no allowlist, so a rung a provider ships
+# tomorrow works today.
+#
+# THE LADDER IS PER-PROVIDER, and often per-MODEL. There is no universal rung set,
+# so a value here lands on every cast at once and can be wrong for some of them:
+#   Gemini      minimal | low | medium | high — four, and that is Google's own
+#               schema, not a kaibo limit. "minimal" is the off-switch, itself
+#               model-dependent (gemini-3.5-flash takes it; gemini-pro-latest
+#               refuses it). "none"/"xhigh"/"max" are rejected outright.
+#   DeepSeek    all seven (none…max), strictly validated.
+#   OpenRouter  all seven; the gateway maps each onto the upstream's native knob,
+#               so deep rungs reach models that refuse them on their direct API.
+#   OpenAI      per MODEL, at both ends: gpt-5.6 reaches "max", gpt-5.2 stops at
+#               "xhigh", gpt-5.1 at "high"; gpt-5's bottom rung is "minimal" while
+#               5.1+ use "none". kaibo sends yours and OpenAI names its supported
+#               values if it disagrees.
+#   Anthropic   the adaptive tier takes an effort; the budget tier (Haiku 4.5 and
+#               older) has no effort field at all and drops it.
+#
+# So prefer a deep rung on the SLOT that can use it (see the casts below) over a
+# server-wide default here. kaibo tells you when a value can't land: one this
+# slot's client refuses is a call-time error naming the cast, the slot and the
+# rungs that wire takes; one with nowhere to go is a startup warning and shows up
+# as `inert_tunables` in kaibo://config.
 explorer_effort = "high"
 synth_effort    = "high"
 
@@ -136,6 +174,41 @@ call_deadline_secs = 3600
 
 session_capacity = 128       # max multi-turn consult sessions held in memory (LRU,
                              # capacity-evicted, no TTL); must be > 0
+job_capacity     = 64        # max async-consult jobs held in memory, running plus
+                             # uncollected; evicting a running one aborts it; must be > 0
+
+# Byte budget for inlining consult text attachments into the driver prompt (greedy, in
+# caller order). Past it an attachment is DEMOTED to a read-it-whole directive, loudly,
+# never dropped. 0 inlines nothing — the escape hatch for a small-context local cast.
+inline_attach_budget = 262144   # 256 KiB
+
+# Files ONE explorer sweep may route with its attach tool (the bytes ride alongside
+# the sweep's report, never through the explorer's context). 0 disables the tool.
+max_attachments = 32
+
+# ---------------------------------------------------------------------------
+# [orientation] — a computed-once file map injected into the exploring phases, so a
+# model starts knowing the layout instead of spending turns on glob/ls/find. Built
+# from the kernel's own ignore-aware enumeration, so it can't disagree with what the
+# explorer's shell sees. Omit the stanza to keep the defaults.
+# ---------------------------------------------------------------------------
+[orientation]
+enabled = true               # false turns the map off entirely
+full_list_max_files = 256    # <= this injects the full file list; above, a directory
+                             # map; 0 is a load error (disable instead)
+tree_max_depth = 4           # how deep the fallback directory map descends; 0 is a
+                             # load error (it would render an empty map)
+
+# ---------------------------------------------------------------------------
+# [persistence] — the state db, ON by default, so consult sessions and batch handles
+# survive a restart and are shared across front doors (start over MCP, continue from
+# the CLI). Fixed XDG path, never one a model controls; refused if it resolves inside
+# an allowed tree. Failure to open is fatal, not a silent drop to memory.
+# ---------------------------------------------------------------------------
+[persistence]
+enabled = true               # false = in-memory only (--no-persistence, KAIBO_NO_PERSISTENCE)
+# Move the db (--state-db FILE, KAIBO_STATE_DB). $VAR/~-expanded like root/allow_paths.
+# path = "$XDG_STATE_HOME/kaibo/state.db"
 
 # ---------------------------------------------------------------------------
 # [sandbox] — the read-only execution limits (see src/sandbox.rs)
@@ -379,11 +452,13 @@ synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tok
 # --- The built-in `openrouter` backend already has a key source, so a custom cast on
 #     it needs only slots. `~author/family-latest` aliases (OpenRouter serves them for
 #     anthropic/google/openai/x-ai/moonshotai — not every family) track the newest
-#     release instead of rotting; `effort = "xhigh"` here pushes
-#     the synth slot past [defaults] synth_effort ("high") into a rung only OpenRouter's
-#     unified reasoning param reaches. The same knob is the opt-out: reasoning is on by
-#     default for everything kaibo calls, and `effort = "none"` on a slot turns it off
-#     when the cost/latency isn't wanted (reasoning bills as output tokens). ---
+#     release instead of rotting; `effort = "xhigh"` here pushes the synth slot past
+#     [defaults] synth_effort ("high"). OpenRouter takes all seven rungs on every model
+#     and maps each onto the upstream's native knob — it will carry a rung to a model
+#     that refuses it on that vendor's direct API. The same knob is the opt-out:
+#     reasoning is on by default for everything kaibo calls, and `effort = "none"` on a
+#     slot turns it off (structurally, not by asking for zero) when the cost/latency
+#     isn't wanted — reasoning bills as output tokens. ---
 
 [casts.or-deep]
 explorer = "openrouter/~google/gemini-flash-latest"
@@ -400,8 +475,12 @@ synth    = "claude/claude-sonnet-4-6"        # no per-model prompt → [prompts]
 # --- Hosted GPT end to end, both roles on the keyed backend above.
 #     Sol is the flagship synth; Luna is the fast/tool-capable explorer. Both slots
 #     pin vision because generic openai endpoints default blind until you say otherwise.
-#     Use `effort = "none"` / "low" / "medium" / "high" / "xhigh" / "max" per slot
-#     to trade latency/cost against reasoning depth on the GPT-5.6 family. ---
+#     Per-slot `effort` trades latency/cost against reasoning depth. The rungs are a
+#     property of the MODEL, not the family: gpt-5.6 goes up to "max", gpt-5.2 stops at
+#     "xhigh", gpt-5.1 at "high", and gpt-5's bottom rung is "minimal" where 5.1+ use
+#     "none". kaibo passes yours through; OpenAI names its supported values if it
+#     disagrees. Note rig's own Responses client caps at "xhigh" — kaibo refuses "max"
+#     up front, naming the cast and slot, rather than letting it die mid-call. ---
 
 [casts.gpt]
 explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
@@ -445,15 +524,20 @@ synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
 synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 #
-# OUTPUT BUDGET. Batch maxes the knobs: high effort + a 32768-token output-token FLOOR (it
-# never skimps on the cheap async lane). Reasoning bills against that same output budget, so a
-# big attached-file review at max thinking can spend the budget thinking and truncate the
-# answer — kaibo flags such a result INCOMPLETE with its finishReason rather than passing off
-# the cut-off fragment as a clean answer. Give batch more answer headroom by raising
-# `max_tokens` on the synth slot; it's a floor, so a higher value wins, and mind each model's
-# output ceiling (Gemini Pro is generous; some backends cap lower). Batch forces effort to
-# high and ignores a per-slot `thinking_budget` (Gemini takes a level; Anthropic floors it),
-# so `max_tokens` is the knob worth setting here:
+# OUTPUT BUDGET. Batch FLOORS the knobs, never caps them: "high" effort and a 32768-token
+# output floor (it never skimps on the cheap async lane), and a slot that asks for MORE keeps
+# it — `effort = "xhigh"` on a batch synth reaches the provider as written, which also means
+# the provider's ladder applies (a Gemini batch slot still takes only minimal/low/medium/high,
+# so `xhigh` there is now the provider's error rather than a silent demotion). The floor is on
+# DEPTH, so `effort = "none"` survives it: a cheap bulk-extraction fan-out stays reasoning-off
+# rather than being lifted to "high" and billing thinking on every item. Reasoning bills
+# against that same output budget, so a big attached-file review at max thinking can spend the
+# budget thinking and truncate the answer — kaibo flags such a result INCOMPLETE with its
+# finishReason rather than passing off the cut-off fragment as a clean answer. Give batch more
+# answer headroom by raising `max_tokens` on the synth slot; it's a floor too, so a higher
+# value wins, and mind each model's output ceiling (Gemini Pro is generous; some backends cap
+# lower). A per-slot `thinking_budget` is ignored here (Gemini takes a level; Anthropic floors
+# it), so `max_tokens` is the knob worth setting:
 #   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch", max_tokens = 65536 }
 
 # --- DELIBERATE casts: an interactive explorer PLUS an offline synth. `deliberate` runs
@@ -462,7 +546,12 @@ synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 #     The synth's lane picks the offline mechanism: `batch` (a provider batch, half price,
 #     durable handle) below, or `direct` (one long LOCAL completion) further down. Unlike the
 #     synth-only batch casts above, these carry BOTH slots — the explorer is what makes it a
-#     deliberate cast rather than a plain batch one. ---
+#     deliberate cast rather than a plain batch one.
+#
+#     THIS SECTION IS WHAT TURNS `deliberate` ON: no built-in cast has this shape, so the
+#     tool is dark on a stock install. Adapt any one cast below and it appears. All three
+#     hosted batch providers work, as does a big LOCAL model on `direct` (no batch API at
+#     all). ---
 
 # Fable on the batch lane, with a Sonnet explorer building the dossier.
 [casts.fable]
