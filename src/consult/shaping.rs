@@ -579,8 +579,10 @@ pub fn effort_sinks(
 /// body, so whatever an operator writes reaches the provider and the *provider* decides.
 /// Two paths don't: rig deserializes the blob into a typed struct first, and a typed
 /// struct has a closed set of reasoning rungs. That ceiling belongs to **rig's client**,
-/// not the provider's API — OpenAI accepts `effort = "max"` on the wire (probed live
-/// 2026-08-01, 200 + echoed) while rig 0.38's `ReasoningEffort` enum stops at `xhigh`.
+/// not the provider's API, and it moves on rig's release schedule: rig 0.38's
+/// `ReasoningEffort` stopped at `xhigh` while OpenAI already accepted `effort = "max"`
+/// (probed live 2026-08-01, 200 + echoed); rig 0.41 added the rung and the two are now
+/// level. Gemini's `ThinkingLevel` ceiling is the provider's own and has not moved.
 ///
 /// Naming the wire lets kaibo ask rig *before* the call (see [`preflight_params`]) and
 /// report the ceiling honestly instead of surfacing a bare serde message mid-consult.
@@ -1036,14 +1038,24 @@ mod tests {
         );
     }
 
-    /// Canary tying `inject_output_budget` to the rig 0.38 pin. The workaround
-    /// exists because rig's `OpenrouterCompletionRequest` has no `max_tokens`
-    /// field; the day a rig bump adds one, `AgentBuilder::max_tokens` starts
-    /// arriving natively and the injected `max_completion_tokens` rides alongside
-    /// it — redundant at best, a provider 400 at worst, and silent either way.
-    /// This failing test is the tripwire: on a rig bump, re-read rig's
-    /// `openrouter/completion.rs`, retire (or deliberately keep) the injection,
-    /// then advance the version prefix here.
+    /// Canary tying `inject_output_budget` to the rig pin. The workaround exists
+    /// because rig's OpenRouter request has no `max_tokens` field; the day a rig bump
+    /// adds one, `AgentBuilder::max_tokens` starts arriving natively and the injected
+    /// `max_completion_tokens` rides alongside it — redundant at best, a provider 400
+    /// at worst, and silent either way. This failing test is the tripwire: on a rig
+    /// bump, re-read rig's `openrouter/completion.rs`, retire (or deliberately keep)
+    /// the injection, then advance the version prefix here.
+    ///
+    /// **Audit log — 0.38.2 → 0.41.0 (2026-08-01): the defect persists; the injection
+    /// stays.** rig 0.40 collapsed OpenRouter onto the shared
+    /// `GenericCompletionModel<OpenRouterExt>` (rig PR #2054), which was the plausible
+    /// moment for it to inherit the OpenAI path's native `max_tokens`. It did not.
+    /// Measured rather than read: a real 0.41 `openrouter::CompletionModel` driven
+    /// through a capture transport with `CompletionRequest.max_tokens = Some(4096)`
+    /// serialized a body whose only keys were `messages`, `model`, and `reasoning` —
+    /// no `max_tokens`, no `max_completion_tokens`. So a thinking-on OpenRouter answer
+    /// still runs on the gateway's default budget unless kaibo injects the ceiling
+    /// itself. Re-run that probe, don't re-derive this from the source, on the next bump.
     #[test]
     fn rig_bump_reaudits_the_openrouter_budget_workaround() {
         let lock = include_str!("../../Cargo.lock");
@@ -1055,10 +1067,10 @@ mod tests {
             .nth(1)
             .expect("version line follows the name line");
         assert!(
-            version.contains("version = \"0.38."),
-            "rig-core moved past 0.38 ({version}): re-audit the \
-             OpenrouterCompletionRequest max_tokens defect before shipping — \
-             see inject_output_budget"
+            version.contains("version = \"0.41."),
+            "rig-core moved past 0.41 ({version}): re-audit the OpenRouter max_tokens \
+             defect before shipping — see inject_output_budget, and the audit log on \
+             this test for how it was last measured"
         );
     }
 }

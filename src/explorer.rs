@@ -7,8 +7,7 @@
 
 use std::sync::Arc;
 
-use rig_core::completion::ToolDefinition;
-use rig_core::tool::Tool;
+use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -65,24 +64,41 @@ impl Tool for RunKaish {
     type Args = RunKaishArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: run_kaish_tool_description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "script": {
-                        "type": "string",
-                        "description": "kaish script to execute, e.g. `grep -rn TODO src | head`"
-                    }
-                },
-                "required": ["script"]
-            }),
-        }
+    /// Keep the failure text model-visible.
+    ///
+    /// rig 0.41's default (`ToolExecutionError::from_error`) redacts an arbitrary
+    /// source error down to a stable kind-level string — the model would read "the
+    /// tool failed" and nothing else. That is the right default for a tool whose
+    /// errors may carry secrets; it is the wrong one here, because this message names what the shell
+    /// refused and is the only thing telling the model how to reshape its script.
+    /// The explicit constructor keeps the message model-visible while `with_source`
+    /// preserves the concrete error for operator diagnostics and downcasting.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string()).with_source(error)
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn description(&self) -> String {
+        run_kaish_tool_description()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "kaish script to execute, e.g. `grep -rn TODO src | head`"
+                }
+            },
+            "required": ["script"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // Announce the read before running it — the beat fires even if the script
         // then errors, which is exactly the liveness a stuck call wants to show.
         self.progress.emit(PhaseEvent::KaishRun {

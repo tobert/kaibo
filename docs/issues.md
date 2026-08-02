@@ -616,12 +616,15 @@ P1 entry):
   grounding (all of which the `gpal` MCP sibling drives directly). This is why "voice
   on Gemini" is parked with TTS. Track rig's gemini coverage; adopt its traits when
   they broaden rather than hand-rolling media modalities over raw HTTP.
-- **OpenRouter provider silently drops `max_tokens`.** rig 0.38.2's native
-  `providers::openrouter` request struct (`openrouter/completion.rs`,
-  `OpenrouterCompletionRequest`) has no `max_tokens` field and its `TryFrom` never
-  reads `CompletionRequest.max_tokens`, so `AgentBuilder::max_tokens()` — kaibo's
-  per-arm headroom mechanism — is a no-op there. Confirmed still present on rig
-  `main` (2026-07-03), untracked upstream. Collides with the `large-token-headroom`
+- **OpenRouter provider silently drops `max_tokens`.** rig's native
+  `providers::openrouter` request never reads `CompletionRequest.max_tokens`, so
+  `AgentBuilder::max_tokens()` — kaibo's per-arm headroom mechanism — is a no-op there.
+  Confirmed still present on rig `main` (2026-07-03) and **re-measured on rig 0.41.0
+  (2026-08-01)**: rig 0.40 collapsed OpenRouter onto the shared
+  `GenericCompletionModel<OpenRouterExt>` without picking up the OpenAI path's native
+  `max_tokens`, and a real 0.41 model driven through a capture transport with
+  `max_tokens = Some(4096)` still serialized a body of only `messages`/`model`/
+  `reasoning`. Untracked upstream. Collides with the `large-token-headroom`
   doctrine (thinking eats the completion budget). Kaibo's workaround: inject
   `max_completion_tokens` (OpenRouter's preferred name; their spec deprecates
   `max_tokens`) via `additional_params`, guarded by a failing-first test. Watch
@@ -720,14 +723,17 @@ Remaining OpenRouter-specific forks:
 - **Spend visibility — token total shipped, two residuals.** The provenance footer
   now carries a `tokens · … in · … out` line (cache/reasoning splits when reported):
   `consult` sums the synth loop plus every delegated explorer sweep, drawn from rig's
-  `PromptResponse.usage` via `.extended_details()` (see `render::fmt_usage`,
-  `engine::run_phase`). Still open:
+  `PromptResponse.usage` (see `render::fmt_usage`, `engine::run_phase`). Still open:
   - **Undercount on the exceptional exits.** rig hands back no usage on
     `MaxTurnsError` / `PromptCancelled`, so a phase that hits its turn cap or breaks for
     an image-resume (`run_phase`'s view_image path) loses the tokens of the capped/broken
     run — only the finalize/resumed run's usage survives. The normal path is exact.
-    Recovering it means summing per-completion through a `PromptHook` rather than reading
-    the run's aggregate; deferred as low-value (both are rare paths) but real.
+    rig 0.41 makes the fix cheaper but not free: `AgentHook::on_completion_response`
+    now carries a per-turn `usage`, so a small tally hook could accumulate across every
+    turn including the lost ones. `PromptResponse.completion_calls` does *not* help —
+    it only exists on the `Ok` path, which is the path that was already exact. The
+    plumbing lands in `finalize_after_max_turns` and the resume loop, so it wants to
+    ride with whoever is next in that code rather than a dependency bump.
   - **Dollars, not just tokens.** rig's normalized `Usage` carries token counts only —
     even OpenRouter's response `usage.cost` is dropped in normalization. A per-call
     *cost* needs a kaibo-side price table keyed by model (input/output/cache-read rates),
