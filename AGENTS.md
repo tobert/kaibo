@@ -152,6 +152,20 @@ project and cannot run external commands.
   into the generic entry points (`run_phase`, `consult_with`, `consult_session_turn`),
   while the public `consult`/`oneshot` run on arms the server resolves with
   `Arm::from_slot` — the single live construction point that wraps the real rig client.
+  The scripted model's `Response` is a bare `serde_json::Value`, so a responder can hand
+  back any provider's *raw* payload shape (`with_raw`) — that's what drives
+  `completion_watch` offline.
+- **Seeing what the provider said.** rig's agent hook is medium-neutral (content, usage,
+  no `raw_response`), so `finish_reason` never reaches kaibo through it. `Watched`
+  (`src/completion_watch.rs`) wraps the *model* instead — `traced`'s sibling, a
+  transparent `CompletionModel` — recording each turn into a per-call `CompletionLog`
+  that `run_phase_logged` hands back, tool-loop turns included, and the last turn's
+  reason onto the `run_phase` span. Provider-agnostic by construction: the reason is read
+  out of the serialized raw response under the spellings providers ship, so an unknown
+  shape degrades to `None` instead of needing a new match arm. The single-shot phases
+  (`oneshot`, `deliberate` direct) skip the agent entirely via `Arm::complete` — one
+  request, built with rig's own `CompletionRequestBuilder` so both paths move together on
+  a rig bump.
 - **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
   before new work. Delete entries when they ship; don't mark them done.
 - **`docs/devlog.md`** is a durable narrative from the agent's perspective — write
