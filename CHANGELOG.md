@@ -17,6 +17,16 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`effort = "max"` now reaches hosted GPT-5.6.** kaibo has always accepted `max` as a
+  rung and always sent it faithfully; the wall was rig's, whose typed OpenAI Responses
+  request stopped one rung short of OpenAI's own API and refused `max` before the
+  request was even built. Upgrading to rig 0.41 removes that wall. Nothing in kaibo
+  changed to make it work — the accepted-rung list is read back out of rig on every
+  call rather than restated — so if you had `synth_effort = "max"` on a hosted GPT slot
+  and were getting a refusal naming the cast and the rungs, you simply stop getting one.
+  Gemini's ceiling (`high`) is unchanged and still correct: that one is Google's limit,
+  not rig's.
+
 - **New MCP resource: `kaibo://config/guide`** — the full configuration manual
   (`docs/config.md`), embedded in the binary the way the annotated template already is.
   An agent configuring kaibo over MCP has no access to kaibo's own `docs/`, so until now
@@ -112,11 +122,27 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A vision model still sees the image after the `rig` 0.41 upgrade.** rig 0.41 stopped
+  inspecting a tool's text output to discover rich content in it, which would have
+  silently turned every `view_image` result into base64 text labelled JSON — the model
+  would have received a wall of characters instead of a picture, with no error anywhere.
+  `view_image` now hands rig a declared image block instead of a JSON envelope for rig to
+  recognize, which is both the supported path and a sturdier one.
+
+- **A tool failure is readable by the model again.** rig 0.41 began replacing an
+  arbitrary tool error with a generic "the tool failed" before showing it to the model.
+  kaibo's tool errors are written *for* the model — `view_image` names the file, the
+  workspace, and the fix (copy it in, crop it, use `run_kaish` instead); a dead
+  `explore` sweep is what tells the driver to answer from its own reads rather than
+  retry blind. All three tools now keep their message model-visible, so a recoverable
+  failure stays recoverable. The full text remains available to operators either way.
+
 - **A reasoning `effort` your provider client can't accept now fails with a message
   you can act on.** Two request shapes — Gemini and OpenAI's Responses API — go
   through a typed builder in the underlying `rig` client whose reasoning levels are a
-  closed set: Gemini takes only `minimal`/`low`/`medium`/`high`, and Responses stops
-  at `xhigh` even though OpenAI's own API accepts `max`. A rung outside those used to
+  closed set: Gemini takes only `minimal`/`low`/`medium`/`high`, and Responses stopped
+  at `xhigh` even though OpenAI's own API accepts `max` (rig 0.41 has since added
+  `max`; Gemini's ceiling stands). A rung outside those used to
   die mid-call with a bare ``unknown variant `max` `` naming neither the cast nor the
   slot that asked for it. kaibo now checks the same builder up front and refuses with
   the cast, the role, the backend, the model, whose ceiling it is, and the rungs that

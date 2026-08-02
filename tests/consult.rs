@@ -690,8 +690,8 @@ struct ScriptedModel {
 struct NoStream;
 
 impl rig_core::completion::GetTokenUsage for NoStream {
-    fn token_usage(&self) -> Option<rig_core::completion::Usage> {
-        None
+    fn token_usage(&self) -> rig_core::completion::Usage {
+        rig_core::completion::Usage::new()
     }
 }
 
@@ -1001,7 +1001,7 @@ fn request_has_user_image(req: &rig_core::completion::CompletionRequest) -> bool
 /// calls it on a real file in the tree, and the bytes return as a rig *image part* in
 /// the next turn — not text. The synth can only reach its answer once it has seen the
 /// image, so a green run proves the whole chain: caps → toolset assembly → VFS read
-/// through the read-only kernel → base64 envelope → rig `from_tool_output` → image in
+/// through the read-only kernel → a typed `ToolResultContent::Image` block → image in
 /// model context. The proof of the "all phases" decision, exercised on the `consult`
 /// driver (the synth arm) — where `view_image` rides now.
 #[tokio::test]

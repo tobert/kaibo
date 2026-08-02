@@ -13,11 +13,11 @@
 use kaibo::consult::RunExplore;
 
 fn assert_send_sync<T: Send + Sync>() {}
-fn assert_is_tool<T: rig_core::tool::Tool>() {}
+fn assert_is_tool<T: rig_agent::tool::Tool>() {}
 
 #[test]
 fn run_explore_is_a_send_sync_rig_tool() {
-    // Send + Sync so it can be a `Box<dyn ToolDyn>` in a consult toolset.
+    // Send + Sync so it can back a `DynamicTool` in a consult toolset.
     assert_send_sync::<RunExplore>();
     // `Tool` — and the trait's `call -> impl Future + Send` bound is checked at the
     // impl site, so this also proves the nested-agent future is Send.
