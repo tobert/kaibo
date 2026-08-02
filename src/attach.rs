@@ -126,7 +126,7 @@ pub fn check_attachment_bounds(
 /// it alone. Breaking out would require a *bare* `</file>` to survive into the body; that
 /// is exactly what the regex rewrites, and what the wrapper-count assertions in
 /// `file_tag_lookalikes_in_body_are_all_escaped` verify with a literal (non-regex) scan.
-fn escape_file_body(body: &str) -> String {
+pub(crate) fn escape_file_body(body: &str) -> String {
     static FILE_TAG: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)<\s*/?\s*file\b[^>]*>").expect("static file-tag regex compiles")
     });

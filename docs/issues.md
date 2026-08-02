@@ -334,6 +334,16 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
+### Server-level test: a sweep-routed image survives the whole `deliberate` handler
+The engine layer pins dossier stitching and `deliberate_direct`-with-images, but
+neither `deliberate_batch` nor `deliberate_direct_job` has a server-level test
+proving a sweep-routed image survives the full handler pipeline (dossier sweep →
+`sink.drain()` → image collection → lane dispatch). The code reads correctly
+(`src/server/mod.rs`, `deliberate`), and the engine tests cover the seams — but a
+future refactor could drop the `images` variable between drain and dispatch
+undetected. Flagged by the DeepSeek cross-family review of the explorer `attach`
+feature (2026-07-26).
+
 ### Stale code comments + test assertions that predate the 5th backend / the direct lane
 Surfaced by a kaibo `or-gpt` (gpt-5.6-luna) review of PR #110, verified against the code.
 Three spots still describe a world with four built-ins and no tool routing to `direct`.

@@ -124,6 +124,14 @@ pub struct Defaults {
     /// model shrugs at). Inlined bytes ride every turn of the driver loop, so this
     /// bounds resident prompt cost, not just one request.
     pub inline_attach_budget: usize,
+    /// Cap on how many files ONE explorer sweep may route with the `attach` tool — a
+    /// routing verb, distinct from `inline_attach_budget` (which bounds INLINING the
+    /// *caller's* attachments into the driver prompt). Bounds a *behavioral* pattern
+    /// (a sweep attaching pathologically many files), not memory — the per-file and
+    /// cumulative byte caps (`attach.rs`) already bound that. `0` is legal and means
+    /// "don't inject the attach tool at all", the escape hatch for a consumer that
+    /// shouldn't receive routed bytes.
+    pub max_attachments: usize,
 }
 
 impl Default for Defaults {
@@ -180,6 +188,11 @@ impl Default for Defaults {
             // runaway attach batch demotes to read-WHOLE directives instead of
             // ballooning every driver-loop turn.
             inline_attach_budget: 1 << 18,
+            // 32 — under the caller-facing DEFAULT_MAX_ATTACHMENTS (64, attach.rs): a
+            // thorough sweep touches 10-20 files, so 32 fires only on pathology. The
+            // per-file/cumulative byte caps already bound worst case; this is an
+            // "observe real behavior before clamping further" default, not a memory one.
+            max_attachments: 32,
         }
     }
 }
@@ -1725,9 +1738,16 @@ impl Config {
         user_context_files: Vec<PathBuf>,
         disable_persistence: bool,
         state_db: Option<PathBuf>,
+        max_attachments: Option<usize>,
     ) {
         if let Some(root) = root {
             self.root = Some(root);
+        }
+        // An operator guardrail, not a per-call dial (kept off the MCP schema to stay
+        // under the client-facing text budget) — global like --root/--cast, applying to
+        // consult, explore-driven deliberate, and the async lanes alike.
+        if let Some(n) = max_attachments {
+            self.defaults.max_attachments = n;
         }
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn persistence OFF,
         // never force it on over a `[persistence] enabled = false` in the file.
@@ -2182,6 +2202,7 @@ struct RawDefaults {
     session_capacity: Option<usize>,
     job_capacity: Option<usize>,
     inline_attach_budget: Option<usize>,
+    max_attachments: Option<usize>,
 }
 
 /// One `[backends.<name>]` stanza: connection knobs only — models live on casts.
@@ -2455,6 +2476,8 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
         // nothing — demote every text attachment to a read-WHOLE directive", the
         // deliberate escape hatch for small-context casts.
         inline_attach_budget: raw.inline_attach_budget.unwrap_or(d.inline_attach_budget),
+        // 0 is legal here too: it turns the explorer's `attach` tool off entirely.
+        max_attachments: raw.max_attachments.unwrap_or(d.max_attachments),
     })
 }
 
@@ -2746,6 +2769,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_INLINE_ATTACH_BUDGET") {
         defaults.inline_attach_budget = Some(parse_env_int("KAIBO_INLINE_ATTACH_BUDGET", &v)?);
+    }
+    if let Some(v) = get("KAIBO_MAX_ATTACHMENTS") {
+        defaults.max_attachments = Some(parse_env_int("KAIBO_MAX_ATTACHMENTS", &v)?);
     }
 
     // Context files: colon-separated like PATH (and like KAIBO_ALLOW_PATHS), so a

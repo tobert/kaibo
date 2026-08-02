@@ -17,6 +17,28 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **The explorer can now hand whole files to whoever reads its report.** Inside
+  `consult` and `deliberate`, the delegated investigator gets an `attach` tool: when a
+  whole file is the evidence, it routes the file's real bytes (numbered, `cat -n`
+  style) alongside its report — into the consult driver's context, or into the
+  `deliberate` dossier the offline model reasons over — instead of transcribing spans
+  through its own small budget. Images ride too: an explorer that can't see a PNG can
+  still staple it to a vision-capable answering model, and is told plainly when the
+  reader is text-only. Governed by `[defaults] max_attachments` (files per sweep;
+  default 32, `0` disables the tool), also settable via `KAIBO_MAX_ATTACHMENTS` and
+  `--max-attachments`; every routed file surfaces as a progress beat so you can watch
+  what the explorer chose.
+
+- **Traces now say how each model turn *ended*.** A `run_phase` span carries
+  `gen_ai.response.finish_reason` — the provider's own word for why generation stopped
+  (`end_turn`, `max_tokens`, `content_filter`, Gemini's `MAX_TOKENS`, OpenAI Responses'
+  `max_output_tokens`). Providers have always reported it; rig's agent layer discarded it
+  before kaibo could look, which is why a consult that came back empty was
+  indistinguishable from one that was truncated or refused by a classifier. kaibo now
+  observes every completion on its way past — the turns *inside* the tool loop included —
+  with no per-provider code, and an unfamiliar response shape simply reports nothing
+  rather than breaking the call.
+
 - **`effort = "max"` now reaches hosted GPT-5.6.** kaibo has always accepted `max` as a
   rung and always sent it faithfully; the wall was rig's, whose typed OpenAI Responses
   request stopped one rung short of OpenAI's own API and refused `max` before the
@@ -55,6 +77,13 @@ record. Each later release appends a new section at the top.
   drives are not English-first, and the small local models already fixate on odd
   phrasing, so a figurative instruction costs them attention that should go to the code.
   Expect this to show up most on the DeepSeek, GLM, Qwen, Kimi, and local casts.
+
+- **`oneshot` and `deliberate`'s direct lane are now one literal request.** Both are
+  toolless by definition — the caller owns the context — but both reached the provider
+  through the managed tool loop carrying an empty toolset, arriving at the same place by
+  a longer road. They now ask the model directly. Same preamble, same params, same
+  answer, same token accounting; the request that goes out is proven request-for-request
+  identical to the one the loop built.
 
 - **Batch treats `effort` as a floor, not an override.** Every other batch knob
   already worked this way: `max_tokens` and the thinking budget rise to a batch
@@ -121,6 +150,17 @@ record. Each later release appends a new section at the top.
   behavior, flags, or tool names changed.
 
 ### Fixed
+
+- **A consultation that produced no answer no longer comes back as a successful empty
+  one.** A reasoning model's final turn can carry reasoning but no answer text, and
+  kaibo would dress that empty string in a provenance footer and return it as success —
+  no error, no signal that the review had not happened. Every phase (`consult`,
+  `explore`, `oneshot`, `deliberate`) now checks its answer: if the model had already
+  gathered evidence, kaibo asks it once to write up what it found, which usually
+  recovers the answer (both attempts' tokens counted in the footer); if it had gathered
+  nothing, the call fails with its diagnostics attached (turns used, token counts, and
+  the provider's own finish reason when it reported one) rather than pressing an
+  evidence-free model into an ungrounded answer.
 
 - **A vision model still sees the image after the `rig` 0.41 upgrade.** rig 0.41 stopped
   inspecting a tool's text output to discover rich content in it, which would have

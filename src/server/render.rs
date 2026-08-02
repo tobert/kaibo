@@ -22,6 +22,10 @@ use crate::jobs::{JobSnapshot, JobState, JobStore};
 /// requested it is surfaced even if empty: an empty report is the honest signal
 /// that the consult read every span itself and delegated no sweep, which is
 /// distinct from the caller not asking at all. Pure and offline-testable.
+///
+/// Text-only on purpose: a sweep-routed image (`attach` in `src/sweep_attach.rs`)
+/// is consumed by the *driver* inside its tool loop — it never reaches the final
+/// MCP result, which stays a cited text answer.
 pub(super) fn consult_result(
     answer: String,
     report: String,
@@ -52,10 +56,12 @@ enum FailureKind {
 /// error text**, by necessity: rig collapses the HTTP status into the response *body*
 /// (`CompletionError::ProviderError(text)` carries Anthropic's `overloaded_error` JSON, a
 /// Gemini `RESOURCE_EXHAUSTED`, etc. — not the number `529`), so we match the providers'
-/// transient *vocabulary* rather than a status code. The model loop wraps its errors as
-/// `"model loop failed: …"` (`consult.rs`); an error chain lacking that marker came from
-/// *before* a model ran (a kaish kernel build inside the toolset factory), so it's a
-/// kaibo-side failure, not the provider's.
+/// transient *vocabulary* rather than a status code. A failure that reached a model wears
+/// one of kaibo's markers (`consult/engine.rs`): `"model loop failed: …"` from the tool
+/// loop, `"model call failed: …"` from a single-shot direct completion (`oneshot`,
+/// `deliberate`'s direct lane), `"model used all …"` from the forced final turn. An error
+/// chain lacking every marker came from *before* a model ran (a kaish kernel build inside
+/// the toolset factory), so it's a kaibo-side failure, not the provider's.
 fn classify_failure(err: &anyhow::Error) -> FailureKind {
     let s = format!("{err:#}").to_lowercase();
     // Our own wall-clock backstop firing (`call_deadline`): the backend stalled past
@@ -66,8 +72,10 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     if s.contains("wall-clock deadline") {
         return FailureKind::TransientProvider;
     }
-    let from_model_loop = s.contains("model loop failed") || s.contains("model used all");
-    if !from_model_loop {
+    let reached_a_model = s.contains("model loop failed")
+        || s.contains("model call failed")
+        || s.contains("model used all");
+    if !reached_a_model {
         return FailureKind::Internal;
     }
     // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
@@ -642,6 +650,12 @@ mod tests {
             "model loop failed: HttpError: error sending request: operation timed out",
             "model loop failed: HttpError: connection reset by peer",
             "model loop failed: ProviderError: RESOURCE_EXHAUSTED",
+            // The single-shot direct lane (`oneshot`, `deliberate` direct) reaches the
+            // provider without a tool loop, so it wears its own marker. An overload
+            // there is every bit as retryable — a classifier that only knew the loop's
+            // marker would call this a kaibo bug and tell the caller not to retry.
+            "model call failed: ProviderError: {\"type\":\"overloaded_error\"}",
+            "model call failed: HttpError: error sending request: operation timed out",
         ] {
             let result = consultation_failed("consult", "gemini", anyhow::anyhow!(body));
             let text = answer_text(&result).to_lowercase();
