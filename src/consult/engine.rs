@@ -9,15 +9,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rig_core::agent::{AgentBuilder, HookAction, PromptHook};
+use rig_agent::agent::hook::{
+    AgentHook, CompletionCall, CompletionCallAction, HookContext, ToolResultAction, ToolResultEvent,
+};
+use rig_agent::agent::AgentBuilder;
+use rig_agent::completion::PromptError;
+use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
     AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
     UserContent,
 };
-use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition, Usage};
+use rig_core::completion::{CompletionModel, Message, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
-use rig_core::tool::{Tool, ToolDyn};
 use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -42,7 +46,7 @@ use super::shaping::{ModelCaps, ModelShape};
 
 /// The toolset factory a phase loop rebuilds its tools from (once for the main
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
-type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<Box<dyn ToolDyn>>> + Send + Sync);
+type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<DynamicTool>> + Send + Sync);
 
 /// The eventual `(answer, usage)` a phase loop yields, boxed `Send` for the
 /// [`PhaseRunner`] vtable: the model's answer paired with the token [`Usage`] the
@@ -419,13 +423,19 @@ impl Arm {
     /// instead of full input price every turn; implicit-caching upstreams
     /// (DeepSeek/GLM/Kimi/Gemini/OpenAI) ignore the marker. The growing
     /// transcript is not marked — an upstream rig limitation, tracked in
-    /// docs/issues.md. Kept as a named seam so the construction is unit-testable:
-    /// rig exposes the caching flag as a public field, and `from_slot` must
-    /// route through here.
-    fn openrouter_completion_model(
-        client: &openrouter::Client,
+    /// docs/issues.md. Kept as a named seam so the construction is unit-testable, and
+    /// `from_slot` must route through here.
+    ///
+    /// Generic over the HTTP backend so a test can drive it with a capture transport
+    /// and read the marker off the serialized body — the only place that answers
+    /// whether this constructor did its job, since rig exposes no readable flag.
+    fn openrouter_completion_model<H>(
+        client: &openrouter::Client<H>,
         id: &str,
-    ) -> openrouter::CompletionModel {
+    ) -> openrouter::CompletionModel<H>
+    where
+        openrouter::Client<H>: CompletionClient<CompletionModel = openrouter::CompletionModel<H>>,
+    {
         client.completion_model(id).with_prompt_caching()
     }
 
@@ -544,22 +554,21 @@ const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the nex
 /// [`run_phase`] can move the image onto the **user-turn** channel for a transport
 /// that can't carry it in a tool result (an OpenAI VLM).
 ///
-/// **Why flag now, terminate next — not mid-turn.** A single assistant turn can call
-/// `view_image` *and* `run_kaish` together; terminating the instant `view_image`
-/// returns would drop the other tool's result and orphan its `tool_use`. And rig's
-/// `on_tool_result` Terminate hands back a transcript snapshotted *before* the turn's
-/// results are folded into `new_messages` (`prompt_request/mod.rs` ~:928), so it
-/// wouldn't even carry the image we came for. So we only *set a flag* on
-/// `on_tool_result`, and terminate on the **next** `on_completion_call` — the point
-/// where rig has written every tool result of the triggering turn into `new_messages`
-/// and `Terminate` returns the complete transcript (`:670`). Disabled
+/// **Why flag now, stop next — not mid-turn.** A single assistant turn can call
+/// `view_image` *and* `run_kaish` together; stopping the instant `view_image` returns
+/// would drop the other tool's result and orphan its `tool_use`. And a stop from
+/// `on_tool_result` hands back a transcript snapshotted *before* the turn's results are
+/// folded into the run's messages, so it wouldn't even carry the image we came for. So
+/// we only *set a flag* on `on_tool_result`, and stop on the **next**
+/// `on_completion_call` — the point where rig has written every tool result of the
+/// triggering turn into the transcript and the stop returns it complete. Disabled
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
 /// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
 #[derive(Clone)]
 struct ViewImageBreakHook {
     enabled: bool,
     /// Set once a `view_image` tool result lands this turn; read at the next
-    /// completion call. Interior mutability because `PromptHook`'s callbacks are `&self`
+    /// completion call. Interior mutability because `AgentHook`'s callbacks are `&self`
     /// and rig runs a turn's tools concurrently.
     saw_view_image: Arc<AtomicBool>,
 }
@@ -573,26 +582,27 @@ impl ViewImageBreakHook {
     }
 }
 
-impl<M: CompletionModel> PromptHook<M> for ViewImageBreakHook {
+impl AgentHook for ViewImageBreakHook {
     async fn on_tool_result(
         &self,
-        tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        _args: &str,
-        _result: &str,
-    ) -> HookAction {
-        if self.enabled && tool_name == ViewImage::NAME {
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        if self.enabled && event.tool_name == ViewImage::NAME {
             self.saw_view_image.store(true, Ordering::SeqCst);
         }
-        HookAction::cont()
+        ToolResultAction::Keep
     }
 
-    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        _event: CompletionCall<'_>,
+    ) -> CompletionCallAction {
         if self.enabled && self.saw_view_image.load(Ordering::SeqCst) {
-            HookAction::terminate(VIEW_IMAGE_BREAK)
+            CompletionCallAction::Stop(VIEW_IMAGE_BREAK.to_string())
         } else {
-            HookAction::cont()
+            CompletionCallAction::Continue
         }
     }
 }
@@ -730,7 +740,7 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// surface — `oneshot` ({} — no tools), the recomposed `consult`
 /// ({run_kaish, explore′}), and its nested `explore′` ({run_kaish}). The factory matters because of the
 /// turn-cap recovery below: a fresh toolset is built for the forced final turn, and
-/// `Box<dyn ToolDyn>` can't be cloned, so we rebuild rather than share. Each call
+/// A `DynamicTool` toolset is consumed by the builder, so we rebuild rather than share. Each call
 /// spawns its own `KaishWorker`(s); the caller owns their lifetime.
 ///
 /// **Turn-cap recovery.** When the model uses every turn without concluding, rig
@@ -783,7 +793,7 @@ pub(crate) async fn run_phase<M, F>(
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
-    F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
+    F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Loop state across view_image-break resumes. The caller hands us the *assembled*
     // first user turn — a bare `Message::user(prompt)` for every tool-driven phase, or a
@@ -835,27 +845,26 @@ where
         if let Some(params) = thinking {
             builder = builder.additional_params(params.clone());
         }
-        let agent = builder.tools(make_tools()?).build();
+        let agent = builder.dynamic_tools(make_tools()?).build();
 
         // A fresh hook per loop iteration is load-bearing: its `saw_view_image` flag
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
-        // `.extended_details()` swaps rig's plain-`String` result for a
-        // `PromptResponse` carrying the token `usage` the provider reported, summed
-        // across every turn of *this* run (rig aggregates `usage += resp.usage` per
-        // completion). The clean `Ok` path is the common case — one run, the full
-        // count. The two exceptional exits below (turn cap, view_image break) undercount:
-        // rig hands back no usage on `MaxTurnsError`/`PromptCancelled`, so the turns
-        // spent in a capped or broken run are lost and only the finalize/resumed run's
-        // usage survives. Deliberate — recovering it would mean summing per-completion
-        // through a hook; documented as a known undercount rather than silently exact.
+        // The run yields a `PromptResponse` carrying the token `usage` the provider
+        // reported, summed across every turn of *this* run. The clean `Ok` path is the
+        // common case — one run, the full count. The two exceptional exits below (turn
+        // cap, view_image break) undercount: rig hands back no usage on
+        // `MaxTurnsError`/`PromptCancelled`, so the turns spent in a capped or broken
+        // run are lost and only the finalize/resumed run's usage survives. Deliberate —
+        // recovering it would mean summing per-completion through a hook; documented as
+        // a known undercount rather than silently exact.
         let result = agent
-            .prompt(prompt.clone())
-            .with_history(history.clone())
-            .with_hook(ViewImageBreakHook::new(break_on_view_image))
+            .runner(prompt.clone())
+            .history(history.clone())
+            .add_hook(ViewImageBreakHook::new(break_on_view_image))
             .max_turns(remaining)
-            .extended_details()
+            .run()
             .await;
 
         match result {
@@ -904,7 +913,7 @@ async fn finalize_after_max_turns<M>(
     max_tokens: u64,
     temperature: Option<f64>,
     thinking: Option<&Value>,
-    tools: Vec<Box<dyn ToolDyn>>,
+    tools: Vec<DynamicTool>,
     chat_history: Vec<Message>,
     max_turns: usize,
 ) -> Result<(String, Usage)>
@@ -922,15 +931,15 @@ where
     if let Some(params) = thinking {
         builder = builder.additional_params(params.clone());
     }
-    let agent = builder.tools(tools).build();
+    let agent = builder.dynamic_tools(tools).build();
     // max_turns(1): one constrained completion. With tools forbidden the model can't
     // loop, so a single round is enough — and if a provider ignores ToolChoice::None
     // and still calls a tool, we surface that rather than recurse.
     agent
-        .prompt(prompt)
-        .with_history(history)
+        .runner(prompt)
+        .history(history)
         .max_turns(1)
-        .extended_details()
+        .run()
         .await
         .map(|resp| (resp.output, resp.usage))
         .map_err(|e| {
@@ -969,7 +978,7 @@ pub(crate) async fn run_explore_phase(
         Message::user(question.to_string()),
         max_turns,
         progress.as_ref(),
-        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
+        &|| -> Result<Vec<DynamicTool>> {
             Ok(vec![traced(RunKaish::with_progress(
                 KaishWorker::spawn_with(&root, sandbox.clone())?,
                 progress.clone(),
@@ -1066,28 +1075,41 @@ impl Tool for RunExplore {
     type Args = RunExploreArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Delegate a broad sweep to a fast investigator that rips \
-                through the repo on a read-only kaish shell and reports back with \
-                concrete `file:line` citations. Give it a focused question; use it \
-                to cover breadth, and read the code yourself with `run_kaish`."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "the question or sub-question to investigate"
-                    }
-                },
-                "required": ["question"]
-            }),
-        }
+    /// Keep the failure text model-visible: rig's default would redact it to a
+    /// kind-level "the tool failed", and a dead sweep is something the driver must
+    /// *see* to recover from — it answers from its own direct reads instead of retrying
+    /// blind, and can only choose that if the failure reaches it. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string()).with_source(error)
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn description(&self) -> String {
+        "Delegate a broad sweep to a fast investigator that rips \
+         through the repo on a read-only kaish shell and reports back with \
+         concrete `file:line` citations. Give it a focused question; use it \
+         to cover breadth, and read the code yourself with `run_kaish`."
+            .to_string()
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "the question or sub-question to investigate"
+                }
+            },
+            "required": ["question"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _ctx: &mut rig_agent::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // Bracket the delegation: the start carries the sub-question, the finish fires
         // on both success and failure (the `?` below short-circuits, so emit it before
         // unwrapping the result).
@@ -1209,7 +1231,7 @@ fn consult_tools(
     reports: Arc<Mutex<Vec<String>>>,
     explore_usage: Arc<Mutex<Usage>>,
     synth_vision: bool,
-) -> Result<Vec<Box<dyn ToolDyn>>> {
+) -> Result<Vec<DynamicTool>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
     let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
@@ -1244,7 +1266,7 @@ fn consult_tools(
         cfg.explore.phase.progress.clone(),
         explorer_preamble,
     );
-    let mut tools: Vec<Box<dyn ToolDyn>> = vec![
+    let mut tools: Vec<DynamicTool> = vec![
         traced(RunKaish::with_progress(
             worker.clone(),
             cfg.explore.phase.progress.clone(),
@@ -1526,8 +1548,9 @@ mod tests {
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
+        transcript_text, usage, with_usage, CaptureHttp, RecordingSink, ScriptedClient,
     };
+    use rig_core::completion::CompletionRequest;
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::Path;
@@ -3818,30 +3841,74 @@ mod tests {
     /// The OpenRouter arm rides with rig's explicit prompt caching ON: Anthropic-
     /// upstream slugs need `cache_control` breakpoints to bill cache-read rates
     /// (2026-07-03: a consult re-billed its full growing prefix every turn without
-    /// them), and implicit-caching upstreams ignore the marker. rig exposes the
-    /// flag as a public field, and `from_slot` routes through this constructor —
-    /// so this pins the wiring, not an internal default.
-    #[test]
-    fn openrouter_arm_enables_prompt_caching() {
-        // Built through kaibo's one TLS client-build site (ring installed there) —
-        // a bare reqwest builder panics under `rustls-no-provider` unless another
-        // test happened to install the provider first.
-        let http = crate::tls::https_client(Duration::from_secs(30)).unwrap();
+    /// them), and implicit-caching upstreams ignore the marker. `from_slot` routes
+    /// through this constructor — so this pins the wiring, not an internal default.
+    ///
+    /// **Asserted on the wire, not on a flag.** What matters is the serialized request
+    /// body, so that is what a fake transport captures here: rig could keep
+    /// `with_prompt_caching()` compiling while changing what it emits, and any check
+    /// short of the body would stay green through that.
+    #[tokio::test]
+    async fn openrouter_arm_enables_prompt_caching() {
+        async fn system_block(model: openrouter::CompletionModel<CaptureHttp>, http: &CaptureHttp) -> Value {
+            let request = CompletionRequest {
+                model: None,
+                preamble: Some("ground every claim".into()),
+                chat_history: OneOrMany::one(Message::user("hi")),
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: Some(4096),
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            // The capture transport always errors; the body is already built by then.
+            let _ = model.completion(request).await;
+            http.recorded()
+                .expect("rig serialized a request body")
+                .pointer("/messages/0")
+                .cloned()
+                .expect("the system message leads the body")
+        }
+
+        let http = CaptureHttp::default();
         let client = openrouter::Client::builder()
             .api_key("sk-or-test")
-            .http_client(http)
+            .http_client(http.clone())
             .build()
             .expect("offline openrouter client construction");
-        let plain = client.completion_model("~anthropic/claude-sonnet-latest");
+
+        let plain_http = CaptureHttp::default();
+        let plain_client = openrouter::Client::builder()
+            .api_key("sk-or-test")
+            .http_client(plain_http.clone())
+            .build()
+            .expect("offline openrouter client construction");
+        let plain = system_block(
+            plain_client.completion_model("~anthropic/claude-sonnet-latest"),
+            &plain_http,
+        )
+        .await;
         assert!(
-            !plain.prompt_caching,
-            "rig defaults the flag off — the arm constructor below is load-bearing"
+            !plain.to_string().contains("cache_control"),
+            "rig marks no breakpoint by default — the arm constructor is load-bearing: \
+             {plain}"
         );
-        let armed =
-            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest");
+
+        let armed = system_block(
+            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest"),
+            &http,
+        )
+        .await;
         assert!(
-            armed.prompt_caching,
-            "the OpenRouter arm must build its model with prompt caching enabled"
+            armed.to_string().contains(r#""cache_control""#),
+            "the OpenRouter arm must put a cache breakpoint on the system prompt: {armed}"
+        );
+        assert!(
+            armed.to_string().contains("ephemeral"),
+            "the breakpoint is the ephemeral kind OpenRouter bills against: {armed}"
         );
     }
 
@@ -4228,7 +4295,7 @@ mod tests {
         )
         .expect("building the consult toolset should succeed");
 
-        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "run_kaish"),
             "missing run_kaish, got {names:?}"
@@ -4263,7 +4330,7 @@ mod tests {
         )
         .expect("building the consult toolset should succeed");
 
-        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "view_image"),
             "a vision synth must get view_image, got {names:?}"
@@ -4293,7 +4360,7 @@ mod tests {
             false,
         )
         .expect("blind toolset builds");
-        let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
+        let blind_names: Vec<String> = blind.iter().map(|t| t.name().to_string()).collect();
         assert!(blind_names.iter().any(|n| n == "run_kaish"));
         assert!(blind_names.iter().any(|n| n == "explore"));
         assert!(
@@ -4303,7 +4370,7 @@ mod tests {
 
         let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, true)
             .expect("vision toolset builds");
-        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
+        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name().to_string()).collect();
         assert!(
             seeing_names.iter().any(|n| n == "view_image"),
             "view_image present with vision, got {seeing_names:?}"
@@ -4383,7 +4450,7 @@ mod tests {
     }
 
     /// A `view_image` tool result: the load note (text) *and* the image part — the
-    /// hybrid shape rig's `from_tool_output` produces.
+    /// two typed content blocks `ViewImage` returns.
     fn vi_result(id: &str) -> UserContent {
         UserContent::ToolResult(ToolResult {
             id: id.to_string(),

@@ -26,20 +26,33 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] 
 async-trait = "0.1"
 anyhow = "1"
 
-# LLM providers + agent/tool loop. Native tools (no `rmcp` feature needed — kaibo
-# wraps kaish as an in-process rig Tool, not over MCP).
-# `default-features = false` drops rig's default `rustls` feature, which would
-# pull `reqwest/rustls` → the aws-lc-rs crypto provider (C + cmake, the one thing
-# that makes a static musl build painful). We re-add the other defaults rig needs
-# (`reqwest`, `derive`) and let TLS come from our own `rustls`+ring wiring below.
-# `image` gates rig's `image_generation` module (lib.rs:159) — the
-# `ImageGenerationModel` trait and its request/response types. It is a pure-Rust,
-# dependency-free feature flag (enabling it added ZERO crates to Cargo.lock, verified
-# 2026-07-25), and it buys more than the provider we hand-write: rig already ships
-# openai / xai / azure / huggingface impls of that trait, so an `image` cast slot can
-# reach them for free. Turned off by 986806f when image generation was removed; back
-# on with the media CAS.
-rig-core = { version = "0.38", default-features = false, features = ["reqwest", "derive", "image"] }
+# LLM providers + the wire types. `default-features = false` drops rig's default
+# `rustls` feature, which would pull `reqwest/rustls` → the aws-lc-rs crypto provider
+# (C + cmake, the one thing that makes a static musl build painful). We re-add the
+# other defaults rig needs (`reqwest`, `derive`) and let TLS come from our own
+# `rustls`+ring wiring below.
+# `image` gates rig's `image_generation` module — the `ImageGenerationModel` trait and
+# its request/response types. It is a pure-Rust, dependency-free feature flag (enabling
+# it added ZERO crates to Cargo.lock, verified 2026-07-25), and it buys more than the
+# provider we hand-write: rig already ships openai / xai / azure / huggingface impls of
+# that trait, so an `image` cast slot can reach them for free. Turned off by 986806f
+# when image generation was removed; back on with the media CAS.
+rig-core = { version = "0.41", default-features = false, features = ["reqwest", "derive", "image"] }
+# The agent/tool loop, which rig ships as its own crate beside `rig-core`.
+#
+# DO NOT collapse these two onto the `rig` facade crate. It looks tidier and it is a
+# trap: the facade's `rustls` feature fans out to the vector-store companions
+# (`rig-fastembed?/hf-hub-rustls-tls`, `rig-helixdb?/rustls`, `rig-lancedb?/rig-rustls`,
+# `rig-milvus?/rustls`) — a *fourth* route for aws-lc into the tree, beside the three
+# named in this file, and one that breaks the static musl build silently. Depending on
+# the two crates we actually use keeps the TLS surface exactly as documented above:
+# `rig-agent` takes `rig-core` with `default-features = false`, so the "drop rig's
+# default rustls" reasoning still covers the whole tree. Verify with
+# `cargo tree -i aws-lc-rs` on host *and* musl; both must be empty.
+#
+# `rmcp` is off (kaibo wraps kaish as an in-process rig Tool, not over MCP); `image` is
+# forwarded so a tool can return image content.
+rig-agent = { version = "0.41", default-features = false, features = ["derive", "image"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
@@ -158,7 +171,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-# Request-body capture in `tests/effort_wire.rs`: rig's `HttpClientExt` trait is
-# typed in `bytes::Bytes`, so implementing a fake transport needs the type by name.
-# Already in the tree via reqwest/rig-core — zero new crates.
+# Request-body capture in `tests/effort_wire.rs` and `test_support::CaptureHttp`:
+# rig's `HttpClientExt` trait is typed in `bytes::Bytes`, so implementing a fake
+# transport needs the type by name. Already in the tree via reqwest/rig-core — zero
+# new crates.
 bytes = "1"

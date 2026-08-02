@@ -4,10 +4,10 @@
 //! rig. Every unit test around that shaping asserts the shape of kaibo's own blob —
 //! which is exactly why a live landmine sat there unnoticed: nothing handed the blob to
 //! rig, so `effort = "xhigh"` on a Gemini slot stayed green in CI and died on every
-//! call. rig 0.38 parses the blob into a typed struct on two of the six wires, and those
-//! structs have a **closed** set of rungs. That ceiling is *rig's client*, not the
-//! provider's API — OpenAI's own Responses endpoint accepts `"max"` (probed live
-//! 2026-08-01: 200, echoed back) while rig's `ReasoningEffort` enum stops at `xhigh`.
+//! call. rig parses the blob into a typed struct on two of the six wires, and those
+//! structs have a **closed** set of rungs — a ceiling that is *rig's client*, not the
+//! provider's API, and that moves on rig's release schedule rather than the provider's.
+//! The two have disagreed before, in both directions.
 //!
 //! So this suite closes the loop with no key and no network: a fake `HttpClientExt`
 //! records the body rig builds, and the test drives a real `CompletionModel` for each
@@ -184,6 +184,9 @@ fn request(params: Option<Value>) -> CompletionRequest {
         tool_choice: None,
         additional_params: params,
         output_schema: None,
+        // Local observability policy, never serialized into a provider payload, so it
+        // cannot affect what this suite measures.
+        record_telemetry_content: false,
     }
 }
 
@@ -287,11 +290,22 @@ async fn on_the_wire(path: Path, effort: &str) -> Result<Option<Value>, String> 
 /// same: passed through where the wire is passthrough, refused where rig is typed.
 const UNRANKED: &str = "ludicrous";
 
-/// The ceilings, pinned. rig 0.38.2 parses the blob into a typed struct on exactly two
-/// wires, and this is what each accepts today. The list is not a claim about the
-/// providers — OpenAI's Responses API takes `"max"` on the wire; rig's enum does not.
-/// A rig bump that moves either ladder lands here first, which is the whole point: the
-/// last time one moved, we found out from a failed consult.
+/// The ceilings, pinned. rig parses the blob into a typed struct on exactly two wires,
+/// and this is what each accepts today. The list is not a claim about the providers —
+/// it is a claim about *rig*, the thing that can refuse a rung before the request is
+/// ever sent. A bump that moves either ladder lands here first, which is the whole
+/// point: the last time one moved, we found out from a failed consult.
+///
+/// **Audit log.** 0.38.2 → 0.41.0 (2026-08-01): `max` opened on the Responses wire.
+/// rig had trailed OpenAI by a rung — the endpoint took `"max"` (probed live: 200,
+/// echoed back) while rig's enum lacked the variant — and 0.41 closed the gap, so the
+/// ladder is now exactly [`known_efforts`]. Updating this pin was the *only* work the
+/// bump needed here, because `accepted_efforts` derives the list by probing rig rather
+/// than declaring one.
+///
+/// Gemini did not move, and should not: `thinkingLevel` is a closed protobuf enum and
+/// Google rejects `none`/`xhigh`/`max` (verified live). A bump that "widens" Gemini
+/// here is a rig bug, not a feature.
 #[tokio::test]
 async fn rig_effort_ladders_are_pinned() {
     for path in Path::ALL {
@@ -306,9 +320,9 @@ async fn rig_effort_ladders_are_pinned() {
             // This is the landmine: `[defaults] synth_effort = "xhigh"` broke every
             // Gemini cast, and every offline test stayed green.
             EffortWire::Gemini => vec!["minimal", "low", "medium", "high"],
-            // rig's `responses_api::ReasoningEffort` — stops one rung short of OpenAI's.
+            // rig's `responses_api::ReasoningEffort` — level with OpenAI's own ladder.
             EffortWire::OpenaiResponses => {
-                vec!["none", "minimal", "low", "medium", "high", "xhigh"]
+                vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"]
             }
             // `#[serde(flatten)]` all the way down: kaibo can express anything and the
             // provider is the one that answers for it.
