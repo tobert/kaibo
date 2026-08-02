@@ -162,6 +162,14 @@ record. Each later release appends a new section at the top.
   the provider's own finish reason when it reported one) rather than pressing an
   evidence-free model into an ungrounded answer.
 
+- **An empty-answer failure now reads as what it is — a retryable model outcome, not a
+  kaibo bug.** The failure classifier predates the empty-answer guard above and did not
+  know its vocabulary, so every empty-answer error was wrapped in "This is a kaibo-side
+  error (not the provider) — please report it" around inner text that said "Retry" —
+  contradictory guidance blaming kaibo for the model's silence. The guidance now says the
+  model delivered no answer text, invites a retry or a different cast, and points at the
+  slot's `max_tokens` when the provider reported the answer was cut off by length.
+
 - **A vision model still sees the image after the `rig` 0.41 upgrade.** rig 0.41 stopped
   inspecting a tool's text output to discover rich content in it, which would have
   silently turned every `view_image` result into base64 text labelled JSON — the model

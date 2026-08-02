@@ -321,6 +321,39 @@ advice split. Distinct from the upstream rig retry/backoff entry above — that'
 level 429/503 backoff; this is a mid-loop model fumble kaibo can re-prompt around itself.
 Surfaced by the DeepSeek CLI-subcommands review (2026-07-17).
 
+### Empty answers keep happening — the guard is a backstop, not a cure
+The empty-answer guard shipped 2026-08-02 (#115, meeting #116's finish_reason plumbing and
+the attach work in #118): no lane returns an empty answer as success. The tool loop gets one
+evidence-gated forced write-up turn (`consult/engine.rs::run_phase`, `empty_answer_error`),
+the turn-cap finalize and the single-shot lanes fail loudly with diagnostics (turns, tokens,
+the provider's own `finish_reason`), and batch has long had `finish_gated_answer`. But the
+guard changes the *failure mode*, not the *frequency*: DeepSeek still sometimes produces the
+textless terminal turn (Amy, 2026-08-02, same day the guard merged), and other families
+likely do too. Experiments the same day: a starved oneshot (256-token synth cap) repros the
+`finish_reason "length"` class on demand — reasoning ate the whole completion budget, guard
+errored loudly — while three grep-heavy review consults on the default deepseek cast all
+completed clean, so the wild stopped-without-answering class is sporadic (or already
+lowered by #114's role-identity preambles; n=3 can't tell). Open work, in order:
+- **Characterize from telemetry before touching prompts.** The plumbing to answer "which
+  models, how often, which finish_reason, does the forced re-ask rescue it" is all in place:
+  `gen_ai.response.finish_reason` on every `run_phase` span (#116), the `warn` event
+  "phase returned an empty answer with evidence gathered — forcing one final write-up turn"
+  (`engine.rs`), and `empty_answer_error`'s token/turn diagnostics in the error text.
+  Collect real occurrences from OTLP over normal use; the interesting split is
+  rescued-by-forced-turn vs. errored-anyway, and `finish_reason "stop"` (model chose to
+  stop) vs. `"length"` (starved — a `max_tokens` problem, different fix).
+- **Prevention is prompt work, and #114 already aims at it.** The measured failure shape is
+  a driver ending a turn with a tool call as its last act and no text (the 2026-08-01
+  DeepSeek run: explorer report delivered, fifteen greps returned, then a 14-token terminal
+  turn). #114's role-identity preambles ("the synth's final turn *is* the answer") target
+  exactly this; measure whether incidence drops post-#114 before adding more prompt mass.
+- **If the forced re-ask often fails**, consider a second differently-worded re-ask or
+  per-model shaping — but only with data showing the single re-ask isn't enough.
+- **The un-catchable neighbor, recorded so it isn't mistaken for a gap:** a non-empty but
+  vacuous answer ("I will now analyze…" then stop) passes the trim gate by construction.
+  If that shape shows up in practice it's a different problem (answer-quality, not
+  emptiness) and wants its own thinking, not a heuristic bolted onto this gate.
+
 ### Dossier checkpointing via the persistence store
 `deliberate`'s dossier (the synchronous explorer sweep) is the expensive artifact — minutes
 of live exploration — yet it lives only in memory until the offline synth consumes it.
