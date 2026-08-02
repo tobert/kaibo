@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
     AssistantContent, Message, ToolChoice, ToolResultContent, UserContent,
@@ -47,6 +48,7 @@ use rig_core::completion::message::{
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
+use rig_core::http_client::{self, HttpClientExt};
 use rig_core::OneOrMany;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -186,8 +188,76 @@ pub struct ScriptedModel {
 pub struct NoStream;
 
 impl GetTokenUsage for NoStream {
-    fn token_usage(&self) -> Option<Usage> {
-        None
+    // A zero-valued `Usage` is rig's documented sentinel for "the provider reported
+    // none" — there is no separate absent case.
+    fn token_usage(&self) -> Usage {
+        Usage::new()
+    }
+}
+
+/// An [`HttpClientExt`] that records the request body rig built, then fails.
+///
+/// The failure is the point: everything under test is already decided by the time rig
+/// hands the request to the transport, so no network, no key, and no canned response
+/// are needed. This is how a unit test asks "what would kaibo actually have sent?",
+/// which is the only honest form of the question for a provider option that shows up
+/// as a transformation of the outgoing body rather than a readable field.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureHttp(Arc<Mutex<Vec<serde_json::Value>>>);
+
+impl CaptureHttp {
+    /// The first body rig serialized, if it got that far.
+    pub fn recorded(&self) -> Option<serde_json::Value> {
+        self.0.lock().unwrap().first().cloned()
+    }
+}
+
+impl HttpClientExt for CaptureHttp {
+    fn send<T, U>(
+        &self,
+        req: http_client::Request<T>,
+    ) -> impl std::future::Future<
+        Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>,
+    > + Send
+           + 'static
+    where
+        T: Into<Bytes> + Send,
+        U: From<Bytes> + Send + 'static,
+    {
+        let (_parts, body) = req.into_parts();
+        let bytes: Bytes = body.into();
+        self.0
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        async move { Err(http_client::Error::StreamEnded) }
+    }
+
+    // Unreachable for a completion, but the trait requires them. `async fn` can't
+    // express the trait's `+ Send + 'static` return bound, so the desugared form stays.
+    #[allow(clippy::manual_async_fn)]
+    fn send_multipart<U>(
+        &self,
+        _req: http_client::Request<http_client::MultipartForm>,
+    ) -> impl std::future::Future<
+        Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>,
+    > + Send
+           + 'static
+    where
+        U: From<Bytes> + Send + 'static,
+    {
+        async move { Err(http_client::Error::StreamEnded) }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_streaming<T>(
+        &self,
+        _req: http_client::Request<T>,
+    ) -> impl std::future::Future<Output = http_client::Result<http_client::StreamingResponse>> + Send
+    where
+        T: Into<Bytes> + Send,
+    {
+        async move { Err(http_client::Error::StreamEnded) }
     }
 }
 
