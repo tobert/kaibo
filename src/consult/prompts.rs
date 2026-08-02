@@ -550,15 +550,15 @@ pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String
     format!(
         "\n\nYou also have `attach`. It aims a file *past you*: kaibo reads the file and \
          its full bytes travel ALONGSIDE your report to {}, without ever entering your \
-         context. When the whole file is the evidence, attach it — your report cites, the \
+         context. When the whole file is the evidence, attach it: your report cites, the \
          attachment carries the bytes. That is cheaper and more accurate than \
-         transcribing a span into your report: transcription spends your own budget and \
-         can drift; an attachment is the real file, numbered like `cat -n`. Attach is \
-         for delivering, not reading — you get back a one-line receipt (path, lines, \
-         size), never the contents; read with `cat -n` anything you need to see \
-         yourself. Attach the file a load-bearing claim rests on; keep writing exact \
-         `file:line` cites, because the attachment is what lets them be checked. Up to \
-         {max} files this sweep.",
+         transcribing a span into your report, because transcription spends your own \
+         budget and can drift, while an attachment is the real file, numbered like \
+         `cat -n`. Attach is for delivering, not reading. You get back a one-line \
+         receipt (path, lines, size), never the contents; read with `cat -n` anything \
+         you need to see yourself. Attach the file a load-bearing claim rests on, and \
+         keep writing exact `file:line` cites, because the attachment is what lets them \
+         be checked. Up to {max} files this sweep.",
         consumer.label,
     )
 }
@@ -881,6 +881,14 @@ mod tests {
             (
                 "house rules",
                 with_house_rules(String::new(), Some("RULES")),
+            ),
+            // Spliced onto the explorer preamble wherever the `attach` tool is
+            // injected (consult's nested sweep, deliberate's dossier stage). It
+            // arrived with the attach feature after the first plain-language pass,
+            // the same way the house-rules framing once sat outside this guard.
+            (
+                "explorer attach directive",
+                explorer_attach_directive(8, &consult_driver_consumer()),
             ),
         ] {
             let ours = text.replace(core, "");
