@@ -1957,6 +1957,72 @@ fn no_builtin_cast_carries_an_image_slot() {
     }
 }
 
+/// Reasoning tunables WRITTEN on an image slot are diagnosed, not load errors: an image
+/// slot sends one generation request with no reasoning phase, so a `thinking_budget` /
+/// `effort` / `temperature` / `thinking_style` written there never reaches a request.
+/// The diagnostic rides the same shared machinery as inert effort (startup warning +
+/// `inert_tunables` in kaibo://config), and it names the cast, the slot, and each knob.
+#[test]
+fn written_reasoning_tunables_on_an_image_slot_are_diagnosed() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "stability"
+
+        [casts.artist]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth    = "deepseek/deepseek-v4-pro"
+        image    = { backend = "sd", id = "core", thinking_budget = 4096, effort = "high", temperature = 0.5, thinking_style = "adaptive" }
+        "#,
+    )
+    .expect("reasoning knobs on an image slot load fine; they are diagnosed, not refused");
+    let diags = c.media_tunable_diagnostics();
+    assert_eq!(diags.len(), 1, "exactly the one image slot is reported");
+    let d = &diags[0];
+    assert_eq!(d.cast, "artist");
+    assert_eq!(d.role, "image");
+    assert_eq!(d.model, "sd/core");
+    assert_eq!(
+        d.tunables,
+        vec!["thinking_budget", "effort", "temperature", "thinking_style"],
+        "every written reasoning knob is named, in render order"
+    );
+}
+
+/// The quiet half: INHERITED defaults never flag an image slot. A `[defaults]`
+/// synth-side effort states the synth posture and merely falls back onto other roles,
+/// so a bare image slot stays silent in both scans — `media_tunable_diagnostics`
+/// (nothing written on the slot) and `effort_diagnostics` (media roles are covered by
+/// the media scan, so a defaults effort can't warn on every image slot the moment
+/// someone sets `synth_effort`).
+#[test]
+fn inherited_defaults_stay_quiet_on_an_image_slot() {
+    let c = Config::from_toml_str(
+        r#"
+        [defaults]
+        synth_effort = "medium"
+
+        [backends.sd]
+        kind = "stability"
+
+        [casts.artist]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth    = "deepseek/deepseek-v4-pro"
+        image    = "sd/core"
+        "#,
+    )
+    .unwrap();
+    assert!(
+        c.media_tunable_diagnostics().is_empty(),
+        "a bare image slot has nothing written, so nothing is reported"
+    );
+    assert!(
+        !c.effort_diagnostics().iter().any(|d| d.role == "image"),
+        "the effort scan covers reasoning roles only; an image slot inheriting a \
+         defaults effort is a fallback artifact, not an operator statement"
+    );
+}
+
 // --- [cas]: the media content-addressed store -------------------------------
 
 /// The default posture: a dir under XDG *data* (not state — these are artifacts the user

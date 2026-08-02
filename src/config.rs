@@ -403,6 +403,34 @@ impl ModelSlot {
             thinking_style: self.thinking_style.unwrap_or(defaults.thinking_style),
         }
     }
+
+    /// The reasoning tunables the operator wrote ON this slot's table, by knob name,
+    /// in the order the `kaibo://config` render lists inert knobs. This is the set a
+    /// non-reasoning (media) slot is judged by: an image slot sends one generation
+    /// request with no preamble, no tool loop, and no thinking budget (see
+    /// [`ModelRole::is_reasoning`]), so a reasoning knob written there never reaches a
+    /// request.
+    ///
+    /// Slot-written only, on purpose. A `[defaults]` effort or temperature states the
+    /// explorer/synth posture and merely falls back onto other roles, so inherited
+    /// values stay quiet here — the same rule that keeps the inherited built-in effort
+    /// quiet on toggle-less wires (see [`Defaults::explorer_effort_explicit`]).
+    pub fn written_reasoning_tunables(&self) -> Vec<&'static str> {
+        let mut written = Vec::new();
+        if self.thinking_budget.is_some() {
+            written.push("thinking_budget");
+        }
+        if self.effort.is_some() {
+            written.push("effort");
+        }
+        if self.temperature.is_some() {
+            written.push("temperature");
+        }
+        if self.thinking_style.is_some() {
+            written.push("thinking_style");
+        }
+        written
+    }
 }
 
 /// Where an operator wrote the `effort` that turned out to be inert.
@@ -497,6 +525,18 @@ pub struct EffortDiagnostic {
     /// The slot's `"backend/model-id"` ref, so the message names both halves.
     pub model: String,
     pub disposition: EffortDisposition,
+}
+
+/// One media (non-reasoning) cast slot carrying reasoning tunables the operator wrote
+/// on the slot table itself — see [`Config::media_tunable_diagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTunableDiagnostic {
+    pub cast: String,
+    pub role: &'static str,
+    /// The slot's `"backend/model-id"` ref, so the message names both halves.
+    pub model: String,
+    /// The written knob names, in the `kaibo://config` render order.
+    pub tunables: Vec<&'static str>,
 }
 
 /// A slot's effective request-shaping knobs after the per-role fallback (see
@@ -1364,6 +1404,16 @@ impl Config {
         let mut out = Vec::new();
         for (cast_name, cast) in &self.casts {
             for (role, slot) in &cast.slots {
+                // A media slot runs no reasoning phase at all, so this scan covers
+                // reasoning roles only; its written knobs are reported by
+                // `media_tunable_diagnostics`. The distinction matters for the quiet
+                // half too: a `[defaults]` effort inheriting onto an image slot is a
+                // fallback artifact, not something the operator said about that slot,
+                // and reporting it here would warn on every image slot the moment
+                // anyone set `synth_effort`.
+                if !role.is_reasoning() {
+                    continue;
+                }
                 let Ok(disposition) = self.effort_disposition(slot, *role) else {
                     continue;
                 };
@@ -1375,6 +1425,41 @@ impl Config {
                     role: role.key(),
                     model: slot.qualified(),
                     disposition,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every media (non-reasoning) cast slot where the operator *wrote* a reasoning
+    /// tunable on the slot table. An image slot sends one generation request with no
+    /// reasoning phase (see [`ModelRole::is_reasoning`]), so a reasoning knob there
+    /// never reaches a request; writing one usually means it landed on the wrong slot.
+    ///
+    /// Surfaced the way inert effort is surfaced — a startup warning plus
+    /// `inert_tunables` in `kaibo://config`, both reading this one rule — and
+    /// deliberately not a load error: the value is harmless, only silent, and the cure
+    /// is a message that names the slot and the knobs.
+    ///
+    /// Slot-written knobs only ([`ModelSlot::written_reasoning_tunables`]); inherited
+    /// `[defaults]` values stay quiet, the same rule that keeps the built-in effort
+    /// quiet on toggle-less wires ([`Self::effort_diagnostics`]).
+    pub fn media_tunable_diagnostics(&self) -> Vec<MediaTunableDiagnostic> {
+        let mut out = Vec::new();
+        for (cast_name, cast) in &self.casts {
+            for (role, slot) in &cast.slots {
+                if role.is_reasoning() {
+                    continue;
+                }
+                let tunables = slot.written_reasoning_tunables();
+                if tunables.is_empty() {
+                    continue;
+                }
+                out.push(MediaTunableDiagnostic {
+                    cast: cast_name.clone(),
+                    role: role.key(),
+                    model: slot.qualified(),
+                    tunables,
                 });
             }
         }

@@ -377,54 +377,67 @@ pub(crate) fn render_config_resource(
                     let backend = config
                         .resolve_backend(&slot.backend)
                         .expect("a loaded cast's slot backend resolves");
-                    // Resolve through `slot.tunables` — the same fallbacks the wire path
-                    // takes, so a `[defaults].thinking_style` (which the old
-                    // `unwrap_or_default()` here silently ignored) can't make the render
-                    // disagree with what actually ships.
-                    let t = slot.tunables(*role, &config.defaults);
-                    let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
-                    // Lane-aware: a `lane = "batch"` slot never builds an interactive arm.
-                    // Batch POSTs its own body and gates the Responses shape on the
-                    // endpoint-exact `is_hosted_openai`; the interactive arm follows the
-                    // configurable `uses_responses_wire` (a responses-wire gateway shapes
-                    // like Platform even though it isn't batch-eligible).
-                    let batch_lane = matches!(lane, Some(Lane::Batch));
-                    let responses_wire = if batch_lane {
-                        backend.is_hosted_openai()
+                    let inert_tunables = if role.is_reasoning() {
+                        // Resolve through `slot.tunables` — the same fallbacks the wire
+                        // path takes, so a `[defaults].thinking_style` (which the old
+                        // `unwrap_or_default()` here silently ignored) can't make the
+                        // render disagree with what actually ships.
+                        let t = slot.tunables(*role, &config.defaults);
+                        let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
+                        // Lane-aware: a `lane = "batch"` slot never builds an interactive
+                        // arm. Batch POSTs its own body and gates the Responses shape on
+                        // the endpoint-exact `is_hosted_openai`; the interactive arm
+                        // follows the configurable `uses_responses_wire` (a responses-wire
+                        // gateway shapes like Platform even though it isn't
+                        // batch-eligible).
+                        let batch_lane = matches!(lane, Some(Lane::Batch));
+                        let responses_wire = if batch_lane {
+                            backend.is_hosted_openai()
+                        } else {
+                            backend.uses_responses_wire()
+                        };
+                        let mut inert = Vec::new();
+                        // Whether the effort ships is a policy with exactly one
+                        // implementation — `Config::effort_disposition`. The render asks
+                        // it rather than re-deriving (drop? batch lift? off-switch?),
+                        // which is what keeps this and the startup warning from ever
+                        // telling an operator different stories about the same slot.
+                        let disposition = config
+                            .effort_disposition(slot, *role)
+                            .expect("a loaded cast's slot backend resolves");
+                        // Batch hands the provider no sampling at all (`None`/`None`), so
+                        // a `temperature` on a batch slot is inert regardless of the model.
+                        let sampling_sinks = if batch_lane {
+                            false
+                        } else if responses_wire {
+                            crate::consult::hosted_openai_accepts_sampling(&slot.id)
+                        } else {
+                            shape.sinks_sampling()
+                        };
+                        if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
+                            inert.push("thinking_budget");
+                        }
+                        // The *effective* effort, not just a per-slot override: a
+                        // `[defaults]`/env effort lands on every cast, and one that lands
+                        // nowhere deserves the same flag. Inherited built-in defaults stay
+                        // quiet — see `Defaults::explorer_effort_explicit`.
+                        if disposition.explicit && !disposition.ships_as_configured() {
+                            inert.push("effort");
+                        }
+                        if temperature.is_some() && !sampling_sinks {
+                            inert.push("temperature");
+                        }
+                        inert
                     } else {
-                        backend.uses_responses_wire()
+                        // A media slot sends one generation request with no reasoning
+                        // phase, so every reasoning knob WRITTEN on the slot is inert —
+                        // and the request-shaping machinery (`ModelShape`,
+                        // `effort_disposition`) is deliberately not resolved for it (see
+                        // `ModelRole::is_reasoning`). Same single policy the startup
+                        // warning reads (`Config::media_tunable_diagnostics`); inherited
+                        // `[defaults]` values stay quiet.
+                        slot.written_reasoning_tunables()
                     };
-                    let mut inert_tunables = Vec::new();
-                    // Whether the effort ships is a policy with exactly one implementation
-                    // — `Config::effort_disposition`. The render asks it rather than
-                    // re-deriving (drop? batch lift? off-switch?), which is what keeps this
-                    // and the startup warning from ever telling an operator different
-                    // stories about the same slot.
-                    let disposition = config
-                        .effort_disposition(slot, *role)
-                        .expect("a loaded cast's slot backend resolves");
-                    // Batch hands the provider no sampling at all (`None`/`None`), so a
-                    // `temperature` on a batch slot is inert regardless of the model.
-                    let sampling_sinks = if batch_lane {
-                        false
-                    } else if responses_wire {
-                        crate::consult::hosted_openai_accepts_sampling(&slot.id)
-                    } else {
-                        shape.sinks_sampling()
-                    };
-                    if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
-                        inert_tunables.push("thinking_budget");
-                    }
-                    // The *effective* effort, not just a per-slot override: a
-                    // `[defaults]`/env effort lands on every cast, and one that lands
-                    // nowhere deserves the same flag. Inherited built-in defaults stay
-                    // quiet — see `Defaults::explorer_effort_explicit`.
-                    if disposition.explicit && !disposition.ships_as_configured() {
-                        inert_tunables.push("effort");
-                    }
-                    if temperature.is_some() && !sampling_sinks {
-                        inert_tunables.push("temperature");
-                    }
                     (
                         role.key(),
                         SlotDoc {
@@ -774,6 +787,63 @@ mod tests {
             inert("gpt_chat", "synth"),
             vec!["thinking_budget", "effort"],
             "hosted GPT chat sinks sampling but rejects reasoning effort and budget"
+        );
+    }
+
+    /// An image slot never runs a reasoning phase, so the render judges it by what the
+    /// operator WROTE on the slot, not by any wire shape: every written reasoning knob
+    /// is flagged inert, and a bare image slot stays clean even when `[defaults]`
+    /// carries a written synth effort (inherited values are a fallback artifact, not a
+    /// statement about the image slot). Same rule as the startup warning
+    /// (`Config::media_tunable_diagnostics`) — one policy, two surfaces.
+    #[test]
+    fn config_render_flags_written_reasoning_knobs_on_an_image_slot() {
+        let config = Config::from_toml_str(
+            r#"
+            [defaults]
+            # Written, synth-side: lands on reasoning slots, must NOT flag image slots.
+            synth_effort = "medium"
+
+            [backends.sd]
+            kind = "stability"
+
+            # Knobs written on the image slot itself: all inert, all flagged.
+            [casts.noisy]
+            synth = "deepseek/deepseek-v4-pro"
+            image = { backend = "sd", id = "core", thinking_budget = 4096, effort = "high", temperature = 0.5, thinking_style = "adaptive" }
+
+            # A bare image slot: nothing written, nothing flagged.
+            [casts.clean]
+            synth = "deepseek/deepseek-v4-pro"
+            image = "sd/ultra"
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let inert = |cast: &str, role: &str| -> Vec<String> {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .map(|a| {
+                    a.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            inert("noisy", "image"),
+            vec!["thinking_budget", "effort", "temperature", "thinking_style"],
+            "every reasoning knob written on the image slot is flagged"
+        );
+        assert!(
+            inert("clean", "image").is_empty(),
+            "a bare image slot is clean; the written [defaults] synth effort does not \
+             leak onto it"
         );
     }
 
