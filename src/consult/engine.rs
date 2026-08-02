@@ -570,34 +570,127 @@ pub struct ConsultOutput {
 const FINALIZE_NOTE: &str = "\
 STOP — you have reached your research limit and may not call any more tools. Using \
 only the evidence you have already gathered in this conversation, write your \
-COMPLETE final response now, with its concrete `file:line` citations. Do not call \
-any tool. Do not ask to continue. Write the full answer (or curated report) from \
-what you already have — right now.";
+COMPLETE final response now, with its concrete `file:line` citations. Where the \
+evidence runs out, say so plainly: naming what you do not know is part of a complete \
+answer. Do not call any tool. Do not ask to continue. Write the full answer (or \
+curated report) from what you already have.";
 
-/// Build the forced final turn from the transcript rig hands back at the turn cap.
+/// The forced-finish instruction for a phase that **stopped early** without writing
+/// its answer — distinct from [`FINALIZE_NOTE`], which is about running out of turns.
+/// A model that quit mid-investigation has budget left and needs to hear that it
+/// simply owes the write-up, not that it has been cut off. Same positive framing and
+/// front-and-back repetition, different fact.
+const EMPTY_ANSWER_NOTE: &str = "\
+Your last turn contained no answer text — the response came back empty. You have \
+already gathered evidence in this conversation, so nothing more needs investigating. \
+Using only that evidence, write your COMPLETE final response now, with its concrete \
+`file:line` citations. Where the evidence runs out, say so plainly: naming what you \
+do not know is part of a complete answer, not a reason to keep investigating. Do not \
+call any tool. Do not ask to continue. Write the full answer (or curated report) from \
+what you already have.";
+
+/// Build the forced final turn from a partial transcript.
 ///
 /// Returns `(history, prompt)` for one more constrained completion: the prompt is
-/// the conversation's last message with [`FINALIZE_NOTE`] appended (so the model
-/// reads the "answer now" instruction last), and `history` is everything before it.
+/// the conversation's last message with `note` appended (so the model reads the
+/// "answer now" instruction last), and `history` is everything before it. The note is
+/// a parameter because the two forced-finish paths mean different things —
+/// [`FINALIZE_NOTE`] (out of turns) vs. [`EMPTY_ANSWER_NOTE`] (stopped without
+/// answering) — and telling a model it hit a limit it did not hit is a lie that
+/// shapes its answer.
 ///
-/// At the cap the transcript's last message is almost always the user's
-/// tool-results turn (the loop broke just as the model was about to call yet
-/// another tool), so the note rides along inside that same user message — we never
-/// emit two user turns back to back, which some providers reject. If the transcript
-/// somehow ends on an assistant turn, the note becomes a fresh trailing user turn
-/// instead (valid after an assistant message). Pure and offline-testable.
-fn finalize_prompt(mut chat_history: Vec<Message>) -> (Vec<Message>, Message) {
+/// The transcript's last message is almost always the user's tool-results turn (the
+/// loop broke just as the model was about to call yet another tool), so the note
+/// rides along inside that same user message — we never emit two user turns back to
+/// back, which some providers reject. If the transcript somehow ends on an assistant
+/// turn, the note becomes a fresh trailing user turn instead (valid after an
+/// assistant message). Pure and offline-testable.
+fn finalize_prompt(mut chat_history: Vec<Message>, note: &str) -> (Vec<Message>, Message) {
     match chat_history.pop() {
         Some(Message::User { mut content }) => {
-            content.push(UserContent::text(FINALIZE_NOTE));
+            content.push(UserContent::text(note));
             (chat_history, Message::User { content })
         }
         Some(other) => {
             chat_history.push(other);
-            (chat_history, Message::user(FINALIZE_NOTE))
+            (chat_history, Message::user(note))
         }
-        None => (Vec::new(), Message::user(FINALIZE_NOTE)),
+        None => (Vec::new(), Message::user(note)),
     }
+}
+
+// --- the empty-answer guard ---------------------------------------------------
+
+/// Does this transcript show the model actually *gathered evidence*? True when any
+/// user turn carries a tool result — i.e. the model called something and got output
+/// back. This is the gate on [`run_phase`]'s one forced re-ask after an empty answer.
+///
+/// **Why the gate is shaped this way — do not "simplify" it into an unconditional
+/// retry.** A forced "write it now" turn handed to a model that has gathered *nothing*
+/// invites it to comply anyway, and what it produces is a confident, ungrounded answer
+/// on a lane whose entire product is grounded citation. So the case where a retry is
+/// least likely to succeed is also the case where succeeding is *dangerous*: a
+/// fabricated review is worse than an error, in the same way a silent empty is. With
+/// evidence in hand, the same turn is safe and usually sufficient — it asks a model
+/// that already did the work to write up what it found (the 2026-08-01 deepseek run:
+/// an explorer report delivered, fifteen greps returned, then a 14-token terminal turn
+/// with no text).
+///
+/// **What this does and does not prove.** rig folds a *failed* tool call into a tool
+/// result too — it stringifies the error and hands it back as the result
+/// (`rig-core/src/agent/prompt_request/mod.rs:1019-1025`) — so a tool result is proof
+/// the model got output back, not proof the output was useful. That is the right line
+/// anyway: a transcript of nothing but tool errors still yields an honest grounded
+/// answer ("I could not read X"), which is a fine thing to have asked for. What the
+/// gate excludes is the genuinely dangerous shape — zero tool interaction, pure
+/// generation, nothing to cite.
+fn transcript_has_tool_results(history: &[Message]) -> bool {
+    history.iter().any(|m| match m {
+        Message::User { content } => content
+            .iter()
+            .any(|c| matches!(c, UserContent::ToolResult(_))),
+        _ => false,
+    })
+}
+
+/// Fail a phase that produced no answer text, carrying the diagnostics that say what
+/// was burned to produce nothing.
+///
+/// The invariant this enforces: **an empty final answer is never a successful call.**
+/// A review that silently did not happen is worse than one that errors, because the
+/// caller merges on it. Same vocabulary as the batch lane's long-standing gate
+/// (`crate::batch`'s `finish_gated_answer`: "a completed-but-empty answer is no
+/// answer") — one concept, one wording, two lanes.
+///
+/// `finish_reason` comes off the phase's [`CompletionLog`] — the provider's own word
+/// for how its last completion ended, read from the raw response the [`Watched`]
+/// wrapper records. `None` means the provider reported none, and that is stated as
+/// absence rather than implied to be a clean stop: on some wires (OpenAI's Responses
+/// API) reporting nothing *is* the normal completion signal, so absence carries no
+/// verdict either way.
+fn empty_answer_error(
+    model: &str,
+    turns: usize,
+    max_turns: usize,
+    usage: &Usage,
+    finish_reason: Option<&str>,
+    detail: &str,
+) -> anyhow::Error {
+    let reason = match finish_reason {
+        Some(r) => format!("finish_reason \"{r}\" reported by the provider"),
+        None => "no finish_reason reported by the provider (normal on some wires)".to_string(),
+    };
+    anyhow!(
+        "model {model} returned an EMPTY answer — {detail}. It is not a result: a \
+         completed-but-empty answer is no answer, and returning it would hand you a \
+         review that never happened. Diagnostics: {turns} of {max_turns} turns used, \
+         {} input tokens ({} cached), {} output tokens, {} reasoning tokens reported; \
+         {reason}. Retry, or try the same question on a different cast.",
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_tokens,
+    )
 }
 
 // --- an image-bearing tool result on the user-turn channel (the openai VLM path) --
@@ -937,6 +1030,8 @@ where
     }
     let result = run_phase_loop(
         &watched(model.clone(), log.clone()),
+        log,
+        model_name,
         preamble,
         max_tokens,
         temperature,
@@ -962,6 +1057,8 @@ where
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 async fn run_phase_loop<M, F>(
     model: &Watched<M>,
+    log: &CompletionLog,
+    model_name: &str,
     preamble: &str,
     max_tokens: u64,
     temperature: Option<f64>,
@@ -998,6 +1095,8 @@ where
             full.push(prompt);
             return finalize_after_max_turns(
                 model,
+                log,
+                model_name,
                 preamble,
                 max_tokens,
                 temperature,
@@ -1042,13 +1141,94 @@ where
             .await;
 
         match result {
-            Ok(resp) => return Ok((resp.output, resp.usage)),
+            Ok(resp) if !resp.output.trim().is_empty() => return Ok((resp.output, resp.usage)),
+            // An `Ok` with no answer text. rig treats a textless terminal turn as a clean
+            // finish and hands back `output: ""` (its own
+            // `prompt_request_stops_cleanly_on_empty_terminal_turn` pins that as intended),
+            // so the check has to live here — the one seam every phase runs through, which
+            // is what makes `consult`/`oneshot`/`explore`/`deliberate` inherit it at once.
+            // The shape that produced it in the wild: a reasoning model whose last choice
+            // carried only a `Reasoning` block, which rig's text extraction filters out.
+            Ok(resp) => {
+                // The spent-so-far usage is real and must survive into whatever we return
+                // — this is the `Ok` path, so rig reported it exactly. The retry's usage is
+                // ADDED to it below, never substituted (the turn-cap path may legitimately
+                // replace, because rig reports none on `MaxTurnsError`).
+                let spent = resp.usage;
+                // rig builds this response at exactly one place and always attaches the
+                // transcript (`with_messages`, `prompt_request/mod.rs:918`), so `Some` is
+                // the structural case. `None` is unreachable-by-construction defensive
+                // code, and it fails CLOSED: no transcript means no evidence to gate on,
+                // and re-asking blind is the fabrication risk the gate exists to refuse.
+                let turns = count_model_turns(&history) + resp.completion_calls.len();
+                let transcript = resp.messages.unwrap_or_default();
+                if !transcript_has_tool_results(&transcript) {
+                    return Err(empty_answer_error(
+                        model_name,
+                        turns,
+                        max_turns,
+                        &spent,
+                        log.last_finish_reason().as_deref(),
+                        "it stopped without answering, and its transcript holds no tool \
+                         results to write up — asking it to answer anyway would invite an \
+                         ungrounded review",
+                    ));
+                }
+                // Evidence in hand: ask for the write-up it owed. **At most once, and
+                // structurally so** — this arm returns on every path (the forced turn's
+                // answer, or an error), so it never re-enters the loop and cannot stack a
+                // second re-ask. That is a stronger guarantee than a `finalized` flag,
+                // which a later edit could reset; the shape itself forbids the loop. Pinned
+                // by `an_empty_forced_write_up_turn_errors_and_is_never_retried_twice`.
+                tracing::warn!(
+                    model = model_name,
+                    turns,
+                    output_tokens = spent.output_tokens,
+                    "phase returned an empty answer with evidence gathered — forcing one \
+                     final write-up turn"
+                );
+                progress.emit(PhaseEvent::TurnCapReached);
+                let mut full = history;
+                full.extend(transcript);
+                let (answer, retry_usage) = forced_finish_turn(
+                    model,
+                    preamble,
+                    max_tokens,
+                    temperature,
+                    thinking,
+                    make_tools()?,
+                    full,
+                    EMPTY_ANSWER_NOTE,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "model {model_name} returned an empty answer, and the forced \
+                         final-answer turn also failed: {e}"
+                    )
+                })?;
+                let usage = spent + retry_usage;
+                if answer.trim().is_empty() {
+                    return Err(empty_answer_error(
+                        model_name,
+                        turns + 1,
+                        max_turns,
+                        &usage,
+                        log.last_finish_reason().as_deref(),
+                        "it was asked once to write the answer it owed and came back empty \
+                         again",
+                    ));
+                }
+                return Ok((answer, usage));
+            }
             Err(PromptError::MaxTurnsError { chat_history, .. }) => {
                 // The loop hit its cap and is about to write a forced final answer —
                 // tell the caller, so a watching client sees "wrapping up" not silence.
                 progress.emit(PhaseEvent::TurnCapReached);
                 return finalize_after_max_turns(
                     model,
+                    log,
+                    model_name,
                     preamble,
                     max_tokens,
                     temperature,
@@ -1076,12 +1256,18 @@ where
     }
 }
 
-/// The forced final turn after a phase hit its turn cap: replay the partial
-/// transcript and make the model write its answer now, with tools declared (so the
-/// history validates) but [`ToolChoice::None`] forbidding any further call. See
-/// [`run_phase`]'s recovery note and [`finalize_prompt`].
+/// One forced final turn: replay the partial transcript and make the model write its
+/// answer now, with tools declared (so the history validates) but [`ToolChoice::None`]
+/// forbidding any further call. The shared shape behind both recoveries — out of turns
+/// ([`finalize_after_max_turns`], [`FINALIZE_NOTE`]) and stopped-without-answering
+/// ([`run_phase`], [`EMPTY_ANSWER_NOTE`]) — which differ only in the note they append
+/// and the failure they report, so the rig plumbing lives here once.
+///
+/// Returns rig's error unwrapped so each caller can say what it was recovering *from*;
+/// it deliberately does not judge the answer, leaving the empty check to the callers
+/// that know which diagnostics belong on it.
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-async fn finalize_after_max_turns<M>(
+async fn forced_finish_turn<M>(
     model: &M,
     preamble: &str,
     max_tokens: u64,
@@ -1089,12 +1275,12 @@ async fn finalize_after_max_turns<M>(
     thinking: Option<&Value>,
     tools: Vec<DynamicTool>,
     chat_history: Vec<Message>,
-    max_turns: usize,
-) -> Result<(String, Usage)>
+    note: &str,
+) -> std::result::Result<(String, Usage), PromptError>
 where
     M: CompletionModel + 'static,
 {
-    let (history, prompt) = finalize_prompt(chat_history);
+    let (history, prompt) = finalize_prompt(chat_history, note);
     let mut builder = AgentBuilder::new(model.clone())
         .preamble(preamble)
         .max_tokens(max_tokens)
@@ -1116,12 +1302,58 @@ where
         .run()
         .await
         .map(|resp| (resp.output, resp.usage))
-        .map_err(|e| {
-            anyhow!(
-                "model used all {max_turns} turns, and the forced final-answer turn \
-                 also failed to conclude: {e}"
-            )
-        })
+}
+
+/// The forced final turn after a phase hit its turn cap. See [`run_phase`]'s recovery
+/// note and [`forced_finish_turn`].
+///
+/// Spending the entire turn budget and *still* delivering nothing is a failure, not an
+/// empty success — so the answer passes the same [`empty_answer_error`] gate the early-
+/// stop path uses. There is no re-ask here: this already **is** the re-ask.
+#[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
+async fn finalize_after_max_turns<M>(
+    model: &M,
+    log: &CompletionLog,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    thinking: Option<&Value>,
+    tools: Vec<DynamicTool>,
+    chat_history: Vec<Message>,
+    max_turns: usize,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+{
+    let (answer, usage) = forced_finish_turn(
+        model,
+        preamble,
+        max_tokens,
+        temperature,
+        thinking,
+        tools,
+        chat_history,
+        FINALIZE_NOTE,
+    )
+    .await
+    .map_err(|e| {
+        anyhow!(
+            "model used all {max_turns} turns, and the forced final-answer turn \
+             also failed to conclude: {e}"
+        )
+    })?;
+    if answer.trim().is_empty() {
+        return Err(empty_answer_error(
+            model_name,
+            max_turns,
+            max_turns,
+            &usage,
+            log.last_finish_reason().as_deref(),
+            "it used every turn and then wrote nothing when forced to conclude",
+        ));
+    }
+    Ok((answer, usage))
 }
 
 /// One completion, no agent and no loop — the single-shot phases said plainly.
@@ -1200,6 +1432,22 @@ where
             _ => None,
         })
         .collect::<String>();
+    // The single-shot lanes are toolless by definition, so an empty answer here can
+    // never satisfy the evidence gate the loop's recovery runs on — there is nothing
+    // gathered to write up, and no re-ask that wouldn't invite an ungrounded answer.
+    // Fail with the same diagnostics vocabulary as the loop, finish reason included
+    // (this path reads it off its own log).
+    if answer.trim().is_empty() {
+        return Err(empty_answer_error(
+            model_name,
+            1,
+            1,
+            &response.usage,
+            log.last_finish_reason().as_deref(),
+            "the single toolless completion returned no answer text, and a lane with \
+             no tools has no gathered evidence to write up, so kaibo does not re-ask",
+        ));
+    }
     Ok((answer, response.usage))
 }
 
@@ -1458,6 +1706,21 @@ impl Tool for RunExplore {
             .usage_sink
             .lock()
             .expect("explore usage sink poisoned") += usage;
+        // A sweep that reported nothing is a *failed* sweep, not an empty one. Handing the
+        // driver a blank tool result is the same silent-empty class one level down, and
+        // worse in one way: the driver cannot tell a blank sweep from a sweep that found
+        // nothing, so it would answer as though the breadth had been covered. As an error
+        // it becomes visible — rig folds it back as this tool's result and the driver
+        // recovers (re-delegate, or read the spans itself). Checked AFTER the usage fold,
+        // because those tokens were spent either way and the footer must say so.
+        // `run_phase`'s own guard makes this near-unreachable today; it stays as this
+        // seam's invariant, not a duplicate of that one.
+        if report.trim().is_empty() {
+            return Err(RunExploreError(
+                "the explorer returned an empty report — no findings reached the driver"
+                    .to_string(),
+            ));
+        }
         // The `reports` sink feeds `ConsultOutput.report` (the readable artifact a
         // caller sees via `include_report`) — the explorer's own prose only, never
         // the routed bytes (those already reached the driver on the tool result; a
@@ -1926,8 +2189,9 @@ mod tests {
 
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
-        has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, usage, with_raw, with_usage, CaptureHttp, RecordingSink, ScriptedClient,
+        has_tool, is_finalize_turn, provider_error, reasoning_response, text_response,
+        tool_call_response, transcript_text, usage, with_raw, with_usage, CaptureHttp,
+        RecordingSink, ScriptedClient,
     };
     use rig_core::completion::CompletionRequest;
     use std::fs;
@@ -2008,6 +2272,13 @@ mod tests {
                 Ok(text_response(format!("ANSWER[{question}]")))
             })
             .build()
+    }
+
+    /// True for a recorded request that is a forced final turn (`ToolChoice::None`) —
+    /// the observable signature of a turn-cap or empty-answer recovery. Taken by
+    /// reference so it drops straight into `.filter(..)` over recorded requests.
+    fn is_finalize_request(r: &crate::test_support::RecordedRequest) -> bool {
+        r.tool_choice == Some(ToolChoice::None)
     }
 
     /// A project root with one real file carrying a known marker, so the kaish reads
@@ -4247,6 +4518,414 @@ mod tests {
         );
     }
 
+    // --- the silent-empty-answer battery (GH: consult returns just the footer) -------
+    //
+    // Reported 2026-08-01: a `consult_submit` on cast `deepseek` burned 16,801 output
+    // tokens and returned an EMPTY answer body — just the provenance footer — while the
+    // same question on `or-kimi` returned a full cited review. The generation happened;
+    // nothing reached the caller. These four tests pin the shapes that produce an empty
+    // final answer with **no error**, which is the worst possible failure: the calling
+    // agent merges on a review that silently did not happen.
+    //
+    // All four are RED on purpose until the guard lands. The fix is *not* to make the
+    // loop invent text — it is to fail the call loudly with the diagnostics attached,
+    // exactly as the batch lane already does (`batch.rs::finish_gated_answer`, GH #75).
+
+    /// **The DeepSeek repro.** A reasoning-only terminal turn: `reasoning_content` with
+    /// an empty `content`. rig's deepseek converter drops the empty text block and emits
+    /// a choice holding only `AssistantContent::Reasoning`
+    /// (`rig-core/src/providers/deepseek.rs:400,:420`); rig sees no tool calls, so it
+    /// takes the clean-finish branch and extracts text with `assistant_text_from_choice`,
+    /// which filters to `Text` and yields `""`
+    /// (`rig-core/src/agent/prompt_request/mod.rs:569`, `:887`, `:918`). `run_phase`
+    /// passes that straight through (`engine.rs:862`), and every layer above — the
+    /// provenance footer, the job result — happily renders an empty answer.
+    ///
+    /// A consult that produced no answer must never be a successful empty. With evidence
+    /// already gathered, the recovery is to ask once for the write-up it owed — which is
+    /// what job-1 needed: the driver held an explorer report and fifteen greps, and
+    /// stopped mid-investigation with a 14-token terminal turn.
+    ///
+    /// **Gate direction 1 of 2: evidence present ⇒ retry, and the retry's answer stands.**
+    #[tokio::test]
+    async fn an_empty_answer_with_evidence_is_recovered_by_one_forced_write_up_turn() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        const RECOVERED: &str = "REVIEW: src/foo.rs:1 defines the marker.";
+        let client = ScriptedClient::builder()
+            // Sweep once (so real evidence and real tokens are on the record), "answer"
+            // with reasoning only — the exact wire shape that produced the empty body —
+            // then write the review when forced to conclude.
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(with_usage(text_response(RECOVERED), usage(36_104, 3_971)))
+                } else if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(with_usage(
+                        reasoning_response("I have finished reviewing. Now to write it up..."),
+                        usage(1_164_958, 16_801),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let dir = project_with_marker();
+        let out = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect("an empty answer backed by real evidence must be recovered, not failed");
+
+        assert!(
+            out.answer.contains(RECOVERED),
+            "the forced write-up turn's answer must be what the caller gets: {:?}",
+            out.answer
+        );
+
+        // Exactly ONE forced turn — the recovery is bounded, not a retry loop.
+        let finalizes: Vec<_> = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .filter(is_finalize_request)
+            .collect();
+        assert_eq!(
+            finalizes.len(),
+            1,
+            "the empty answer must buy exactly one forced write-up turn"
+        );
+
+        // It must carry the accumulated evidence — a forced turn over a blank history
+        // would just invite the ungrounded answer the gate exists to refuse.
+        assert!(
+            finalizes[0].transcript.contains("SWEEP_DONE"),
+            "the forced turn must replay the gathered evidence, got: {:?}",
+            finalizes[0].transcript
+        );
+        // ...and it must say *stopped without answering*, not *out of turns*. The model
+        // had 198 turns left; telling it otherwise is a lie that shapes its answer.
+        assert!(
+            finalizes[0].transcript.contains("came back empty"),
+            "the forced turn must carry EMPTY_ANSWER_NOTE: {:?}",
+            finalizes[0].transcript
+        );
+        assert!(
+            !finalizes[0].transcript.contains("reached your research limit"),
+            "the forced turn must NOT claim a turn cap that was never hit: {:?}",
+            finalizes[0].transcript
+        );
+
+        // The retry's usage is ADDED to what was already spent, never substituted —
+        // the caller paid for both, so the footer must say so. (16,801 + 3,971.)
+        assert_eq!(
+            out.usage.output_tokens, 20_772,
+            "the pre-retry spend must survive into the returned usage"
+        );
+        assert_eq!(out.usage.input_tokens, 1_201_062);
+    }
+
+    /// **Gate direction 2 of 2: no evidence ⇒ error, and no forced turn is even attempted.**
+    ///
+    /// This is the load-bearing half. A forced "write it now" handed to a model that
+    /// gathered *nothing* invites it to comply anyway, producing a confident ungrounded
+    /// answer on a lane whose whole product is grounded citation — strictly worse than an
+    /// error. So we assert the *absence* of the second request, not merely that the call
+    /// failed: an implementation that retried blind and happened to get an empty answer
+    /// back would pass an error-only assertion while being exactly wrong.
+    #[tokio::test]
+    async fn an_empty_answer_with_no_evidence_errors_without_asking_the_model_again() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        let client = ScriptedClient::builder()
+            // Straight to a reasoning-only turn: no tool calls, so no tool results, so
+            // nothing to write up. The raw payload carries the provider's own
+            // finish_reason, the way a real deepseek response would — the error must
+            // surface it.
+            .on_model(SYNTH, |_req| {
+                Ok(with_raw(
+                    with_usage(
+                        reasoning_response("Hmm, where should I even start..."),
+                        usage(6_342, 199),
+                    ),
+                    serde_json::json!({"choices": [{"finish_reason": "stop"}]}),
+                ))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("an empty answer with no evidence gathered must fail");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no tool results"),
+            "the error must name the reason the retry was withheld: {msg}"
+        );
+        // The teeth: the model was never asked to answer anyway.
+        assert!(
+            !client.requests_for(SYNTH).iter().any(is_finalize_request),
+            "a model with no evidence must NOT be asked to write an answer anyway — \
+             that invites a fabricated review, which is worse than an error"
+        );
+        // And the diagnostics still ride along.
+        assert!(
+            msg.contains("199"),
+            "the error must carry the output-token count: {msg}"
+        );
+        assert!(
+            msg.contains("finish_reason \"stop\""),
+            "the error must name the provider's own finish_reason: {msg}"
+        );
+    }
+
+    /// At most once, proven: evidence is present so the retry fires, the forced turn *also*
+    /// comes back empty, and that is an error — not a second re-ask. `run_phase`'s
+    /// empty-answer arm returns on every path, so the bound is structural rather than
+    /// flag-enforced; this is what would fail if a later edit turned it into a loop.
+    #[tokio::test]
+    async fn an_empty_forced_write_up_turn_errors_and_is_never_retried_twice() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        let client = ScriptedClient::builder()
+            // Reasoning-only forever, including when forced to conclude.
+            .on_model(SYNTH, |req| {
+                if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(with_usage(
+                        reasoning_response("...still thinking..."),
+                        usage(1_000, 500),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a forced write-up turn that is also empty must fail, not re-ask again");
+
+        assert!(
+            format!("{err:#}").contains("came back empty again"),
+            "the error must name the exhausted recovery: {err:#}"
+        );
+        assert_eq!(
+            client
+                .requests_for(SYNTH)
+                .into_iter()
+                .filter(is_finalize_request)
+                .count(),
+            1,
+            "exactly one forced turn — the recovery must never stack"
+        );
+    }
+
+    /// The same hole through the *other* door: a terminal turn whose text block is
+    /// present but empty. rig normalizes that to "no assistant output"
+    /// (`is_empty_assistant_turn`, `prompt_request/mod.rs:561`) and still returns
+    /// `Ok` with `output == ""` — rig's own
+    /// `prompt_request_stops_cleanly_on_empty_terminal_turn` test pins that as intended
+    /// upstream behavior. So kaibo cannot delegate this check to rig; the guard has to
+    /// live at `run_phase`'s `Ok` arm. A provider-independent shape: any model that
+    /// finishes with no text lands here.
+    #[tokio::test]
+    async fn an_empty_text_terminal_turn_fails_loudly_instead_of_answering_empty() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |_req| {
+                Ok(with_usage(text_response("   \n  "), usage(1000, 9000)))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let err = consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a whitespace-only answer is no answer — it must fail, not succeed empty");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no answer"),
+            "the error must name the empty answer: {msg}"
+        );
+    }
+
+    /// Amy's candidate 1, checked at the place it actually bites. `run_phase` *does*
+    /// recover from a turn cap — it runs a forced finalize turn
+    /// (`finalize_after_max_turns`, `engine.rs:901`) rather than returning the last
+    /// message blindly. But that turn's answer is extracted the same way
+    /// (`engine.rs:935`), so a finalize turn that produces only reasoning is *also* a
+    /// silent empty — and the turn-cap hit itself never reaches the caller (it's a
+    /// progress beat only, `engine.rs:812,:866`). Burning the whole budget and
+    /// delivering nothing must be loud, and must name the cap.
+    #[tokio::test]
+    async fn a_reasoning_only_finalize_turn_after_the_turn_cap_fails_loudly() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(with_usage(
+                        reasoning_response("still thinking about how to start..."),
+                        usage(500_000, 12_000),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t",
+                        "run_kaish",
+                        json!({ "script": "cat src/foo.rs" }),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            synth_max_turns: 2,
+            ..ConsultConfig::default()
+        };
+        let err = consult_with(
+            "a question the model never finishes answering",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect_err(
+            "spending the whole turn budget and then delivering no text must be an \
+             error, not an empty success",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains('2'),
+            "the error must name the turn cap that was hit: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("empty") || msg.to_lowercase().contains("no answer"),
+            "the error must name the empty answer: {msg}"
+        );
+    }
+
+    /// The fourth door, which the report shape hides: the **explorer** phase. The
+    /// top-level `explore` tool returns its report verbatim, so a reasoning-only
+    /// explorer turn ships a report body that is just the footer — same silent shape,
+    /// different tool. (Inside `consult` this lands as an empty `explore′` tool result,
+    /// which is arguably worse: the driver reasons on a blank sweep and never learns
+    /// the sweep failed.)
+    #[tokio::test]
+    async fn a_reasoning_only_explorer_report_fails_loudly_instead_of_reporting_empty() {
+        const EXPLORER: &str = "deepseek-v4-flash";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |_req| {
+                Ok(with_usage(
+                    reasoning_response("I have surveyed the repo and concluded..."),
+                    usage(200_000, 4_000),
+                ))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let err = explore_with(
+            "where does the cast live?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &ExploreConfig::default(),
+            &[],
+            None,
+        )
+        .await
+        .expect_err("an explorer that reported nothing must fail, not return an empty report");
+        // No tool results in its transcript, so no blind re-ask — the same gate.
+        assert!(
+            !client.requests_for(EXPLORER).iter().any(is_finalize_request),
+            "an explorer with no evidence must not be asked to report anyway"
+        );
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no answer") || msg.contains("no report"),
+            "the error must name the empty report: {msg}"
+        );
+    }
+
+    /// The guard lives at the **shared seam** (`run_phase`), not on the `consult` path,
+    /// so every tool built on that loop inherits it from one place. `oneshot` and
+    /// `deliberate_direct` are the toolless lanes: they can never satisfy the evidence
+    /// gate (no tools ⇒ no tool results), so for them an empty answer is *always* the
+    /// error case — which is the right answer, since a toolless model asked to "write it
+    /// now" has nothing but its own priors to write from.
+    ///
+    /// If a future refactor moves the guard up into `consult_with`, these two go silently
+    /// empty again — that is exactly the regression this pins.
+    #[tokio::test]
+    async fn the_empty_answer_guard_covers_the_toolless_lanes_too() {
+        const MODEL: &str = "reasoner";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| {
+                Ok(with_usage(
+                    reasoning_response("Considering the question..."),
+                    usage(2_000, 800),
+                ))
+            })
+            .build();
+
+        let err = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .expect_err("oneshot must not return an empty answer as a success");
+        assert!(
+            format!("{err:#}").contains("EMPTY answer"),
+            "oneshot must fail with the shared empty-answer error: {err:#}"
+        );
+
+        let err = deliberate_direct(
+            "q",
+            "the dossier",
+            &[],
+            &arm(&client, MODEL),
+            "system",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("deliberate_direct must not return an empty answer as a success");
+        assert!(
+            format!("{err:#}").contains("EMPTY answer"),
+            "deliberate_direct must fail with the shared empty-answer error: {err:#}"
+        );
+
+        // Neither lane re-asked: no evidence is possible without tools, so the gate holds.
+        assert!(
+            !client.requests_for(MODEL).iter().any(is_finalize_request),
+            "a toolless lane can never satisfy the evidence gate, so it must never re-ask"
+        );
+    }
+
     /// Thinking params must reach *every* model call — the consult driver and each
     /// nested `explore′`. All other tests pass `None` for thinking, so a regression
     /// that dropped `additional_params` in `run_phase`, or stopped `RunExplore`
@@ -5675,7 +6354,7 @@ mod tests {
             Message::assistant("calling a tool"),
             Message::user("tool results"),
         ];
-        let (rest, prompt) = finalize_prompt(history);
+        let (rest, prompt) = finalize_prompt(history, FINALIZE_NOTE);
 
         // The trailing user turn becomes the prompt and carries both its original
         // content and the appended note.
@@ -5695,7 +6374,7 @@ mod tests {
     #[test]
     fn finalize_adds_user_turn_when_transcript_ends_on_assistant() {
         let history = vec![Message::user("Q"), Message::assistant("partial thoughts")];
-        let (rest, prompt) = finalize_prompt(history);
+        let (rest, prompt) = finalize_prompt(history, FINALIZE_NOTE);
 
         assert!(
             user_text(&prompt).contains(FINALIZE_NOTE),
