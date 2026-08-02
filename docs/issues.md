@@ -334,6 +334,22 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
+### Batch results don't cross-check returned `custom_id`s against the submitted set
+From the 2026-08-02 batch error-propagation audit (DeepSeek agentic consult, key claims
+verified by hand — the audit's overall verdict was that per-item propagation is SOUND:
+loud per-item `Err`s on all three providers, `finish_gated_answer` on every succeeded
+path at `batch.rs:548/986/1625`, no error detail discarded). The one blind spot: none of
+the three result parsers (`parse_results_jsonl` `batch.rs:524`, `parse_gemini_inlined`
+`:975`, `parse_openai_output_jsonl` `:1579`) verifies that every submitted `custom_id`
+came back. A provider that silently drops an item yields N-1 results with no error about
+the missing one — "Batch complete — 9 result(s)" after submitting 10. Fix shape: carry
+the submitted count (or id set) on the handle and emit a synthetic per-item failure for
+each absentee at parse time. Two accepted-as-designed observations from the same audit,
+recorded so they aren't re-flagged: Anthropic has no batch-level `Failed` state ("ended"
+covers all outcomes; per-item errors live inside `Done`, and `job_list` is a triage view —
+`job_get` has the detail), and Gemini's errored-item summarizer probes only
+`error.message` before falling back to the full JSON (data preserved, label coarser).
+
 ### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
 The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
 tracker pointer. Direction settled 2026-06-25 (w/ Amy): **stay OSS / GitHub-native** —
