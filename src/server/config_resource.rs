@@ -1037,8 +1037,14 @@ mod tests {
             body.contains("/tmp/test-allowed"),
             "config resource must show the allowed set:\n{body}"
         );
-        // Backends and casts include the built-in four.
-        for name in ["anthropic", "deepseek", "gemini", "openai-local"] {
+        // Backends and casts include the built-in five.
+        for name in [
+            "anthropic",
+            "deepseek",
+            "gemini",
+            "openrouter",
+            "openai-local",
+        ] {
             assert!(
                 body.contains(&format!("[backends.{name}]")),
                 "config resource must list the {name} backend:\n{body}"
