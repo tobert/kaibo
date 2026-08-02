@@ -4879,12 +4879,24 @@ mod tests {
         // job is a migration-pointing load error, not a knob anyone should type.
         let undocumented = ["profiles"];
         let mut missing = Vec::new();
+        // A word-boundary match, not bare `contains`: short names (`id`, `log`,
+        // `lane`, `kind`) are substrings of ordinary prose (`guide`, `changelog`),
+        // and a bare containment check would keep passing after the knob's real
+        // documentation vanished (gemini cross-family review, 2026-08-02).
+        let mentions = |field: &str| {
+            let is_word =
+                |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            template.match_indices(field).any(|(i, _)| {
+                !is_word(template[..i].chars().next_back())
+                    && !is_word(template[i + field.len()..].chars().next())
+            })
+        };
         let mut check = |strukt: &str, fields: Vec<String>| {
             for f in fields {
                 if undocumented.contains(&f.as_str()) {
                     continue;
                 }
-                if !template.contains(&f) {
+                if !mentions(&f) {
                     missing.push(format!("{strukt}.{f}"));
                 }
             }
