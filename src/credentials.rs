@@ -179,6 +179,73 @@ impl ProviderKind {
     pub fn key_file(self, home: &Path) -> PathBuf {
         home.join(self.key_file_name())
     }
+
+    /// Which side of the completion/media line this kind lives on — the structural
+    /// gate that keeps media kinds out of the completion-path machinery. Exhaustive
+    /// on purpose: a new `ProviderKind` variant fails to compile until it is
+    /// classified here, and that one decision is the *only* completion-vs-media
+    /// decision the new kind has to make. Everything downstream matches on
+    /// [`WireKind`] or [`MediaKind`] and never sees the other family.
+    pub fn class(self) -> ProviderClass {
+        match self {
+            ProviderKind::Anthropic => ProviderClass::Wire(WireKind::Anthropic),
+            ProviderKind::DeepSeek => ProviderClass::Wire(WireKind::DeepSeek),
+            ProviderKind::Gemini => ProviderClass::Wire(WireKind::Gemini),
+            ProviderKind::OpenRouter => ProviderClass::Wire(WireKind::OpenRouter),
+            ProviderKind::Openai => ProviderClass::Wire(WireKind::Openai),
+            ProviderKind::Stability => ProviderClass::Media(MediaKind::Stability),
+        }
+    }
+
+    /// The completion wire behind this kind, or `None` for a media kind — the
+    /// convenience form of [`class`](Self::class) for the completion entry points
+    /// (`ModelShape::resolve`, `ModelCaps::resolve`, `EffortWire::resolve`,
+    /// `batch_supported`), each of which answers the media case once at its top
+    /// instead of growing a media arm in every internal match.
+    pub fn wire(self) -> Option<WireKind> {
+        match self.class() {
+            ProviderClass::Wire(w) => Some(w),
+            ProviderClass::Media(_) => None,
+        }
+    }
+
+    /// Is this a media-generation kind (no completion model behind it)?
+    pub fn is_media(self) -> bool {
+        matches!(self.class(), ProviderClass::Media(_))
+    }
+}
+
+/// A completion wire protocol — the [`ProviderKind`] subset rig builds a
+/// `CompletionModel` for. The completion-path machinery (request shaping, effort
+/// wires, the vision/transport classifiers, batch eligibility, `Arm` construction)
+/// matches on THIS enum, so a media kind can never reach those matches and a new
+/// piece of completion machinery needs no media arm at all. Reached only through
+/// [`ProviderKind::class`]/[`ProviderKind::wire`], whose exhaustive match is where a
+/// new kind gets classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireKind {
+    Anthropic,
+    DeepSeek,
+    Gemini,
+    OpenRouter,
+    Openai,
+}
+
+/// A media-generation API — a backend kaibo drives through its own facade and the
+/// [`crate::media::MediaModel`] seam, never through rig's completion machinery. Valid
+/// only on media cast slots (`image` today); the load-time role/kind guard in
+/// `config.rs` refuses every other pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// Stability AI's v2beta family, via `src/stability.rs`.
+    Stability,
+}
+
+/// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderClass {
+    Wire(WireKind),
+    Media(MediaKind),
 }
 
 impl std::str::FromStr for ProviderKind {

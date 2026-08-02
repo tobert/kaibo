@@ -1579,15 +1579,19 @@ impl Config {
             // ROOT — rig's `ClientBuilder::base_url` appends its own versioned path
             // (`/v1beta/models/...` for Gemini) rather than taking one baked in; see
             // `GeminiBatch::base_url` (`batch.rs`) for the batch lane's matching
-            // reconciliation.
+            // reconciliation. `stability` takes one on the same optional host-root
+            // contract: kaibo's own facade appends `/v2beta/...` (`StabilityClient`),
+            // and unset dials the real https://api.stability.ai.
             if b.kind != ProviderKind::Openai
                 && b.kind != ProviderKind::Anthropic
                 && b.kind != ProviderKind::Gemini
+                && b.kind != ProviderKind::Stability
                 && b.base_url.is_some()
             {
                 bail!(
                     "backend {:?} (kind {:?}) sets base_url, but only the `openai`, \
-                     `anthropic`, and `gemini` kinds have a configurable endpoint",
+                     `anthropic`, `gemini`, and `stability` kinds have a configurable \
+                     endpoint",
                     b.name,
                     b.kind
                 );
@@ -2178,15 +2182,17 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
 /// casts; they drift — keep in sync with the source-of-truth pal configs
 /// (`provider-model-ids` memory).
 pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
-    match kind {
-        // Stability seeds no built-in cast: it staffs only the `image` slot, which no
-        // built-in carries, and it has no explorer/synth to name. Returning empty ids
-        // rather than plausible-looking ones keeps a mistaken caller loud — an empty
-        // model id fails at request time instead of silently dialing a wrong model.
-        ProviderKind::Stability => ("", ""),
-        ProviderKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
-        ProviderKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
-        ProviderKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
+    // A media kind seeds no built-in cast: it staffs only media slots, which no
+    // built-in carries, and it has no explorer/synth to name. Returning empty ids
+    // rather than plausible-looking ones keeps a mistaken caller loud — an empty
+    // model id fails at request time instead of silently dialing a wrong model.
+    let Some(wire) = kind.wire() else {
+        return ("", "");
+    };
+    match wire {
+        credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
+        credentials::WireKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
+        credentials::WireKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
         // OpenRouter's job here is a family we *can't* reach directly (we key
         // DeepSeek, Gemini, and Anthropic on their own backends), so the gateway
         // default is Qwen — a distinct lineage for a genuine cross-family read.
@@ -2198,8 +2204,8 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         // which is text-only (hence the synth slot takes no vision pin below). If
         // you'd rather keep vision on the synth, swap in the multimodal plus tier
         // `qwen/qwen3.7-plus` (weaker reasoner, ~4.5× cheaper) and pin its vision on.
-        ProviderKind::OpenRouter => ("qwen/qwen3.6-flash", "qwen/qwen3.7-max"),
-        ProviderKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
+        credentials::WireKind::OpenRouter => ("qwen/qwen3.6-flash", "qwen/qwen3.7-max"),
+        credentials::WireKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
 
@@ -4636,7 +4642,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("only the `openai`, `anthropic`, and `gemini` kinds"),
+            err.contains("only the `openai`, `anthropic`, `gemini`, and `stability` kinds"),
             "got: {err}"
         );
     }
@@ -4654,6 +4660,20 @@ mod tests {
         .unwrap();
         let b = cfg.backends.get("anthropic").unwrap();
         assert_eq!(b.base_url.as_deref(), Some("http://ai.example.ts.net"));
+    }
+
+    /// The stability kind takes an optional base_url on the same host-root contract:
+    /// kaibo's own facade appends `/v2beta/...` (`StabilityClient`), so a gateway or a
+    /// test double in front of the real API is one config line. Unset still dials
+    /// api.stability.ai (`STABILITY_API_BASE`, applied in `MediaArm::from_slot`).
+    #[test]
+    fn stability_backend_accepts_a_base_url() {
+        let cfg = Config::from_toml_str(
+            "[backends.sd]\nkind = \"stability\"\nbase_url = \"http://sd.example.ts.net\"\n",
+        )
+        .unwrap();
+        let b = cfg.backends.get("sd").unwrap();
+        assert_eq!(b.base_url.as_deref(), Some("http://sd.example.ts.net"));
     }
 
     /// The gemini kind may also set base_url — for a Gemini-API-compatible

@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use crate::attach::Attachment;
 use crate::completion_watch::{watched, CompletionLog, Watched};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
-use crate::credentials::ProviderKind;
+use crate::credentials::WireKind;
 use crate::explorer::RunKaish;
 use crate::progress::{PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
@@ -366,20 +366,25 @@ impl Arm {
         // (the 2026-06-06 wedge; see the helper's doc). Injected via rig's `.http_client(..)`.
         let http = crate::tls::https_client(backend.request_timeout)?;
 
-        match backend.kind {
-            // A Stability backend has no completion model to build an arm from — it is
-            // an image API, reached through kaibo's own facade (`src/stability.rs`) on
-            // the `image` cast slot, never through rig. Config validation refuses a
-            // reasoning slot pointed at one, so this is the belt to that braces: if the
-            // two ever disagree, fail loudly here rather than construct a nonsense arm.
-            ProviderKind::Stability => anyhow::bail!(
-                "backend {:?} is kind `stability`, which generates images and cannot \
-                 staff a reasoning slot — point `explorer`/`synth` at a completion \
-                 backend, and use `image = \"{}/<model>\"` for generation",
+        // A media backend has no completion model to build an arm from — it is reached
+        // through the media seam (`crate::media::MediaArm`) on a media cast slot, never
+        // through rig. Config validation refuses a reasoning slot pointed at one, so
+        // this is the belt to those braces: if the two ever disagree, fail loudly here
+        // rather than construct a nonsense arm. Classifying up front also keeps the
+        // construction match below on `WireKind`, where a media arm cannot exist.
+        let wire = match backend.kind.class() {
+            crate::credentials::ProviderClass::Wire(w) => w,
+            crate::credentials::ProviderClass::Media(_) => anyhow::bail!(
+                "backend {:?} is kind `{}`, which generates media and cannot staff a \
+                 reasoning slot — point `explorer`/`synth` at a completion backend, \
+                 and use `image = \"{}/<model>\"` for generation",
                 backend.name,
+                backend.kind.canonical_name(),
                 backend.name
             ),
-            ProviderKind::Anthropic => {
+        };
+        match wire {
+            WireKind::Anthropic => {
                 // base_url is optional here (unlike the openai kind): unset dials
                 // rig's built-in https://api.anthropic.com; set, it points at an
                 // Anthropic-Messages-API-compatible gateway/proxy instead.
@@ -394,7 +399,7 @@ impl Arm {
                     .map_err(|e| anyhow!("anthropic client init: {e}"))?;
                 Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
             }
-            ProviderKind::DeepSeek => {
+            WireKind::DeepSeek => {
                 let key = backend.resolve_key()?;
                 let client = deepseek::Client::builder()
                     .api_key(&key)
@@ -403,7 +408,7 @@ impl Arm {
                     .map_err(|e| anyhow!("deepseek client init: {e}"))?;
                 Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
             }
-            ProviderKind::Gemini => {
+            WireKind::Gemini => {
                 // base_url is optional here (unlike the openai kind): unset dials
                 // rig's built-in https://generativelanguage.googleapis.com; set, it
                 // points at a Gemini-API-compatible gateway/proxy instead. Same
@@ -421,7 +426,7 @@ impl Arm {
                     .map_err(|e| anyhow!("gemini client init: {e}"))?;
                 Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
             }
-            ProviderKind::OpenRouter => {
+            WireKind::OpenRouter => {
                 // A keyed gateway with a *fixed* endpoint (rig pins the base URL), so —
                 // unlike the openai kind — there is no base_url to resolve. `with_app_identity`
                 // stamps the X-OpenRouter-Title / HTTP-Referer headers so kaibo's traffic is
@@ -436,7 +441,7 @@ impl Arm {
                 let model = Self::openrouter_completion_model(&client, &slot.id);
                 Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
             }
-            ProviderKind::Openai => {
+            WireKind::Openai => {
                 // Any OpenAI-compatible endpoint, addressed by the backend's base
                 // URL. The key is optional for a keyless backend: `resolve_key`
                 // returns the configured key or a placeholder the server ignores.
@@ -2200,6 +2205,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use crate::credentials::ProviderKind;
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, reasoning_response, text_response,

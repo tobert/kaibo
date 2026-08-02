@@ -669,6 +669,14 @@ pub struct Artifact {
 pub struct JobId(String);
 
 impl JobId {
+    /// Rebuild a job id from its string spelling. The id round-trips through kaibo's
+    /// job store (and the [`crate::media::MediaJobId`] seam) as a plain string, so
+    /// the poll path needs a way back in; the string stays opaque either way — only
+    /// Stability's own polling endpoints interpret it.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -1084,6 +1092,98 @@ impl RigImageGenerationModel for StabilityImageModel {
                 seed: artifact.seed,
             },
         })
+    }
+}
+
+impl StabilityImageModel {
+    /// Build directly from a client + model id — the non-rig constructor
+    /// [`crate::media::MediaArm::from_slot`] uses. Same shape as
+    /// [`RigImageGenerationModel::make`], available without importing rig's trait.
+    pub fn from_parts(client: &StabilityClient, model: impl Into<String>) -> Self {
+        Self {
+            client: client.clone(),
+            model: model.into(),
+        }
+    }
+
+    /// The request-side translation shared with [`from_rig_request`]: classify the
+    /// model id into a route, seed the sd3 `model` field and the explicit
+    /// `output_format = "png"` default, then let the caller's own fields override —
+    /// last write wins, the same contract [`build_form_fields`] applies again at
+    /// send time.
+    fn media_request(&self, request: &crate::media::MediaRequest) -> (Operation, StabilityRequest) {
+        let route = GenerateRoute::classify(&self.model);
+        let mut fields: Vec<(String, String)> = Vec::new();
+        if let GenerateRoute::Sd3 { model } = &route {
+            fields.push(("model".to_string(), model.clone()));
+        }
+        fields.push(("output_format".to_string(), "png".to_string()));
+        for (k, v) in &request.fields {
+            if let Some(existing) = fields.iter_mut().find(|(name, _)| name == k) {
+                existing.1 = v.clone();
+            } else {
+                fields.push((k.clone(), v.clone()));
+            }
+        }
+        (
+            Operation::Generate(route),
+            StabilityRequest {
+                prompt: request.prompt.clone(),
+                input_image: request.input_image.clone(),
+                // No derived ratio on this path: the neutral request has no
+                // width/height to bridge, and an `aspect_ratio` field from the caller
+                // rides `fields` verbatim.
+                aspect_ratio: None,
+                fields,
+            },
+        )
+    }
+}
+
+/// The [`crate::media::MediaModel`] impl — the neutral seam
+/// [`crate::media::MediaArm`] dispatches through. Thin on purpose:
+/// [`crate::media::MediaRequest::fields`] already speak Stability's `(name, value)`
+/// form-field shape, and the outcome enums mirror [`StabilityResponse`] /
+/// [`PollOutcome`] one-to-one — including the deferred half rig's trait cannot carry
+/// (see [`StabilityImageModel::image_generation`]'s forced error there).
+#[async_trait::async_trait]
+impl crate::media::MediaModel for StabilityImageModel {
+    async fn generate(
+        &self,
+        request: &crate::media::MediaRequest,
+    ) -> AnyResult<crate::media::MediaOutcome> {
+        let (op, stability_request) = self.media_request(request);
+        let response = self.client.call(&op, &stability_request).await?;
+        Ok(match response {
+            StabilityResponse::Complete(a) => {
+                crate::media::MediaOutcome::Complete(media_artifact(a))
+            }
+            StabilityResponse::Deferred(id) => crate::media::MediaOutcome::Deferred(
+                crate::media::MediaJobId(id.as_str().to_string()),
+            ),
+        })
+    }
+
+    async fn poll(
+        &self,
+        job: &crate::media::MediaJobId,
+    ) -> AnyResult<crate::media::MediaPollOutcome> {
+        let outcome = self.client.poll(&JobId::new(job.0.clone())).await?;
+        Ok(match outcome {
+            PollOutcome::Pending => crate::media::MediaPollOutcome::Pending,
+            PollOutcome::Complete(a) => crate::media::MediaPollOutcome::Complete(media_artifact(a)),
+        })
+    }
+}
+
+/// Lift this facade's [`Artifact`] into the neutral [`crate::media::MediaArtifact`]:
+/// the mime becomes the wire spelling ([`MediaType::as_str`]), bytes and seed carry
+/// verbatim.
+fn media_artifact(a: Artifact) -> crate::media::MediaArtifact {
+    crate::media::MediaArtifact {
+        mime: a.media_type.as_str().to_string(),
+        bytes: a.bytes,
+        seed: a.seed,
     }
 }
 

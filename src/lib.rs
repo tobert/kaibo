@@ -27,6 +27,7 @@ pub mod explorer;
 pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;
+pub mod media;
 pub mod orientation;
 pub mod progress;
 pub mod sandbox;

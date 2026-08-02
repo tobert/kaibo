@@ -51,7 +51,7 @@ use serde_json::{json, Map, Value};
 
 use crate::attach::Attachment;
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot, SlotTunables};
-use crate::credentials::ProviderKind;
+use crate::credentials::{ProviderKind, WireKind};
 
 /// Anthropic's default API base, used when the backend sets no `base_url` of its own
 /// (the common case — rig fixes the endpoint for most keyed kinds, but the anthropic
@@ -1950,13 +1950,15 @@ impl BatchProvider for OpenaiBatch {
 /// gateway has no `/v1/batches` to submit to. Same seam the interactive Responses routing
 /// uses ([`Backend::is_hosted_openai`]).
 pub fn batch_supported(backend: &Backend) -> bool {
-    match backend.kind {
-        ProviderKind::Anthropic | ProviderKind::Gemini => true,
-        ProviderKind::Openai => backend.is_hosted_openai(),
-        ProviderKind::DeepSeek | ProviderKind::OpenRouter => false,
-        // Not a completion wire at all — an image API with no batch endpoint, and no
-        // reasoning slot can point at it (see `ProviderKind::Stability`).
-        ProviderKind::Stability => false,
+    // A media kind is not a completion wire at all — no batch endpoint, and no
+    // reasoning slot can point at one (see `ProviderKind::class`).
+    let Some(wire) = backend.kind.wire() else {
+        return false;
+    };
+    match wire {
+        WireKind::Anthropic | WireKind::Gemini => true,
+        WireKind::Openai => backend.is_hosted_openai(),
+        WireKind::DeepSeek | WireKind::OpenRouter => false,
     }
 }
 

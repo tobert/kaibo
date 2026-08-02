@@ -626,7 +626,7 @@ fn base_url_on_a_keyed_backend_is_rejected() {
     let msg = format!("{err:#}");
     assert!(msg.contains("base_url"), "got: {msg}");
     assert!(
-        msg.contains("only the `openai`, `anthropic`, and `gemini` kinds"),
+        msg.contains("only the `openai`, `anthropic`, `gemini`, and `stability` kinds"),
         "got: {msg}"
     );
 }
