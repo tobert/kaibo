@@ -22,7 +22,7 @@ use kaibo::server::ToolGating;
 fn builtin_reproduces_the_historical_defaults() {
     let c = Config::builtin();
 
-    // Turn caps are set high on purpose (a capable model rarely wastes turns and a
+    // Turn caps are set high on purpose (the synthesis agent rarely wastes turns and a
     // cap-hit now degrades gracefully rather than failing) — see Defaults::default.
     assert_eq!(c.defaults.explorer_max_turns, 100);
     assert_eq!(c.defaults.synth_max_turns, 200);
@@ -917,9 +917,10 @@ fn cli_cast_wins_over_env_and_file() {
         vec![], // no --project-context-file flags
         vec![], // no --user-context-file flags
         false,  // --no-persistence not passed
-        None,   // no --state-db,
-        None, // --cas-dir
-        None, // --cas-max-bytes
+        None,   // no --state-db
+        None,   // --cas-dir
+        None,   // --cas-max-bytes
+        None,   // no --max-attachments
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
@@ -954,6 +955,7 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         None,
         None, // --cas-dir
         None, // --cas-max-bytes
+        None, // --max-attachments
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1223,6 +1225,31 @@ fn inline_attach_budget_defaults_overrides_and_zero_is_legal() {
         .collect();
     let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
     assert_eq!(c.defaults.inline_attach_budget, 1024);
+}
+
+/// `max_attachments` bounds the explorer's `attach` tool (a sweep routing a file's
+/// bytes past itself to the sweep's consumer) — its own knob from `inline_attach_budget`
+/// (which bounds INLINING caller-supplied attachments into the driver prompt). Same
+/// ladder shape: built-in default, `[defaults]` override, env wins over file, and `0`
+/// is legal (it means "don't inject the attach tool at all").
+#[test]
+fn max_attachments_defaults_overrides_and_zero_is_legal() {
+    // Absent → the built-in 32.
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.max_attachments, 32);
+    // Set in [defaults] → honored.
+    let c = Config::from_toml_str("[defaults]\nmax_attachments = 8\n").unwrap();
+    assert_eq!(c.defaults.max_attachments, 8);
+    // Zero is legal: it turns the attach tool off entirely.
+    let c = Config::from_toml_str("[defaults]\nmax_attachments = 0\n").unwrap();
+    assert_eq!(c.defaults.max_attachments, 0);
+    // Env wins over the file, like every other [defaults] knob.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[defaults]\nmax_attachments = 8\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_MAX_ATTACHMENTS", "4")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.defaults.max_attachments, 4);
 }
 
 // --- Key resolution (now a Backend concern) --------------------------------------
@@ -2027,7 +2054,8 @@ fn cas_cli_wins_and_absent_flags_do_not_clobber() {
         false,
         None,
         Some(std::path::PathBuf::from("/from/cli")), // --cas-dir
-        None,                                       // --cas-max-bytes NOT passed
+        None,                                        // --cas-max-bytes NOT passed
+        None,                                        // --max-attachments NOT passed
     );
     assert_eq!(
         c.cas.dir.unwrap(),
@@ -2060,6 +2088,7 @@ fn persistence_cli_wins_over_lower_layers() {
         Some(std::path::PathBuf::from("/from/cli.db")), // --state-db
         None,                                           // --cas-dir
         None,                                           // --cas-max-bytes
+        None,                                           // no --max-attachments
     );
     assert!(!c.persistence.enabled, "--no-persistence wins");
     assert_eq!(

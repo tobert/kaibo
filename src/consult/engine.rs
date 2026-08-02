@@ -9,40 +9,49 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rig_core::agent::{AgentBuilder, HookAction, PromptHook};
+use rig_agent::agent::hook::{
+    AgentHook, CompletionCall, CompletionCallAction, HookContext, ToolResultAction, ToolResultEvent,
+};
+use rig_agent::agent::AgentBuilder;
+use rig_agent::completion::PromptError;
+use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
-    UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
+    ToolResultContent, UserContent,
 };
-use rig_core::completion::{CompletionModel, Message, Prompt, PromptError, ToolDefinition, Usage};
+use rig_core::completion::{CompletionModel, Message, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
-use rig_core::tool::{Tool, ToolDyn};
 use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::attach::Attachment;
+use crate::completion_watch::{watched, CompletionLog, Watched};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::ProviderKind;
 use crate::explorer::RunKaish;
 use crate::progress::{PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, Sessions};
+use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepConsumerKind};
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
 use super::config::{ConsultConfig, ExploreConfig, PhaseContext};
 #[cfg(test)]
 use super::prompts::PromptOverrides;
-use super::prompts::{consult_user_prompt, deliberation_prompt, resolve_phase_preamble, Phase};
+use super::prompts::{
+    consult_user_prompt, deliberation_prompt, explorer_attach_directive, resolve_phase_preamble,
+    sweep_evidence_block, Phase,
+};
 use super::shaping::{ModelCaps, ModelShape};
 
 // --- The Arm seam ------------------------------------------------------------
 
 /// The toolset factory a phase loop rebuilds its tools from (once for the main
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
-type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<Box<dyn ToolDyn>>> + Send + Sync);
+type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<DynamicTool>> + Send + Sync);
 
 /// The eventual `(answer, usage)` a phase loop yields, boxed `Send` for the
 /// [`PhaseRunner`] vtable: the model's answer paired with the token [`Usage`] the
@@ -69,7 +78,20 @@ trait PhaseRunner: Send + Sync {
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
-        break_on_view_image: bool,
+        break_on_tool_images: bool,
+    ) -> PhaseFuture<'a>;
+
+    /// One completion, straight to the provider — no agent, no tool loop. The
+    /// single-shot phases (`oneshot`, `deliberate`'s direct lane) are exactly one
+    /// upstream request by definition, so they say so instead of asking a tool loop
+    /// to arrive at the same place with an empty toolset. See [`run_completion`].
+    fn complete<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        prompt: Message,
+        params: Option<&'a Value>,
     ) -> PhaseFuture<'a>;
 }
 
@@ -99,7 +121,7 @@ where
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
-        break_on_view_image: bool,
+        break_on_tool_images: bool,
     ) -> PhaseFuture<'a> {
         Box::pin(run_phase(
             &self.model,
@@ -112,8 +134,31 @@ where
             params,
             progress,
             make_tools,
-            break_on_view_image,
+            break_on_tool_images,
         ))
+    }
+
+    fn complete<'a>(
+        &'a self,
+        preamble: &'a str,
+        max_tokens: u64,
+        temperature: Option<f64>,
+        prompt: Message,
+        params: Option<&'a Value>,
+    ) -> PhaseFuture<'a> {
+        Box::pin(async move {
+            run_completion(
+                &self.model,
+                &self.name,
+                &CompletionLog::new(),
+                preamble,
+                max_tokens,
+                temperature,
+                prompt,
+                params,
+            )
+            .await
+        })
     }
 }
 
@@ -288,6 +333,31 @@ impl Arm {
         // config opt-in. A no-op for every other kind.
         let params =
             super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
+        // Preflight the blob through rig's OWN request builder for this wire. Two of the
+        // six wires parse it into a typed struct whose reasoning rungs are a closed enum,
+        // so an effort rig can't name dies *inside rig* at call time with a bare serde
+        // line ("unknown variant `max`") that says nothing about which slot of which cast
+        // asked for it. Asking here — the single live construction point — turns that into
+        // a boundary error naming the slot and the rungs that wire does take. It stays a
+        // preflight, not a policy: the accepted list is read back out of rig, so a rig bump
+        // that adds a rung needs no kaibo change, and effort stays a passthrough string
+        // everywhere rig lets it be one.
+        let wire = super::shaping::EffortWire::resolve(backend.kind, responses_wire);
+        if let Err(detail) = super::shaping::preflight_params(wire, params.as_ref()) {
+            return Err(anyhow!(
+                "model {:?} (backend {:?}, {} slot): effort {:?} is refused by rig's {} \
+                 request builder before the request leaves kaibo. That ceiling is \
+                 rig-core's typed client, not the provider's API — this wire accepts {}. \
+                 Set the slot's `effort` (or `[defaults]`) to one of those, or point the \
+                 slot at a backend whose wire passes effort through. (rig: {detail})",
+                slot.id,
+                backend.name,
+                role.key(),
+                t.effort,
+                wire.label(),
+                super::shaping::accepted_efforts(wire).join(" | "),
+            ));
+        }
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -406,13 +476,19 @@ impl Arm {
     /// instead of full input price every turn; implicit-caching upstreams
     /// (DeepSeek/GLM/Kimi/Gemini/OpenAI) ignore the marker. The growing
     /// transcript is not marked — an upstream rig limitation, tracked in
-    /// docs/issues.md. Kept as a named seam so the construction is unit-testable:
-    /// rig exposes the caching flag as a public field, and `from_slot` must
-    /// route through here.
-    fn openrouter_completion_model(
-        client: &openrouter::Client,
+    /// docs/issues.md. Kept as a named seam so the construction is unit-testable, and
+    /// `from_slot` must route through here.
+    ///
+    /// Generic over the HTTP backend so a test can drive it with a capture transport
+    /// and read the marker off the serialized body — the only place that answers
+    /// whether this constructor did its job, since rig exposes no readable flag.
+    fn openrouter_completion_model<H>(
+        client: &openrouter::Client<H>,
         id: &str,
-    ) -> openrouter::CompletionModel {
+    ) -> openrouter::CompletionModel<H>
+    where
+        openrouter::Client<H>: CompletionClient<CompletionModel = openrouter::CompletionModel<H>>,
+    {
         client.completion_model(id).with_prompt_caching()
     }
 
@@ -420,7 +496,7 @@ impl Arm {
     /// the model can *see* but its transport can't carry the image in a tool result
     /// (an OpenAI VLM) — the predicate [`run_phase`]'s break-rewrite-resume gate reads.
     /// A blind arm never sees `view_image`, so this is false there regardless.
-    fn rewrites_view_image(&self) -> bool {
+    fn rewrites_tool_images(&self) -> bool {
         self.caps.vision && !self.caps.tool_result_images
     }
 
@@ -447,7 +523,28 @@ impl Arm {
                 self.params.as_ref(),
                 progress,
                 make_tools,
-                self.rewrites_view_image(),
+                self.rewrites_tool_images(),
+            )
+            .await
+    }
+
+    /// Ask this arm one question and take its answer: a single completion with this
+    /// arm's params and `max_tokens`, no tools and no loop. The single-shot seam
+    /// behind `oneshot` and `deliberate`'s direct lane — prompt in, answer out, one
+    /// upstream request. Returns the answer paired with the provider's reported
+    /// [`Usage`] (zero-valued when it reported none), exactly as [`run`](Self::run) does.
+    pub(crate) async fn complete(
+        &self,
+        preamble: &str,
+        prompt: Message,
+    ) -> Result<(String, Usage)> {
+        self.runner
+            .complete(
+                preamble,
+                self.max_tokens,
+                self.temperature,
+                prompt,
+                self.params.as_ref(),
             )
             .await
     }
@@ -485,108 +582,216 @@ pub struct ConsultOutput {
 const FINALIZE_NOTE: &str = "\
 STOP — you have reached your research limit and may not call any more tools. Using \
 only the evidence you have already gathered in this conversation, write your \
-COMPLETE final response now, with its concrete `file:line` citations. Do not call \
-any tool. Do not ask to continue. Write the full answer (or curated report) from \
-what you already have — right now.";
+COMPLETE final response now, with its concrete `file:line` citations. Where the \
+evidence runs out, say so plainly: naming what you do not know is part of a complete \
+answer. Do not call any tool. Do not ask to continue. Write the full answer (or \
+curated report) from what you already have.";
 
-/// Build the forced final turn from the transcript rig hands back at the turn cap.
+/// The forced-finish instruction for a phase that **stopped early** without writing
+/// its answer — distinct from [`FINALIZE_NOTE`], which is about running out of turns.
+/// A model that quit mid-investigation has budget left and needs to hear that it
+/// simply owes the write-up, not that it has been cut off. Same positive framing and
+/// front-and-back repetition, different fact.
+const EMPTY_ANSWER_NOTE: &str = "\
+Your last turn contained no answer text — the response came back empty. You have \
+already gathered evidence in this conversation, so nothing more needs investigating. \
+Using only that evidence, write your COMPLETE final response now, with its concrete \
+`file:line` citations. Where the evidence runs out, say so plainly: naming what you \
+do not know is part of a complete answer, not a reason to keep investigating. Do not \
+call any tool. Do not ask to continue. Write the full answer (or curated report) from \
+what you already have.";
+
+/// Build the forced final turn from a partial transcript.
 ///
 /// Returns `(history, prompt)` for one more constrained completion: the prompt is
-/// the conversation's last message with [`FINALIZE_NOTE`] appended (so the model
-/// reads the "answer now" instruction last), and `history` is everything before it.
+/// the conversation's last message with `note` appended (so the model reads the
+/// "answer now" instruction last), and `history` is everything before it. The note is
+/// a parameter because the two forced-finish paths mean different things —
+/// [`FINALIZE_NOTE`] (out of turns) vs. [`EMPTY_ANSWER_NOTE`] (stopped without
+/// answering) — and telling a model it hit a limit it did not hit is a lie that
+/// shapes its answer.
 ///
-/// At the cap the transcript's last message is almost always the user's
-/// tool-results turn (the loop broke just as the model was about to call yet
-/// another tool), so the note rides along inside that same user message — we never
-/// emit two user turns back to back, which some providers reject. If the transcript
-/// somehow ends on an assistant turn, the note becomes a fresh trailing user turn
-/// instead (valid after an assistant message). Pure and offline-testable.
-fn finalize_prompt(mut chat_history: Vec<Message>) -> (Vec<Message>, Message) {
+/// The transcript's last message is almost always the user's tool-results turn (the
+/// loop broke just as the model was about to call yet another tool), so the note
+/// rides along inside that same user message — we never emit two user turns back to
+/// back, which some providers reject. If the transcript somehow ends on an assistant
+/// turn, the note becomes a fresh trailing user turn instead (valid after an
+/// assistant message). Pure and offline-testable.
+fn finalize_prompt(mut chat_history: Vec<Message>, note: &str) -> (Vec<Message>, Message) {
     match chat_history.pop() {
         Some(Message::User { mut content }) => {
-            content.push(UserContent::text(FINALIZE_NOTE));
+            content.push(UserContent::text(note));
             (chat_history, Message::User { content })
         }
         Some(other) => {
             chat_history.push(other);
-            (chat_history, Message::user(FINALIZE_NOTE))
+            (chat_history, Message::user(note))
         }
-        None => (Vec::new(), Message::user(FINALIZE_NOTE)),
+        None => (Vec::new(), Message::user(note)),
     }
 }
 
-// --- view_image on the user-turn channel (the openai VLM path) ----------------
+// --- the empty-answer guard ---------------------------------------------------
 
-/// The cancellation reason [`ViewImageBreakHook`] terminates with, so [`run_phase`]
+/// Does this transcript show the model actually *gathered evidence*? True when any
+/// user turn carries a tool result — i.e. the model called something and got output
+/// back. This is the gate on [`run_phase`]'s one forced re-ask after an empty answer.
+///
+/// **Why the gate is shaped this way — do not "simplify" it into an unconditional
+/// retry.** A forced "write it now" turn handed to a model that has gathered *nothing*
+/// invites it to comply anyway, and what it produces is a confident, ungrounded answer
+/// on a lane whose entire product is grounded citation. So the case where a retry is
+/// least likely to succeed is also the case where succeeding is *dangerous*: a
+/// fabricated review is worse than an error, in the same way a silent empty is. With
+/// evidence in hand, the same turn is safe and usually sufficient — it asks a model
+/// that already did the work to write up what it found (the 2026-08-01 deepseek run:
+/// an explorer report delivered, fifteen greps returned, then a 14-token terminal turn
+/// with no text).
+///
+/// **What this does and does not prove.** rig folds a *failed* tool call into a tool
+/// result too — it stringifies the error and hands it back as the result
+/// (`rig-core/src/agent/prompt_request/mod.rs:1019-1025`) — so a tool result is proof
+/// the model got output back, not proof the output was useful. That is the right line
+/// anyway: a transcript of nothing but tool errors still yields an honest grounded
+/// answer ("I could not read X"), which is a fine thing to have asked for. What the
+/// gate excludes is the genuinely dangerous shape — zero tool interaction, pure
+/// generation, nothing to cite.
+fn transcript_has_tool_results(history: &[Message]) -> bool {
+    history.iter().any(|m| match m {
+        Message::User { content } => content
+            .iter()
+            .any(|c| matches!(c, UserContent::ToolResult(_))),
+        _ => false,
+    })
+}
+
+/// Fail a phase that produced no answer text, carrying the diagnostics that say what
+/// was burned to produce nothing.
+///
+/// The invariant this enforces: **an empty final answer is never a successful call.**
+/// A review that silently did not happen is worse than one that errors, because the
+/// caller merges on it. Same vocabulary as the batch lane's long-standing gate
+/// (`crate::batch`'s `finish_gated_answer`: "a completed-but-empty answer is no
+/// answer") — one concept, one wording, two lanes.
+///
+/// `finish_reason` comes off the phase's [`CompletionLog`] — the provider's own word
+/// for how its last completion ended, read from the raw response the [`Watched`]
+/// wrapper records. `None` means the provider reported none, and that is stated as
+/// absence rather than implied to be a clean stop: on some wires (OpenAI's Responses
+/// API) reporting nothing *is* the normal completion signal, so absence carries no
+/// verdict either way.
+fn empty_answer_error(
+    model: &str,
+    turns: usize,
+    max_turns: usize,
+    usage: &Usage,
+    finish_reason: Option<&str>,
+    detail: &str,
+) -> anyhow::Error {
+    let reason = match finish_reason {
+        Some(r) => format!("finish_reason \"{r}\" reported by the provider"),
+        None => "no finish_reason reported by the provider (normal on some wires)".to_string(),
+    };
+    anyhow!(
+        "model {model} returned an EMPTY answer — {detail}. It is not a result: a \
+         completed-but-empty answer is no answer, and returning it would hand you a \
+         review that never happened. Diagnostics: {turns} of {max_turns} turns used, \
+         {} input tokens ({} cached), {} output tokens, {} reasoning tokens reported; \
+         {reason}. Retry, or try the same question on a different cast.",
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_tokens,
+    )
+}
+
+// --- an image-bearing tool result on the user-turn channel (the openai VLM path) --
+
+/// The cancellation reason [`ToolImageBreakHook`] terminates with, so [`run_phase`]
 /// can tell *its* deliberate break from any other `PromptCancelled` rig might raise
 /// (a lost prompt, an empty tool batch). An internal sentinel; never shown to a model.
-const VIEW_IMAGE_BREAK: &str = "kaibo:view_image_break";
+const TOOL_IMAGE_BREAK: &str = "kaibo:view_image_break";
 
 /// The text a rewritten `view_image` tool result carries when its own note is somehow
 /// absent — enough to satisfy the `tool_use → tool_result` pairing every provider
 /// requires. The image itself rides the separate user turn the rewrite inserts.
-const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
+const TOOL_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
 
 /// Breaks the managed tool loop at the turn boundary after a `view_image` ran, so
 /// [`run_phase`] can move the image onto the **user-turn** channel for a transport
 /// that can't carry it in a tool result (an OpenAI VLM).
 ///
-/// **Why flag now, terminate next — not mid-turn.** A single assistant turn can call
-/// `view_image` *and* `run_kaish` together; terminating the instant `view_image`
-/// returns would drop the other tool's result and orphan its `tool_use`. And rig's
-/// `on_tool_result` Terminate hands back a transcript snapshotted *before* the turn's
-/// results are folded into `new_messages` (`prompt_request/mod.rs` ~:928), so it
-/// wouldn't even carry the image we came for. So we only *set a flag* on
-/// `on_tool_result`, and terminate on the **next** `on_completion_call` — the point
-/// where rig has written every tool result of the triggering turn into `new_messages`
-/// and `Terminate` returns the complete transcript (`:670`). Disabled
+/// **Why flag now, stop next — not mid-turn.** A single assistant turn can call
+/// `view_image` *and* `run_kaish` together; stopping the instant `view_image` returns
+/// would drop the other tool's result and orphan its `tool_use`. And a stop from
+/// `on_tool_result` hands back a transcript snapshotted *before* the turn's results are
+/// folded into the run's messages, so it wouldn't even carry the image we came for. So
+/// we only *set a flag* on `on_tool_result`, and stop on the **next**
+/// `on_completion_call` — the point where rig has written every tool result of the
+/// triggering turn into the transcript and the stop returns it complete. Disabled
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
 /// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
 #[derive(Clone)]
-struct ViewImageBreakHook {
+struct ToolImageBreakHook {
     enabled: bool,
     /// Set once a `view_image` tool result lands this turn; read at the next
-    /// completion call. Interior mutability because `PromptHook`'s callbacks are `&self`
+    /// completion call. Interior mutability because `AgentHook`'s callbacks are `&self`
     /// and rig runs a turn's tools concurrently.
-    saw_view_image: Arc<AtomicBool>,
+    saw_tool_image: Arc<AtomicBool>,
 }
 
-impl ViewImageBreakHook {
+impl ToolImageBreakHook {
     fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            saw_view_image: Arc::new(AtomicBool::new(false)),
+            saw_tool_image: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-impl<M: CompletionModel> PromptHook<M> for ViewImageBreakHook {
+impl AgentHook for ToolImageBreakHook {
     async fn on_tool_result(
         &self,
-        tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        _args: &str,
-        _result: &str,
-    ) -> HookAction {
-        if self.enabled && tool_name == ViewImage::NAME {
-            self.saw_view_image.store(true, Ordering::SeqCst);
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        if self.enabled && tool_output_carries_image(event.presentation) {
+            self.saw_tool_image.store(true, Ordering::SeqCst);
         }
-        HookAction::cont()
+        ToolResultAction::Keep
     }
 
-    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
-        if self.enabled && self.saw_view_image.load(Ordering::SeqCst) {
-            HookAction::terminate(VIEW_IMAGE_BREAK)
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        _event: CompletionCall<'_>,
+    ) -> CompletionCallAction {
+        if self.enabled && self.saw_tool_image.load(Ordering::SeqCst) {
+            CompletionCallAction::Stop(TOOL_IMAGE_BREAK.to_string())
         } else {
-            HookAction::cont()
+            CompletionCallAction::Continue
         }
     }
 }
 
-/// Rewrite a transcript so every `view_image` image rides the **user-turn** channel
-/// instead of the tool-result channel. For each `view_image` tool result that still
-/// carries an image: keep its text as a short ack (so the `tool_use → tool_result`
+/// Does this tool output carry an image part? Keys the break hook on the RESULT, not
+/// the tool's name — fully general, so the next image-bearing tool (`view_image`
+/// today, and a sweep's `explore` result carrying a routed image) needs no new `if`.
+/// Typed, not sniffed: rig 0.41 hands the hook the model-visible [`ToolOutput`]
+/// whole, so the check reads the declared content parts — the same declared-image
+/// contract [`crate::view_image::ViewImage`] and [`crate::consult::RunExplore`] emit
+/// on.
+fn tool_output_carries_image(output: &ToolOutput) -> bool {
+    output
+        .as_content()
+        .iter()
+        .any(|c| matches!(c, ToolResultContent::Image(_)))
+}
+
+/// Rewrite a transcript so every image-bearing tool result rides the **user-turn**
+/// channel instead of the tool-result channel — `view_image`, or a delegated
+/// `explore` sweep that routed an image via `attach`. For each such result that
+/// still carries an image: keep its text as a short ack (so the `tool_use → tool_result`
 /// pairing stays valid) and emit a separate, tool-result-free `Message::User { [Image] }`
 /// right after that user message — the bytes the model now sees on a channel OpenAI
 /// accepts. Every other block (assistant text/thinking, other tools' use/result pairs)
@@ -601,24 +806,7 @@ impl<M: CompletionModel> PromptHook<M> for ViewImageBreakHook {
 /// result already acked to text (an earlier break) and an already-inserted image
 /// message both pass through untouched — safe to run after every break. Pure and
 /// offline-testable.
-fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
-    // The tool_use ids naming a view_image call live on the *assistant* `ToolCall`,
-    // not on the user `ToolResult` — collect them first, then match results against them.
-    let view_image_ids: HashSet<String> = history
-        .iter()
-        .filter_map(|m| match m {
-            Message::Assistant { content, .. } => Some(content),
-            _ => None,
-        })
-        .flat_map(|content| content.iter())
-        .filter_map(|c| match c {
-            AssistantContent::ToolCall(tc) if tc.function.name == ViewImage::NAME => {
-                Some(tc.id.clone())
-            }
-            _ => None,
-        })
-        .collect();
-
+fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(history.len());
     for msg in history {
         let content = match msg {
@@ -630,21 +818,32 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
         };
 
         let mut new_parts: Vec<UserContent> = Vec::new();
-        // Images pulled out of this turn's view_image results, re-emitted as their own
-        // user messages immediately after (one per image), preserving order.
+        // Images pulled out of this turn's image-bearing tool results, re-emitted as
+        // their own user messages immediately after (one per image), preserving order.
         let mut extracted: Vec<Image> = Vec::new();
 
         for part in content {
             match part {
-                UserContent::ToolResult(tr) if view_image_ids.contains(&tr.id) => {
+                // Key on the RESULT still carrying an image — not the tool's name or
+                // id. Fully general: the next image-bearing tool (today: `view_image`
+                // and a sweep's `explore` result carrying a routed image) needs no
+                // edit here. A result already acked to text (an earlier break, or an
+                // already-inserted image turn) holds no `ToolResultContent::Image`, so
+                // it falls through untouched — the idempotency that makes re-running
+                // this safe.
+                UserContent::ToolResult(tr)
+                    if tr
+                        .content
+                        .iter()
+                        .any(|rc| matches!(rc, ToolResultContent::Image(_))) =>
+                {
                     let ToolResult {
                         id,
                         call_id,
                         content,
                     } = tr;
                     // Split the result into its text (the load note → ack) and its
-                    // image (→ a user turn). A result already acked has no image, so
-                    // this is a no-op for it — the idempotency that makes re-running safe.
+                    // image(s) (→ a user turn each).
                     let mut texts: Vec<ToolResultContent> = Vec::new();
                     for rc in content {
                         match rc {
@@ -653,7 +852,7 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
                         }
                     }
                     let content = OneOrMany::many(texts).unwrap_or_else(|_| {
-                        OneOrMany::one(ToolResultContent::text(VIEW_IMAGE_ACK))
+                        OneOrMany::one(ToolResultContent::text(TOOL_IMAGE_ACK))
                     });
                     new_parts.push(UserContent::ToolResult(ToolResult {
                         id,
@@ -717,7 +916,7 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// surface — `oneshot` ({} — no tools), the recomposed `consult`
 /// ({run_kaish, explore′}), and its nested `explore′` ({run_kaish}). The factory matters because of the
 /// turn-cap recovery below: a fresh toolset is built for the forced final turn, and
-/// `Box<dyn ToolDyn>` can't be cloned, so we rebuild rather than share. Each call
+/// A `DynamicTool` toolset is consumed by the builder, so we rebuild rather than share. Each call
 /// spawns its own `KaishWorker`(s); the caller owns their lifetime.
 ///
 /// **Turn-cap recovery.** When the model uses every turn without concluding, rig
@@ -727,16 +926,74 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// declared so the accumulated tool_use/tool_result history stays valid, but
 /// `ToolChoice::None` forbids new calls — the model must answer from what it has.
 ///
-/// **view_image on the user-turn channel.** When `break_on_view_image` is set (a
-/// vision model whose transport can't carry an image in a tool result — an OpenAI
-/// VLM), a [`ViewImageBreakHook`] terminates the loop at the turn boundary after a
-/// `view_image` call. rig hands back the full transcript via `PromptCancelled`; we
-/// rewrite each `view_image` result onto a separate user `Image` turn
-/// ([`rewrite_view_image_history`]) and re-enter the loop with the remaining turn
-/// budget. The model now sees the image in user content, the one channel every
-/// provider accepts. When unset the hook is inert and this is the old single call.
+/// **A tool-result image on the user-turn channel.** When `break_on_tool_images` is
+/// set (a vision model whose transport can't carry an image in a tool result — an
+/// OpenAI VLM), a [`ToolImageBreakHook`] terminates the loop at the turn boundary
+/// after any tool result carries an image — `view_image`, or a delegated `explore`
+/// sweep that routed one via `attach`. rig hands back the full transcript via
+/// `PromptCancelled`; we rewrite each image-bearing result onto a separate user
+/// `Image` turn ([`rewrite_tool_image_history`]) and re-enter the loop with the
+/// remaining turn budget. The model now sees the image in user content, the one
+/// channel every provider accepts. When unset the hook is inert and this is the old
+/// single call.
+///
+/// **Seeing how each turn ended.** This is [`run_phase_logged`] with a log nobody
+/// keeps — reach for that one when the phase's per-turn finish reasons are the point.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+pub(crate) async fn run_phase<M, F>(
+    model: &M,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
+    make_tools: F,
+    break_on_tool_images: bool,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
+    run_phase_logged(
+        &CompletionLog::new(),
+        model,
+        model_name,
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        make_tools,
+        break_on_tool_images,
+    )
+    .await
+}
+
+/// [`run_phase`] with the per-turn completion record kept.
+///
+/// rig's agent layer hands back only what its medium-neutral hook event carries —
+/// content and usage — so a phase that stopped early, got truncated, or was refused
+/// by a classifier looks identical to one that finished. The provider *did* say which
+/// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
+/// `CompletionResponse::raw_response`, which the loop discards. Wrapping the model in
+/// [`Watched`] puts the record on the one path every completion takes — **including
+/// the turns inside the tool loop and the forced final turn**, which no hook reaches —
+/// and `log` is the caller's slot for it, readable after this returns whether the
+/// phase succeeded or failed.
+///
+/// The log is per call, never global: a phase makes its own, so concurrent consults
+/// never mix. It holds plain data and crosses `.await` freely — nothing to do with the
+/// `!Send` kaish kernel, which stays on its `KaishWorker` thread as always.
+///
+/// [`run_phase`] is this with a log nobody keeps; the *last* turn's finish reason is
+/// recorded on the span either way, so the phase's ending is visible in telemetry
+/// today.
 #[allow(clippy::too_many_arguments)]
-// each arg is a distinct, named loop input
 // A named parent for rig's GenAI spans: rig's `invoke_agent` checks the current
 // span and nests under this one, so a phase's whole model loop (every `chat` turn,
 // every `tool` call) hangs off one `run_phase` span carrying the model. Inert
@@ -753,9 +1010,14 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
         // known non-None, so a `None` (toggle-less) provider records nothing and
         // telemetry-off stays a no-op.
         gen_ai.request.thinking = tracing::field::Empty,
+        // How the phase's LAST completion ended, in the provider's own words. Empty
+        // when the provider reported none (or nothing ran), so it exports only when
+        // there's something to say.
+        gen_ai.response.finish_reason = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_phase<M, F>(
+pub(crate) async fn run_phase_logged<M, F>(
+    log: &CompletionLog,
     model: &M,
     model_name: &str,
     preamble: &str,
@@ -766,11 +1028,62 @@ pub(crate) async fn run_phase<M, F>(
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
     make_tools: F,
-    break_on_view_image: bool,
+    break_on_tool_images: bool,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
-    F: Fn() -> Result<Vec<Box<dyn ToolDyn>>>,
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
+    // Surface the exact reasoning/sampling params this phase ships (constant across the
+    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
+    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
+    let result = run_phase_loop(
+        &watched(model.clone(), log.clone()),
+        log,
+        model_name,
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        make_tools,
+        break_on_tool_images,
+    )
+    .await;
+    // Read the ending off the log — after the loop, on every exit path, so a failed
+    // phase reports how its last completion ended too.
+    if let Some(reason) = log.last_finish_reason() {
+        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    result
+}
+
+/// The bounded tool loop itself, driving whatever model it's handed — in production a
+/// [`Watched`] wrapper, so every turn below (main loop, view_image resume, forced
+/// finalize) records on its way past.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+async fn run_phase_loop<M, F>(
+    model: &Watched<M>,
+    log: &CompletionLog,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: &dyn ProgressSink,
+    make_tools: F,
+    break_on_tool_images: bool,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+    F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Loop state across view_image-break resumes. The caller hands us the *assembled*
     // first user turn — a bare `Message::user(prompt)` for every tool-driven phase, or a
@@ -780,13 +1093,6 @@ where
     // the transcript and re-enters here (holistic review, Gemini Pro 2026-06-22).
     let mut prompt: Message = initial_prompt;
     let mut history: Vec<Message> = Vec::new();
-
-    // Surface the exact reasoning/sampling params this phase ships (constant across the
-    // resume loop), so a trace shows whether — and at what depth — thinking was on: the
-    // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
-    if let Some(t) = thinking {
-        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
-    }
 
     loop {
         // Outer turn budget: rig's `max_turns` resets each resume, so subtract the
@@ -801,6 +1107,8 @@ where
             full.push(prompt);
             return finalize_after_max_turns(
                 model,
+                log,
+                model_name,
                 preamble,
                 max_tokens,
                 temperature,
@@ -822,37 +1130,117 @@ where
         if let Some(params) = thinking {
             builder = builder.additional_params(params.clone());
         }
-        let agent = builder.tools(make_tools()?).build();
+        let agent = builder.dynamic_tools(make_tools()?).build();
 
-        // A fresh hook per loop iteration is load-bearing: its `saw_view_image` flag
+        // A fresh hook per loop iteration is load-bearing: its `saw_tool_image` flag
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
-        // `.extended_details()` swaps rig's plain-`String` result for a
-        // `PromptResponse` carrying the token `usage` the provider reported, summed
-        // across every turn of *this* run (rig aggregates `usage += resp.usage` per
-        // completion). The clean `Ok` path is the common case — one run, the full
-        // count. The two exceptional exits below (turn cap, view_image break) undercount:
-        // rig hands back no usage on `MaxTurnsError`/`PromptCancelled`, so the turns
-        // spent in a capped or broken run are lost and only the finalize/resumed run's
-        // usage survives. Deliberate — recovering it would mean summing per-completion
-        // through a hook; documented as a known undercount rather than silently exact.
+        // The run yields a `PromptResponse` carrying the token `usage` the provider
+        // reported, summed across every turn of *this* run. The clean `Ok` path is the
+        // common case — one run, the full count. The two exceptional exits below (turn
+        // cap, view_image break) undercount: rig hands back no usage on
+        // `MaxTurnsError`/`PromptCancelled`, so the turns spent in a capped or broken
+        // run are lost and only the finalize/resumed run's usage survives. Deliberate —
+        // recovering it would mean summing per-completion through a hook; documented as
+        // a known undercount rather than silently exact.
         let result = agent
-            .prompt(prompt.clone())
-            .with_history(history.clone())
-            .with_hook(ViewImageBreakHook::new(break_on_view_image))
+            .runner(prompt.clone())
+            .history(history.clone())
+            .add_hook(ToolImageBreakHook::new(break_on_tool_images))
             .max_turns(remaining)
-            .extended_details()
+            .run()
             .await;
 
         match result {
-            Ok(resp) => return Ok((resp.output, resp.usage)),
+            Ok(resp) if !resp.output.trim().is_empty() => return Ok((resp.output, resp.usage)),
+            // An `Ok` with no answer text. rig treats a textless terminal turn as a clean
+            // finish and hands back `output: ""` (its own
+            // `prompt_request_stops_cleanly_on_empty_terminal_turn` pins that as intended),
+            // so the check has to live here — the one seam every phase runs through, which
+            // is what makes `consult`/`oneshot`/`explore`/`deliberate` inherit it at once.
+            // The shape that produced it in the wild: a reasoning model whose last choice
+            // carried only a `Reasoning` block, which rig's text extraction filters out.
+            Ok(resp) => {
+                // The spent-so-far usage is real and must survive into whatever we return
+                // — this is the `Ok` path, so rig reported it exactly. The retry's usage is
+                // ADDED to it below, never substituted (the turn-cap path may legitimately
+                // replace, because rig reports none on `MaxTurnsError`).
+                let spent = resp.usage;
+                // rig builds this response at exactly one place and always attaches the
+                // transcript (`with_messages`, `prompt_request/mod.rs:918`), so `Some` is
+                // the structural case. `None` is unreachable-by-construction defensive
+                // code, and it fails CLOSED: no transcript means no evidence to gate on,
+                // and re-asking blind is the fabrication risk the gate exists to refuse.
+                let turns = count_model_turns(&history) + resp.completion_calls.len();
+                let transcript = resp.messages.unwrap_or_default();
+                if !transcript_has_tool_results(&transcript) {
+                    return Err(empty_answer_error(
+                        model_name,
+                        turns,
+                        max_turns,
+                        &spent,
+                        log.last_finish_reason().as_deref(),
+                        "it stopped without answering, and its transcript holds no tool \
+                         results to write up — asking it to answer anyway would invite an \
+                         ungrounded review",
+                    ));
+                }
+                // Evidence in hand: ask for the write-up it owed. **At most once, and
+                // structurally so** — this arm returns on every path (the forced turn's
+                // answer, or an error), so it never re-enters the loop and cannot stack a
+                // second re-ask. That is a stronger guarantee than a `finalized` flag,
+                // which a later edit could reset; the shape itself forbids the loop. Pinned
+                // by `an_empty_forced_write_up_turn_errors_and_is_never_retried_twice`.
+                tracing::warn!(
+                    model = model_name,
+                    turns,
+                    output_tokens = spent.output_tokens,
+                    "phase returned an empty answer with evidence gathered — forcing one \
+                     final write-up turn"
+                );
+                progress.emit(PhaseEvent::TurnCapReached);
+                let mut full = history;
+                full.extend(transcript);
+                let (answer, retry_usage) = forced_finish_turn(
+                    model,
+                    preamble,
+                    max_tokens,
+                    temperature,
+                    thinking,
+                    make_tools()?,
+                    full,
+                    EMPTY_ANSWER_NOTE,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "model {model_name} returned an empty answer, and the forced \
+                         final-answer turn also failed: {e}"
+                    )
+                })?;
+                let usage = spent + retry_usage;
+                if answer.trim().is_empty() {
+                    return Err(empty_answer_error(
+                        model_name,
+                        turns + 1,
+                        max_turns,
+                        &usage,
+                        log.last_finish_reason().as_deref(),
+                        "it was asked once to write the answer it owed and came back empty \
+                         again",
+                    ));
+                }
+                return Ok((answer, usage));
+            }
             Err(PromptError::MaxTurnsError { chat_history, .. }) => {
                 // The loop hit its cap and is about to write a forced final answer —
                 // tell the caller, so a watching client sees "wrapping up" not silence.
                 progress.emit(PhaseEvent::TurnCapReached);
                 return finalize_after_max_turns(
                     model,
+                    log,
+                    model_name,
                     preamble,
                     max_tokens,
                     temperature,
@@ -870,8 +1258,8 @@ where
             Err(PromptError::PromptCancelled {
                 chat_history,
                 reason,
-            }) if reason == VIEW_IMAGE_BREAK => {
-                let (rest, next) = split_for_resume(rewrite_view_image_history(chat_history));
+            }) if reason == TOOL_IMAGE_BREAK => {
+                let (rest, next) = split_for_resume(rewrite_tool_image_history(chat_history));
                 history = rest;
                 prompt = next;
             }
@@ -880,25 +1268,31 @@ where
     }
 }
 
-/// The forced final turn after a phase hit its turn cap: replay the partial
-/// transcript and make the model write its answer now, with tools declared (so the
-/// history validates) but [`ToolChoice::None`] forbidding any further call. See
-/// [`run_phase`]'s recovery note and [`finalize_prompt`].
+/// One forced final turn: replay the partial transcript and make the model write its
+/// answer now, with tools declared (so the history validates) but [`ToolChoice::None`]
+/// forbidding any further call. The shared shape behind both recoveries — out of turns
+/// ([`finalize_after_max_turns`], [`FINALIZE_NOTE`]) and stopped-without-answering
+/// ([`run_phase`], [`EMPTY_ANSWER_NOTE`]) — which differ only in the note they append
+/// and the failure they report, so the rig plumbing lives here once.
+///
+/// Returns rig's error unwrapped so each caller can say what it was recovering *from*;
+/// it deliberately does not judge the answer, leaving the empty check to the callers
+/// that know which diagnostics belong on it.
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-async fn finalize_after_max_turns<M>(
+async fn forced_finish_turn<M>(
     model: &M,
     preamble: &str,
     max_tokens: u64,
     temperature: Option<f64>,
     thinking: Option<&Value>,
-    tools: Vec<Box<dyn ToolDyn>>,
+    tools: Vec<DynamicTool>,
     chat_history: Vec<Message>,
-    max_turns: usize,
-) -> Result<(String, Usage)>
+    note: &str,
+) -> std::result::Result<(String, Usage), PromptError>
 where
     M: CompletionModel + 'static,
 {
-    let (history, prompt) = finalize_prompt(chat_history);
+    let (history, prompt) = finalize_prompt(chat_history, note);
     let mut builder = AgentBuilder::new(model.clone())
         .preamble(preamble)
         .max_tokens(max_tokens)
@@ -909,23 +1303,164 @@ where
     if let Some(params) = thinking {
         builder = builder.additional_params(params.clone());
     }
-    let agent = builder.tools(tools).build();
+    let agent = builder.dynamic_tools(tools).build();
     // max_turns(1): one constrained completion. With tools forbidden the model can't
     // loop, so a single round is enough — and if a provider ignores ToolChoice::None
     // and still calls a tool, we surface that rather than recurse.
     agent
-        .prompt(prompt)
-        .with_history(history)
+        .runner(prompt)
+        .history(history)
         .max_turns(1)
-        .extended_details()
+        .run()
         .await
         .map(|resp| (resp.output, resp.usage))
-        .map_err(|e| {
-            anyhow!(
-                "model used all {max_turns} turns, and the forced final-answer turn \
-                 also failed to conclude: {e}"
-            )
+}
+
+/// The forced final turn after a phase hit its turn cap. See [`run_phase`]'s recovery
+/// note and [`forced_finish_turn`].
+///
+/// Spending the entire turn budget and *still* delivering nothing is a failure, not an
+/// empty success — so the answer passes the same [`empty_answer_error`] gate the early-
+/// stop path uses. There is no re-ask here: this already **is** the re-ask.
+#[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
+async fn finalize_after_max_turns<M>(
+    model: &M,
+    log: &CompletionLog,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    thinking: Option<&Value>,
+    tools: Vec<DynamicTool>,
+    chat_history: Vec<Message>,
+    max_turns: usize,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+{
+    let (answer, usage) = forced_finish_turn(
+        model,
+        preamble,
+        max_tokens,
+        temperature,
+        thinking,
+        tools,
+        chat_history,
+        FINALIZE_NOTE,
+    )
+    .await
+    .map_err(|e| {
+        anyhow!(
+            "model used all {max_turns} turns, and the forced final-answer turn \
+             also failed to conclude: {e}"
+        )
+    })?;
+    if answer.trim().is_empty() {
+        return Err(empty_answer_error(
+            model_name,
+            max_turns,
+            max_turns,
+            &usage,
+            log.last_finish_reason().as_deref(),
+            "it used every turn and then wrote nothing when forced to conclude",
+        ));
+    }
+    Ok((answer, usage))
+}
+
+/// One completion, no agent and no loop — the single-shot phases said plainly.
+///
+/// `oneshot` and `deliberate`'s direct lane are each *one* upstream request by
+/// definition: the caller owns the context, there is nothing to explore, and there are
+/// no tools to call. Running them through the managed tool loop with an empty toolset
+/// arrived at the same place by a longer road; this asks the provider directly.
+///
+/// **Byte-identical to what the agent built.** rig's agent prepares its request with
+/// the same [`CompletionRequestBuilder`](rig_core::completion::CompletionRequestBuilder)
+/// this uses, and `build()` is what turns a preamble into the leading
+/// `Message::System` — so preamble placement, params, `max_tokens`, temperature, the
+/// empty tool list, and the absent `tool_choice` all land exactly as before. Using
+/// rig's own builder rather than a hand-written literal is deliberate: a rig bump that
+/// changes how a request is assembled moves both paths together.
+///
+/// The answer text is the assistant turn's text content concatenated, which is how
+/// rig's runner builds `PromptResponse::output`; `usage` is the provider's report for
+/// this one call, zero-valued when it reported none.
+///
+/// `log` records how the completion ended, the same seam [`run_phase_logged`] gives
+/// the loop.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named request input
+#[tracing::instrument(
+    name = "run_phase",
+    skip_all,
+    fields(
+        model = %model_name,
+        // Honest, not decorative: this phase *is* one turn.
+        max_turns = 1,
+        gen_ai.request.thinking = tracing::field::Empty,
+        gen_ai.response.finish_reason = tracing::field::Empty,
+    )
+)]
+pub(crate) async fn run_completion<M>(
+    model: &M,
+    model_name: &str,
+    log: &CompletionLog,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    prompt: Message,
+    thinking: Option<&Value>,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + 'static,
+{
+    if let Some(t) = thinking {
+        tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
+    }
+    let mut builder = watched(model.clone(), log.clone())
+        .completion_request(prompt)
+        .preamble(preamble.to_string())
+        .max_tokens(max_tokens);
+    if let Some(t) = temperature {
+        builder = builder.temperature(t);
+    }
+    if let Some(params) = thinking {
+        builder = builder.additional_params(params.clone());
+    }
+    // `send()` is `model.completion(builder.build())` — the one provider call.
+    let response = builder.send().await;
+    if let Some(reason) = log.last_finish_reason() {
+        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    // "model call failed" keeps this on the provider side of `classify_failure`
+    // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
+    // overload or rate limit here is still worth a caller retry.
+    let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
+    let answer = response
+        .choice
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
         })
+        .collect::<String>();
+    // The single-shot lanes are toolless by definition, so an empty answer here can
+    // never satisfy the evidence gate the loop's recovery runs on — there is nothing
+    // gathered to write up, and no re-ask that wouldn't invite an ungrounded answer.
+    // Fail with the same diagnostics vocabulary as the loop, finish reason included
+    // (this path reads it off its own log).
+    if answer.trim().is_empty() {
+        return Err(empty_answer_error(
+            model_name,
+            1,
+            1,
+            &response.usage,
+            log.last_finish_reason().as_deref(),
+            "the single toolless completion returned no answer text, and a lane with \
+             no tools has no gathered evidence to write up, so kaibo does not re-ask",
+        ));
+    }
+    Ok((answer, response.usage))
 }
 
 /// Run the explorer phase once and return its cited report. The explorer [`Arm`]
@@ -942,6 +1477,14 @@ where
 /// handed to `run_kaish` so the sweep's own reads surface too. `!Send` care (an
 /// invariant): the kernel stays on its `KaishWorker` thread and never crosses the
 /// `.await`.
+///
+/// `attach` is the sweep's [`SweepAttachSink`] — `Some` injects the `attach` tool
+/// alongside `run_kaish` (sharing the same kernel `view_image` shares with
+/// `run_kaish` in `consult_tools`) and appends [`explorer_attach_directive`] to the
+/// preamble in the same place, so preamble and toolset can never drift apart.
+/// `None` (the top-level `explore` tool, v1) is byte-for-byte the old behavior —
+/// same preamble, same two-line toolset.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 pub(crate) async fn run_explore_phase(
     arm: &Arm,
     preamble: &str,
@@ -950,17 +1493,39 @@ pub(crate) async fn run_explore_phase(
     sandbox: &SandboxConfig,
     max_turns: usize,
     progress: &Arc<dyn ProgressSink>,
+    attach: Option<&Arc<SweepAttachSink>>,
 ) -> Result<(String, Usage)> {
+    let preamble_owned;
+    let preamble = match attach {
+        Some(sink) => {
+            preamble_owned = format!(
+                "{preamble}{}",
+                explorer_attach_directive(sink.max_attachments(), sink.consumer())
+            );
+            preamble_owned.as_str()
+        }
+        None => preamble,
+    };
     arm.run(
         preamble,
         Message::user(question.to_string()),
         max_turns,
         progress.as_ref(),
-        &|| -> Result<Vec<Box<dyn ToolDyn>>> {
-            Ok(vec![traced(RunKaish::with_progress(
-                KaishWorker::spawn_with(&root, sandbox.clone())?,
+        &|| -> Result<Vec<DynamicTool>> {
+            let worker = KaishWorker::spawn_with(&root, sandbox.clone())?;
+            let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
+                worker.clone(),
                 progress.clone(),
-            ))])
+            ))];
+            if let Some(sink) = attach {
+                tools.push(traced(SweepAttach::new(
+                    worker,
+                    root.clone(),
+                    Arc::clone(sink),
+                    progress.clone(),
+                )));
+            }
+            Ok(tools)
         },
     )
     .await
@@ -1002,6 +1567,18 @@ pub struct RunExplore {
     /// nested explorer carries the explorer's `[prompts]`/`[context]` framing,
     /// built once instead of per sweep.
     preamble: Arc<str>,
+    /// Who reads this sweep's report — decides the vision gate and the demotion
+    /// wording a fresh [`SweepAttachSink`] is built with per sweep.
+    consumer: SweepConsumer,
+    /// This sweep's attach budget. `0` means "don't inject the tool at all" — no
+    /// sink is built, `run_explore_phase` gets `None`, byte-for-byte the pre-attach
+    /// behavior.
+    max_attachments: usize,
+    /// Canonical paths whose bytes already reach the consumer another way (the
+    /// caller's own `consult` attachments) — seeded into every sweep's sink so
+    /// `attach` doesn't re-route what's already in front of the driver. Empty for
+    /// `deliberate` (see `SweepAttachSink`'s doc).
+    already_delivered: Arc<HashSet<PathBuf>>,
 }
 
 impl RunExplore {
@@ -1015,6 +1592,9 @@ impl RunExplore {
         usage_sink: Arc<Mutex<Usage>>,
         progress: Arc<dyn ProgressSink>,
         preamble: Arc<str>,
+        consumer: SweepConsumer,
+        max_attachments: usize,
+        already_delivered: Arc<HashSet<PathBuf>>,
     ) -> Self {
         Self {
             arm,
@@ -1025,6 +1605,9 @@ impl RunExplore {
             usage_sink,
             progress,
             preamble,
+            consumer,
+            max_attachments,
+            already_delivered,
         }
     }
 }
@@ -1051,35 +1634,66 @@ impl Tool for RunExplore {
     const NAME: &'static str = "explore";
     type Error = RunExploreError;
     type Args = RunExploreArgs;
-    type Output = String;
+    /// [`ToolOutput`], not `String`: no attachment → `ToolOutput::text(report)`,
+    /// exactly the plain report the driver always read. With a routed image → the
+    /// text plus one *declared* `Image` block per routed image, the same typed
+    /// contract [`crate::view_image::ViewImage::view`] emits — rig 0.41 only routes
+    /// images a tool declares, never ones it might discover inside text output.
+    type Output = ToolOutput;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Delegate a broad sweep to a fast investigator that rips \
-                through the repo on a read-only kaish shell and reports back with \
-                concrete `file:line` citations. Give it a focused question; use it \
-                to cover breadth, and read the code yourself with `run_kaish`."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "the question or sub-question to investigate"
-                    }
-                },
-                "required": ["question"]
-            }),
-        }
+    /// Keep the failure text model-visible: rig's default would redact it to a
+    /// kind-level "the tool failed", and a dead sweep is something the driver must
+    /// *see* to recover from — it answers from its own direct reads instead of retrying
+    /// blind, and can only choose that if the failure reaches it. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string()).with_source(error)
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn description(&self) -> String {
+        "Delegate a broad sweep to the fast explorer on your team. It \
+         searches the repository on a read-only kaish shell and reports back \
+         with concrete `file:line` citations. Give it a focused question. Use \
+         `explore` when a question needs breadth, and use `run_kaish` to read \
+         specific code yourself."
+            .to_string()
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "the question or sub-question to investigate"
+                }
+            },
+            "required": ["question"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _ctx: &mut rig_agent::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // Bracket the delegation: the start carries the sub-question, the finish fires
         // on both success and failure (the `?` below short-circuits, so emit it before
         // unwrapping the result).
         self.progress.emit(PhaseEvent::SweepStarted {
             question: args.question.clone(),
+        });
+        // A fresh sink per sweep — `attach`'s budget/dedupe is scoped to ONE sweep,
+        // not the whole consult (a driver that delegates 5 sweeps pays for 5 budgets;
+        // see the residual-risk note in the design doc). `0` means the operator
+        // turned the tool off: no sink, `run_explore_phase` gets `None`, byte-for-byte
+        // the pre-attach behavior.
+        let sink = (self.max_attachments > 0).then(|| {
+            Arc::new(SweepAttachSink::new(
+                self.max_attachments,
+                self.consumer.clone(),
+                (*self.already_delivered).clone(),
+            ))
         });
         // Reuse the one seam — explore′ is just the shared explorer phase, run on the
         // sub-agent's arm with its resolved preamble. The sweep bracket
@@ -1093,6 +1707,7 @@ impl Tool for RunExplore {
             &self.sandbox,
             self.max_turns,
             &self.progress,
+            sink.as_ref(),
         )
         .await;
         self.progress.emit(PhaseEvent::SweepFinished);
@@ -1104,26 +1719,112 @@ impl Tool for RunExplore {
             .usage_sink
             .lock()
             .expect("explore usage sink poisoned") += usage;
+        // A sweep that reported nothing is a *failed* sweep, not an empty one. Handing the
+        // driver a blank tool result is the same silent-empty class one level down, and
+        // worse in one way: the driver cannot tell a blank sweep from a sweep that found
+        // nothing, so it would answer as though the breadth had been covered. As an error
+        // it becomes visible — rig folds it back as this tool's result and the driver
+        // recovers (re-delegate, or read the spans itself). Checked AFTER the usage fold,
+        // because those tokens were spent either way and the footer must say so.
+        // `run_phase`'s own guard makes this near-unreachable today; it stays as this
+        // seam's invariant, not a duplicate of that one.
+        if report.trim().is_empty() {
+            return Err(RunExploreError(
+                "the explorer returned an empty report — no findings reached the driver"
+                    .to_string(),
+            ));
+        }
+        // The `reports` sink feeds `ConsultOutput.report` (the readable artifact a
+        // caller sees via `include_report`) — the explorer's own prose only, never
+        // the routed bytes (those already reached the driver on the tool result; a
+        // caller-facing summary duplicating full attached files would just bloat it).
         self.reports
             .lock()
             .expect("explore report sink poisoned")
             .push(report.clone());
-        Ok(report)
+        // What the DRIVER sees on the tool result: the report plus whatever this
+        // sweep routed via `attach` — text bodies inline, an image manifest, notes,
+        // and demotions. `None` (no sink, or a sink that never attached anything)
+        // leaves this byte-for-byte the bare report, and `images` stays empty.
+        let (text, images) = match &sink {
+            Some(sink) => {
+                let delivery = sink.drain();
+                let images = delivery.images();
+                let text = match sweep_evidence_block(&self.consumer, &delivery) {
+                    Some(block) => format!("{report}{block}"),
+                    None => report,
+                };
+                (text, images)
+            }
+            None => (report, Vec::new()),
+        };
+        // No image → plain text, exactly the pre-attach tool result (see the `Output`
+        // doc). With one or more → the text followed by a declared `Image` block per
+        // routed image, the same typed blocks `view_image` emits for one.
+        if images.is_empty() {
+            Ok(ToolOutput::text(text))
+        } else {
+            let mut parts: Vec<ToolResultContent> = vec![ToolResultContent::text(text)];
+            parts.extend(images.iter().filter_map(|a| match a {
+                Attachment::Image { mime, data_b64, .. } => Some(ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64(data_b64.clone()),
+                    media_type: ImageMediaType::from_mime_type(mime),
+                    detail: None,
+                    additional_params: None,
+                })),
+                Attachment::Text { .. } => None,
+            }));
+            Ok(ToolOutput::content(
+                OneOrMany::many(parts).expect("the text part is always present"),
+            ))
+        }
+    }
+}
+
+/// Assemble a single user turn from `text` plus any image attachments — shared by
+/// [`oneshot`] and [`deliberate_direct`] (both are exactly-one-completion phases with
+/// no tool loop to fold an image into, so the image must ride the initial turn
+/// itself). No images → a bare `Message::user(text)`, byte-for-byte the pre-attach
+/// call. With images, the text rides as the first part (skipped when empty — an
+/// image-only turn shouldn't emit a pointless `{type:text,text:""}` block), then the
+/// images. `&[]` is byte-for-byte the old `Message::user(text)` either way.
+fn user_turn_with_attachments(attachments: &[Attachment], text: String) -> Message {
+    let image_parts: Vec<UserContent> = attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
+                data_b64.clone(),
+                ImageMediaType::from_mime_type(mime),
+                None,
+            )),
+            Attachment::Text { .. } => None,
+        })
+        .collect();
+    if image_parts.is_empty() {
+        Message::user(text)
+    } else {
+        let mut parts = Vec::with_capacity(image_parts.len() + 1);
+        if !text.is_empty() {
+            parts.push(UserContent::text(text));
+        }
+        parts.extend(image_parts);
+        Message::User {
+            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
+        }
     }
 }
 
 /// The `oneshot` seam: one direct completion on the resolved arm — no tools, no
 /// shell, no exploration. The thin counterpart to `consult` (prompt in, answer out)
 /// for when the caller already owns the context and just wants the model's take.
-/// Built on the one loop primitive with an empty toolset and a single turn, so it is
-/// exactly one upstream request. Neither orientation nor operator house rules are
-/// spliced — both are project guidance, and oneshot reads no project.
+/// Exactly one upstream request, and now literally so: [`Arm::complete`] asks the
+/// provider directly rather than routing a toolless single turn through the managed
+/// loop. Neither orientation nor operator house rules are spliced — both are project
+/// guidance, and oneshot reads no project.
 ///
-/// Safe-by-accident note: a vision synth arm carries `break_on_view_image = true`
-/// (via `Arm::rewrites_view_image`), but the empty toolset has no `view_image` tool,
-/// so the break hook can never fire and the single turn always completes cleanly. If
-/// you ever give oneshot a tool, revisit this — a live break would consume the turn
-/// and land in the turn-cap finalize path.
+/// Give oneshot a tool one day and this is the line to revisit: a direct completion
+/// has nowhere to dispatch a tool call to, so a toolful oneshot belongs back on
+/// [`run_phase`], not here.
 ///
 /// `attachments` are caller-named workspace files inlined as context (the `attach` arg),
 /// resolved server-side so their bytes never transit the calling agent's context — the
@@ -1139,37 +1840,11 @@ pub async fn oneshot(
     cfg: &PhaseContext,
 ) -> Result<(String, Usage)> {
     let user_prompt = crate::attach::with_text_context(attachments, prompt);
-    let image_parts: Vec<UserContent> = attachments
-        .iter()
-        .filter_map(|a| match a {
-            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
-                data_b64.clone(),
-                ImageMediaType::from_mime_type(mime),
-                None,
-            )),
-            Attachment::Text { .. } => None,
-        })
-        .collect();
-    // Assemble the single user turn here — multimodal awareness lives in oneshot, not the
-    // shared loop. No images → a bare `Message::user` (byte-for-byte the old call). With
-    // images, the text rides as the first part (skipped when empty — image-only with an
-    // empty prompt shouldn't emit a pointless `{type:text,text:""}` block), then the images.
-    let initial_prompt = if image_parts.is_empty() {
-        Message::user(user_prompt)
-    } else {
-        let mut parts = Vec::with_capacity(image_parts.len() + 1);
-        if !user_prompt.is_empty() {
-            parts.push(UserContent::text(user_prompt));
-        }
-        parts.extend(image_parts);
-        Message::User {
-            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
-        }
-    };
+    let initial_prompt = user_turn_with_attachments(attachments, user_prompt);
     with_call_deadline(
         cfg.call_deadline,
         "oneshot",
-        arm.run(
+        arm.complete(
             &resolve_phase_preamble(
                 Phase::Oneshot,
                 &cfg.prompts,
@@ -1177,9 +1852,6 @@ pub async fn oneshot(
                 cfg.house_rules.as_deref(),
             ),
             initial_prompt,
-            1,
-            cfg.progress.as_ref(),
-            &|| Ok(Vec::new()),
         ),
     )
     .await
@@ -1195,8 +1867,8 @@ fn consult_tools(
     cfg: &ConsultConfig,
     reports: Arc<Mutex<Vec<String>>>,
     explore_usage: Arc<Mutex<Usage>>,
-    synth_vision: bool,
-) -> Result<Vec<Box<dyn ToolDyn>>> {
+    synth: &Arm,
+) -> Result<Vec<DynamicTool>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
     let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
@@ -1221,6 +1893,22 @@ fn consult_tools(
         explorer_preamble_owned.push_str(&directive);
     }
     let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
+    // Who a delegated sweep's `attach` calls route to: the DRIVER (this loop runs on
+    // the synth arm), named so the explorer knows who reads its report, gated on the
+    // synth's own vision cap (the same cap `view_image` below rides).
+    let consumer = SweepConsumer {
+        kind: SweepConsumerKind::ConsultDriver,
+        label: Arc::from(format!("the consult driver (`{}`)", synth.model)),
+        vision: synth.caps.vision,
+    };
+    // The caller's own `consult` attachments already reach the driver another way
+    // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
+    // doesn't re-route what's already in front of the driver.
+    // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
+    // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
+    // a `..`, or a symlink, and the reader then receives the same bytes twice.
+    let already_delivered: HashSet<PathBuf> =
+        crate::sweep_attach::delivered_seed(root, cfg.attachments.iter().map(|a| Path::new(a.path())));
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explore.explorer_max_turns,
@@ -1230,8 +1918,11 @@ fn consult_tools(
         explore_usage,
         cfg.explore.phase.progress.clone(),
         explorer_preamble,
+        consumer,
+        cfg.explore.max_attachments,
+        Arc::new(already_delivered),
     );
-    let mut tools: Vec<Box<dyn ToolDyn>> = vec![
+    let mut tools: Vec<DynamicTool> = vec![
         traced(RunKaish::with_progress(
             worker.clone(),
             cfg.explore.phase.progress.clone(),
@@ -1241,7 +1932,7 @@ fn consult_tools(
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
-    if synth_vision {
+    if synth.caps.vision {
         tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     Ok(tools)
@@ -1262,6 +1953,7 @@ pub(crate) async fn explore_with(
     explorer: &Arm,
     cfg: &ExploreConfig,
     attached: &[super::prompts::ConsultAttachment],
+    attach: Option<&Arc<SweepAttachSink>>,
 ) -> Result<(String, Usage)> {
     let mut preamble = resolve_phase_preamble(
         Phase::Explorer,
@@ -1283,6 +1975,7 @@ pub(crate) async fn explore_with(
             &cfg.sandbox,
             cfg.explorer_max_turns,
             &cfg.phase.progress,
+            attach,
         ),
     )
     .await
@@ -1333,31 +2026,28 @@ async fn with_call_deadline<T>(
 /// `call_deadline` — a slow local model gets its full patience without forcing the
 /// interactive ceiling high. The **batch** lane, by contrast, holds no in-process wait
 /// at all — its deliberation runs on the *provider's* queue.
+///
+/// `attachments` carries any images a delegated dossier sweep routed via `attach`
+/// (text attachments never reach here — they're already stitched into `dossier`'s
+/// text by `sweep_evidence_block`) — the single turn's own images, via the same
+/// [`user_turn_with_attachments`] helper [`oneshot`] uses. `&[]` is byte-for-byte the
+/// old `Message::user(...)` call.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named phase input
 pub async fn deliberate_direct(
     question: &str,
     dossier: &str,
+    attachments: &[Attachment],
     synth: &Arm,
     system: &str,
     deadline: Duration,
-    progress: &Arc<dyn ProgressSink>,
 ) -> Result<(String, Usage)> {
-    with_call_deadline(
-        deadline,
-        "deliberate",
-        synth.run(
-            system,
-            Message::user(deliberation_prompt(question, dossier)),
-            1,
-            progress.as_ref(),
-            &|| Ok(Vec::new()),
-        ),
-    )
-    .await
+    let prompt = user_turn_with_attachments(attachments, deliberation_prompt(question, dossier));
+    with_call_deadline(deadline, "deliberate", synth.complete(system, prompt)).await
 }
 
 /// Run a `consult` over two resolved arms.
 ///
-/// One loop, two tools — no rigid explorer→synth hand-off. The capable model
+/// One loop, two tools — no rigid explorer→synth hand-off. The synthesis agent
 /// decides when to delegate a sweep to the cheap `explore′` vs. read a span
 /// directly with `run_kaish`. Each arm carries its own client and request shape,
 /// so a mixed cast routes each phase to its own backend through the same loop.
@@ -1399,7 +2089,7 @@ pub(crate) async fn consult_with(
                     cfg,
                     reports.clone(),
                     explore_usage.clone(),
-                    synth.caps.vision,
+                    synth,
                 )
             },
         ),
@@ -1512,9 +2202,11 @@ mod tests {
 
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
-        has_tool, is_finalize_turn, provider_error, text_response, tool_call_response,
-        transcript_text, usage, with_usage, RecordingSink, ScriptedClient,
+        has_tool, is_finalize_turn, provider_error, reasoning_response, text_response,
+        tool_call_response, transcript_text, usage, with_raw, with_usage, CaptureHttp,
+        RecordingSink, ScriptedClient,
     };
+    use rig_core::completion::CompletionRequest;
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::Path;
@@ -1560,6 +2252,22 @@ mod tests {
         )
     }
 
+    /// A vision-capable arm on a transport that carries an image in a tool result
+    /// (Anthropic/Gemini-shaped caps) — the toolset-wiring tests' injection point for
+    /// "the synth can see", distinct from `arm`'s deliberately blind default.
+    fn vision_arm(client: &ScriptedClient, model: &str) -> Arm {
+        Arm::new(
+            client.clone(),
+            model,
+            16384,
+            None,
+            ModelCaps {
+                vision: true,
+                tool_result_images: true,
+            },
+        )
+    }
+
     /// A driver that answers immediately (no tools), echoing the current question into
     /// its answer so a later turn's replayed history is easy to spot. Keeps the
     /// session tests focused on the glue, not the loop. `consult_user_prompt` puts the
@@ -1577,6 +2285,13 @@ mod tests {
                 Ok(text_response(format!("ANSWER[{question}]")))
             })
             .build()
+    }
+
+    /// True for a recorded request that is a forced final turn (`ToolChoice::None`) —
+    /// the observable signature of a turn-cap or empty-answer recovery. Taken by
+    /// reference so it drops straight into `.filter(..)` over recorded requests.
+    fn is_finalize_request(r: &crate::test_support::RecordedRequest) -> bool {
+        r.tool_choice == Some(ToolChoice::None)
     }
 
     /// A project root with one real file carrying a known marker, so the kaish reads
@@ -1637,7 +2352,7 @@ mod tests {
         );
         // Still the consult driver's own role framing — house rules append, not replace.
         assert!(
-            pre.contains("You answer a question about a codebase"),
+            pre.contains("You are the synthesis agent"),
             "base preamble must remain: {pre}"
         );
 
@@ -1659,7 +2374,7 @@ mod tests {
         let pre2 = reqs2[0].preamble.as_deref().unwrap_or("");
         assert!(!pre2.contains(MARKER), "no [context] → no marker: {pre2}");
         assert!(
-            pre2.contains("You answer a question about a codebase"),
+            pre2.contains("You are the synthesis agent"),
             "base preamble intact: {pre2}"
         );
     }
@@ -1729,7 +2444,7 @@ mod tests {
             "the nested explore′ sweep must carry the house rules too: {explorer_pre}"
         );
         assert!(
-            explorer_pre.contains("code explorer"),
+            explorer_pre.contains("You are the explorer"),
             "still the explorer's own role framing: {explorer_pre}"
         );
     }
@@ -1781,7 +2496,7 @@ mod tests {
         assert!(pre.contains(CUSTOM), "override prose missing: {pre}");
         // ...the built-in framing is fully replaced (full-replace, by decision)...
         assert!(
-            !pre.contains("You answer a question about a codebase"),
+            !pre.contains("You are the synthesis agent"),
             "override must REPLACE, not augment, the built-in: {pre}"
         );
         // ...and house rules still layer on top.
@@ -2010,6 +2725,162 @@ mod tests {
         );
     }
 
+    /// `oneshot` is now one *literal* upstream request — a direct completion, no agent
+    /// and no tool loop — and it must ask for exactly what the loop used to ask for.
+    ///
+    /// The proof is a side-by-side: the same preamble, params, `max_tokens`, and prompt
+    /// go down the old road (`Arm::run` with an empty toolset and a single turn) and the
+    /// new one (`oneshot` → `Arm::complete`), on two scripted models sharing one request
+    /// log. The two serialized [`CompletionRequest`]s must be identical — every field,
+    /// including the ones no accessor names: preamble placement (rig turns it into the
+    /// leading `System` message), the empty `tools`/`documents`, the absent
+    /// `tool_choice`, `additional_params`. Comparing whole requests is the point: a
+    /// spot-check of a few fields would pass while a dropped one changed the call.
+    #[tokio::test]
+    async fn oneshot_asks_exactly_what_the_agent_loop_asked() {
+        const VIA_LOOP: &str = "via-agent-loop";
+        const VIA_DIRECT: &str = "via-direct-call";
+        let client = ScriptedClient::builder()
+            .on_model(VIA_LOOP, |_req| Ok(text_response("done")))
+            .on_model(VIA_DIRECT, |_req| Ok(text_response("done")))
+            .build();
+        // A real params blob, so the thinking toggle rides both paths.
+        let params = Some(json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}));
+        let cfg = PhaseContext::default();
+        let preamble = resolve_phase_preamble(
+            Phase::Oneshot,
+            &cfg.prompts,
+            cfg.orientation.as_deref(),
+            cfg.house_rules.as_deref(),
+        );
+
+        // The pre-change path, reproduced: the managed loop, one turn, no tools.
+        let (loop_answer, loop_usage) = arm_with(&client, VIA_LOOP, params.clone())
+            .run(
+                &preamble,
+                Message::user("what changed?"),
+                1,
+                cfg.progress.as_ref(),
+                &|| Ok(Vec::new()),
+            )
+            .await
+            .expect("the agent-loop path answers");
+
+        // The shipped path.
+        let (direct_answer, direct_usage) = oneshot(
+            "what changed?",
+            &[],
+            &arm_with(&client, VIA_DIRECT, params),
+            &cfg,
+        )
+        .await
+        .expect("the direct path answers");
+
+        assert_eq!(direct_answer, loop_answer, "same answer text");
+        assert_eq!(direct_usage, loop_usage, "same usage accounting");
+
+        let looped = client.requests_for(VIA_LOOP);
+        let direct = client.requests_for(VIA_DIRECT);
+        assert_eq!(
+            looped.len(),
+            1,
+            "the loop made one request to compare against"
+        );
+        assert_eq!(
+            direct.len(),
+            1,
+            "oneshot is exactly ONE upstream request, got {}",
+            direct.len()
+        );
+        assert_eq!(
+            direct[0].raw, looped[0].raw,
+            "the direct completion must be request-for-request what the agent built"
+        );
+    }
+
+    /// The whole reason the wrapper exists: a phase's completion record reaches
+    /// [`run_phase_logged`]'s caller **including the turns inside the tool loop** — the
+    /// ones rig's agent hook can only see in its medium-neutral form, with no
+    /// `raw_response` and so no finish reason.
+    ///
+    /// Two turns here: the driver calls `run_kaish` (a provider reporting
+    /// `finish_reason: "tool_calls"`, nested under `choices[]` the OpenAI way), then
+    /// answers (an Anthropic-shaped top-level `stop_reason: "end_turn"`). Both land in
+    /// the log, in order, each with the reason its own payload gave — two spellings
+    /// through one extractor, from inside one real loop.
+    #[tokio::test]
+    async fn the_completion_log_carries_every_turn_including_inside_the_tool_loop() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                if transcript_text(req).contains("TOOL_RAN") {
+                    // The answering turn: Anthropic's top-level spelling.
+                    Ok(with_raw(
+                        text_response("the answer"),
+                        json!({"stop_reason": "end_turn"}),
+                    ))
+                } else {
+                    // A turn INSIDE the loop: the OpenAI-compatible spelling, nested.
+                    Ok(with_raw(
+                        tool_call_response("c1", "run_kaish", json!({"script": "echo TOOL_RAN"})),
+                        json!({"choices": [{"index": 0, "finish_reason": "tool_calls"}]}),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let log = CompletionLog::new();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase_logged(
+            &log,
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            4,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        )
+        .await
+        .expect("the scripted loop answers");
+
+        assert_eq!(answer, "the answer");
+        let turns = log.turns();
+        assert_eq!(
+            turns.len(),
+            2,
+            "every completion is recorded, tool turn included: {turns:?}"
+        );
+        assert_eq!(
+            turns[0].finish_reason.as_deref(),
+            Some("tool_calls"),
+            "the turn inside the loop — the one no hook can reach"
+        );
+        assert_eq!(turns[0].tool_calls, 1);
+        assert_eq!(turns[0].text_chars, 0);
+        assert_eq!(
+            turns[1].finish_reason.as_deref(),
+            Some("end_turn"),
+            "a different provider spelling, same extractor"
+        );
+        assert_eq!(
+            log.last_finish_reason().as_deref(),
+            Some("end_turn"),
+            "the phase's ending is one call away"
+        );
+    }
+
     /// oneshot carries the provider's reported token usage back out — the thin
     /// single-turn seam threads `PromptResponse.usage` the same as the loop does.
     #[tokio::test]
@@ -2117,7 +2988,7 @@ mod tests {
         );
 
         // And the routing held: the cheap model saw the *report* preamble (explorer
-        // role), the capable model saw the *consult* preamble (driver role).
+        // role), the synth model saw the *consult* preamble (driver role).
         let explorer_reqs = client.requests_for(EXPLORER);
         assert!(
             !explorer_reqs.is_empty(),
@@ -2128,7 +2999,7 @@ mod tests {
                 .preamble
                 .as_deref()
                 .unwrap_or("")
-                .contains("code explorer"),
+                .contains("You are the explorer"),
             "explorer got the report preamble: {:?}",
             explorer_reqs[0].preamble
         );
@@ -2283,6 +3154,614 @@ mod tests {
         );
     }
 
+    // --- The explorer `attach` tool, wired into the recomposed consult loop ------
+
+    /// A delegated sweep's OWN toolset (not the driver's) is exactly
+    /// `{run_kaish, attach}` — never a nested `explore` (a sweep doesn't delegate
+    /// further). Pinned by asserting inside the EXPLORER's own responder, since the
+    /// inner toolset only exists once the driver actually delegates.
+    #[tokio::test]
+    async fn the_delegated_sweep_toolset_is_run_kaish_and_attach() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "q" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(has_tool(req, "run_kaish"), "{:?}", req.tools);
+                assert!(has_tool(req, "attach"), "{:?}", req.tools);
+                assert!(
+                    !has_tool(req, "explore"),
+                    "a sweep does not delegate further: {:?}",
+                    req.tools
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+    }
+
+    /// The load-bearing wiring test: a sweep that calls `attach` must land its
+    /// routed file — full body, numbered — on the DRIVER's tool result, not just
+    /// in the sweep's own transcript.
+    #[tokio::test]
+    async fn a_sweep_attachment_rides_the_tool_result_to_the_driver() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("<file path=\"src/foo.rs\">") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs.iter().any(|r| r.transcript.contains("<file path=\"src/foo.rs\">")
+                && r.transcript.contains("fn target_marker")),
+            "the driver's transcript must carry the attached file's numbered body: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// The explorer's OWN context (its later requests, after the attach call) must
+    /// never carry the routed bytes — the whole premise of the feature is that the
+    /// bytes bypass the sweep's own context.
+    #[tokio::test]
+    async fn the_explorer_never_sees_the_attached_bytes() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT: routed") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        for r in client.requests_for(EXPLORER) {
+            assert!(
+                !r.transcript.contains("fn target_marker"),
+                "the explorer's own transcript must never carry the routed bytes: {:?}",
+                r.transcript
+            );
+        }
+    }
+
+    /// A sweep that never calls `attach` hands the driver exactly the bare report —
+    /// no evidence block appended, byte-for-byte the pre-attach behavior.
+    #[tokio::test]
+    async fn a_sweep_with_no_attachment_hands_the_driver_the_bare_report() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("PLAIN REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |_req| Ok(text_response("PLAIN REPORT: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("PLAIN REPORT: src/foo.rs:1")
+                    && !r.transcript.contains("Files the explorer routed")),
+            "no attach call -> no evidence block, just the bare report: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// Past `max_attachments`, the extra file's demotion reaches the DRIVER as a
+    /// loud, consumer-shaped line — the driver learns it can still `run_kaish` the
+    /// file itself.
+    #[tokio::test]
+    async fn an_over_cap_sweep_attach_reaches_the_driver_as_a_loud_demotion() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("could not route") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach two files" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("1 of 1 attachments") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs", "src/bar.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: tried to route both"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::write(dir.path().join("src/bar.rs"), "fn other() {}\n").unwrap();
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                max_attachments: 1,
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "attach two files",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("could not route")
+                    && r.transcript.contains("budget of 1 was full")),
+            "the over-cap demotion must reach the driver: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// `explore` (v1) never offers `attach` — the top-level tool passes `None`
+    /// straight through to `run_explore_phase`, so the toolset stays exactly
+    /// `{run_kaish}`.
+    #[tokio::test]
+    async fn the_top_level_explore_sweep_offers_no_attach_tool() {
+        const EXPLORER: &str = "cheap-explorer";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "attach"),
+                    "the top-level explore tool must not offer attach"
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        explore_with(
+            "q",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[],
+            None,
+        )
+        .await
+        .expect("scripted explore should succeed");
+    }
+
+    /// `max_attachments: 0` omits the `attach` tool from a delegated sweep's
+    /// toolset entirely — the config-driven off switch, distinct from the v1
+    /// top-level-`explore` exclusion above (this one is `consult`'s nested sweep).
+    #[tokio::test]
+    async fn max_attachments_zero_omits_the_attach_tool() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "q" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "attach"),
+                    "max_attachments = 0 must omit the attach tool"
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                max_attachments: 0,
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+    }
+
+    /// A sweep's `attach` call surfaces as `PhaseEvent::Attached` on the shared
+    /// progress sink — the one beat that lets an operator observe the pattern the
+    /// generous default budget exists to watch for.
+    #[tokio::test]
+    async fn sweep_attachments_surface_as_progress() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT: routed") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: sink.clone(),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let events = sink.events();
+        assert!(
+            events.contains(&PhaseEvent::Attached {
+                path: "src/foo.rs".into()
+            }),
+            "an attach call must surface as progress: {events:?}"
+        );
+    }
+
+    /// A minimal PNG signature plus filler — enough to sniff as an image without
+    /// decoding it (mirrors the `view_image`/`attach.rs`/`sweep_attach.rs` test helpers).
+    fn fake_png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend(std::iter::repeat_n(0xAB, 16));
+        v
+    }
+
+    /// A vision-capable driver (Anthropic/Gemini-shaped: `tool_result_images = true`)
+    /// receives a sweep's routed image right on the `explore` tool result — no break,
+    /// no user-turn rewrite, since this transport carries an image in a tool result.
+    #[tokio::test]
+    async fn a_vision_driver_receives_the_sweep_image_in_the_tool_result() {
+        const SYNTH: &str = "vision-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                if any_tool_result_image(&history) {
+                    Ok(text_response("ANSWER: saw the diagram"))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: the diagram shows the pipeline"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+        // vision + tool_result_images: the Anthropic/Gemini shape.
+        let synth = vision_arm(&client, SYNTH);
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &synth,
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        assert!(
+            client
+                .requests_for(SYNTH)
+                .iter()
+                .any(|r| any_tool_result_image(&r.chat_history)),
+            "the vision driver must receive the image on the explore tool result"
+        );
+    }
+
+    /// A vision-capable driver whose TRANSPORT can't carry an image in a tool result
+    /// (an OpenAI VLM shape: `tool_result_images = false`) still receives the sweep's
+    /// image — on a separate user `Image` turn, via the same break-rewrite-resume
+    /// path `view_image` uses, now generalized to any image-bearing tool result.
+    #[tokio::test]
+    async fn an_openai_vlm_driver_receives_the_sweep_image_on_a_user_turn() {
+        const SYNTH: &str = "openai-vlm-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                if user_image_messages(&history) > 0 {
+                    Ok(text_response("ANSWER: saw the diagram"))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: the diagram shows the pipeline"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+        // vision but NOT tool_result_images: the OpenAI VLM shape that must break,
+        // rewrite, and resume.
+        let synth = Arm::new(
+            client.clone(),
+            SYNTH,
+            16384,
+            None,
+            ModelCaps {
+                vision: true,
+                tool_result_images: false,
+            },
+        );
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &synth,
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| user_image_messages(&r.chat_history) > 0),
+            "the OpenAI-shaped driver must receive the image on its own user turn: {:?}",
+            synth_reqs.iter().map(|r| r.chat_history.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            synth_reqs
+                .iter()
+                .all(|r| !any_tool_result_image(&r.chat_history)),
+            "an image must never ride this transport's tool-result channel"
+        );
+    }
+
+    /// A blind consumer (the default `arm()` — not vision-capable) never receives an
+    /// image: `attach` refuses it in the receipt, and the EXPLORER sees that refusal
+    /// on its very next turn (immediately, within the same sweep) rather than only
+    /// finding out once the whole sweep concludes.
+    #[tokio::test]
+    async fn a_blind_driver_refuses_the_image_and_the_explorer_learns_immediately() {
+        const SYNTH: &str = "blind-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: no diagram available"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("not attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    // The explorer learns of the refusal on its OWN very next turn —
+                    // it doesn't have to wait for anything downstream.
+                    assert!(
+                        transcript_text(req).contains("reads text only"),
+                        "the explorer must see the refusal reason immediately: {}",
+                        transcript_text(req)
+                    );
+                    Ok(text_response("REPORT: could not attach the diagram"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH), // the default arm is blind
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        for r in client.requests_for(SYNTH) {
+            assert!(
+                !any_tool_result_image(&r.chat_history),
+                "a blind driver must never receive an image on any channel"
+            );
+        }
+    }
+
     /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
     /// explorer arm over `{run_kaish}` against the real repo and returns the
     /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
@@ -2326,6 +3805,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &cfg,
             &[],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -2345,7 +3825,7 @@ mod tests {
                 .preamble
                 .as_deref()
                 .unwrap_or("")
-                .contains("code explorer"),
+                .contains("You are the explorer"),
             "explorer got the report preamble: {:?}",
             reqs[0].preamble
         );
@@ -2373,6 +3853,7 @@ mod tests {
                 path: "src/parser_gen.rs".into(),
                 size: 900_000,
             }],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -2429,6 +3910,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &cfg,
             &[],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -2485,10 +3967,10 @@ mod tests {
         let (out, _usage) = deliberate_direct(
             "Is the retry path safe?",
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
+            &[],
             &arm(&client, SYNTH),
-            "You are a capable model answering a hard question offline.",
+            "You are the synthesis agent, answering a hard question offline.",
             cfg.call_deadline,
-            &cfg.progress,
         )
         .await
         .expect("scripted direct deliberation should succeed");
@@ -2503,6 +3985,112 @@ mod tests {
             1,
             "one toolless completion"
         );
+    }
+
+    /// `deliberate`'s dossier stage: `explore_with` run with an attach sink returns
+    /// the RAW dossier text (unstitched — `explore_with` itself doesn't touch the
+    /// sink); the caller drains it and stitches `sweep_evidence_block` on top, the
+    /// exact composition `server::deliberate` performs. Proves that composition
+    /// works end to end at the engine layer, without the MCP server.
+    #[tokio::test]
+    async fn a_deliberate_dossier_sweep_routes_bytes_into_the_dossier() {
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("DOSSIER REPORT: src/foo.rs is the relevant module"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: Arc::from("the offline synth (`test-model`)"),
+            vision: false,
+        };
+        let sink = Arc::new(SweepAttachSink::new(
+            cfg.max_attachments,
+            consumer.clone(),
+            HashSet::new(),
+        ));
+
+        let (mut dossier, _usage) = explore_with(
+            "what's the relevant module?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[],
+            Some(&sink),
+        )
+        .await
+        .expect("scripted explore should succeed");
+
+        // explore_with itself doesn't stitch — the raw dossier is just the report.
+        assert!(
+            !dossier.contains("<file path=\"src/foo.rs\">"),
+            "explore_with returns the RAW dossier; stitching is the caller's job: {dossier:?}"
+        );
+
+        let delivery = sink.drain();
+        if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
+            dossier.push_str(&block);
+        }
+
+        assert!(
+            dossier.contains("DOSSIER REPORT")
+                && dossier.contains("<file path=\"src/foo.rs\">")
+                && dossier.contains("fn target_marker"),
+            "the stitched dossier must carry both the report and the routed file's \
+             numbered body: {dossier:?}"
+        );
+    }
+
+    /// `deliberate_direct`'s single turn carries a routed image as a native part —
+    /// the same `user_turn_with_attachments` seam `oneshot` uses, so a dossier
+    /// sweep's `attach`-routed image reaches the direct-lane synth even though the
+    /// synth itself never runs a tool loop.
+    #[tokio::test]
+    async fn deliberate_direct_carries_sweep_images_into_its_single_turn() {
+        const SYNTH: &str = "big-local-vision-synth";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                assert!(
+                    user_image_messages(&history) > 0,
+                    "the single turn must carry the routed image"
+                );
+                Ok(text_response("DELIBERATION: the diagram confirms it"))
+            })
+            .build();
+
+        let image = Attachment::Image {
+            path: "docs/arch.png".into(),
+            mime: "image/png",
+            data_b64: "ZmFrZQ==".into(),
+        };
+        let cfg = PhaseContext::default();
+        let (out, _usage) = deliberate_direct(
+            "Does the diagram confirm the design?",
+            "src/x.rs:1 DOSSIER",
+            &[image],
+            &vision_arm(&client, SYNTH),
+            "You are a capable model answering a hard question offline.",
+            cfg.call_deadline,
+        )
+        .await
+        .expect("scripted direct deliberation should succeed");
+
+        assert!(out.contains("DELIBERATION"));
     }
 
     /// The wall-clock backstop: a wedged provider (a stopped/hung backend whose
@@ -2573,6 +4161,7 @@ mod tests {
                 &arm(&client, EXPLORER),
                 &cfg,
                 &[],
+                None,
             ),
         )
         .await
@@ -2599,10 +4188,10 @@ mod tests {
             deliberate_direct(
                 "q",
                 "src/x.rs:1 DOSSIER",
+                &[],
                 &arm(&client, SYNTH),
                 "offline synth preamble",
                 Duration::from_millis(50),
-                &(Arc::new(crate::progress::NullSink) as Arc<dyn ProgressSink>),
             ),
         )
         .await
@@ -2939,6 +4528,414 @@ mod tests {
             finalize.transcript.contains("target_marker"),
             "finalize turn must replay the accumulated tool work, got transcript: {:?}",
             finalize.transcript
+        );
+    }
+
+    // --- the silent-empty-answer battery (GH: consult returns just the footer) -------
+    //
+    // Reported 2026-08-01: a `consult_submit` on cast `deepseek` burned 16,801 output
+    // tokens and returned an EMPTY answer body — just the provenance footer — while the
+    // same question on `or-kimi` returned a full cited review. The generation happened;
+    // nothing reached the caller. These four tests pin the shapes that produce an empty
+    // final answer with **no error**, which is the worst possible failure: the calling
+    // agent merges on a review that silently did not happen.
+    //
+    // All four are RED on purpose until the guard lands. The fix is *not* to make the
+    // loop invent text — it is to fail the call loudly with the diagnostics attached,
+    // exactly as the batch lane already does (`batch.rs::finish_gated_answer`, GH #75).
+
+    /// **The DeepSeek repro.** A reasoning-only terminal turn: `reasoning_content` with
+    /// an empty `content`. rig's deepseek converter drops the empty text block and emits
+    /// a choice holding only `AssistantContent::Reasoning`
+    /// (`rig-core/src/providers/deepseek.rs:400,:420`); rig sees no tool calls, so it
+    /// takes the clean-finish branch and extracts text with `assistant_text_from_choice`,
+    /// which filters to `Text` and yields `""`
+    /// (`rig-core/src/agent/prompt_request/mod.rs:569`, `:887`, `:918`). `run_phase`
+    /// passes that straight through (`engine.rs:862`), and every layer above — the
+    /// provenance footer, the job result — happily renders an empty answer.
+    ///
+    /// A consult that produced no answer must never be a successful empty. With evidence
+    /// already gathered, the recovery is to ask once for the write-up it owed — which is
+    /// what job-1 needed: the driver held an explorer report and fifteen greps, and
+    /// stopped mid-investigation with a 14-token terminal turn.
+    ///
+    /// **Gate direction 1 of 2: evidence present ⇒ retry, and the retry's answer stands.**
+    #[tokio::test]
+    async fn an_empty_answer_with_evidence_is_recovered_by_one_forced_write_up_turn() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        const RECOVERED: &str = "REVIEW: src/foo.rs:1 defines the marker.";
+        let client = ScriptedClient::builder()
+            // Sweep once (so real evidence and real tokens are on the record), "answer"
+            // with reasoning only — the exact wire shape that produced the empty body —
+            // then write the review when forced to conclude.
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(with_usage(text_response(RECOVERED), usage(36_104, 3_971)))
+                } else if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(with_usage(
+                        reasoning_response("I have finished reviewing. Now to write it up..."),
+                        usage(1_164_958, 16_801),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let dir = project_with_marker();
+        let out = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect("an empty answer backed by real evidence must be recovered, not failed");
+
+        assert!(
+            out.answer.contains(RECOVERED),
+            "the forced write-up turn's answer must be what the caller gets: {:?}",
+            out.answer
+        );
+
+        // Exactly ONE forced turn — the recovery is bounded, not a retry loop.
+        let finalizes: Vec<_> = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .filter(is_finalize_request)
+            .collect();
+        assert_eq!(
+            finalizes.len(),
+            1,
+            "the empty answer must buy exactly one forced write-up turn"
+        );
+
+        // It must carry the accumulated evidence — a forced turn over a blank history
+        // would just invite the ungrounded answer the gate exists to refuse.
+        assert!(
+            finalizes[0].transcript.contains("SWEEP_DONE"),
+            "the forced turn must replay the gathered evidence, got: {:?}",
+            finalizes[0].transcript
+        );
+        // ...and it must say *stopped without answering*, not *out of turns*. The model
+        // had 198 turns left; telling it otherwise is a lie that shapes its answer.
+        assert!(
+            finalizes[0].transcript.contains("came back empty"),
+            "the forced turn must carry EMPTY_ANSWER_NOTE: {:?}",
+            finalizes[0].transcript
+        );
+        assert!(
+            !finalizes[0].transcript.contains("reached your research limit"),
+            "the forced turn must NOT claim a turn cap that was never hit: {:?}",
+            finalizes[0].transcript
+        );
+
+        // The retry's usage is ADDED to what was already spent, never substituted —
+        // the caller paid for both, so the footer must say so. (16,801 + 3,971.)
+        assert_eq!(
+            out.usage.output_tokens, 20_772,
+            "the pre-retry spend must survive into the returned usage"
+        );
+        assert_eq!(out.usage.input_tokens, 1_201_062);
+    }
+
+    /// **Gate direction 2 of 2: no evidence ⇒ error, and no forced turn is even attempted.**
+    ///
+    /// This is the load-bearing half. A forced "write it now" handed to a model that
+    /// gathered *nothing* invites it to comply anyway, producing a confident ungrounded
+    /// answer on a lane whose whole product is grounded citation — strictly worse than an
+    /// error. So we assert the *absence* of the second request, not merely that the call
+    /// failed: an implementation that retried blind and happened to get an empty answer
+    /// back would pass an error-only assertion while being exactly wrong.
+    #[tokio::test]
+    async fn an_empty_answer_with_no_evidence_errors_without_asking_the_model_again() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        let client = ScriptedClient::builder()
+            // Straight to a reasoning-only turn: no tool calls, so no tool results, so
+            // nothing to write up. The raw payload carries the provider's own
+            // finish_reason, the way a real deepseek response would — the error must
+            // surface it.
+            .on_model(SYNTH, |_req| {
+                Ok(with_raw(
+                    with_usage(
+                        reasoning_response("Hmm, where should I even start..."),
+                        usage(6_342, 199),
+                    ),
+                    serde_json::json!({"choices": [{"finish_reason": "stop"}]}),
+                ))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("an empty answer with no evidence gathered must fail");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no tool results"),
+            "the error must name the reason the retry was withheld: {msg}"
+        );
+        // The teeth: the model was never asked to answer anyway.
+        assert!(
+            !client.requests_for(SYNTH).iter().any(is_finalize_request),
+            "a model with no evidence must NOT be asked to write an answer anyway — \
+             that invites a fabricated review, which is worse than an error"
+        );
+        // And the diagnostics still ride along.
+        assert!(
+            msg.contains("199"),
+            "the error must carry the output-token count: {msg}"
+        );
+        assert!(
+            msg.contains("finish_reason \"stop\""),
+            "the error must name the provider's own finish_reason: {msg}"
+        );
+    }
+
+    /// At most once, proven: evidence is present so the retry fires, the forced turn *also*
+    /// comes back empty, and that is an error — not a second re-ask. `run_phase`'s
+    /// empty-answer arm returns on every path, so the bound is structural rather than
+    /// flag-enforced; this is what would fail if a later edit turned it into a loop.
+    #[tokio::test]
+    async fn an_empty_forced_write_up_turn_errors_and_is_never_retried_twice() {
+        const SYNTH: &str = "deepseek-v4-pro";
+        let client = ScriptedClient::builder()
+            // Reasoning-only forever, including when forced to conclude.
+            .on_model(SYNTH, |req| {
+                if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(with_usage(
+                        reasoning_response("...still thinking..."),
+                        usage(1_000, 500),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review this branch",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a forced write-up turn that is also empty must fail, not re-ask again");
+
+        assert!(
+            format!("{err:#}").contains("came back empty again"),
+            "the error must name the exhausted recovery: {err:#}"
+        );
+        assert_eq!(
+            client
+                .requests_for(SYNTH)
+                .into_iter()
+                .filter(is_finalize_request)
+                .count(),
+            1,
+            "exactly one forced turn — the recovery must never stack"
+        );
+    }
+
+    /// The same hole through the *other* door: a terminal turn whose text block is
+    /// present but empty. rig normalizes that to "no assistant output"
+    /// (`is_empty_assistant_turn`, `prompt_request/mod.rs:561`) and still returns
+    /// `Ok` with `output == ""` — rig's own
+    /// `prompt_request_stops_cleanly_on_empty_terminal_turn` test pins that as intended
+    /// upstream behavior. So kaibo cannot delegate this check to rig; the guard has to
+    /// live at `run_phase`'s `Ok` arm. A provider-independent shape: any model that
+    /// finishes with no text lands here.
+    #[tokio::test]
+    async fn an_empty_text_terminal_turn_fails_loudly_instead_of_answering_empty() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |_req| {
+                Ok(with_usage(text_response("   \n  "), usage(1000, 9000)))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let err = consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a whitespace-only answer is no answer — it must fail, not succeed empty");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no answer"),
+            "the error must name the empty answer: {msg}"
+        );
+    }
+
+    /// Amy's candidate 1, checked at the place it actually bites. `run_phase` *does*
+    /// recover from a turn cap — it runs a forced finalize turn
+    /// (`finalize_after_max_turns`, `engine.rs:901`) rather than returning the last
+    /// message blindly. But that turn's answer is extracted the same way
+    /// (`engine.rs:935`), so a finalize turn that produces only reasoning is *also* a
+    /// silent empty — and the turn-cap hit itself never reaches the caller (it's a
+    /// progress beat only, `engine.rs:812,:866`). Burning the whole budget and
+    /// delivering nothing must be loud, and must name the cap.
+    #[tokio::test]
+    async fn a_reasoning_only_finalize_turn_after_the_turn_cap_fails_loudly() {
+        const SYNTH: &str = "synth";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(with_usage(
+                        reasoning_response("still thinking about how to start..."),
+                        usage(500_000, 12_000),
+                    ))
+                } else {
+                    Ok(tool_call_response(
+                        "t",
+                        "run_kaish",
+                        json!({ "script": "cat src/foo.rs" }),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            synth_max_turns: 2,
+            ..ConsultConfig::default()
+        };
+        let err = consult_with(
+            "a question the model never finishes answering",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect_err(
+            "spending the whole turn budget and then delivering no text must be an \
+             error, not an empty success",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains('2'),
+            "the error must name the turn cap that was hit: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("empty") || msg.to_lowercase().contains("no answer"),
+            "the error must name the empty answer: {msg}"
+        );
+    }
+
+    /// The fourth door, which the report shape hides: the **explorer** phase. The
+    /// top-level `explore` tool returns its report verbatim, so a reasoning-only
+    /// explorer turn ships a report body that is just the footer — same silent shape,
+    /// different tool. (Inside `consult` this lands as an empty `explore′` tool result,
+    /// which is arguably worse: the driver reasons on a blank sweep and never learns
+    /// the sweep failed.)
+    #[tokio::test]
+    async fn a_reasoning_only_explorer_report_fails_loudly_instead_of_reporting_empty() {
+        const EXPLORER: &str = "deepseek-v4-flash";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |_req| {
+                Ok(with_usage(
+                    reasoning_response("I have surveyed the repo and concluded..."),
+                    usage(200_000, 4_000),
+                ))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let err = explore_with(
+            "where does the cast live?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &ExploreConfig::default(),
+            &[],
+            None,
+        )
+        .await
+        .expect_err("an explorer that reported nothing must fail, not return an empty report");
+        // No tool results in its transcript, so no blind re-ask — the same gate.
+        assert!(
+            !client.requests_for(EXPLORER).iter().any(is_finalize_request),
+            "an explorer with no evidence must not be asked to report anyway"
+        );
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no answer") || msg.contains("no report"),
+            "the error must name the empty report: {msg}"
+        );
+    }
+
+    /// The guard lives at the **shared seam** (`run_phase`), not on the `consult` path,
+    /// so every tool built on that loop inherits it from one place. `oneshot` and
+    /// `deliberate_direct` are the toolless lanes: they can never satisfy the evidence
+    /// gate (no tools ⇒ no tool results), so for them an empty answer is *always* the
+    /// error case — which is the right answer, since a toolless model asked to "write it
+    /// now" has nothing but its own priors to write from.
+    ///
+    /// If a future refactor moves the guard up into `consult_with`, these two go silently
+    /// empty again — that is exactly the regression this pins.
+    #[tokio::test]
+    async fn the_empty_answer_guard_covers_the_toolless_lanes_too() {
+        const MODEL: &str = "reasoner";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| {
+                Ok(with_usage(
+                    reasoning_response("Considering the question..."),
+                    usage(2_000, 800),
+                ))
+            })
+            .build();
+
+        let err = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .expect_err("oneshot must not return an empty answer as a success");
+        assert!(
+            format!("{err:#}").contains("EMPTY answer"),
+            "oneshot must fail with the shared empty-answer error: {err:#}"
+        );
+
+        let err = deliberate_direct(
+            "q",
+            "the dossier",
+            &[],
+            &arm(&client, MODEL),
+            "system",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("deliberate_direct must not return an empty answer as a success");
+        assert!(
+            format!("{err:#}").contains("EMPTY answer"),
+            "deliberate_direct must fail with the shared empty-answer error: {err:#}"
+        );
+
+        // Neither lane re-asked: no evidence is possible without tools, so the gate holds.
+        assert!(
+            !client.requests_for(MODEL).iter().any(is_finalize_request),
+            "a toolless lane can never satisfy the evidence gate, so it must never re-ask"
         );
     }
 
@@ -3432,6 +5429,88 @@ mod tests {
         );
     }
 
+    /// An effort rig's typed request builder can't name fails **here**, at arm
+    /// construction, with a message an operator can act on — not mid-consult as a bare
+    /// `unknown variant \`max\``.
+    ///
+    /// Two wires parse kaibo's blob into a typed struct with a closed rung set (rig's
+    /// Gemini `ThinkingLevel`, its Responses `ReasoningEffort`), and that ceiling is
+    /// rig's client rather than the provider's API — OpenAI's own endpoint takes `"max"`.
+    /// kaibo keeps no allowlist of its own, so the refusal comes from asking rig's
+    /// converter, and the rungs it offers are read back out of rig too
+    /// (`tests/effort_wire.rs` pins both against real request bodies). What this test
+    /// owns is the *message*: the model, the backend, the role, the value that failed,
+    /// whose ceiling it is, and what to type instead.
+    #[test]
+    fn a_rig_refused_effort_fails_at_arm_construction_with_an_actionable_message() {
+        let defaults = crate::config::Defaults::default();
+        let backend = crate::config::Backend {
+            name: "google".into(),
+            kind: ProviderKind::Gemini,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+            wire: None,
+        };
+        // `docs/config.example.toml` used to invite exactly this, and it broke every
+        // Gemini cast the moment a call was made.
+        let slot = ModelSlot {
+            effort: Some("xhigh".into()),
+            ..ModelSlot::bare("google", "gemini-3.5-flash")
+        };
+        let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect_err("rig's Gemini builder refuses xhigh")
+            .to_string();
+        assert!(err.contains("gemini-3.5-flash"), "names the model: {err}");
+        assert!(err.contains("google"), "names the backend: {err}");
+        assert!(err.contains("synth"), "names the role: {err}");
+        assert!(err.contains("xhigh"), "names the value that failed: {err}");
+        assert!(
+            err.contains("rig-core"),
+            "says whose ceiling this is, so the operator doesn't go hunting in \
+             Google's docs for a limit that isn't theirs: {err}"
+        );
+        assert!(
+            err.contains("minimal | low | medium | high"),
+            "offers the rungs this wire does take: {err}"
+        );
+
+        // A rung the wire accepts builds normally — the preflight adds no ceiling of
+        // its own, it only reports rig's.
+        let slot = ModelSlot {
+            effort: Some("low".into()),
+            ..ModelSlot::bare("google", "gemini-3.5-flash")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("an accepted rung builds offline with a placeholder key");
+        assert_eq!(
+            arm.params.expect("gemini sends a thinking block")["generationConfig"]
+                ["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+
+        // And a passthrough wire keeps passing anything through — the preflight must not
+        // quietly become a global allowlist.
+        let backend = crate::config::Backend {
+            name: "deepseek".into(),
+            kind: ProviderKind::DeepSeek,
+            ..backend
+        };
+        let slot = ModelSlot {
+            effort: Some("ludicrous".into()),
+            ..ModelSlot::bare("deepseek", "deepseek-v4-pro")
+        };
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a passthrough wire carries an unknown rung to the provider");
+        assert_eq!(
+            arm.params.expect("deepseek sends a thinking block")["reasoning_effort"],
+            "ludicrous"
+        );
+    }
+
     /// An OpenAI-compatible gateway that faithfully proxies `/v1/responses` (verified
     /// against a real gateway) is not OpenAI Platform's own endpoint, so the
     /// endpoint-exact heuristic alone would leave it on Chat Completions — starving
@@ -3723,30 +5802,74 @@ mod tests {
     /// The OpenRouter arm rides with rig's explicit prompt caching ON: Anthropic-
     /// upstream slugs need `cache_control` breakpoints to bill cache-read rates
     /// (2026-07-03: a consult re-billed its full growing prefix every turn without
-    /// them), and implicit-caching upstreams ignore the marker. rig exposes the
-    /// flag as a public field, and `from_slot` routes through this constructor —
-    /// so this pins the wiring, not an internal default.
-    #[test]
-    fn openrouter_arm_enables_prompt_caching() {
-        // Built through kaibo's one TLS client-build site (ring installed there) —
-        // a bare reqwest builder panics under `rustls-no-provider` unless another
-        // test happened to install the provider first.
-        let http = crate::tls::https_client(Duration::from_secs(30)).unwrap();
+    /// them), and implicit-caching upstreams ignore the marker. `from_slot` routes
+    /// through this constructor — so this pins the wiring, not an internal default.
+    ///
+    /// **Asserted on the wire, not on a flag.** What matters is the serialized request
+    /// body, so that is what a fake transport captures here: rig could keep
+    /// `with_prompt_caching()` compiling while changing what it emits, and any check
+    /// short of the body would stay green through that.
+    #[tokio::test]
+    async fn openrouter_arm_enables_prompt_caching() {
+        async fn system_block(model: openrouter::CompletionModel<CaptureHttp>, http: &CaptureHttp) -> Value {
+            let request = CompletionRequest {
+                model: None,
+                preamble: Some("ground every claim".into()),
+                chat_history: OneOrMany::one(Message::user("hi")),
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: Some(4096),
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            // The capture transport always errors; the body is already built by then.
+            let _ = model.completion(request).await;
+            http.recorded()
+                .expect("rig serialized a request body")
+                .pointer("/messages/0")
+                .cloned()
+                .expect("the system message leads the body")
+        }
+
+        let http = CaptureHttp::default();
         let client = openrouter::Client::builder()
             .api_key("sk-or-test")
-            .http_client(http)
+            .http_client(http.clone())
             .build()
             .expect("offline openrouter client construction");
-        let plain = client.completion_model("~anthropic/claude-sonnet-latest");
+
+        let plain_http = CaptureHttp::default();
+        let plain_client = openrouter::Client::builder()
+            .api_key("sk-or-test")
+            .http_client(plain_http.clone())
+            .build()
+            .expect("offline openrouter client construction");
+        let plain = system_block(
+            plain_client.completion_model("~anthropic/claude-sonnet-latest"),
+            &plain_http,
+        )
+        .await;
         assert!(
-            !plain.prompt_caching,
-            "rig defaults the flag off — the arm constructor below is load-bearing"
+            !plain.to_string().contains("cache_control"),
+            "rig marks no breakpoint by default — the arm constructor is load-bearing: \
+             {plain}"
         );
-        let armed =
-            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest");
+
+        let armed = system_block(
+            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest"),
+            &http,
+        )
+        .await;
         assert!(
-            armed.prompt_caching,
-            "the OpenRouter arm must build its model with prompt caching enabled"
+            armed.to_string().contains(r#""cache_control""#),
+            "the OpenRouter arm must put a cache breakpoint on the system prompt: {armed}"
+        );
+        assert!(
+            armed.to_string().contains("ephemeral"),
+            "the breakpoint is the ephemeral kind OpenRouter bills against: {armed}"
         );
     }
 
@@ -4123,17 +6246,18 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
+        let synth = arm(&client, "synth-model"); // not vision-capable
         let tools = consult_tools(
             &arm(&client, "explorer-model"),
             dir.path(),
             &cfg,
             reports,
             Arc::new(Mutex::new(Usage::new())),
-            false, // synth is not vision-capable
+            &synth,
         )
         .expect("building the consult toolset should succeed");
 
-        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "run_kaish"),
             "missing run_kaish, got {names:?}"
@@ -4158,17 +6282,18 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
+        let synth = vision_arm(&client, "synth-model"); // synth IS vision-capable
         let tools = consult_tools(
             &arm(&client, "explorer-model"),
             dir.path(),
             &cfg,
             reports,
             Arc::new(Mutex::new(Usage::new())),
-            true, // synth IS vision-capable
+            &synth,
         )
         .expect("building the consult toolset should succeed");
 
-        let names: Vec<String> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "view_image"),
             "a vision synth must get view_image, got {names:?}"
@@ -4189,16 +6314,17 @@ mod tests {
         let reports = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let usage_sink = Arc::new(Mutex::new(Usage::new()));
+        let blind_synth = arm(&client, "synth-model");
         let blind = consult_tools(
             &explorer,
             dir.path(),
             &cfg,
             reports.clone(),
             usage_sink.clone(),
-            false,
+            &blind_synth,
         )
         .expect("blind toolset builds");
-        let blind_names: Vec<String> = blind.iter().map(|t| t.name()).collect();
+        let blind_names: Vec<String> = blind.iter().map(|t| t.name().to_string()).collect();
         assert!(blind_names.iter().any(|n| n == "run_kaish"));
         assert!(blind_names.iter().any(|n| n == "explore"));
         assert!(
@@ -4206,9 +6332,10 @@ mod tests {
             "no view_image without vision, got {blind_names:?}"
         );
 
-        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, true)
+        let seeing_synth = vision_arm(&client, "synth-model");
+        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, &seeing_synth)
             .expect("vision toolset builds");
-        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name()).collect();
+        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name().to_string()).collect();
         assert!(
             seeing_names.iter().any(|n| n == "view_image"),
             "view_image present with vision, got {seeing_names:?}"
@@ -4240,7 +6367,7 @@ mod tests {
             Message::assistant("calling a tool"),
             Message::user("tool results"),
         ];
-        let (rest, prompt) = finalize_prompt(history);
+        let (rest, prompt) = finalize_prompt(history, FINALIZE_NOTE);
 
         // The trailing user turn becomes the prompt and carries both its original
         // content and the appended note.
@@ -4260,7 +6387,7 @@ mod tests {
     #[test]
     fn finalize_adds_user_turn_when_transcript_ends_on_assistant() {
         let history = vec![Message::user("Q"), Message::assistant("partial thoughts")];
-        let (rest, prompt) = finalize_prompt(history);
+        let (rest, prompt) = finalize_prompt(history, FINALIZE_NOTE);
 
         assert!(
             user_text(&prompt).contains(FINALIZE_NOTE),
@@ -4288,7 +6415,7 @@ mod tests {
     }
 
     /// A `view_image` tool result: the load note (text) *and* the image part — the
-    /// hybrid shape rig's `from_tool_output` produces.
+    /// two typed content blocks `ViewImage` returns.
     fn vi_result(id: &str) -> UserContent {
         UserContent::ToolResult(ToolResult {
             id: id.to_string(),
@@ -4333,7 +6460,7 @@ mod tests {
                 content: OneOrMany::one(vi_result("call-1")),
             },
         ];
-        let out = rewrite_view_image_history(history);
+        let out = rewrite_tool_image_history(history);
 
         assert!(
             !any_tool_result_image(&out),
@@ -4386,8 +6513,8 @@ mod tests {
                 content: OneOrMany::one(vi_result("c1")),
             },
         ];
-        let once = rewrite_view_image_history(history);
-        let twice = rewrite_view_image_history(once.clone());
+        let once = rewrite_tool_image_history(history);
+        let twice = rewrite_tool_image_history(once.clone());
         assert_eq!(once, twice, "a second rewrite pass is a no-op");
         assert_eq!(user_image_messages(&twice), 1, "no duplicate image turn");
     }
@@ -4417,7 +6544,7 @@ mod tests {
             ])
             .unwrap(),
         };
-        let out = rewrite_view_image_history(vec![Message::user("q"), assistant, results]);
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
 
         assert!(!any_tool_result_image(&out), "view_image image moved out");
         assert_eq!(user_image_messages(&out), 1, "exactly the one image turn");
@@ -4429,6 +6556,138 @@ mod tests {
                         ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
             "the run_kaish tool_result is preserved verbatim: {out:?}"
         );
+    }
+
+    /// The generalization's whole point: an `explore` sweep's result carrying a
+    /// routed image (the hybrid envelope `RunExplore::call` emits once it attached
+    /// an image) gets EXACTLY the same user-turn-channel treatment as `view_image` —
+    /// no per-tool `if` was added for it, because the rewrite keys on the result,
+    /// not the tool's name.
+    #[test]
+    fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "explore-1",
+                "explore",
+                json!({ "question": "what does the diagram show?" }),
+            )),
+        };
+        let result = Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "explore-1".to_string(),
+                call_id: None,
+                content: OneOrMany::many([
+                    ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
+                    ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                ])
+                .unwrap(),
+            })),
+        };
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, result]);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "the explore result's image must leave the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            1,
+            "it reappears as exactly one user Image message: {out:?}"
+        );
+        assert!(
+            out.iter().any(|m| matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                    if tr.id == "explore-1"
+                    && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+            "the explore tool_use stays answered by a text-only result: {out:?}"
+        );
+    }
+
+    /// Two image-bearing results in ONE assistant turn (`view_image` + an `explore`
+    /// sweep that routed a picture): the rewrite must move BOTH out — per-part
+    /// filtering that stopped at the first image-bearing result would strand the
+    /// second on a channel the transport rejects. (DeepSeek review gap, 2026-07-26.)
+    #[test]
+    fn rewrite_moves_both_images_when_two_tools_carry_them() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::many([
+                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+                AssistantContent::tool_call("ex", "explore", json!({ "question": "diagram?" })),
+            ])
+            .unwrap(),
+        };
+        let results = Message::User {
+            content: OneOrMany::many([
+                vi_result("vi"),
+                UserContent::ToolResult(ToolResult {
+                    id: "ex".to_string(),
+                    call_id: None,
+                    content: OneOrMany::many([
+                        ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
+                        ToolResultContent::image_base64("ZmFrZTI=", None, None),
+                    ])
+                    .unwrap(),
+                }),
+            ])
+            .unwrap(),
+        };
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "both images must leave the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            2,
+            "each image gets its own user Image turn: {out:?}"
+        );
+        for id in ["vi", "ex"] {
+            assert!(
+                out.iter().any(|m| matches!(m, Message::User { content }
+                    if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                        if tr.id == id
+                        && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+                "tool_use `{id}` stays answered by a text-only result: {out:?}"
+            );
+        }
+    }
+
+    /// The break keys on the DECLARED content parts, never on text: a *text* result
+    /// that happens to quote image-looking JSON — an explorer cat-ing this very
+    /// file, a JSON fixture, a grep hit — must not trip the break/rewrite machinery.
+    /// On rig 0.41 the gate reads typed [`ToolOutput`] parts (no sniffing), so the
+    /// false positive the Gemini review worried about (2026-07-26) is impossible by
+    /// construction; this pins it against a regression to string matching.
+    #[test]
+    fn a_text_result_containing_the_image_literal_does_not_carry_an_image() {
+        // A run_kaish-style plain string result quoting envelope-shaped JSON.
+        let grep_hit = r#"exit:0
+src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data": b64}]})"#;
+        assert!(!tool_output_carries_image(&ToolOutput::text(grep_hit)));
+
+        // JSON output shaped like the old hybrid envelope is still just JSON — only
+        // a declared Image part counts.
+        let envelope = json!({"response": "r", "parts": [{"type": "image", "data": "ZmFrZQ=="}]});
+        assert!(!tool_output_carries_image(&ToolOutput::json(envelope)));
+
+        // A genuinely declared image part — the block `view_image` and a routed
+        // `explore` result emit — does carry.
+        let with_image = ToolOutput::content(
+            OneOrMany::many([
+                ToolResultContent::text("note"),
+                ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                    media_type: ImageMediaType::from_mime_type("image/png"),
+                    detail: None,
+                    additional_params: None,
+                }),
+            ])
+            .expect("two blocks is never empty"),
+        );
+        assert!(tool_output_carries_image(&with_image));
     }
 
     /// The outer turn budget is derived from the transcript (rig carries no

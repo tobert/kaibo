@@ -15,10 +15,69 @@ pub const THINKING_BUDGET: u64 = 8192;
 
 /// The per-role thinking-depth lever for the models that expose one as a request
 /// param (Anthropic adaptive's `output_config.effort`, DeepSeek's `reasoning_effort`).
-/// A passthrough string the provider validates — like a model id — so a new level
-/// lands without a code change. Default for both roles unless a slot or the
+/// A passthrough string — like a model id — so a rung a provider ships tomorrow
+/// lands without a kaibo release. Default for both roles unless a slot or the
 /// per-role `[defaults]` tunes it.
+///
+/// **kaibo keeps no allowlist.** Two of the six wire paths *do* have a closed ladder,
+/// but it belongs to rig's typed request builder, not to the provider — see
+/// [`EffortWire`] and [`accepted_efforts`], which read that ladder back out of rig
+/// itself rather than restating it here.
 pub const DEFAULT_EFFORT: &str = "high";
+
+/// The reasoning **depths** kaibo knows how to order, shallow → deep. Used for exactly
+/// one thing: comparing two efforts when a lane needs a floor
+/// ([`batch_effort`](crate::batch::batch_effort)). It is a ranking, never a gate — an
+/// effort outside this list is still shaped and sent, and a comparison against it simply
+/// defers to the operator's value.
+///
+/// **[`EFFORT_OFF`] is deliberately not on this ladder.** "Off" is not the shallowest
+/// depth; it is a different kind of answer. Ranking it as rung 0 let a *depth* floor
+/// silently switch reasoning back **on** — see [`EFFORT_OFF`] and [`is_effort_off`],
+/// which are the other half of this pair. Anything that ranks an effort has to decide
+/// what it does about the off-switch first.
+pub const EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The reasoning **opt-out** — a sentinel beside [`EFFORT_LADDER`], not a rung on it.
+///
+/// Two providers ship a structural off-switch (DeepSeek's `thinking:{"type":"disabled"}`,
+/// OpenRouter's `reasoning:{"enabled":false}`) and both mishandle a "zero effort" string
+/// riding beside an explicit enable — DeepSeek bills 160–253 reasoning tokens for exactly
+/// that pairing (probed 2026-08-01). So `none` is answered by *shape*, not by value:
+/// [`ModelShape::to_params`] routes it through [`is_effort_off`].
+///
+/// Keeping it off the ladder is the same distinction one level up. A floor that raises
+/// *depth* (batch) must leave an operator's "off" alone, because turning reasoning back
+/// on isn't "more depth" — it's ignoring the setting, and billing them for it.
+pub const EFFORT_OFF: &str = "none";
+
+/// Where `effort` sits on [`EFFORT_LADDER`], or `None` for anything that isn't an
+/// orderable depth: [`EFFORT_OFF`] (ask [`is_effort_off`] instead — off is not a depth),
+/// a provider's newer rung, or an operator's typo. The last two look identical from here
+/// and both mean "don't second-guess it". Case- and whitespace-insensitive.
+pub fn effort_rank(effort: &str) -> Option<usize> {
+    let e = effort.trim().to_ascii_lowercase();
+    EFFORT_LADDER.iter().position(|rung| *rung == e)
+}
+
+/// Is this effort the reasoning opt-out ([`EFFORT_OFF`])? The counterpart to
+/// [`effort_rank`]: that one orders depths and returns `None` here; this one answers the
+/// question ranking can't. **Public because the batch lane must ask it** — a depth floor
+/// consulting only the ladder would see `none` as unrankable, and an earlier version that
+/// ranked it as rung 0 lifted it to `BATCH_EFFORT`, quietly billing reasoning on every
+/// item of a fan-out the operator had switched off.
+///
+/// Case- and whitespace-insensitive, so `"None"` can never quietly mean "on".
+pub fn is_effort_off(effort: &str) -> bool {
+    effort.trim().eq_ignore_ascii_case(EFFORT_OFF)
+}
+
+/// Every effort spelling kaibo knows by name — the off-switch, then the depth ladder.
+/// For *probing* and *presenting* ("what does this wire accept?"), never for gating: an
+/// effort absent from this list is still shaped and sent.
+pub fn known_efforts() -> Vec<&'static str> {
+    std::iter::once(EFFORT_OFF).chain(EFFORT_LADDER).collect()
+}
 
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
 /// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
@@ -371,21 +430,42 @@ impl ModelShape {
             ThinkingStyle::GeminiLevel => {
                 // Gemini's depth lever IS the per-role effort: the values align (Google's
                 // thinking doc lists `minimal|low|medium|high` across the 3-line; the
-                // default "high" matches gemini-cli's investigator, rig deserializes it to
-                // ThinkingLevel::High), and like every effort it's a passthrough string
-                // the provider validates. Dropping it for a hardcoded "high" would
+                // default "high" deserializes to rig's `ThinkingLevel::High` and matches
+                // gemini-cli's investigator). Dropping it for a hardcoded "high" would
                 // silently ignore a slot's `effort = "low"`.
+                //
+                // Unlike the other effort sinks this one is NOT a passthrough string: rig
+                // models the level as a closed enum (`minimal|low|medium|high`), so
+                // `xhigh`/`max`/`none` are refused by rig's own converter before the
+                // request leaves the process. [`EffortWire::Gemini`] names that, and
+                // `Arm::from_slot` turns it into a legible error rather than a mid-call
+                // surprise. Here rig's enum is *correct*, not a stale cap: Google's own
+                // schema refuses those three rungs too (`gemini_thinking_level_ladder_live`,
+                // 2026-08-01, protobuf enum error). `minimal` is Google's off-switch, and
+                // is itself per-model — gemini-pro-latest refuses even that
+                // (`gemini_pro_rejects_minimal_live`).
                 obj.insert(
                     "generationConfig".into(),
                     json!({ "thinkingConfig": { "thinkingLevel": effort, "includeThoughts": true } }),
                 );
             }
             ThinkingStyle::DeepSeekEffort => {
-                // Explicit-on (the V4 default, but stated so intent survives a default
-                // flip). rig flattens both top-level and round-trips the response
-                // `reasoning_content` so tool loops don't trip DeepSeek's echo-or-400 rule.
-                obj.insert("thinking".into(), json!({ "type": "enabled" }));
-                obj.insert("reasoning_effort".into(), json!(effort));
+                // `"none"` gets the *structural* off-switch. Measured on deepseek-v4-pro
+                // (2026-08-01): `type:"enabled"` + `reasoning_effort:"none"` bills 160–253
+                // reasoning tokens — the explicit enable wins and the opt-out is a silent
+                // no-op the operator pays for. `type:"disabled"` alone is a true zero.
+                // Re-checked live by `deepseek_effort_none_needs_the_structural_disable_live`
+                // (tests/consult.rs), which also asserts this blob bills zero on the wire.
+                if is_effort_off(effort) {
+                    obj.insert("thinking".into(), json!({ "type": "disabled" }));
+                } else {
+                    // Explicit-on (the V4 default, but stated so intent survives a default
+                    // flip). rig flattens both top-level and round-trips the response
+                    // `reasoning_content` so tool loops don't trip DeepSeek's echo-or-400
+                    // rule.
+                    obj.insert("thinking".into(), json!({ "type": "enabled" }));
+                    obj.insert("reasoning_effort".into(), json!(effort));
+                }
             }
             ThinkingStyle::OpenRouterEffort => {
                 // The unified reasoning knob. `effort` is the per-role depth lever, a
@@ -398,7 +478,7 @@ impl ModelShape {
                 // gateway's documented off-switch — rather than trusting the effort
                 // ladder to treat the literal string as off (a drift there would
                 // silently re-enable reasoning, billed as output tokens).
-                if effort == "none" {
+                if is_effort_off(effort) {
                     obj.insert("reasoning".into(), json!({ "enabled": false }));
                 } else {
                     obj.insert("reasoning".into(), json!({ "effort": effort }));
@@ -446,6 +526,18 @@ pub fn request_params(
 /// reasoning models (`gpt-5*`, including `gpt-5.6-sol`) take `reasoning.effort`
 /// and reject custom `temperature`; older GPT chat families (`gpt-4*`,
 /// `gpt-3.5*`, `chatgpt-*`) take sampling and reject `reasoning.effort`.
+///
+/// *Whether* a model takes reasoning is a family question; **which rungs it takes is a
+/// per-model question** — measured 2026-08-01, the ladder moves at both ends within
+/// `gpt-5*`: `gpt-5.6` reaches `max`, `gpt-5.2` stops at `xhigh`, `gpt-5.1` at `high`,
+/// and plain `gpt-5`'s bottom rung is `minimal` where 5.1+ have `none` instead. kaibo
+/// deliberately encodes none of that: an operator gets to reach a rung OpenAI shipped
+/// this morning, and a wrong one comes back as OpenAI's own error naming the model's
+/// supported values. (rig's enum is a separate, *lower* ceiling that kaibo does report
+/// up front — see [`EffortWire`].) Measured and re-checkable:
+/// `openai_effort_ceiling_is_per_model_live` in `tests/consult.rs`, which also pins the
+/// trap that an off-schema sentinel reports the API's superset for every model — so the
+/// table can only be re-derived by posting the real rungs.
 pub fn hosted_openai_responses_params(
     model: &str,
     top_p: Option<f64>,
@@ -481,10 +573,146 @@ pub fn hosted_openai_accepts_reasoning(model: &str) -> bool {
     model.trim().to_ascii_lowercase().starts_with("gpt-5")
 }
 
+/// Does this (backend, slot) actually put the per-role `effort` on the wire? The one
+/// answer both the wire path and the `kaibo://config` render read, so an operator's
+/// "is my `effort` doing anything?" is settled in exactly one place. `responses_wire`
+/// is the backend's resolved interactive wire ([`Backend::uses_responses_wire`]),
+/// which is what splits a hosted GPT-5 slot (reasoning) from the same `openai` kind
+/// pointed at a local llama.cpp server (no reasoning knob at all).
+pub fn effort_sinks(
+    kind: ProviderKind,
+    model: &str,
+    style: ThinkingStyleOverride,
+    responses_wire: bool,
+) -> bool {
+    if responses_wire {
+        return hosted_openai_accepts_reasoning(model);
+    }
+    ModelShape::resolve(kind, model, style).sinks_effort()
+}
+
+/// Which of rig's request builders this arm's `additional_params` blob has to survive.
+///
+/// kaibo hands rig a JSON blob; most providers `#[serde(flatten)]` it straight into the
+/// body, so whatever an operator writes reaches the provider and the *provider* decides.
+/// Two paths don't: rig deserializes the blob into a typed struct first, and a typed
+/// struct has a closed set of reasoning rungs. That ceiling belongs to **rig's client**,
+/// not the provider's API, and the two can disagree in either direction — rig has
+/// trailed OpenAI's own ladder by a rung before. Gemini's is the exception: its
+/// `ThinkingLevel` mirrors a limit Google actually enforces.
+///
+/// Naming the wire lets kaibo ask rig *before* the call (see [`preflight_params`]) and
+/// report the ceiling honestly instead of surfacing a bare serde message mid-consult.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortWire {
+    /// `gemini::completion::create_request_body` parses the blob as
+    /// `gemini_api_types::AdditionalParameters`, whose `ThinkingLevel` is a closed enum.
+    Gemini,
+    /// OpenAI's Responses builder parses the blob as `responses_api::AdditionalParameters`,
+    /// whose `ReasoningEffort` is a closed enum.
+    OpenaiResponses,
+    /// rig flattens the blob into the body verbatim (Anthropic, DeepSeek, OpenRouter, and
+    /// the generic OpenAI `/chat/completions` shape). kaibo can express anything here; who
+    /// answers for it is the *provider's* business, and they differ — DeepSeek validates
+    /// strictly against its own seven rungs, OpenRouter accepts all seven and normalizes
+    /// each onto the upstream's native knob (proven 2026-08-01: `xhigh`/`max` reach
+    /// `openai/gpt-5.1` through the gateway with reasoning billed, on ids that 400 those
+    /// rungs on OpenAI's direct API — the two halves are
+    /// `openrouter_clamps_rungs_the_direct_backend_refuses_live` and
+    /// `openai_effort_ceiling_is_per_model_live`), and the toggle-less chat shape has no
+    /// field to put it in at all. "Passthrough" is a statement about *rig*, not about the
+    /// far end.
+    Passthrough,
+}
+
+impl EffortWire {
+    /// The wire an arm built from `kind` (with its resolved `responses_wire` flag) runs on.
+    pub fn resolve(kind: ProviderKind, responses_wire: bool) -> Self {
+        if responses_wire {
+            return Self::OpenaiResponses;
+        }
+        match kind {
+            ProviderKind::Gemini => Self::Gemini,
+            ProviderKind::Anthropic
+            | ProviderKind::DeepSeek
+            | ProviderKind::OpenRouter
+            | ProviderKind::Openai => Self::Passthrough,
+            // Never reached: effort belongs to reasoning arms, and the load-time
+            // guard refuses a reasoning slot on a Stability backend (it is an
+            // image-generation wire, no completion model). `Passthrough` is the
+            // do-nothing answer if that ever changes.
+            ProviderKind::Stability => Self::Passthrough,
+        }
+    }
+
+    /// How an operator would name this wire in a config conversation.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Gemini => "gemini",
+            Self::OpenaiResponses => "openai responses",
+            Self::Passthrough => "passthrough",
+        }
+    }
+}
+
+/// Run `params` through rig's own converter for `wire`, exactly as the live call will.
+/// `Ok(())` means the request builder accepts this blob; `Err` carries rig's own message.
+///
+/// This is a *preflight*, not a policy: it asks rig, it doesn't hold a list. A rung rig
+/// starts accepting after a version bump starts working here the same day, with no kaibo
+/// change — which is the whole reason effort stayed a passthrough string.
+pub fn preflight_params(
+    wire: EffortWire,
+    params: Option<&Value>,
+) -> std::result::Result<(), String> {
+    let Some(params) = params else {
+        return Ok(());
+    };
+    match wire {
+        EffortWire::Passthrough => Ok(()),
+        // The exact `serde_json::from_value` rig runs in `create_request_body`
+        // (gemini/completion.rs) — same type, same failure.
+        EffortWire::Gemini => serde_json::from_value::<
+            rig_core::providers::gemini::completion::gemini_api_types::AdditionalParameters,
+        >(params.clone())
+        .map(|_| ())
+        .map_err(|e| e.to_string()),
+        // The exact `serde_json::from_value` rig runs building a Responses request
+        // (openai/responses_api/mod.rs).
+        EffortWire::OpenaiResponses => serde_json::from_value::<
+            rig_core::providers::openai::responses_api::AdditionalParameters,
+        >(params.clone())
+        .map(|_| ())
+        .map_err(|e| e.to_string()),
+    }
+}
+
+/// The effort values `wire` accepts today, read back out of rig by probing each of
+/// [`known_efforts`] through [`preflight_params`]. Derived, never declared — so the list
+/// an error message shows an operator is rig's current truth even after a rig bump, and
+/// kaibo never grows a second ladder to drift from it.
+pub fn accepted_efforts(wire: EffortWire) -> Vec<&'static str> {
+    if wire == EffortWire::Passthrough {
+        return known_efforts();
+    }
+    known_efforts()
+        .into_iter()
+        .filter(|rung| {
+            let probe = match wire {
+                EffortWire::Gemini => {
+                    json!({ "generationConfig": { "thinkingConfig": { "thinkingLevel": rung } } })
+                }
+                _ => json!({ "reasoning": { "effort": rung } }),
+            };
+            preflight_params(wire, Some(&probe)).is_ok()
+        })
+        .collect()
+}
+
 /// Fold this arm's output-token budget into `params` where the provider needs it
-/// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig
-/// 0.38's `OpenrouterCompletionRequest` (openrouter/completion.rs) has no `max_tokens`
-/// field and its `TryFrom` never reads `CompletionRequest.max_tokens`, so
+/// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig's
+/// OpenRouter request (`openrouter/completion.rs`) never reads
+/// `CompletionRequest.max_tokens`, so
 /// `AgentBuilder::max_tokens()` is silently a no-op for that provider — the answer
 /// would run on OpenRouter's own default budget, starving a thinking-on completion.
 /// `additional_params` *is* `#[serde(flatten)]`-merged into the body, so we inject the
@@ -629,6 +857,43 @@ mod tests {
             .to_params(8192, Some(0.5), None, DEFAULT_EFFORT)
             .unwrap();
         assert_eq!(params["temperature"], 0.5);
+    }
+
+    /// `effort = "none"` on DeepSeek must be the *structural* disable
+    /// (`thinking:{"type":"disabled"}`), not enabled-plus-`reasoning_effort:"none"`.
+    ///
+    /// Measured against deepseek-v4-pro (live probe, 2026-08-01), one variable at a time:
+    /// `reasoning_effort:"none"` alone → 0 reasoning tokens; `thinking:{"type":"disabled"}`
+    /// → 0 reasoning tokens; **`thinking:{"type":"enabled"}` + `reasoning_effort:"none"`
+    /// → reasoning ON, 160–253 tokens billed.** The explicit `type:"enabled"` wins, so the
+    /// old shape turned an operator's opt-out into a silent no-op they paid for — the exact
+    /// silent-fallback class kaibo refuses. Same structural-off pattern as OpenRouter below.
+    #[test]
+    fn deepseek_effort_none_disables_reasoning_structurally() {
+        let shape = ModelShape::resolve(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-pro",
+            ThinkingStyleOverride::Auto,
+        );
+        let params = shape.to_params(8192, None, None, "none").unwrap();
+        assert_eq!(
+            params["thinking"]["type"], "disabled",
+            "none must turn thinking off structurally, not ask for zero effort while \
+             leaving it enabled: {params}"
+        );
+        assert!(
+            params.get("reasoning_effort").is_none(),
+            "no effort string rides alongside the disable — it is what re-enabled \
+             reasoning: {params}"
+        );
+        // Off is off however it was spelled; every other rung still rides as effort.
+        assert_eq!(
+            shape.to_params(8192, None, None, "NONE").unwrap()["thinking"]["type"],
+            "disabled"
+        );
+        let params = shape.to_params(8192, None, None, "low").unwrap();
+        assert_eq!(params["thinking"]["type"], "enabled");
+        assert_eq!(params["reasoning_effort"], "low");
     }
 
     /// `effort = "none"` is the documented reasoning opt-out, and it must be the
@@ -795,14 +1060,19 @@ mod tests {
         );
     }
 
-    /// Canary tying `inject_output_budget` to the rig 0.38 pin. The workaround
-    /// exists because rig's `OpenrouterCompletionRequest` has no `max_tokens`
-    /// field; the day a rig bump adds one, `AgentBuilder::max_tokens` starts
-    /// arriving natively and the injected `max_completion_tokens` rides alongside
-    /// it — redundant at best, a provider 400 at worst, and silent either way.
-    /// This failing test is the tripwire: on a rig bump, re-read rig's
-    /// `openrouter/completion.rs`, retire (or deliberately keep) the injection,
-    /// then advance the version prefix here.
+    /// Canary tying `inject_output_budget` to the rig pin. The workaround exists
+    /// because rig's OpenRouter request has no `max_tokens` field; the day a rig bump
+    /// adds one, `AgentBuilder::max_tokens` starts arriving natively and the injected
+    /// `max_completion_tokens` rides alongside it — redundant at best, a provider 400
+    /// at worst, and silent either way. This failing test is the tripwire: on a rig
+    /// bump, re-read rig's `openrouter/completion.rs`, retire (or deliberately keep)
+    /// the injection, then advance the version prefix here.
+    ///
+    /// **Audit log.** 0.38.2 → 0.41.0 (2026-08-01): defect persists, injection stays.
+    /// Measured, not read — a real `openrouter::CompletionModel` driven through a
+    /// capture transport with `max_tokens = Some(4096)` serialized a body whose only
+    /// keys were `messages`, `model`, `reasoning`. Run that probe again on the next
+    /// bump rather than re-deriving the answer from rig's source.
     #[test]
     fn rig_bump_reaudits_the_openrouter_budget_workaround() {
         let lock = include_str!("../../Cargo.lock");
@@ -814,10 +1084,10 @@ mod tests {
             .nth(1)
             .expect("version line follows the name line");
         assert!(
-            version.contains("version = \"0.38."),
-            "rig-core moved past 0.38 ({version}): re-audit the \
-             OpenrouterCompletionRequest max_tokens defect before shipping — \
-             see inject_output_budget"
+            version.contains("version = \"0.41."),
+            "rig-core moved past 0.41 ({version}): re-audit the OpenRouter max_tokens \
+             defect before shipping — see inject_output_budget, and the audit log on \
+             this test for how it was last measured"
         );
     }
 }

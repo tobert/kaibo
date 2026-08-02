@@ -31,6 +31,10 @@ pub enum PhaseEvent {
     SweepStarted { question: String },
     /// A delegated sweep returned (it either reported or failed — both end it).
     SweepFinished,
+    /// A sweep routed a workspace file's bytes past itself to its report's reader
+    /// with the `attach` tool. The one beat that lets an operator actually observe
+    /// the pattern the generous `max_attachments` default exists to watch for.
+    Attached { path: String },
     /// The phase exhausted its turn cap and is writing a forced final answer.
     TurnCapReached,
     /// The top-level tool finished and is about to return its answer/report.
@@ -49,6 +53,7 @@ impl PhaseEvent {
                 format!("exploring: {}", brief(question, 80))
             }
             PhaseEvent::SweepFinished => "sweep complete".to_string(),
+            PhaseEvent::Attached { path } => format!("attached {path} to the report"),
             PhaseEvent::TurnCapReached => "reached research limit, writing the answer".to_string(),
             PhaseEvent::PhaseFinished { phase } => format!("{phase} complete"),
         }

@@ -30,18 +30,20 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// exact. These are *not* in `kaish-help` — they describe kaibo's sandbox, not
 /// kaish the language — so they're authored here and layered onto the canonical
 /// contract. Positive framing on purpose (weaker/local models loop on blanket
-/// prohibitions): "just read", not a wall of "never".
+/// prohibitions): say what reading looks like, rather than listing what is refused.
+/// Plain and literal per the agent-facing clarity rule in AGENTS.md — this block is
+/// embedded in every preamble, so an idiom here is charged to every model we drive.
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
-`git`, `touch`, and external commands are refused, so just read — files WHOLE by \
-default, `cat -n FILE`; `grep -rn PATTERN .` finds matches whether the target is a \
-file or a directory. Each call starts at the project root; \
+`git`, `touch`, and external commands are refused, so your work here is reading. Read \
+files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN .` finds matches whether \
+the target is a file or a directory. Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
 read-only sandbox; 127 is command-not-found; any other non-zero means the script \
-itself failed. Want to go deeper? Run `help`, `help syntax`, or `help <builtin>` in \
-any script, or read the `kaibo://kaish/*` resources.";
+itself failed. To learn more, run `help`, `help syntax`, or `help <builtin>` in any \
+script, or read the `kaibo://kaish/*` resources.";
 
 /// The canonical kaish operating contract, sourced from `kaish-help` so kaibo
 /// never re-states (and drifts from) kaish's own guidance. This is exactly what
@@ -117,7 +119,7 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 /// `## Scope` — the menu of teams reads before scope, and both sit above the point a
 /// truncating host (Claude Code's 2048-char cap) would cut.
 fn kaibo_lead() -> &'static str {
-    "kaibo (解剖) — grounded, cited answers about a codebase from a model outside \
+    "kaibo — grounded, cited answers about a codebase from a model outside \
      your own family. DeepSeek, Gemini, Anthropic, OpenRouter, or a local model reads the \
      project READ-ONLY and answers with file:line citations. Say in prose what you \
      did or want to know — kaibo finds and reads the current code itself; no \
@@ -254,7 +256,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
     )
 }
 
-/// Like [`kaibo_instructions`] but with a **scope section** appended so the calling
+/// Build the MCP server instructions, with a **scope section** appended so the calling
 /// model always knows:
 /// - the default root (or that every call must pass one),
 /// - the allowed trees a per-call `path` must be at-or-under, and
@@ -777,11 +779,17 @@ mod tests {
         );
         let casts_at = text.find("## Casts").expect("has a Casts section");
         let scope_at = text.find("## Scope").expect("has a Scope section");
-        let lead_at = text.find("kaibo (解剖)").expect("opens with the lead");
+        // Assert the lead actually OPENS the text, rather than merely finding the first
+        // "kaibo" somewhere before `## Casts` — the Casts section's own `kaibo://config`
+        // reference would satisfy a bare `find`, leaving this weaker than it reads.
         assert!(
-            lead_at < casts_at && casts_at < scope_at,
-            "order must be lead → casts → scope (got lead={lead_at}, casts={casts_at}, \
-             scope={scope_at}):\n{text}"
+            text.starts_with(kaibo_lead()),
+            "the instructions must open with the lead verbatim — it is the resident pitch \
+             and the tool-search retrieval index:\n{text}"
+        );
+        assert!(
+            casts_at < scope_at,
+            "order must be lead → casts → scope (got casts={casts_at}, scope={scope_at}):\n{text}"
         );
         assert!(
             !text.contains("The shell is kaish"),

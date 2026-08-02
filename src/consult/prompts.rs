@@ -1,8 +1,10 @@
 //! Preambles and prompt framers for the consult phases.
 
+use crate::attach::Attachment;
 use crate::config::ModelRole;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::session::QaTurn;
+use crate::sweep_attach::{SweepConsumer, SweepConsumerKind, SweepDelivery};
 
 /// Splice the operator's house rules (if any) onto a phase preamble. The base
 /// preamble functions stay pure (and their tests byte-for-byte stable); this is
@@ -23,11 +25,11 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
         Some(rules) => format!(
             "{base}\n\n\
              --- Operator house rules for this codebase ---\n\
-             The agent you're helping configured the guidance below — project \
-             conventions and working preferences for this repository. Treat it as \
-             trusted standing context: honor it as you investigate and when you write \
-             your answer. It's background about how this codebase works, not the \
-             question you're answering.\n\n{rules}"
+             The agent you're helping configured the guidance below. It holds the \
+             project conventions and working preferences for this repository. Treat it \
+             as trusted standing context: honor it as you investigate and when you \
+             write your answer. It is background about how this codebase works, not \
+             the question you are answering.\n\n{rules}"
         ),
     }
 }
@@ -187,40 +189,57 @@ pub fn resolve_phase_preamble(
 /// Explorer preamble: gather and organize evidence, don't conclude. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
+///
+/// Opens a *role on a team* rather than a capability: this half of the pair is the
+/// **explorer** and its counterpart is the **synthesis agent**, the same two names
+/// the code uses ([`ModelRole::Explorer`]/[`ModelRole::Synth`]) and the same two the
+/// synth-side preambles use — one vocabulary end to end. It closes on the same
+/// completion obligation the synth carries, aimed at this role's deliverable: the
+/// report is what leaves the loop, so the last turn is the report itself.
 pub fn report_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You are a code explorer. You build a complete, accurate picture of the code \
-         a question touches and hand it to a synthesizer who writes the final \
-         answer — so your work is to gather grounded evidence and cite it exactly. \
+        "You are the explorer on a two-model team reading one codebase. You build a \
+         complete, accurate picture of the code a question touches, and you give that \
+         picture to the synthesis agent. The synthesis agent writes the final answer \
+         from what you found. So your work is to gather grounded evidence and cite it \
+         exactly. \
          {core}\n\n\
-         HOW TO READ. Read files WHOLE. `cat -n FILE` is the default move on any \
-         file the question touches — one read hands you the imports, the types with \
-         their impls, the call sites, and exact line numbers together, and nearly \
-         every source file fits in one look. `grep -rn PATTERN .` is how you find \
-         WHICH files matter (`-B4 -A8` previews the matches); once it hits, open \
-         the file whole rather than reading around the match. When a whole read \
-         comes back truncated (exit 3), the sample already hands you the file's \
-         head and tail — stage the rest as targeted reads: `grep -n SYMBOL FILE` \
-         pins the line numbers the question needs, then take a wide span around \
-         each, `cat -n FILE | sed -n '1200,2400p'` (a span of ~1,200 lines fits one \
-         look). Walk a giant end-to-end only when the question truly needs all of \
-         it.\n\n\
-         HOW TO INVESTIGATE. Aim for the complete set of relevant locations. Follow \
-         each key symbol to where it is defined and where it is used; chase anything \
-         that puzzles you until it is clear — a confusing spot usually hides the \
-         thing you need. Follow each thread while you are already in the code, so one \
-         thorough pass leaves you the complete picture.\n\n\
-         WHAT TO PRODUCE. A curated report for the synthesizer, in these sections:\n\
-         - SummaryOfFindings: what you concluded, in a few sentences.\n\
-         - RelevantLocations: for each location that matters — the concrete \
+         HOW TO READ. Read files WHOLE. `cat -n FILE` is your default command for any \
+         file the question touches. One read gives you the imports, the types with \
+         their impls, the call sites, and exact line numbers together, and most source \
+         files are small enough to read in a single command. Use `grep -rn PATTERN .` \
+         to find WHICH files matter (`-B4 -A8` shows a preview around each match). \
+         Once grep names a file, open that file whole instead of reading only the \
+         lines around the match. A whole-file read of a very large file comes back \
+         truncated (exit 3), and the truncated result still contains the start and the \
+         end of the file. Read the rest in targeted spans: run `grep -n SYMBOL FILE` \
+         to get the line numbers the question needs, then read a wide span around each \
+         one with `cat -n FILE | sed -n '1200,2400p'`. A span of about 1,200 lines \
+         fits in a single read. Read a very large file from start to end only when the \
+         question needs all of it.\n\n\
+         HOW TO INVESTIGATE. Read holistically. The question tells you where to start \
+         reading, not where to stop. Read the code around each relevant location as \
+         well, not only the lines the question names directly. Your report is the only \
+         view of this codebase the synthesis agent receives, so anything you leave out \
+         is missing from its answer. Aim for the complete set of relevant locations. \
+         Follow each key symbol to where it is defined and to every place it is used. \
+         When something in the code confuses you, keep reading until it is clear: a \
+         confusing section often holds the detail the question depends on. Follow each \
+         thread while you are already reading the code, so that one investigation \
+         leaves you with the complete picture.\n\n\
+         WHAT TO PRODUCE. A curated report for the synthesis agent, in these \
+         sections:\n\
+         - SummaryOfFindings: state what you concluded.\n\
+         - RelevantLocations: for each location that matters, give the concrete \
          `file:line`, the key symbols there (functions, types, fields), a short \
          verbatim snippet, and what it means for the question.\n\
-         - ExplorationTrace: the path you took, when it helps the synthesizer trust \
-         the result.\n\
-         Keep it tight and evidence-first. The synthesizer trusts your citations and \
-         builds on them, so ground every claim in an exact `file:line` — that \
-         exactness is the whole value of your report."
+         - ExplorationTrace: the path you took, when it helps the synthesis agent \
+         trust the result.\n\
+         Keep the report focused and evidence-first. The synthesis agent trusts your \
+         citations and builds on them, so ground every claim in an exact `file:line`. \
+         That exactness is the whole value of your report. The report is all you hand \
+         over, so your last turn is the report itself, written out in full."
     )
 }
 
@@ -269,21 +288,27 @@ impl ConsultAttachment {
 }
 
 /// The `oneshot` preamble: a thin, direct second opinion with no tools and no
-/// codebase access. The caller owns the context, so this never investigates — frame
-/// the model as a capable outside voice answering from what it was handed plus its
-/// own knowledge. Deliberately minimal: no kaish cheatsheet (there are no tools to
-/// drive) and no repo map (oneshot never reads the project).
+/// codebase access. The caller owns the context, so this never investigates — it is
+/// the **synthesis agent** working from what it was handed plus its own knowledge,
+/// named with the same role the other synth phases open on. Deliberately minimal: no
+/// kaish cheatsheet (there are no tools to drive) and no repo map (oneshot never
+/// reads the project). It closes on the shared output-ordering line — the reply *is*
+/// the answer, so it leads — which costs one clause and is the same discipline
+/// [`batch_preamble`] spells out at length for the offline lane.
 pub fn oneshot_preamble() -> String {
-    "You are a capable model giving a direct second opinion to another agent. Answer \
-     the question it sends from the material it provides and your own knowledge — \
-     this call has no codebase access and no tools, so the caller owns the context. \
-     Be precise and useful: reason over exactly what you were handed, and name \
-     explicitly anything you'd need that wasn't given, so the caller can supply it \
-     next turn. Keep your claims grounded in the material and say where its edge is."
+    "You are the synthesis agent, giving a direct second opinion to another agent. \
+     Answer the question it sends, using the material it provides and your own \
+     knowledge. This call has no codebase access and no tools, so the caller has \
+     supplied all the context you have. Be precise and useful: reason over exactly \
+     the material you were given. If you need something that was not given, name it \
+     explicitly, so the caller can supply it on the next call. Keep your claims \
+     grounded in the material, and say clearly where the material stops covering the \
+     question. Your reply is the answer itself. Write the answer first and write it \
+     in full, then give your reasoning after it."
         .to_string()
 }
 
-/// The `batch` preamble: a capable model answering one hard question *offline*, at
+/// The `batch` preamble: the synthesis agent answering one hard question *offline*, at
 /// max thinking, with no codebase access and no tools. Deliberately **not** a reuse of
 /// [`oneshot_preamble`] — batch is the same toolless shape but a different behavioral
 /// contract, and a cross-model review of the feature caught three places the oneshot
@@ -293,11 +318,15 @@ pub fn oneshot_preamble() -> String {
 ///   clarify and there is no next turn. oneshot's "name what you'd need rather than
 ///   guessing" is right *synchronously* (flagging a gap invites the caller to fill it
 ///   next turn) but wrong here — stopping at "I'd need X" burns the caller's one shot
-///   for nothing. The batch contract is *state the assumption, answer under it, flag
+///   for nothing. The batch contract is *state the assumption, answer under it, say
 ///   what would change* — both the answer and the diagnostic, in one pass.
-/// - **Depth is free.** The lane forces high effort + a generous token floor precisely
-///   because the latency is already accepted. The prompt says so out loud — spend the
-///   room on depth — rather than leaving that intent only in the knobs.
+/// - **Depth is free.** The lane floors reasoning depth and the token budget precisely
+///   because the latency is already accepted. The prompt says so out loud — reason as
+///   deeply as the question deserves — rather than leaving that intent only in the
+///   knobs. It says it
+///   *without naming a rung*: effort is a floor a cast can raise (see
+///   [`batch_effort`](crate::batch::batch_effort)), so a preamble promising "high"
+///   would be quietly wrong on a slot tuned deeper.
 /// - **The written answer comes before the depth (GH #75).** Reasoning and answer draw
 ///   on one shared output budget, so a big attached-file review at max thinking can spend
 ///   the whole budget thinking and get truncated *before* the answer is written — the
@@ -315,19 +344,20 @@ pub fn oneshot_preamble() -> String {
 /// named the unwanted pathway; the replacement asks for the wanted behavior — a
 /// reasoned, labelled assumption — directly.
 pub fn batch_preamble() -> String {
-    "You are a capable model answering a hard question for another agent, offline. Work \
-     from the material it provides and your own knowledge — this call has no codebase \
-     access and no tools, so the caller owns all the context you have. This is your \
-     single response: there is no follow-up turn and the caller cannot clarify, so make \
-     the answer complete and self-contained. The lane gives you room and high effort — \
-     spend it on depth, but spend it on the *written* answer: lead with the conclusion \
-     (the findings, the verdict, the recommendation) and write it in full, then let your \
-     reasoning build under it. Your thinking and your answer draw on one shared output \
-     budget, so land the deliverable the caller can act on first — don't reason at length \
+    "You are the synthesis agent, answering a hard question for another agent, offline. \
+     Work from the material the caller provides and your own knowledge. This call has no \
+     codebase access and no tools, so the caller has supplied all the context you have. \
+     This is your single response: there is no follow-up turn and the caller cannot ask \
+     you to clarify, so make the answer complete and self-contained. This call runs \
+     offline with a large reasoning budget, so reason as deeply as the question deserves, \
+     and spend that depth on the *written* answer. Write in this order: lead with the \
+     conclusion (the findings, the verdict, the recommendation) and write it in full, \
+     then give your reasoning after it. Your reasoning and your answer draw on one shared \
+     output budget, so write the part the caller can act on first; don't reason at length \
      and leave the answer unfinished. Be direct and precise. Ground every claim in the \
-     material or your own knowledge, and say where the evidence runs out. Where something \
-     you'd need is missing, state the assumption you're making, answer under it, and flag \
-     what would change if the assumption is wrong."
+     material or in your own knowledge, and say clearly where the evidence runs out. If \
+     something you need is missing, state the assumption you are making, answer under \
+     that assumption, and state what would change if the assumption is wrong."
         .to_string()
 }
 
@@ -386,21 +416,21 @@ pub fn consult_user_prompt(
             ));
         }
         prompt.push_str(
-            "Use the earlier turns for context and continuity. Investigate fresh and \
-             re-confirm any `file:line` an earlier answer cited before you rely on it — \
-             the code is the ground truth, not the prior answer.\n\n",
+            "Use the earlier turns for context and continuity. Investigate fresh, and \
+             re-read any `file:line` an earlier answer cited before you rely on it. The \
+             code is the ground truth, not the prior answer.\n\n",
         );
     }
     if let Some(context) = context {
         prompt.push_str(&format!(
             "Context the caller supplied (a diff or change summary, a prior report, or \
              pasted source):\n{context}\n\n\
-             Treat it as trusted starting evidence: when it cites a concrete \
-             `file:line`, trust it rather than re-deriving it. Reach for your tools \
-             when you need more than it gives — a span it references but doesn't quote, \
-             a whole file for the full picture, a detail it left open, or anything the \
-             question reaches that it didn't cover. Where the code you read and the \
-             context genuinely disagree, the code wins.\n\n",
+             Treat it as trusted starting evidence. When it cites a concrete \
+             `file:line`, trust that citation instead of re-deriving it. Use your tools \
+             when you need more than the context gives you: read a span it refers to \
+             but does not quote, read a whole file when you need the full picture, and \
+             read anything the question covers that the context does not. If the code \
+             you read and the context disagree, the code is correct.\n\n",
         ));
     }
     if !attached.is_empty() {
@@ -419,9 +449,9 @@ pub fn consult_user_prompt(
             // an inlined attachment cites as exactly as a shell read — no turn spent
             // re-fetching what the caller flagged as central.
             prompt.push_str(
-                "\nTheir full contents follow, lines numbered like `cat -n` — they are \
-                 already in front of you, so work from them directly and cite them by \
-                 `file:line` like anything you read:\n\n",
+                "\nTheir full contents follow, with lines numbered the way `cat -n` \
+                 numbers them. You already have these bytes, so work from them directly \
+                 and cite them by `file:line` like any file you read:\n\n",
             );
             for a in &inlined {
                 if let ConsultAttachment::Text { path, body } = a {
@@ -459,8 +489,9 @@ pub fn consult_user_prompt(
             // (present because the synth is vision-capable, gated server-side) that hands
             // it the actual picture. Route images there, never to the shell.
             prompt.push_str(
-                "\nImages — view each with the `view_image` tool (`view_image PATH`), which \
-                 hands you the picture itself; don't `cat` an image:\n",
+                "\nImages: view each one with the `view_image` tool \
+                 (`view_image PATH`), which gives you the picture. Use `view_image` for \
+                 every image; `cat` cannot read them:\n",
             );
             for a in &images {
                 prompt.push_str(&format!(
@@ -502,42 +533,170 @@ pub fn explorer_attachment_directive(attached: &[ConsultAttachment]) -> Option<S
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "\n\nThe caller attached these files as central to the question — they live \
-         under the project root, so each path opens directly. Read each one WHOLE with \
-         `cat -n PATH` and weigh what you find in your report; when the output \
-         truncates, continue in spans (`cat -n PATH | sed -n '1,1200p'`, then \
-         `'1201,2400p'`, …) until you reach the end of the file:\n{list}"
+        "\n\nThe caller attached these files as central to the question. They are under \
+         the project root, so each path opens directly. Read each one WHOLE with \
+         `cat -n PATH` and report what you find in it. When the output truncates, \
+         continue in spans (`cat -n PATH | sed -n '1,1200p'`, then `'1201,2400p'`, …) \
+         until you reach the end of the file:\n{list}"
     ))
 }
 
-/// The recomposed `consult` driver: one capable model, two tools. Composes the
+/// Appended to an explorer preamble wherever the `attach` tool (`src/sweep_attach.rs`)
+/// is injected — every sweep that gets the tool gets this paragraph in the same
+/// place, so preamble and toolset can't drift apart. Positive framing: attach is
+/// cheaper and more accurate than transcribing a span, not a fallback for when
+/// writing fails.
+pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String {
+    format!(
+        "\n\nYou also have `attach`. It aims a file *past you*: kaibo reads the file and \
+         its full bytes travel ALONGSIDE your report to {}, without ever entering your \
+         context. When the whole file is the evidence, attach it: your report cites, the \
+         attachment carries the bytes. That is cheaper and more accurate than \
+         transcribing a span into your report, because transcription spends your own \
+         budget and can drift, while an attachment is the real file, numbered like \
+         `cat -n`. Attach is for delivering, not reading. You get back a one-line \
+         receipt (path, lines, size), never the contents; read with `cat -n` anything \
+         you need to see yourself. Attach the file a load-bearing claim rests on, and \
+         keep writing exact `file:line` cites, because the attachment is what lets them \
+         be checked. Up to {max} files this sweep.",
+        consumer.label,
+    )
+}
+
+/// The evidence block appended to a sweep's report (`consult`'s nested `explore′`) or
+/// dossier (`deliberate`'s explorer stage) once its `attach` calls are drained. `None`
+/// when the delivery is empty, so a sweep that never attached anything leaves the
+/// report/dossier byte-for-byte what it was before this feature existed.
+///
+/// Demotions arrive from [`SweepAttachSink`](crate::sweep_attach::SweepAttachSink)
+/// already rendered and consumer-shaped (it built them with the same `consumer` this
+/// fn receives, at the moment a path was refused) — this just lists them; the
+/// consumer param otherwise picks the section header, so a driver sees "routed to
+/// you" framing and an offline synth sees "included in this dossier" framing.
+pub fn sweep_evidence_block(consumer: &SweepConsumer, delivery: &SweepDelivery) -> Option<String> {
+    if delivery.is_empty() {
+        return None;
+    }
+    let header = match consumer.kind {
+        SweepConsumerKind::ConsultDriver => {
+            "\n\n--- Files the explorer routed to you this sweep (their full bytes ride \
+             with this tool result) ---\n"
+        }
+        SweepConsumerKind::OfflineSynth => {
+            "\n\n--- Files the explorer routed into this dossier (their full bytes are \
+             included below) ---\n"
+        }
+    };
+    let mut block = String::new();
+    block.push_str(header);
+
+    let texts = delivery.texts();
+    for a in &texts {
+        if let Some(wrapped) = a.wrapped_text() {
+            block.push_str(&wrapped);
+            block.push_str("\n\n");
+        }
+    }
+
+    let images = delivery.images();
+    if !images.is_empty() {
+        block.push_str(
+            "Images (see the image parts carried alongside this text) — described by \
+             path, never inlined as text:\n",
+        );
+        for a in &images {
+            if let Attachment::Image { path, mime, .. } = a {
+                block.push_str(&format!(
+                    "- {} ({mime})\n",
+                    crate::attach::escape_attr_value(path)
+                ));
+            }
+        }
+        block.push('\n');
+    }
+
+    if !delivery.notes.is_empty() {
+        block.push_str("Explorer's note:\n");
+        for n in &delivery.notes {
+            block.push_str(&crate::attach::escape_file_body(n));
+            block.push('\n');
+        }
+        block.push('\n');
+    }
+
+    if !delivery.demotions.is_empty() {
+        block.push_str("Not routed this sweep:\n");
+        for line in &delivery.demotions {
+            block.push_str(&format!("- {line}\n"));
+        }
+    }
+
+    Some(block)
+}
+
+/// The recomposed `consult` driver: the **synthesis agent**, two tools. Composes the
 /// shared [`kaish_syntax_core`] (for `run_kaish`) and frames `explore` as the way
 /// to cover breadth. Positive framing on purpose — weaker/local models loop on
 /// blanket prohibitions, so reinforce the grounded behavior we want.
+///
+/// Opens on a role, not a capability: the model is *the synthesis agent* whose
+/// counterpart is *the explorer* — the vocabulary the code already uses for the two
+/// slots — because a role framing starts a narrative the model acts from, where "a
+/// capable model" only described it. Two behaviors ride that identity:
+///
+/// - **Delegation pays.** A live OpenRouter trace showed a driver take 203 of 203
+///   turns itself and never once sweep, so the preamble states the arithmetic plainly
+///   — one `explore` call reads more of the repo than a turn of direct reading, which
+///   buys back turns for close reading — rather than only offering the tool.
+/// - **The final turn is the answer.** A DeepSeek `consult` once finished a turn with
+///   14 output tokens, no text, and a `grep` as its last act: it stopped mid-
+///   investigation, and the clean-finish path reported that empty string as success.
+///   The obligation is folded into who the agent is (the tools support the answer; the
+///   work is not finished until the answer is written) rather than appended as a rule,
+///   and deliberately carries **no length target** — a size cue is a *stopping* cue,
+///   and stopping early is the failure. The structural guard lives in the engine; this
+///   is the prompt-side half.
+///
+/// Written in plain, literal English per the agent-facing clarity rule in AGENTS.md:
+/// declarative sentences, one instruction each, no idiom and no metaphor, because most
+/// of the models that read this are not English-first.
 pub fn consult_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You answer a question about a codebase, grounded in evidence and citing \
-         concrete `file:line`. {core}\n\n\
-         You also have a second tool, `explore`: it delegates a broad sweep to a \
-         fast investigator that rips through the repo and reports back with a \
-         curated report — RelevantLocations carrying `file:line`, key symbols, and \
-         snippets. Reach for `explore` to cover breadth — find where a \
-         thing lives, gather the relevant files — and use `run_kaish` to read the \
-         code yourself. When you read directly, read files WHOLE with `cat -n FILE` \
-         — nearly every file fits one look. A truncated giant (exit 3) hands you \
-         its head and tail; stage the rest as targeted spans around what you need \
-         (`grep -n SYMBOL FILE`, then `cat -n FILE | sed -n '1200,2400p'`). Build \
-         your answer from what \
-         they return: quote the key snippet, name its `file:line`, and let the \
-         evidence carry the claim. Where the evidence settles the question, answer \
-         it fully; where it reaches its edge, say so and name what would close the gap.\n\n\
-         The caller may hand you CONTEXT — a diff or change summary, a prior report, \
-         or pasted source. Treat it as trusted starting evidence: when it cites a \
-         concrete `file:line`, trust it rather than re-deriving it, and spend your \
-         turns getting *more* than it gave — reading a span it left unquoted, a whole \
-         file for the full picture, anything the question reaches past it. Where the \
-         code you read and the context genuinely disagree, the code wins."
+        "You are the synthesis agent on a two-model team. You investigate a codebase \
+         and write the answer that another agent will act on. Ground every claim in \
+         evidence and cite the concrete `file:line`. {core}\n\n\
+         You also have a second tool, `explore`. It sends a broad sweep to the fast \
+         explorer on your team, which searches the repository on the same read-only \
+         shell and returns a curated report: RelevantLocations carrying `file:line`, \
+         key symbols, and snippets. Delegate a sweep when a question needs breadth, \
+         such as finding where something lives or gathering the relevant files. The \
+         explorer is fast and cheap, and one `explore` call searches far more of the \
+         repository than you could read in one turn, which leaves you more turns for \
+         reading the most important code closely and for reasoning. Use `run_kaish` \
+         to read the code yourself when you need a specific span. When you read \
+         directly, read files WHOLE with `cat -n FILE`, because most files are small \
+         enough to read in a single command. A whole-file read of a very large file \
+         comes back truncated (exit 3), and the truncated result still contains the \
+         start and the end of the file. Read the rest in targeted spans: run \
+         `grep -n SYMBOL FILE` to get the line numbers you need, then read a wide \
+         span around each one with `cat -n FILE | sed -n '1200,2400p'`.\n\n\
+         Your tools exist to support the answer. Writing the answer is your work, and \
+         no tool writes it for you. Every read you make is evidence for that answer, \
+         and the work is not finished until the answer is written. Write it in this \
+         order: state the finding first, then put the quoted snippet and its \
+         `file:line` underneath it, so the evidence supports the claim directly. Where \
+         the evidence settles the question, answer it fully. Where the evidence runs \
+         out, say so and name what would close the gap; naming the limit of your \
+         evidence is itself a grounded answer. When you have what the question needs, \
+         your next turn is that answer, written out in full.\n\n\
+         The caller may give you CONTEXT: a diff or change summary, a prior report, \
+         or pasted source. Treat it as trusted starting evidence. When it cites a \
+         concrete `file:line`, trust that citation instead of re-deriving it. Spend \
+         your turns getting *more* than the context gave you: read a span it refers \
+         to but does not quote, read a whole file when you need the full picture, and \
+         read anything the question covers that the context does not. If the code you \
+         read and the context disagree, the code is correct."
     )
 }
 
@@ -547,18 +706,25 @@ pub fn consult_preamble() -> String {
 /// Pure, so the wire shape is pinned without a network.
 ///
 /// The framing installs the deliberate posture: the dossier is *trusted* investigated
-/// evidence (a fast explorer read the real spans and cited them), so the synth spends
+/// evidence (the explorer read the real spans and cited them), so the synth spends
 /// its one offline turn reasoning the question all the way through, not re-verifying
 /// cites it can't cheaply re-derive — and names the edge of the evidence rather than
 /// guessing past it (the "thin dossier deliberating on air" failure the spec warns of).
+///
+/// This is a *user* turn, so the role identity is already installed above it by
+/// [`batch_preamble`] (the offline synth's system prompt on both lanes). It names the
+/// other half of the team the same way every other prompt does — "the explorer on your
+/// team" — so the two blocks read as one voice rather than two authors.
 pub fn deliberation_prompt(question: &str, dossier: &str) -> String {
     format!(
-        "A fast explorer investigated this codebase READ-ONLY and assembled the dossier \
-         below — spans it read from the real, current source, cited by `file:line`. Trust \
-         those citations as accurate and deliberate deeply over the question using this \
-         evidence: reason it all the way through, and say where the evidence runs out. If \
-         the dossier leaves a load-bearing detail open, reason under a stated assumption \
-         and flag what would change if it's wrong.\n\n\
+        "The explorer on your team investigated this codebase READ-ONLY and assembled \
+         the dossier below. The dossier holds spans it read from the real, current \
+         source, cited by `file:line`. Trust those citations as accurate. Use this turn \
+         to deliberate on that evidence, not to re-derive it. Reason the question \
+         through to a conclusion, and say clearly where the evidence runs out. If the \
+         dossier leaves open a detail the answer depends on, state the assumption you \
+         are making, reason under that assumption, and state what would change if the \
+         assumption is wrong.\n\n\
          ## Question\n{question}\n\n## Dossier\n{dossier}"
     )
 }
@@ -619,10 +785,118 @@ mod tests {
             p.contains("WHICH files matter"),
             "grep framed as the locator: {p}"
         );
+        // Identity, in the code's own vocabulary: this is the *explorer* half of the
+        // pair and its counterpart is the *synthesis agent* — never "a synthesizer",
+        // never "a capable model". The three phases that share this preamble include
+        // `deliberate`'s dossier build, whose offline synth never sees the code at
+        // all, so "the only view" is literal there — which is why the sweep is told
+        // to read holistically rather than to the edges of the question.
+        assert!(
+            p.contains("You are the explorer") && p.contains("the synthesis agent"),
+            "explorer names its own role and its counterpart's: {p}"
+        );
+        assert!(
+            p.contains("Read holistically") && p.contains("the only view"),
+            "the sweep is told to build the whole picture, not just answer the \
+             question asked: {p}"
+        );
+        assert!(
+            p.contains("your last turn is the report itself"),
+            "the explorer owns writing the report it was reading for: {p}"
+        );
         // The report template the consult driver preamble is written
         // against — keep the three section names in lockstep with those.
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
             assert!(p.contains(section), "missing report section {section}: {p}");
+        }
+    }
+
+    /// Every synth-side phase opens on the *same role*, in the vocabulary the code
+    /// already uses for the slot (`ModelRole::Synth`): "You are the synthesis agent".
+    /// That's the narrative half of the rework — a role a model acts from, where "a
+    /// capable model" only described one — so a drift back to a capability phrase, or
+    /// three phases wearing three different identities, fails here.
+    ///
+    /// The tool-driving synth additionally owns the *written* answer. A live DeepSeek
+    /// consult once ended its terminal turn with 14 output tokens, no text, and a
+    /// `grep` as its last act — it stopped mid-investigation and the clean-finish path
+    /// reported the empty string as success. The mitigation is part of who the agent
+    /// is, not a rule in a list: tools serve the answer, and the work is done when the
+    /// answer is written.
+    #[test]
+    fn synth_phases_share_one_role_identity_and_own_the_written_answer() {
+        for (label, p) in [
+            ("consult", consult_preamble()),
+            ("oneshot", oneshot_preamble()),
+            ("batch", batch_preamble()),
+        ] {
+            assert!(
+                p.contains("You are the synthesis agent"),
+                "{label} must open on the synthesis-agent role: {p}"
+            );
+            assert!(
+                !p.contains("capable model"),
+                "{label} must name the role, not describe a capability: {p}"
+            );
+        }
+        let c = consult_preamble();
+        assert!(
+            c.contains("no tool writes it for you") && c.contains("written out in full"),
+            "the consult driver must own writing the answer its tools serve: {c}"
+        );
+        // The other half of the team is named the same way from both sides, so the
+        // pair reads as one vocabulary: driver → explorer, explorer → synthesis agent.
+        assert!(
+            c.contains("the fast explorer on your team"),
+            "the driver names its explorer counterpart: {c}"
+        );
+        assert!(
+            report_preamble().contains("the synthesis agent"),
+            "the explorer names its synth counterpart"
+        );
+    }
+
+    /// Plain, literal English is the agent-facing clarity rule (AGENTS.md, "Writing for
+    /// models"). Most of the models that read these blocks are not English-first
+    /// (DeepSeek, GLM, Qwen, Kimi) and the small local models already fixate on odd
+    /// phrasing, so an idiom or a three-clause em-dash chain is a comprehension tax
+    /// charged to exactly the synths we most need to work well. The em-dash is the
+    /// mechanical half of that rule and the half a test can hold: every kaibo-authored
+    /// preamble states its instructions as sentences instead. The shared kaish contract
+    /// is excluded on purpose — that text is composed in from the upstream `kaish-help`
+    /// crate, so its punctuation is not ours to set.
+    #[test]
+    fn built_in_preambles_are_written_without_em_dash_clause_chains() {
+        let core = kaish_syntax_core();
+        for (label, text) in [
+            ("explorer", report_preamble()),
+            ("consult", consult_preamble()),
+            ("oneshot", oneshot_preamble()),
+            ("batch", batch_preamble()),
+            ("deliberation", deliberation_prompt("Q", "D")),
+            // Not a preamble of its own, but model-facing all the same: this framing is
+            // spliced onto whichever preamble is in play whenever `[context]` names a
+            // house-rules file, which on a configured install is every call. It sat
+            // outside this guard through the first pass and kept its em-dash.
+            (
+                "house rules",
+                with_house_rules(String::new(), Some("RULES")),
+            ),
+            // Spliced onto the explorer preamble wherever the `attach` tool is
+            // injected (consult's nested sweep, deliberate's dossier stage). It
+            // arrived with the attach feature after the first plain-language pass,
+            // the same way the house-rules framing once sat outside this guard.
+            (
+                "explorer attach directive",
+                explorer_attach_directive(8, &consult_driver_consumer()),
+            ),
+        ] {
+            let ours = text.replace(core, "");
+            assert!(
+                !ours.contains('\u{2014}'),
+                "{label}: say it as sentences rather than an em-dash clause chain \u{2014} a \
+                 non-English-first synth reads plain, literal English best:\n{ours}"
+            );
         }
     }
 
@@ -651,7 +925,7 @@ mod tests {
         // (3) Assume-and-answer, not flag-and-stall: state the assumption and answer
         // under it (the synchronous oneshot would say "name what you'd need").
         assert!(
-            lower.contains("assumption") && lower.contains("answer under it"),
+            lower.contains("assumption") && lower.contains("answer under that assumption"),
             "batch must steer toward assume-and-answer, not flag-and-stall: {p}"
         );
         // Positive framing (the CLAUDE.md rule): it must not reintroduce the negative
@@ -1013,5 +1287,95 @@ mod tests {
             second < current,
             "history must precede the current question"
         );
+    }
+
+    fn consult_driver_consumer() -> SweepConsumer {
+        SweepConsumer {
+            kind: SweepConsumerKind::ConsultDriver,
+            label: std::sync::Arc::from("the consult driver (`claude-sonnet-4-6`)"),
+            vision: false,
+        }
+    }
+
+    fn offline_synth_consumer() -> SweepConsumer {
+        SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: std::sync::Arc::from("the offline synth (`gpt-5.6-sol`)"),
+            vision: false,
+        }
+    }
+
+    /// The attach directive names both the budget (so the explorer can self-pace)
+    /// and who the bytes route to (the consumer's label) — and mentions the tool by
+    /// name so a model reading the preamble connects the prose to the toolset.
+    #[test]
+    fn the_attach_directive_names_the_budget_and_the_routing() {
+        let d = explorer_attach_directive(5, &consult_driver_consumer());
+        assert!(d.contains("`attach`"), "{d}");
+        assert!(d.contains("5 files"), "{d}");
+        // Both cross-family reviewers converged here: a weak explorer must be told
+        // up front that attach hands back a receipt, never the file — otherwise it
+        // attaches what it meant to read and hallucinates the contents.
+        assert!(d.contains("never the contents"), "{d}");
+        assert!(d.contains("delivering, not reading"), "{d}");
+        assert!(
+            d.contains("the consult driver (`claude-sonnet-4-6`)"),
+            "{d}"
+        );
+    }
+
+    /// The evidence block wraps a delivered text attachment exactly once (the same
+    /// wrapper-count discipline `attach.rs`'s own tests pin), numbered `cat -n`
+    /// style so citations against a routed file are exact.
+    #[test]
+    fn the_evidence_block_numbers_each_file_and_wraps_it_once() {
+        let delivery = SweepDelivery {
+            attachments: vec![Attachment::Text {
+                path: "src/foo.rs".into(),
+                body: "fn a() {}\nfn b() {}\n".into(),
+            }],
+            ..SweepDelivery::default()
+        };
+        let block = sweep_evidence_block(&consult_driver_consumer(), &delivery)
+            .expect("a non-empty delivery renders a block");
+        assert_eq!(
+            block.matches("<file path=\"src/foo.rs\">").count(),
+            1,
+            "exactly one wrapper: {block}"
+        );
+        assert_eq!(block.matches("</file>").count(), 1, "{block}");
+        assert!(
+            block.contains("     1\tfn a() {}\n     2\tfn b() {}\n"),
+            "numbered cat -n style: {block}"
+        );
+    }
+
+    /// The offline-synth evidence block surfaces a dropped file's demotion — already
+    /// rendered by the sink — verbatim, telling the synth it cannot fetch what was
+    /// left out.
+    #[test]
+    fn the_deliberate_evidence_block_says_the_synth_cannot_fetch_what_was_dropped() {
+        let delivery = SweepDelivery {
+            demotions: vec![
+                "**NOT INCLUDED**: `src/z.rs` — the explorer's per-sweep attachment \
+                 budget (32) was exhausted. You cannot fetch it; treat its contents as \
+                 unavailable and say so if the question turns on it."
+                    .to_string(),
+            ],
+            ..SweepDelivery::default()
+        };
+        let block = sweep_evidence_block(&offline_synth_consumer(), &delivery)
+            .expect("a non-empty delivery renders a block");
+        assert!(block.contains("NOT INCLUDED"), "{block}");
+        assert!(block.contains("cannot fetch"), "{block}");
+        assert!(block.contains("src/z.rs"), "{block}");
+    }
+
+    /// An empty delivery (a sweep that never called `attach`) renders no block at
+    /// all — the report/dossier stays byte-for-byte what it was before this feature.
+    #[test]
+    fn an_empty_delivery_renders_no_block() {
+        assert!(sweep_evidence_block(&consult_driver_consumer(), &SweepDelivery::default())
+            .is_none());
     }
 }

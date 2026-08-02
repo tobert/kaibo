@@ -81,8 +81,8 @@ EXIT CODES
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
 this table (0 ok, 126 blocked, 124 timed out).";
 
-/// kaibo (解剖) — read-only codebase consultation from a model outside your own
-/// family. Ask a question; a capable model (DeepSeek, Gemini, Anthropic, OpenRouter,
+/// kaibo — read-only codebase consultation from a model outside your own
+/// family. Ask a question; a synthesis agent (DeepSeek, Gemini, Anthropic, OpenRouter,
 /// or local — pick with `--cast`) reads the project READ-ONLY and answers with
 /// `file:line` citations, never modifying anything. Bare `kaibo` is the MCP server
 /// (stdio); `kaibo consult` is the one-shot CLI; `kaibo config` prints the resolved
@@ -224,6 +224,13 @@ pub struct CommonArgs {
     /// Overrides KAIBO_CAS_MAX_BYTES / [cas] max_bytes.
     #[arg(long = "cas-max-bytes", value_name = "BYTES", global = true)]
     pub cas_max_bytes: Option<u64>,
+
+    /// Cap on how many files one explorer sweep may route with its `attach` tool
+    /// (the bytes ride to whoever reads the sweep's report — the consult driver, or
+    /// deliberate's offline synth). `0` turns the tool off. Also KAIBO_MAX_ATTACHMENTS
+    /// / [defaults] max_attachments.
+    #[arg(long = "max-attachments", value_name = "N", global = true)]
+    pub max_attachments: Option<usize>,
 }
 
 /// The per-tool `--no-<tool>` gates — serve-only (they only make sense for the
@@ -373,7 +380,7 @@ pub struct ExploreArgs {
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
 
-    /// Workspace file central to the survey: the investigator is directed to read it
+    /// Workspace file central to the survey: the explorer is directed to read it
     /// WHOLE. Text only (it reads through the shell). Repeatable.
     #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
     pub attach: Vec<String>,
@@ -523,6 +530,7 @@ fn load_config(common: &CommonArgs) -> anyhow::Result<Config> {
         common.state_db.clone(),
         common.cas_dir.clone(),
         common.cas_max_bytes,
+        common.max_attachments,
     );
     Ok(config)
 }
@@ -745,6 +753,7 @@ async fn resolve_and_run(
             },
             explorer_max_turns: args.explorer_max_turns.unwrap_or(default_explorer_turns),
             sandbox: sandbox.clone(),
+            max_attachments: resolver.config.defaults.max_attachments,
         },
         synth_max_turns: args.synth_max_turns.unwrap_or(default_synth_turns),
         attachments,
@@ -1180,8 +1189,9 @@ async fn explore_inner(
             .explorer_max_turns
             .unwrap_or(resolver.config.defaults.explorer_max_turns),
         sandbox: resolver.config.sandbox.clone(),
+        max_attachments: resolver.config.defaults.max_attachments,
     };
-    match explore_with(&args.question, root, &explorer, &cfg, &attachments).await {
+    match explore_with(&args.question, root, &explorer, &cfg, &attachments, None).await {
         Ok((report, usage)) => {
             if args.json {
                 println!(

@@ -1,6 +1,6 @@
 # kaibo — Known Issues & Open Work
 
-解剖（かいぼう）'s punch list. kaibo is an assistant agent for other agents — a team
+kaibo's punch list. kaibo is an assistant agent for other agents — a team
 of models offering *consultation* (read-only, cited codebase answers). This file is
 where we record what's missing, what's fragile, and what we'd improve. Evidence-first
 — name the file, the line, the *why*, and how it surfaced.
@@ -22,18 +22,6 @@ the model-facing surface pass + the full consultation ladder (arc closeout, #37�
 
 ## P1 — High-leverage features & robustness
 
-### `deliberate` cannot be staffed by any built-in cast — advertised but DOA
-`cast_can_deliberate` (`config.rs:846`) needs an **offline synth lane plus an explorer
-slot**. Of the built-in casts, only `anthropic-batch` and `gemini-batch` carry an offline
-lane, and both are **synth-only** — so every `deliberate` call on a stock install fails
-`cast "…" has no explorer slot`. The tool's own description points at `fable` /
-`gemini-deliberate` / `local-direct`, which live in `docs/config.example.toml` and are
-**not** built in, so the guidance names casts the user does not have. Either ship a
-deliberate-capable built-in (a Flash-Lite explorer beside the Pro batch synth is one line)
-or have the refusal say "no built-in cast can staff this; copy `gemini-deliberate` from
-`docs/config.example.toml`". Surfaced 2026-07-25 trying to run a `deliberate` design pass
-on the media CAS; worked around locally by adding the cast to the XDG config.
-
 ### Media spine — perception in, production REOPENED (2026-07-25)
 
 **Superseded in part.** The 2026-06-28 direction below removed `generate_image` and made
@@ -53,13 +41,36 @@ must land *together* with the first tool, because each is unsafe or dishonest al
   mounted will accept the prompt, **spend the user's provider credits**, verify and write
   the artifact, then destroy it on exit. Silently evaporating paid artifacts is exactly what
   a store that refuses to ever delete exists to prevent. Ranked the top remaining risk by
-  the Gemini design pass. Detect overlay/tmpfs backing and warn severely, or require an
-  explicit acknowledgement — never proceed quietly.
+  the Gemini design pass. **Decided (Amy, 2026-07-30): detect overlay/tmpfs backing and warn
+  severely, then proceed** — not a refusal gated on an acknowledgement flag. The container
+  path stays frictionless for someone who genuinely doesn't want persistence; what must not
+  happen is proceeding *quietly*.
 - **`AGENTS.md`'s opening paragraph** still says kaibo "produces no output artifacts." That
   is *true today* (nothing reachable produces anything) and becomes false the moment a tool
   lands. Rewrite it in that same change.
-- **The tool must be gated and auto-disabled** — see the next entry, which this shares a
-  mechanism with.
+- **Gating is done** — the staffing gate shipped 2026-07-30 (a tool no configured cast can
+  staff is not advertised, with the reason in the startup log and `kaibo://config`'s
+  `[runtime].unstaffable_tools`). An image tool inherits it by adding a `CAST_ENUM_RULES`
+  entry with an `cast_can_generate_image` predicate, so a user who configures no image cast
+  pays zero resident tokens for it. Nothing further to build here — just wire the rule.
+
+**Decided with Amy, 2026-07-30 — the shape of the first image tool:**
+- **The image model is a cast SLOT, not a separate config concept.** Revive
+  `ModelRole::Image` (undoing that part of `986806f`) so a cast reads
+  `[casts.artist] explorer = … / synth = … / image = "stability/core"`. Considered and
+  rejected: a standalone `[image]`/backend-only concept divorced from casts, on the argument
+  that a cast is a *reasoning* team. Amy's call went the other way, and it buys a real
+  simplification — the staffing gate, the `cast` enum, and the per-call `cast` argument all
+  keep working unchanged, with `cast_can_generate_image` sitting beside
+  `cast_can_deliberate` in exactly the same shape.
+- **The tool returns the digest and the path — not the bytes.** No inline image content
+  block: a multi-megabyte artifact should not land in the calling agent's context unless it
+  asks, and the caller may not even share kaibo's filesystem. A by-digest read verb can come
+  later if wanted (and see the egress-gateway note below, which already argues a by-digest
+  fetch leaks nothing).
+- Still open, not yet decided: whether `ProviderKind::Stability` is the right home for the
+  image backend (it is not a rig `CompletionModel`, so it does not slot into the existing
+  arm machinery), and the `[cas]` config surface (dir override, `max_bytes` cap).
 
 **Decided, so it isn't re-litigated:** audio and 3D are *not* refused on principle. The
 account-fleet argument that justifies image generation extends to them; the real constraint
@@ -108,30 +119,6 @@ file" — is the general escape hatch the invariant exists to refuse.
 
 **What must not weaken:** kaibo never touches the *project* — that is the user promise and
 egress-to-CAS does not touch it. And the model team still must not enumerate.
-
-### Never advertise a tool no configured cast can staff
-A single rule that fixes an existing bug and pre-empts a coming one. Tools are gated at
-startup by dropping routes from the `ToolRouter` (`server/mod.rs`, the `remove_route` loop),
-and `CAST_ENUM_RULES` already computes per-tool cast eligibility from live config
-(`cast_can_explore`, `cast_can_deliberate`, …). But eligibility currently only shapes the
-`cast` *enum* — it never removes the tool. `inject_cast_enum` even documents the near-miss:
-when no cast qualifies it *skips* injecting the enum, because an empty enum reads as "no
-valid value." So the tool ships advertised with no usable cast, which is precisely the
-`deliberate` DOA bug above.
-
-Fix: when a tool's eligible-cast list is empty, **remove the route** instead of skipping its
-enum. That repairs `deliberate` on stock installs, and gives image tools zero resident cost
-for the many users who configure no image cast — answering the resident-cost objection from
-the direction review with a mechanism rather than a caveat. It generalizes to `explore` and
-`batch_submit`, which have the same latent shape.
-
-Pair it with a **startup log line naming what was dropped and why** ("deliberate disabled:
-no configured cast pairs an explorer with an offline synth — see
-`docs/config.example.toml`"). Vanishing is right for the model's tool list and wrong for
-operator discoverability; the log plus `kaibo://config`'s roster keeps the operator informed
-without spending resident characters on the model. Amy agreed 2026-07-25; deliberately kept
-out of the media-CAS PR since it changes `deliberate`'s live behavior and deserves its own
-review.
 
 Direction settled 2026-06-28 (w/ Amy): `generate_image` removed and read-only becomes
 *unconditional* — no out-dir, no handler-side write, no write path of any kind. Image
@@ -347,6 +334,42 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
+### Server-level test: a sweep-routed image survives the whole `deliberate` handler
+The engine layer pins dossier stitching and `deliberate_direct`-with-images, but
+neither `deliberate_batch` nor `deliberate_direct_job` has a server-level test
+proving a sweep-routed image survives the full handler pipeline (dossier sweep →
+`sink.drain()` → image collection → lane dispatch). The code reads correctly
+(`src/server/mod.rs`, `deliberate`), and the engine tests cover the seams — but a
+future refactor could drop the `images` variable between drain and dispatch
+undetected. Flagged by the DeepSeek cross-family review of the explorer `attach`
+feature (2026-07-26).
+
+### Stale code comments + test assertions that predate the 5th backend / the direct lane
+Surfaced by a kaibo `or-gpt` (gpt-5.6-luna) review of PR #110, verified against the code.
+Three spots still describe a world with four built-ins and no tool routing to `direct`.
+None affects behavior; all three are places a reader (or a future us) would be misled, and
+the test one could let a real regression pass:
+
+- **`tests/config.rs`** (~:35) — "Four built-in backends + four single-backend casts", and
+  the loop below it iterates only Anthropic/DeepSeek/Gemini/Openai. `openrouter` is a real
+  built-in (`config.rs::builtin_registry`), so removing it would keep this test green.
+  Same undercount in a `src/server/config_resource.rs` test (~:831).
+- **`src/config.rs`** (~:225) — a doc-comment still says the `direct` lane has no tool
+  route. `deliberate` routes to it now (`config.rs::cast_can_deliberate`,
+  `server/mod.rs::CAST_ENUM_RULES`).
+
+Fix is mechanical; kept out of PR #110 because that one is a docs PR and this touches
+tests. Do it with the next change that lands in `tests/config.rs`.
+
+### Shipped config template omits four knobs its own resource description promises
+`kaibo://config/example`'s description said "every option with its default"; the template
+was missing `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`.
+Added in PR #110, so the claim is true again — **the open work is the guard**: nothing
+tests that the template covers the config surface, so the next new knob can silently
+reintroduce the gap. A test walking `RawConfig`'s field names against
+`CONFIG_EXAMPLE_TOML` would close it, in the spirit of the `no_write_path.rs` pinned-count
+guard. (The example's *parse* test exists already; coverage is the missing half.)
+
 ### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
 The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
 tracker pointer. Direction settled 2026-06-25 (w/ Amy): **stay OSS / GitHub-native** —
@@ -495,10 +518,18 @@ in the module doc and `docs/devlog.md`. What's left:
   provider batch). The diverse-opinion panel — one question across **many** casts — is N
   provider batches under a composite handle; deferred. The provenance footer already
   makes each result self-labelling, so the rendering is mostly there.
-- **Effort tier.** Batch forces `BATCH_EFFORT = "high"` (== `DEFAULT_EFFORT`, the
-  proven-accepted top for the Anthropic adaptive tier). If a higher tier (`xhigh`/`max`)
-  is ever confirmed by probe for a batch backend, lift it there — the constant is the
-  one knob to change.
+- **Anthropic's effort ladder is still unknown, and two of our own documents disagree
+  about it.** `docs/config.example.toml` ships `effort = "max"` on an Opus slot;
+  `BATCH_EFFORT`'s doc treats `high` as the top. The probe that settles it is written and
+  in the tree — `anthropic_adaptive_effort_ladder_live` (`tests/consult.rs`) — but cannot
+  run on an unfunded key: Anthropic's billing check precedes body validation, so every
+  rung returns the same credit-balance 400 and a rejection proves nothing about the rung.
+  The test fails loudly on that message rather than skipping, so an unfunded run can't be
+  mistaken for a result. Run it with a funded key, then fix whichever document is wrong.
+  Every other provider's ladder is now measured (see the sibling live probes and the
+  table in `docs/config.md`); this is the one empty cell. Lower stakes than it was, since
+  batch's `effort` is a floor rather than a force — a cast that pins a deeper rung already
+  reaches the provider, so only kaibo's *default* rides on the answer.
 - **`FileRef` / Gemini File API for *batch* is bigger than "a variant beside `Image`"
   — and may be the wrong shape.** Re-scoped after checking gpal + Google's docs (2026-06-22):
   - **gpal's batch is inline-only** (`create_batch` → `InlinedRequest(contents=prompt)`,
@@ -547,12 +578,6 @@ failures and a truncated page are surfaced, not hidden). Still open:
   progress string to know whether it's looking at a status or its answers. A structured
   status token (or distinct content shape) would let the caller branch without reading
   prose.
-- **Forced effort vs. a floor.** `max_tokens` is already a floor (never undercuts a
-  richer slot), but effort is *force-clobbered* to `BATCH_EFFORT` — lossy for legitimate
-  bulk-classification / short-extraction batches where high effort is wasted spend.
-  Consider making effort a default-on floor the cast/caller can lower, the way
-  `max_tokens` already is. (Distinct from the "lift the tier" bullet above — that's the
-  ceiling, this is the override.)
 - **Shared `attach` duplicates per item — bounded by the inlined-batch payload cap.**
   Attachments are shared across the batch but inlined *per item*: `anthropic_content`/
   `gemini_parts` (`batch.rs`) re-encode every attachment into every item's request, so a
@@ -601,12 +626,15 @@ P1 entry):
   grounding (all of which the `gpal` MCP sibling drives directly). This is why "voice
   on Gemini" is parked with TTS. Track rig's gemini coverage; adopt its traits when
   they broaden rather than hand-rolling media modalities over raw HTTP.
-- **OpenRouter provider silently drops `max_tokens`.** rig 0.38.2's native
-  `providers::openrouter` request struct (`openrouter/completion.rs`,
-  `OpenrouterCompletionRequest`) has no `max_tokens` field and its `TryFrom` never
-  reads `CompletionRequest.max_tokens`, so `AgentBuilder::max_tokens()` — kaibo's
-  per-arm headroom mechanism — is a no-op there. Confirmed still present on rig
-  `main` (2026-07-03), untracked upstream. Collides with the `large-token-headroom`
+- **OpenRouter provider silently drops `max_tokens`.** rig's native
+  `providers::openrouter` request never reads `CompletionRequest.max_tokens`, so
+  `AgentBuilder::max_tokens()` — kaibo's per-arm headroom mechanism — is a no-op there.
+  Confirmed still present on rig `main` (2026-07-03) and **re-measured on rig 0.41.0
+  (2026-08-01)**: rig 0.40 collapsed OpenRouter onto the shared
+  `GenericCompletionModel<OpenRouterExt>` without picking up the OpenAI path's native
+  `max_tokens`, and a real 0.41 model driven through a capture transport with
+  `max_tokens = Some(4096)` still serialized a body of only `messages`/`model`/
+  `reasoning`. Untracked upstream. Collides with the `large-token-headroom`
   doctrine (thinking eats the completion budget). Kaibo's workaround: inject
   `max_completion_tokens` (OpenRouter's preferred name; their spec deprecates
   `max_tokens`) via `additional_params`, guarded by a failing-first test. Watch
@@ -649,27 +677,16 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
   thinking maximized by default**, opt-*out* per slot, never silently absent. The
   fix wants model-aware shaping on the openai wire — e.g. emit `reasoning_effort`
   for OpenAI-compatible reasoners, OpenRouter's unified `reasoning` param when the
-  backend is OpenRouter — landing with the first-class OpenRouter work.
+  backend is OpenRouter — landing with the first-class OpenRouter work. No longer
+  *silent*, at least: an `effort` the operator wrote onto this wire is now a startup
+  warning plus an `inert_tunables` entry (`Config::effort_diagnostics`), and
+  `tests/effort_wire.rs` pins the drop against a real serialized request body. Audible
+  is not fixed — reasoning is still off on that wire.
 - **`thinking_style` is missing from the `inert_tunables` render** (GLM review,
   2026-07-03): `kaibo://config` flags an inert `thinking_budget`/`effort`/
   `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
   slot whose kind ignores the override (anything non-Anthropic) renders as if
   effective. Display accuracy only; add it to the inert check alongside the others.
-- **The `inert_tunables` render is lane-blind** (or-gpt review, 2026-07-18): it
-  resolves only the model *shape*, not the slot's `lane`, so a **batch** slot renders
-  `effort` and `temperature` as effective even though `batch_shaping` forces
-  `BATCH_EFFORT` (ignoring the slot's `effort`) and passes `None` sampling. A configured
-  `effort = "low"` on a `lane = "batch"` slot is a silent no-op the render doesn't flag.
-  Same display-accuracy class as the `thinking_style` gap above; make the inert check
-  lane-aware — mark batch `effort` as overridden and batch sampling as inert.
-- **The `inert_tunables` render resolves the shape differently from validation**
-  (deepseek review, 2026-07-18): the render resolves `thinking_style` via
-  `unwrap_or_default()` (→ `Auto`), while the validation/`slot.tunables` path uses the
-  `defaults.thinking_style` fallback — so a `[defaults].thinking_style = "adaptive"` set
-  without a per-slot override is missed by the render, which can mislabel a
-  `thinking_budget`'s inertness on an actually-adaptive Anthropic slot. Display-only,
-  no wire effect. The clean fix for this whole render-accuracy cluster: resolve the
-  slot's shape in the render exactly as `slot.tunables` does.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
@@ -716,14 +733,17 @@ Remaining OpenRouter-specific forks:
 - **Spend visibility — token total shipped, two residuals.** The provenance footer
   now carries a `tokens · … in · … out` line (cache/reasoning splits when reported):
   `consult` sums the synth loop plus every delegated explorer sweep, drawn from rig's
-  `PromptResponse.usage` via `.extended_details()` (see `render::fmt_usage`,
-  `engine::run_phase`). Still open:
+  `PromptResponse.usage` (see `render::fmt_usage`, `engine::run_phase`). Still open:
   - **Undercount on the exceptional exits.** rig hands back no usage on
     `MaxTurnsError` / `PromptCancelled`, so a phase that hits its turn cap or breaks for
     an image-resume (`run_phase`'s view_image path) loses the tokens of the capped/broken
     run — only the finalize/resumed run's usage survives. The normal path is exact.
-    Recovering it means summing per-completion through a `PromptHook` rather than reading
-    the run's aggregate; deferred as low-value (both are rare paths) but real.
+    rig 0.41 makes the fix cheaper but not free: `AgentHook::on_completion_response`
+    now carries a per-turn `usage`, so a small tally hook could accumulate across every
+    turn including the lost ones. `PromptResponse.completion_calls` does *not* help —
+    it only exists on the `Ok` path, which is the path that was already exact. The
+    plumbing lands in `finalize_after_max_turns` and the resume loop, so it wants to
+    ride with whoever is next in that code rather than a dependency bump.
   - **Dollars, not just tokens.** rig's normalized `Usage` carries token counts only —
     even OpenRouter's response `usage.cost` is dropped in normalization. A per-call
     *cost* needs a kaibo-side price table keyed by model (input/output/cache-read rates),

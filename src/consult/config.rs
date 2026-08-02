@@ -79,6 +79,12 @@ pub struct ExploreConfig {
     pub explorer_max_turns: usize,
     /// Read-only sandbox limits applied to every kaish worker this phase spawns.
     pub sandbox: SandboxConfig,
+    /// Cap on how many files ONE sweep may route with its `attach` tool — the bytes
+    /// ride ALONGSIDE the sweep's report to whoever reads it, without entering the
+    /// explorer's own context. Rides `ExploreConfig` (not `ConsultConfig`) because
+    /// `deliberate`'s dossier stage — which has no synth driver loop — uses this rung
+    /// too. `0` means "don't inject the tool at all".
+    pub max_attachments: usize,
 }
 
 impl Default for ExploreConfig {
@@ -87,6 +93,7 @@ impl Default for ExploreConfig {
             phase: PhaseContext::default(),
             explorer_max_turns: crate::config::Defaults::default().explorer_max_turns,
             sandbox: SandboxConfig::default(),
+            max_attachments: crate::config::Defaults::default().max_attachments,
         }
     }
 }

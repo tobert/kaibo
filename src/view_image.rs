@@ -6,18 +6,24 @@
 //! docs. So the whole input surface is a **path**: the model names a file, this tool
 //! reads its bytes *through the kaish VFS* (the same read-only mount `run_kaish`
 //! uses, so containment and read-only stay structural), and returns them as a rig
-//! image part — the one channel that carries an image into model context (rig's
-//! [`ToolResultContent::from_tool_output`] parses `{"response":…, "parts":[{"type":
-//! "image","data":…,"mimeType":…}]}`). There is deliberately no base64/attach input:
-//! if a genuinely-never-a-file image ever needs viewing, that's added then (see the
-//! media-spine entry in `docs/issues.md`).
+//! image part — the one channel that carries an image into model context. There is
+//! deliberately no base64/attach input: if a genuinely-never-a-file image ever needs
+//! viewing, that's added then (see the media-spine entry in `docs/issues.md`).
+//!
+//! **The image part is declared, not sniffed.** The output is a typed [`ToolOutput`]
+//! carrying a [`ToolResultContent::Text`] note and a [`ToolResultContent::Image`]
+//! block. rig does not inspect a tool's text output looking for rich content in it, so
+//! an image described by some JSON convention instead of declared would reach the model
+//! as a wall of base64 — no image, and no error. Declaring it also means
+//! [`run_phase`](crate::consult)'s user-turn rewrite reads the very block this tool
+//! constructed, rather than a shape two crates have to keep agreeing on.
 //!
 //! The tool is only ever placed in a phase's toolset when that phase's [`Arm`]'s
 //! resolved caps say the model is vision-capable (`consult.rs`), so a blind model
 //! never sees it — there is no "image handed to a model that can't read it" path.
 //!
-//! **The envelope is the same; the channel is not.** This tool always produces the
-//! tool-result image envelope. On a transport that carries an image inside a tool
+//! **The output is the same; the channel is not.** This tool always produces the same
+//! text-plus-image tool result. On a transport that carries an image inside a tool
 //! result (Anthropic `tool_result` blocks, Gemini `functionResponse` inline data)
 //! that's the whole story. On one that can't — the OpenAI wire forbids an image in a
 //! `role:tool` message — the loop ([`run_phase`](crate::consult)) breaks at the turn
@@ -27,16 +33,18 @@
 //! `ModelCaps.tool_result_images`. The invariant: a vision model on a no-tool-result-
 //! image transport still gets the image — via a user turn, never silently dropped.
 //!
-//! [`ToolResultContent::from_tool_output`]: rig_core::completion::message
 //! [`Arm`]: crate::consult::Arm
 
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use rig_core::completion::ToolDefinition;
-use rig_core::tool::Tool;
+use rig_agent::tool::{Tool, ToolContext, ToolExecutionError, ToolOutput};
+use rig_core::completion::message::{
+    DocumentSourceKind, Image, ImageMediaType, MimeType, ToolResultContent,
+};
+use rig_core::OneOrMany;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::sandbox::KaishWorker;
 
@@ -121,14 +129,11 @@ impl ViewImage {
         Ok(canon)
     }
 
-    /// The core: resolve → read through the VFS → size-check → sniff → encode →
-    /// envelope. Split out of [`Tool::call`] so it's directly testable. Returns the
-    /// rig hybrid envelope as a [`Value`] — *not* a `String`: rig serializes a tool's
-    /// `Output` with `serde_json::to_string`, so a `String` would arrive double-encoded
-    /// (a quoted JSON string) and `from_tool_output` would treat it as text, never
-    /// extracting the image. A `Value::Object` serializes to the bare object the
-    /// parser needs.
-    async fn view(&self, path_arg: &str) -> Result<Value, ViewImageError> {
+    /// The core: resolve → read through the VFS → size-check → sniff → encode → typed
+    /// content. Split out of [`Tool::call`] so it's directly testable. Returns a
+    /// [`ToolOutput`] — *not* a `String` or a `Value`, which rig would render as text or
+    /// JSON; only a declared [`ToolResultContent::Image`] reaches the model as an image.
+    async fn view(&self, path_arg: &str) -> Result<ToolOutput, ViewImageError> {
         let canon = self.resolve_in_workspace(path_arg)?;
         // Read at most one byte past the limit: a file swapped to something enormous
         // between the caller's view and this read stops at the cap instead of slurping
@@ -172,12 +177,22 @@ impl ViewImage {
             "Loaded image {label} ({mime}, {:.1} KiB).",
             bytes.len() as f64 / 1024.0
         );
-        // The rig hybrid envelope: `response` is text the model also sees; `parts`
-        // carries the image. The part key is camelCase `mimeType` (rig-core 0.34).
-        Ok(json!({
-            "response": note,
-            "parts": [ { "type": "image", "data": data, "mimeType": mime } ],
-        }))
+        // Two typed blocks in one result: the note is text the model also reads,
+        // and the image is a declared `Image` block — no envelope for rig to
+        // re-discover. `run_phase` moves exactly this block onto a user turn on a
+        // transport that can't carry an image inside a tool result.
+        Ok(ToolOutput::content(
+            OneOrMany::many([
+                ToolResultContent::text(note),
+                ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64(data),
+                    media_type: ImageMediaType::from_mime_type(mime),
+                    detail: None,
+                    additional_params: None,
+                }),
+            ])
+            .expect("two blocks is never empty"),
+        ))
     }
 }
 
@@ -205,34 +220,50 @@ impl Tool for ViewImage {
     const NAME: &'static str = "view_image";
     type Error = ViewImageError;
     type Args = ViewImageArgs;
-    type Output = Value;
+    type Output = ToolOutput;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Look at an image file in the project so you can see it \
+    /// Keep the failure text model-visible.
+    ///
+    /// rig's default redacts an arbitrary tool error to a kind-level string — the model
+    /// reads "the tool failed" and nothing more. Right for errors that may carry
+    /// secrets, wrong here: every `ViewImageError` is written *for* the model, naming
+    /// the file, the workspace, and the fix (copy it in, crop it, use run_kaish
+    /// instead). A model that can't read it can't retry correctly. `with_source` keeps
+    /// the concrete error for operator diagnostics and downcasting.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string()).with_source(error)
+    }
+
+    fn description(&self) -> String {
+        "Look at an image file in the project so you can see it \
                           directly — a screenshot, a diagram, a design asset, a \
                           rendered figure. Pass the path to a PNG, JPEG, GIF, or WebP \
                           (relative to the project root, or an absolute path inside \
                           it); the image is loaded into your view. Use this whenever \
                           the question involves what an image shows. For source or \
                           text files, use run_kaish instead."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the image file (PNG/JPEG/GIF/WebP), \
-                                        relative to the project root or absolute inside it."
-                    }
-                },
-                "required": ["path"]
-            }),
-        }
+            .to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the image file (PNG/JPEG/GIF/WebP), \
+                                    relative to the project root or absolute inside it."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         self.view(&args.path).await
     }
 }
@@ -300,16 +331,39 @@ mod tests {
         std::fs::write(root.join("shot.png"), &bytes).unwrap();
 
         let tool = ViewImage::new(worker_over(&root), &root);
-        let v = tool.view("shot.png").await.expect("view should succeed");
+        let out = tool.view("shot.png").await.expect("view should succeed");
 
-        // The hybrid envelope rig parses into an image part.
-        assert!(v["response"].as_str().unwrap().contains("image/png"));
-        let part = &v["parts"][0];
-        assert_eq!(part["type"], "image");
-        assert_eq!(part["mimeType"], "image/png");
+        // A declared image block, not a JSON shape rig has to recognize — this is the
+        // assertion that fails if the output ever regresses to describing an image
+        // instead of declaring one, which a vision model receives as base64 text.
+        let blocks: Vec<_> = out.as_content().iter().cloned().collect();
+        assert_eq!(blocks.len(), 2, "one text note plus one image: {out:?}");
+        let note = blocks
+            .iter()
+            .find_map(|b| match b {
+                ToolResultContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("the load note rides along as text");
+        assert!(
+            note.contains("image/png"),
+            "the note names the type: {note}"
+        );
+
+        let image = blocks
+            .iter()
+            .find_map(|b| match b {
+                ToolResultContent::Image(i) => Some(i.clone()),
+                _ => None,
+            })
+            .expect("a typed image block reaches the transcript");
+        assert_eq!(image.media_type, Some(ImageMediaType::PNG));
         // The data round-trips to exactly the file's bytes.
+        let DocumentSourceKind::Base64(data) = &image.data else {
+            panic!("the image rides as base64, not a URL: {:?}", image.data);
+        };
         let decoded = base64::engine::general_purpose::STANDARD
-            .decode(part["data"].as_str().unwrap())
+            .decode(data)
             .unwrap();
         assert_eq!(decoded, bytes, "the model sees the real file bytes");
     }
@@ -335,6 +389,17 @@ mod tests {
         assert!(msg.contains("OUTSIDE"), "names the boundary: {msg}");
         assert!(msg.contains("cp "), "suggests copying it in: {msg}");
         assert!(msg.contains("workspace"), "{msg}");
+
+        // …and the model actually reads it. Without `map_error`, rig shows the model a
+        // kind-level "the tool failed" and every fix-it message above is visible only
+        // to an operator reading a log. These messages exist so the *model* can act on
+        // them, so assert the presentation, not just the `Display`.
+        let mapped = tool.map_error(err);
+        assert_eq!(
+            mapped.model_feedback(),
+            Some(msg.as_str()),
+            "the actionable message must reach the model, not be redacted"
+        );
     }
 
     #[tokio::test]

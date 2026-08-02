@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
     AssistantContent, Message, ToolChoice, ToolResultContent, UserContent,
@@ -47,6 +48,7 @@ use rig_core::completion::message::{
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
+use rig_core::http_client::{self, HttpClientExt};
 use rig_core::OneOrMany;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,7 +56,7 @@ use serde_json::Value;
 /// How the mock answers one request for one model: branch on the request's content
 /// and return a response, or an error to exercise the failure paths.
 pub type Responder = Arc<
-    dyn Fn(&CompletionRequest) -> Result<CompletionResponse<()>, CompletionError> + Send + Sync,
+    dyn Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError> + Send + Sync,
 >;
 
 /// A snapshot of one inbound completion request, captured for post-hoc assertions.
@@ -81,6 +83,19 @@ pub struct RecordedRequest {
     pub max_tokens: Option<u64>,
     /// `Some(ToolChoice::None)` marks the forced finalize turn after a turn-cap hit.
     pub tool_choice: Option<ToolChoice>,
+    /// The raw chat history rig forwarded, images and all. `transcript`/`user_text`
+    /// only extract `Text` content, so an image (a `view_image`/`explore` tool
+    /// result, or a user `Image` turn from the break-rewrite path) is invisible to
+    /// them — a test that must see whether an image actually reached a request
+    /// needs this instead (with the `any_tool_result_image`/`user_image_messages`
+    /// helpers in `consult/engine.rs`'s test module).
+    pub chat_history: Vec<Message>,
+    /// The **whole** request as rig built it, serialized. The distilled fields above
+    /// answer "did the preamble/history/params reach the model"; this one answers
+    /// "are two requests the *same* request" — which is the only honest way to prove a
+    /// hand-rolled direct completion is equivalent to the one the agent loop produced,
+    /// field for field, including the ones no accessor above names.
+    pub raw: Value,
 }
 
 impl RecordedRequest {
@@ -94,6 +109,8 @@ impl RecordedRequest {
             additional_params: req.additional_params.clone(),
             max_tokens: req.max_tokens,
             tool_choice: req.tool_choice.clone(),
+            chat_history: req.chat_history.iter().cloned().collect(),
+            raw: serde_json::to_value(req).unwrap_or(Value::Null),
         }
     }
 }
@@ -144,7 +161,7 @@ impl ScriptedBuilder {
     /// and returns a response (or an error, to drive a failure path).
     pub fn on_model<F>(mut self, id: impl Into<String>, responder: F) -> Self
     where
-        F: Fn(&CompletionRequest) -> Result<CompletionResponse<()>, CompletionError>
+        F: Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError>
             + Send
             + Sync
             + 'static,
@@ -186,8 +203,76 @@ pub struct ScriptedModel {
 pub struct NoStream;
 
 impl GetTokenUsage for NoStream {
-    fn token_usage(&self) -> Option<Usage> {
-        None
+    // A zero-valued `Usage` is rig's documented sentinel for "the provider reported
+    // none" — there is no separate absent case.
+    fn token_usage(&self) -> Usage {
+        Usage::new()
+    }
+}
+
+/// An [`HttpClientExt`] that records the request body rig built, then fails.
+///
+/// The failure is the point: everything under test is already decided by the time rig
+/// hands the request to the transport, so no network, no key, and no canned response
+/// are needed. This is how a unit test asks "what would kaibo actually have sent?",
+/// which is the only honest form of the question for a provider option that shows up
+/// as a transformation of the outgoing body rather than a readable field.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureHttp(Arc<Mutex<Vec<serde_json::Value>>>);
+
+impl CaptureHttp {
+    /// The first body rig serialized, if it got that far.
+    pub fn recorded(&self) -> Option<serde_json::Value> {
+        self.0.lock().unwrap().first().cloned()
+    }
+}
+
+impl HttpClientExt for CaptureHttp {
+    fn send<T, U>(
+        &self,
+        req: http_client::Request<T>,
+    ) -> impl std::future::Future<
+        Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>,
+    > + Send
+           + 'static
+    where
+        T: Into<Bytes> + Send,
+        U: From<Bytes> + Send + 'static,
+    {
+        let (_parts, body) = req.into_parts();
+        let bytes: Bytes = body.into();
+        self.0
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        async move { Err(http_client::Error::StreamEnded) }
+    }
+
+    // Unreachable for a completion, but the trait requires them. `async fn` can't
+    // express the trait's `+ Send + 'static` return bound, so the desugared form stays.
+    #[allow(clippy::manual_async_fn)]
+    fn send_multipart<U>(
+        &self,
+        _req: http_client::Request<http_client::MultipartForm>,
+    ) -> impl std::future::Future<
+        Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>,
+    > + Send
+           + 'static
+    where
+        U: From<Bytes> + Send + 'static,
+    {
+        async move { Err(http_client::Error::StreamEnded) }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_streaming<T>(
+        &self,
+        _req: http_client::Request<T>,
+    ) -> impl std::future::Future<Output = http_client::Result<http_client::StreamingResponse>> + Send
+    where
+        T: Into<Bytes> + Send,
+    {
+        async move { Err(http_client::Error::StreamEnded) }
     }
 }
 
@@ -196,7 +281,13 @@ impl CompletionClient for ScriptedClient {
 }
 
 impl CompletionModel for ScriptedModel {
-    type Response = ();
+    /// The **raw provider response**, as free-form JSON. A real provider's raw payload
+    /// is its own struct; here it is a `Value` a responder can shape into whatever
+    /// wire form the test is about — an Anthropic `stop_reason`, a Gemini
+    /// `candidates[].finishReason` — which is what lets the offline harness drive
+    /// [`Watched`](crate::completion_watch::Watched), whose whole job is reading that
+    /// payload. `Value::Null` is the default: a response that reports nothing.
+    type Response = Value;
     type StreamingResponse = NoStream;
     type Client = ScriptedClient;
 
@@ -248,8 +339,20 @@ impl CompletionModel for ScriptedModel {
 // ---- response builders -----------------------------------------------------
 
 /// A final text answer — ends the tool loop.
-pub fn text_response(text: impl Into<String>) -> CompletionResponse<()> {
+pub fn text_response(text: impl Into<String>) -> CompletionResponse<Value> {
     response(OneOrMany::one(AssistantContent::text(text)))
+}
+
+/// A **reasoning-only** terminal turn — the shape a DeepSeek reasoner produces when it
+/// returns `reasoning_content` with an empty/whitespace `content`. rig's deepseek
+/// converter drops the empty text block outright and pushes only
+/// `AssistantContent::Reasoning` (`providers/deepseek.rs:400`/`:420`), so the choice
+/// carries no `Text` and no `ToolCall`. rig then treats it as a clean terminal turn and
+/// its text extraction (`assistant_text_from_choice`) filters to `Text`, yielding `""` —
+/// an `Ok` response with an empty `output`. The offline stand-in for the
+/// generated-but-undelivered answer.
+pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse<Value> {
+    response(OneOrMany::one(AssistantContent::reasoning(reasoning)))
 }
 
 /// A single tool call — drives one more loop turn.
@@ -257,7 +360,7 @@ pub fn tool_call_response(
     id: impl Into<String>,
     name: impl Into<String>,
     args: Value,
-) -> CompletionResponse<()> {
+) -> CompletionResponse<Value> {
     response(OneOrMany::one(AssistantContent::tool_call(id, name, args)))
 }
 
@@ -265,7 +368,7 @@ pub fn tool_call_response(
 /// that calls `view_image` alongside `run_kaish`). rig runs them together and folds
 /// all their results into a single user turn, which is exactly the shape the
 /// view_image turn-boundary break must tolerate without orphaning a `tool_use`.
-pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse<()> {
+pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse<Value> {
     let contents: Vec<AssistantContent> = calls
         .into_iter()
         .map(|(id, name, args)| AssistantContent::tool_call(id, name, args))
@@ -273,13 +376,24 @@ pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionRespons
     response(OneOrMany::many(contents).expect("at least one tool call"))
 }
 
-fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<()> {
+fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<Value> {
     CompletionResponse {
         choice,
         usage: Usage::new(),
-        raw_response: (),
+        // Nothing reported — the default a test that doesn't care about the provider's
+        // own payload gets. Shape one with [`with_raw`] when the payload is the point.
+        raw_response: Value::Null,
         message_id: None,
     }
+}
+
+/// Stamp a **raw provider payload** onto a scripted response — the untouched JSON a
+/// real provider would return alongside the parsed choice. This is what
+/// [`Watched`](crate::completion_watch::Watched) reads, so a test that cares how a
+/// turn *ended* (`finish_reason` / `stop_reason` / `finishReason`) shapes it here.
+pub fn with_raw(mut resp: CompletionResponse<Value>, raw: Value) -> CompletionResponse<Value> {
+    resp.raw_response = raw;
+    resp
 }
 
 /// A [`Usage`] a scripted provider "reports" for one completion, `input`/`output`
@@ -299,7 +413,7 @@ pub fn usage(input: u64, output: u64) -> Usage {
 
 /// Stamp a reported [`usage`] onto a scripted response. `text_response`/`tool_call_response`
 /// default to `Usage::new()` (nothing reported); wrap them here to drive the accounting.
-pub fn with_usage(mut resp: CompletionResponse<()>, usage: Usage) -> CompletionResponse<()> {
+pub fn with_usage(mut resp: CompletionResponse<Value>, usage: Usage) -> CompletionResponse<Value> {
     resp.usage = usage;
     resp
 }
