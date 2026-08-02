@@ -30,18 +30,20 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// exact. These are *not* in `kaish-help` — they describe kaibo's sandbox, not
 /// kaish the language — so they're authored here and layered onto the canonical
 /// contract. Positive framing on purpose (weaker/local models loop on blanket
-/// prohibitions): "just read", not a wall of "never".
+/// prohibitions): say what reading looks like, rather than listing what is refused.
+/// Plain and literal per the agent-facing clarity rule in AGENTS.md — this block is
+/// embedded in every preamble, so an idiom here is charged to every model we drive.
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
-`git`, `touch`, and external commands are refused, so just read — files WHOLE by \
-default, `cat -n FILE`; `grep -rn PATTERN .` finds matches whether the target is a \
-file or a directory. Each call starts at the project root; \
+`git`, `touch`, and external commands are refused, so your work here is reading. Read \
+files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN .` finds matches whether \
+the target is a file or a directory. Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
 read-only sandbox; 127 is command-not-found; any other non-zero means the script \
-itself failed. Want to go deeper? Run `help`, `help syntax`, or `help <builtin>` in \
-any script, or read the `kaibo://kaish/*` resources.";
+itself failed. To learn more, run `help`, `help syntax`, or `help <builtin>` in any \
+script, or read the `kaibo://kaish/*` resources.";
 
 /// The canonical kaish operating contract, sourced from `kaish-help` so kaibo
 /// never re-states (and drifts from) kaish's own guidance. This is exactly what

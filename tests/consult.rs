@@ -76,9 +76,8 @@ fn consult_seed_context_is_framed_as_trusted_evidence() {
         "a grounded citation should be trusted, got: {p}"
     );
     assert!(
-        lower.contains("more than it gives")
-            || lower.contains("didn't cover")
-            || lower.contains("left open"),
+        lower.contains("more than the context gives you")
+            || lower.contains("that the context does not"),
         "supplied context must steer toward fetching more, not re-verifying, got: {p}"
     );
 }

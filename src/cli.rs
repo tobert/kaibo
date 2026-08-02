@@ -82,7 +82,7 @@ EXIT CODES
 this table (0 ok, 126 blocked, 124 timed out).";
 
 /// kaibo — read-only codebase consultation from a model outside your own
-/// family. Ask a question; a capable model (DeepSeek, Gemini, Anthropic, OpenRouter,
+/// family. Ask a question; a synthesis agent (DeepSeek, Gemini, Anthropic, OpenRouter,
 /// or local — pick with `--cast`) reads the project READ-ONLY and answers with
 /// `file:line` citations, never modifying anything. Bare `kaibo` is the MCP server
 /// (stdio); `kaibo consult` is the one-shot CLI; `kaibo config` prints the resolved
@@ -369,7 +369,7 @@ pub struct ExploreArgs {
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
 
-    /// Workspace file central to the survey: the investigator is directed to read it
+    /// Workspace file central to the survey: the explorer is directed to read it
     /// WHOLE. Text only (it reads through the shell). Repeatable.
     #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
     pub attach: Vec<String>,

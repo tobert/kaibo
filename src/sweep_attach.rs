@@ -506,14 +506,14 @@ impl Tool for SweepAttach {
         format!(
             "Aim a file past yourself at whoever reads your report. `attach` routes a \
              workspace file's full bytes ALONGSIDE your report to {}, without ever \
-             entering your own context — so a 3,000-line file costs you nothing to \
+             entering your own context, so a 3,000-line file costs you nothing to \
              deliver. When the whole file is the evidence, attach it: your report cites, \
-             the attachment carries the bytes. That's cheaper and more accurate than \
-             transcribing a span — transcription spends your own budget and can drift; \
-             an attachment is the real file, numbered like `cat -n`. You get back a \
-             one-line receipt (path, size), never the contents. Keep writing exact \
-             `file:line` citations as always — the attachment is what lets your reader \
-             check them against the real source. Up to {max} files this sweep.",
+             the attachment carries the bytes. That is cheaper and more accurate than \
+             transcribing a span, because transcription spends your own budget and can \
+             drift, while an attachment is the real file, numbered like `cat -n`. You \
+             get back a one-line receipt (path, size), never the contents. Keep writing \
+             exact `file:line` citations as always; the attachment is what lets your \
+             reader check them against the real source. Up to {max} files this sweep.",
             self.sink.consumer.label,
         )
     }

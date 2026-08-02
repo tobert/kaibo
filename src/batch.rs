@@ -10,7 +10,7 @@
 //! **Toolless by construction — no agents.** A batch item is a question, not a
 //! `run_phase` loop: no kaish, no explorer, no tool loop. That's forced, not just
 //! convenient — provider batch APIs are offline/async and can't drive an interactive
-//! tool loop. So batch is built on the `oneshot` *shape* (a single capable model
+//! tool loop. So batch is built on the `oneshot` *shape* (a lone synthesis agent
 //! answering from what it was handed), never `consult`.
 //!
 //! **Floor the knobs by default.** Batch is the cheap/async lane, so it spends: every

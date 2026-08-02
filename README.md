@@ -46,8 +46,8 @@ workspace and write nowhere.
 You ask your agent for something. It calls `consult` with a question and a cast — the
 two-model team you picked, from whatever family you like.
 
-From there kaibo runs its own agents. The **synth** owns the investigation: it's the
-capable model, and it decides how to work. It reads spans through the read-only shell
+From there kaibo runs its own agents. The **synth** is the synthesis agent: it owns
+the investigation, and it decides how to work. It reads spans through the read-only shell
 itself, and it can hand a broad sweep to the **explorer** — a cheaper, faster model that
 searches the repo and reports back what it found. Delegating is a tool call, and it's the
 synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
@@ -532,7 +532,7 @@ your agent ──stdio MCP──▶ kaibo
                             │  consult(question or request)
                             ▼
                     ┌───────────────────────────┐   ┌───────────────────────────┐
-                    │ synth (capable model)     │   │ explorer (fast model)     │
+                    │ synth (synthesis agent)   │   │ explorer (fast model)     │
                     │   • reads files via kaish │   │   • reads files via kaish │
                     │   • delegates to explorer │-> │                           │
                     │   • writes a summary      │ <-│   • summarizes results    │

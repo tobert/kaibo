@@ -60,6 +60,24 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **kaibo's models now work from a role, not a job description.** Every preamble opens
+  on who the model is on kaibo's team — "You are the synthesis agent", "You are the
+  explorer" — where it used to say "a capable model", and the obligation to finish rides
+  that identity: the synthesis agent's final turn *is* the answer, the explorer's last
+  turn *is* the report. This is the prompt-side half of a real failure — a consult that
+  stopped mid-investigation and handed back an empty answer as a success. The `consult`
+  driver is also told plainly why delegating a sweep pays (a trace caught one taking all
+  203 turns itself and never delegating), and the sweep that builds a `deliberate`
+  dossier is now told to read *holistically*: its offline synth never sees the code, so
+  whatever the dossier leaves out is missing for good.
+
+- **kaibo's prompts are now written in plain, literal English.** Every preamble, the
+  kaish cheatsheet, and the attachment directives were rewritten as declarative
+  sentences: no idiom, no metaphor, no em-dash clause chains. Most of the models kaibo
+  drives are not English-first, and the small local models already fixate on odd
+  phrasing, so a figurative instruction costs them attention that should go to the code.
+  Expect this to show up most on the DeepSeek, GLM, Qwen, Kimi, and local casts.
+
 - **`oneshot` and `deliberate`'s direct lane are now one literal request.** Both are
   toolless by definition — the caller owns the context — but both reached the provider
   through the managed tool loop carrying an empty toolset, arriving at the same place by
