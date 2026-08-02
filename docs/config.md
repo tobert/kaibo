@@ -258,6 +258,7 @@ Global tunables every slot falls back to. Per-slot overrides are documented abov
 | `session_capacity` | 128 | > 0 |
 | `job_capacity` | 64 | > 0 |
 | `inline_attach_budget` | 262144 (256 KiB) | `0` is legal |
+| `max_attachments` | 32 | `0` disables the explorer's `attach` tool |
 
 Out-of-range values are rejected at load, not clamped. This applies at the `[defaults]`
 level and per slot.
@@ -375,6 +376,15 @@ bytes a hosted model absorbs without trouble.
 Inlined bytes ride every turn of the driver loop, so this bounds resident prompt cost,
 not just one request. The toolless tools (`oneshot`, `batch_submit`) are unaffected;
 with no shell to fall back on, they keep their own per-file and per-call caps.
+
+**`max_attachments`.** Cap on how many files one explorer sweep may route with its
+`attach` tool. The routed bytes ride alongside the sweep's report to whoever reads it —
+the `consult` driver, or `deliberate`'s offline synth — without entering the explorer's
+own context. Distinct from `inline_attach_budget`, which bounds inlining the *caller's*
+attachments into the driver prompt: this bounds a sweep's own routing, and it is a
+behavioral guard rather than a memory one (the per-file and cumulative byte caps in
+`attach.rs` bound the worst case). `0` disables the tool. Also settable via
+`KAIBO_MAX_ATTACHMENTS` and `--max-attachments`.
 
 ### Built-in registry (the defaults)
 
@@ -535,6 +545,7 @@ Everything else follows one naming rule:
 | session cache size | `defaults.session_capacity` *(must be > 0)* | `KAIBO_SESSION_CAPACITY` | — |
 | async job cache size | `defaults.job_capacity` *(must be > 0; default 64)* | `KAIBO_JOB_CAPACITY` | — |
 | attach inline budget (bytes) | `defaults.inline_attach_budget` *(0 = never inline; default 262144)* | `KAIBO_INLINE_ATTACH_BUDGET` | — |
+| explorer attach cap (count) | `defaults.max_attachments` *(0 = attach tool off; default 32)* | `KAIBO_MAX_ATTACHMENTS` | `--max-attachments N` |
 | exec timeout (s) | `sandbox.exec_timeout_secs` | `KAIBO_EXEC_TIMEOUT_SECS` | — |
 | output cap (bytes) | `sandbox.output_limit_bytes` | `KAIBO_OUTPUT_LIMIT_BYTES` | — |
 | scratch cap (bytes) | `sandbox.scratch_limit_bytes` *(must be > 0; default 64 MB)* | `KAIBO_SCRATCH_LIMIT_BYTES` | — |

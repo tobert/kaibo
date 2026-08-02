@@ -17,6 +17,18 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **The explorer can now hand whole files to whoever reads its report.** Inside
+  `consult` and `deliberate`, the delegated investigator gets an `attach` tool: when a
+  whole file is the evidence, it routes the file's real bytes (numbered, `cat -n`
+  style) alongside its report — into the consult driver's context, or into the
+  `deliberate` dossier the offline model reasons over — instead of transcribing spans
+  through its own small budget. Images ride too: an explorer that can't see a PNG can
+  still staple it to a vision-capable answering model, and is told plainly when the
+  reader is text-only. Governed by `[defaults] max_attachments` (files per sweep;
+  default 32, `0` disables the tool), also settable via `KAIBO_MAX_ATTACHMENTS` and
+  `--max-attachments`; every routed file surfaces as a progress beat so you can watch
+  what the explorer chose.
+
 - **Traces now say how each model turn *ended*.** A `run_phase` span carries
   `gen_ai.response.finish_reason` — the provider's own word for why generation stopped
   (`end_turn`, `max_tokens`, `content_filter`, Gemini's `MAX_TOKENS`, OpenAI Responses'

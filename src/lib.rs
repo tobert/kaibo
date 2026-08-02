@@ -34,6 +34,7 @@ pub mod server;
 pub mod session;
 pub mod stability;
 pub mod store;
+pub mod sweep_attach;
 pub mod telemetry;
 pub mod tls;
 pub mod tool_span;

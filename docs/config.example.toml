@@ -182,6 +182,10 @@ job_capacity     = 64        # max async-consult jobs held in memory, running pl
 # never dropped. 0 inlines nothing — the escape hatch for a small-context local cast.
 inline_attach_budget = 262144   # 256 KiB
 
+# Files ONE explorer sweep may route with its attach tool (the bytes ride alongside
+# the sweep's report, never through the explorer's context). 0 disables the tool.
+max_attachments = 32
+
 # ---------------------------------------------------------------------------
 # [orientation] — a computed-once file map injected into the exploring phases, so a
 # model starts knowing the layout instead of spending turns on glob/ls/find. Built

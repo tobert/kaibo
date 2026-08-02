@@ -22,6 +22,10 @@ use crate::jobs::{JobSnapshot, JobState, JobStore};
 /// requested it is surfaced even if empty: an empty report is the honest signal
 /// that the consult read every span itself and delegated no sweep, which is
 /// distinct from the caller not asking at all. Pure and offline-testable.
+///
+/// Text-only on purpose: a sweep-routed image (`attach` in `src/sweep_attach.rs`)
+/// is consumed by the *driver* inside its tool loop — it never reaches the final
+/// MCP result, which stays a cited text answer.
 pub(super) fn consult_result(
     answer: String,
     report: String,

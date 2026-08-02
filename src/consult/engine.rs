@@ -14,11 +14,11 @@ use rig_agent::agent::hook::{
 };
 use rig_agent::agent::AgentBuilder;
 use rig_agent::completion::PromptError;
-use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError};
+use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
-    UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
+    ToolResultContent, UserContent,
 };
 use rig_core::completion::{CompletionModel, Message, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
@@ -34,13 +34,17 @@ use crate::explorer::RunKaish;
 use crate::progress::{PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, Sessions};
+use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepConsumerKind};
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
 use super::config::{ConsultConfig, ExploreConfig, PhaseContext};
 #[cfg(test)]
 use super::prompts::PromptOverrides;
-use super::prompts::{consult_user_prompt, deliberation_prompt, resolve_phase_preamble, Phase};
+use super::prompts::{
+    consult_user_prompt, deliberation_prompt, explorer_attach_directive, resolve_phase_preamble,
+    sweep_evidence_block, Phase,
+};
 use super::shaping::{ModelCaps, ModelShape};
 
 // --- The Arm seam ------------------------------------------------------------
@@ -74,7 +78,7 @@ trait PhaseRunner: Send + Sync {
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
-        break_on_view_image: bool,
+        break_on_tool_images: bool,
     ) -> PhaseFuture<'a>;
 
     /// One completion, straight to the provider — no agent, no tool loop. The
@@ -117,7 +121,7 @@ where
         params: Option<&'a Value>,
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
-        break_on_view_image: bool,
+        break_on_tool_images: bool,
     ) -> PhaseFuture<'a> {
         Box::pin(run_phase(
             &self.model,
@@ -130,7 +134,7 @@ where
             params,
             progress,
             make_tools,
-            break_on_view_image,
+            break_on_tool_images,
         ))
     }
 
@@ -480,7 +484,7 @@ impl Arm {
     /// the model can *see* but its transport can't carry the image in a tool result
     /// (an OpenAI VLM) — the predicate [`run_phase`]'s break-rewrite-resume gate reads.
     /// A blind arm never sees `view_image`, so this is false there regardless.
-    fn rewrites_view_image(&self) -> bool {
+    fn rewrites_tool_images(&self) -> bool {
         self.caps.vision && !self.caps.tool_result_images
     }
 
@@ -507,7 +511,7 @@ impl Arm {
                 self.params.as_ref(),
                 progress,
                 make_tools,
-                self.rewrites_view_image(),
+                self.rewrites_tool_images(),
             )
             .await
     }
@@ -689,17 +693,17 @@ fn empty_answer_error(
     )
 }
 
-// --- view_image on the user-turn channel (the openai VLM path) ----------------
+// --- an image-bearing tool result on the user-turn channel (the openai VLM path) --
 
-/// The cancellation reason [`ViewImageBreakHook`] terminates with, so [`run_phase`]
+/// The cancellation reason [`ToolImageBreakHook`] terminates with, so [`run_phase`]
 /// can tell *its* deliberate break from any other `PromptCancelled` rig might raise
 /// (a lost prompt, an empty tool batch). An internal sentinel; never shown to a model.
-const VIEW_IMAGE_BREAK: &str = "kaibo:view_image_break";
+const TOOL_IMAGE_BREAK: &str = "kaibo:view_image_break";
 
 /// The text a rewritten `view_image` tool result carries when its own note is somehow
 /// absent — enough to satisfy the `tool_use → tool_result` pairing every provider
 /// requires. The image itself rides the separate user turn the rewrite inserts.
-const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
+const TOOL_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the next message.";
 
 /// Breaks the managed tool loop at the turn boundary after a `view_image` ran, so
 /// [`run_phase`] can move the image onto the **user-turn** channel for a transport
@@ -716,31 +720,31 @@ const VIEW_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the nex
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
 /// that carries tool-result images (Anthropic/Gemini) is byte-for-byte the old path.
 #[derive(Clone)]
-struct ViewImageBreakHook {
+struct ToolImageBreakHook {
     enabled: bool,
     /// Set once a `view_image` tool result lands this turn; read at the next
     /// completion call. Interior mutability because `AgentHook`'s callbacks are `&self`
     /// and rig runs a turn's tools concurrently.
-    saw_view_image: Arc<AtomicBool>,
+    saw_tool_image: Arc<AtomicBool>,
 }
 
-impl ViewImageBreakHook {
+impl ToolImageBreakHook {
     fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            saw_view_image: Arc::new(AtomicBool::new(false)),
+            saw_tool_image: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-impl AgentHook for ViewImageBreakHook {
+impl AgentHook for ToolImageBreakHook {
     async fn on_tool_result(
         &self,
         _ctx: &HookContext,
         event: ToolResultEvent<'_>,
     ) -> ToolResultAction {
-        if self.enabled && event.tool_name == ViewImage::NAME {
-            self.saw_view_image.store(true, Ordering::SeqCst);
+        if self.enabled && tool_output_carries_image(event.presentation) {
+            self.saw_tool_image.store(true, Ordering::SeqCst);
         }
         ToolResultAction::Keep
     }
@@ -750,17 +754,32 @@ impl AgentHook for ViewImageBreakHook {
         _ctx: &HookContext,
         _event: CompletionCall<'_>,
     ) -> CompletionCallAction {
-        if self.enabled && self.saw_view_image.load(Ordering::SeqCst) {
-            CompletionCallAction::Stop(VIEW_IMAGE_BREAK.to_string())
+        if self.enabled && self.saw_tool_image.load(Ordering::SeqCst) {
+            CompletionCallAction::Stop(TOOL_IMAGE_BREAK.to_string())
         } else {
             CompletionCallAction::Continue
         }
     }
 }
 
-/// Rewrite a transcript so every `view_image` image rides the **user-turn** channel
-/// instead of the tool-result channel. For each `view_image` tool result that still
-/// carries an image: keep its text as a short ack (so the `tool_use → tool_result`
+/// Does this tool output carry an image part? Keys the break hook on the RESULT, not
+/// the tool's name — fully general, so the next image-bearing tool (`view_image`
+/// today, and a sweep's `explore` result carrying a routed image) needs no new `if`.
+/// Typed, not sniffed: rig 0.41 hands the hook the model-visible [`ToolOutput`]
+/// whole, so the check reads the declared content parts — the same declared-image
+/// contract [`crate::view_image::ViewImage`] and [`crate::consult::RunExplore`] emit
+/// on.
+fn tool_output_carries_image(output: &ToolOutput) -> bool {
+    output
+        .as_content()
+        .iter()
+        .any(|c| matches!(c, ToolResultContent::Image(_)))
+}
+
+/// Rewrite a transcript so every image-bearing tool result rides the **user-turn**
+/// channel instead of the tool-result channel — `view_image`, or a delegated
+/// `explore` sweep that routed an image via `attach`. For each such result that
+/// still carries an image: keep its text as a short ack (so the `tool_use → tool_result`
 /// pairing stays valid) and emit a separate, tool-result-free `Message::User { [Image] }`
 /// right after that user message — the bytes the model now sees on a channel OpenAI
 /// accepts. Every other block (assistant text/thinking, other tools' use/result pairs)
@@ -775,24 +794,7 @@ impl AgentHook for ViewImageBreakHook {
 /// result already acked to text (an earlier break) and an already-inserted image
 /// message both pass through untouched — safe to run after every break. Pure and
 /// offline-testable.
-fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
-    // The tool_use ids naming a view_image call live on the *assistant* `ToolCall`,
-    // not on the user `ToolResult` — collect them first, then match results against them.
-    let view_image_ids: HashSet<String> = history
-        .iter()
-        .filter_map(|m| match m {
-            Message::Assistant { content, .. } => Some(content),
-            _ => None,
-        })
-        .flat_map(|content| content.iter())
-        .filter_map(|c| match c {
-            AssistantContent::ToolCall(tc) if tc.function.name == ViewImage::NAME => {
-                Some(tc.id.clone())
-            }
-            _ => None,
-        })
-        .collect();
-
+fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(history.len());
     for msg in history {
         let content = match msg {
@@ -804,21 +806,32 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
         };
 
         let mut new_parts: Vec<UserContent> = Vec::new();
-        // Images pulled out of this turn's view_image results, re-emitted as their own
-        // user messages immediately after (one per image), preserving order.
+        // Images pulled out of this turn's image-bearing tool results, re-emitted as
+        // their own user messages immediately after (one per image), preserving order.
         let mut extracted: Vec<Image> = Vec::new();
 
         for part in content {
             match part {
-                UserContent::ToolResult(tr) if view_image_ids.contains(&tr.id) => {
+                // Key on the RESULT still carrying an image — not the tool's name or
+                // id. Fully general: the next image-bearing tool (today: `view_image`
+                // and a sweep's `explore` result carrying a routed image) needs no
+                // edit here. A result already acked to text (an earlier break, or an
+                // already-inserted image turn) holds no `ToolResultContent::Image`, so
+                // it falls through untouched — the idempotency that makes re-running
+                // this safe.
+                UserContent::ToolResult(tr)
+                    if tr
+                        .content
+                        .iter()
+                        .any(|rc| matches!(rc, ToolResultContent::Image(_))) =>
+                {
                     let ToolResult {
                         id,
                         call_id,
                         content,
                     } = tr;
                     // Split the result into its text (the load note → ack) and its
-                    // image (→ a user turn). A result already acked has no image, so
-                    // this is a no-op for it — the idempotency that makes re-running safe.
+                    // image(s) (→ a user turn each).
                     let mut texts: Vec<ToolResultContent> = Vec::new();
                     for rc in content {
                         match rc {
@@ -827,7 +840,7 @@ fn rewrite_view_image_history(history: Vec<Message>) -> Vec<Message> {
                         }
                     }
                     let content = OneOrMany::many(texts).unwrap_or_else(|_| {
-                        OneOrMany::one(ToolResultContent::text(VIEW_IMAGE_ACK))
+                        OneOrMany::one(ToolResultContent::text(TOOL_IMAGE_ACK))
                     });
                     new_parts.push(UserContent::ToolResult(ToolResult {
                         id,
@@ -901,14 +914,16 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// declared so the accumulated tool_use/tool_result history stays valid, but
 /// `ToolChoice::None` forbids new calls — the model must answer from what it has.
 ///
-/// **view_image on the user-turn channel.** When `break_on_view_image` is set (a
-/// vision model whose transport can't carry an image in a tool result — an OpenAI
-/// VLM), a [`ViewImageBreakHook`] terminates the loop at the turn boundary after a
-/// `view_image` call. rig hands back the full transcript via `PromptCancelled`; we
-/// rewrite each `view_image` result onto a separate user `Image` turn
-/// ([`rewrite_view_image_history`]) and re-enter the loop with the remaining turn
-/// budget. The model now sees the image in user content, the one channel every
-/// provider accepts. When unset the hook is inert and this is the old single call.
+/// **A tool-result image on the user-turn channel.** When `break_on_tool_images` is
+/// set (a vision model whose transport can't carry an image in a tool result — an
+/// OpenAI VLM), a [`ToolImageBreakHook`] terminates the loop at the turn boundary
+/// after any tool result carries an image — `view_image`, or a delegated `explore`
+/// sweep that routed one via `attach`. rig hands back the full transcript via
+/// `PromptCancelled`; we rewrite each image-bearing result onto a separate user
+/// `Image` turn ([`rewrite_tool_image_history`]) and re-enter the loop with the
+/// remaining turn budget. The model now sees the image in user content, the one
+/// channel every provider accepts. When unset the hook is inert and this is the old
+/// single call.
 ///
 /// **Seeing how each turn ended.** This is [`run_phase_logged`] with a log nobody
 /// keeps — reach for that one when the phase's per-turn finish reasons are the point.
@@ -924,7 +939,7 @@ pub(crate) async fn run_phase<M, F>(
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
     make_tools: F,
-    break_on_view_image: bool,
+    break_on_tool_images: bool,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -942,7 +957,7 @@ where
         thinking,
         progress,
         make_tools,
-        break_on_view_image,
+        break_on_tool_images,
     )
     .await
 }
@@ -1001,7 +1016,7 @@ pub(crate) async fn run_phase_logged<M, F>(
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
     make_tools: F,
-    break_on_view_image: bool,
+    break_on_tool_images: bool,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -1025,7 +1040,7 @@ where
         thinking,
         progress,
         make_tools,
-        break_on_view_image,
+        break_on_tool_images,
     )
     .await;
     // Read the ending off the log — after the loop, on every exit path, so a failed
@@ -1052,7 +1067,7 @@ async fn run_phase_loop<M, F>(
     thinking: Option<&Value>,
     progress: &dyn ProgressSink,
     make_tools: F,
-    break_on_view_image: bool,
+    break_on_tool_images: bool,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -1105,7 +1120,7 @@ where
         }
         let agent = builder.dynamic_tools(make_tools()?).build();
 
-        // A fresh hook per loop iteration is load-bearing: its `saw_view_image` flag
+        // A fresh hook per loop iteration is load-bearing: its `saw_tool_image` flag
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
         // agent across resumes) would carry a stale flag — breaking on the first
         // completion call of a resume that ran no view_image. Keep it built here.
@@ -1120,7 +1135,7 @@ where
         let result = agent
             .runner(prompt.clone())
             .history(history.clone())
-            .add_hook(ViewImageBreakHook::new(break_on_view_image))
+            .add_hook(ToolImageBreakHook::new(break_on_tool_images))
             .max_turns(remaining)
             .run()
             .await;
@@ -1231,8 +1246,8 @@ where
             Err(PromptError::PromptCancelled {
                 chat_history,
                 reason,
-            }) if reason == VIEW_IMAGE_BREAK => {
-                let (rest, next) = split_for_resume(rewrite_view_image_history(chat_history));
+            }) if reason == TOOL_IMAGE_BREAK => {
+                let (rest, next) = split_for_resume(rewrite_tool_image_history(chat_history));
                 history = rest;
                 prompt = next;
             }
@@ -1450,6 +1465,14 @@ where
 /// handed to `run_kaish` so the sweep's own reads surface too. `!Send` care (an
 /// invariant): the kernel stays on its `KaishWorker` thread and never crosses the
 /// `.await`.
+///
+/// `attach` is the sweep's [`SweepAttachSink`] — `Some` injects the `attach` tool
+/// alongside `run_kaish` (sharing the same kernel `view_image` shares with
+/// `run_kaish` in `consult_tools`) and appends [`explorer_attach_directive`] to the
+/// preamble in the same place, so preamble and toolset can never drift apart.
+/// `None` (the top-level `explore` tool, v1) is byte-for-byte the old behavior —
+/// same preamble, same two-line toolset.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 pub(crate) async fn run_explore_phase(
     arm: &Arm,
     preamble: &str,
@@ -1458,17 +1481,39 @@ pub(crate) async fn run_explore_phase(
     sandbox: &SandboxConfig,
     max_turns: usize,
     progress: &Arc<dyn ProgressSink>,
+    attach: Option<&Arc<SweepAttachSink>>,
 ) -> Result<(String, Usage)> {
+    let preamble_owned;
+    let preamble = match attach {
+        Some(sink) => {
+            preamble_owned = format!(
+                "{preamble}{}",
+                explorer_attach_directive(sink.max_attachments(), sink.consumer())
+            );
+            preamble_owned.as_str()
+        }
+        None => preamble,
+    };
     arm.run(
         preamble,
         Message::user(question.to_string()),
         max_turns,
         progress.as_ref(),
         &|| -> Result<Vec<DynamicTool>> {
-            Ok(vec![traced(RunKaish::with_progress(
-                KaishWorker::spawn_with(&root, sandbox.clone())?,
+            let worker = KaishWorker::spawn_with(&root, sandbox.clone())?;
+            let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
+                worker.clone(),
                 progress.clone(),
-            ))])
+            ))];
+            if let Some(sink) = attach {
+                tools.push(traced(SweepAttach::new(
+                    worker,
+                    root.clone(),
+                    Arc::clone(sink),
+                    progress.clone(),
+                )));
+            }
+            Ok(tools)
         },
     )
     .await
@@ -1510,6 +1555,18 @@ pub struct RunExplore {
     /// nested explorer carries the explorer's `[prompts]`/`[context]` framing,
     /// built once instead of per sweep.
     preamble: Arc<str>,
+    /// Who reads this sweep's report — decides the vision gate and the demotion
+    /// wording a fresh [`SweepAttachSink`] is built with per sweep.
+    consumer: SweepConsumer,
+    /// This sweep's attach budget. `0` means "don't inject the tool at all" — no
+    /// sink is built, `run_explore_phase` gets `None`, byte-for-byte the pre-attach
+    /// behavior.
+    max_attachments: usize,
+    /// Canonical paths whose bytes already reach the consumer another way (the
+    /// caller's own `consult` attachments) — seeded into every sweep's sink so
+    /// `attach` doesn't re-route what's already in front of the driver. Empty for
+    /// `deliberate` (see `SweepAttachSink`'s doc).
+    already_delivered: Arc<HashSet<PathBuf>>,
 }
 
 impl RunExplore {
@@ -1523,6 +1580,9 @@ impl RunExplore {
         usage_sink: Arc<Mutex<Usage>>,
         progress: Arc<dyn ProgressSink>,
         preamble: Arc<str>,
+        consumer: SweepConsumer,
+        max_attachments: usize,
+        already_delivered: Arc<HashSet<PathBuf>>,
     ) -> Self {
         Self {
             arm,
@@ -1533,6 +1593,9 @@ impl RunExplore {
             usage_sink,
             progress,
             preamble,
+            consumer,
+            max_attachments,
+            already_delivered,
         }
     }
 }
@@ -1559,7 +1622,12 @@ impl Tool for RunExplore {
     const NAME: &'static str = "explore";
     type Error = RunExploreError;
     type Args = RunExploreArgs;
-    type Output = String;
+    /// [`ToolOutput`], not `String`: no attachment → `ToolOutput::text(report)`,
+    /// exactly the plain report the driver always read. With a routed image → the
+    /// text plus one *declared* `Image` block per routed image, the same typed
+    /// contract [`crate::view_image::ViewImage::view`] emits — rig 0.41 only routes
+    /// images a tool declares, never ones it might discover inside text output.
+    type Output = ToolOutput;
 
     /// Keep the failure text model-visible: rig's default would redact it to a
     /// kind-level "the tool failed", and a dead sweep is something the driver must
@@ -1602,6 +1670,18 @@ impl Tool for RunExplore {
         self.progress.emit(PhaseEvent::SweepStarted {
             question: args.question.clone(),
         });
+        // A fresh sink per sweep — `attach`'s budget/dedupe is scoped to ONE sweep,
+        // not the whole consult (a driver that delegates 5 sweeps pays for 5 budgets;
+        // see the residual-risk note in the design doc). `0` means the operator
+        // turned the tool off: no sink, `run_explore_phase` gets `None`, byte-for-byte
+        // the pre-attach behavior.
+        let sink = (self.max_attachments > 0).then(|| {
+            Arc::new(SweepAttachSink::new(
+                self.max_attachments,
+                self.consumer.clone(),
+                (*self.already_delivered).clone(),
+            ))
+        });
         // Reuse the one seam — explore′ is just the shared explorer phase, run on the
         // sub-agent's arm with its resolved preamble. The sweep bracket
         // (started/finished) and the reports-sink push stay here (consult-loop
@@ -1614,6 +1694,7 @@ impl Tool for RunExplore {
             &self.sandbox,
             self.max_turns,
             &self.progress,
+            sink.as_ref(),
         )
         .await;
         self.progress.emit(PhaseEvent::SweepFinished);
@@ -1640,11 +1721,83 @@ impl Tool for RunExplore {
                     .to_string(),
             ));
         }
+        // The `reports` sink feeds `ConsultOutput.report` (the readable artifact a
+        // caller sees via `include_report`) — the explorer's own prose only, never
+        // the routed bytes (those already reached the driver on the tool result; a
+        // caller-facing summary duplicating full attached files would just bloat it).
         self.reports
             .lock()
             .expect("explore report sink poisoned")
             .push(report.clone());
-        Ok(report)
+        // What the DRIVER sees on the tool result: the report plus whatever this
+        // sweep routed via `attach` — text bodies inline, an image manifest, notes,
+        // and demotions. `None` (no sink, or a sink that never attached anything)
+        // leaves this byte-for-byte the bare report, and `images` stays empty.
+        let (text, images) = match &sink {
+            Some(sink) => {
+                let delivery = sink.drain();
+                let images = delivery.images();
+                let text = match sweep_evidence_block(&self.consumer, &delivery) {
+                    Some(block) => format!("{report}{block}"),
+                    None => report,
+                };
+                (text, images)
+            }
+            None => (report, Vec::new()),
+        };
+        // No image → plain text, exactly the pre-attach tool result (see the `Output`
+        // doc). With one or more → the text followed by a declared `Image` block per
+        // routed image, the same typed blocks `view_image` emits for one.
+        if images.is_empty() {
+            Ok(ToolOutput::text(text))
+        } else {
+            let mut parts: Vec<ToolResultContent> = vec![ToolResultContent::text(text)];
+            parts.extend(images.iter().filter_map(|a| match a {
+                Attachment::Image { mime, data_b64, .. } => Some(ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64(data_b64.clone()),
+                    media_type: ImageMediaType::from_mime_type(mime),
+                    detail: None,
+                    additional_params: None,
+                })),
+                Attachment::Text { .. } => None,
+            }));
+            Ok(ToolOutput::content(
+                OneOrMany::many(parts).expect("the text part is always present"),
+            ))
+        }
+    }
+}
+
+/// Assemble a single user turn from `text` plus any image attachments — shared by
+/// [`oneshot`] and [`deliberate_direct`] (both are exactly-one-completion phases with
+/// no tool loop to fold an image into, so the image must ride the initial turn
+/// itself). No images → a bare `Message::user(text)`, byte-for-byte the pre-attach
+/// call. With images, the text rides as the first part (skipped when empty — an
+/// image-only turn shouldn't emit a pointless `{type:text,text:""}` block), then the
+/// images. `&[]` is byte-for-byte the old `Message::user(text)` either way.
+fn user_turn_with_attachments(attachments: &[Attachment], text: String) -> Message {
+    let image_parts: Vec<UserContent> = attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
+                data_b64.clone(),
+                ImageMediaType::from_mime_type(mime),
+                None,
+            )),
+            Attachment::Text { .. } => None,
+        })
+        .collect();
+    if image_parts.is_empty() {
+        Message::user(text)
+    } else {
+        let mut parts = Vec::with_capacity(image_parts.len() + 1);
+        if !text.is_empty() {
+            parts.push(UserContent::text(text));
+        }
+        parts.extend(image_parts);
+        Message::User {
+            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
+        }
     }
 }
 
@@ -1674,33 +1827,7 @@ pub async fn oneshot(
     cfg: &PhaseContext,
 ) -> Result<(String, Usage)> {
     let user_prompt = crate::attach::with_text_context(attachments, prompt);
-    let image_parts: Vec<UserContent> = attachments
-        .iter()
-        .filter_map(|a| match a {
-            Attachment::Image { mime, data_b64, .. } => Some(UserContent::image_base64(
-                data_b64.clone(),
-                ImageMediaType::from_mime_type(mime),
-                None,
-            )),
-            Attachment::Text { .. } => None,
-        })
-        .collect();
-    // Assemble the single user turn here — multimodal awareness lives in oneshot, not the
-    // shared loop. No images → a bare `Message::user` (byte-for-byte the old call). With
-    // images, the text rides as the first part (skipped when empty — image-only with an
-    // empty prompt shouldn't emit a pointless `{type:text,text:""}` block), then the images.
-    let initial_prompt = if image_parts.is_empty() {
-        Message::user(user_prompt)
-    } else {
-        let mut parts = Vec::with_capacity(image_parts.len() + 1);
-        if !user_prompt.is_empty() {
-            parts.push(UserContent::text(user_prompt));
-        }
-        parts.extend(image_parts);
-        Message::User {
-            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
-        }
-    };
+    let initial_prompt = user_turn_with_attachments(attachments, user_prompt);
     with_call_deadline(
         cfg.call_deadline,
         "oneshot",
@@ -1727,7 +1854,7 @@ fn consult_tools(
     cfg: &ConsultConfig,
     reports: Arc<Mutex<Vec<String>>>,
     explore_usage: Arc<Mutex<Usage>>,
-    synth_vision: bool,
+    synth: &Arm,
 ) -> Result<Vec<DynamicTool>> {
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
@@ -1753,6 +1880,22 @@ fn consult_tools(
         explorer_preamble_owned.push_str(&directive);
     }
     let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
+    // Who a delegated sweep's `attach` calls route to: the DRIVER (this loop runs on
+    // the synth arm), named so the explorer knows who reads its report, gated on the
+    // synth's own vision cap (the same cap `view_image` below rides).
+    let consumer = SweepConsumer {
+        kind: SweepConsumerKind::ConsultDriver,
+        label: Arc::from(format!("the consult driver (`{}`)", synth.model)),
+        vision: synth.caps.vision,
+    };
+    // The caller's own `consult` attachments already reach the driver another way
+    // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
+    // doesn't re-route what's already in front of the driver.
+    // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
+    // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
+    // a `..`, or a symlink, and the reader then receives the same bytes twice.
+    let already_delivered: HashSet<PathBuf> =
+        crate::sweep_attach::delivered_seed(root, cfg.attachments.iter().map(|a| Path::new(a.path())));
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explore.explorer_max_turns,
@@ -1762,6 +1905,9 @@ fn consult_tools(
         explore_usage,
         cfg.explore.phase.progress.clone(),
         explorer_preamble,
+        consumer,
+        cfg.explore.max_attachments,
+        Arc::new(already_delivered),
     );
     let mut tools: Vec<DynamicTool> = vec![
         traced(RunKaish::with_progress(
@@ -1773,7 +1919,7 @@ fn consult_tools(
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
-    if synth_vision {
+    if synth.caps.vision {
         tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     Ok(tools)
@@ -1794,6 +1940,7 @@ pub(crate) async fn explore_with(
     explorer: &Arm,
     cfg: &ExploreConfig,
     attached: &[super::prompts::ConsultAttachment],
+    attach: Option<&Arc<SweepAttachSink>>,
 ) -> Result<(String, Usage)> {
     let mut preamble = resolve_phase_preamble(
         Phase::Explorer,
@@ -1815,6 +1962,7 @@ pub(crate) async fn explore_with(
             &cfg.sandbox,
             cfg.explorer_max_turns,
             &cfg.phase.progress,
+            attach,
         ),
     )
     .await
@@ -1865,22 +2013,23 @@ async fn with_call_deadline<T>(
 /// `call_deadline` — a slow local model gets its full patience without forcing the
 /// interactive ceiling high. The **batch** lane, by contrast, holds no in-process wait
 /// at all — its deliberation runs on the *provider's* queue.
+///
+/// `attachments` carries any images a delegated dossier sweep routed via `attach`
+/// (text attachments never reach here — they're already stitched into `dossier`'s
+/// text by `sweep_evidence_block`) — the single turn's own images, via the same
+/// [`user_turn_with_attachments`] helper [`oneshot`] uses. `&[]` is byte-for-byte the
+/// old `Message::user(...)` call.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named phase input
 pub async fn deliberate_direct(
     question: &str,
     dossier: &str,
+    attachments: &[Attachment],
     synth: &Arm,
     system: &str,
     deadline: Duration,
 ) -> Result<(String, Usage)> {
-    with_call_deadline(
-        deadline,
-        "deliberate",
-        synth.complete(
-            system,
-            Message::user(deliberation_prompt(question, dossier)),
-        ),
-    )
-    .await
+    let prompt = user_turn_with_attachments(attachments, deliberation_prompt(question, dossier));
+    with_call_deadline(deadline, "deliberate", synth.complete(system, prompt)).await
 }
 
 /// Run a `consult` over two resolved arms.
@@ -1927,7 +2076,7 @@ pub(crate) async fn consult_with(
                     cfg,
                     reports.clone(),
                     explore_usage.clone(),
-                    synth.caps.vision,
+                    synth,
                 )
             },
         ),
@@ -2085,6 +2234,22 @@ mod tests {
             params,
             ModelCaps {
                 vision: false,
+                tool_result_images: true,
+            },
+        )
+    }
+
+    /// A vision-capable arm on a transport that carries an image in a tool result
+    /// (Anthropic/Gemini-shaped caps) — the toolset-wiring tests' injection point for
+    /// "the synth can see", distinct from `arm`'s deliberately blind default.
+    fn vision_arm(client: &ScriptedClient, model: &str) -> Arm {
+        Arm::new(
+            client.clone(),
+            model,
+            16384,
+            None,
+            ModelCaps {
+                vision: true,
                 tool_result_images: true,
             },
         )
@@ -2976,6 +3141,614 @@ mod tests {
         );
     }
 
+    // --- The explorer `attach` tool, wired into the recomposed consult loop ------
+
+    /// A delegated sweep's OWN toolset (not the driver's) is exactly
+    /// `{run_kaish, attach}` — never a nested `explore` (a sweep doesn't delegate
+    /// further). Pinned by asserting inside the EXPLORER's own responder, since the
+    /// inner toolset only exists once the driver actually delegates.
+    #[tokio::test]
+    async fn the_delegated_sweep_toolset_is_run_kaish_and_attach() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "q" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(has_tool(req, "run_kaish"), "{:?}", req.tools);
+                assert!(has_tool(req, "attach"), "{:?}", req.tools);
+                assert!(
+                    !has_tool(req, "explore"),
+                    "a sweep does not delegate further: {:?}",
+                    req.tools
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+    }
+
+    /// The load-bearing wiring test: a sweep that calls `attach` must land its
+    /// routed file — full body, numbered — on the DRIVER's tool result, not just
+    /// in the sweep's own transcript.
+    #[tokio::test]
+    async fn a_sweep_attachment_rides_the_tool_result_to_the_driver() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("<file path=\"src/foo.rs\">") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs.iter().any(|r| r.transcript.contains("<file path=\"src/foo.rs\">")
+                && r.transcript.contains("fn target_marker")),
+            "the driver's transcript must carry the attached file's numbered body: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// The explorer's OWN context (its later requests, after the attach call) must
+    /// never carry the routed bytes — the whole premise of the feature is that the
+    /// bytes bypass the sweep's own context.
+    #[tokio::test]
+    async fn the_explorer_never_sees_the_attached_bytes() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT: routed") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        for r in client.requests_for(EXPLORER) {
+            assert!(
+                !r.transcript.contains("fn target_marker"),
+                "the explorer's own transcript must never carry the routed bytes: {:?}",
+                r.transcript
+            );
+        }
+    }
+
+    /// A sweep that never calls `attach` hands the driver exactly the bare report —
+    /// no evidence block appended, byte-for-byte the pre-attach behavior.
+    #[tokio::test]
+    async fn a_sweep_with_no_attachment_hands_the_driver_the_bare_report() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("PLAIN REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "find it" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |_req| Ok(text_response("PLAIN REPORT: src/foo.rs:1")))
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("PLAIN REPORT: src/foo.rs:1")
+                    && !r.transcript.contains("Files the explorer routed")),
+            "no attach call -> no evidence block, just the bare report: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// Past `max_attachments`, the extra file's demotion reaches the DRIVER as a
+    /// loud, consumer-shaped line — the driver learns it can still `run_kaish` the
+    /// file itself.
+    #[tokio::test]
+    async fn an_over_cap_sweep_attach_reaches_the_driver_as_a_loud_demotion() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("could not route") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach two files" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("1 of 1 attachments") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs", "src/bar.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: tried to route both"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::write(dir.path().join("src/bar.rs"), "fn other() {}\n").unwrap();
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                max_attachments: 1,
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "attach two files",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("could not route")
+                    && r.transcript.contains("budget of 1 was full")),
+            "the over-cap demotion must reach the driver: {:?}",
+            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
+        );
+    }
+
+    /// `explore` (v1) never offers `attach` — the top-level tool passes `None`
+    /// straight through to `run_explore_phase`, so the toolset stays exactly
+    /// `{run_kaish}`.
+    #[tokio::test]
+    async fn the_top_level_explore_sweep_offers_no_attach_tool() {
+        const EXPLORER: &str = "cheap-explorer";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "attach"),
+                    "the top-level explore tool must not offer attach"
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        explore_with(
+            "q",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[],
+            None,
+        )
+        .await
+        .expect("scripted explore should succeed");
+    }
+
+    /// `max_attachments: 0` omits the `attach` tool from a delegated sweep's
+    /// toolset entirely — the config-driven off switch, distinct from the v1
+    /// top-level-`explore` exclusion above (this one is `consult`'s nested sweep).
+    #[tokio::test]
+    async fn max_attachments_zero_omits_the_attach_tool() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "q" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "attach"),
+                    "max_attachments = 0 must omit the attach tool"
+                );
+                Ok(text_response("REPORT"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                max_attachments: 0,
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect("scripted consult should succeed");
+    }
+
+    /// A sweep's `attach` call surfaces as `PhaseEvent::Attached` on the shared
+    /// progress sink — the one beat that lets an operator observe the pattern the
+    /// generous default budget exists to watch for.
+    #[tokio::test]
+    async fn sweep_attachments_surface_as_progress() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT: routed") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the marker file" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: done"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: routed the config file"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: sink.clone(),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+
+        consult_with(
+            "attach the marker file",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let events = sink.events();
+        assert!(
+            events.contains(&PhaseEvent::Attached {
+                path: "src/foo.rs".into()
+            }),
+            "an attach call must surface as progress: {events:?}"
+        );
+    }
+
+    /// A minimal PNG signature plus filler — enough to sniff as an image without
+    /// decoding it (mirrors the `view_image`/`attach.rs`/`sweep_attach.rs` test helpers).
+    fn fake_png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend(std::iter::repeat_n(0xAB, 16));
+        v
+    }
+
+    /// A vision-capable driver (Anthropic/Gemini-shaped: `tool_result_images = true`)
+    /// receives a sweep's routed image right on the `explore` tool result — no break,
+    /// no user-turn rewrite, since this transport carries an image in a tool result.
+    #[tokio::test]
+    async fn a_vision_driver_receives_the_sweep_image_in_the_tool_result() {
+        const SYNTH: &str = "vision-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                if any_tool_result_image(&history) {
+                    Ok(text_response("ANSWER: saw the diagram"))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: the diagram shows the pipeline"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+        // vision + tool_result_images: the Anthropic/Gemini shape.
+        let synth = vision_arm(&client, SYNTH);
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &synth,
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        assert!(
+            client
+                .requests_for(SYNTH)
+                .iter()
+                .any(|r| any_tool_result_image(&r.chat_history)),
+            "the vision driver must receive the image on the explore tool result"
+        );
+    }
+
+    /// A vision-capable driver whose TRANSPORT can't carry an image in a tool result
+    /// (an OpenAI VLM shape: `tool_result_images = false`) still receives the sweep's
+    /// image — on a separate user `Image` turn, via the same break-rewrite-resume
+    /// path `view_image` uses, now generalized to any image-bearing tool result.
+    #[tokio::test]
+    async fn an_openai_vlm_driver_receives_the_sweep_image_on_a_user_turn() {
+        const SYNTH: &str = "openai-vlm-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                if user_image_messages(&history) > 0 {
+                    Ok(text_response("ANSWER: saw the diagram"))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    Ok(text_response("REPORT: the diagram shows the pipeline"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+        // vision but NOT tool_result_images: the OpenAI VLM shape that must break,
+        // rewrite, and resume.
+        let synth = Arm::new(
+            client.clone(),
+            SYNTH,
+            16384,
+            None,
+            ModelCaps {
+                vision: true,
+                tool_result_images: false,
+            },
+        );
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &synth,
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let synth_reqs = client.requests_for(SYNTH);
+        assert!(
+            synth_reqs
+                .iter()
+                .any(|r| user_image_messages(&r.chat_history) > 0),
+            "the OpenAI-shaped driver must receive the image on its own user turn: {:?}",
+            synth_reqs.iter().map(|r| r.chat_history.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            synth_reqs
+                .iter()
+                .all(|r| !any_tool_result_image(&r.chat_history)),
+            "an image must never ride this transport's tool-result channel"
+        );
+    }
+
+    /// A blind consumer (the default `arm()` — not vision-capable) never receives an
+    /// image: `attach` refuses it in the receipt, and the EXPLORER sees that refusal
+    /// on its very next turn (immediately, within the same sweep) rather than only
+    /// finding out once the whole sweep concludes.
+    #[tokio::test]
+    async fn a_blind_driver_refuses_the_image_and_the_explorer_learns_immediately() {
+        const SYNTH: &str = "blind-synth";
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("REPORT") {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "attach the diagram" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: no diagram available"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("not attached: docs/arch.png") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["docs/arch.png"] }),
+                    ))
+                } else {
+                    // The explorer learns of the refusal on its OWN very next turn —
+                    // it doesn't have to wait for anything downstream.
+                    assert!(
+                        transcript_text(req).contains("reads text only"),
+                        "the explorer must see the refusal reason immediately: {}",
+                        transcript_text(req)
+                    );
+                    Ok(text_response("REPORT: could not attach the diagram"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
+
+        let cfg = ConsultConfig::default();
+
+        consult_with(
+            "attach the diagram",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH), // the default arm is blind
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        for r in client.requests_for(SYNTH) {
+            assert!(
+                !any_tool_result_image(&r.chat_history),
+                "a blind driver must never receive an image on any channel"
+            );
+        }
+    }
+
     /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
     /// explorer arm over `{run_kaish}` against the real repo and returns the
     /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
@@ -3019,6 +3792,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &cfg,
             &[],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -3066,6 +3840,7 @@ mod tests {
                 path: "src/parser_gen.rs".into(),
                 size: 900_000,
             }],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -3122,6 +3897,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &cfg,
             &[],
+            None,
         )
         .await
         .expect("scripted explore should succeed");
@@ -3178,6 +3954,7 @@ mod tests {
         let (out, _usage) = deliberate_direct(
             "Is the retry path safe?",
             "src/retry.rs:12 DOSSIER_MARKER fn retry()",
+            &[],
             &arm(&client, SYNTH),
             "You are a capable model answering a hard question offline.",
             cfg.call_deadline,
@@ -3195,6 +3972,112 @@ mod tests {
             1,
             "one toolless completion"
         );
+    }
+
+    /// `deliberate`'s dossier stage: `explore_with` run with an attach sink returns
+    /// the RAW dossier text (unstitched — `explore_with` itself doesn't touch the
+    /// sink); the caller drains it and stitches `sweep_evidence_block` on top, the
+    /// exact composition `server::deliberate` performs. Proves that composition
+    /// works end to end at the engine layer, without the MCP server.
+    #[tokio::test]
+    async fn a_deliberate_dossier_sweep_routes_bytes_into_the_dossier() {
+        const EXPLORER: &str = "cheap-explorer";
+
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |req| {
+                if !transcript_text(req).contains("attached: src/foo.rs") {
+                    Ok(tool_call_response(
+                        "t-attach",
+                        "attach",
+                        json!({ "paths": ["src/foo.rs"] }),
+                    ))
+                } else {
+                    Ok(text_response("DOSSIER REPORT: src/foo.rs is the relevant module"))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ExploreConfig::default();
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: Arc::from("the offline synth (`test-model`)"),
+            vision: false,
+        };
+        let sink = Arc::new(SweepAttachSink::new(
+            cfg.max_attachments,
+            consumer.clone(),
+            HashSet::new(),
+        ));
+
+        let (mut dossier, _usage) = explore_with(
+            "what's the relevant module?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &cfg,
+            &[],
+            Some(&sink),
+        )
+        .await
+        .expect("scripted explore should succeed");
+
+        // explore_with itself doesn't stitch — the raw dossier is just the report.
+        assert!(
+            !dossier.contains("<file path=\"src/foo.rs\">"),
+            "explore_with returns the RAW dossier; stitching is the caller's job: {dossier:?}"
+        );
+
+        let delivery = sink.drain();
+        if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
+            dossier.push_str(&block);
+        }
+
+        assert!(
+            dossier.contains("DOSSIER REPORT")
+                && dossier.contains("<file path=\"src/foo.rs\">")
+                && dossier.contains("fn target_marker"),
+            "the stitched dossier must carry both the report and the routed file's \
+             numbered body: {dossier:?}"
+        );
+    }
+
+    /// `deliberate_direct`'s single turn carries a routed image as a native part —
+    /// the same `user_turn_with_attachments` seam `oneshot` uses, so a dossier
+    /// sweep's `attach`-routed image reaches the direct-lane synth even though the
+    /// synth itself never runs a tool loop.
+    #[tokio::test]
+    async fn deliberate_direct_carries_sweep_images_into_its_single_turn() {
+        const SYNTH: &str = "big-local-vision-synth";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                assert!(
+                    user_image_messages(&history) > 0,
+                    "the single turn must carry the routed image"
+                );
+                Ok(text_response("DELIBERATION: the diagram confirms it"))
+            })
+            .build();
+
+        let image = Attachment::Image {
+            path: "docs/arch.png".into(),
+            mime: "image/png",
+            data_b64: "ZmFrZQ==".into(),
+        };
+        let cfg = PhaseContext::default();
+        let (out, _usage) = deliberate_direct(
+            "Does the diagram confirm the design?",
+            "src/x.rs:1 DOSSIER",
+            &[image],
+            &vision_arm(&client, SYNTH),
+            "You are a capable model answering a hard question offline.",
+            cfg.call_deadline,
+        )
+        .await
+        .expect("scripted direct deliberation should succeed");
+
+        assert!(out.contains("DELIBERATION"));
     }
 
     /// The wall-clock backstop: a wedged provider (a stopped/hung backend whose
@@ -3265,6 +4148,7 @@ mod tests {
                 &arm(&client, EXPLORER),
                 &cfg,
                 &[],
+                None,
             ),
         )
         .await
@@ -3291,6 +4175,7 @@ mod tests {
             deliberate_direct(
                 "q",
                 "src/x.rs:1 DOSSIER",
+                &[],
                 &arm(&client, SYNTH),
                 "offline synth preamble",
                 Duration::from_millis(50),
@@ -3974,6 +4859,7 @@ mod tests {
             &arm(&client, EXPLORER),
             &ExploreConfig::default(),
             &[],
+            None,
         )
         .await
         .expect_err("an explorer that reported nothing must fail, not return an empty report");
@@ -4021,6 +4907,7 @@ mod tests {
         let err = deliberate_direct(
             "q",
             "the dossier",
+            &[],
             &arm(&client, MODEL),
             "system",
             Duration::from_secs(30),
@@ -5346,13 +6233,14 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
+        let synth = arm(&client, "synth-model"); // not vision-capable
         let tools = consult_tools(
             &arm(&client, "explorer-model"),
             dir.path(),
             &cfg,
             reports,
             Arc::new(Mutex::new(Usage::new())),
-            false, // synth is not vision-capable
+            &synth,
         )
         .expect("building the consult toolset should succeed");
 
@@ -5381,13 +6269,14 @@ mod tests {
         let cfg = ConsultConfig::default();
         let reports = Arc::new(Mutex::new(Vec::new()));
 
+        let synth = vision_arm(&client, "synth-model"); // synth IS vision-capable
         let tools = consult_tools(
             &arm(&client, "explorer-model"),
             dir.path(),
             &cfg,
             reports,
             Arc::new(Mutex::new(Usage::new())),
-            true, // synth IS vision-capable
+            &synth,
         )
         .expect("building the consult toolset should succeed");
 
@@ -5412,13 +6301,14 @@ mod tests {
         let reports = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let usage_sink = Arc::new(Mutex::new(Usage::new()));
+        let blind_synth = arm(&client, "synth-model");
         let blind = consult_tools(
             &explorer,
             dir.path(),
             &cfg,
             reports.clone(),
             usage_sink.clone(),
-            false,
+            &blind_synth,
         )
         .expect("blind toolset builds");
         let blind_names: Vec<String> = blind.iter().map(|t| t.name().to_string()).collect();
@@ -5429,7 +6319,8 @@ mod tests {
             "no view_image without vision, got {blind_names:?}"
         );
 
-        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, true)
+        let seeing_synth = vision_arm(&client, "synth-model");
+        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, &seeing_synth)
             .expect("vision toolset builds");
         let seeing_names: Vec<String> = seeing.iter().map(|t| t.name().to_string()).collect();
         assert!(
@@ -5556,7 +6447,7 @@ mod tests {
                 content: OneOrMany::one(vi_result("call-1")),
             },
         ];
-        let out = rewrite_view_image_history(history);
+        let out = rewrite_tool_image_history(history);
 
         assert!(
             !any_tool_result_image(&out),
@@ -5609,8 +6500,8 @@ mod tests {
                 content: OneOrMany::one(vi_result("c1")),
             },
         ];
-        let once = rewrite_view_image_history(history);
-        let twice = rewrite_view_image_history(once.clone());
+        let once = rewrite_tool_image_history(history);
+        let twice = rewrite_tool_image_history(once.clone());
         assert_eq!(once, twice, "a second rewrite pass is a no-op");
         assert_eq!(user_image_messages(&twice), 1, "no duplicate image turn");
     }
@@ -5640,7 +6531,7 @@ mod tests {
             ])
             .unwrap(),
         };
-        let out = rewrite_view_image_history(vec![Message::user("q"), assistant, results]);
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
 
         assert!(!any_tool_result_image(&out), "view_image image moved out");
         assert_eq!(user_image_messages(&out), 1, "exactly the one image turn");
@@ -5652,6 +6543,138 @@ mod tests {
                         ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
             "the run_kaish tool_result is preserved verbatim: {out:?}"
         );
+    }
+
+    /// The generalization's whole point: an `explore` sweep's result carrying a
+    /// routed image (the hybrid envelope `RunExplore::call` emits once it attached
+    /// an image) gets EXACTLY the same user-turn-channel treatment as `view_image` —
+    /// no per-tool `if` was added for it, because the rewrite keys on the result,
+    /// not the tool's name.
+    #[test]
+    fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "explore-1",
+                "explore",
+                json!({ "question": "what does the diagram show?" }),
+            )),
+        };
+        let result = Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "explore-1".to_string(),
+                call_id: None,
+                content: OneOrMany::many([
+                    ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
+                    ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                ])
+                .unwrap(),
+            })),
+        };
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, result]);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "the explore result's image must leave the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            1,
+            "it reappears as exactly one user Image message: {out:?}"
+        );
+        assert!(
+            out.iter().any(|m| matches!(m, Message::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                    if tr.id == "explore-1"
+                    && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+            "the explore tool_use stays answered by a text-only result: {out:?}"
+        );
+    }
+
+    /// Two image-bearing results in ONE assistant turn (`view_image` + an `explore`
+    /// sweep that routed a picture): the rewrite must move BOTH out — per-part
+    /// filtering that stopped at the first image-bearing result would strand the
+    /// second on a channel the transport rejects. (DeepSeek review gap, 2026-07-26.)
+    #[test]
+    fn rewrite_moves_both_images_when_two_tools_carry_them() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::many([
+                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+                AssistantContent::tool_call("ex", "explore", json!({ "question": "diagram?" })),
+            ])
+            .unwrap(),
+        };
+        let results = Message::User {
+            content: OneOrMany::many([
+                vi_result("vi"),
+                UserContent::ToolResult(ToolResult {
+                    id: "ex".to_string(),
+                    call_id: None,
+                    content: OneOrMany::many([
+                        ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
+                        ToolResultContent::image_base64("ZmFrZTI=", None, None),
+                    ])
+                    .unwrap(),
+                }),
+            ])
+            .unwrap(),
+        };
+        let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
+
+        assert!(
+            !any_tool_result_image(&out),
+            "both images must leave the tool-result channel: {out:?}"
+        );
+        assert_eq!(
+            user_image_messages(&out),
+            2,
+            "each image gets its own user Image turn: {out:?}"
+        );
+        for id in ["vi", "ex"] {
+            assert!(
+                out.iter().any(|m| matches!(m, Message::User { content }
+                    if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
+                        if tr.id == id
+                        && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
+                "tool_use `{id}` stays answered by a text-only result: {out:?}"
+            );
+        }
+    }
+
+    /// The break keys on the DECLARED content parts, never on text: a *text* result
+    /// that happens to quote image-looking JSON — an explorer cat-ing this very
+    /// file, a JSON fixture, a grep hit — must not trip the break/rewrite machinery.
+    /// On rig 0.41 the gate reads typed [`ToolOutput`] parts (no sniffing), so the
+    /// false positive the Gemini review worried about (2026-07-26) is impossible by
+    /// construction; this pins it against a regression to string matching.
+    #[test]
+    fn a_text_result_containing_the_image_literal_does_not_carry_an_image() {
+        // A run_kaish-style plain string result quoting envelope-shaped JSON.
+        let grep_hit = r#"exit:0
+src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data": b64}]})"#;
+        assert!(!tool_output_carries_image(&ToolOutput::text(grep_hit)));
+
+        // JSON output shaped like the old hybrid envelope is still just JSON — only
+        // a declared Image part counts.
+        let envelope = json!({"response": "r", "parts": [{"type": "image", "data": "ZmFrZQ=="}]});
+        assert!(!tool_output_carries_image(&ToolOutput::json(envelope)));
+
+        // A genuinely declared image part — the block `view_image` and a routed
+        // `explore` result emit — does carry.
+        let with_image = ToolOutput::content(
+            OneOrMany::many([
+                ToolResultContent::text("note"),
+                ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                    media_type: ImageMediaType::from_mime_type("image/png"),
+                    detail: None,
+                    additional_params: None,
+                }),
+            ])
+            .expect("two blocks is never empty"),
+        );
+        assert!(tool_output_carries_image(&with_image));
     }
 
     /// The outer turn budget is derived from the transcript (rig carries no

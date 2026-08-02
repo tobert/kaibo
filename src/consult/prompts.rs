@@ -1,8 +1,10 @@
 //! Preambles and prompt framers for the consult phases.
 
+use crate::attach::Attachment;
 use crate::config::ModelRole;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::session::QaTurn;
+use crate::sweep_attach::{SweepConsumer, SweepConsumerKind, SweepDelivery};
 
 /// Splice the operator's house rules (if any) onto a phase preamble. The base
 /// preamble functions stay pure (and their tests byte-for-byte stable); this is
@@ -513,6 +515,99 @@ pub fn explorer_attachment_directive(attached: &[ConsultAttachment]) -> Option<S
     ))
 }
 
+/// Appended to an explorer preamble wherever the `attach` tool (`src/sweep_attach.rs`)
+/// is injected — every sweep that gets the tool gets this paragraph in the same
+/// place, so preamble and toolset can't drift apart. Positive framing: attach is
+/// cheaper and more accurate than transcribing a span, not a fallback for when
+/// writing fails.
+pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String {
+    format!(
+        "\n\nYou also have `attach`. It aims a file *past you*: kaibo reads the file and \
+         its full bytes travel ALONGSIDE your report to {}, without ever entering your \
+         context. When the whole file is the evidence, attach it — your report cites, the \
+         attachment carries the bytes. That is cheaper and more accurate than \
+         transcribing a span into your report: transcription spends your own budget and \
+         can drift; an attachment is the real file, numbered like `cat -n`. Attach is \
+         for delivering, not reading — you get back a one-line receipt (path, lines, \
+         size), never the contents; read with `cat -n` anything you need to see \
+         yourself. Attach the file a load-bearing claim rests on; keep writing exact \
+         `file:line` cites, because the attachment is what lets them be checked. Up to \
+         {max} files this sweep.",
+        consumer.label,
+    )
+}
+
+/// The evidence block appended to a sweep's report (`consult`'s nested `explore′`) or
+/// dossier (`deliberate`'s explorer stage) once its `attach` calls are drained. `None`
+/// when the delivery is empty, so a sweep that never attached anything leaves the
+/// report/dossier byte-for-byte what it was before this feature existed.
+///
+/// Demotions arrive from [`SweepAttachSink`](crate::sweep_attach::SweepAttachSink)
+/// already rendered and consumer-shaped (it built them with the same `consumer` this
+/// fn receives, at the moment a path was refused) — this just lists them; the
+/// consumer param otherwise picks the section header, so a driver sees "routed to
+/// you" framing and an offline synth sees "included in this dossier" framing.
+pub fn sweep_evidence_block(consumer: &SweepConsumer, delivery: &SweepDelivery) -> Option<String> {
+    if delivery.is_empty() {
+        return None;
+    }
+    let header = match consumer.kind {
+        SweepConsumerKind::ConsultDriver => {
+            "\n\n--- Files the explorer routed to you this sweep (their full bytes ride \
+             with this tool result) ---\n"
+        }
+        SweepConsumerKind::OfflineSynth => {
+            "\n\n--- Files the explorer routed into this dossier (their full bytes are \
+             included below) ---\n"
+        }
+    };
+    let mut block = String::new();
+    block.push_str(header);
+
+    let texts = delivery.texts();
+    for a in &texts {
+        if let Some(wrapped) = a.wrapped_text() {
+            block.push_str(&wrapped);
+            block.push_str("\n\n");
+        }
+    }
+
+    let images = delivery.images();
+    if !images.is_empty() {
+        block.push_str(
+            "Images (see the image parts carried alongside this text) — described by \
+             path, never inlined as text:\n",
+        );
+        for a in &images {
+            if let Attachment::Image { path, mime, .. } = a {
+                block.push_str(&format!(
+                    "- {} ({mime})\n",
+                    crate::attach::escape_attr_value(path)
+                ));
+            }
+        }
+        block.push('\n');
+    }
+
+    if !delivery.notes.is_empty() {
+        block.push_str("Explorer's note:\n");
+        for n in &delivery.notes {
+            block.push_str(&crate::attach::escape_file_body(n));
+            block.push('\n');
+        }
+        block.push('\n');
+    }
+
+    if !delivery.demotions.is_empty() {
+        block.push_str("Not routed this sweep:\n");
+        for line in &delivery.demotions {
+            block.push_str(&format!("- {line}\n"));
+        }
+    }
+
+    Some(block)
+}
+
 /// The recomposed `consult` driver: one capable model, two tools. Composes the
 /// shared [`kaish_syntax_core`] (for `run_kaish`) and frames `explore` as the way
 /// to cover breadth. Positive framing on purpose — weaker/local models loop on
@@ -1016,5 +1111,95 @@ mod tests {
             second < current,
             "history must precede the current question"
         );
+    }
+
+    fn consult_driver_consumer() -> SweepConsumer {
+        SweepConsumer {
+            kind: SweepConsumerKind::ConsultDriver,
+            label: std::sync::Arc::from("the consult driver (`claude-sonnet-4-6`)"),
+            vision: false,
+        }
+    }
+
+    fn offline_synth_consumer() -> SweepConsumer {
+        SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: std::sync::Arc::from("the offline synth (`gpt-5.6-sol`)"),
+            vision: false,
+        }
+    }
+
+    /// The attach directive names both the budget (so the explorer can self-pace)
+    /// and who the bytes route to (the consumer's label) — and mentions the tool by
+    /// name so a model reading the preamble connects the prose to the toolset.
+    #[test]
+    fn the_attach_directive_names_the_budget_and_the_routing() {
+        let d = explorer_attach_directive(5, &consult_driver_consumer());
+        assert!(d.contains("`attach`"), "{d}");
+        assert!(d.contains("5 files"), "{d}");
+        // Both cross-family reviewers converged here: a weak explorer must be told
+        // up front that attach hands back a receipt, never the file — otherwise it
+        // attaches what it meant to read and hallucinates the contents.
+        assert!(d.contains("never the contents"), "{d}");
+        assert!(d.contains("delivering, not reading"), "{d}");
+        assert!(
+            d.contains("the consult driver (`claude-sonnet-4-6`)"),
+            "{d}"
+        );
+    }
+
+    /// The evidence block wraps a delivered text attachment exactly once (the same
+    /// wrapper-count discipline `attach.rs`'s own tests pin), numbered `cat -n`
+    /// style so citations against a routed file are exact.
+    #[test]
+    fn the_evidence_block_numbers_each_file_and_wraps_it_once() {
+        let delivery = SweepDelivery {
+            attachments: vec![Attachment::Text {
+                path: "src/foo.rs".into(),
+                body: "fn a() {}\nfn b() {}\n".into(),
+            }],
+            ..SweepDelivery::default()
+        };
+        let block = sweep_evidence_block(&consult_driver_consumer(), &delivery)
+            .expect("a non-empty delivery renders a block");
+        assert_eq!(
+            block.matches("<file path=\"src/foo.rs\">").count(),
+            1,
+            "exactly one wrapper: {block}"
+        );
+        assert_eq!(block.matches("</file>").count(), 1, "{block}");
+        assert!(
+            block.contains("     1\tfn a() {}\n     2\tfn b() {}\n"),
+            "numbered cat -n style: {block}"
+        );
+    }
+
+    /// The offline-synth evidence block surfaces a dropped file's demotion — already
+    /// rendered by the sink — verbatim, telling the synth it cannot fetch what was
+    /// left out.
+    #[test]
+    fn the_deliberate_evidence_block_says_the_synth_cannot_fetch_what_was_dropped() {
+        let delivery = SweepDelivery {
+            demotions: vec![
+                "**NOT INCLUDED**: `src/z.rs` — the explorer's per-sweep attachment \
+                 budget (32) was exhausted. You cannot fetch it; treat its contents as \
+                 unavailable and say so if the question turns on it."
+                    .to_string(),
+            ],
+            ..SweepDelivery::default()
+        };
+        let block = sweep_evidence_block(&offline_synth_consumer(), &delivery)
+            .expect("a non-empty delivery renders a block");
+        assert!(block.contains("NOT INCLUDED"), "{block}");
+        assert!(block.contains("cannot fetch"), "{block}");
+        assert!(block.contains("src/z.rs"), "{block}");
+    }
+
+    /// An empty delivery (a sweep that never called `attach`) renders no block at
+    /// all — the report/dossier stays byte-for-byte what it was before this feature.
+    #[test]
+    fn an_empty_delivery_renders_no_block() {
+        assert!(sweep_evidence_block(&consult_driver_consumer(), &SweepDelivery::default())
+            .is_none());
     }
 }
