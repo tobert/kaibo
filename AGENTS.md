@@ -249,6 +249,23 @@ Two audiences are optimized differently:
   start to finish by whoever is configuring kaibo, so every line there is a line they pay
   for.
 
+kaish's [docs/style.md](https://github.com/tobert/kaish/blob/main/docs/style.md)
+applies here by reference — that guide names kaibo as an adopter, and it carries
+the weights, the term rules, and the reasoning. It layers under the audience
+rules above, which stay in charge: where the guide's "keep the why" collides
+with the 2048-character resident budget, the budget wins. The weight map for
+this repo:
+
+- **Full weight**: every error or diagnostic string the server returns, and the
+  client-facing tool `description`s — an agent reads a failure message more
+  often than any doc.
+- **Terms only**: `README.md` and the docs under `docs/`. kaish's Terms table
+  binds where kaibo uses kaish's words (`kernel`, `spill`, `loud`, `mount`).
+- **Exempt**: `docs/devlog.md`, `signoff.md` — they tell a story and need a
+  voice.
+
+Groom at the point of touch; there is no bulk pass.
+
 ## Driving the models
 
 How kaibo talks to LLMs — project defaults, made local so any agent here inherits them.
