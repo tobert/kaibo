@@ -409,16 +409,30 @@ fn per_slot_tunables_override_defaults_others_inherit() {
     assert_eq!(et.max_tokens, 20000);
     assert_eq!(et.thinking_budget, 9000);
 
-    // A built-in cast that overrode nothing inherits the file-set defaults too.
+    // A built-in slot with no pin inherits the file-set defaults too (gemini's
+    // synth carries no built-in max_tokens pin).
+    let g = c
+        .resolve_cast("gemini")
+        .unwrap()
+        .require_slot(ModelRole::Synth)
+        .unwrap()
+        .tunables(ModelRole::Synth, &c.defaults);
+    assert_eq!(g.max_tokens, 20000);
+    assert_eq!(g.thinking_budget, 9000);
+    assert_eq!(g.temperature, 0.5);
+
+    // A built-in slot pin is an ordinary slot override, so it wins over the
+    // file-set default the same way a user cast's pin does (the built-in
+    // anthropic synth pins 32768 — see
+    // `builtin_synth_max_tokens_pins_are_deliberate` in src/config.rs).
     let a = c
         .resolve_cast("anthropic")
         .unwrap()
         .require_slot(ModelRole::Synth)
         .unwrap()
         .tunables(ModelRole::Synth, &c.defaults);
-    assert_eq!(a.max_tokens, 20000);
+    assert_eq!(a.max_tokens, 32768);
     assert_eq!(a.thinking_budget, 9000);
-    assert_eq!(a.temperature, 0.5);
 }
 
 #[test]
@@ -1059,9 +1073,12 @@ fn env_overrides_file_defaults_and_flows_into_slot_tunables() {
     let env: HashMap<&str, &str> = [("KAIBO_MAX_TOKENS", "22222")].into_iter().collect();
     let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
     assert_eq!(c.defaults.max_tokens, 22222);
-    // And the env'd default flows into a slot that inherits it.
+    // And the env'd default flows into a slot that inherits it — gemini's synth,
+    // which carries no built-in max_tokens pin (the anthropic and deepseek synths
+    // do, and a slot pin wins over [defaults] from any layer; see
+    // `builtin_synth_max_tokens_pins_are_deliberate` in src/config.rs).
     let t = c
-        .resolve_cast("anthropic")
+        .resolve_cast("gemini")
         .unwrap()
         .require_slot(ModelRole::Synth)
         .unwrap()

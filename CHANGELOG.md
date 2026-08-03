@@ -17,6 +17,11 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **Model listings show each model's output ceiling.** `kaibo models` and `list_models`
+  render the provider's advertised max completion tokens beside the context window
+  (`output_ceiling` in the JSON face); the configure prompt and config guide now say to
+  size a synth slot's `max_tokens` from it.
+
 - **The explorer can now hand whole files to whoever reads its report.** Inside
   `consult` and `deliberate`, the delegated investigator gets an `attach` tool: when a
   whole file is the evidence, it routes the file's real bytes (numbered, `cat -n`
@@ -59,6 +64,10 @@ record. Each later release appends a new section at the top.
   all three.
 
 ### Changed
+
+- **The built-in deepseek and anthropic synths pin `max_tokens = 32768`** (the 16384
+  `[defaults]` floor is unchanged): a measured consult showed reasoning consuming half
+  the completion budget before the answer started.
 
 - **kaibo's models now work from a role, not a job description.** Every preamble opens
   on who the model is on kaibo's team — "You are the synthesis agent", "You are the

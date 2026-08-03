@@ -704,6 +704,18 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
 
+### Synth output budgets — measure the remaining casts before pinning them
+
+The built-in deepseek and anthropic synths now pin `max_tokens = 32768` from a
+measured consult (numbers in the 2026-08-03 devlog entry). Still open:
+
+- The unmeasured built-ins (gemini, openrouter/qwen, openai-local, both batch
+  casts) stay on the 16384 floor — a pin without a measurement is a guess.
+- The anthropic pin has no catalog backing (`/v1/models` reports no ceiling);
+  confirm with a live probe when the key is funded.
+- Ceilings drift: kimi-k2.7-code advertised 16384 on 2026-08-02 and 262144 on
+  2026-08-03. Read `kaibo models` fresh when pinning; a noted ceiling goes stale.
+
 ### OpenRouter cost + shaping follow-ups (measured $4 GLM consult, 2026-07-03)
 First live `or-glm` consult (GLM-5 explorer / GLM-5.2 synth, 8 whole files attached):
 203 chat turns in 21 min, 18.2M cumulative input tokens (16.4M cache reads) for ~40K
@@ -729,12 +741,6 @@ Remaining OpenRouter-specific forks:
   re-bills at full input price every turn — the preamble is the only cached prefix.
   Upstream rig gap; the fix wants a trailing-message breakpoint like rig's native
   Anthropic path carries.
-- **Per-slot output ceilings vary by pinned slug** (`top_provider.max_completion_tokens`:
-  glm-5.2 32768, kimi-k2.7-code 16384, gpt-5.5 128000) and reasoning bills into the
-  same completion budget — the `[defaults]` 16384 starved a real GLM oneshot answer
-  mid-sentence. Per-slot `max_tokens` already exists; the gap is doctrine: set a synth
-  slot's ceiling from the catalog when pinning a slug, and watch 16384-capped reasoners
-  (kimi) for starvation.
 - **Provider routing variance — data policy shipped, the rest open.** One slug routes
   to multiple upstream hosts differing in cache support, quantization, pricing, and
   parameter fidelity. `provider.data_collection = "deny"` now rides every request by
