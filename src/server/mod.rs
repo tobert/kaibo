@@ -21,12 +21,13 @@ use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, Implementation,
-    JsonObject, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, LoggingLevel,
-    MetaObject, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
-    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
-    ReadResourceResponse, RequestMetaObject, ResourceContents, Resource, ResourceTemplate, Role,
-    ServerCapabilities, ServerInfo, SetLevelRequestParams, GetPromptResult,
+    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+    Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, LoggingLevel, MetaObject, PaginatedRequestParams,
+    ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    RequestMetaObject, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+    ServerInfo, SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -105,6 +106,14 @@ const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
 /// on demand, not in every agent's startup context (the AGENTS.md prompt-writing split:
 /// terse where it's always loaded, generous where it's pulled).
 const TOOLS_URI: &str = "kaibo://tools";
+/// Generated-artifact retrieval by content digest: `kaibo://cas/<sha256-hex>`.
+/// OPERATOR SURFACE ONLY (Amy's ruling, 2026-08-03): the MCP client and CLI read it;
+/// the inner model team never can — the CAS is not mounted into kaish and no
+/// cast-facing tool reads it, because kaibo state spans projects and a browsable CAS
+/// would let one project's team enumerate another's artifacts.
+const CAS_RES_PREFIX: &str = "kaibo://cas/";
+/// The RFC 6570 template `list_resource_templates` advertises for the CAS reads.
+const CAS_URI_TEMPLATE: &str = "kaibo://cas/{digest}";
 /// The system preambles kaibo hands each model-driven phase — explorer, consult
 /// driver, oneshot, and the offline batch/deliberate synth — rendered through the exact
 /// same [`resolve_phase_preamble`](crate::consult::resolve_phase_preamble) seam the live
@@ -201,6 +210,11 @@ pub struct ToolGating {
     /// model-driven tool: no cast, no tool loop, just a GET per backend. Its own gate,
     /// independent of the model-backed tools above.
     pub list_models: bool,
+    /// The `generate` tool (media generation through a cast's `image` slot) — its own
+    /// gate. Beyond this flag it also needs a cast that can staff it AND the media CAS
+    /// on (`[cas] enabled`), since artifacts must have somewhere to land — see
+    /// `live_tools`.
+    pub generate: bool,
 }
 
 impl Default for ToolGating {
@@ -213,6 +227,7 @@ impl Default for ToolGating {
             run_kaish: true,
             batch: true,
             list_models: true,
+            generate: true,
         }
     }
 }
@@ -234,6 +249,7 @@ impl ToolGating {
             "run_kaish" => self.run_kaish,
             "batch_submit" => self.batch,
             "list_models" => self.list_models,
+            "generate" => self.generate,
             _ => true,
         }
     }
@@ -247,6 +263,7 @@ impl ToolGating {
             && !self.run_kaish
             && !self.batch
             && !self.list_models
+            && !self.generate
     }
 }
 
@@ -581,6 +598,29 @@ pub struct ListModelsInput {
     pub backend: Option<String>,
 }
 
+/// Arguments to `generate`: media generation through the cast's `image` slot. No
+/// `path` — generation reads no project (the prompt is the whole input), so there is
+/// nothing to scope to an allowed tree.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateInput {
+    /// What to generate, described in prose.
+    pub prompt: String,
+
+    /// Cast (model team) whose `image` slot generates. Optional — the server default
+    /// applies; the cast must carry an `image` slot (kaibo://config lists casts).
+    #[serde(default)]
+    pub cast: Option<String>,
+
+    /// Provider-native generation options passed through verbatim as string fields
+    /// (Stability: aspect_ratio "16:9", output_format png|jpeg|webp, seed,
+    /// negative_prompt, style_preset, ...). The provider validates its own knobs.
+    /// `prompt` and `model` are reserved: use the prompt parameter and the cast's
+    /// image slot.
+    #[serde(default)]
+    pub fields: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// kaibo's MCP handler. Cheap to clone (rmcp clones it per request).
 #[derive(Clone)]
 pub struct KaiboHandler {
@@ -628,6 +668,18 @@ pub struct KaiboHandler {
     /// [`with_batch_providers`](Self::with_batch_providers) to exercise the submit/poll
     /// handler wiring offline. `Arc<dyn …>` so the derived `Clone` shares one factory.
     batch_providers: Arc<dyn crate::batch::BatchProviderFactory>,
+    /// The media CAS, in whichever mode the lifecycle resolved (see
+    /// [`Config::cas_mode`]): `None` when `[cas] enabled = false`. `new` seeds the
+    /// in-memory store (mirroring how sessions start in-memory);
+    /// [`finalize_media_store`](Self::finalize_media_store) upgrades it to the disk
+    /// store once `main` knows whether persistence actually came up. `Arc` so
+    /// per-request handler clones share one store.
+    media_cas: Option<Arc<crate::cas::MediaStore>>,
+    /// How `generate` builds its media arm — the injection seam mirroring
+    /// `batch_providers`: production seeds [`crate::media::LiveMediaArms`]; tests swap
+    /// in a factory returning a scripted model via
+    /// [`with_media_arms`](Self::with_media_arms).
+    media_arms: Arc<dyn crate::media::MediaArmFactory>,
 }
 
 /// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, the predicate
@@ -691,6 +743,15 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         "a cast pairing an `explorer` slot with an OFFLINE synth (`lane = \"batch\"` or \
          `lane = \"direct\"`) — see the DELIBERATE casts in docs/config.example.toml",
     ),
+    // `generate` runs no reasoning slot at all: it needs the cast's media member. The
+    // media CAS gate ([cas] enabled) rides separately in `live_tools` — this rule is
+    // only the staffing half.
+    (
+        &["generate"],
+        Config::cast_can_generate,
+        "a cast with an `image` slot pointing at a media backend (kind `stability`) — \
+         see the image-slot example in docs/config.example.toml",
+    ),
 ];
 
 /// Inject `casts` as a JSON-Schema `enum` on the `cast` parameter of every
@@ -743,7 +804,7 @@ pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 12] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 13] = [
     "consult",
     "consult_submit",
     "explore",
@@ -751,6 +812,7 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 12] = [
     "oneshot",
     "run_kaish",
     "batch_submit",
+    "generate",
     "job_get",
     "job_cancel",
     "job_list",
@@ -782,7 +844,12 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     let deliberate_live = gating.deliberate && can_staff("deliberate");
     let oneshot_live = gating.oneshot && can_staff("oneshot");
     let batch_live = gating.batch && can_staff("batch_submit");
-    let jobs_live = consult_live || batch_live || deliberate_live;
+    // `generate` needs its flag, a cast with an `image` slot, AND the media CAS on —
+    // an artifact-producing tool with nowhere to put artifacts is not advertised
+    // ([cas] enabled = false is the operator's explicit choice; the startup log and
+    // kaibo://config's [cas] section name it, distinct from the unstaffable warning).
+    let generate_live = gating.generate && can_staff("generate") && config.cas.enabled;
+    let jobs_live = consult_live || batch_live || deliberate_live || generate_live;
 
     [
         (consult_live, "consult"),
@@ -799,6 +866,9 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // No cast, no model: the read-only shell is always staffable.
         (gating.run_kaish, "run_kaish"),
         (batch_live, "batch_submit"),
+        // Media generation through the cast's image slot; a deferred operation mints a
+        // `job-N`, so it is a job producer like the three above.
+        (generate_live, "generate"),
         // The collect verbs follow their producers — see the fn doc. "Live" folds the
         // flag AND staffing together, so a producer nothing can staff keeps them no more
         // than a producer the operator switched off does: neither mints a handle.
@@ -917,6 +987,19 @@ impl KaiboHandler {
             );
         }
 
+        // `generate` has a third gate beyond flag + staffing: the media CAS. When the
+        // operator's `[cas] enabled = false` is what holds it back, say that — it is a
+        // different answer than "nothing can staff it", and the [cas] section of
+        // kaibo://config carries the same fact for a live reader.
+        if gating.generate && !config.cas.enabled {
+            tracing::warn!(
+                tools = "generate",
+                "disabled: the media CAS is off ([cas] enabled = false) — an \
+                 artifact-producing tool needs somewhere to store artifacts. Remove the \
+                 flag and reconnect to bring it back."
+            );
+        }
+
         // Which tools actually survive: the operator's flags AND a cast that can staff
         // each. `live_tools` is the single source — `kaibo://config` reports the same
         // decision, so the resource can never describe a surface this router doesn't serve.
@@ -991,8 +1074,18 @@ impl KaiboHandler {
         // same allocation) for its many `self.config` uses.
         let config = Arc::new(config);
         let resolver = Resolver::from_config(config.clone())?;
+        // The media CAS starts in-memory when enabled — the same posture sessions take
+        // (memory until `main` proves durable state is really available). `main` calls
+        // `finalize_media_store` to upgrade to disk / warn / keep it off; a handler
+        // built for a test that never finalizes holds a working in-memory store.
+        let media_cas = config.cas.enabled.then(|| {
+            Arc::new(crate::cas::MediaStore::Memory(crate::cas::MemoryCas::new(
+                config.cas.max_bytes,
+            )))
+        });
         Ok(Self {
             config,
+            media_cas,
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
@@ -1005,6 +1098,7 @@ impl KaiboHandler {
             resolver,
             // The real network-client builders; tests swap in a scripted double.
             batch_providers: Arc::new(crate::batch::LiveBatchProviders),
+            media_arms: Arc::new(crate::media::LiveMediaArms),
         })
     }
 
@@ -1034,6 +1128,126 @@ impl KaiboHandler {
         self
     }
 
+    /// Settle the media CAS into its final mode, once `main` knows whether persistence
+    /// actually came up — the runtime half of [`Config::cas_mode`]'s derivation
+    /// (Amy's lifecycle ruling: on and disk-backed while persistence is; on but
+    /// in-memory when it's not; `[cas] enabled = false` turns it off).
+    ///
+    /// - **Disk**: open the store at the fixed XDG data dir (never a model-suppliable
+    ///   path), containment-checked against the resolved allowed set. An open failure is
+    ///   a LOUD startup error — crash over a silent fallback to memory, mirroring the
+    ///   session store's posture.
+    /// - **Memory**: keep the in-memory store `new` seeded, and warn SEVERELY: the
+    ///   operator is paying provider credits for artifacts that will not survive a
+    ///   restart, and must hear that at startup, not discover it after one.
+    /// - **Off**: the operator's explicit choice; say so once at info, nothing to build.
+    pub fn finalize_media_store(mut self, persistence_active: bool) -> Result<Self> {
+        match self.config.cas_mode(persistence_active) {
+            crate::config::CasMode::Off => {
+                tracing::info!(
+                    "media CAS disabled ([cas] enabled = false) — artifact-producing tools \
+                     are not advertised"
+                );
+                self.media_cas = None;
+            }
+            crate::config::CasMode::Memory => {
+                let why = if self.config.cas.dir.is_none() {
+                    "no CAS directory resolves (neither $XDG_DATA_HOME nor $HOME is set)"
+                } else {
+                    "persistence is not active this run"
+                };
+                tracing::warn!(
+                    "MEDIA CAS IS IN-MEMORY ONLY: {why}. Generated artifacts are fetchable \
+                     by digest for THIS RUN ONLY and will NOT survive a restart — they cost \
+                     real provider credits and may not be reproducible. kaibo://config shows \
+                     [cas] mode = \"memory\". To store artifacts durably, run with \
+                     persistence enabled (and a resolvable $XDG_DATA_HOME or $HOME)."
+                );
+                // `new` already seeded the in-memory store; nothing to swap.
+            }
+            crate::config::CasMode::Disk => {
+                let dir = self
+                    .config
+                    .cas
+                    .dir
+                    .clone()
+                    .expect("CasMode::Disk implies a resolved dir");
+                let allowed = self.allowed_set();
+                let allowed_refs: Vec<&std::path::Path> =
+                    allowed.iter().map(PathBuf::as_path).collect();
+                let cas = crate::cas::Cas::open(&dir, &allowed_refs, self.config.cas.max_bytes)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to open the media CAS at {}: {e}\nkaibo never \
+                                 invents a different path and never falls back silently to \
+                                 memory. Point [cas] dir somewhere outside every allowed \
+                                 tree, or set [cas] enabled = false to run without it.",
+                            dir.display()
+                        )
+                    })?;
+                tracing::info!(
+                    cas_dir = %dir.display(),
+                    "media CAS on disk — generated artifacts are durable across restarts"
+                );
+                self.media_cas = Some(Arc::new(crate::cas::MediaStore::Disk(cas)));
+            }
+        }
+        Ok(self)
+    }
+
+    /// The mode the handler's media store is *actually* in right now — what the
+    /// `kaibo://config` render reports. Derived from the live field, not re-derived
+    /// from config, so the resource can never describe a store the handler doesn't hold.
+    fn live_cas_mode(&self) -> crate::config::CasMode {
+        match self.media_cas.as_deref() {
+            None => crate::config::CasMode::Off,
+            Some(crate::cas::MediaStore::Disk(_)) => crate::config::CasMode::Disk,
+            Some(crate::cas::MediaStore::Memory(_)) => crate::config::CasMode::Memory,
+        }
+    }
+
+    /// The live media store, if the CAS is enabled — for tests and diagnostics.
+    pub fn media_store(&self) -> Option<&Arc<crate::cas::MediaStore>> {
+        self.media_cas.as_ref()
+    }
+
+    /// Serve one `kaibo://cas/<digest>` read: the artifact's bytes as a base64 blob
+    /// stamped with its mime. The retrieval half of the `generate` contract — the tool
+    /// returns digests, this resource returns the bytes, and only to the operator
+    /// surface (the MCP client / CLI caller); the inner model team has no path here.
+    /// The digest is validated before it goes anywhere near a lookup
+    /// ([`crate::cas::Digest::from_hex`] — 64 lowercase hex or refused), a missing
+    /// object is a clean not-found, and a corrupt or unreadable object is a loud error,
+    /// never folded into "not found".
+    fn read_cas_resource(&self, hex: &str, uri: &str) -> Result<ReadResourceResponse, McpError> {
+        let Some(store) = &self.media_cas else {
+            return Err(McpError::resource_not_found(
+                "the media CAS is disabled ([cas] enabled = false); no artifacts are held"
+                    .to_string(),
+                None,
+            ));
+        };
+        let digest = crate::cas::Digest::from_hex(hex)
+            .map_err(|e| McpError::invalid_params(format!("{e} (in {uri})"), None))?;
+        match store.get(&digest) {
+            Ok(Some((bytes, ext))) => {
+                use base64::Engine as _;
+                let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
+                Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+                    vec![ResourceContents::blob(blob, uri).with_mime_type(ext.mime())],
+                )))
+            }
+            Ok(None) => Err(McpError::resource_not_found(
+                format!(
+                    "no artifact with digest {hex} — it was never generated on this \
+                     store, or (in memory mode) it did not survive a restart"
+                ),
+                None,
+            )),
+            Err(e) => Err(McpError::internal_error(format!("{e}"), None)),
+        }
+    }
+
     /// Swap in a batch-provider factory — the seam that lets tests drive the batch
     /// handlers (`batch_submit`, `deliberate`'s batch lane, the `job_*` batch arms) with a
     /// scripted double instead of real network clients. A builder, like
@@ -1044,6 +1258,16 @@ impl KaiboHandler {
         providers: Arc<dyn crate::batch::BatchProviderFactory>,
     ) -> Self {
         self.batch_providers = providers;
+        self
+    }
+
+    /// Swap in a media-arm factory — the seam that lets tests drive the `generate`
+    /// lane (sync store-and-answer, the deferred job, the CAS resource) with a
+    /// scripted [`crate::media::MediaModel`] instead of a real provider client. A
+    /// builder, like [`with_batch_providers`](Self::with_batch_providers).
+    #[cfg(test)]
+    pub fn with_media_arms(mut self, arms: Arc<dyn crate::media::MediaArmFactory>) -> Self {
+        self.media_arms = arms;
         self
     }
 
@@ -2003,9 +2227,9 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(format_output(
-            &out,
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            format_output(&out),
+        )]))
     }
 
     #[tool(
@@ -2035,8 +2259,10 @@ impl KaiboHandler {
             None => self.config.backends.keys().cloned().collect(),
         };
 
-        let mut results: std::collections::BTreeMap<String, Result<Vec<crate::discover::DiscoveredModel>, String>> =
-            std::collections::BTreeMap::new();
+        let mut results: std::collections::BTreeMap<
+            String,
+            Result<Vec<crate::discover::DiscoveredModel>, String>,
+        > = std::collections::BTreeMap::new();
         for name in names {
             // A backend resolved above always resolves again here (nothing mutates
             // the registry mid-call); skip defensively rather than panic if that
@@ -2241,6 +2467,170 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Generate an image from a text prompt with the cast's `image` \
+            model (a media backend, e.g. Stability). Bytes are never inlined: each \
+            artifact lands in kaibo's content-addressed media store and the result \
+            lists per-artifact digests — a kaibo://cas/<digest> resource URI, the mime, \
+            the provider's seed, and the real file path when the store is on disk. \
+            Provider-native options (aspect_ratio, output_format, seed, \
+            negative_prompt, style_preset, ...) pass through `fields` verbatim. An \
+            operation the provider declares deferred returns a `job-N` handle for \
+            job_wait/job_get instead (today's Stability routes all answer in-call). \
+            Provenance (prompt, model, cast, seed) is recorded beside every artifact."
+    )]
+    pub async fn generate(
+        &self,
+        Parameters(input): Parameters<GenerateInput>,
+    ) -> Result<CallToolResult, McpError> {
+        // The route is dropped when the CAS is off, so this arm is a belt for a direct
+        // caller that bypasses the advertised list.
+        let Some(store) = self.media_cas.clone() else {
+            return Err(McpError::invalid_params(
+                "the media CAS is disabled ([cas] enabled = false), so `generate` has \
+                 nowhere to store artifacts. Re-enable it (or remove the flag) and \
+                 reconnect."
+                    .to_string(),
+                None,
+            ));
+        };
+        let cast = self.resolve_cast(input.cast)?;
+        let Some(slot) = cast.slot(ModelRole::Image) else {
+            return Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` has no `image` slot — `generate` needs a cast whose \
+                     `image` slot points at a media backend (kind `stability`). \
+                     kaibo://config lists the configured casts and their slots.",
+                    cast.name
+                ),
+                None,
+            ));
+        };
+        // Slot backend refs are resolved at config load, so a miss here is kaibo's
+        // inconsistency, not the caller's parameter mistake.
+        let backend = self
+            .config
+            .resolve_backend(&slot.backend)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        // Building the arm resolves the provider key — a missing key is the operator's
+        // setup gap, reported cleanly with the cast and slot named.
+        let arm = self.media_arms.build(backend, slot).map_err(|e| {
+            McpError::invalid_params(format!("cast `{}` image slot: {e:#}", cast.name), None)
+        })?;
+        let fields: Vec<(String, String)> = input.fields.unwrap_or_default().into_iter().collect();
+        // Reserved keys: recorded provenance must describe the request that actually
+        // ran. `fields.prompt` would send prompt B while the sidecar records prompt A,
+        // and `fields.model` would reroute an SD3 call while the sidecar records the
+        // slot's model — so both are refused loudly, pointing at the real parameter.
+        for (key, param) in [
+            ("prompt", "the `prompt` parameter"),
+            (
+                "model",
+                "the cast's `image` slot (its model id picks the route/variant)",
+            ),
+        ] {
+            if fields.iter().any(|(name, _)| name == key) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "`fields.{key}` is reserved — it would make the recorded \
+                         provenance disagree with the request that ran. Set it through \
+                         {param} instead."
+                    ),
+                    None,
+                ));
+            }
+        }
+        let request = crate::media::MediaRequest {
+            prompt: input.prompt.clone(),
+            fields,
+            input_image: None,
+        };
+        let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
+        match arm.generate(&request).instrument(span).await {
+            Ok(crate::media::MediaOutcome::Complete(artifacts)) => {
+                let rendered = match store_generated_artifacts(
+                    &store,
+                    &artifacts,
+                    &input.prompt,
+                    arm.slot_ref(),
+                    &cast.name,
+                ) {
+                    Ok(text) => text,
+                    Err(e) => return Ok(consultation_failed("generate", &cast.name, e)),
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    with_provenance(
+                        rendered,
+                        &cast.name,
+                        &[("image", arm.slot_ref())],
+                        &Usage::new(),
+                    ),
+                )]))
+            }
+            // The provider declared this operation deferred: hand back a `job-N` on the
+            // existing collect verbs, with a background task owning the poll cadence.
+            // The lane split follows the operation's DECLARED shape (see
+            // stability::Operation::shape), never a sniffed response.
+            Ok(crate::media::MediaOutcome::Deferred(provider_job)) => {
+                let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
+                let label = format!("generate · cast {} · image {}", cast.name, arm.slot_ref());
+                let prompt = input.prompt.clone();
+                let cast_name = cast.name.clone();
+                let slot_ref = arm.slot_ref().to_string();
+                let deadline = self.config.defaults.call_deadline;
+                let poll_arm = arm.clone();
+                let id = self.jobs.submit(label, progress_log, async move {
+                    let started = tokio::time::Instant::now();
+                    loop {
+                        match poll_arm.poll(&provider_job).await {
+                            Ok(crate::media::MediaPollOutcome::Complete(artifacts)) => {
+                                let text = store_generated_artifacts(
+                                    &store, &artifacts, &prompt, &slot_ref, &cast_name,
+                                )
+                                .map_err(|e| {
+                                    consultation_failure_text("generate", &cast_name, e)
+                                })?;
+                                return Ok(JobResult {
+                                    answer: with_provenance(
+                                        text,
+                                        &cast_name,
+                                        &[("image", &slot_ref)],
+                                        &Usage::new(),
+                                    ),
+                                    report: None,
+                                });
+                            }
+                            Ok(crate::media::MediaPollOutcome::Pending) => {
+                                if started.elapsed() > deadline {
+                                    return Err(format!(
+                                        "still pending after {}s (the call_deadline \
+                                         budget) — provider job id `{}` may still \
+                                         finish on the provider's side, but kaibo has \
+                                         stopped polling it",
+                                        deadline.as_secs(),
+                                        provider_job.0
+                                    ));
+                                }
+                                tokio::time::sleep(GENERATE_POLL_INTERVAL).await;
+                            }
+                            Err(e) => {
+                                return Err(consultation_failure_text("generate", &cast_name, e))
+                            }
+                        }
+                    }
+                });
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Deferred: `{id}` — the provider is generating in the background \
+                     (cast `{}`, image `{}`). Collect it with `job_get {id}` or park on \
+                     `job_wait`; stop it with `job_cancel {id}`.",
+                    cast.name,
+                    arm.slot_ref()
+                ))]))
+            }
+            Err(e) => Ok(consultation_failed("generate", &cast.name, e)),
+        }
+    }
+
+    #[tool(
         description = "Collect async work by handle — a batch (`backend/provider-id`) \
             or a background job (`job-N`). Returns a progress line while it runs, the \
             full result once done (batches: every item's answer, per-item failures \
@@ -2282,8 +2672,8 @@ impl KaiboHandler {
             }
             None => Err(McpError::invalid_params(
                 format!(
-                    "no consultation job `{}` — it may have finished and been evicted by \
-                     newer submits, been canceled, or never existed. Consult job ids look \
+                    "no background job `{}` — it may have finished and been evicted by \
+                     newer submits, been canceled, or never existed. Job ids look \
                      like `job-1` and live only for this server session.",
                     input.handle
                 ),
@@ -2319,16 +2709,18 @@ impl KaiboHandler {
             ))]));
         }
         self.ensure_consult_enabled(&input.handle)?;
+        // Producer-neutral wording throughout: a `job-N` may be a consultation, a
+        // deliberation, or a deferred generation — the handle doesn't say which.
         let msg = match self.jobs.cancel(&input.handle) {
-            CancelOutcome::Canceled => format!("Canceled consultation `{}`.", input.handle),
+            CancelOutcome::Canceled => format!("Canceled job `{}`.", input.handle),
             CancelOutcome::AlreadyFinished => format!(
-                "Consultation `{}` had already finished — `job_get` it for the answer.",
+                "Job `{}` had already finished — `job_get` it for the result.",
                 input.handle
             ),
             CancelOutcome::Unknown => {
                 return Err(McpError::invalid_params(
                     format!(
-                        "no consultation job `{}` to cancel — it may have finished and \
+                        "no background job `{}` to cancel — it may have finished and \
                          been evicted, or never existed.",
                         input.handle
                     ),
@@ -2352,9 +2744,11 @@ impl KaiboHandler {
     ) -> Result<CallToolResult, McpError> {
         let mut sections: Vec<String> = Vec::new();
 
-        // In-memory jobs first — this session. `consult_submit` AND `deliberate`'s direct
-        // lane both land here, so show the section when either produces jobs.
-        if self.config.tools.consult || self.config.tools.deliberate {
+        // In-memory jobs first — this session. `consult_submit`, `deliberate`'s direct
+        // lane, and deferred `generate` all land here, so the section shows whenever any
+        // producer is live — the same predicate the `job-N` collect guard uses
+        // (`job_producer_live`), so a server never accepts handles it won't list.
+        if self.job_producer_live() {
             sections.push(render_jobs_section(&self.jobs.list()));
         }
 
@@ -2582,12 +2976,9 @@ impl KaiboHandler {
             batch_lines.push(line);
         }
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(render_wait(
-            &records,
-            &batch_lines,
-            &self.jobs,
-            timeout,
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            render_wait(&records, &batch_lines, &self.jobs, timeout),
+        )]))
     }
 
     /// Refuse a batch-shaped handle only when *no tool that produces one* is enabled —
@@ -2607,17 +2998,32 @@ impl KaiboHandler {
         ))
     }
 
+    /// Whether any producer of in-memory `job-N` handles is live on this server:
+    /// `consult_submit`, `deliberate`'s direct lane, or a deferred `generate`. The ONE
+    /// predicate behind both the `job_list` in-memory section and the `job-N` collect
+    /// guard, so the section a server renders and the handles it accepts can't drift.
+    /// `generate` is judged by route liveness, not its bare flag: the flag defaults on
+    /// but the tool only mints a `job-N` when it is actually advertised (a cast can
+    /// staff it AND the media CAS is on), and a stock install has neither — the flag
+    /// alone would claim producers on servers where generate can't run.
+    fn job_producer_live(&self) -> bool {
+        self.config.tools.consult
+            || self.config.tools.deliberate
+            || self.tool_router.has_route("generate")
+    }
+
     /// Refuse a `job-N` handle only when no tool that produces one is enabled. A `job-N`
-    /// comes from `consult_submit` OR `deliberate`'s direct lane, so either keeps it
-    /// collectible.
+    /// comes from `consult_submit`, `deliberate`'s direct lane, OR a deferred `generate`,
+    /// so any of the three keeps it collectible.
     fn ensure_consult_enabled(&self, handle: &str) -> Result<(), McpError> {
-        if self.config.tools.consult || self.config.tools.deliberate {
+        if self.job_producer_live() {
             return Ok(());
         }
         Err(McpError::invalid_params(
             format!(
                 "`{handle}` looks like a background job (`job-N`), but nothing that \
-                 produces one is enabled on this server (--no-consult --no-deliberate)."
+                 produces one is enabled on this server (--no-consult --no-deliberate \
+                 --no-generate)."
             ),
             None,
         ))
@@ -2643,8 +3049,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         )
         // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
         .with_server_info(
-            Implementation::new("kaibo", env!("CARGO_PKG_VERSION"))
-                .with_title("kaibo"),
+            Implementation::new("kaibo", env!("CARGO_PKG_VERSION")).with_title("kaibo"),
         )
         .with_protocol_version(ProtocolVersion::LATEST)
         // Judge provider usability from the live environment so a fresh install
@@ -2692,7 +3097,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult {
-            resource_templates: kaibo_resource_templates(),
+            resource_templates: kaibo_resource_templates(self.media_cas.is_some()),
             ..Default::default()
         })
     }
@@ -2702,6 +3107,12 @@ impl rmcp::ServerHandler for KaiboHandler {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
+        // Generated-artifact reads by digest — handled here, not in the pure dispatch,
+        // because they need the handler's live media store. Operator surface only: MCP
+        // resources reach the client, never the inner model team.
+        if let Some(hex) = request.uri.strip_prefix(CAS_RES_PREFIX) {
+            return self.read_cas_resource(hex, &request.uri);
+        }
         // Compute the runtime-derived worktree set here (it needs the handler's
         // allowed_set and reflects worktrees that exist *now*); the renderer is a
         // pure function of its inputs, so it can't reach back for this itself.
@@ -2714,6 +3125,7 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.resolver.default_root_inferred(),
             self.followed_worktrees(),
             self.sessions.store().is_some(),
+            self.live_cas_mode(),
         )
     }
 
@@ -2733,7 +3145,8 @@ impl rmcp::ServerHandler for KaiboHandler {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, McpError> {
-        kaibo_prompt_messages(&request.name, request.arguments.as_ref()).map(GetPromptResponse::Complete)
+        kaibo_prompt_messages(&request.name, request.arguments.as_ref())
+            .map(GetPromptResponse::Complete)
     }
 }
 
@@ -2952,12 +3365,14 @@ fn kaibo_prompt_messages(
             // Blank/whitespace-vs-absent is normalized in `append_configure_goal` (the
             // one gate both this MCP path and the CLI's `run_configure` go through), so
             // this just extracts the raw value.
-            let goal = arguments.and_then(|a| a.get("goal")).and_then(|v| v.as_str());
+            let goal = arguments
+                .and_then(|a| a.get("goal"))
+                .and_then(|v| v.as_str());
             Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    Role::User,
-                    configure_prompt_text(goal),
-                )])
-                .with_description("Configure kaibo's models for this codebase"))
+                Role::User,
+                configure_prompt_text(goal),
+            )])
+            .with_description("Configure kaibo's models for this codebase"))
         }
         other => Err(McpError::invalid_params(
             format!("unknown prompt {other:?}; kaibo offers: {CONFIGURE_PROMPT_NAME}"),
@@ -3006,7 +3421,7 @@ pub(crate) fn configure_prompt_text_cli(goal: Option<&str>) -> String {
 
 /// The URI templates kaibo advertises: per-builtin help and per-cast prompts, each
 /// addressed by name.
-fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
+fn kaibo_resource_templates(cas_on: bool) -> Vec<rmcp::model::ResourceTemplate> {
     let builtin = ResourceTemplate::new(BUILTIN_URI_TEMPLATE, "kaish builtin help")
         .with_description(
             "Help for a single kaish builtin — parameters and examples. \
@@ -3019,7 +3434,20 @@ fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
              `preamble`s folded in as a live call resolves them. e.g. kaibo://prompts/deepseek",
         )
         .with_mime_type("text/markdown");
-    vec![builtin, prompts]
+    let mut templates = vec![builtin, prompts];
+    // Advertised only while a media store exists — a template whose every read would
+    // error is the resource-shaped version of the unstaffable-tool lie the staffing
+    // gate exists to prevent.
+    if cas_on {
+        templates.push(
+            ResourceTemplate::new(CAS_URI_TEMPLATE, "kaibo: generated artifact by digest")
+                .with_description(
+                    "One generated artifact's bytes, addressed by the content digest a \
+                     `generate` result returned (64 lowercase hex).",
+                ),
+        );
+    }
+    templates
 }
 
 /// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
@@ -3186,6 +3614,20 @@ This is a fire-and-forget lane. Submit, then go do other work — don't sit in a
 poll/sleep loop holding your turn open. `job_wait` when you're ready to spend a minute;
 `job_get`/`job_list` are the source of truth. Nothing here wakes you, and nothing is lost
 by waiting — the handles keep.
+
+## Generate media: `generate`
+
+`generate` turns a text prompt into an image through the cast's `image` slot (a media
+backend such as Stability). It is advertised only when a configured cast carries that
+slot and the media CAS is on. The result is never inline bytes: each artifact lands in
+kaibo's content-addressed store and you get its digest as a `kaibo://cas/<digest>`
+resource URI (read it as an MCP resource for the bytes), the mime, the provider's seed,
+and — when the store is on disk — the real file path. Provider-native options ride the
+`fields` object verbatim (Stability: `aspect_ratio` \"16:9\", `output_format`
+png|jpeg|webp, `seed`, `negative_prompt`, `style_preset`). An operation the provider
+declares deferred hands back a `job-N` on the same collect verbs above — the lane is
+wired, though every Stability generate route today answers in-call. Every artifact gets
+a provenance sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
 
 ## Driving the read-only shell (`run_kaish`)
 
@@ -3362,6 +3804,112 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
     out
 }
 
+/// How often a deferred `generate` job re-polls its provider. The provider owns no
+/// cadence (`MediaModel::poll` is one shot by contract); this background job does,
+/// bounded overall by `[defaults] call_deadline`.
+const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Store every artifact of one completed generation in the media store and render the
+/// per-artifact result lines: `kaibo://cas/<digest>`, the mime, the provider seed when
+/// reported, and the real file path in disk mode. One provenance sidecar per artifact
+/// (each has its own digest — the one-to-many consequence of
+/// [`crate::media::MediaOutcome::Complete`] carrying a list). An empty list is refused:
+/// a provider reporting success with nothing attached is that provider's bug, surfaced
+/// loudly rather than rendered as an empty success.
+///
+/// The artifacts are paid for, so partial failure is handled in two layers (or-gpt
+/// review, 2026-08-03). First, the WHOLE list is prevalidated — every mime must map
+/// onto the store's closed on-disk set — before the first byte is written, so a list
+/// with one unstorable member stores *nothing* instead of storing some and then
+/// erroring with their digests discarded. Second, a store failure that can only occur
+/// mid-loop (I/O, the soft cap) returns an error that NAMES the digests already
+/// stored: they exist, they were paid for, and they stay retrievable by those
+/// addresses — an error that hid them would orphan them.
+fn store_generated_artifacts(
+    store: &crate::cas::MediaStore,
+    artifacts: &[crate::media::MediaArtifact],
+    prompt: &str,
+    model: &str,
+    cast: &str,
+) -> Result<String> {
+    use anyhow::{anyhow, ensure};
+    ensure!(
+        !artifacts.is_empty(),
+        "the provider reported a completed generation with zero artifacts"
+    );
+    // Prevalidate every mime up front — an unknown format is refused rather than
+    // written under an invented extension (the same argument
+    // stability::MediaType::to_cas_extension records at length), and refusing BEFORE
+    // the first put is what keeps a mixed list all-or-nothing at this layer.
+    let exts: Vec<crate::cas::Extension> = artifacts
+        .iter()
+        .enumerate()
+        .map(|(i, artifact)| {
+            crate::cas::Extension::from_mime(&artifact.mime).ok_or_else(|| {
+                anyhow!(
+                    "artifact {} has mime {:?}, which the media store cannot name on \
+                     disk yet — refusing the whole result rather than storing it under \
+                     an invented extension; nothing was stored",
+                    i + 1,
+                    artifact.mime
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
+    let timestamp = now_epoch_secs();
+    let mut lines = vec![format!(
+        "Generated {} artifact{}:",
+        artifacts.len(),
+        if artifacts.len() == 1 { "" } else { "s" }
+    )];
+    let mut stored: Vec<String> = Vec::new();
+    for (i, (artifact, ext)) in artifacts.iter().zip(exts).enumerate() {
+        let provenance = crate::cas::Provenance {
+            prompt: prompt.to_string(),
+            model: model.to_string(),
+            cast: cast.to_string(),
+            timestamp,
+            mime: artifact.mime.clone(),
+            seed: artifact.seed.clone(),
+        };
+        let digest =
+            store
+                .put(&artifact.bytes, ext, &provenance)
+                .map_err(|e| match stored.is_empty() {
+                    true => anyhow!("storing artifact {}: {e} — nothing was stored", i + 1),
+                    false => anyhow!(
+                        "storing artifact {} of {}: {e}. The artifact{} stored before the \
+                     failure {} paid for and retrievable: {}",
+                        i + 1,
+                        artifacts.len(),
+                        if stored.len() == 1 { "" } else { "s" },
+                        if stored.len() == 1 {
+                            "remains"
+                        } else {
+                            "remain"
+                        },
+                        stored
+                            .iter()
+                            .map(|hex| format!("{CAS_RES_PREFIX}{hex}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                })?;
+        let hex = digest.to_hex();
+        let mut line = format!("{}. {CAS_RES_PREFIX}{hex} ({}", i + 1, artifact.mime);
+        if let Some(seed) = &artifact.seed {
+            line.push_str(&format!(", seed {seed}"));
+        }
+        line.push(')');
+        if let Some(path) = store.path_for(&digest) {
+            line.push_str(&format!("\n   path: {}", path.display()));
+        }
+        lines.push(line);
+        stored.push(hex);
+    }
+    Ok(lines.join("\n"))
+}
+
 /// Read one kaibo resource by URI, with the runtime config and allowed set threaded
 /// in for `kaibo://config`. The pure path (kaish/*, sandbox) routes through
 /// `render_resource` (line below); the config arm renders via `render_config_resource`.
@@ -3381,14 +3929,15 @@ fn read_kaibo_resource_with_config(
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
+    cas_mode: crate::config::CasMode,
 ) -> Result<ReadResourceResponse, McpError> {
     if uri == PROMPTS_URI {
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(
                 render_prompts_resource(config, None),
                 uri,
-            ),
-        ])));
+            )],
+        )));
     }
     if let Some(name) = uri.strip_prefix(PROMPTS_CAST_PREFIX) {
         // `kaibo://prompts/<cast>` — the cast's resolved framing (name or alias). An
@@ -3397,12 +3946,12 @@ fn read_kaibo_resource_with_config(
         let cast = config
             .resolve_cast(name)
             .map_err(|e| McpError::resource_not_found(format!("{e:#} (in {uri})"), None))?;
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(
                 render_prompts_resource(config, Some(cast)),
                 uri,
-            ),
-        ])));
+            )],
+        )));
     }
     if uri == CONFIG_URI {
         let body = render_config_resource(
@@ -3412,22 +3961,23 @@ fn read_kaibo_resource_with_config(
             default_root_inferred,
             followed_worktrees,
             persistence_active,
+            cas_mode,
         );
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(body, uri),
-        ])));
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(body, uri)],
+        )));
     }
     if uri == CONFIG_EXAMPLE_URI {
         // Static, config-independent — the embedded template verbatim.
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(CONFIG_EXAMPLE_TOML, uri),
-        ])));
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(CONFIG_EXAMPLE_TOML, uri)],
+        )));
     }
     let body = render_resource(uri, schemas)
         .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
-    Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-        ResourceContents::text(body, uri),
-    ])))
+    Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+        vec![ResourceContents::text(body, uri)],
+    )))
 }
 
 /// The MCP token the client attached for progress, if any. Per the spec, progress
@@ -3506,7 +4056,7 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{NumberOrString, ContentBlock};
+    use rmcp::model::{ContentBlock, NumberOrString};
     use rmcp::ServerHandler;
     use serde_json::json;
 
@@ -3904,11 +4454,705 @@ mod tests {
     /// want a usable cast declare a `key_optional = true` backend (no credential needed);
     /// everything else resolves to `Unconfigured` and drops out.
     fn hermetic_handler_from_toml(toml: &str) -> KaiboHandler {
-        KaiboHandler::new_with_env(
-            Config::from_toml_str(toml).expect("config parses"),
-            |_| None,
-        )
+        KaiboHandler::new_with_env(Config::from_toml_str(toml).expect("config parses"), |_| {
+            None
+        })
         .expect("handler builds")
+    }
+
+    /// The media-CAS lifecycle on the handler: `new` seeds the in-memory store when
+    /// the CAS is enabled (mirroring sessions-start-in-memory) and holds nothing when
+    /// `[cas] enabled = false`; `finalize_media_store` upgrades to disk exactly when
+    /// persistence is active, keeps memory when it is not, and refuses a CAS dir
+    /// inside an allowed tree the same way the session store does.
+    #[test]
+    fn media_store_lifecycle_memory_disk_and_off() {
+        use crate::config::CasMode;
+
+        // Enabled (default): a working in-memory store from construction.
+        let h = handler();
+        assert_eq!(h.live_cas_mode(), CasMode::Memory);
+        assert!(h.media_store().is_some());
+
+        // Explicitly disabled: no store at all.
+        let off = handler_from_toml("[cas]\nenabled = false\n");
+        assert_eq!(off.live_cas_mode(), CasMode::Off);
+        assert!(off.media_store().is_none());
+        // Finalize keeps it off even with persistence active — the off switch wins.
+        let off = off.finalize_media_store(true).expect("finalize");
+        assert_eq!(off.live_cas_mode(), CasMode::Off);
+
+        // Persistence inactive: finalize keeps the in-memory store (the warned mode).
+        let h = handler().finalize_media_store(false).expect("finalize");
+        assert_eq!(h.live_cas_mode(), CasMode::Memory);
+
+        // Persistence active + a dir outside every allowed tree: disk, rooted there.
+        let cas_dir = tempfile::tempdir().unwrap();
+        let toml = format!("[cas]\ndir = \"{}\"\n", cas_dir.path().display());
+        let h = handler_from_toml(&toml)
+            .finalize_media_store(true)
+            .expect("finalize opens the disk store");
+        assert_eq!(h.live_cas_mode(), CasMode::Disk);
+        assert_eq!(
+            h.media_store().unwrap().root().unwrap(),
+            cas_dir.path(),
+            "the disk store roots at the configured dir"
+        );
+    }
+
+    /// A CAS dir that resolves inside an allowed project tree is refused at finalize —
+    /// loudly, with the escape hatches named — never opened and never silently moved.
+    #[test]
+    fn media_store_refuses_a_cas_dir_inside_an_allowed_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "[server]\nroot = \"{r}\"\n[cas]\ndir = \"{r}/cas\"\n",
+            r = root.path().display()
+        );
+        let Err(err) = handler_from_toml(&toml).finalize_media_store(true) else {
+            panic!("a CAS inside the project must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("media CAS") && msg.contains("enabled = false"),
+            "the error names the store and an escape hatch, got: {msg}"
+        );
+    }
+
+    // --- The generate lane, driven offline through the media-arm seam -----------
+
+    /// A cast that can staff `generate`: a keyless (placeholder-credential) stability
+    /// backend plus an image-only cast. The scripted factory below never dials it.
+    const MEDIA_CAST_TOML: &str = r#"
+        [backends.sd]
+        kind = "stability"
+        key_optional = true
+
+        [casts.artist]
+        image = "sd/core"
+    "#;
+
+    /// A factory handing every build the same scripted [`crate::media::MediaModel`] —
+    /// the offline double for the whole generate lane (CAS writes, job lane, render).
+    struct ScriptedMediaArms(Arc<dyn crate::media::MediaModel>);
+
+    impl crate::media::MediaArmFactory for ScriptedMediaArms {
+        fn build(
+            &self,
+            _backend: &Backend,
+            slot: &ModelSlot,
+        ) -> anyhow::Result<crate::media::MediaArm> {
+            Ok(crate::media::MediaArm::new(
+                self.0.clone(),
+                slot.qualified(),
+            ))
+        }
+    }
+
+    /// Completes synchronously with a fixed artifact list.
+    struct SyncArtifacts(Vec<crate::media::MediaArtifact>);
+
+    #[async_trait::async_trait]
+    impl crate::media::MediaModel for SyncArtifacts {
+        async fn generate(
+            &self,
+            _request: &crate::media::MediaRequest,
+        ) -> anyhow::Result<crate::media::MediaOutcome> {
+            Ok(crate::media::MediaOutcome::Complete(self.0.clone()))
+        }
+
+        async fn poll(
+            &self,
+            _job: &crate::media::MediaJobId,
+        ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+            unreachable!("a sync generation is never polled")
+        }
+    }
+
+    /// Defers on generate; the poll is pending once, then completes.
+    struct DeferredArtifacts {
+        artifacts: Vec<crate::media::MediaArtifact>,
+        polls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media::MediaModel for DeferredArtifacts {
+        async fn generate(
+            &self,
+            _request: &crate::media::MediaRequest,
+        ) -> anyhow::Result<crate::media::MediaOutcome> {
+            Ok(crate::media::MediaOutcome::Deferred(
+                crate::media::MediaJobId("prov-77".to_string()),
+            ))
+        }
+
+        async fn poll(
+            &self,
+            job: &crate::media::MediaJobId,
+        ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+            assert_eq!(job.0, "prov-77", "the provider id round-trips to the poll");
+            let mut n = self.polls.lock().unwrap();
+            *n += 1;
+            Ok(if *n == 1 {
+                crate::media::MediaPollOutcome::Pending
+            } else {
+                crate::media::MediaPollOutcome::Complete(self.artifacts.clone())
+            })
+        }
+    }
+
+    fn png(bytes: &[u8]) -> crate::media::MediaArtifact {
+        crate::media::MediaArtifact {
+            bytes: bytes.to_vec(),
+            mime: "image/png".to_string(),
+            seed: Some("42".to_string()),
+        }
+    }
+
+    fn media_handler(model: Arc<dyn crate::media::MediaModel>) -> KaiboHandler {
+        hermetic_handler_from_toml(MEDIA_CAST_TOML)
+            .with_media_arms(Arc::new(ScriptedMediaArms(model)))
+    }
+
+    /// The sync lane: a completed generation stores EVERY artifact in the media store
+    /// (its own digest and provenance each — the one-to-many contract) and answers with
+    /// per-artifact `kaibo://cas/<digest>` URIs, never inline bytes. Memory mode, so no
+    /// `path:` lines.
+    #[tokio::test]
+    async fn generate_stores_every_artifact_and_returns_digests() {
+        let a1 = png(b"first-artifact");
+        let mut a2 = png(b"second-artifact");
+        a2.mime = "image/webp".to_string();
+        a2.seed = None;
+        let h = media_handler(Arc::new(SyncArtifacts(vec![a1.clone(), a2.clone()])));
+        let result = h
+            .generate(Parameters(GenerateInput {
+                prompt: "a lighthouse at dusk".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("generate succeeds");
+        assert_ne!(result.is_error, Some(true), "not a tool error");
+        let text = result_text(result);
+
+        let store = h.media_store().expect("cas on");
+        for (artifact, ext) in [
+            (&a1, crate::cas::Extension::Png),
+            (&a2, crate::cas::Extension::Webp),
+        ] {
+            let digest = crate::cas::Digest::of_bytes(&artifact.bytes);
+            assert!(
+                text.contains(&format!("kaibo://cas/{}", digest.to_hex())),
+                "the answer names each artifact's digest URI:\n{text}"
+            );
+            assert_eq!(
+                store.get(&digest).expect("readable"),
+                Some((artifact.bytes.clone(), ext)),
+                "the bytes are in the store under their own digest"
+            );
+        }
+        assert!(
+            text.contains("seed 42"),
+            "the provider seed is echoed:\n{text}"
+        );
+        assert!(
+            !text.contains("path:"),
+            "memory mode has no filesystem path to name:\n{text}"
+        );
+        assert!(
+            text.contains("cast `artist`") && text.contains("sd/core"),
+            "the provenance footer names the cast and image model:\n{text}"
+        );
+    }
+
+    /// Provenance sidecars are per-artifact: the prompt, the image slot ref, the cast,
+    /// the mime, and the provider seed all land beside the object.
+    #[tokio::test]
+    async fn generate_records_provenance_beside_each_artifact() {
+        let artifact = png(b"provenanced");
+        let h = media_handler(Arc::new(SyncArtifacts(vec![artifact.clone()])));
+        h.generate(Parameters(GenerateInput {
+            prompt: "a red door".to_string(),
+            cast: Some("artist".to_string()),
+            fields: None,
+        }))
+        .await
+        .expect("generate succeeds");
+
+        let digest = crate::cas::Digest::of_bytes(&artifact.bytes);
+        let Some(crate::cas::MediaStore::Memory(mem)) = h.media_store().map(Arc::as_ref) else {
+            panic!("test handler holds the in-memory store");
+        };
+        let prov = mem.provenance(&digest).expect("sidecar recorded");
+        assert_eq!(prov.prompt, "a red door");
+        assert_eq!(prov.model, "sd/core");
+        assert_eq!(prov.cast, "artist");
+        assert_eq!(prov.mime, "image/png");
+        assert_eq!(prov.seed.as_deref(), Some("42"));
+    }
+
+    /// The deferred lane: the declared-deferred outcome becomes a `job-N` on the
+    /// existing collect verbs; the background task owns the poll cadence
+    /// (pending → sleep → complete) and the finished job's answer carries the digest
+    /// URIs, with the artifacts landed in the store. `start_paused` auto-advances the
+    /// poll interval's sleep.
+    #[tokio::test(start_paused = true)]
+    async fn generate_deferred_returns_a_job_that_collects_digests() {
+        let artifact = png(b"deferred-artifact");
+        let mut second = png(b"second-deferred-artifact");
+        second.mime = "image/webp".to_string();
+        let h = media_handler(Arc::new(DeferredArtifacts {
+            artifacts: vec![artifact.clone(), second.clone()],
+            polls: std::sync::Mutex::new(0),
+        }));
+        let result = h
+            .generate(Parameters(GenerateInput {
+                prompt: "slow art".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("submit succeeds");
+        let ack = result_text(result);
+        assert!(
+            ack.contains("job-") && ack.contains("job_get"),
+            "the ack hands back a job handle and the collect verb:\n{ack}"
+        );
+        let handle = ack
+            .split('`')
+            .nth(1)
+            .expect("the handle is backticked")
+            .to_string();
+
+        let digest = crate::cas::Digest::of_bytes(&artifact.bytes);
+        let mut answer = String::new();
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let r = h
+                .job_get(Parameters(HandleInput {
+                    handle: handle.clone(),
+                }))
+                .await
+                .expect("job_get answers");
+            let text = result_text(r);
+            if text.contains("kaibo://cas/") {
+                answer = text;
+                break;
+            }
+        }
+        assert!(
+            answer.contains(&format!("kaibo://cas/{}", digest.to_hex())),
+            "the finished job names the artifact's digest URI:\n{answer}"
+        );
+        assert_eq!(
+            h.media_store().unwrap().get(&digest).expect("readable"),
+            Some((artifact.bytes.clone(), crate::cas::Extension::Png)),
+            "the deferred artifact landed in the store"
+        );
+        // The one-to-many contract holds through the deferred lane too: the second
+        // artifact gets its own digest line and its own stored object.
+        let second_digest = crate::cas::Digest::of_bytes(&second.bytes);
+        assert!(
+            answer.contains(&format!("kaibo://cas/{}", second_digest.to_hex())),
+            "every artifact of a deferred completion is named:\n{answer}"
+        );
+        assert_eq!(
+            h.media_store()
+                .unwrap()
+                .get(&second_digest)
+                .expect("readable"),
+            Some((second.bytes.clone(), crate::cas::Extension::Webp)),
+            "the second deferred artifact landed in the store"
+        );
+    }
+
+    /// Recorded provenance must describe the request that ran (or-gpt review,
+    /// 2026-08-03): a caller who smuggles `prompt` or `model` through `fields` would
+    /// make the sidecar record the *other* prompt/model — so both keys are reserved
+    /// and refused loudly, naming the right parameter.
+    #[tokio::test]
+    async fn generate_refuses_reserved_field_keys() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"x")])));
+
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "A".to_string(),
+                cast: Some("artist".to_string()),
+                fields: Some(
+                    [("prompt".to_string(), "B".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            }))
+            .await
+            .expect_err("a fields.prompt override must be refused");
+        assert!(
+            err.message.contains("prompt") && err.message.contains("reserved"),
+            "the refusal names the reserved key, got: {}",
+            err.message
+        );
+
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "A".to_string(),
+                cast: Some("artist".to_string()),
+                fields: Some(
+                    [("model".to_string(), "sd3.5-large".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            }))
+            .await
+            .expect_err("a fields.model override must be refused");
+        assert!(
+            err.message.contains("model")
+                && err.message.contains("reserved")
+                && err.message.contains("image"),
+            "the refusal names the key and points at the image slot, got: {}",
+            err.message
+        );
+    }
+
+    /// A provider reporting success with an empty artifact list is that provider's
+    /// bug, surfaced as a loud tool error — never an empty success.
+    #[tokio::test]
+    async fn generate_refuses_an_empty_artifact_list() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let result = h
+            .generate(Parameters(GenerateInput {
+                prompt: "p".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("a tool-result error, not a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(result).contains("zero artifacts"),
+            "the error names the empty completion"
+        );
+    }
+
+    /// Partial multi-artifact failure must not orphan paid artifacts silently
+    /// (or-gpt review, 2026-08-03). The cheap 90%: the WHOLE list is prevalidated —
+    /// every mime must map onto the store's on-disk set — before the first byte is
+    /// written, so [valid, unsupported] stores NOTHING instead of storing #1 and then
+    /// discarding its digest with the error.
+    #[tokio::test]
+    async fn generate_prevalidates_every_mime_before_storing_anything() {
+        let good = png(b"good-artifact");
+        let mut bad = png(b"unstorable-artifact");
+        bad.mime = "audio/mpeg".to_string();
+        let h = media_handler(Arc::new(SyncArtifacts(vec![good.clone(), bad])));
+        let result = h
+            .generate(Parameters(GenerateInput {
+                prompt: "p".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("a tool-result error, not a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(result).contains("audio/mpeg"),
+            "the error names the unstorable mime"
+        );
+        let store = h.media_store().unwrap();
+        assert_eq!(
+            store
+                .get(&crate::cas::Digest::of_bytes(&good.bytes))
+                .expect("readable"),
+            None,
+            "prevalidation failed the call BEFORE the valid artifact was stored"
+        );
+    }
+
+    /// The residual 10%: a mid-loop store failure AFTER prevalidation (here the soft
+    /// cap refusing artifact #2) must return an error that NAMES the digests already
+    /// stored — the caller paid for them and they are retrievable; discarding their
+    /// addresses would orphan them.
+    #[tokio::test]
+    async fn generate_mid_loop_store_failure_names_the_digests_already_stored() {
+        let small = png(b"tiny");
+        let big = png(&[7u8; 4096]);
+        // A capped in-memory store: #1 fits, #2 breaches. Both mimes prevalidate.
+        let toml = format!("{MEDIA_CAST_TOML}\n[cas]\nmax_bytes = 64\n");
+        let h = hermetic_handler_from_toml(&toml).with_media_arms(Arc::new(ScriptedMediaArms(
+            Arc::new(SyncArtifacts(vec![small.clone(), big])),
+        )));
+        let result = h
+            .generate(Parameters(GenerateInput {
+                prompt: "p".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("a tool-result error, not a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(result);
+        let stored = crate::cas::Digest::of_bytes(&small.bytes);
+        assert!(
+            text.contains(&stored.to_hex()),
+            "the error names the digest that DID land, so it isn't orphaned:\n{text}"
+        );
+        assert!(
+            h.media_store()
+                .unwrap()
+                .get(&stored)
+                .expect("readable")
+                .is_some(),
+            "and that artifact really is retrievable"
+        );
+    }
+
+    /// The deferred poll loop is bounded by [defaults] call_deadline: a provider job
+    /// that never completes fails the kaibo job with the PROVIDER id named, so the
+    /// operator can chase it on the provider's side.
+    #[tokio::test(start_paused = true)]
+    async fn generate_deferred_poll_deadline_fails_the_job_naming_the_provider_id() {
+        /// Defers, then reports Pending forever.
+        struct NeverDone;
+
+        #[async_trait::async_trait]
+        impl crate::media::MediaModel for NeverDone {
+            async fn generate(
+                &self,
+                _request: &crate::media::MediaRequest,
+            ) -> anyhow::Result<crate::media::MediaOutcome> {
+                Ok(crate::media::MediaOutcome::Deferred(
+                    crate::media::MediaJobId("prov-stuck-9".to_string()),
+                ))
+            }
+
+            async fn poll(
+                &self,
+                _job: &crate::media::MediaJobId,
+            ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+                Ok(crate::media::MediaPollOutcome::Pending)
+            }
+        }
+
+        let h = media_handler(Arc::new(NeverDone));
+        let ack = result_text(
+            h.generate(Parameters(GenerateInput {
+                prompt: "p".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("submit succeeds"),
+        );
+        let handle = ack
+            .split('`')
+            .nth(1)
+            .expect("backticked handle")
+            .to_string();
+
+        // Advance past the whole call_deadline budget (auto-advanced under start_paused)
+        // and collect the failure.
+        let deadline = h.config.defaults.call_deadline;
+        let mut failed = String::new();
+        for _ in 0..80 {
+            tokio::time::sleep(deadline / 8).await;
+            let r = h
+                .job_get(Parameters(HandleInput {
+                    handle: handle.clone(),
+                }))
+                .await
+                .expect("job_get answers");
+            if r.is_error == Some(true) {
+                failed = result_text(r);
+                break;
+            }
+        }
+        assert!(
+            failed.contains("prov-stuck-9") && failed.contains("still pending"),
+            "the timed-out job names the provider id so it can be chased:\n{failed}"
+        );
+    }
+
+    /// A cast without an `image` slot is refused at call time with the requirement
+    /// named — the call-time mirror of the staffing rule.
+    #[tokio::test]
+    async fn generate_refuses_a_cast_without_an_image_slot() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"x")])));
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "p".to_string(),
+                cast: Some("anthropic".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect_err("no image slot must refuse");
+        assert!(
+            err.message.contains("image") && err.message.contains("anthropic"),
+            "the refusal names the missing slot and the cast, got: {}",
+            err.message
+        );
+    }
+
+    /// The advertisement gate, all three legs: no image-slot cast → dropped; staffable
+    /// → advertised (and the job verbs come alive with it, since a deferred generate
+    /// mints a `job-N`); staffable but `[cas] enabled = false` → dropped again, because
+    /// artifacts would have nowhere to land.
+    #[test]
+    fn generate_is_advertised_only_with_an_image_cast_and_the_cas_on() {
+        let bare = hermetic_handler_from_toml("");
+        assert!(
+            !bare.advertised_tools().contains(&"generate".to_string()),
+            "no built-in cast has an image slot, so a stock install must not advertise it"
+        );
+
+        let staffed = hermetic_handler_from_toml(MEDIA_CAST_TOML);
+        let tools = staffed.advertised_tools();
+        assert!(tools.contains(&"generate".to_string()));
+        assert!(
+            tools.contains(&"job_get".to_string()) && tools.contains(&"job_wait".to_string()),
+            "generate is a job producer, so the collect verbs follow it: {tools:?}"
+        );
+
+        let cas_off = hermetic_handler_from_toml(&format!(
+            "{MEDIA_CAST_TOML}
+[cas]
+enabled = false
+"
+        ));
+        assert!(
+            !cas_off.advertised_tools().contains(&"generate".to_string()),
+            "with the CAS off the tool has nowhere to store artifacts and must vanish"
+        );
+    }
+
+    /// A generate-ONLY server (consult, deliberate, and batch all disabled) still
+    /// lists, collects, and cancels the `job-N` handles its deferred generations mint.
+    /// The regression this pins (or-gpt review, 2026-08-03): `job_list`'s in-memory
+    /// section was keyed off `consult || deliberate` flags, so a generate-only server
+    /// advertised `job_list` yet returned no jobs section at all. And the shared job-N
+    /// wording said "Consultation" for every producer — it must stay producer-neutral.
+    #[tokio::test(start_paused = true)]
+    async fn generate_only_server_lists_collects_and_cancels_its_jobs() {
+        let toml = format!(
+            "{MEDIA_CAST_TOML}\n[server.tools]\nconsult = false\ndeliberate = false\nbatch = false\n"
+        );
+        let h = hermetic_handler_from_toml(&toml).with_media_arms(Arc::new(ScriptedMediaArms(
+            Arc::new(DeferredArtifacts {
+                artifacts: vec![png(b"listed-artifact")],
+                polls: std::sync::Mutex::new(0),
+            }),
+        )));
+        assert!(
+            h.advertised_tools().contains(&"job_list".to_string()),
+            "generate keeps the collect verbs alive"
+        );
+        let ack = result_text(
+            h.generate(Parameters(GenerateInput {
+                prompt: "p".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+            }))
+            .await
+            .expect("submit succeeds"),
+        );
+        let handle = ack
+            .split('`')
+            .nth(1)
+            .expect("backticked handle")
+            .to_string();
+
+        // job_list must show the in-memory jobs section with this job in it.
+        let listing = result_text(
+            h.job_list(Parameters(ListInput {
+                backend: None,
+                all: false,
+            }))
+            .await
+            .expect("job_list answers"),
+        );
+        assert!(
+            listing.contains(&handle),
+            "a generate-only server must list its own deferred job `{handle}`:\n{listing}"
+        );
+
+        // job_get while running: producer-neutral wording, never "Consultation".
+        let running = result_text(
+            h.job_get(Parameters(HandleInput {
+                handle: handle.clone(),
+            }))
+            .await
+            .expect("job_get answers"),
+        );
+        assert!(
+            !running.contains("Consultation"),
+            "job-N wording is shared by every producer and must stay neutral:\n{running}"
+        );
+
+        // job_cancel: same neutrality.
+        let canceled = result_text(
+            h.job_cancel(Parameters(HandleInput {
+                handle: handle.clone(),
+            }))
+            .await
+            .expect("job_cancel answers"),
+        );
+        assert!(
+            canceled.contains(&handle) && !canceled.contains("Consultation"),
+            "the cancel ack names the job without calling it a consultation:\n{canceled}"
+        );
+    }
+
+    /// The `kaibo://cas/<digest>` read: bytes come back base64 with the right mime, an
+    /// unknown digest is a clean not-found, and a malformed digest is refused before it
+    /// goes near a lookup. Operator surface — served straight off the handler's store.
+    #[tokio::test]
+    async fn cas_resource_serves_stored_bytes_and_validates_the_digest() {
+        use base64::Engine as _;
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"resource-bytes")])));
+        h.generate(Parameters(GenerateInput {
+            prompt: "p".to_string(),
+            cast: Some("artist".to_string()),
+            fields: None,
+        }))
+        .await
+        .expect("generate succeeds");
+
+        let digest = crate::cas::Digest::of_bytes(b"resource-bytes");
+        let hex = digest.to_hex();
+        let uri = format!("kaibo://cas/{hex}");
+        let ReadResourceResponse::Complete(result) = h
+            .read_cas_resource(&hex, &uri)
+            .expect("stored digest reads")
+        else {
+            panic!("expected a complete read");
+        };
+        let ResourceContents::BlobResourceContents {
+            blob, mime_type, ..
+        } = &result.contents[0]
+        else {
+            panic!("an artifact read is a blob, got {:?}", result.contents[0]);
+        };
+        assert_eq!(mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .expect("valid base64"),
+            b"resource-bytes"
+        );
+
+        let missing = crate::cas::Digest::of_bytes(b"never-generated").to_hex();
+        let err = h
+            .read_cas_resource(&missing, &format!("kaibo://cas/{missing}"))
+            .expect_err("unknown digest is not found");
+        assert!(err.message.contains("no artifact"), "got: {}", err.message);
+
+        let err = h
+            .read_cas_resource("../../etc/passwd", "kaibo://cas/../../etc/passwd")
+            .expect_err("a traversal-shaped digest is refused");
+        assert!(
+            err.message.contains("64 lowercase hex"),
+            "the refusal names the rule, got: {}",
+            err.message
+        );
     }
 
     /// The joined text of a successful `CallToolResult` — for asserting on a handler's
@@ -4147,6 +5391,13 @@ mod tests {
 
             [casts.mydirect_synthonly]                         # offline, no explorer → no tool
             synth    = { backend = "gem", id = "big", lane = "direct" }
+
+            [backends.sd]                                      # media backend for `generate`
+            kind = "stability"
+            key_optional = true
+
+            [casts.artist]                                     # image slot → `generate`
+            image    = "sd/core"
             "#,
         );
         let enum_of = |tool: &str| -> Vec<String> {
@@ -4176,6 +5427,9 @@ mod tests {
                 "explore" => true,
                 "batch_submit" => h.require_batch_cast(cast).is_ok(),
                 "deliberate" => h.require_deliberate_cast(cast).is_ok(),
+                // `generate`'s call-time gate is the image slot's presence — the same
+                // predicate the enum rule uses, checked here through the cast itself.
+                "generate" => cast.slot(crate::config::ModelRole::Image).is_some(),
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
             }
         };
@@ -4540,6 +5794,7 @@ mod tests {
                 oneshot: true,
                 run_kaish: true,
                 list_models: true,
+                generate: false,
             };
             KaiboHandler::new(config).expect("handler builds")
         };
@@ -5205,7 +6460,7 @@ mod tests {
 
     #[test]
     fn advertises_the_per_builtin_template() {
-        let templates = kaibo_resource_templates();
+        let templates = kaibo_resource_templates(true);
         assert!(
             templates
                 .iter()
@@ -5432,6 +6687,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         )
         .expect("known uri must read");
         let result = match result {
@@ -5638,7 +6894,7 @@ mod tests {
     /// message names the known casts (so a caller recovers to a real cast name).
     #[test]
     fn per_cast_prompts_template_advertised_and_unknown_cast_is_not_found() {
-        let templates: Vec<String> = kaibo_resource_templates()
+        let templates: Vec<String> = kaibo_resource_templates(true)
             .into_iter()
             .map(|t| t.uri_template)
             .collect();
@@ -5657,6 +6913,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         )
         .expect_err("an unknown cast must be a not-found");
         assert!(
@@ -5686,6 +6943,7 @@ mod tests {
                 false,
                 vec![],
                 false,
+                crate::config::CasMode::Memory,
             )
             .is_err(),
             "an unregistered builtin must be a not-found error"
@@ -5706,6 +6964,7 @@ mod tests {
                 false,
                 vec![],
                 false,
+                crate::config::CasMode::Memory,
             )
             .is_err(),
             "an unknown URI must be a not-found error, not an empty success"
@@ -5737,6 +6996,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         )
         .expect("example resource must be readable");
         let result = match result {
@@ -5831,7 +7091,15 @@ mod tests {
     fn read_kaibo_config_resource_is_readable() {
         let config = Config::builtin();
         let allowed = handler().allowed_set();
-        let body_str = render_config_resource(&config, &allowed, None, false, vec![], false);
+        let body_str = render_config_resource(
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // Sanity: the rendered document has something in it.
         assert!(
             !body_str.is_empty(),
@@ -5847,6 +7115,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         );
         assert!(
             result.is_ok(),

@@ -643,7 +643,7 @@ fn base_url_on_a_keyed_backend_is_rejected() {
     let msg = format!("{err:#}");
     assert!(msg.contains("base_url"), "got: {msg}");
     assert!(
-        msg.contains("only the `openai`, `anthropic`, and `gemini` kinds"),
+        msg.contains("only the `openai`, `anthropic`, `gemini`, and `stability` kinds"),
         "got: {msg}"
     );
 }
@@ -935,6 +935,8 @@ fn cli_cast_wins_over_env_and_file() {
         vec![], // no --user-context-file flags
         false,  // --no-persistence not passed
         None,   // no --state-db
+        None,   // --cas-dir
+        None,   // --cas-max-bytes
         None,   // no --max-attachments
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
@@ -968,7 +970,9 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         vec![],
         false,
         None,
-        None,
+        None, // --cas-dir
+        None, // --cas-max-bytes
+        None, // --max-attachments
     );
     // The env/file-layer value must survive.
     assert!(
@@ -1883,6 +1887,309 @@ fn persistence_env_disables_and_overrides_path() {
     );
 }
 
+// --- the image role and the stability kind ----------------------------------
+
+/// An `image` slot parses and lands on the cast. Until this change `image = …` was a
+/// loud `deny_unknown_fields` error (986806f reduced the role set to explorer+synth);
+/// reviving it is what lets a cast staff an artifact-producing tool.
+#[test]
+fn a_cast_can_carry_an_image_slot() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "stability"
+
+        [casts.artist]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth    = "deepseek/deepseek-v4-pro"
+        image    = "sd/core"
+        "#,
+    )
+    .expect("an image slot must parse");
+    let cast = c.resolve_cast("artist").expect("cast resolves");
+    let slot = cast
+        .slot(kaibo::config::ModelRole::Image)
+        .expect("the image slot is present");
+    assert_eq!(slot.backend, "sd");
+    assert_eq!(slot.id, "core");
+}
+
+/// A REASONING slot pointed at a Stability backend is a loud LOAD error. There is no
+/// completion model behind an image API, so an arm built from one could only fail at
+/// request time — and by then the operator is reading a provider error instead of being
+/// told their config is wrong. Refuse at load, and name the fix.
+#[test]
+fn a_reasoning_slot_cannot_point_at_a_stability_backend() {
+    for role in ["explorer", "synth"] {
+        let toml = format!(
+            r#"
+            [backends.sd]
+            kind = "stability"
+
+            [casts.broken]
+            {role} = "sd/core"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a {role} slot on a stability backend must be refused at load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(role) && msg.contains("stability"),
+            "the error must name the offending slot and the kind, got: {msg}"
+        );
+        assert!(
+            msg.contains("image"),
+            "and it must point at the fix (the image slot), got: {msg}"
+        );
+    }
+}
+
+/// The mirror: an `image` slot on a chat backend is refused too. Asking a completion
+/// model to return pixels fails just as surely, and just as confusingly, at request time.
+#[test]
+fn an_image_slot_cannot_point_at_a_completion_backend() {
+    let err = Config::from_toml_str(
+        r#"
+        [casts.broken]
+        image = "deepseek/deepseek-v4-pro"
+        "#,
+    )
+    .expect_err("an image slot on a chat backend must be refused at load");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("image") && msg.contains("stability"),
+        "the error must name the slot and the kind it needs, got: {msg}"
+    );
+}
+
+/// No BUILT-IN cast carries an image slot, so a stock install can staff no image tool —
+/// the staffing gate then keeps that tool off the wire entirely, at zero resident cost
+/// for every user who never configures one. Pins the premise that argument rests on.
+#[test]
+fn no_builtin_cast_carries_an_image_slot() {
+    let c = Config::builtin();
+    for (name, cast) in &c.casts {
+        assert!(
+            cast.slot(kaibo::config::ModelRole::Image).is_none(),
+            "built-in cast {name:?} must not carry an image slot — image generation \
+             costs real money per call and has to be configured deliberately"
+        );
+    }
+}
+
+/// Reasoning tunables WRITTEN on an image slot are diagnosed, not load errors: an image
+/// slot sends one generation request with no reasoning phase, so a `thinking_budget` /
+/// `effort` / `temperature` / `thinking_style` written there never reaches a request.
+/// The diagnostic rides the same shared machinery as inert effort (startup warning +
+/// `inert_tunables` in kaibo://config), and it names the cast, the slot, and each knob.
+#[test]
+fn written_reasoning_tunables_on_an_image_slot_are_diagnosed() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "stability"
+
+        [casts.artist]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth    = "deepseek/deepseek-v4-pro"
+        image    = { backend = "sd", id = "core", thinking_budget = 4096, effort = "high", temperature = 0.5, thinking_style = "adaptive" }
+        "#,
+    )
+    .expect("reasoning knobs on an image slot load fine; they are diagnosed, not refused");
+    let diags = c.media_tunable_diagnostics();
+    assert_eq!(diags.len(), 1, "exactly the one image slot is reported");
+    let d = &diags[0];
+    assert_eq!(d.cast, "artist");
+    assert_eq!(d.role, "image");
+    assert_eq!(d.model, "sd/core");
+    assert_eq!(
+        d.tunables,
+        vec!["thinking_budget", "effort", "temperature", "thinking_style"],
+        "every written reasoning knob is named, in render order"
+    );
+}
+
+/// The quiet half: INHERITED defaults never flag an image slot. A `[defaults]`
+/// synth-side effort states the synth posture and merely falls back onto other roles,
+/// so a bare image slot stays silent in both scans — `media_tunable_diagnostics`
+/// (nothing written on the slot) and `effort_diagnostics` (media roles are covered by
+/// the media scan, so a defaults effort can't warn on every image slot the moment
+/// someone sets `synth_effort`).
+#[test]
+fn inherited_defaults_stay_quiet_on_an_image_slot() {
+    let c = Config::from_toml_str(
+        r#"
+        [defaults]
+        synth_effort = "medium"
+
+        [backends.sd]
+        kind = "stability"
+
+        [casts.artist]
+        explorer = "deepseek/deepseek-v4-flash"
+        synth    = "deepseek/deepseek-v4-pro"
+        image    = "sd/core"
+        "#,
+    )
+    .unwrap();
+    assert!(
+        c.media_tunable_diagnostics().is_empty(),
+        "a bare image slot has nothing written, so nothing is reported"
+    );
+    assert!(
+        !c.effort_diagnostics().iter().any(|d| d.role == "image"),
+        "the effort scan covers reasoning roles only; an image slot inheriting a \
+         defaults effort is a fallback artifact, not an operator statement"
+    );
+}
+
+// --- [cas]: the media content-addressed store -------------------------------
+
+/// The default posture: a dir under XDG *data* (not state — these are artifacts the user
+/// paid for), and **no size cap**. The absent cap is the load-bearing default, not an
+/// oversight: enforcing one means summing every file in the store on every write, over a
+/// store that never deletes.
+#[test]
+fn cas_defaults_to_the_xdg_data_dir_and_no_cap() {
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(
+        c.cas.max_bytes, None,
+        "the CAS ships uncapped — a cap costs an O(objects) walk per write, so it is opt-in"
+    );
+    let dir = c.cas.dir.expect("a default CAS dir resolves from XDG_DATA_HOME or HOME");
+    assert!(
+        dir.ends_with("kaibo/cas"),
+        "the default CAS dir is <data>/kaibo/cas, got {}",
+        dir.display()
+    );
+    assert!(
+        !dir.to_string_lossy().contains("/state/"),
+        "the CAS belongs in the DATA dir, not beside the disposable state db: {}",
+        dir.display()
+    );
+}
+
+/// `[cas] enabled = false` is the explicit off switch (Amy, 2026-08-03); on is the
+/// default, so an empty config runs with the CAS available.
+#[test]
+fn cas_enabled_defaults_true_and_the_file_can_turn_it_off() {
+    let c = Config::from_toml_str("").unwrap();
+    assert!(c.cas.enabled, "the CAS is on by default");
+    let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
+    assert!(!off.cas.enabled);
+}
+
+/// The one derivation of the CAS lifecycle: disabled wins over everything; otherwise
+/// the CAS follows *runtime* persistence truth — disk while a durable store is open,
+/// memory while it is not (including the degrade path where `[persistence]` is enabled
+/// but the store failed to open) or when no directory resolves.
+#[test]
+fn cas_mode_follows_persistence_and_the_off_switch_wins() {
+    use kaibo::config::CasMode;
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.cas_mode(true), CasMode::Disk);
+    assert_eq!(
+        c.cas_mode(false),
+        CasMode::Memory,
+        "no durable persistence means an in-memory CAS, not a stranded disk store"
+    );
+
+    let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
+    assert_eq!(off.cas_mode(true), CasMode::Off);
+    assert_eq!(off.cas_mode(false), CasMode::Off);
+
+    // No resolvable dir: enabled + persistence-active still cannot mean disk.
+    let mut no_dir = Config::from_toml_str("").unwrap();
+    no_dir.cas.dir = None;
+    assert_eq!(no_dir.cas_mode(true), CasMode::Memory);
+}
+
+/// The file layer sets both knobs, and `$VAR`/`~` in `dir` expand like every other path.
+#[test]
+fn cas_file_layer_sets_dir_and_cap() {
+    let c = Config::from_toml_str(
+        "[cas]\ndir = \"/srv/art\"\nmax_bytes = 1024\n",
+    )
+    .unwrap();
+    assert_eq!(c.cas.dir.unwrap(), std::path::PathBuf::from("/srv/art"));
+    assert_eq!(c.cas.max_bytes, Some(1024));
+}
+
+/// A zero ceiling is a loud load error, not a store that refuses every write. Nobody
+/// means "refuse everything" by `max_bytes = 0`; accepting it would produce a CAS that
+/// fails on first use with a capacity error no operator could explain.
+#[test]
+fn cas_zero_max_bytes_is_a_loud_load_error() {
+    let err = Config::from_toml_str("[cas]\nmax_bytes = 0\n")
+        .expect_err("max_bytes = 0 must be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("max_bytes") && msg.contains("> 0"),
+        "the error must name the knob and the rule, got: {msg}"
+    );
+    assert!(
+        msg.contains("Omit"),
+        "and it must say how to get the uncapped default, got: {msg}"
+    );
+}
+
+/// An unknown key under `[cas]` is refused — `deny_unknown_fields`, like every other
+/// section, so a typo'd knob is never silently ignored.
+#[test]
+fn cas_unknown_key_is_refused() {
+    assert!(
+        Config::from_toml_str("[cas]\nmax_size = 10\n").is_err(),
+        "a typo'd [cas] key must be a loud load error, not a silently-ignored knob"
+    );
+}
+
+/// Env overrides the file, per the standard naming rule (`max_bytes` ⇄ KAIBO_CAS_MAX_BYTES).
+#[test]
+fn cas_env_overrides_the_file() {
+    let env: HashMap<&str, &str> = [
+        ("KAIBO_CAS_DIR", "/from/env"),
+        ("KAIBO_CAS_MAX_BYTES", "4096"),
+    ]
+    .into_iter()
+    .collect();
+    let c = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(c.cas.dir.unwrap(), std::path::PathBuf::from("/from/env"));
+    assert_eq!(c.cas.max_bytes, Some(4096));
+}
+
+/// The CLI is the top layer, and an ABSENT flag never clobbers a lower layer — the same
+/// grammar every other optional flag here uses.
+#[test]
+fn cas_cli_wins_and_absent_flags_do_not_clobber() {
+    let mut c =
+        Config::from_toml_str("[cas]\ndir = \"/from/file\"\nmax_bytes = 111\n").unwrap();
+    c.apply_cli(
+        None,
+        None,
+        ToolDisables::default(),
+        vec![],
+        false,
+        false,
+        vec![],
+        vec![],
+        false,
+        None,
+        Some(std::path::PathBuf::from("/from/cli")), // --cas-dir
+        None,                                        // --cas-max-bytes NOT passed
+        None,                                        // --max-attachments NOT passed
+    );
+    assert_eq!(
+        c.cas.dir.unwrap(),
+        std::path::PathBuf::from("/from/cli"),
+        "--cas-dir wins over the file"
+    );
+    assert_eq!(
+        c.cas.max_bytes,
+        Some(111),
+        "an absent --cas-max-bytes must leave the file's value alone, not reset it"
+    );
+}
+
 /// The CLI is the top layer: `--no-persistence` and `--state-db` win over file/env.
 #[test]
 fn persistence_cli_wins_over_lower_layers() {
@@ -1900,7 +2207,9 @@ fn persistence_cli_wins_over_lower_layers() {
         vec![],
         true,                                           // --no-persistence
         Some(std::path::PathBuf::from("/from/cli.db")), // --state-db
-        None,                                            // no --max-attachments
+        None,                                           // --cas-dir
+        None,                                           // --cas-max-bytes
+        None,                                           // no --max-attachments
     );
     assert!(!c.persistence.enabled, "--no-persistence wins");
     assert_eq!(

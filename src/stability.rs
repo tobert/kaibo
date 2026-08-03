@@ -306,7 +306,9 @@ pub enum GenerateRoute {
     /// rides as the `model` form field — see [`from_rig_request`]. Passed through
     /// verbatim; Stability validates it, so an unrecognized variant still reaches the
     /// provider as a normal `400`, not a client-side guess.
-    Sd3 { model: String },
+    Sd3 {
+        model: String,
+    },
 }
 
 impl GenerateRoute {
@@ -527,7 +529,10 @@ impl std::fmt::Display for StabilityError {
                 write!(f, "invalid additional_params: {msg}")
             }
             StabilityError::InvalidDeferredBody(msg) => {
-                write!(f, "Stability's deferred response body didn't parse as {{\"id\": ...}}: {msg}")
+                write!(
+                    f,
+                    "Stability's deferred response body didn't parse as {{\"id\": ...}}: {msg}"
+                )
             }
             StabilityError::UnexpectedlyDeferred => write!(
                 f,
@@ -669,6 +674,14 @@ pub struct Artifact {
 pub struct JobId(String);
 
 impl JobId {
+    /// Rebuild a job id from its string spelling. The id round-trips through kaibo's
+    /// job store (and the [`crate::media::MediaJobId`] seam) as a plain string, so
+    /// the poll path needs a way back in; the string stays opaque either way — only
+    /// Stability's own polling endpoints interpret it.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -1087,6 +1100,104 @@ impl RigImageGenerationModel for StabilityImageModel {
     }
 }
 
+impl StabilityImageModel {
+    /// Build directly from a client + model id — the non-rig constructor
+    /// [`crate::media::MediaArm::from_slot`] uses. Same shape as
+    /// [`RigImageGenerationModel::make`], available without importing rig's trait.
+    pub fn from_parts(client: &StabilityClient, model: impl Into<String>) -> Self {
+        Self {
+            client: client.clone(),
+            model: model.into(),
+        }
+    }
+
+    /// The request-side translation shared with [`from_rig_request`]: classify the
+    /// model id into a route, seed the sd3 `model` field and the explicit
+    /// `output_format = "png"` default, then let the caller's own fields override —
+    /// last write wins, the same contract [`build_form_fields`] applies again at
+    /// send time.
+    fn media_request(&self, request: &crate::media::MediaRequest) -> (Operation, StabilityRequest) {
+        let route = GenerateRoute::classify(&self.model);
+        let mut fields: Vec<(String, String)> = Vec::new();
+        if let GenerateRoute::Sd3 { model } = &route {
+            fields.push(("model".to_string(), model.clone()));
+        }
+        fields.push(("output_format".to_string(), "png".to_string()));
+        for (k, v) in &request.fields {
+            if let Some(existing) = fields.iter_mut().find(|(name, _)| name == k) {
+                existing.1 = v.clone();
+            } else {
+                fields.push((k.clone(), v.clone()));
+            }
+        }
+        (
+            Operation::Generate(route),
+            StabilityRequest {
+                prompt: request.prompt.clone(),
+                input_image: request.input_image.clone(),
+                // No derived ratio on this path: the neutral request has no
+                // width/height to bridge, and an `aspect_ratio` field from the caller
+                // rides `fields` verbatim.
+                aspect_ratio: None,
+                fields,
+            },
+        )
+    }
+}
+
+/// The [`crate::media::MediaModel`] impl — the neutral seam
+/// [`crate::media::MediaArm`] dispatches through. Thin on purpose:
+/// [`crate::media::MediaRequest::fields`] already speak Stability's `(name, value)`
+/// form-field shape, and the outcome enums mirror [`StabilityResponse`] /
+/// [`PollOutcome`] one-to-one — including the deferred half rig's trait cannot carry
+/// (see [`StabilityImageModel::image_generation`]'s forced error there).
+#[async_trait::async_trait]
+impl crate::media::MediaModel for StabilityImageModel {
+    async fn generate(
+        &self,
+        request: &crate::media::MediaRequest,
+    ) -> AnyResult<crate::media::MediaOutcome> {
+        let (op, stability_request) = self.media_request(request);
+        let response = self.client.call(&op, &stability_request).await?;
+        Ok(match response {
+            // Stability's operations each return exactly one artifact, so it rides as a
+            // one-element list — the neutral outcome is a Vec because many image models
+            // return several per call, and the CAS story is per-artifact digests.
+            StabilityResponse::Complete(a) => {
+                crate::media::MediaOutcome::Complete(vec![media_artifact(a)])
+            }
+            StabilityResponse::Deferred(id) => crate::media::MediaOutcome::Deferred(
+                crate::media::MediaJobId(id.as_str().to_string()),
+            ),
+        })
+    }
+
+    async fn poll(
+        &self,
+        job: &crate::media::MediaJobId,
+    ) -> AnyResult<crate::media::MediaPollOutcome> {
+        let outcome = self.client.poll(&JobId::new(job.0.clone())).await?;
+        Ok(match outcome {
+            PollOutcome::Pending => crate::media::MediaPollOutcome::Pending,
+            // One artifact per Stability poll, as a one-element list — see `generate`.
+            PollOutcome::Complete(a) => {
+                crate::media::MediaPollOutcome::Complete(vec![media_artifact(a)])
+            }
+        })
+    }
+}
+
+/// Lift this facade's [`Artifact`] into the neutral [`crate::media::MediaArtifact`]:
+/// the mime becomes the wire spelling ([`MediaType::as_str`]), bytes and seed carry
+/// verbatim.
+fn media_artifact(a: Artifact) -> crate::media::MediaArtifact {
+    crate::media::MediaArtifact {
+        mime: a.media_type.as_str().to_string(),
+        bytes: a.bytes,
+        seed: a.seed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,7 +1306,11 @@ mod tests {
     /// `#[non_exhaustive]`, so a struct literal isn't available outside rig's crate.
     /// Any `ImageGenerationModel` instance can mint the builder; a throwaway
     /// [`StabilityImageModel`] over a never-dialed client does the job with no network.
-    fn rig_request(width: u32, height: u32, additional_params: Option<Value>) -> ImageGenerationRequest {
+    fn rig_request(
+        width: u32,
+        height: u32,
+        additional_params: Option<Value>,
+    ) -> ImageGenerationRequest {
         let client = StabilityClient::new("test-key", "http://localhost", Duration::from_secs(1))
             .expect("client construction is pure config, no network");
         let model = StabilityImageModel::make(&client, "core");
@@ -1224,7 +1339,8 @@ mod tests {
 
     #[test]
     fn from_rig_request_sd3_variant_carries_model_field() {
-        let (op, req) = from_rig_request("sd3.5-large-turbo", &rig_request(1024, 1024, None)).unwrap();
+        let (op, req) =
+            from_rig_request("sd3.5-large-turbo", &rig_request(1024, 1024, None)).unwrap();
         assert_eq!(
             op,
             Operation::Generate(GenerateRoute::Sd3 {
@@ -1248,7 +1364,10 @@ mod tests {
         assert!(req.fields.iter().any(|(k, v)| k == "seed" && v == "42"));
         // output_format must not appear twice (override, not append).
         assert_eq!(
-            req.fields.iter().filter(|(k, _)| k == "output_format").count(),
+            req.fields
+                .iter()
+                .filter(|(k, _)| k == "output_format")
+                .count(),
             1
         );
     }
@@ -1386,7 +1505,11 @@ mod tests {
     /// `MediaType` section for why this refusal is a deliberate feature.
     #[test]
     fn media_type_to_cas_extension_refuses_audio_and_3d() {
-        for media_type in [MediaType::AudioMpeg, MediaType::AudioWav, MediaType::ModelGltfBinary] {
+        for media_type in [
+            MediaType::AudioMpeg,
+            MediaType::AudioWav,
+            MediaType::ModelGltfBinary,
+        ] {
             let err = media_type.to_cas_extension().unwrap_err();
             match err {
                 StabilityError::NoCasExtension { media_type: got } => {
@@ -1499,10 +1622,7 @@ mod tests {
         let body = br#"{"image":"AAAA","seed":1,"finish_reason":"SUCCESS"}"#;
         let err = handle_response(Shape::Sync, 200, Some("application/json"), None, None, body)
             .unwrap_err();
-        assert!(matches!(
-            err,
-            StabilityError::UnexpectedContentType { .. }
-        ));
+        assert!(matches!(err, StabilityError::UnexpectedContentType { .. }));
     }
 
     #[test]
@@ -1547,15 +1667,22 @@ mod tests {
 
     #[test]
     fn handle_response_200_empty_body_is_refused() {
-        let err = handle_response(Shape::Sync, 200, Some("image/png"), Some("SUCCESS"), None, b"")
-            .unwrap_err();
+        let err = handle_response(
+            Shape::Sync,
+            200,
+            Some("image/png"),
+            Some("SUCCESS"),
+            None,
+            b"",
+        )
+        .unwrap_err();
         assert_eq!(err, StabilityError::EmptyBody);
     }
 
     #[test]
     fn handle_response_200_missing_finish_reason_is_refused() {
-        let err = handle_response(Shape::Sync, 200, Some("image/png"), None, None, b"bytes")
-            .unwrap_err();
+        let err =
+            handle_response(Shape::Sync, 200, Some("image/png"), None, None, b"bytes").unwrap_err();
         assert_eq!(err, StabilityError::MissingFinishReason);
     }
 
@@ -1609,8 +1736,15 @@ mod tests {
     #[test]
     fn handle_response_deferred_200_with_id_is_deferred() {
         let body = br#"{"id":"job-abc-123"}"#;
-        let got = handle_response(Shape::Deferred, 200, Some("application/json"), None, None, body)
-            .expect("expected a deferred outcome");
+        let got = handle_response(
+            Shape::Deferred,
+            200,
+            Some("application/json"),
+            None,
+            None,
+            body,
+        )
+        .expect("expected a deferred outcome");
         match got {
             StabilityResponse::Deferred(id) => assert_eq!(id.as_str(), "job-abc-123"),
             StabilityResponse::Complete(_) => panic!("expected Deferred, got Complete"),
@@ -1620,8 +1754,15 @@ mod tests {
     #[test]
     fn handle_response_deferred_202_with_id_is_deferred() {
         let body = br#"{"id":"job-abc-123"}"#;
-        let got = handle_response(Shape::Deferred, 202, Some("application/json"), None, None, body)
-            .expect("expected a deferred outcome");
+        let got = handle_response(
+            Shape::Deferred,
+            202,
+            Some("application/json"),
+            None,
+            None,
+            body,
+        )
+        .expect("expected a deferred outcome");
         match got {
             StabilityResponse::Deferred(id) => assert_eq!(id.as_str(), "job-abc-123"),
             StabilityResponse::Complete(_) => panic!("expected Deferred, got Complete"),
@@ -1630,17 +1771,30 @@ mod tests {
 
     #[test]
     fn handle_response_deferred_invalid_json_is_refused() {
-        let err = handle_response(Shape::Deferred, 200, Some("application/json"), None, None, b"not json")
-            .unwrap_err();
+        let err = handle_response(
+            Shape::Deferred,
+            200,
+            Some("application/json"),
+            None,
+            None,
+            b"not json",
+        )
+        .unwrap_err();
         assert!(matches!(err, StabilityError::InvalidDeferredBody(_)));
     }
 
     #[test]
     fn handle_response_deferred_missing_id_field_is_refused() {
         let body = br#"{"status":"in_progress"}"#;
-        let err =
-            handle_response(Shape::Deferred, 200, Some("application/json"), None, None, body)
-                .unwrap_err();
+        let err = handle_response(
+            Shape::Deferred,
+            200,
+            Some("application/json"),
+            None,
+            None,
+            body,
+        )
+        .unwrap_err();
         assert!(matches!(err, StabilityError::InvalidDeferredBody(_)));
     }
 
@@ -1649,8 +1803,15 @@ mod tests {
         // Non-2xx handling is shape-agnostic — checked before the Sync/Deferred
         // dispatch — so a deferred route's 400 looks exactly like a sync route's.
         let body = br#"{"id":"abc123","name":"bad_request","errors":["missing field: prompt"]}"#;
-        let err = handle_response(Shape::Deferred, 400, Some("application/json"), None, None, body)
-            .unwrap_err();
+        let err = handle_response(
+            Shape::Deferred,
+            400,
+            Some("application/json"),
+            None,
+            None,
+            body,
+        )
+        .unwrap_err();
         assert!(matches!(err, StabilityError::Provider { status: 400, .. }));
     }
 
@@ -1689,8 +1850,14 @@ mod tests {
         let pending = handle_poll_response(202, None, None, None, b"{}").unwrap();
         assert_eq!(pending, PollOutcome::Pending);
 
-        let done = handle_poll_response(200, Some("audio/wav"), Some("SUCCESS"), None, b"RIFF....WAVEfmt ")
-            .unwrap();
+        let done = handle_poll_response(
+            200,
+            Some("audio/wav"),
+            Some("SUCCESS"),
+            None,
+            b"RIFF....WAVEfmt ",
+        )
+        .unwrap();
         match done {
             PollOutcome::Complete(artifact) => assert_eq!(artifact.media_type, MediaType::AudioWav),
             PollOutcome::Pending => panic!("expected Complete on the second poll"),
@@ -1700,7 +1867,8 @@ mod tests {
     #[test]
     fn handle_poll_response_404_expired_job_is_a_provider_error() {
         let body = br#"{"id":"abc123","name":"not_found","errors":["job id expired"]}"#;
-        let err = handle_poll_response(404, Some("application/json"), None, None, body).unwrap_err();
+        let err =
+            handle_poll_response(404, Some("application/json"), None, None, body).unwrap_err();
         assert!(matches!(err, StabilityError::Provider { status: 404, .. }));
     }
 

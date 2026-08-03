@@ -14,12 +14,13 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// and stay advertised as long as either capability is on, so they belong to neither
 /// flag. `list_models` is its own gate — a read-only operator/config tool, no model in
 /// the loop, independent of everything else here.
-const ALL_TOOLS: [&str; 12] = [
+const ALL_TOOLS: [&str; 13] = [
     "batch_submit",
     "consult",
     "consult_submit",
     "deliberate",
     "explore",
+    "generate",
     "job_cancel",
     "job_get",
     "job_list",
@@ -56,9 +57,14 @@ const FULLY_STAFFED: &str = r#"
     kind = "gemini"
     key_optional = true
 
+    [backends.sd]
+    kind = "stability"
+    key_optional = true
+
     [casts.inter]
     explorer = "gem/lite"
     synth    = "gem/flash"
+    image    = "sd/core"
 
     [casts.deep]
     explorer = "gem/lite"
@@ -109,6 +115,11 @@ fn a_stock_install_does_not_advertise_deliberate() {
          not be advertised on a stock install; got {tools:?}"
     );
     assert!(
+        !tools.contains(&"generate".to_string()),
+        "no built-in cast carries an `image` slot, so `generate` must not be advertised \
+         on a stock install; got {tools:?}"
+    );
+    assert!(
         tools.contains(&"consult".to_string()),
         "the rest of the surface must survive — this is a targeted drop, not a shutdown; \
          got {tools:?}"
@@ -121,7 +132,7 @@ fn each_flag_removes_exactly_its_own_tools() {
     // `job_get`/`job_cancel`/`job_list` belong to neither flag alone — gating one
     // capability leaves them because the other still needs them — so they appear in no
     // row's removed-set and are covered by the "every other tool remains" check below.
-    let cases: [(&[&str], ToolGating); 7] = [
+    let cases: [(&[&str], ToolGating); 8] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
             // `job_get`/`job_cancel`/`job_list` stay (batch still uses them).
@@ -181,6 +192,15 @@ fn each_flag_removes_exactly_its_own_tools() {
                 ..Default::default()
             },
         ),
+        (
+            // `--no-generate` drops only `generate`; the collect verbs stay (the other
+            // producers still mint handles).
+            &["generate"],
+            ToolGating {
+                generate: false,
+                ..Default::default()
+            },
+        ),
     ];
     for (disabled, gating) in cases {
         let tools = advertised(gating);
@@ -202,19 +222,54 @@ fn each_flag_removes_exactly_its_own_tools() {
 
 /// The shared collect verbs (`job_get`/`job_cancel`/`job_list`/`job_wait`) are gated by
 /// *any handle producer*: `consult_submit` and `batch_submit` — and `deliberate`, which
-/// produces both a `job-N` (direct lane) and a `backend/provider-id` (batch lane). They
-/// stay while any of the three is on, and drop only when all are off. A gate that knew
-/// only batch+consult would strand a `deliberate`-only server's handles.
+/// produces both a `job-N` (direct lane) and a `backend/provider-id` (batch lane) —
+/// and `generate`, whose deferred operations mint a `job-N`. They stay while any of
+/// the four is on, and drop only when all are off. A gate that knew only batch+consult
+/// would strand a `deliberate`-only (or `generate`-only) server's handles.
 #[test]
 fn shared_collect_verbs_track_all_handle_producers() {
     const VERBS: [&str; 4] = ["job_get", "job_cancel", "job_list", "job_wait"];
 
     // Each producer alone must keep the verbs — its handles need collecting.
     for (label, only) in [
-        ("consult", ToolGating { batch: false, deliberate: false, ..Default::default() }),
-        ("batch", ToolGating { consult: false, deliberate: false, ..Default::default() }),
+        (
+            "consult",
+            ToolGating {
+                batch: false,
+                deliberate: false,
+                generate: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "batch",
+            ToolGating {
+                consult: false,
+                deliberate: false,
+                generate: false,
+                ..Default::default()
+            },
+        ),
         // deliberate alone: it's the case the old batch+consult gate would have stranded.
-        ("deliberate", ToolGating { batch: false, consult: false, ..Default::default() }),
+        (
+            "deliberate",
+            ToolGating {
+                batch: false,
+                consult: false,
+                generate: false,
+                ..Default::default()
+            },
+        ),
+        // generate alone: a deferred generation is collected through the same verbs.
+        (
+            "generate",
+            ToolGating {
+                batch: false,
+                consult: false,
+                deliberate: false,
+                ..Default::default()
+            },
+        ),
     ] {
         let tools = advertised(only);
         for v in VERBS {
@@ -225,18 +280,19 @@ fn shared_collect_verbs_track_all_handle_producers() {
         }
     }
 
-    // All three producers off — nothing to collect, so the verbs drop. (run_kaish/oneshot
+    // All four producers off — nothing to collect, so the verbs drop. (run_kaish/oneshot
     // keep the server a valid, non-empty surface.)
     let none = advertised(ToolGating {
         batch: false,
         consult: false,
         deliberate: false,
+        generate: false,
         ..Default::default()
     });
     for v in VERBS {
         assert!(
             !none.contains(&v.to_string()),
-            "{v} must drop when every handle producer (batch/consult/deliberate) is off"
+            "{v} must drop when every handle producer (batch/consult/deliberate/generate) is off"
         );
     }
 }
@@ -251,6 +307,7 @@ fn all_disabled_is_detected() {
         run_kaish: false,
         batch: false,
         list_models: false,
+        generate: false,
     };
     assert!(none_on.all_disabled());
     // Any single tool on means it's a usable server, not the refused state.

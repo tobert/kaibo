@@ -19,7 +19,8 @@ of backends and casts. A missing file at the default path is not an error.
 ## The model: backends, roles, casts
 
 ```
-ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (the wire protocol)
+ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (completion wires)
+             | stability                                             (media wire)
 Backend      = { name, kind, base_url?, key source, request_timeout }
 Cast         = { name, role → ModelSlot }                  (freely spans backends)
 ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
@@ -28,11 +29,16 @@ ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
 Each concept owns one idea:
 
 - **backend** — a *connection*. Carries `kind` (the closed `ProviderKind` enum; it
-  selects the rig client and the request shape), `base_url`, a key source, and
-  `request_timeout`. Answers "how do I reach Gemini".
-- **role** — a *job* a model serves. Two exist: `explorer` and `synth`, the two agent
-  phases. There are no output or production roles, because kaibo reasons over code and
-  renders nothing. Image input is a slot capability (the `vision` pin), not a role.
+  selects the client and the request shape), `base_url`, a key source, and
+  `request_timeout`. Answers "how do I reach Gemini". Kinds divide into two classes:
+  the completion wires (everything through rig's completion clients) and the media
+  wire (`stability`, an image-generation API with no completion surface).
+- **role** — a *job* a model serves. Three exist: `explorer` and `synth`, the two
+  reasoning phases, and `image`, the media member that staffs the `generate` tool.
+  A reasoning role takes a completion backend; the `image` role takes a media backend
+  (kind `stability`) — pairing either with the wrong class is a load error naming the
+  fix. Image *input* is a slot capability (the `vision` pin on a reasoning slot), not
+  a role.
 - **cast** — a *composition*. A named assignment of models to roles. This is what the
   `cast` call parameter selects.
 
@@ -47,8 +53,8 @@ Connection settings only. Models are never declared here.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` | required on a new backend | closed enum; selects client + request shape |
-| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini`; load error elsewhere |
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` | required on a new backend | closed enum; selects client + request shape (`stability` is the media wire — image slots only) |
+| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini`/`stability`; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
 | `api_key_file` | path | seeded from `kind` | file source, checked second |
@@ -73,6 +79,9 @@ by re-declaration.
 - **`kind = "anthropic"` / `kind = "gemini"`** — optional. Unset resolves to rig's
   built-in `https://api.anthropic.com` / `https://generativelanguage.googleapis.com`.
   Set, it points that wire protocol at a compatible gateway or proxy.
+- **`kind = "stability"`** — optional, same contract: unset dials
+  `https://api.stability.ai`; set, it points the media wire at a compatible
+  gateway or proxy.
 - **Every other kind** — a load error. rig fixes those endpoints.
 
 The value is a **host root**, not a versioned path. rig's `ClientBuilder` appends the
@@ -194,13 +203,18 @@ synth    = "claude/claude-sonnet-4-6"       # the model that answers
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
-**Roles.** `explorer` and `synth`. A misspelled role, or a misspelled per-slot key, is
-a load error rather than a silent no-op.
+**Roles.** `explorer`, `synth`, and `image`. A misspelled role, or a misspelled
+per-slot key, is a load error rather than a silent no-op. The `image` slot is the
+media member: it points at a `stability`-kind backend (its model id picks the route —
+`core`, `ultra`, or an SD3.5 variant) and staffs the `generate` tool. It sends one
+generation request, not a reasoning loop, so the reasoning tunables (`effort`,
+`thinking_budget`, `temperature`, ...) written on it are inert — `kaibo://config`
+flags them under `inert_tunables`.
 
-A cast may omit a role. The interactive built-ins carry both; the batch built-ins carry
-`synth` only. A user cast that omits a role is valid config, and the tool needing the
-missing role fails at call time naming the gap (`cast "lite" has no synth slot`). Absent
-means the capability is absent.
+A cast may omit a role. The interactive built-ins carry explorer + synth; the batch
+built-ins carry `synth` only; none carries `image`. A user cast that omits a role is
+valid config, and the tool needing the missing role fails at call time naming the gap
+(`cast "lite" has no synth slot`). Absent means the capability is absent.
 
 **Slot references.** An unknown backend in a slot is a load error naming the known
 backends. An empty model id is rejected at load, since it would otherwise surface as an
@@ -605,9 +619,11 @@ stale `provider` is now an invalid-params error like every other tombstone above
 A tool clears **two** gates to be advertised: the `[server.tools]` flag (equivalently
 `--no-<tool>` or `KAIBO_NO_<TOOL>`), and a configured cast that can **staff** it.
 
-The seven flags are *capability* switches, not one per MCP tool. `consult` gates both
+The eight flags are *capability* switches, not one per MCP tool. `consult` gates both
 `consult` and `consult_submit`; `batch` gates `batch_submit`; the `job_*` verbs have no
-flag of their own and follow whichever handle producers are live.
+flag of their own and follow whichever handle producers are live. `generate` clears a
+third gate as well: the media CAS must be on (`[cas] enabled`), because an
+artifact-producing tool needs somewhere to store artifacts.
 
 A tool nothing can staff has its route removed rather than shipping unusable. The calling
 agent never sees a tool whose every call would fail, and an unusable tool stops costing
@@ -621,10 +637,13 @@ Which cast shape staffs which tool:
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
+| `generate` | a cast with an `image` slot (a media backend, kind `stability`) — plus `[cas]` on |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
-**Default installs.** This affects one tool. No built-in cast pairs an explorer with an
+**Default installs.** This affects two tools. No built-in cast carries an `image` slot,
+so `generate` stays dark until you configure one (the image-slot example in
+`docs/config.example.toml`). And no built-in cast pairs an explorer with an
 offline synth — the two built-in offline casts, `anthropic-batch` and `gemini-batch`, are
 synth-only — so `deliberate` is not advertised until you configure a cast carrying both
 slots. The DELIBERATE casts section of `docs/config.example.toml` is the worked example.
@@ -782,6 +801,52 @@ It is not silent. The startup log says so, and `kaibo://config` shows `persisten
 = false` alongside `enabled = true`, so the calling model can see that durability is off.
 Close the other kaibo, point `--state-db` elsewhere, or pass `--no-persistence` to make it
 explicit. Every other open failure stays fatal.
+
+## Media CAS: `[cas]`
+
+**On by default, and it follows persistence.** The CAS is the content-addressed store
+where an artifact-producing tool (image generation) writes what it made. Its lifecycle
+has three states, reported as `mode` in `kaibo://config`'s `[cas]` section:
+
+| mode | when | what it means |
+|---|---|---|
+| `disk` | persistence is active | artifacts land at `dir`, durable across restarts |
+| `memory` | persistence is off or degraded, or no `dir` resolves | artifacts are fetchable by digest for this run only; startup warns loudly |
+| `off` | `enabled = false` | no store, and every tool that needs one is not advertised |
+
+```toml
+[cas]
+enabled   = true                            # default true; false un-advertises the tools that need it
+dir       = "$XDG_DATA_HOME/kaibo/cas"      # default; else ~/.local/share/kaibo/cas
+max_bytes = 8589934592                      # optional soft cap; omit for no cap (the default)
+```
+
+CLI/env: `--cas-dir` / `KAIBO_CAS_DIR` move the store; `--cas-max-bytes` /
+`KAIBO_CAS_MAX_BYTES` set the cap. `enabled` is file-only.
+
+**The address is the content.** Every object's filename is the SHA-256 of its bytes, so
+nothing (model or operator) can aim a write at a chosen path, and identical content is
+stored once. Objects are written once and never rewritten, unlinked, or evicted. Each
+object gets a `<hex>.json` provenance sidecar (prompt, model, cast, timestamp, mime,
+seed) so you can prune by hand with `find`/`jq`/`restic` — kaibo ships no GC.
+
+**Retrieval is operator-surface only.** A generation result returns each artifact's
+digest, a `kaibo://cas/<digest>` resource URI, and (in disk mode) the real filesystem
+path. The MCP client and CLI read those; the inner model team never sees the CAS — it is
+not mounted into kaish and no cast-facing tool reads it, because kaibo state spans
+projects and a browsable CAS would let one project's team enumerate another's artifacts.
+
+**`max_bytes` refuses, never evicts.** A write that would pass the cap fails loudly and
+nothing is deleted to make room. The cap is opt-in because enforcing it costs an
+O(objects) walk of the store per new write.
+
+**Failure is loud.** In disk mode, a structurally unusable CAS path fails startup with
+an error naming the escape hatches: a dir that resolves inside an allowed project tree
+(refused the same way the state db is), or a file sitting where the store or one of its
+ancestors must be a directory. Write errors that only a real write can reveal
+(permissions, disk full, a read-only mount) surface on the first generation instead —
+opening the store writes nothing, so it cannot probe for them. Memory mode is the one
+warned degrade, mirroring the persistence posture it follows.
 
 ## House rules: `[context]`
 

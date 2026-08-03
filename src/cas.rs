@@ -102,11 +102,17 @@
 //! caller to handle a truncated/failed read as a first-class outcome — not carrying this
 //! module's verify-before-return contract over unexamined. Read this before adding one.
 //!
-//! # The soft cap refuses; it never evicts
+//! # The soft cap is opt-in; when set it refuses, and it never evicts
 //!
-//! [`Cas::open`] takes a `max_bytes` ceiling. A [`Cas::put`] that would push the store's
-//! total size over that ceiling is refused with [`CasError::CapacityExceeded`] — loudly,
-//! before any bytes are written. It never deletes anything to make room: eviction would
+//! [`Cas::open`] takes an **optional** `max_bytes` ceiling, and the default is `None` —
+//! no ceiling, and no size accounting whatsoever. Enforcing a ceiling means summing every
+//! file in the store on the *write* path, for every new object, over a store that never
+//! deletes and is sharded two levels deep; that walk is O(objects) and only slows down as
+//! the store fills. An operator who never asked for a ceiling should not pay it, so they
+//! do not. Cleanup is theirs to do (`find -mtime` over the sidecars); a TTL may come later.
+//!
+//! When a cap *is* set, a [`Cas::put`] that would push the store's total size over it is
+//! refused with [`CasError::CapacityExceeded`] — loudly, before any bytes are written. It never deletes anything to make room: eviction would
 //! quietly make "write-only" a lie (a lie exactly one write-time trust judgment away from
 //! looking corrupt), and disk-full-in-effect is precisely the crash-over-corrupt case
 //! kaibo's read-only posture already treats as correct. A dedup write of content already
@@ -167,6 +173,14 @@ pub enum CasError {
          the CAS directory by hand)"
     )]
     CapacityExceeded { max_bytes: u64, current_bytes: u64 },
+    /// The requested CAS root — or a path component on the way to it — exists but is
+    /// not a directory, so the store structurally cannot live there. Caught at
+    /// [`Cas::open`] so it fails startup, not the first paid generation.
+    #[error(
+        "media CAS path cannot be used: {0} is not a directory — the store needs a \
+         directory (or a creatable path whose existing ancestors are directories)"
+    )]
+    NotADirectory(String),
     /// A filesystem operation failed for a reason other than the ones above (permissions,
     /// disk full, an unreadable existing file, …), surfaced verbatim.
     #[error("media CAS io: {0}")]
@@ -285,6 +299,33 @@ impl Extension {
             Extension::Gif => "gif",
         }
     }
+
+    /// The canonical mime type this on-disk format serves as — what the
+    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back.
+    pub fn mime(&self) -> &'static str {
+        match self {
+            Extension::Png => "image/png",
+            Extension::Jpeg => "image/jpeg",
+            Extension::Webp => "image/webp",
+            Extension::Gif => "image/gif",
+        }
+    }
+
+    /// Map a wire mime string (a provider's own spelling, case-insensitive per RFC
+    /// 7231) onto the closed on-disk set. `None` for anything the CAS cannot name on
+    /// disk — the caller decides loudly what that means (see
+    /// `stability::MediaType::to_cas_extension` for the same refusal argued at length);
+    /// this helper never invents an extension for unknown bytes.
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        let essence = mime.split(';').next().unwrap_or(mime).trim();
+        match essence.to_ascii_lowercase().as_str() {
+            "image/png" => Some(Extension::Png),
+            "image/jpeg" => Some(Extension::Jpeg),
+            "image/webp" => Some(Extension::Webp),
+            "image/gif" => Some(Extension::Gif),
+            _ => None,
+        }
+    }
 }
 
 /// The provenance sidecar recorded next to every object: `prompt`, `model`, `cast`,
@@ -331,13 +372,32 @@ pub struct Provenance {
 #[derive(Debug, Clone)]
 pub struct Cas {
     root: PathBuf,
-    max_bytes: u64,
+    /// The optional soft cap. `None` — the default — means no ceiling AND no size
+    /// accounting: [`Cas::put`] never walks the store. See [`Cas::open`].
+    max_bytes: Option<u64>,
+    /// Serializes [`Cas::put`] across threads sharing this store (clones share it —
+    /// the handler holds one `Arc<MediaStore>` across concurrent MCP calls).
+    /// Generation is rare and writes are small, so a plain mutex buys the whole
+    /// check-then-write path (dedup verify, cap accounting, object + sidecar) its
+    /// atomicity with no cleverness. See [`Cas::put`].
+    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl Cas {
     /// Open (but do not yet create — see below) the CAS rooted at `dir`, refusing if
     /// `dir` resolves inside any `allowed_trees` entry (the read-only sandbox's project
-    /// roots). `max_bytes` is the soft cap enforced by every [`Cas::put`].
+    /// roots).
+    ///
+    /// `max_bytes` is an **optional** soft cap, and `None` (the default) is meaningfully
+    /// different from a very large number: it means [`Cas::put`] does no size accounting
+    /// at all. That matters because enforcing a cap requires summing every file in the
+    /// store, on the *write* path, for every new object — over a store that by design
+    /// never deletes anything, sharded two levels deep. That walk only gets slower as the
+    /// store fills, which is exactly the cost an operator who never asked for a ceiling
+    /// should not pay. Amy's call (2026-07-30): leave the accounting off until someone has
+    /// a problem that needs it. Disk-full is the real backstop and the OS reports it
+    /// honestly; pruning is `find -mtime` over the provenance sidecars (see the module
+    /// doc's "No GC here, on purpose").
     ///
     /// Unlike [`crate::store::SessionStore::open`], this does **not** create any
     /// directory — there is nothing to eagerly create. The root (and every shard
@@ -353,7 +413,7 @@ impl Cas {
     /// canonicalize the deepest *existing* ancestor of `dir` (following symlinks) and
     /// re-append the not-yet-created tail lexically, and refuse if that resolves inside
     /// any allowed tree.
-    pub fn open(dir: &Path, allowed_trees: &[&Path], max_bytes: u64) -> Result<Self> {
+    pub fn open(dir: &Path, allowed_trees: &[&Path], max_bytes: Option<u64>) -> Result<Self> {
         let dir = absolutize(dir)?;
         let resolved = resolve_existing_ancestor(&dir);
         for tree in allowed_trees {
@@ -362,9 +422,21 @@ impl Cas {
                 return Err(CasError::PathInAllowedTree(dir.display().to_string()));
             }
         }
+        // Structural check, still with zero side effects: the deepest EXISTING path on
+        // the way to the root must be a directory (the root itself included, when it
+        // exists). A file sitting there means every future write must fail — caught
+        // here so it fails startup, not the first paid generation. What this can NOT
+        // vouch for without writing is writability (permissions, disk full, a
+        // read-only mount); those still surface on first use.
+        if let Some(existing) = first_existing_ancestor(&dir) {
+            if !existing.is_dir() {
+                return Err(CasError::NotADirectory(existing.display().to_string()));
+            }
+        }
         Ok(Self {
             root: dir,
             max_bytes,
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -396,9 +468,16 @@ impl Cas {
     /// under. `None` if no object with this digest has ever been written (or an ancestor
     /// directory doesn't exist yet, which reads the same way: nothing is here).
     pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
+        self.entry_for(digest).map(|(path, _)| path)
+    }
+
+    /// [`path_for`](Self::path_for) plus which [`Extension`] the object was written
+    /// under — the extension carries the mime type a resource read needs to stamp on
+    /// the bytes, and re-deriving it from the path string would be a second parser.
+    pub fn entry_for(&self, digest: &Digest) -> Option<(PathBuf, Extension)> {
         Extension::ALL.into_iter().find_map(|ext| {
             let path = self.object_path(digest, ext);
-            path.is_file().then_some(path)
+            path.is_file().then_some((path, ext))
         })
     }
 
@@ -432,9 +511,12 @@ impl Cas {
     }
 
     /// Recursively sum the size in bytes of every file currently in the store. Backs the
-    /// soft-cap check in [`Cas::put`]. A read-only directory walk — no writes, no
-    /// caching, no separate counter file to keep in sync (and thus no extra write site
-    /// this module would otherwise need).
+    /// soft-cap check in [`Cas::put`], and is called ONLY when a cap is configured — see
+    /// [`Cas::open`] for why an uncapped store must never pay for this. A read-only
+    /// directory walk: no writes, no caching, no separate counter file to keep in sync
+    /// (and thus no extra write site this module would otherwise need). The flip side of
+    /// holding no counter is that the cost is O(objects) per capped write, which is
+    /// precisely why the cap is opt-in rather than a default ceiling.
     fn total_bytes(&self) -> Result<u64> {
         fn walk(dir: &Path) -> std::io::Result<u64> {
             if !dir.is_dir() {
@@ -469,15 +551,31 @@ impl Cas {
     /// into a poisoned slot — the caller's data was never at risk, only the report of
     /// success was. A verified dedup is **not** re-checked against the soft cap — it adds
     /// zero new bytes, so it cannot be what pushes the store over the line. Otherwise (new
-    /// content) the soft cap is checked *before* any write: if the current total plus
-    /// `bytes.len()` would exceed `max_bytes`, the write is refused with
+    /// content) the soft cap is checked *before* any write, and it counts the whole
+    /// footprint this put would add — the artifact **and** its provenance sidecar,
+    /// which is real disk usage written by the same call: if the current total plus
+    /// both would exceed `max_bytes`, the write is refused with
     /// [`CasError::CapacityExceeded`] and nothing is written — never evicted, see the
     /// module doc.
+    ///
+    /// The whole body runs under the store's write mutex, so concurrent puts on
+    /// clones/`Arc`s of one store serialize: the dedup check, the cap accounting, and
+    /// the two writes are atomic with respect to each other. If `create_new` still
+    /// loses to something that appeared from outside this process (another kaibo, an
+    /// operator's copy), the existing bytes are read back and **verified** before
+    /// success is reported — never trusted from the path alone.
     pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
         let digest = Digest::of_bytes(bytes);
         let shard = self.shard_dir(&digest);
         let obj_path = self.object_path(&digest, ext);
         let sidecar_path = self.sidecar_path(&digest);
+
+        let _write_guard = self.write_lock.lock().expect("cas write mutex poisoned");
+
+        // Serialized up front so the cap admission below can count it — the sidecar is
+        // part of this put's disk footprint, not an afterthought.
+        let sidecar_json = serde_json::to_vec_pretty(provenance)
+            .map_err(|e| CasError::Serialize(e.to_string()))?;
 
         if obj_path.is_file() {
             // Dedup path: the module doc's "AlreadyExists means these exact bytes are
@@ -496,13 +594,15 @@ impl Cas {
                 ))
             })?;
             verify(&digest, existing)?;
-        } else {
-            // New content only: check the soft cap before growing the store at all.
+        } else if let Some(max_bytes) = self.max_bytes {
+            // New content, and a cap is configured: measure before growing the store at
+            // all. This is the ONLY call site that walks the store, and it is reached only
+            // when an operator opted into a ceiling — an uncapped CAS never sizes itself.
             let current = self.total_bytes()?;
-            let incoming = bytes.len() as u64;
-            if current.saturating_add(incoming) > self.max_bytes {
+            let incoming = bytes.len() as u64 + sidecar_json.len() as u64;
+            if current.saturating_add(incoming) > max_bytes {
                 return Err(CasError::CapacityExceeded {
-                    max_bytes: self.max_bytes,
+                    max_bytes,
                     current_bytes: current,
                 });
             }
@@ -513,11 +613,25 @@ impl Cas {
                 CasError::Io(format!("creating cas shard dir {}: {e}", shard.display()))
             })?;
 
-        write_new_file(&obj_path, bytes)
+        let wrote = write_new_file(&obj_path, bytes)
             .map_err(|e| CasError::Io(format!("writing cas object {}: {e}", obj_path.display())))?;
+        if !wrote {
+            // The pre-check saw nothing here, yet `create_new` lost: something claimed
+            // the path from outside this process (the in-process race is excluded by
+            // the mutex above). The contract stands — an existing object is a VERIFIED
+            // no-op — so read back and verify before reporting success. A path that
+            // exists but cannot even be read (a dangling symlink, permissions) is a
+            // loud Io error, never a silent "someone else surely wrote it".
+            let existing = std::fs::read(&obj_path).map_err(|e| {
+                CasError::Io(format!(
+                    "cas object {} was claimed concurrently but cannot be read back to \
+                     verify: {e}",
+                    obj_path.display()
+                ))
+            })?;
+            verify(&digest, existing)?;
+        }
 
-        let sidecar_json = serde_json::to_vec_pretty(provenance)
-            .map_err(|e| CasError::Serialize(e.to_string()))?;
         write_new_file(&sidecar_path, &sidecar_json).map_err(|e| {
             CasError::Io(format!(
                 "writing cas provenance sidecar {}: {e}",
@@ -529,14 +643,163 @@ impl Cas {
     }
 }
 
+/// One artifact held by the in-memory store: the bytes plus the metadata a disk
+/// object keeps in its filename (`ext`) and sidecar (`provenance`).
+#[derive(Debug, Clone)]
+struct MemObject {
+    bytes: Vec<u8>,
+    ext: Extension,
+    provenance: Provenance,
+}
+
+/// The in-memory CAS: the same content-addressed contract as [`Cas`] — the address is
+/// the content's own hash, `put` takes no destination, nothing is ever deleted or
+/// rewritten — held in a `HashMap` instead of on disk. This is the degraded mode Amy
+/// decided for a run without persistence ("cas should be on when persistence is, and
+/// ideally on but in memory only when it's not", 2026-07-30): artifacts stay
+/// retrievable by digest for the life of the process and are gone on restart, which
+/// startup warns about LOUDLY (see `main.rs`) and `kaibo://config` reports as
+/// `mode = "memory"`. Touches no filesystem at all, so the write-path guard
+/// (`tests/no_write_path.rs`) has nothing to bless here.
+///
+/// The optional `max_bytes` cap is honored with the same refuse-never-evict posture as
+/// [`Cas::put`] — in memory the accounting is a cheap sum over held objects, but the
+/// *meaning* of the knob (a ceiling that refuses, loudly) must not change with the mode.
+#[derive(Debug)]
+pub struct MemoryCas {
+    objects: std::sync::Mutex<std::collections::HashMap<Digest, MemObject>>,
+    max_bytes: Option<u64>,
+}
+
+impl MemoryCas {
+    pub fn new(max_bytes: Option<u64>) -> Self {
+        Self {
+            objects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_bytes,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Digest, MemObject>> {
+        self.objects.lock().expect("memory CAS mutex poisoned")
+    }
+
+    /// Store `bytes` under their own digest. A repeat of identical content is a
+    /// no-op returning the same digest (dedup needs no verification here: the map is
+    /// keyed by the digest of exactly the bytes it holds, and nothing between put and
+    /// get can corrupt process memory the way a torn disk write can). A new object is
+    /// checked against the cap first, mirroring [`Cas::put`].
+    pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
+        let digest = Digest::of_bytes(bytes);
+        let mut objects = self.lock();
+        if objects.contains_key(&digest) {
+            return Ok(digest);
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            let current: u64 = objects.values().map(|o| o.bytes.len() as u64).sum();
+            if current.saturating_add(bytes.len() as u64) > max_bytes {
+                return Err(CasError::CapacityExceeded {
+                    max_bytes,
+                    current_bytes: current,
+                });
+            }
+        }
+        objects.insert(
+            digest,
+            MemObject {
+                bytes: bytes.to_vec(),
+                ext,
+                provenance: provenance.clone(),
+            },
+        );
+        Ok(digest)
+    }
+
+    /// Read an object back by digest: the bytes and the extension it was stored
+    /// under. `None` if nothing with this digest was ever put.
+    pub fn get(&self, digest: &Digest) -> Option<(Vec<u8>, Extension)> {
+        self.lock().get(digest).map(|o| (o.bytes.clone(), o.ext))
+    }
+
+    /// The provenance recorded with an object, if it exists — the in-memory analogue
+    /// of reading a disk sidecar.
+    pub fn provenance(&self, digest: &Digest) -> Option<Provenance> {
+        self.lock().get(digest).map(|o| o.provenance.clone())
+    }
+}
+
+/// The media store a running kaibo actually holds: the disk [`Cas`] when persistence
+/// is active, the [`MemoryCas`] when it is not. One seam so every consumer (the
+/// generate lane, the `kaibo://cas/<digest>` resource, the `kaibo://config` render)
+/// dispatches over the mode instead of each carrying its own two-armed match — and so
+/// the *contract* (content-addressed, write-only, no destination parameter) is the
+/// same sentence in both modes.
+#[derive(Debug)]
+pub enum MediaStore {
+    Disk(Cas),
+    Memory(MemoryCas),
+}
+
+impl MediaStore {
+    /// Store an artifact; the digest is its address in either mode.
+    pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
+        match self {
+            MediaStore::Disk(cas) => cas.put(bytes, ext, provenance),
+            MediaStore::Memory(mem) => mem.put(bytes, ext, provenance),
+        }
+    }
+
+    /// Read an object back with the extension (and thus mime) it was stored under.
+    /// Disk reads verify content against the digest ([`Cas::get`]'s contract); memory
+    /// reads need no verification (see [`MemoryCas::put`]).
+    pub fn get(&self, digest: &Digest) -> Result<Option<(Vec<u8>, Extension)>> {
+        match self {
+            MediaStore::Disk(cas) => {
+                let Some((_, ext)) = cas.entry_for(digest) else {
+                    return Ok(None);
+                };
+                Ok(cas.get(digest)?.map(|bytes| (bytes, ext)))
+            }
+            MediaStore::Memory(mem) => Ok(mem.get(digest)),
+        }
+    }
+
+    /// The real filesystem path of an object — `Some` only in disk mode, where an
+    /// operator (or the calling agent, acting as the operator's proxy) can reach the
+    /// file directly. Memory mode has no path; the `kaibo://cas/<digest>` resource is
+    /// the only retrieval channel there.
+    pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
+        match self {
+            MediaStore::Disk(cas) => cas.path_for(digest),
+            MediaStore::Memory(_) => None,
+        }
+    }
+
+    /// The store's root directory — `Some` only in disk mode.
+    pub fn root(&self) -> Option<&Path> {
+        match self {
+            MediaStore::Disk(cas) => Some(cas.root()),
+            MediaStore::Memory(_) => None,
+        }
+    }
+
+    /// The mode word `kaibo://config` renders: `"disk"` or `"memory"`.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            MediaStore::Disk(_) => "disk",
+            MediaStore::Memory(_) => "memory",
+        }
+    }
+}
+
 /// Create `path` as a brand-new file (`create_new` — `O_EXCL` on Unix), write `bytes` to
 /// it, and `sync_all` before returning — pushing both data and metadata to durable storage
-/// rather than leaving them in a page-cache buffer a crash could still lose. If `path`
-/// already exists this is a deliberate no-op (`Ok(())`, not an error): on a
-/// content-addressed path that *should* only mean these exact bytes are already there —
-/// see [`CasError::Corrupt`] and [`Cas::get`] for why callers can no longer take that on
-/// faith alone. Any other I/O failure (permissions, disk full, the parent directory
-/// missing) is propagated. There is no unlink, truncate, or rename anywhere in this
+/// rather than leaving them in a page-cache buffer a crash could still lose. Returns
+/// `Ok(true)` when this call wrote the file, `Ok(false)` when `path` already existed
+/// (nothing written) — the CALLER decides what an existing path means: [`Cas::put`]
+/// verifies an existing object's bytes before reporting success (see
+/// [`CasError::Corrupt`]), and treats an existing sidecar as fine. Any other I/O
+/// failure (permissions, disk full, the parent directory missing) is propagated.
+/// There is no unlink, truncate, or rename anywhere in this
 /// function or its caller — an "edit" is always a new digest, never a mutation of an
 /// existing object.
 ///
@@ -547,17 +810,18 @@ impl Cas {
 /// window is exactly why verification on read ([`Cas::get`]) and on dedup ([`Cas::put`])
 /// exists as the actual backstop — fsync narrows how often corruption occurs, verification
 /// is what guarantees it is never handed back silently when it does.
-fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     use std::io::Write;
 
     let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
     };
     file.write_all(bytes)?; // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
-    file.sync_all()
+    file.sync_all()?;
+    Ok(true)
 }
 
 /// Verify that `bytes` hashes to `digest`, consuming `bytes` into the `Ok` case so a
@@ -637,6 +901,21 @@ fn resolve_existing_ancestor(path: &Path) -> PathBuf {
         }
     }
     normalize(path)
+}
+
+/// The deepest existing path at-or-above `path` — `path` itself when it exists, else
+/// the nearest existing ancestor; `None` when nothing on the way up exists (an
+/// absolute path always bottoms out at `/`, so this is the degenerate relative case).
+/// Backs [`Cas::open`]'s structural check: whatever exists on the way to the root
+/// must be a directory, or no future write can succeed.
+fn first_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut cursor = path;
+    loop {
+        if cursor.exists() {
+            return Some(cursor);
+        }
+        cursor = cursor.parent()?;
+    }
 }
 
 /// Lexically clean a path (resolve `.` and `..` without touching the filesystem).

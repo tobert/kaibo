@@ -179,6 +179,25 @@ impl Resolver {
             );
         }
 
+        // The media half of the same policy, from the same shared rule
+        // (`Config::media_tunable_diagnostics`, which the `kaibo://config` render also
+        // reads): reasoning tunables the operator WROTE on a slot that runs no
+        // reasoning phase. One line per slot, knobs named, so the fix needs no hunt.
+        // Inherited `[defaults]` values stay quiet, exactly like the effort scan above.
+        for d in config.media_tunable_diagnostics() {
+            tracing::warn!(
+                cast = %d.cast,
+                slot = %d.role,
+                model = %d.model,
+                tunables = %d.tunables.join(", "),
+                "reasoning tunables on the {} slot do nothing: this slot sends one \
+                 generation request with no reasoning phase, so these knobs are \
+                 dropped before any request is built. Move them to a reasoning slot \
+                 (explorer/synth) or remove them. See kaibo://config (inert_tunables).",
+                d.role
+            );
+        }
+
         Ok(Self {
             config,
             allowed_set: Arc::new(allowed),

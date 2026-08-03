@@ -449,6 +449,17 @@ code + stdout + stderr. For an agent that already has a shell tool, this mostly 
 *safety* — writes and external commands are refused, so exploration leaves nothing to
 review: there's no diff, because nothing it runs can change your tree.
 
+### `generate` — images through the cast's media member
+
+kaibo's first artifact-*producing* tool: a text prompt in, generated images out —
+through a cast's `image` slot (a Stability backend today). The bytes never inline into
+your context: each artifact lands in kaibo's content-addressed media store with a
+provenance sidecar (prompt, model, cast, seed), and the result lists per-artifact
+digests as `kaibo://cas/<digest>` resource URIs — plus the real file path when the
+store is on disk. Advertised only when a configured cast carries an `image` slot and
+the `[cas]` store is on; the project stays untouched — the store lives at a fixed XDG
+data path the model can't steer. See "Media CAS" in [`docs/config.md`](docs/config.md).
+
 ---
 
 ## Backends, Roles, and Casts
@@ -467,8 +478,9 @@ config has three concepts for configuring models:
   never live in the TOML — only the *name* of an env var or the path to a key file.
   `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every major
   model family, reasoning on by default via its unified `effort` param.
-- **role** — a *job* a model does: `explorer` (fast sweeps) and `synth` (the voice that
-  answers). A slot that reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
+- **role** — a *job* a model does: `explorer` (fast sweeps), `synth` (the voice that
+  answers), and `image` (the media member behind `generate`). A reasoning slot that
+  reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
   argument selects the ensemble; the calling agent sees these names in its tool listing,
   so a descriptive name (`local-only`, `deep-dive`) lets it pick a team by intent without

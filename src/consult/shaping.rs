@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::config::DataCollection;
-use crate::credentials::ProviderKind;
+use crate::credentials::{ProviderKind, WireKind};
 
 /// Token budget for model "thinking"/reasoning, for the providers that expose a
 /// request-time toggle. Sized well under [`ConsultConfig`]'s `max_tokens` so the
@@ -122,10 +122,20 @@ impl ModelCaps {
     /// vision answer in both directions; `None` asks the classifier. The transport
     /// channel is a property of the wire protocol alone (`kind`), never overridden.
     pub fn resolve(kind: ProviderKind, model: &str, vision_override: Option<bool>) -> Self {
-        let vision = vision_override.unwrap_or_else(|| is_vision_capable(kind, model));
+        // Media kinds answered once, up front: a media backend answers no completion
+        // request, so it has nothing to see with and no tool-result channel — the
+        // per-wire classifiers below never need a media arm, and a stray `vision` pin
+        // on a media slot cannot conjure capabilities the wire doesn't have.
+        let Some(wire) = kind.wire() else {
+            return Self {
+                vision: false,
+                tool_result_images: false,
+            };
+        };
+        let vision = vision_override.unwrap_or_else(|| is_vision_capable(wire, model));
         Self {
             vision,
-            tool_result_images: transport_supports_tool_result_images(kind),
+            tool_result_images: transport_supports_tool_result_images(wire),
         }
     }
 }
@@ -138,10 +148,10 @@ impl ModelCaps {
 /// delivered as an `image_url` part on a **user** turn. DeepSeek is moot — vision-blind,
 /// so `view_image` never attaches. Branch the rewrite on *this*, not on `kind == Openai`:
 /// the next no-tool-result-image provider is a table entry, not a new `if`.
-fn transport_supports_tool_result_images(kind: ProviderKind) -> bool {
-    match kind {
-        ProviderKind::Anthropic | ProviderKind::Gemini => true,
-        ProviderKind::Openai => false,
+fn transport_supports_tool_result_images(wire: WireKind) -> bool {
+    match wire {
+        WireKind::Anthropic | WireKind::Gemini => true,
+        WireKind::Openai => false,
         // OpenRouter speaks the OpenAI wire but is *more* dangerous than a 400: rig's
         // converter silently rewrites a tool-result image to the placeholder text
         // "[Image content not supported in tool results]" (openrouter/completion.rs,
@@ -149,37 +159,37 @@ fn transport_supports_tool_result_images(kind: ProviderKind) -> bool {
         // quiet drop, the exact silent loss kaibo refuses. `false` routes a seen image
         // onto the user-turn channel (the break-rewrite-resume path) *before* it can
         // reach that converter, so the bytes actually arrive.
-        ProviderKind::OpenRouter => false,
+        WireKind::OpenRouter => false,
         // Vision-blind on the wire; the value is unreached (no view_image attaches),
         // but "no tool-result image channel" is the honest answer.
-        ProviderKind::DeepSeek => false,
+        WireKind::DeepSeek => false,
     }
 }
 
 /// The built-in vision classifier. **Empirical — confirm by probe** (the discipline
 /// of [`is_anthropic_adaptive`]): boundaries reflect what the providers actually
 /// serve today, and a wrong guess fails loud at the provider, not silent here.
-fn is_vision_capable(kind: ProviderKind, _model: &str) -> bool {
-    match kind {
+fn is_vision_capable(wire: WireKind, _model: &str) -> bool {
+    match wire {
         // Every current Claude completion id is multimodal-in (vision shipped with
         // Claude 3; no text-only ids remain in the lineup).
-        ProviderKind::Anthropic => true,
+        WireKind::Anthropic => true,
         // The gemini-* completion line is natively multimodal across 2.x/3.x.
-        ProviderKind::Gemini => true,
+        WireKind::Gemini => true,
         // DeepSeek chat/reasoner are text-only on the wire (docs/issues.md, media
         // spine): images attached to a blind model must fail loud, not get dropped.
-        ProviderKind::DeepSeek => false,
+        WireKind::DeepSeek => false,
         // A generic OpenAI-compatible endpoint can front anything; vision is opt-in
         // per slot (`vision = true` in the role table) rather than guessed from an
         // arbitrary id.
-        ProviderKind::Openai => false,
+        WireKind::Openai => false,
         // OpenRouter fronts every model — vision-capable and text-only alike — so the
         // capability is a property of the pinned *model*, not the gateway. Opt in per
         // slot (`vision = true`), like the generic OpenAI kind. The built-in openrouter
         // cast splits by role: its explorer default (multimodal `qwen3.6-flash`) pins
         // vision on, while its synth default (text-only `qwen3.7-max`) leaves the slot
         // `None` and lets this false stand.
-        ProviderKind::OpenRouter => false,
+        WireKind::OpenRouter => false,
     }
 }
 
@@ -261,8 +271,21 @@ pub struct ModelShape {
 impl ModelShape {
     /// Resolve the shape for `model` under `kind`, honoring an explicit override.
     pub fn resolve(kind: ProviderKind, model: &str, ovr: ThinkingStyleOverride) -> Self {
-        let thinking = match kind {
-            ProviderKind::Anthropic => {
+        // Media kinds answered once, up front: no completion request is ever shaped
+        // for one (a media backend is only reachable from a media cast slot, and the
+        // load guard refuses every other pairing), so the inert shape — no thinking
+        // style, nothing to sink a budget or an effort into — is the truthful value,
+        // and the per-wire matches below never need a media arm. A media provider's
+        // own knobs (cfg_scale, seed) ride its native request, not this shape.
+        let Some(wire) = kind.wire() else {
+            return Self {
+                thinking: ThinkingStyle::None,
+                sampling_under_thinking: true,
+                sampling_placement: SamplingPlacement::TopLevel,
+            };
+        };
+        let thinking = match wire {
+            WireKind::Anthropic => {
                 let adaptive = match ovr {
                     ThinkingStyleOverride::Auto => is_anthropic_adaptive(model),
                     ThinkingStyleOverride::Adaptive => true,
@@ -279,17 +302,17 @@ impl ModelShape {
             // 3-flash / 3.1-pro / 3.5-flash and drops `thinkingBudget` entirely — that
             // knob is the retired 2.5-era shape). So every Gemini id routes to level;
             // the per-role effort rides it. A pre-3.x id fails loud, not silent.
-            ProviderKind::Gemini => ThinkingStyle::GeminiLevel,
-            ProviderKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
-            ProviderKind::OpenRouter => ThinkingStyle::OpenRouterEffort,
-            ProviderKind::Openai => ThinkingStyle::None,
+            WireKind::Gemini => ThinkingStyle::GeminiLevel,
+            WireKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
+            WireKind::OpenRouter => ThinkingStyle::OpenRouterEffort,
+            WireKind::Openai => ThinkingStyle::None,
         };
-        let (sampling_under_thinking, sampling_placement) = match kind {
-            ProviderKind::Anthropic => (false, SamplingPlacement::TopLevel),
-            ProviderKind::Gemini => (true, SamplingPlacement::GeminiGenerationConfig),
+        let (sampling_under_thinking, sampling_placement) = match wire {
+            WireKind::Anthropic => (false, SamplingPlacement::TopLevel),
+            WireKind::Gemini => (true, SamplingPlacement::GeminiGenerationConfig),
             // OpenRouter takes OpenAI-shaped sampling top-level and, being tolerant of
             // unsupported params (dropped per-model), keeps it under reasoning.
-            ProviderKind::DeepSeek | ProviderKind::OpenRouter | ProviderKind::Openai => {
+            WireKind::DeepSeek | WireKind::OpenRouter | WireKind::Openai => {
                 (true, SamplingPlacement::TopLevel)
             }
         };
@@ -613,12 +636,17 @@ impl EffortWire {
         if responses_wire {
             return Self::OpenaiResponses;
         }
-        match kind {
-            ProviderKind::Gemini => Self::Gemini,
-            ProviderKind::Anthropic
-            | ProviderKind::DeepSeek
-            | ProviderKind::OpenRouter
-            | ProviderKind::Openai => Self::Passthrough,
+        // Media kinds carry no effort at all — no arm is ever built from one — so the
+        // do-nothing wire is the truthful answer, resolved once here instead of as an
+        // arm in the completion match below.
+        let Some(wire) = kind.wire() else {
+            return Self::Passthrough;
+        };
+        match wire {
+            WireKind::Gemini => Self::Gemini,
+            WireKind::Anthropic | WireKind::DeepSeek | WireKind::OpenRouter | WireKind::Openai => {
+                Self::Passthrough
+            }
         }
     }
 

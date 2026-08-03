@@ -199,29 +199,55 @@ impl Default for Defaults {
 
 // --- Roles ------------------------------------------------------------------
 
-/// The roles a cast's model slots can serve: the two agent phases. Explorer does the
-/// fast sweeps; synth answers. There are no output/production roles — kaibo reasons
-/// over a codebase and renders nothing. Perception (image input, audio-in later) is a
-/// slot *capability* (`ModelCaps` / the `vision` pin), not a role. A cast may omit a
-/// role: an absent slot means the capability is absent, not an error (the four
-/// interactive built-in casts carry explorer+synth; the batch built-ins carry synth
-/// only).
+/// The roles a cast's model slots can serve.
+///
+/// Explorer does the fast sweeps and synth answers — the two *reasoning* phases, and for
+/// most of kaibo's life the only two. `Image` is deliberately different in kind: it is a
+/// **production** role, the one place kaibo emits rather than reasons, and it exists
+/// because Amy reopened image generation on 2026-07-25 with the media CAS as the write
+/// surface that makes it acceptable (see `src/cas.rs`'s module doc for why the CAS is
+/// safe by *shape* rather than by policy).
+///
+/// It lives here, on a cast slot, rather than as a config concept of its own. That was
+/// Amy's call (2026-07-30) over the alternative of a standalone `[image]` section keyed
+/// straight to a backend, and it earns its place: the staffing gate, the per-tool `cast`
+/// enum, and the per-call `cast` argument all keep working unchanged, so an image tool
+/// is one `CAST_ENUM_RULES` row rather than a parallel mechanism. The cost is that
+/// "cast" now names a team that may include a non-reasoning member; the benefit is that
+/// there is exactly one way to say "which models answer this call".
+///
+/// Perception stays a slot *capability* (`ModelCaps` / the `vision` pin), not a role —
+/// reading an image is part of a reasoning slot's input, not a job of its own.
+///
+/// A cast may omit any role: an absent slot means the capability is absent, not an error
+/// (the interactive built-ins carry explorer+synth; the batch built-ins carry synth
+/// only; none carries an image slot, so no built-in cast can staff an image tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelRole {
     Explorer,
     Synth,
+    Image,
 }
 
 impl ModelRole {
     /// Every role, in table order — the source for "known roles" error text.
-    pub const ALL: [ModelRole; 2] = [Self::Explorer, Self::Synth];
+    pub const ALL: [ModelRole; 3] = [Self::Explorer, Self::Synth, Self::Image];
 
     /// The role's config-table key (`[casts.<name>]`).
     pub fn key(self) -> &'static str {
         match self {
             Self::Explorer => "explorer",
             Self::Synth => "synth",
+            Self::Image => "image",
         }
+    }
+
+    /// Whether this role runs a *reasoning* phase — an agent turn with a preamble, a
+    /// tool loop, and a thinking budget. `Image` does not: it is one request to an image
+    /// API, so the request-shaping machinery (`ModelShape`, effort, thinking style, turn
+    /// caps) neither applies to it nor should be resolved for it.
+    pub fn is_reasoning(self) -> bool {
+        matches!(self, Self::Explorer | Self::Synth)
     }
 }
 
@@ -377,6 +403,34 @@ impl ModelSlot {
             thinking_style: self.thinking_style.unwrap_or(defaults.thinking_style),
         }
     }
+
+    /// The reasoning tunables the operator wrote ON this slot's table, by knob name,
+    /// in the order the `kaibo://config` render lists inert knobs. This is the set a
+    /// non-reasoning (media) slot is judged by: an image slot sends one generation
+    /// request with no preamble, no tool loop, and no thinking budget (see
+    /// [`ModelRole::is_reasoning`]), so a reasoning knob written there never reaches a
+    /// request.
+    ///
+    /// Slot-written only, on purpose. A `[defaults]` effort or temperature states the
+    /// explorer/synth posture and merely falls back onto other roles, so inherited
+    /// values stay quiet here — the same rule that keeps the inherited built-in effort
+    /// quiet on toggle-less wires (see [`Defaults::explorer_effort_explicit`]).
+    pub fn written_reasoning_tunables(&self) -> Vec<&'static str> {
+        let mut written = Vec::new();
+        if self.thinking_budget.is_some() {
+            written.push("thinking_budget");
+        }
+        if self.effort.is_some() {
+            written.push("effort");
+        }
+        if self.temperature.is_some() {
+            written.push("temperature");
+        }
+        if self.thinking_style.is_some() {
+            written.push("thinking_style");
+        }
+        written
+    }
 }
 
 /// Where an operator wrote the `effort` that turned out to be inert.
@@ -471,6 +525,18 @@ pub struct EffortDiagnostic {
     /// The slot's `"backend/model-id"` ref, so the message names both halves.
     pub model: String,
     pub disposition: EffortDisposition,
+}
+
+/// One media (non-reasoning) cast slot carrying reasoning tunables the operator wrote
+/// on the slot table itself — see [`Config::media_tunable_diagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTunableDiagnostic {
+    pub cast: String,
+    pub role: &'static str,
+    /// The slot's `"backend/model-id"` ref, so the message names both halves.
+    pub model: String,
+    /// The written knob names, in the `kaibo://config` render order.
+    pub tunables: Vec<&'static str>,
 }
 
 /// A slot's effective request-shaping knobs after the per-role fallback (see
@@ -908,6 +974,103 @@ impl Default for PersistenceConfig {
     }
 }
 
+/// `[cas]` — the media content-addressed store where generated artifacts land.
+///
+/// Lifecycle (Amy's ruling, 2026-08-03, reversing an earlier "no enabled flag" stance
+/// recorded here): the CAS is **on by default** and follows persistence — disk-backed at
+/// the fixed XDG data path while persistence is active, in-memory (artifacts lost on
+/// restart, warned LOUDLY at startup) while it is not. `enabled = false` is the explicit
+/// off switch, and it un-advertises every tool that needs the CAS — the same
+/// route-dropped posture the staffing gate takes, with the reason distinguishable in the
+/// startup warning and `kaibo://config` ("you disabled it" vs "nothing can staff it").
+/// The earlier stance ("the tool gates suffice") under-counted the modes: with disk /
+/// memory / off there are three states, and only an explicit flag makes "off" a choice
+/// rather than a side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CasConfig {
+    /// The explicit off switch (`[cas] enabled = false`). Default `true`.
+    pub enabled: bool,
+    /// Where artifacts live. Defaults to `$XDG_DATA_HOME/kaibo/cas`, else
+    /// `~/.local/share/kaibo/cas` — the *data* dir, not the state dir the session db
+    /// uses, because these are artifacts the user paid for and may never be able to
+    /// reproduce (see `src/cas.rs`'s module doc). `None` only when neither
+    /// `$XDG_DATA_HOME` nor `$HOME` is set; a tool that needs the CAS then fails loudly
+    /// rather than inventing a path.
+    pub dir: Option<PathBuf>,
+    /// Optional soft cap on total store size. **Unset by default, and that is not the
+    /// same as a very large number**: a cap has to be enforced by summing every file in
+    /// the store on the write path, for every new object, over a store that by design
+    /// never deletes. That walk is O(objects) and only slows as the store fills, so an
+    /// operator who never asked for a ceiling pays nothing for it. Set it and you opt
+    /// into the accounting; leave it and disk-full is the backstop, with `find -mtime`
+    /// over the provenance sidecars as the cleanup story.
+    pub max_bytes: Option<u64>,
+}
+
+impl Default for CasConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: crate::cas::default_cas_dir(),
+            max_bytes: None,
+        }
+    }
+}
+
+/// Which media store a running server holds — the three-way state `kaibo://config`
+/// reports and `main` builds from. Derived in exactly one place
+/// ([`Config::cas_mode`]) so the store `main` constructs, the mode the resource
+/// renders, and the CLI's prediction can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasMode {
+    /// Persistence is active and a CAS directory resolved: artifacts land on disk at
+    /// the fixed XDG data path, durable across restarts.
+    Disk,
+    /// The CAS is enabled but has nowhere durable to write (persistence inactive, or
+    /// no resolvable directory): artifacts are held in process memory for this run
+    /// only. Startup warns loudly; `kaibo://config` shows `mode = "memory"`.
+    Memory,
+    /// `[cas] enabled = false`: no store at all, and every tool that needs one is
+    /// un-advertised.
+    Off,
+}
+
+impl CasMode {
+    /// The word the `[cas]` render uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CasMode::Disk => "disk",
+            CasMode::Memory => "memory",
+            CasMode::Off => "off",
+        }
+    }
+}
+
+impl Config {
+    /// The media-store mode this config implies once `persistence_active` is known —
+    /// the ONE derivation of Amy's lifecycle ruling ("cas should be on when
+    /// persistence is, and ideally on but in memory only when it's not. but can be
+    /// disabled"). `main` builds the store from this; the `kaibo://config` render and
+    /// `kaibo config` report it; keeping one implementation is what stops the built
+    /// store and the reported mode from drifting.
+    ///
+    /// `persistence_active` is *runtime* truth, not `[persistence] enabled`: a store
+    /// that failed to open (the Windows `SingleProcessLocked` degrade) leaves this run
+    /// without durable state, and a CAS whose artifacts outlive the sessions that
+    /// name their digests would strand them — so the CAS degrades with it. A missing
+    /// directory (`dir = None`: neither `$XDG_DATA_HOME` nor `$HOME` resolvable) also
+    /// lands on `Memory` — loud in the startup warning, never a silently invented path.
+    pub fn cas_mode(&self, persistence_active: bool) -> CasMode {
+        if !self.cas.enabled {
+            CasMode::Off
+        } else if persistence_active && self.cas.dir.is_some() {
+            CasMode::Disk
+        } else {
+            CasMode::Memory
+        }
+    }
+}
+
 // --- The whole config ------------------------------------------------------
 
 /// kaibo's resolved configuration.
@@ -950,6 +1113,8 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// Durable sessions + batch handles — on by default (see [`PersistenceConfig`]).
     pub persistence: PersistenceConfig,
+    /// `[cas]` — where generated media artifacts land, and an optional size ceiling.
+    pub cas: CasConfig,
     /// House-rules files spliced into each consultation tool's preamble (the
     /// `[context]` table). Defaults to reading `AGENTS.md` when present.
     pub context: ContextConfig,
@@ -1092,6 +1257,17 @@ impl Config {
         self.casts
             .get(name)
             .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())
+    }
+
+    /// Whether canonical cast `name` can staff a `generate` call: it carries an
+    /// **image** slot — the media member, the only slot `generate` runs. Load
+    /// validation already pinned that slot to a media backend (kind `stability`), so
+    /// slot presence is the whole test here. Independent of the reasoning slots: a
+    /// cast may be image-only, and a full team's image slot is equally valid.
+    pub fn cast_can_generate(&self, name: &str) -> bool {
+        self.casts
+            .get(name)
+            .is_some_and(|c| c.slot(ModelRole::Image).is_some())
     }
 
     /// Whether canonical cast `name` is the configured default — comparing against the
@@ -1303,6 +1479,16 @@ impl Config {
         let mut out = Vec::new();
         for (cast_name, cast) in &self.casts {
             for (role, slot) in &cast.slots {
+                // A media slot runs no reasoning phase at all, so this scan covers
+                // reasoning roles only; its written knobs are reported by
+                // `media_tunable_diagnostics`. The distinction matters for the quiet
+                // half too: a `[defaults]` effort inheriting onto an image slot is a
+                // fallback artifact, not something the operator said about that slot,
+                // and reporting it here would warn on every image slot the moment
+                // anyone set `synth_effort`.
+                if !role.is_reasoning() {
+                    continue;
+                }
                 let Ok(disposition) = self.effort_disposition(slot, *role) else {
                     continue;
                 };
@@ -1314,6 +1500,41 @@ impl Config {
                     role: role.key(),
                     model: slot.qualified(),
                     disposition,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every media (non-reasoning) cast slot where the operator *wrote* a reasoning
+    /// tunable on the slot table. An image slot sends one generation request with no
+    /// reasoning phase (see [`ModelRole::is_reasoning`]), so a reasoning knob there
+    /// never reaches a request; writing one usually means it landed on the wrong slot.
+    ///
+    /// Surfaced the way inert effort is surfaced — a startup warning plus
+    /// `inert_tunables` in `kaibo://config`, both reading this one rule — and
+    /// deliberately not a load error: the value is harmless, only silent, and the cure
+    /// is a message that names the slot and the knobs.
+    ///
+    /// Slot-written knobs only ([`ModelSlot::written_reasoning_tunables`]); inherited
+    /// `[defaults]` values stay quiet, the same rule that keeps the built-in effort
+    /// quiet on toggle-less wires ([`Self::effort_diagnostics`]).
+    pub fn media_tunable_diagnostics(&self) -> Vec<MediaTunableDiagnostic> {
+        let mut out = Vec::new();
+        for (cast_name, cast) in &self.casts {
+            for (role, slot) in &cast.slots {
+                if role.is_reasoning() {
+                    continue;
+                }
+                let tunables = slot.written_reasoning_tunables();
+                if tunables.is_empty() {
+                    continue;
+                }
+                out.push(MediaTunableDiagnostic {
+                    cast: cast_name.clone(),
+                    role: role.key(),
+                    model: slot.qualified(),
+                    tunables,
                 });
             }
         }
@@ -1433,15 +1654,19 @@ impl Config {
             // ROOT — rig's `ClientBuilder::base_url` appends its own versioned path
             // (`/v1beta/models/...` for Gemini) rather than taking one baked in; see
             // `GeminiBatch::base_url` (`batch.rs`) for the batch lane's matching
-            // reconciliation.
+            // reconciliation. `stability` takes one on the same optional host-root
+            // contract: kaibo's own facade appends `/v2beta/...` (`StabilityClient`),
+            // and unset dials the real https://api.stability.ai.
             if b.kind != ProviderKind::Openai
                 && b.kind != ProviderKind::Anthropic
                 && b.kind != ProviderKind::Gemini
+                && b.kind != ProviderKind::Stability
                 && b.base_url.is_some()
             {
                 bail!(
                     "backend {:?} (kind {:?}) sets base_url, but only the `openai`, \
-                     `anthropic`, and `gemini` kinds have a configurable endpoint",
+                     `anthropic`, `gemini`, and `stability` kinds have a configurable \
+                     endpoint",
                     b.name,
                     b.kind
                 );
@@ -1595,6 +1820,35 @@ impl Config {
                         t.max_tokens
                     );
                 }
+                // The role and the backend KIND have to agree about what kind of wire
+                // this is. `stability` is an image-generation API driven through
+                // kaibo's own facade, not a rig completion model, so it can staff the
+                // `image` slot and nothing else; conversely an image slot pointed at a
+                // chat backend would ask a completion model to return pixels. Both are
+                // load errors here rather than a baffling failure at request time, when
+                // the operator would be reading a provider error instead of a config
+                // mistake. This is the config half of the guard `Arm::from_slot` bails
+                // on — if the two ever disagree, both refuse rather than improvise.
+                if kind == ProviderKind::Stability && role.is_reasoning() {
+                    bail!(
+                        "cast {name:?}: the {} slot points at backend {:?} (kind \
+                         `stability`), which generates images and has no completion \
+                         model to reason with — point {} at a chat backend, and put the \
+                         stability backend on this cast's `image` slot instead",
+                        role.key(),
+                        slot.backend,
+                        role.key(),
+                    );
+                }
+                if *role == ModelRole::Image && kind != ProviderKind::Stability {
+                    bail!(
+                        "cast {name:?}: the image slot points at backend {:?} (kind \
+                         `{}`), which is a chat/completion wire and cannot generate an \
+                         image — an image slot needs a backend of kind `stability`",
+                        slot.backend,
+                        kind.canonical_name(),
+                    );
+                }
                 // A slot's lane needs a fitting role and backend, caught here rather
                 // than as a baffling refusal or a 400 at submit/deliberate time. The
                 // explorer always runs interactively (a `deliberate` cast pairs it with
@@ -1616,7 +1870,9 @@ impl Config {
                             lane.as_str()
                         );
                     }
-                    if lane == Lane::Batch && !crate::batch::batch_supported(&backends[&slot.backend]) {
+                    if lane == Lane::Batch
+                        && !crate::batch::batch_supported(&backends[&slot.backend])
+                    {
                         bail!(
                             "cast {name:?}: synth lane = \"batch\" but the synth backend \
                              {:?} ({}) has no batch API — a batch synth must sit on a \
@@ -1667,6 +1923,7 @@ impl Config {
         let infer_cwd = server.infer_cwd.unwrap_or(true);
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
+        let cas = merge_cas(raw.cas.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
@@ -1698,6 +1955,7 @@ impl Config {
             defaults,
             telemetry,
             persistence,
+            cas,
             context,
             prompts,
             orientation,
@@ -1738,6 +1996,8 @@ impl Config {
         user_context_files: Vec<PathBuf>,
         disable_persistence: bool,
         state_db: Option<PathBuf>,
+        cas_dir: Option<PathBuf>,
+        cas_max_bytes: Option<u64>,
         max_attachments: Option<usize>,
     ) {
         if let Some(root) = root {
@@ -1758,6 +2018,16 @@ impl Config {
         // shell; a path arrives concrete). Overrides file/env/default.
         if let Some(path) = state_db {
             self.persistence.path = Some(path);
+        }
+        // `--cas-dir` / `--cas-max-bytes` are the top layer over env/file/default. Note
+        // there is no CLI way to *clear* a configured cap back to "no ceiling" — the
+        // absence of the flag means "don't override", the same grammar every other
+        // optional flag here uses. Omit `max_bytes` from the file to run uncapped.
+        if let Some(dir) = cas_dir {
+            self.cas.dir = Some(dir);
+        }
+        if let Some(max) = cas_max_bytes {
+            self.cas.max_bytes = Some(max);
         }
         // Mirrors the `--no-<tool>` discipline: the CLI can only turn the follow OFF,
         // never force it on over a `[server] follow_worktrees = false` in the file.
@@ -1793,6 +2063,9 @@ impl Config {
         if disable.list_models {
             self.tools.list_models = false;
         }
+        if disable.generate {
+            self.tools.generate = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -1822,6 +2095,7 @@ pub struct ToolDisables {
     pub run_kaish: bool,
     pub batch: bool,
     pub list_models: bool,
+    pub generate: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -2006,10 +2280,17 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
 /// casts; they drift — keep in sync with the source-of-truth pal configs
 /// (`provider-model-ids` memory).
 pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
-    match kind {
-        ProviderKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
-        ProviderKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
-        ProviderKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
+    // A media kind seeds no built-in cast: it staffs only media slots, which no
+    // built-in carries, and it has no explorer/synth to name. Returning empty ids
+    // rather than plausible-looking ones keeps a mistaken caller loud — an empty
+    // model id fails at request time instead of silently dialing a wrong model.
+    let Some(wire) = kind.wire() else {
+        return ("", "");
+    };
+    match wire {
+        credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
+        credentials::WireKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
+        credentials::WireKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
         // OpenRouter's job here is a family we *can't* reach directly (we key
         // DeepSeek, Gemini, and Anthropic on their own backends), so the gateway
         // default is Qwen — a distinct lineage for a genuine cross-family read.
@@ -2021,8 +2302,8 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         // which is text-only (hence the synth slot takes no vision pin below). If
         // you'd rather keep vision on the synth, swap in the multimodal plus tier
         // `qwen/qwen3.7-plus` (weaker reasoner, ~4.5× cheaper) and pin its vision on.
-        ProviderKind::OpenRouter => ("qwen/qwen3.6-flash", "qwen/qwen3.7-max"),
-        ProviderKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
+        credentials::WireKind::OpenRouter => ("qwen/qwen3.6-flash", "qwen/qwen3.7-max"),
+        credentials::WireKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
 
@@ -2037,6 +2318,7 @@ struct RawConfig {
     defaults: Option<RawDefaults>,
     telemetry: Option<RawTelemetry>,
     persistence: Option<RawPersistence>,
+    cas: Option<RawCas>,
     context: Option<RawContext>,
     prompts: Option<RawPrompts>,
     orientation: Option<RawOrientation>,
@@ -2072,6 +2354,18 @@ struct RawPersistence {
     /// `$VAR`/`~`-expanded like `root`/`allow_paths`, so `$XDG_STATE_HOME/kaibo.db` or
     /// `~/state.db` resolves per-environment rather than landing as a literal token.
     path: Option<String>,
+}
+
+/// `[cas]` as written in the file. `max_bytes` absent means *no cap* — see [`CasConfig`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCas {
+    /// The explicit off switch — absent means on (see [`CasConfig::enabled`]).
+    enabled: Option<bool>,
+    /// `$VAR`/`~`-expanded like `root`/`allow_paths`, so `$XDG_DATA_HOME/art` resolves
+    /// per-environment rather than landing as a literal token.
+    dir: Option<String>,
+    max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2199,6 +2493,7 @@ struct RawTools {
     run_kaish: Option<bool>,
     batch: Option<bool>,
     list_models: Option<bool>,
+    generate: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2284,9 +2579,9 @@ impl RawBackend {
                     b.kind
                 );
             }
-            b.data_collection = v.parse().with_context(|| {
-                format!("backend {:?} data_collection", b.name)
-            })?;
+            b.data_collection = v
+                .parse()
+                .with_context(|| format!("backend {:?} data_collection", b.name))?;
         }
         if let Some(v) = &self.wire {
             // The knob only exists on the openai kind — naming it anywhere else
@@ -2325,6 +2620,8 @@ struct RawCast {
     batch: Option<bool>,
     explorer: Option<RawSlot>,
     synth: Option<RawSlot>,
+    /// The production slot — a text-to-image model. See [`ModelRole::Image`].
+    image: Option<RawSlot>,
 }
 
 impl RawCast {
@@ -2333,6 +2630,7 @@ impl RawCast {
         [
             (ModelRole::Explorer, &self.explorer),
             (ModelRole::Synth, &self.synth),
+            (ModelRole::Image, &self.image),
         ]
         .into_iter()
         .filter_map(|(role, slot)| slot.as_ref().map(|s| (role, s)))
@@ -2541,6 +2839,30 @@ fn merge_persistence(raw: RawPersistence) -> Result<PersistenceConfig> {
     Ok(PersistenceConfig { enabled, path })
 }
 
+/// Resolve `[cas]`. A missing `dir` falls back to the XDG data default; a missing
+/// `max_bytes` means **no cap at all**, which is the deliberate default (see
+/// [`CasConfig::max_bytes`]). An explicit `max_bytes = 0` is a loud load error rather
+/// than a store that refuses every write — a zero ceiling is never what anyone means,
+/// and silently accepting it would produce a CAS that fails on first use with a
+/// capacity error nobody could explain.
+fn merge_cas(raw: RawCas) -> Result<CasConfig> {
+    let dir = match raw.dir {
+        Some(d) => Some(expand_path(&d)?),
+        None => crate::cas::default_cas_dir(),
+    };
+    if raw.max_bytes == Some(0) {
+        bail!(
+            "[cas] max_bytes must be > 0 — a zero ceiling refuses every write. Omit it \
+             entirely for no cap (the default), or set a real byte budget."
+        );
+    }
+    Ok(CasConfig {
+        enabled: raw.enabled.unwrap_or(true),
+        dir,
+        max_bytes: raw.max_bytes,
+    })
+}
+
 /// Resolve `[context]`. A *missing* `project_files` keeps the built-in
 /// `["AGENTS.md"]` default (vendor-neutral, opt-out by an explicit empty list);
 /// `user_files` default to empty and are `$VAR`/`~`-expanded here (via `expand_path`,
@@ -2664,6 +2986,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         batch: raw.batch.unwrap_or(d.batch),
         list_models: raw.list_models.unwrap_or(d.list_models),
+        generate: raw.generate.unwrap_or(d.generate),
     }
 }
 
@@ -2737,6 +3060,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_LIST_MODELS") {
         tools.list_models = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_GENERATE") {
+        tools.generate = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);
@@ -2845,6 +3171,18 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_STATE_DB") {
         persistence.path = Some(v);
+    }
+
+    // Media CAS: KAIBO_CAS_DIR / KAIBO_CAS_MAX_BYTES, straight from the naming rule
+    // (config key `foo_bar` ⇄ env `KAIBO_FOO_BAR`). There is no KAIBO_NO_CAS — the CAS
+    // isn't a capability you switch off, it's where an artifact-producing tool writes,
+    // and those tools carry their own `--no-<tool>` gates.
+    let cas = raw.cas.get_or_insert_with(Default::default);
+    if let Some(v) = get("KAIBO_CAS_DIR") {
+        cas.dir = Some(v);
+    }
+    if let Some(v) = get("KAIBO_CAS_MAX_BYTES") {
+        cas.max_bytes = Some(parse_env_int("KAIBO_CAS_MAX_BYTES", &v)?);
     }
     Ok(())
 }
@@ -3045,7 +3383,11 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
                     // give — and so both reference forms agree on what a name is. (The
                     // braced form *is* an explicit expansion request, so a bad name is an
                     // error here, unlike a bare `$1` which is simply not a reference.)
-                    let ok = if name.is_empty() { is_start(nc) } else { is_continue(nc) };
+                    let ok = if name.is_empty() {
+                        is_start(nc)
+                    } else {
+                        is_continue(nc)
+                    };
                     if !ok {
                         bail!(
                             "path {s:?} has an invalid character {nc:?} in a ${{...}} \
@@ -3158,19 +3500,19 @@ mod tests {
         );
 
         for bad in [
-            format!("${unset}"),       // bare form, undefined
-            format!("${{{unset}}}"),   // braced form, undefined
+            format!("${unset}"),     // bare form, undefined
+            format!("${{{unset}}}"), // braced form, undefined
             "${UNTERMINATED".to_string(),
             "${}".to_string(),
             // The braced form is an explicit expansion request, so an invalid name is a
             // loud parse error (not the misleading "not set" the env lookup would give).
-            "${1bad}".to_string(),     // can't start with a digit
-            "${A/B}".to_string(),      // `/` is not a name char
+            "${1bad}".to_string(), // can't start with a digit
+            "${A/B}".to_string(),  // `/` is not a name char
             // A stray `$` that begins no reference is a typo in a boundary path, refused
             // rather than kept as a silent literal. Write `$$` for a real literal `$`.
-            "/a/$ b".to_string(),      // `$` followed by a space
-            "/cost/$100".to_string(),  // `$` followed by a digit
-            "trailing$".to_string(),   // `$` at end of string
+            "/a/$ b".to_string(),     // `$` followed by a space
+            "/cost/$100".to_string(), // `$` followed by a digit
+            "trailing$".to_string(),  // `$` at end of string
         ] {
             assert!(
                 expand_env_vars(&bad).is_err(),
@@ -3416,7 +3758,10 @@ mod tests {
         );
         assert_eq!((s.backend.as_str(), s.id.as_str()), ("openrouter", synth));
         assert_eq!(e.vision, Some(true), "explorer flash is multimodal-in");
-        assert_eq!(s.vision, None, "text-only synth leaves the classifier's false to stand");
+        assert_eq!(
+            s.vision, None,
+            "text-only synth leaves the classifier's false to stand"
+        );
 
         let b = cfg.resolve_backend("openrouter").unwrap();
         assert_eq!(b.kind, ProviderKind::OpenRouter);
@@ -4446,7 +4791,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("only the `openai`, `anthropic`, and `gemini` kinds"),
+            err.contains("only the `openai`, `anthropic`, `gemini`, and `stability` kinds"),
             "got: {err}"
         );
     }
@@ -4464,6 +4809,20 @@ mod tests {
         .unwrap();
         let b = cfg.backends.get("anthropic").unwrap();
         assert_eq!(b.base_url.as_deref(), Some("http://ai.example.ts.net"));
+    }
+
+    /// The stability kind takes an optional base_url on the same host-root contract:
+    /// kaibo's own facade appends `/v2beta/...` (`StabilityClient`), so a gateway or a
+    /// test double in front of the real API is one config line. Unset still dials
+    /// api.stability.ai (`STABILITY_API_BASE`, applied in `MediaArm::from_slot`).
+    #[test]
+    fn stability_backend_accepts_a_base_url() {
+        let cfg = Config::from_toml_str(
+            "[backends.sd]\nkind = \"stability\"\nbase_url = \"http://sd.example.ts.net\"\n",
+        )
+        .unwrap();
+        let b = cfg.backends.get("sd").unwrap();
+        assert_eq!(b.base_url.as_deref(), Some("http://sd.example.ts.net"));
     }
 
     /// The gemini kind may also set base_url — for a Gemini-API-compatible
@@ -4937,8 +5296,7 @@ mod tests {
         // and a bare containment check would keep passing after the knob's real
         // documentation vanished (gemini cross-family review, 2026-08-02).
         let mentions = |field: &str| {
-            let is_word =
-                |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
             template.match_indices(field).any(|(i, _)| {
                 !is_word(template[..i].chars().next_back())
                     && !is_word(template[i + field.len()..].chars().next())

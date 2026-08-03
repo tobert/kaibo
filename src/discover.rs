@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::batch::rfc3339_to_epoch;
 use crate::config::Backend;
-use crate::credentials::ProviderKind;
+use crate::credentials::WireKind;
 
 /// DeepSeek's models-list host. Mirrors rig's private `deepseek` provider constant —
 /// same drift-prone class as `config.rs::default_models`: if rig retargets its DeepSeek
@@ -118,9 +118,24 @@ pub fn discovery_endpoint(backend: &Backend) -> Result<DiscoveryRequest> {
 /// have no continuation — `cursor` is ignored for them, since [`discover_models`] never
 /// loops on those kinds anyway.
 pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Result<DiscoveryRequest> {
+    // A media kind publishes no model-listing endpoint in the `/models` shape this
+    // module speaks — Stability's model set is the small fixed route family
+    // (`generate/{core,ultra,sd3}`), documented rather than enumerable. Refusing
+    // loudly beats inventing a URL that would 404, and beats returning an empty
+    // list that would read as "this backend serves no models". Classified up front
+    // so the wire match below stays media-free.
+    let Some(wire) = backend.kind.wire() else {
+        anyhow::bail!(
+            "backend {:?} is kind `{}`, which publishes no model-listing endpoint — \
+             its models are the documented generate routes (core, ultra, sd3), not a \
+             discoverable list",
+            backend.name,
+            backend.kind.canonical_name()
+        )
+    };
     let key = backend.resolve_key()?;
-    match backend.kind {
-        ProviderKind::Openai => {
+    match wire {
+        WireKind::Openai => {
             let base = backend.resolved_base_url();
             let base = base.trim_end_matches('/');
             Ok(DiscoveryRequest {
@@ -129,17 +144,17 @@ pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Resul
                 query: Vec::new(),
             })
         }
-        ProviderKind::OpenRouter => Ok(DiscoveryRequest {
+        WireKind::OpenRouter => Ok(DiscoveryRequest {
             url: format!("{OPENROUTER_BASE}/models"),
             headers: vec![("Authorization".to_string(), format!("Bearer {key}"))],
             query: Vec::new(),
         }),
-        ProviderKind::DeepSeek => Ok(DiscoveryRequest {
+        WireKind::DeepSeek => Ok(DiscoveryRequest {
             url: format!("{DEEPSEEK_BASE}/models"),
             headers: vec![("Authorization".to_string(), format!("Bearer {key}"))],
             query: Vec::new(),
         }),
-        ProviderKind::Anthropic => {
+        WireKind::Anthropic => {
             let base = backend
                 .base_url
                 .as_deref()
@@ -162,7 +177,7 @@ pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Resul
                 query,
             })
         }
-        ProviderKind::Gemini => {
+        WireKind::Gemini => {
             let base = backend.base_url.as_deref().unwrap_or(GEMINI_DEFAULT_BASE);
             let base = base.trim_end_matches('/');
             // No auth header: Gemini authenticates `?key=` as a query param. A
@@ -375,8 +390,14 @@ pub async fn discover_models(
     backend: &Backend,
     fetcher: &impl ModelListFetcher,
 ) -> Result<Vec<DiscoveredModel>> {
-    match backend.kind {
-        ProviderKind::Anthropic => discover_paginated(
+    // A media kind has no listing endpoint — `discovery_endpoint_page` carries the
+    // loud refusal, so `list_models` over a mixed backend set names the one it
+    // cannot enumerate instead of quietly omitting it.
+    let Some(wire) = backend.kind.wire() else {
+        return discovery_endpoint_page(backend, None).map(|_| Vec::new());
+    };
+    match wire {
+        WireKind::Anthropic => discover_paginated(
             backend,
             fetcher,
             parse_anthropic_models,
@@ -388,7 +409,7 @@ pub async fn discover_models(
             },
         )
         .await,
-        ProviderKind::Gemini => discover_paginated(
+        WireKind::Gemini => discover_paginated(
             backend,
             fetcher,
             parse_gemini_models,
@@ -400,7 +421,7 @@ pub async fn discover_models(
             },
         )
         .await,
-        ProviderKind::Openai | ProviderKind::OpenRouter | ProviderKind::DeepSeek => {
+        WireKind::Openai | WireKind::OpenRouter | WireKind::DeepSeek => {
             let req = discovery_endpoint(backend)?;
             let body = fetcher.get_json(&req).await?;
             Ok(parse_openai_models(&body))
@@ -545,6 +566,7 @@ pub fn models_json_envelope(results: &BTreeMap<String, Result<Vec<DiscoveredMode
 mod tests {
     use super::*;
     use crate::config::{DataCollection, OpenaiWire};
+    use crate::credentials::ProviderKind;
     use std::sync::Mutex;
     use tempfile::TempDir;
 

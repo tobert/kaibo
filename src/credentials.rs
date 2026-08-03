@@ -49,9 +49,33 @@ pub enum ProviderKind {
     /// Any OpenAI-compatible endpoint, addressed by base URL; key optional.
     /// Defaults to a local keyless server (Gemma via an OpenAI-compatible host).
     Openai,
+    /// Stability AI's v2beta image family — the one **production** wire kaibo speaks,
+    /// and the odd one out here in a way worth stating: every other kind is a chat
+    /// completion API driven through `rig`, while this one is an image API driven
+    /// through kaibo's own facade (`src/stability.rs`). It is therefore only ever valid
+    /// on an `image` cast slot ([`crate::config::ModelRole::Image`]); a reasoning slot
+    /// pointed at a Stability backend is a load error, because there is no completion
+    /// model behind it to resolve.
+    ///
+    /// Deliberately NOT in the built-in backend list: image generation costs real money
+    /// per call and needs a key, so it appears only when an operator writes the stanza.
+    Stability,
 }
 
 impl ProviderKind {
+    /// Every kind, in declaration order. Drives the "expected one of…" error text so a
+    /// new kind can never be accepted by `FromStr` while staying unlisted in the message
+    /// a user actually reads — a hand-maintained list in that string had already drifted
+    /// once (`openrouter` shipped before it was named there).
+    pub const ALL: [ProviderKind; 6] = [
+        Self::Anthropic,
+        Self::DeepSeek,
+        Self::Gemini,
+        Self::OpenRouter,
+        Self::Openai,
+        Self::Stability,
+    ];
+
     /// Whether a missing credential is tolerated rather than a hard error. Only
     /// the OpenAI-compatible provider is: its default endpoint is a local keyless
     /// server, so an absent key falls back to a placeholder bearer token
@@ -84,7 +108,11 @@ impl ProviderKind {
             ProviderKind::Anthropic
             | ProviderKind::DeepSeek
             | ProviderKind::OpenRouter
-            | ProviderKind::Openai => PLACEHOLDER_OPENAI_KEY,
+            | ProviderKind::Openai
+            // Never reached: Stability is not `key_optional`, so a missing key is a
+            // hard error long before a stand-in is wanted. It is a header-bearer wire,
+            // so it takes the same shape as the others if that ever changes.
+            | ProviderKind::Stability => PLACEHOLDER_OPENAI_KEY,
         }
     }
 
@@ -100,6 +128,7 @@ impl ProviderKind {
             ProviderKind::Gemini => "gemini",
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Openai => "openai",
+            ProviderKind::Stability => "stability",
         }
     }
 
@@ -125,6 +154,9 @@ impl ProviderKind {
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
             ProviderKind::Openai => "OPENAI_API_KEY",
+            // Reuses the constant `src/stability.rs` already resolves keys with, so the
+            // facade and the config layer can never disagree about which var to read.
+            ProviderKind::Stability => crate::stability::STABILITY_KEY_ENV_VAR,
         }
     }
 
@@ -138,6 +170,8 @@ impl ProviderKind {
             ProviderKind::Gemini => ".gemini-api-key",
             ProviderKind::OpenRouter => ".openrouter-key",
             ProviderKind::Openai => ".openai-key",
+            // Same constant `src/stability.rs` uses, for the same reason as `env_var`.
+            ProviderKind::Stability => crate::stability::STABILITY_KEY_FILE_NAME,
         }
     }
 
@@ -145,6 +179,73 @@ impl ProviderKind {
     pub fn key_file(self, home: &Path) -> PathBuf {
         home.join(self.key_file_name())
     }
+
+    /// Which side of the completion/media line this kind lives on — the structural
+    /// gate that keeps media kinds out of the completion-path machinery. Exhaustive
+    /// on purpose: a new `ProviderKind` variant fails to compile until it is
+    /// classified here, and that one decision is the *only* completion-vs-media
+    /// decision the new kind has to make. Everything downstream matches on
+    /// [`WireKind`] or [`MediaKind`] and never sees the other family.
+    pub fn class(self) -> ProviderClass {
+        match self {
+            ProviderKind::Anthropic => ProviderClass::Wire(WireKind::Anthropic),
+            ProviderKind::DeepSeek => ProviderClass::Wire(WireKind::DeepSeek),
+            ProviderKind::Gemini => ProviderClass::Wire(WireKind::Gemini),
+            ProviderKind::OpenRouter => ProviderClass::Wire(WireKind::OpenRouter),
+            ProviderKind::Openai => ProviderClass::Wire(WireKind::Openai),
+            ProviderKind::Stability => ProviderClass::Media(MediaKind::Stability),
+        }
+    }
+
+    /// The completion wire behind this kind, or `None` for a media kind — the
+    /// convenience form of [`class`](Self::class) for the completion entry points
+    /// (`ModelShape::resolve`, `ModelCaps::resolve`, `EffortWire::resolve`,
+    /// `batch_supported`), each of which answers the media case once at its top
+    /// instead of growing a media arm in every internal match.
+    pub fn wire(self) -> Option<WireKind> {
+        match self.class() {
+            ProviderClass::Wire(w) => Some(w),
+            ProviderClass::Media(_) => None,
+        }
+    }
+
+    /// Is this a media-generation kind (no completion model behind it)?
+    pub fn is_media(self) -> bool {
+        matches!(self.class(), ProviderClass::Media(_))
+    }
+}
+
+/// A completion wire protocol — the [`ProviderKind`] subset rig builds a
+/// `CompletionModel` for. The completion-path machinery (request shaping, effort
+/// wires, the vision/transport classifiers, batch eligibility, `Arm` construction)
+/// matches on THIS enum, so a media kind can never reach those matches and a new
+/// piece of completion machinery needs no media arm at all. Reached only through
+/// [`ProviderKind::class`]/[`ProviderKind::wire`], whose exhaustive match is where a
+/// new kind gets classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireKind {
+    Anthropic,
+    DeepSeek,
+    Gemini,
+    OpenRouter,
+    Openai,
+}
+
+/// A media-generation API — a backend kaibo drives through its own facade and the
+/// [`crate::media::MediaModel`] seam, never through rig's completion machinery. Valid
+/// only on media cast slots (`image` today); the load-time role/kind guard in
+/// `config.rs` refuses every other pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// Stability AI's v2beta family, via `src/stability.rs`.
+    Stability,
+}
+
+/// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderClass {
+    Wire(WireKind),
+    Media(MediaKind),
 }
 
 impl std::str::FromStr for ProviderKind {
@@ -159,8 +260,14 @@ impl std::str::FromStr for ProviderKind {
             // The OpenAI-compatible endpoint. Also accept the names people reach
             // for when it points at the local keyless default (Gemma via Lemonade).
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
+            "stability" => Ok(ProviderKind::Stability),
             other => Err(anyhow!(
-                "unknown provider {other:?} (expected anthropic, deepseek, gemini, openrouter, or openai)"
+                "unknown provider {other:?} (expected one of: {})",
+                ProviderKind::ALL
+                    .iter()
+                    .map(|k| k.canonical_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }

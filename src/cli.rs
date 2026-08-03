@@ -214,6 +214,17 @@ pub struct CommonArgs {
     #[arg(long = "state-db", value_name = "FILE", global = true)]
     pub state_db: Option<PathBuf>,
 
+    /// Directory for the media CAS (generated artifacts). Overrides KAIBO_CAS_DIR /
+    /// [cas] dir / the default ($XDG_DATA_HOME/kaibo/cas).
+    #[arg(long = "cas-dir", value_name = "DIR", global = true)]
+    pub cas_dir: Option<PathBuf>,
+
+    /// Soft cap on total media-CAS size, in bytes. Unset means NO cap and no size
+    /// accounting; setting one makes every new write first sum the whole store.
+    /// Overrides KAIBO_CAS_MAX_BYTES / [cas] max_bytes.
+    #[arg(long = "cas-max-bytes", value_name = "BYTES", global = true)]
+    pub cas_max_bytes: Option<u64>,
+
     /// Cap on how many files one explorer sweep may route with its `attach` tool
     /// (the bytes ride to whoever reads the sweep's report — the consult driver, or
     /// deliberate's offline synth). `0` turns the tool off. Also KAIBO_MAX_ATTACHMENTS
@@ -247,6 +258,9 @@ pub struct ServeGates {
     /// Don't advertise the `list_models` tool.
     #[arg(long)]
     pub no_list_models: bool,
+    /// Don't advertise the `generate` tool (media generation).
+    #[arg(long)]
+    pub no_generate: bool,
 }
 
 impl ServeGates {
@@ -260,6 +274,7 @@ impl ServeGates {
             run_kaish: self.no_run_kaish,
             batch: self.no_batch,
             list_models: self.no_list_models,
+            generate: self.no_generate,
         }
     }
 }
@@ -517,6 +532,8 @@ fn load_config(common: &CommonArgs) -> anyhow::Result<Config> {
         common.user_context_file.clone(),
         common.no_persistence,
         common.state_db.clone(),
+        common.cas_dir.clone(),
+        common.cas_max_bytes,
         common.max_attachments,
     );
     Ok(config)
@@ -964,7 +981,9 @@ pub fn run_config(common: CommonArgs) -> i32 {
     };
     // `active` reflects whether a real invocation would hold the store open — for a
     // one-shot `config` print we don't open it, but persistence being enabled is what
-    // a consult here would activate, so report that.
+    // a consult here would activate, so report that. The CAS mode is predicted from
+    // the same assumption, through the one shared derivation (`Config::cas_mode`).
+    let cas_mode = resolver.config.cas_mode(persistence_enabled);
     let body = render_config_resource(
         &resolver.config,
         resolver.allowed_trees(),
@@ -972,6 +991,7 @@ pub fn run_config(common: CommonArgs) -> i32 {
         resolver.default_root_inferred(),
         resolver.followed_worktrees(),
         persistence_enabled,
+        cas_mode,
     );
     println!("{body}");
     EXIT_OK
@@ -1776,7 +1796,12 @@ mod tests {
             long_help.contains("EXIT CODES"),
             "long --help should carry the exit-code table:\n{long_help}"
         );
-        for code in ["0  an answer", "2  usage error", "3  setup/containment", "4  the work ran"] {
+        for code in [
+            "0  an answer",
+            "2  usage error",
+            "3  setup/containment",
+            "4  the work ran",
+        ] {
             assert!(
                 long_help.contains(code),
                 "long --help should document exit code {code:?}:\n{long_help}"

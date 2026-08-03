@@ -29,6 +29,7 @@ pub(crate) fn render_config_resource(
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
+    cas_mode: crate::config::CasMode,
 ) -> String {
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -91,6 +92,9 @@ pub(crate) fn render_config_resource(
         /// Durable-store state (on by default): whether persistence is enabled, the
         /// resolved state-db path, and whether the store is actually open right now.
         persistence: PersistenceDoc,
+        /// The media CAS: the on/off knob, the runtime mode (disk / memory / off),
+        /// and where disk mode writes.
+        cas: CasDoc,
         /// alias → canonical backend name. Aliases are valid slot-ref prefixes
         /// and per-call backend overrides, so callers must be able to discover
         /// them here — built-in and file-declared both.
@@ -112,6 +116,7 @@ pub(crate) fn render_config_resource(
         run_kaish: bool,
         batch: bool,
         list_models: bool,
+        generate: bool,
     }
 
     /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
@@ -212,6 +217,21 @@ pub(crate) fn render_config_resource(
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<String>,
         active: bool,
+    }
+
+    /// The media CAS as resolved. `mode` is runtime truth (`"disk"` / `"memory"` /
+    /// `"off"`) from the store the handler actually holds — `"memory"` is the loud
+    /// degraded state (artifacts do not survive a restart; startup already warned).
+    /// `dir` is the configured directory whether or not the current mode uses it, so
+    /// an operator diagnosing `"memory"` still sees where disk mode would write.
+    #[derive(Serialize)]
+    struct CasDoc {
+        enabled: bool,
+        mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
     }
 
     #[derive(Serialize)]
@@ -327,11 +347,12 @@ pub(crate) fn render_config_resource(
                 api_key_file: api_key_file.clone(),
                 key_optional: *key_optional,
                 request_timeout_secs: request_timeout.as_secs(),
-                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter)
-                    .then_some(match data_collection {
+                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter).then_some(
+                    match data_collection {
                         crate::config::DataCollection::Deny => "deny",
                         crate::config::DataCollection::Allow => "allow",
-                    }),
+                    },
+                ),
                 // Resolved, not raw: an unset `wire` still has an effective shape
                 // (the endpoint-exact heuristic), so render what the backend will
                 // actually do, not just what was configured.
@@ -377,54 +398,67 @@ pub(crate) fn render_config_resource(
                     let backend = config
                         .resolve_backend(&slot.backend)
                         .expect("a loaded cast's slot backend resolves");
-                    // Resolve through `slot.tunables` — the same fallbacks the wire path
-                    // takes, so a `[defaults].thinking_style` (which the old
-                    // `unwrap_or_default()` here silently ignored) can't make the render
-                    // disagree with what actually ships.
-                    let t = slot.tunables(*role, &config.defaults);
-                    let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
-                    // Lane-aware: a `lane = "batch"` slot never builds an interactive arm.
-                    // Batch POSTs its own body and gates the Responses shape on the
-                    // endpoint-exact `is_hosted_openai`; the interactive arm follows the
-                    // configurable `uses_responses_wire` (a responses-wire gateway shapes
-                    // like Platform even though it isn't batch-eligible).
-                    let batch_lane = matches!(lane, Some(Lane::Batch));
-                    let responses_wire = if batch_lane {
-                        backend.is_hosted_openai()
+                    let inert_tunables = if role.is_reasoning() {
+                        // Resolve through `slot.tunables` — the same fallbacks the wire
+                        // path takes, so a `[defaults].thinking_style` (which the old
+                        // `unwrap_or_default()` here silently ignored) can't make the
+                        // render disagree with what actually ships.
+                        let t = slot.tunables(*role, &config.defaults);
+                        let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
+                        // Lane-aware: a `lane = "batch"` slot never builds an interactive
+                        // arm. Batch POSTs its own body and gates the Responses shape on
+                        // the endpoint-exact `is_hosted_openai`; the interactive arm
+                        // follows the configurable `uses_responses_wire` (a responses-wire
+                        // gateway shapes like Platform even though it isn't
+                        // batch-eligible).
+                        let batch_lane = matches!(lane, Some(Lane::Batch));
+                        let responses_wire = if batch_lane {
+                            backend.is_hosted_openai()
+                        } else {
+                            backend.uses_responses_wire()
+                        };
+                        let mut inert = Vec::new();
+                        // Whether the effort ships is a policy with exactly one
+                        // implementation — `Config::effort_disposition`. The render asks
+                        // it rather than re-deriving (drop? batch lift? off-switch?),
+                        // which is what keeps this and the startup warning from ever
+                        // telling an operator different stories about the same slot.
+                        let disposition = config
+                            .effort_disposition(slot, *role)
+                            .expect("a loaded cast's slot backend resolves");
+                        // Batch hands the provider no sampling at all (`None`/`None`), so
+                        // a `temperature` on a batch slot is inert regardless of the model.
+                        let sampling_sinks = if batch_lane {
+                            false
+                        } else if responses_wire {
+                            crate::consult::hosted_openai_accepts_sampling(&slot.id)
+                        } else {
+                            shape.sinks_sampling()
+                        };
+                        if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
+                            inert.push("thinking_budget");
+                        }
+                        // The *effective* effort, not just a per-slot override: a
+                        // `[defaults]`/env effort lands on every cast, and one that lands
+                        // nowhere deserves the same flag. Inherited built-in defaults stay
+                        // quiet — see `Defaults::explorer_effort_explicit`.
+                        if disposition.explicit && !disposition.ships_as_configured() {
+                            inert.push("effort");
+                        }
+                        if temperature.is_some() && !sampling_sinks {
+                            inert.push("temperature");
+                        }
+                        inert
                     } else {
-                        backend.uses_responses_wire()
+                        // A media slot sends one generation request with no reasoning
+                        // phase, so every reasoning knob WRITTEN on the slot is inert —
+                        // and the request-shaping machinery (`ModelShape`,
+                        // `effort_disposition`) is deliberately not resolved for it (see
+                        // `ModelRole::is_reasoning`). Same single policy the startup
+                        // warning reads (`Config::media_tunable_diagnostics`); inherited
+                        // `[defaults]` values stay quiet.
+                        slot.written_reasoning_tunables()
                     };
-                    let mut inert_tunables = Vec::new();
-                    // Whether the effort ships is a policy with exactly one implementation
-                    // — `Config::effort_disposition`. The render asks it rather than
-                    // re-deriving (drop? batch lift? off-switch?), which is what keeps this
-                    // and the startup warning from ever telling an operator different
-                    // stories about the same slot.
-                    let disposition = config
-                        .effort_disposition(slot, *role)
-                        .expect("a loaded cast's slot backend resolves");
-                    // Batch hands the provider no sampling at all (`None`/`None`), so a
-                    // `temperature` on a batch slot is inert regardless of the model.
-                    let sampling_sinks = if batch_lane {
-                        false
-                    } else if responses_wire {
-                        crate::consult::hosted_openai_accepts_sampling(&slot.id)
-                    } else {
-                        shape.sinks_sampling()
-                    };
-                    if thinking_budget.is_some() && !shape.sinks_thinking_budget() {
-                        inert_tunables.push("thinking_budget");
-                    }
-                    // The *effective* effort, not just a per-slot override: a
-                    // `[defaults]`/env effort lands on every cast, and one that lands
-                    // nowhere deserves the same flag. Inherited built-in defaults stay
-                    // quiet — see `Defaults::explorer_effort_explicit`.
-                    if disposition.explicit && !disposition.ships_as_configured() {
-                        inert_tunables.push("effort");
-                    }
-                    if temperature.is_some() && !sampling_sinks {
-                        inert_tunables.push("temperature");
-                    }
                     (
                         role.key(),
                         SlotDoc {
@@ -457,6 +491,7 @@ pub(crate) fn render_config_resource(
         run_kaish,
         batch,
         list_models,
+        generate,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -522,6 +557,7 @@ pub(crate) fn render_config_resource(
             run_kaish,
             batch,
             list_models,
+            generate,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),
@@ -575,6 +611,12 @@ pub(crate) fn render_config_resource(
                 .map(|p| p.display().to_string()),
             active: persistence_active,
         },
+        cas: CasDoc {
+            enabled: config.cas.enabled,
+            mode: cas_mode.as_str().to_string(),
+            dir: config.cas.dir.as_ref().map(|p| p.display().to_string()),
+            max_bytes: config.cas.max_bytes,
+        },
         backend_aliases: config.backend_aliases().clone(),
         backends,
         cast_aliases: config.cast_aliases().clone(),
@@ -614,7 +656,15 @@ mod tests {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/the-repo")];
         let followed = vec![std::path::PathBuf::from("/tmp/the-repo-feature")];
-        let body = render_config_resource(&config, &allowed, None, false, followed, false);
+        let body = render_config_resource(
+            &config,
+            &allowed,
+            None,
+            false,
+            followed,
+            false,
+            crate::config::CasMode::Memory,
+        );
         assert!(
             body.contains("[runtime]") && body.contains("follow_worktrees = true"),
             "runtime section must echo the follow knob:\n{body}"
@@ -646,7 +696,15 @@ mod tests {
     /// confusing failure this reporting exists to prevent.
     #[test]
     fn config_resource_runtime_explains_a_tool_no_cast_can_staff() {
-        let body = render_config_resource(&Config::builtin(), &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &Config::builtin(),
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let runtime = section(&body, "[runtime]");
         assert!(
             !runtime.contains("\"deliberate\""),
@@ -678,7 +736,15 @@ mod tests {
     fn config_resource_does_not_blame_casts_for_an_operator_disabled_tool() {
         let mut config = Config::builtin();
         config.tools.deliberate = false;
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         assert!(
             !section(&body, "[runtime.unstaffable_tools]").contains("deliberate"),
             "a flag-disabled tool belongs to [tools], not unstaffable_tools:\n{body}"
@@ -729,7 +795,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
             doc.get("casts")
@@ -774,6 +848,71 @@ mod tests {
             inert("gpt_chat", "synth"),
             vec!["thinking_budget", "effort"],
             "hosted GPT chat sinks sampling but rejects reasoning effort and budget"
+        );
+    }
+
+    /// An image slot never runs a reasoning phase, so the render judges it by what the
+    /// operator WROTE on the slot, not by any wire shape: every written reasoning knob
+    /// is flagged inert, and a bare image slot stays clean even when `[defaults]`
+    /// carries a written synth effort (inherited values are a fallback artifact, not a
+    /// statement about the image slot). Same rule as the startup warning
+    /// (`Config::media_tunable_diagnostics`) — one policy, two surfaces.
+    #[test]
+    fn config_render_flags_written_reasoning_knobs_on_an_image_slot() {
+        let config = Config::from_toml_str(
+            r#"
+            [defaults]
+            # Written, synth-side: lands on reasoning slots, must NOT flag image slots.
+            synth_effort = "medium"
+
+            [backends.sd]
+            kind = "stability"
+
+            # Knobs written on the image slot itself: all inert, all flagged.
+            [casts.noisy]
+            synth = "deepseek/deepseek-v4-pro"
+            image = { backend = "sd", id = "core", thinking_budget = 4096, effort = "high", temperature = 0.5, thinking_style = "adaptive" }
+
+            # A bare image slot: nothing written, nothing flagged.
+            [casts.clean]
+            synth = "deepseek/deepseek-v4-pro"
+            image = "sd/ultra"
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let inert = |cast: &str, role: &str| -> Vec<String> {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .map(|a| {
+                    a.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            inert("noisy", "image"),
+            vec!["thinking_budget", "effort", "temperature", "thinking_style"],
+            "every reasoning knob written on the image slot is flagged"
+        );
+        assert!(
+            inert("clean", "image").is_empty(),
+            "a bare image slot is clean; the written [defaults] synth effort does not \
+             leak onto it"
         );
     }
 
@@ -825,7 +964,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
             doc.get("casts")
@@ -909,7 +1056,15 @@ mod tests {
         )
         .unwrap();
 
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let render_flags = |cast: &str, role: &str| -> bool {
             doc.get("casts")
@@ -975,7 +1130,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let wire = |name: &str| -> Option<String> {
             doc.get("backends")
@@ -1014,7 +1177,15 @@ mod tests {
     fn config_resource_renders_expected_fields() {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
-        let body = render_config_resource(&config, &allowed, None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // Structural presence checks — the resource is TOML or a document, not prose.
         for needle in [
             "allowed_paths",
@@ -1103,7 +1274,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // The header NAME is discoverable…
         assert!(
             body.contains("authorization"),
@@ -1123,7 +1302,15 @@ mod tests {
         // Enabled (the default) with the store open.
         let config =
             Config::from_toml_str("[persistence]\npath = \"/var/lib/kaibo/state.db\"\n").unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], true);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            true,
+            crate::config::CasMode::Disk,
+        );
         let section = body
             .split_once("[persistence]")
             .expect("a [persistence] table renders")
@@ -1137,11 +1324,54 @@ mod tests {
 
         // Disabled: off and inactive.
         let off = Config::from_toml_str("[persistence]\nenabled = false\n").unwrap();
-        let body = render_config_resource(&off, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &off,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let section = body.split_once("[persistence]").expect("table renders").1;
         assert!(
             section.contains("enabled = false") && section.contains("active = false"),
             "a disabled store renders off and inactive:\n{body}"
+        );
+    }
+
+    /// The media CAS renders its knob AND its runtime mode — the three-way state
+    /// (disk / memory / off) an operator needs to see, with `"memory"` the loud
+    /// degraded case (artifacts do not survive a restart) and `dir` shown even then
+    /// so a diagnosing operator sees where disk mode would write.
+    #[test]
+    fn config_resource_shows_cas_state_in_all_three_modes() {
+        use crate::config::CasMode;
+
+        let config = Config::from_toml_str("[cas]\ndir = \"/srv/art\"\n").unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], true, CasMode::Disk);
+        let section = body.split_once("[cas]").expect("a [cas] table renders").1;
+        assert!(
+            section.contains("enabled = true")
+                && section.contains(r#"mode = "disk""#)
+                && section.contains("/srv/art"),
+            "disk mode must show on, the mode word, and the dir:\n{body}"
+        );
+
+        let body =
+            render_config_resource(&config, &[], None, false, vec![], false, CasMode::Memory);
+        let section = body.split_once("[cas]").expect("table renders").1;
+        assert!(
+            section.contains(r#"mode = "memory""#) && section.contains("/srv/art"),
+            "memory mode must render as memory and still show the configured dir:\n{body}"
+        );
+
+        let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
+        let body = render_config_resource(&off, &[], None, false, vec![], false, CasMode::Off);
+        let section = body.split_once("[cas]").expect("table renders").1;
+        assert!(
+            section.contains("enabled = false") && section.contains(r#"mode = "off""#),
+            "the explicit off switch renders as off:\n{body}"
         );
     }
 
@@ -1163,7 +1393,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         for needle in ["[backend_aliases]", "[cast_aliases]"] {
             assert!(body.contains(needle), "must render {needle}:\n{body}");
         }
@@ -1210,7 +1448,15 @@ mod tests {
             unsafe {
                 std::env::set_var(var_name, SENTINEL);
             }
-            let b = render_config_resource(&config, &allowed, None, false, vec![], false);
+            let b = render_config_resource(
+                &config,
+                &allowed,
+                None,
+                false,
+                vec![],
+                false,
+                crate::config::CasMode::Memory,
+            );
             #[allow(deprecated)]
             unsafe {
                 std::env::remove_var(var_name);
@@ -1236,7 +1482,15 @@ mod tests {
         let file_path = tmp.path().to_string_lossy().to_string();
         let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
         let config2 = Config::from_toml_str(&toml2).expect("valid config");
-        let body2 = render_config_resource(&config2, &allowed, None, false, vec![], false);
+        let body2 = render_config_resource(
+            &config2,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // The file path (source pointer) may appear, but not the file contents.
         assert!(
             !body2.contains(SENTINEL),
