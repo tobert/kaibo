@@ -733,6 +733,11 @@ impl Backend {
     /// `base_url` wins; otherwise fall back to `OPENAI_BASE_URL` (back-compat) or the
     /// built-in default. Read at use-time, not construction, so backend *building*
     /// stays pure (see [`Config::from_toml_str`]).
+    ///
+    /// COMPLETION-WIRE ONLY: the fallback default here is the local keyless server, the
+    /// `openai` kind's home. A media backend (`openai-images`) defaults to the *hosted*
+    /// endpoint instead, resolved in `MediaArm::from_slot` — a call site reaching this
+    /// method for a media backend would silently dial localhost.
     pub fn resolved_base_url(&self) -> String {
         self.base_url
             .clone()

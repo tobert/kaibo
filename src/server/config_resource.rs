@@ -340,7 +340,7 @@ pub(crate) fn render_config_resource(
                 base_url.clone()
             };
             let doc = BackendDoc {
-                kind: format!("{:?}", kind).to_lowercase(),
+                kind: kind.canonical_name().to_string(),
                 base_url: rendered_base_url,
                 // KEY SOURCE ONLY — env var name or file path, never the value.
                 api_key_env: api_key_env.clone(),
@@ -672,6 +672,37 @@ mod tests {
         assert!(
             body.contains("/tmp/the-repo-feature"),
             "runtime section must list the followed worktree:\n{body}"
+        );
+    }
+
+    /// A backend's `kind` renders as its canonical (hyphenated) name, the spelling an
+    /// operator writes in config — a Debug-derived lowercase would collapse
+    /// `openai-images` into `openaiimages`, a name that round-trips into a load error.
+    #[test]
+    fn config_resource_renders_kind_by_canonical_name() {
+        let config = Config::from_toml_str(
+            r#"
+            [backends.imggen]
+            kind = "openai-images"
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
+        assert!(
+            body.contains(r#"kind = "openai-images""#),
+            "the kind must render in its canonical spelling:\n{body}"
+        );
+        assert!(
+            !body.contains("openaiimages"),
+            "a Debug-lowercased kind name must not appear:\n{body}"
         );
     }
 
