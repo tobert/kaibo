@@ -30,47 +30,31 @@ the argument against it, and the CAS that makes the write path acceptable are in
 `docs/devlog.md` (2026-07-25); the shape rationale lives in `src/cas.rs`'s module doc. The
 perception half below stands unchanged.
 
-**Open work to make it reachable.** `src/cas.rs` and `src/stability.rs` exist and are
-tested, but nothing constructs either outside their own tests — no `ProviderKind::Stability`,
-no `image` cast slot (`986806f` reduced `ModelRole` to Explorer/Synth and made `image =` a
-loud `deny_unknown_fields` error), no MCP tool or CLI verb, no `[cas]` config. Three things
-must land *together* with the first tool, because each is unsafe or dishonest alone:
+**The production spine shipped** (feat/media-cas, 2026-08-03): `ProviderKind::Stability`
+behind the `ProviderKind::class()` Wire|Media funnel, the revived `ModelRole::Image` cast
+slot, `MediaModel`/`MediaArm` (complete outcomes are `Vec<MediaArtifact>` — one digest and
+one provenance sidecar per artifact, Amy 2026-08-03), the `[cas]` lifecycle (disk with
+persistence / in-memory without, SEVERE-warned / `enabled = false` off, un-advertising the
+tools that need it), the `generate` tool (its own `--no-generate` flag, staffed by the
+`image` slot via `CAST_ENUM_RULES`, deferred shapes on the `job-N` verbs), and the
+operator-only `kaibo://cas/<digest>` retrieval resource. The tool returns digests +
+URIs (+ real path on disk), never inline bytes — as decided.
 
-- **A loud guard when the CAS is on ephemeral storage.** The ghcr image is a first-class
-  distribution path, and a CAS at `$XDG_DATA_HOME/kaibo/cas` in a container with no volume
-  mounted will accept the prompt, **spend the user's provider credits**, verify and write
-  the artifact, then destroy it on exit. Silently evaporating paid artifacts is exactly what
-  a store that refuses to ever delete exists to prevent. Ranked the top remaining risk by
-  the Gemini design pass. **Decided (Amy, 2026-07-30): detect overlay/tmpfs backing and warn
-  severely, then proceed** — not a refusal gated on an acknowledgement flag. The container
-  path stays frictionless for someone who genuinely doesn't want persistence; what must not
-  happen is proceeding *quietly*.
-- **`AGENTS.md`'s opening paragraph** still says kaibo "produces no output artifacts." That
-  is *true today* (nothing reachable produces anything) and becomes false the moment a tool
-  lands. Rewrite it in that same change.
-- **Gating is done** — the staffing gate shipped 2026-07-30 (a tool no configured cast can
-  staff is not advertised, with the reason in the startup log and `kaibo://config`'s
-  `[runtime].unstaffable_tools`). An image tool inherits it by adding a `CAST_ENUM_RULES`
-  entry with an `cast_can_generate_image` predicate, so a user who configures no image cast
-  pays zero resident tokens for it. Nothing further to build here — just wire the rule.
+**Open work that remains:**
 
-**Decided with Amy, 2026-07-30 — the shape of the first image tool:**
-- **The image model is a cast SLOT, not a separate config concept.** Revive
-  `ModelRole::Image` (undoing that part of `986806f`) so a cast reads
-  `[casts.artist] explorer = … / synth = … / image = "stability/core"`. Considered and
-  rejected: a standalone `[image]`/backend-only concept divorced from casts, on the argument
-  that a cast is a *reasoning* team. Amy's call went the other way, and it buys a real
-  simplification — the staffing gate, the `cast` enum, and the per-call `cast` argument all
-  keep working unchanged, with `cast_can_generate_image` sitting beside
-  `cast_can_deliberate` in exactly the same shape.
-- **The tool returns the digest and the path — not the bytes.** No inline image content
-  block: a multi-megabyte artifact should not land in the calling agent's context unless it
-  asks, and the caller may not even share kaibo's filesystem. A by-digest read verb can come
-  later if wanted (and see the egress-gateway note below, which already argues a by-digest
-  fetch leaks nothing).
-- Still open, not yet decided: whether `ProviderKind::Stability` is the right home for the
-  image backend (it is not a rig `CompletionModel`, so it does not slot into the existing
-  arm machinery), and the `[cas]` config surface (dir override, `max_bytes` cap).
+- **A loud guard when the CAS is on ephemeral DISK storage.** The ghcr image is a
+  first-class distribution path, and a disk CAS at `$XDG_DATA_HOME/kaibo/cas` in a
+  container with no volume mounted will accept the prompt, **spend the user's provider
+  credits**, verify and write the artifact, then destroy it on exit. Ranked the top
+  remaining risk by the Gemini design pass. **Decided (Amy, 2026-07-30): detect
+  overlay/tmpfs backing and warn severely, then proceed** — not a refusal gated on an
+  acknowledgement flag. The memory-mode SEVERE warn that shipped covers the
+  no-persistence path; this remaining piece is the disk mode whose backing store is
+  secretly ephemeral (statfs the CAS dir, warn on overlay/tmpfs magic).
+- **Cross-agent CAS sharing is DEFERRED** (Amy, 2026-08-03): no tracking of which agent
+  created which object, no allow-listing, until a concrete need shows up. The CAS's job
+  in one line, hers: "cas should be a way for the kaibo agents to get stuff to the
+  client efficiently. like images. maybe reports."
 
 **Decided, so it isn't re-litigated:** audio and 3D are *not* refused on principle. The
 account-fleet argument that justifies image generation extends to them; the real constraint

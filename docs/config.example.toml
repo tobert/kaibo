@@ -79,7 +79,7 @@ cast = "anthropic"
 # tracing/EnvFilter directive used when RUST_LOG is unset.
 log = "kaibo=info"
 
-# Tool gating — seven capability flags (the --no-<tool> flags), all default true. They
+# Tool gating — eight capability flags (the --no-<tool> flags), all default true. They
 # are not one-per-tool: `consult` also gates consult_submit, `batch` gates batch_submit,
 # and the job_* verbs follow whichever handle producers are live. A config that leaves
 # nothing advertised is refused at startup, whether by turning every flag off or by
@@ -87,10 +87,11 @@ log = "kaibo=info"
 #
 # A tool also needs a cast that can STAFF it. One nothing can staff is not advertised at
 # all, so it costs no resident tokens and no call of it can fail. Out of the box that
-# affects `deliberate`: no built-in cast pairs an explorer with an offline synth, so it
-# stays dark until you configure one (see DELIBERATE casts below). kaibo warns at startup
-# naming the cast shape it wants, and kaibo://config's [runtime].unstaffable_tools reports
-# it live. Full table: kaibo://config/guide, "Tool gating".
+# affects `deliberate` (no built-in cast pairs an explorer with an offline synth — see
+# DELIBERATE casts below) and `generate` (no built-in cast carries an `image` slot — see
+# the image-slot example below). kaibo warns at startup naming the cast shape it wants,
+# and kaibo://config's [runtime].unstaffable_tools reports it live. Full table:
+# kaibo://config/guide, "Tool gating".
 [server.tools]
 consult        = true
 explore        = true
@@ -99,6 +100,7 @@ oneshot        = true
 run_kaish      = true
 batch          = true
 list_models    = true
+generate       = true      # ...and needs a cast with an `image` slot AND [cas] on
 
 # ---------------------------------------------------------------------------
 # [defaults] — tunables every cast slot falls back to. The model-tracking knobs

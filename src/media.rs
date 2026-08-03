@@ -187,6 +187,26 @@ impl MediaArm {
     }
 }
 
+/// How the generate lane turns a cast's `image` slot into a callable [`MediaArm`] —
+/// the injection seam, mirroring [`crate::batch::BatchProviderFactory`]: the handler
+/// holds an `Arc<dyn MediaArmFactory>`, production seeds [`LiveMediaArms`] (the real
+/// [`MediaArm::from_slot`] path), and tests swap in a factory returning a scripted
+/// [`MediaModel`] so the whole tool lane — CAS writes, job lane, rendering — runs
+/// offline with no network.
+pub trait MediaArmFactory: Send + Sync {
+    fn build(&self, backend: &Backend, slot: &ModelSlot) -> Result<MediaArm>;
+}
+
+/// The real construction path: [`MediaArm::from_slot`], the single live point where a
+/// media backend becomes callable.
+pub struct LiveMediaArms;
+
+impl MediaArmFactory for LiveMediaArms {
+    fn build(&self, backend: &Backend, slot: &ModelSlot) -> Result<MediaArm> {
+        MediaArm::from_slot(backend, slot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

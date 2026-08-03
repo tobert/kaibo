@@ -258,6 +258,9 @@ pub struct ServeGates {
     /// Don't advertise the `list_models` tool.
     #[arg(long)]
     pub no_list_models: bool,
+    /// Don't advertise the `generate` tool (media generation).
+    #[arg(long)]
+    pub no_generate: bool,
 }
 
 impl ServeGates {
@@ -271,6 +274,7 @@ impl ServeGates {
             run_kaish: self.no_run_kaish,
             batch: self.no_batch,
             list_models: self.no_list_models,
+            generate: self.no_generate,
         }
     }
 }

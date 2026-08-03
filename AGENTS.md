@@ -5,10 +5,12 @@ It augments a calling agent (Codex, Claude, Gemini, local agents, etc.) with a t
 models, lending one kind of help — *consultation*: grounded, cited, read-only answers
 about a codebase. The team
 *perceives* what fuses into its reasoning (image input today — `view_image` and image
-attachments on the model-driven tools; more modalities as the models gain them), but
-kaibo produces **no output artifacts** — it reasons over code, it doesn't render or
-emit. (When it needs to *record* something, that's a specific mediated tool, not a
-general write path; see the read-only invariant.)
+attachments on the model-driven tools; more modalities as the models gain them), and —
+when a cast carries an `image` slot — *produces*: the `generate` tool writes artifacts
+into kaibo's own media CAS (content-addressed, provenance-recorded, retrieved by the
+operator via `kaibo://cas/<digest>`), **never into the project**. Recording and emitting
+are always a specific mediated tool over kaibo's own store, not a general write path;
+see the read-only invariant.
 
 ## For agents working here
 
@@ -37,9 +39,11 @@ loop. Each consultation tool is that loop wearing different clothes:
 Both model-driven tools name their cast + answering model(s) in a provenance footer
 (`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
 
-Seven `--no-<tool>` capability flags gate the surface (all on by default; `consult` also
-gates `consult_submit`, `batch` gates `batch_submit`, and the `job_*` verbs follow their
-live producers). A tool also needs a cast that can **staff** it, or its route is dropped;
+Eight `--no-<tool>` capability flags gate the surface (all on by default; `consult` also
+gates `consult_submit`, `batch` gates `batch_submit`, `generate` additionally needs the
+media CAS on, and the `job_*` verbs follow their live producers — a deferred `generate`
+mints a `job-N` like the other producers). A tool also needs a cast that can **staff**
+it, or its route is dropped;
 a server left with nothing advertised is refused at startup, by either road. See
 `CAST_ENUM_RULES` and `live_tools` in `server.rs`, and "Tool gating" in `docs/config.md`.
 Multi-provider over `rig-core`: a **`ProviderKind`** is the wire protocol (keyed

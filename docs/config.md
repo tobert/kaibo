@@ -603,9 +603,11 @@ stale `provider` is now an invalid-params error like every other tombstone above
 A tool clears **two** gates to be advertised: the `[server.tools]` flag (equivalently
 `--no-<tool>` or `KAIBO_NO_<TOOL>`), and a configured cast that can **staff** it.
 
-The seven flags are *capability* switches, not one per MCP tool. `consult` gates both
+The eight flags are *capability* switches, not one per MCP tool. `consult` gates both
 `consult` and `consult_submit`; `batch` gates `batch_submit`; the `job_*` verbs have no
-flag of their own and follow whichever handle producers are live.
+flag of their own and follow whichever handle producers are live. `generate` clears a
+third gate as well: the media CAS must be on (`[cas] enabled`), because an
+artifact-producing tool needs somewhere to store artifacts.
 
 A tool nothing can staff has its route removed rather than shipping unusable. The calling
 agent never sees a tool whose every call would fail, and an unusable tool stops costing
@@ -619,10 +621,13 @@ Which cast shape staffs which tool:
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
+| `generate` | a cast with an `image` slot (a media backend, kind `stability`) — plus `[cas]` on |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
-**Default installs.** This affects one tool. No built-in cast pairs an explorer with an
+**Default installs.** This affects two tools. No built-in cast carries an `image` slot,
+so `generate` stays dark until you configure one (the image-slot example in
+`docs/config.example.toml`). And no built-in cast pairs an explorer with an
 offline synth — the two built-in offline casts, `anthropic-batch` and `gemini-batch`, are
 synth-only — so `deliberate` is not advertised until you configure a cast carrying both
 slots. The DELIBERATE casts section of `docs/config.example.toml` is the worked example.

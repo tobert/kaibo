@@ -1259,6 +1259,17 @@ impl Config {
             .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())
     }
 
+    /// Whether canonical cast `name` can staff a `generate` call: it carries an
+    /// **image** slot — the media member, the only slot `generate` runs. Load
+    /// validation already pinned that slot to a media backend (kind `stability`), so
+    /// slot presence is the whole test here. Independent of the reasoning slots: a
+    /// cast may be image-only, and a full team's image slot is equally valid.
+    pub fn cast_can_generate(&self, name: &str) -> bool {
+        self.casts
+            .get(name)
+            .is_some_and(|c| c.slot(ModelRole::Image).is_some())
+    }
+
     /// Whether canonical cast `name` is the configured default — comparing against the
     /// *resolved* default, so an alias default (`server.cast = "claude"`) still matches
     /// its canonical cast (`anthropic`). The roster renderer (`casts_section`) gets
@@ -2052,6 +2063,9 @@ impl Config {
         if disable.list_models {
             self.tools.list_models = false;
         }
+        if disable.generate {
+            self.tools.generate = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -2081,6 +2095,7 @@ pub struct ToolDisables {
     pub run_kaish: bool,
     pub batch: bool,
     pub list_models: bool,
+    pub generate: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -2461,6 +2476,7 @@ struct RawTools {
     run_kaish: Option<bool>,
     batch: Option<bool>,
     list_models: Option<bool>,
+    generate: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2953,6 +2969,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
         batch: raw.batch.unwrap_or(d.batch),
         list_models: raw.list_models.unwrap_or(d.list_models),
+        generate: raw.generate.unwrap_or(d.generate),
     }
 }
 
@@ -3026,6 +3043,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_LIST_MODELS") {
         tools.list_models = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_GENERATE") {
+        tools.generate = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);

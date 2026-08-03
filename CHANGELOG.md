@@ -17,6 +17,36 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **kaibo can now generate images.** A new `generate` tool turns a text prompt into
+  artifacts through the cast's new `image` slot — a media backend (Stability's v2beta
+  `core`/`ultra`/SD3.5 family) riding beside the reasoning slots, e.g.
+  `[casts.artist] image = "sd/core"`. The tool never inlines bytes: every artifact
+  lands in kaibo's content-addressed media store under its own SHA-256 digest with a
+  provenance sidecar (prompt, model, cast, timestamp, mime, seed), and the result
+  lists per-artifact `kaibo://cas/<digest>` resource URIs — plus the real file path
+  when the store is on disk. Provider-native options (`aspect_ratio`,
+  `output_format`, `seed`, `negative_prompt`, ...) pass through a `fields` object
+  verbatim. Operations the provider declares deferred return a `job-N` handle on the
+  existing `job_wait`/`job_get`/`job_list`/`job_cancel` verbs. The tool follows the
+  staffing discipline: no configured cast with an `image` slot (a stock install)
+  means it is not advertised and costs nothing; `--no-generate` /
+  `KAIBO_NO_GENERATE` / `[server.tools] generate = false` switch it off explicitly.
+
+- **The media CAS has a lifecycle, and it follows persistence.** While persistence is
+  active, generated artifacts are durable on disk at `[cas] dir` (default
+  `$XDG_DATA_HOME/kaibo/cas`). Without persistence (off, or degraded) the CAS runs
+  in memory: artifacts stay fetchable by digest for that run only, and startup warns
+  loudly that they will not survive a restart. `[cas] enabled = false` turns the
+  store off entirely and un-advertises every tool that needs it. `kaibo://config`
+  gains a `[cas]` section reporting the knob and the live mode
+  (`disk` / `memory` / `off`).
+
+- **Artifact retrieval is operator-surface only.** The new `kaibo://cas/{digest}` MCP
+  resource serves an artifact's bytes (base64, correct mime) to the calling client —
+  the inner model team never sees the CAS: it is not mounted into kaish and no
+  cast-facing tool reads it, so one project's team can never enumerate another
+  project's artifacts.
+
 - **The explorer can now hand whole files to whoever reads its report.** Inside
   `consult` and `deliberate`, the delegated investigator gets an `attach` tool: when a
   whole file is the evidence, it routes the file's real bytes (numbered, `cat -n`

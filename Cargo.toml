@@ -22,7 +22,9 @@ path = "src/main.rs"
 # read-only safety is thus structural (the dangerous surface doesn't exist),
 # backed by the runtime read-only mount; see src/sandbox.rs.
 kaish-kernel = { version = "0.13.0", default-features = false, features = ["localfs"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
+# named here rather than inherited from a transitive enabler.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 async-trait = "0.1"
 anyhow = "1"
 
@@ -171,6 +173,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `start_paused` tests (the deferred-generate poll loop) auto-advance tokio's clock
+# instead of really sleeping the poll interval.
+tokio = { version = "1", features = ["test-util"] }
 # Request-body capture in `tests/effort_wire.rs` and `test_support::CaptureHttp`:
 # rig's `HttpClientExt` trait is typed in `bytes::Bytes`, so implementing a fake
 # transport needs the type by name. Already in the tree via reqwest/rig-core — zero
