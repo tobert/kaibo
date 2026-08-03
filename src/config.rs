@@ -1261,7 +1261,7 @@ impl Config {
 
     /// Whether canonical cast `name` can staff a `generate` call: it carries an
     /// **image** slot — the media member, the only slot `generate` runs. Load
-    /// validation already pinned that slot to a media backend (kind `stability`), so
+    /// validation already pinned that slot to a media-class backend, so
     /// slot presence is the whole test here. Independent of the reasoning slots: a
     /// cast may be image-only, and a full team's image slot is equally valid.
     pub fn cast_can_generate(&self, name: &str) -> bool {
@@ -1646,27 +1646,31 @@ impl Config {
                     b.name
                 );
             }
-            // A base_url on a keyed kind: rig fixes those endpoints — except Anthropic
-            // and Gemini, which also accept one (for an Anthropic/Gemini-API-compatible
-            // gateway/proxy in front of the real backend), optionally: unset still
-            // dials rig's built-in https://api.anthropic.com /
-            // https://generativelanguage.googleapis.com. Both contracts are a HOST
-            // ROOT — rig's `ClientBuilder::base_url` appends its own versioned path
-            // (`/v1beta/models/...` for Gemini) rather than taking one baked in; see
-            // `GeminiBatch::base_url` (`batch.rs`) for the batch lane's matching
-            // reconciliation. `stability` takes one on the same optional host-root
-            // contract: kaibo's own facade appends `/v2beta/...` (`StabilityClient`),
-            // and unset dials the real https://api.stability.ai.
-            if b.kind != ProviderKind::Openai
-                && b.kind != ProviderKind::Anthropic
-                && b.kind != ProviderKind::Gemini
-                && b.kind != ProviderKind::Stability
-                && b.base_url.is_some()
-            {
+            // A base_url on a keyed completion kind: rig fixes those endpoints —
+            // except Anthropic and Gemini, which also accept one (for an
+            // Anthropic/Gemini-API-compatible gateway/proxy in front of the real
+            // backend), optionally: unset still dials rig's built-in
+            // https://api.anthropic.com / https://generativelanguage.googleapis.com.
+            // Both contracts are a ROOT the client versions itself — rig's
+            // `ClientBuilder::base_url` appends its own path (`/v1beta/models/...`
+            // for Gemini) rather than taking one baked in; see `GeminiBatch::base_url`
+            // (`batch.rs`) for the batch lane's matching reconciliation. EVERY
+            // media-class kind takes one on the same client-appends-its-path
+            // contract: kaibo's own facades append their route (`/v2beta/...` for
+            // stability, `/images/generations` for openai-images), and unset dials
+            // each kind's real hosted endpoint (api.stability.ai /
+            // api.openai.com/v1). Class-based on the media side so a new media kind
+            // never has to join a hand-maintained list here.
+            let base_url_legal = matches!(b.kind.class(), credentials::ProviderClass::Media(_))
+                || matches!(
+                    b.kind,
+                    ProviderKind::Openai | ProviderKind::Anthropic | ProviderKind::Gemini
+                );
+            if !base_url_legal && b.base_url.is_some() {
                 bail!(
                     "backend {:?} (kind {:?}) sets base_url, but only the `openai`, \
-                     `anthropic`, `gemini`, and `stability` kinds have a configurable \
-                     endpoint",
+                     `anthropic`, and `gemini` completion kinds and the media kinds \
+                     have a configurable endpoint",
                     b.name,
                     b.kind
                 );
@@ -1820,31 +1824,39 @@ impl Config {
                         t.max_tokens
                     );
                 }
-                // The role and the backend KIND have to agree about what kind of wire
-                // this is. `stability` is an image-generation API driven through
-                // kaibo's own facade, not a rig completion model, so it can staff the
-                // `image` slot and nothing else; conversely an image slot pointed at a
-                // chat backend would ask a completion model to return pixels. Both are
-                // load errors here rather than a baffling failure at request time, when
-                // the operator would be reading a provider error instead of a config
-                // mistake. This is the config half of the guard `Arm::from_slot` bails
-                // on — if the two ever disagree, both refuse rather than improvise.
-                if kind == ProviderKind::Stability && role.is_reasoning() {
+                // The role and the backend kind's CLASS have to agree. A media-class
+                // kind (stability, openai-images, ...) is driven through kaibo's own
+                // facade, not a rig completion model, so it can staff the `image`
+                // slot and nothing else; conversely an image slot pointed at a
+                // completion wire would ask a chat model to return pixels. Both are
+                // load errors here rather than a baffling failure at request time,
+                // when the operator would be reading a provider error instead of a
+                // config mistake. Class-based on purpose (`ProviderKind::class`), so
+                // a new media kind is covered the moment it is classified and the
+                // error text never carries a kind list that goes stale. This is the
+                // config half of the guard `Arm::from_slot` / `MediaArm::from_slot`
+                // bail on — if the two ever disagree, both refuse rather than
+                // improvise.
+                let is_media = matches!(kind.class(), credentials::ProviderClass::Media(_));
+                if is_media && role.is_reasoning() {
                     bail!(
                         "cast {name:?}: the {} slot points at backend {:?} (kind \
-                         `stability`), which generates images and has no completion \
-                         model to reason with — point {} at a chat backend, and put the \
-                         stability backend on this cast's `image` slot instead",
+                         `{}`, a media kind), which generates artifacts and has no \
+                         completion model to reason with — point {} at a completion \
+                         backend, and put backend {:?} on this cast's `image` slot \
+                         instead",
                         role.key(),
                         slot.backend,
+                        kind.canonical_name(),
                         role.key(),
+                        slot.backend,
                     );
                 }
-                if *role == ModelRole::Image && kind != ProviderKind::Stability {
+                if *role == ModelRole::Image && !is_media {
                     bail!(
                         "cast {name:?}: the image slot points at backend {:?} (kind \
-                         `{}`), which is a chat/completion wire and cannot generate an \
-                         image — an image slot needs a backend of kind `stability`",
+                         `{}`, a completion wire), which cannot generate an image — \
+                         an image slot needs a media-kind backend",
                         slot.backend,
                         kind.canonical_name(),
                     );
@@ -4791,7 +4803,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("only the `openai`, `anthropic`, `gemini`, and `stability` kinds"),
+            err.contains(
+                "only the `openai`, `anthropic`, and `gemini` completion kinds and the \
+                 media kinds"
+            ),
             "got: {err}"
         );
     }

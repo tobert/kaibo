@@ -28,6 +28,7 @@ pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;
 pub mod media;
+pub mod openai_images;
 pub mod orientation;
 pub mod progress;
 pub mod sandbox;

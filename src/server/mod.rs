@@ -614,9 +614,10 @@ pub struct GenerateInput {
 
     /// Provider-native generation options passed through verbatim as string fields
     /// (Stability: aspect_ratio "16:9", output_format png|jpeg|webp, seed,
-    /// negative_prompt, style_preset, ...). The provider validates its own knobs.
-    /// `prompt` and `model` are reserved: use the prompt parameter and the cast's
-    /// image slot.
+    /// negative_prompt, style_preset, ...; OpenAI-compatible images endpoints: size
+    /// "1024x1024", n, quality, output_format, ...). The provider validates its own
+    /// knobs. `prompt` and `model` are reserved: use the prompt parameter and the
+    /// cast's image slot.
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, String>>,
 }
@@ -749,8 +750,8 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["generate"],
         Config::cast_can_generate,
-        "a cast with an `image` slot pointing at a media backend (kind `stability`) — \
-         see the image-slot example in docs/config.example.toml",
+        "a cast with an `image` slot pointing at a media backend (kind `stability` or \
+         `openai-images`) — see the image-slot examples in docs/config.example.toml",
     ),
 ];
 
@@ -2467,15 +2468,17 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Generate an image from a text prompt with the cast's `image` \
-            model (a media backend, e.g. Stability). Bytes are never inlined: each \
-            artifact lands in kaibo's content-addressed media store and the result \
-            lists per-artifact digests — a kaibo://cas/<digest> resource URI, the mime, \
-            the provider's seed, and the real file path when the store is on disk. \
-            Provider-native options (aspect_ratio, output_format, seed, \
+        description = "Generate images from a text prompt with the cast's `image` \
+            model (a media backend: Stability, or an OpenAI-compatible images \
+            endpoint — hosted gpt-image or a local stable-diffusion.cpp sd-server). \
+            Bytes are never inlined: each artifact lands in kaibo's content-addressed \
+            media store and the result lists per-artifact digests — a \
+            kaibo://cas/<digest> resource URI, the mime, the provider's seed when \
+            reported, and the real file path when the store is on disk. \
+            Provider-native options (aspect_ratio, size, n, output_format, seed, \
             negative_prompt, style_preset, ...) pass through `fields` verbatim. An \
             operation the provider declares deferred returns a `job-N` handle for \
-            job_wait/job_get instead (today's Stability routes all answer in-call). \
+            job_wait/job_get instead (every route wired today answers in-call). \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
     )]
     pub async fn generate(
@@ -2498,8 +2501,9 @@ impl KaiboHandler {
             return Err(McpError::invalid_params(
                 format!(
                     "cast `{}` has no `image` slot — `generate` needs a cast whose \
-                     `image` slot points at a media backend (kind `stability`). \
-                     kaibo://config lists the configured casts and their slots.",
+                     `image` slot points at a media backend (kind `stability` or \
+                     `openai-images`). kaibo://config lists the configured casts and \
+                     their slots.",
                     cast.name
                 ),
                 None,
@@ -2519,13 +2523,14 @@ impl KaiboHandler {
         let fields: Vec<(String, String)> = input.fields.unwrap_or_default().into_iter().collect();
         // Reserved keys: recorded provenance must describe the request that actually
         // ran. `fields.prompt` would send prompt B while the sidecar records prompt A,
-        // and `fields.model` would reroute an SD3 call while the sidecar records the
-        // slot's model — so both are refused loudly, pointing at the real parameter.
+        // and `fields.model` would reroute the call (Stability's SD3 route, the
+        // Images API's model field) while the sidecar records the slot's model — so
+        // both are refused loudly, pointing at the real parameter.
         for (key, param) in [
             ("prompt", "the `prompt` parameter"),
             (
                 "model",
-                "the cast's `image` slot (its model id picks the route/variant)",
+                "the cast's `image` slot (its model id picks the provider model/route)",
             ),
         ] {
             if fields.iter().any(|(name, _)| name == key) {

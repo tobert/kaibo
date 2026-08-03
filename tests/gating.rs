@@ -126,6 +126,34 @@ fn a_stock_install_does_not_advertise_deliberate() {
     );
 }
 
+/// An `image` slot on an `openai-images` backend staffs `generate` exactly the way a
+/// stability one does — the staffing gate is class-based, not stability-shaped. The
+/// keyless local sd-server posture (base_url set, no key anywhere) is the config
+/// under test, since it is the shape that must work with zero credentials.
+#[test]
+fn an_openai_images_cast_staffs_generate() {
+    let mut config = Config::from_toml_str(
+        r#"
+        [backends.sdcpp]
+        kind = "openai-images"
+        base_url = "http://localhost:1234/v1"
+        api_key_file = "/nonexistent-kaibo-test/openai"
+
+        [casts.artist]
+        image = "sdcpp/sd3.5-large"
+        "#,
+    )
+    .expect("fixture config parses");
+    config.tools = ToolGating::default();
+    let tools = KaiboHandler::new_with_env(config, |_| None)
+        .expect("handler builds")
+        .advertised_tools();
+    assert!(
+        tools.contains(&"generate".to_string()),
+        "an openai-images image slot must staff `generate`; got {tools:?}"
+    );
+}
+
 #[test]
 fn each_flag_removes_exactly_its_own_tools() {
     // Each flag and the tool route(s) it drops *exclusively*. The shared collect verbs

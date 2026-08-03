@@ -452,7 +452,9 @@ review: there's no diff, because nothing it runs can change your tree.
 ### `generate` — images through the cast's media member
 
 kaibo's first artifact-*producing* tool: a text prompt in, generated images out —
-through a cast's `image` slot (a Stability backend today). The bytes never inline into
+through a cast's `image` slot. Image generation spans Stability's v2beta family and
+OpenAI-compatible image endpoints (hosted gpt-image, or a local stable-diffusion.cpp
+`sd-server` speaking the same `/v1/images/generations` shape). The bytes never inline into
 your context: each artifact lands in kaibo's content-addressed media store with a
 provenance sidecar (prompt, model, cast, seed), and the result lists per-artifact
 digests as `kaibo://cas/<digest>` resource URIs — plus the real file path when the

@@ -165,10 +165,30 @@ impl MediaArm {
                 let model = crate::stability::StabilityImageModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
+            ProviderClass::Media(MediaKind::OpenAiImages) => {
+                // Key posture mirrors the `openai` completion kind: `resolve_key`
+                // hands back the placeholder for a keyless local sd-server
+                // (`key_optional`, the seeded default) and a real key otherwise.
+                let key = backend.resolve_key()?;
+                // Unset dials hosted OpenAI — a root through /v1; the client appends
+                // its own /images/generations. A local sd-server sets base_url.
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::credentials::HOSTED_OPENAI_BASE_URL.to_string());
+                let client = crate::openai_images::OpenAiImagesClient::new(
+                    key,
+                    base_url,
+                    backend.request_timeout,
+                )?;
+                let model =
+                    crate::openai_images::OpenAiImagesModel::from_parts(&client, &slot.id);
+                Ok(Self::new(Arc::new(model), slot.qualified()))
+            }
             ProviderClass::Wire(_) => bail!(
                 "backend {:?} is kind `{}`, a completion wire — it cannot staff a media \
-                 slot. Point the `image` slot at a media backend (kind `stability`), \
-                 and use this backend on `explorer`/`synth` instead",
+                 slot. Point the `image` slot at a media backend, and use this backend \
+                 on `explorer`/`synth` instead",
                 backend.name,
                 backend.kind.canonical_name()
             ),
@@ -303,8 +323,47 @@ mod tests {
         let err = MediaArm::from_slot(backend, &slot).expect_err("wire kind must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("completion wire") && msg.contains("stability"),
+            msg.contains("completion wire") && msg.contains("media backend"),
             "the error names the problem and the fix, got: {msg}"
         );
+    }
+
+    /// An openai-images backend staffs an image slot — and the keyless default
+    /// (`key_optional` seeds true for this kind) resolves to the placeholder, so a
+    /// local sd-server backend needs no credential at all. Construction only; no
+    /// network.
+    #[test]
+    fn from_slot_staffs_an_openai_images_backend_keylessly() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.sdcpp]
+            kind = "openai-images"
+            base_url = "http://localhost:1234/v1"
+            api_key_file = "/nonexistent-kaibo-test/openai"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("sdcpp").expect("backend exists");
+        let slot = ModelSlot::bare("sdcpp", "sd3.5-large");
+        let arm = MediaArm::from_slot(backend, &slot).expect("an openai-images backend staffs");
+        assert_eq!(arm.slot_ref(), "sdcpp/sd3.5-large");
+    }
+
+    /// The Stability arm still staffs — the sibling-kind regression guard for the
+    /// `from_slot` match growing a second media arm.
+    #[test]
+    fn from_slot_still_staffs_a_stability_backend() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.sd]
+            kind = "stability"
+            key_optional = true
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("sd").expect("backend exists");
+        let slot = ModelSlot::bare("sd", "core");
+        let arm = MediaArm::from_slot(backend, &slot).expect("a stability backend staffs");
+        assert_eq!(arm.slot_ref(), "sd/core");
     }
 }

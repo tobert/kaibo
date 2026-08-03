@@ -60,6 +60,16 @@ pub enum ProviderKind {
     /// Deliberately NOT in the built-in backend list: image generation costs real money
     /// per call and needs a key, so it appears only when an operator writes the stanza.
     Stability,
+    /// OpenAI's Images API (`POST {base}/images/generations`) — the second media kind,
+    /// via `src/openai_images.rs`. One kind covers two real targets: hosted OpenAI
+    /// image generation (the gpt-image-1 family) and any local server speaking the
+    /// same endpoint shape (stable-diffusion.cpp's sd-server). Its key posture
+    /// mirrors [`ProviderKind::Openai`], not Stability: the same `OPENAI_API_KEY` /
+    /// `~/.openai-key` sources, and `key_optional` by default because the local
+    /// sd-server case is keyless — an operator pointing at hosted OpenAI sets
+    /// `key_optional = false` explicitly. Like Stability, it is not in the built-in
+    /// backend list and staffs only `image` cast slots.
+    OpenAiImages,
 }
 
 impl ProviderKind {
@@ -67,21 +77,25 @@ impl ProviderKind {
     /// new kind can never be accepted by `FromStr` while staying unlisted in the message
     /// a user actually reads — a hand-maintained list in that string had already drifted
     /// once (`openrouter` shipped before it was named there).
-    pub const ALL: [ProviderKind; 6] = [
+    pub const ALL: [ProviderKind; 7] = [
         Self::Anthropic,
         Self::DeepSeek,
         Self::Gemini,
         Self::OpenRouter,
         Self::Openai,
         Self::Stability,
+        Self::OpenAiImages,
     ];
 
-    /// Whether a missing credential is tolerated rather than a hard error. Only
-    /// the OpenAI-compatible provider is: its default endpoint is a local keyless
-    /// server, so an absent key falls back to a placeholder bearer token
-    /// ([`PLACEHOLDER_OPENAI_KEY`]). The keyed providers must fail loudly on a missing key.
+    /// Whether a missing credential is tolerated rather than a hard error. The two
+    /// OpenAI-shaped kinds are: the completion kind's default endpoint is a local
+    /// keyless server, and the images kind covers the keyless local sd-server case
+    /// with the same reasoning — an absent key falls back to a placeholder bearer
+    /// token ([`PLACEHOLDER_OPENAI_KEY`]), and an operator pointing either at hosted
+    /// OpenAI sets `key_optional = false` on the backend explicitly. The keyed
+    /// providers must fail loudly on a missing key.
     pub fn key_optional(self) -> bool {
-        matches!(self, ProviderKind::Openai)
+        matches!(self, ProviderKind::Openai | ProviderKind::OpenAiImages)
     }
 
     /// The stand-in credential a `key_optional` backend sends when no real key is
@@ -109,6 +123,8 @@ impl ProviderKind {
             | ProviderKind::DeepSeek
             | ProviderKind::OpenRouter
             | ProviderKind::Openai
+            // The keyless local sd-server case: header-bearer shaped, value ignored.
+            | ProviderKind::OpenAiImages
             // Never reached: Stability is not `key_optional`, so a missing key is a
             // hard error long before a stand-in is wanted. It is a header-bearer wire,
             // so it takes the same shape as the others if that ever changes.
@@ -129,6 +145,7 @@ impl ProviderKind {
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Openai => "openai",
             ProviderKind::Stability => "stability",
+            ProviderKind::OpenAiImages => "openai-images",
         }
     }
 
@@ -153,7 +170,10 @@ impl ProviderKind {
             ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
             ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
-            ProviderKind::Openai => "OPENAI_API_KEY",
+            // The images kind shares the completion kind's key sources on purpose:
+            // both talk to the same OpenAI account when hosted, and both cover a
+            // keyless local server when not — one credential, not two to maintain.
+            ProviderKind::Openai | ProviderKind::OpenAiImages => "OPENAI_API_KEY",
             // Reuses the constant `src/stability.rs` already resolves keys with, so the
             // facade and the config layer can never disagree about which var to read.
             ProviderKind::Stability => crate::stability::STABILITY_KEY_ENV_VAR,
@@ -169,7 +189,8 @@ impl ProviderKind {
             ProviderKind::DeepSeek => ".deepseek-key",
             ProviderKind::Gemini => ".gemini-api-key",
             ProviderKind::OpenRouter => ".openrouter-key",
-            ProviderKind::Openai => ".openai-key",
+            // Shared with the images kind — see `env_var`.
+            ProviderKind::Openai | ProviderKind::OpenAiImages => ".openai-key",
             // Same constant `src/stability.rs` uses, for the same reason as `env_var`.
             ProviderKind::Stability => crate::stability::STABILITY_KEY_FILE_NAME,
         }
@@ -194,6 +215,7 @@ impl ProviderKind {
             ProviderKind::OpenRouter => ProviderClass::Wire(WireKind::OpenRouter),
             ProviderKind::Openai => ProviderClass::Wire(WireKind::Openai),
             ProviderKind::Stability => ProviderClass::Media(MediaKind::Stability),
+            ProviderKind::OpenAiImages => ProviderClass::Media(MediaKind::OpenAiImages),
         }
     }
 
@@ -239,6 +261,9 @@ pub enum WireKind {
 pub enum MediaKind {
     /// Stability AI's v2beta family, via `src/stability.rs`.
     Stability,
+    /// OpenAI's Images API shape (`/v1/images/generations`), via
+    /// `src/openai_images.rs` — hosted OpenAI or a local sd-server.
+    OpenAiImages,
 }
 
 /// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
@@ -261,6 +286,7 @@ impl std::str::FromStr for ProviderKind {
             // for when it points at the local keyless default (Gemma via Lemonade).
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
             "stability" => Ok(ProviderKind::Stability),
+            "openai-images" => Ok(ProviderKind::OpenAiImages),
             other => Err(anyhow!(
                 "unknown provider {other:?} (expected one of: {})",
                 ProviderKind::ALL
