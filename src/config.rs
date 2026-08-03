@@ -4288,9 +4288,15 @@ mod tests {
         )
         .unwrap();
         let cast = cfg.resolve_cast("anthropic").unwrap();
+        let synth = cast.require_slot(ModelRole::Synth).unwrap();
+        assert_eq!(synth.id, "claude-opus-4-8");
+        // A file slot REPLACES the built-in slot whole, so the built-in synth's
+        // 32768 max_tokens pin is gone and the slot inherits [defaults] again.
+        // Deliberate: a slot override is a whole-slot statement, and the pin is
+        // headroom for the built-in model, not the operator's replacement.
         assert_eq!(
-            cast.require_slot(ModelRole::Synth).unwrap().id,
-            "claude-opus-4-8"
+            synth.max_tokens, None,
+            "a string-form slot override drops the built-in pin"
         );
         // The explorer slot is untouched (still the built-in default).
         assert_eq!(

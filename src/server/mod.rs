@@ -2867,7 +2867,8 @@ tool-capable coding models (a consult cast needs `tools` support); `q=` / `conte
 slug where offered. When you pick a synth model, read its output ceiling from kaibo's \
 model listing (the `list_models` tool, or `kaibo models` on the CLI) and set that \
 slot's `max_tokens` from the ceiling, because reasoning bills into the same completion \
-budget as the answer.
+budget as the answer. Some providers publish no ceiling; there, look it up in the \
+provider's own model documentation.
 4. Keep secrets in the environment or a key file. A backend names an env var \
 (`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
 the secret stays outside it. Tell me which env vars to set or files to write, and let \
