@@ -468,6 +468,20 @@ synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
 explorer = "llama/qwen2.5-coder-7b"                              # bare ref: just the id
 synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
+# --- The `image` slot: a MEDIA member on the team. It points at a media backend
+#     (kind = "stability") and produces artifacts instead of text, so the reasoning
+#     tunables (effort, thinking_budget, temperature, ...) do not apply to it —
+#     writing one there is inert and kaibo://config flags it. A cast carries it
+#     beside its reasoning slots; a cast without one cannot staff the media tools. ---
+
+# [backends.sd]
+# kind = "stability"              # key: STABILITY_API_KEY / ~/.stability-key.txt
+
+# [casts.artist]
+# explorer = "deepseek/deepseek-v4-flash"
+# synth    = "deepseek/deepseek-v4-pro"
+# image    = "sd/core"            # core | ultra | an sd3.5 variant (e.g. sd3.5-large)
+
 # --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
 #     per-role value for THIS slot only; knobs you omit fall back. Available:
 #     max_tokens, thinking_budget, temperature, effort, thinking_style, and
