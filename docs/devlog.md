@@ -14,6 +14,45 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-03 — Output ceilings surfaced, and the feature's first catch was its own premise
+
+Configure-time agents were sizing synth `max_tokens` blind: the ceiling arrived in
+`DiscoveredModel.raw` (OpenRouter's `top_provider.max_completion_tokens`, Gemini's
+`outputTokenLimit`) and died there, unrendered. Meanwhile reasoning bills into the
+same completion budget as the answer, so a blind budget starves exactly the models we
+run with thinking on. The 2026-08-02 probes (attach `render.rs`, exhaustive-review
+ask, at the 16384 `[defaults]` floor) made it concrete:
+
+| cast | completion used / cap | reasoning share |
+|---|---|---|
+| deepseek | 10.6K / 16.4K | ~half the completion |
+| or-glm | 10.2K / 16.4K | 0 |
+| or-kimi | 15,916 / 16,384 (97%) | hidden inside output; ~1.35 chars/token |
+
+So: normalize the ceiling, render it beside context on both faces, teach the
+configure prompt and the guide to size from it, and pin the two measured built-in
+synths (deepseek, anthropic) at 32768. The `[defaults]` floor stayed put — a pin
+without a measurement is a guess, and the unmeasured casts keep the floor.
+
+Then live validation handed us the good part. The freshly rendered catalog said
+kimi-k2.7-code's ceiling was **262144** — flatly contradicting the session-old note
+"or-kimi's provider ceiling IS 16384" that had shaped the pin decision. That probe
+had grazed kaibo's *own* 16384 default, not a provider wall, and OpenRouter's
+`top_provider` figure moves as serving providers change. The first thing the
+feature did in production was invalidate the stale note that motivated one of its
+own constraints. That is the argument for rendering live catalog facts instead of
+recording them: a noted ceiling goes stale silently; a rendered one is read fresh.
+
+Validation also exposed a cosmetic-but-telling gap: OpenRouter models rendered
+`(output: N)` with no context beside it, because `parse_openai_models` had never
+normalized `context_length` — invisible until the ceiling landed next to the hole.
+DeepSeek's cross-family review (ready-to-merge, no blockers) contributed two folds:
+the configure directive now says where to look when a provider publishes no ceiling,
+and the role-wise-merge test now pins that a string-form slot override
+(`synth = "backend/other-model"`) replaces the slot whole and drops the built-in
+pin — pre-existing semantics, but `max_tokens` is the first pin where the loss
+matters, so it's asserted as deliberate rather than discovered later.
+
 ## 2026-07-26 — Configure names host-agent sandbox access and per-client state
 
 The first Codex MCP bring-up surfaced a setup mismatch rather than a kaibo runtime bug:

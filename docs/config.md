@@ -269,7 +269,9 @@ bills against the completion budget, so `max_tokens` must sit well above
 `budget_tokens` tier) an inverted pair is rejected at load on the slot's resolved
 values, because Anthropic would 400 on it mid-call. A slot with no budget sink (Gemini
 takes a `thinkingLevel`, Anthropic's adaptive tier an effort) carries an inert
-`thinking_budget` and the pair is not checked.
+`thinking_budget` and the pair is not checked. `kaibo models` (CLI) and the
+`list_models` tool report each model's advertised output ceiling where the provider
+publishes one; size a synth slot's `max_tokens` from that value.
 
 **Sampling.** The explorer gathers exact citations and runs cold; the synth composes the
 answer and gets slightly more room. Sent where a model accepts them: top-level for

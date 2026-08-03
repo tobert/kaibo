@@ -3240,7 +3240,11 @@ tool-capable coding models (a consult cast needs `tools` support); `q=` / `conte
 `reasoning` capability block. Favor the drift-proof `~author/family-latest` aliases \
 (e.g. `~anthropic/claude-sonnet-latest`) over a pinned slug, and know that `:free` / \
 `:nitro` / `:floor` suffixes pick a free, fastest, or cheapest variant of a concrete \
-slug where offered.
+slug where offered. When you pick a synth model, read its output ceiling from kaibo's \
+model listing (the `list_models` tool, or `kaibo models` on the CLI) and set that \
+slot's `max_tokens` from the ceiling, because reasoning bills into the same completion \
+budget as the answer. Some providers publish no ceiling; there, look it up in the \
+provider's own model documentation.
 4. Keep secrets in the environment or a key file. A backend names an env var \
 (`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
 the secret stays outside it. Tell me which env vars to set or files to write, and let \
@@ -6241,6 +6245,7 @@ enabled = false
             "config.toml",          // write target
             "api_key_env",          // keys-by-reference, not inline
             "both within it",       // shared roster-design substance
+            "output ceiling",       // synth max_tokens sizing rides the shared core
         ] {
             assert!(
                 text.contains(needle),

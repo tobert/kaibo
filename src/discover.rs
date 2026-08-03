@@ -66,6 +66,13 @@ pub struct DiscoveredModel {
     pub created: Option<i64>,
     /// Anthropic `max_input_tokens`, Gemini `inputTokenLimit`.
     pub context_window: Option<u64>,
+    /// The model's advertised max *completion* tokens — OpenRouter
+    /// `top_provider.max_completion_tokens`, Gemini `outputTokenLimit`. `None` where
+    /// the provider's list endpoint doesn't report one (Anthropic, plain OpenAI wire).
+    /// Surfaced so a configure-time caller can size a synth slot's `max_tokens` from
+    /// it: reasoning bills into the same completion budget as the answer, so a budget
+    /// set below the ceiling starves answers.
+    pub output_ceiling: Option<u64>,
     /// The provider's per-model object, untouched — the passthrough half of the
     /// contract, so a caller who needs a field we didn't normalize still has it.
     pub raw: Value,
@@ -208,7 +215,23 @@ pub fn parse_openai_models(v: &Value) -> Vec<DiscoveredModel> {
                 .to_string(),
             display_name: None,
             created: item.get("created").and_then(Value::as_i64),
-            context_window: None,
+            // OpenRouter carries the model's context at the top level, with the
+            // serving provider's figure under `top_provider` as the fallback; the
+            // other OpenAI-wire endpoints carry neither.
+            context_window: item
+                .get("context_length")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    item.get("top_provider")
+                        .and_then(|tp| tp.get("context_length"))
+                        .and_then(Value::as_u64)
+                }),
+            // OpenRouter nests the completion ceiling under `top_provider`; the
+            // other OpenAI-wire endpoints simply don't carry the field.
+            output_ceiling: item
+                .get("top_provider")
+                .and_then(|tp| tp.get("max_completion_tokens"))
+                .and_then(Value::as_u64),
             pricing: parse_openai_pricing(item),
             raw: item.clone(),
         })
@@ -267,7 +290,8 @@ pub fn parse_anthropic_models(v: &Value) -> Vec<DiscoveredModel> {
                 .and_then(Value::as_str)
                 .and_then(rfc3339_to_epoch),
             context_window: item.get("max_input_tokens").and_then(Value::as_u64),
-            // Anthropic's `/v1/models` doesn't advertise pricing.
+            // Anthropic's `/v1/models` advertises neither pricing nor an output ceiling.
+            output_ceiling: None,
             pricing: None,
             raw: item.clone(),
         })
@@ -292,6 +316,7 @@ pub fn parse_gemini_models(v: &Value) -> Vec<DiscoveredModel> {
                     .map(str::to_string),
                 created: None,
                 context_window: item.get("inputTokenLimit").and_then(Value::as_u64),
+                output_ceiling: item.get("outputTokenLimit").and_then(Value::as_u64),
                 // Gemini's `/v1beta/models` doesn't advertise pricing.
                 pricing: None,
                 raw: item.clone(),
@@ -439,7 +464,7 @@ async fn discover_paginated(
 }
 
 /// Render a multi-backend sweep as prose: one section per backend, each model's `id` +
-/// `display_name` (when present) + `context_window` (when present); a backend that
+/// `display_name` (when present) + `context_window`/`output_ceiling` (when present); a backend that
 /// errored gets an inline error line instead of a model list. Shared by the MCP tool
 /// and the CLI so the two faces can't drift on what a sweep looks like (the
 /// `render_config_resource` discipline).
@@ -463,8 +488,18 @@ pub fn render_models(results: &BTreeMap<String, Result<Vec<DiscoveredModel>, Str
                     if let Some(dn) = &m.display_name {
                         line.push_str(&format!(" — {dn}"));
                     }
+                    // Context window and output ceiling share one paren group; either
+                    // may be absent alone, and an absent fact renders nothing (no
+                    // placeholder noise).
+                    let mut limits = Vec::new();
                     if let Some(ctx) = m.context_window {
-                        line.push_str(&format!(" (context: {ctx})"));
+                        limits.push(format!("context: {ctx}"));
+                    }
+                    if let Some(ceiling) = m.output_ceiling {
+                        limits.push(format!("output: {ceiling}"));
+                    }
+                    if !limits.is_empty() {
+                        line.push_str(&format!(" ({})", limits.join(", ")));
                     }
                     if let Some(p) = &m.pricing {
                         let mut parts = Vec::new();
@@ -508,6 +543,7 @@ pub fn models_json_envelope(results: &BTreeMap<String, Result<Vec<DiscoveredMode
                             "display_name": m.display_name,
                             "created": m.created,
                             "context_window": m.context_window,
+                            "output_ceiling": m.output_ceiling,
                             "pricing": m.pricing.as_ref().map(|p| serde_json::json!({
                                 "input": p.input,
                                 "output": p.output,
@@ -751,6 +787,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_openai_shape_normalizes_openrouter_output_ceiling() {
+        // OpenRouter's catalog nests the completion ceiling under `top_provider` —
+        // the field a configure-time caller sizes a synth `max_tokens` from.
+        let body = serde_json::json!({
+            "data": [
+                {
+                    "id": "moonshotai/kimi-k2.7-code",
+                    "context_length": 262_144,
+                    "top_provider": {
+                        "context_length": 131_072,
+                        "max_completion_tokens": 16_384,
+                    },
+                },
+                {"id": "no-ceiling/model", "top_provider": {"context_length": 8192}},
+            ]
+        });
+        let models = parse_openai_models(&body);
+        assert_eq!(models[0].output_ceiling, Some(16_384));
+        assert_eq!(models[1].output_ceiling, None);
+        // Context rides the same catalog: the model-level `context_length` wins,
+        // the `top_provider` figure is the fallback (live catalogs carry both).
+        assert_eq!(models[0].context_window, Some(262_144));
+        assert_eq!(models[1].context_window, Some(8192));
+        // .raw keeps the nested object untouched either way.
+        assert_eq!(
+            models[0].raw["top_provider"]["max_completion_tokens"],
+            16_384
+        );
+    }
+
+    #[test]
     fn parse_openai_shape_is_defensive_on_missing_fields() {
         let body = serde_json::json!({ "data": [ {"object": "model"} ] });
         let models = parse_openai_models(&body);
@@ -787,6 +854,7 @@ mod tests {
         assert_eq!(m.display_name.as_deref(), Some("Claude X"));
         assert_eq!(m.created, Some(1_767_225_600));
         assert_eq!(m.context_window, Some(200_000));
+        assert_eq!(m.output_ceiling, None, "anthropic's list reports no ceiling");
         assert_eq!(m.raw, body["data"][0]);
     }
 
@@ -820,6 +888,7 @@ mod tests {
         assert_eq!(m.id, "gemini-x");
         assert_eq!(m.display_name.as_deref(), Some("Gemini X"));
         assert_eq!(m.context_window, Some(1_000_000));
+        assert_eq!(m.output_ceiling, Some(8192));
         assert_eq!(m.created, None);
         // .raw keeps the original "models/..." name untouched.
         assert_eq!(m.raw["name"], "models/gemini-x");
@@ -974,6 +1043,7 @@ mod tests {
                 display_name: Some("Model One".to_string()),
                 created: None,
                 context_window: Some(128_000),
+                output_ceiling: Some(16_384),
                 pricing: Some(ModelPricing {
                     input: Some("0.0000015".to_string()),
                     output: Some("0.000006".to_string()),
@@ -991,9 +1061,35 @@ mod tests {
         assert!(text.contains("Model One"));
         assert!(text.contains("128000") || text.contains("128,000"));
         assert!(
+            text.contains("(context: 128000, output: 16384)"),
+            "expected the output ceiling beside context, got: {text}"
+        );
+        assert!(
             text.contains("[in $0.0000015/tok, out $0.000006/tok]"),
             "expected a pricing suffix, got: {text}"
         );
+    }
+
+    #[test]
+    fn render_models_shows_a_ceiling_without_a_context_window() {
+        // The OpenRouter shape today: ceiling normalized, context not — the paren
+        // group must render the one fact it has, with no placeholder for the other.
+        let mut results: BTreeMap<String, Result<Vec<DiscoveredModel>, String>> = BTreeMap::new();
+        results.insert(
+            "or".to_string(),
+            Ok(vec![DiscoveredModel {
+                id: "m1".to_string(),
+                display_name: None,
+                created: None,
+                context_window: None,
+                output_ceiling: Some(16_384),
+                pricing: None,
+                raw: serde_json::json!({"id": "m1"}),
+            }]),
+        );
+        let text = render_models(&results);
+        assert!(text.contains("(output: 16384)"), "got: {text}");
+        assert!(!text.contains("context"), "no context means no context label, got: {text}");
     }
 
     #[test]
@@ -1006,6 +1102,7 @@ mod tests {
                 display_name: None,
                 created: None,
                 context_window: None,
+                output_ceiling: None,
                 pricing: None,
                 raw: serde_json::json!({"id": "m1"}),
             }]),
@@ -1030,6 +1127,7 @@ mod tests {
                 display_name: None,
                 created: Some(42),
                 context_window: None,
+                output_ceiling: Some(65_536),
                 pricing: Some(ModelPricing {
                     input: Some("0.000001".to_string()),
                     output: None,
@@ -1050,6 +1148,7 @@ mod tests {
         assert_eq!(ok["models"][0]["id"], "m1");
         assert_eq!(ok["models"][0]["created"], 42);
         assert_eq!(ok["models"][0]["raw"]["extra"], "field");
+        assert_eq!(ok["models"][0]["output_ceiling"], 65_536);
         assert_eq!(ok["models"][0]["pricing"]["input"], "0.000001");
         assert!(ok["models"][0]["pricing"]["output"].is_null());
 
@@ -1071,6 +1170,7 @@ mod tests {
                 display_name: None,
                 created: None,
                 context_window: None,
+                output_ceiling: None,
                 pricing: None,
                 raw: serde_json::json!({"id": "m1"}),
             }]),
