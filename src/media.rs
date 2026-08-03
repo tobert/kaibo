@@ -13,8 +13,10 @@
 //!
 //! The vocabulary here is deliberately provider-neutral (a [`MediaArtifact`] is bytes,
 //! a mime string, and a seed) — providers translate their native shapes at their own
-//! impl, exactly as rig providers translate into rig's completion types. The one live
-//! implementation today is Stability's (`src/stability.rs`).
+//! impl, exactly as rig providers translate into rig's completion types. Two live
+//! implementations today: Stability's (`src/stability.rs`, multipart form wire, sync
+//! and deferred shapes) and OpenAI Images (`src/openai_images.rs`, JSON body wire,
+//! sync only).
 //!
 //! # The construction point
 //!
@@ -37,22 +39,88 @@ use async_trait::async_trait;
 use crate::config::{Backend, ModelSlot};
 use crate::credentials::{MediaKind, ProviderClass};
 
+/// One provider-native field value, carrying the caller's JSON type end to end. The
+/// caller said string, number, or bool at the tool face; guessing the type back out
+/// of a string is unsound in both directions (the Images API's `user` field is a
+/// string — `user = "123"` re-typed to the number `123` is a provider 400), so the
+/// stated type rides through instead. Each provider serializes it for its own wire:
+/// a JSON-body provider (openai-images) sends it verbatim as the JSON scalar it is;
+/// a form-field provider (Stability) stringifies via
+/// [`to_wire_string`](Self::to_wire_string), which is lossless there because its
+/// multipart wire is all-string anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldValue {
+    Str(String),
+    /// `serde_json::Number`, not `f64`: it keeps integers integral (`n = 2` must
+    /// serialize as `2`, never `2.0` — the Images API type-checks it) and carries
+    /// the full u64/i64/f64 range a caller can write in JSON.
+    Num(serde_json::Number),
+    Bool(bool),
+}
+
+impl FieldValue {
+    /// The value as the JSON scalar the caller stated — what a JSON-body provider
+    /// sends verbatim.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            FieldValue::Str(s) => serde_json::Value::String(s.clone()),
+            FieldValue::Num(n) => serde_json::Value::Number(n.clone()),
+            FieldValue::Bool(b) => serde_json::Value::Bool(*b),
+        }
+    }
+
+    /// The value as wire text — what a form-field provider sends. Numbers and bools
+    /// render in their JSON spelling (`2`, `1.5`, `true`), so nothing is lost on an
+    /// all-string wire.
+    pub fn to_wire_string(&self) -> String {
+        match self {
+            FieldValue::Str(s) => s.clone(),
+            FieldValue::Num(n) => n.to_string(),
+            FieldValue::Bool(b) => b.to_string(),
+        }
+    }
+
+    /// The string inside a `Str`, or `None` — for the fields a provider itself must
+    /// read (an `output_format` name), where a number or bool is the caller's
+    /// mistake to surface, not a value to coerce.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            FieldValue::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl From<&str> for FieldValue {
+    fn from(s: &str) -> Self {
+        FieldValue::Str(s.to_string())
+    }
+}
+
+impl From<String> for FieldValue {
+    fn from(s: String) -> Self {
+        FieldValue::Str(s)
+    }
+}
+
 /// One generation request, provider-neutral. The prompt is the portable half; every
 /// provider-native knob (seed, aspect ratio, negative prompt, output format, ...)
-/// rides `fields` untyped — kaibo keeps no allowlist, the provider answers for its own
-/// knobs, the same passthrough posture `additional_params` takes on the completion
-/// side. (`prompt` and `model` never ride `fields`: the tool layer reserves both, so
-/// the recorded provenance always describes the request that ran.)
+/// rides `fields` with no allowlist — kaibo passes them through, the provider answers
+/// for its own knobs, the same passthrough posture `additional_params` takes on the
+/// completion side. (`prompt` and `model` never ride `fields`: the tool layer
+/// reserves both, so the recorded provenance always describes the request that ran.)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaRequest {
     pub prompt: String,
     /// `(name, value)` provider-native fields: **uniquely named**, in the order the
     /// caller gave them (kept as a `Vec` because a provider may care about order —
-    /// the MCP face is a map, so duplicate names cannot arrive from a tool call). A
-    /// provider impl may seed its own defaults (Stability seeds `output_format`) and
-    /// lets a caller field of the same name replace the seeded default — that merge
-    /// is the provider's business, not a contract of this struct.
-    pub fields: Vec<(String, String)>,
+    /// the MCP face is a map, so duplicate names cannot arrive from a tool call).
+    /// Values are typed ([`FieldValue`]) so the caller's JSON type survives to the
+    /// provider's wire. A provider impl may seed its own defaults (Stability seeds
+    /// `output_format`) and lets a caller field of the same name replace the seeded
+    /// default — that merge is the provider's business, not a contract of this
+    /// struct.
+    pub fields: Vec<(String, FieldValue)>,
     /// Bytes of an input image, for the operations that take one (edit / upscale /
     /// image-to-image). `None` for text-to-image. Carried on the request now so the
     /// trait does not churn when those operations land.
@@ -165,10 +233,31 @@ impl MediaArm {
                 let model = crate::stability::StabilityImageModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
+            ProviderClass::Media(MediaKind::OpenAiImages) => {
+                // Key sources are shared with the `openai` completion kind, but the
+                // key is required by default (the default endpoint is hosted OpenAI
+                // — see `ProviderKind::key_optional`); a keyless local sd-server
+                // backend sets `key_optional = true` and resolves the placeholder.
+                let key = backend.resolve_key()?;
+                // Unset dials hosted OpenAI — a root through /v1; the client appends
+                // its own /images/generations. A local sd-server sets base_url.
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::credentials::HOSTED_OPENAI_BASE_URL.to_string());
+                let client = crate::openai_images::OpenAiImagesClient::new(
+                    key,
+                    base_url,
+                    backend.request_timeout,
+                )?;
+                let model =
+                    crate::openai_images::OpenAiImagesModel::from_parts(&client, &slot.id);
+                Ok(Self::new(Arc::new(model), slot.qualified()))
+            }
             ProviderClass::Wire(_) => bail!(
                 "backend {:?} is kind `{}`, a completion wire — it cannot staff a media \
-                 slot. Point the `image` slot at a media backend (kind `stability`), \
-                 and use this backend on `explorer`/`synth` instead",
+                 slot. Point the `image` slot at a media backend, and use this backend \
+                 on `explorer`/`synth` instead",
                 backend.name,
                 backend.kind.canonical_name()
             ),
@@ -303,8 +392,48 @@ mod tests {
         let err = MediaArm::from_slot(backend, &slot).expect_err("wire kind must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("completion wire") && msg.contains("stability"),
+            msg.contains("completion wire") && msg.contains("media backend"),
             "the error names the problem and the fix, got: {msg}"
         );
+    }
+
+    /// An openai-images backend staffs an image slot. The local sd-server shape —
+    /// explicit `base_url` plus explicit `key_optional = true` (the kind seeds
+    /// key-REQUIRED, because its default endpoint is hosted OpenAI) — resolves the
+    /// placeholder and needs no credential. Construction only; no network.
+    #[test]
+    fn from_slot_staffs_an_openai_images_backend_keylessly() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.sdcpp]
+            kind = "openai-images"
+            base_url = "http://localhost:1234/v1"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/openai"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("sdcpp").expect("backend exists");
+        let slot = ModelSlot::bare("sdcpp", "sd3.5-large");
+        let arm = MediaArm::from_slot(backend, &slot).expect("an openai-images backend staffs");
+        assert_eq!(arm.slot_ref(), "sdcpp/sd3.5-large");
+    }
+
+    /// The Stability arm still staffs — the sibling-kind regression guard for the
+    /// `from_slot` match growing a second media arm.
+    #[test]
+    fn from_slot_still_staffs_a_stability_backend() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.sd]
+            kind = "stability"
+            key_optional = true
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("sd").expect("backend exists");
+        let slot = ModelSlot::bare("sd", "core");
+        let arm = MediaArm::from_slot(backend, &slot).expect("a stability backend staffs");
+        assert_eq!(arm.slot_ref(), "sd/core");
     }
 }

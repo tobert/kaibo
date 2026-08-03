@@ -6,12 +6,16 @@
 //! sub-agent, all driving a read-only [`kaish`] kernel via `run_kaish(script)` (`cat`,
 //! `grep`, `find`, `jq`, pipelines, the lot). The `consult` and toolless `oneshot` tools
 //! are both costumes over one primitive, [`consult::run_phase`]. The team *perceives*
-//! what fuses into its reasoning (image input today, via `view_image`); it produces no
-//! output artifacts — kaibo reasons over code, it doesn't render or emit.
+//! what fuses into its reasoning (image input today, via `view_image`); when kaibo
+//! *produces* (the `generate` tool, via [`media`]), the artifacts land only in the
+//! content-addressed media store ([`cas`]) — an individually-gated mediated surface at
+//! a fixed XDG path no model steers, never a general write path.
 //!
-//! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project but
-//! cannot mutate it (read-only is *unconditional* — no write path of any kind), and
-//! cannot shell out to external commands.
+//! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project
+//! but cannot mutate it — the project is untouchable from every path (the model-facing
+//! shell has no write mount; kaibo's own two blessed write surfaces, the persistence
+//! store and the media CAS, refuse to resolve into any allowed tree) — and cannot
+//! shell out to external commands.
 
 pub mod attach;
 pub mod batch;
@@ -28,6 +32,7 @@ pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;
 pub mod media;
+pub mod openai_images;
 pub mod orientation;
 pub mod progress;
 pub mod sandbox;

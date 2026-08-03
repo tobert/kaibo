@@ -1124,10 +1124,15 @@ impl StabilityImageModel {
         }
         fields.push(("output_format".to_string(), "png".to_string()));
         for (k, v) in &request.fields {
+            // Typed neutral values land on Stability's all-string multipart wire via
+            // their wire spelling — lossless here (`seed = 42` was always the text
+            // `42` on this wire), and the caller's stated type still reached the
+            // provider that cares (see `media::FieldValue`).
+            let v = v.to_wire_string();
             if let Some(existing) = fields.iter_mut().find(|(name, _)| name == k) {
-                existing.1 = v.clone();
+                existing.1 = v;
             } else {
-                fields.push((k.clone(), v.clone()));
+                fields.push((k.clone(), v));
             }
         }
         (
@@ -1298,6 +1303,34 @@ mod tests {
             ],
             "an explicit fields entry must win over the derived aspect_ratio, not duplicate it"
         );
+    }
+
+    /// Typed neutral field values land on Stability's all-string multipart wire in
+    /// their wire spelling — `seed = 42` (a caller number) becomes the text `42`,
+    /// a bool becomes `true` — losslessly, since this wire was always text. The
+    /// stringify half of the `media::FieldValue` contract (the typed half lands on
+    /// openai-images' JSON wire; see that module's tests).
+    #[test]
+    fn media_request_stringifies_typed_fields_for_the_form_wire() {
+        use crate::media::FieldValue;
+        let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
+        let model = StabilityImageModel::from_parts(&client, "core");
+        let (_, req) = model.media_request(&crate::media::MediaRequest {
+            prompt: "p".to_string(),
+            fields: vec![
+                ("seed".to_string(), FieldValue::Num(serde_json::Number::from(42))),
+                ("tiling".to_string(), FieldValue::Bool(true)),
+                ("style_preset".to_string(), FieldValue::Str("anime".to_string())),
+            ],
+            input_image: None,
+        });
+        for (name, wire) in [("seed", "42"), ("tiling", "true"), ("style_preset", "anime")] {
+            assert!(
+                req.fields.iter().any(|(k, v)| k == name && v == wire),
+                "{name} must reach the form fields as the text {wire:?}, got {:?}",
+                req.fields
+            );
+        }
     }
 
     // --- from_rig_request --------------------------------------------------------

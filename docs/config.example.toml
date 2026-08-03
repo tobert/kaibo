@@ -313,18 +313,19 @@ scratch_limit_bytes = 67108864
 # ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
 # completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
-# reasoning slots; the media wire (stability) serves `image` slots only. The rest
-# describes the wire (endpoint, key source, per-request deadline). Models live on
-# cast slots, never here.
+# reasoning slots; the media kinds (stability | openai-images) serve `image` slots
+# only. The rest describes the wire (endpoint, key source, per-request deadline).
+# Models live on cast slots, never here.
 #
 # Keys are referenced, never inlined: api_key_env names an env var, api_key_file a
 # path (~ ok). env wins over file. key_optional=true falls back to a placeholder
 # bearer token (keyless local servers). base_url is legal on the openai kind
 # (required for a new backend), the anthropic and gemini kinds (optional —
 # unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
-# and the stability kind (optional — unset dials api.stability.ai); set it to point
-# the same wire at a compatible gateway/proxy instead — a HOST ROOT in every case,
-# since the client appends its own versioned path. Every other keyed kind rejects
+# and the media kinds (optional — unset dials api.stability.ai for stability,
+# api.openai.com/v1 for openai-images); set it to point the same wire at a
+# compatible gateway/proxy (or a local server) instead — a ROOT in every case,
+# since the client appends its own path. Every other keyed kind rejects
 # base_url at load (rig fixes those endpoints).
 # ---------------------------------------------------------------------------
 
@@ -434,8 +435,8 @@ wire = "responses"
 # `deep-dive`) so it can route by name without reading this file.
 #
 # Roles: explorer, synth (the reasoning phases), and image (the media member — it
-# points at a stability backend and staffs `generate`; see the image-slot example
-# below). A typo'd role is a loud load
+# points at a media backend, kind stability or openai-images, and staffs `generate`;
+# see the image-slot examples below). A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
 # naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
 #
@@ -480,10 +481,11 @@ explorer = "llama/qwen2.5-coder-7b"                              # bare ref: jus
 synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # --- The `image` slot: a MEDIA member on the team. It points at a media backend
-#     (kind = "stability") and produces artifacts instead of text, so the reasoning
-#     tunables (effort, thinking_budget, temperature, ...) do not apply to it —
-#     writing one there is inert and kaibo://config flags it. A cast carries it
-#     beside its reasoning slots; a cast without one cannot staff the media tools. ---
+#     (kind = "stability" or "openai-images") and produces artifacts instead of
+#     text, so the reasoning tunables (effort, thinking_budget, temperature, ...)
+#     do not apply to it — writing one there is inert and kaibo://config flags it.
+#     A cast carries it beside its reasoning slots; a cast without one cannot staff
+#     the media tools. ---
 
 # [backends.sd]
 # kind = "stability"              # key: STABILITY_API_KEY / ~/.stability-key.txt
@@ -492,6 +494,31 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 # explorer = "deepseek/deepseek-v4-flash"
 # synth    = "deepseek/deepseek-v4-pro"
 # image    = "sd/core"            # core | ultra | an sd3.5 variant (e.g. sd3.5-large)
+
+# --- The openai-images kind covers two shapes with one wire. Hosted OpenAI: no
+#     base_url (unset dials api.openai.com/v1); the key is required — the seeded
+#     default, so a missing OPENAI_API_KEY / ~/.openai-key fails loudly instead of
+#     sending a placeholder bearer to a paid endpoint. Local stable-diffusion.cpp
+#     sd-server: base_url through /v1 plus key_optional = true — keyless is an
+#     explicit opt-in on this kind, stated beside the local endpoint it belongs to.
+#     Provider knobs (size, quality, n, output_format, ...) ride the `generate`
+#     tool's fields, not the config; output_format is checked before the call and
+#     must be png, jpeg, or webp (the set kaibo's media store can name on disk). ---
+
+# [backends.oai-images]
+# kind = "openai-images"          # key: OPENAI_API_KEY / ~/.openai-key (required —
+#                                 # the default; a missing key fails at call setup)
+
+# [backends.sdcpp]
+# kind = "openai-images"
+# base_url = "http://localhost:1234/v1"   # local sd-server...
+# key_optional = true                     # ...which needs no key: explicit opt-in
+
+# [casts.hosted-artist]
+# image = "oai-images/gpt-image-1"        # the request's `model` field
+
+# [casts.local-artist]
+# image = "sdcpp/sd3.5-large"             # whatever the local server loaded
 
 # --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
 #     per-role value for THIS slot only; knobs you omit fall back. Available:

@@ -20,7 +20,7 @@ of backends and casts. A missing file at the default path is not an error.
 
 ```
 ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (completion wires)
-             | stability                                             (media wire)
+             | stability | openai-images                             (media kinds)
 Backend      = { name, kind, base_url?, key source, request_timeout }
 Cast         = { name, role → ModelSlot }                  (freely spans backends)
 ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
@@ -32,13 +32,14 @@ Each concept owns one idea:
   selects the client and the request shape), `base_url`, a key source, and
   `request_timeout`. Answers "how do I reach Gemini". Kinds divide into two classes:
   the completion wires (everything through rig's completion clients) and the media
-  wire (`stability`, an image-generation API with no completion surface).
+  kinds (`stability`, `openai-images` — image-generation APIs with no completion
+  surface).
 - **role** — a *job* a model serves. Three exist: `explorer` and `synth`, the two
   reasoning phases, and `image`, the media member that staffs the `generate` tool.
   A reasoning role takes a completion backend; the `image` role takes a media backend
-  (kind `stability`) — pairing either with the wrong class is a load error naming the
-  fix. Image *input* is a slot capability (the `vision` pin on a reasoning slot), not
-  a role.
+  (kind `stability` or `openai-images`) — pairing either with the wrong class is a
+  load error naming the fix. Image *input* is a slot capability (the `vision` pin on
+  a reasoning slot), not a role.
 - **cast** — a *composition*. A named assignment of models to roles. This is what the
   `cast` call parameter selects.
 
@@ -53,8 +54,8 @@ Connection settings only. Models are never declared here.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` | required on a new backend | closed enum; selects client + request shape (`stability` is the media wire — image slots only) |
-| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini`/`stability`; load error elsewhere |
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` | required on a new backend | closed enum; selects client + request shape (`stability` and `openai-images` are the media kinds — image slots only) |
+| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini` and the media kinds; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
 | `api_key_file` | path | seeded from `kind` | file source, checked second |
@@ -82,12 +83,25 @@ by re-declaration.
 - **`kind = "stability"`** — optional, same contract: unset dials
   `https://api.stability.ai`; set, it points the media wire at a compatible
   gateway or proxy.
+- **`kind = "openai-images"`** — optional. Unset dials hosted OpenAI
+  (`https://api.openai.com/v1`). Set, it points the same wire at any server speaking
+  `/v1/images/generations` — a local stable-diffusion.cpp `sd-server`
+  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Key sources
+  are shared with the `openai` kind (the same `OPENAI_API_KEY` / `~/.openai-key`),
+  but the key is **required by default**: the default endpoint is hosted, so a
+  keyless seed would send a placeholder bearer to a paid API and 401 on the first
+  call instead of failing loudly at setup. A keyless local `sd-server` backend sets
+  `key_optional = true` beside its local `base_url`. The `generate` tool's
+  `output_format` field for this kind must be `png`, `jpeg`, or `webp` — checked
+  before the call, since it names the stored artifact's on-disk format.
 - **Every other kind** — a load error. rig fixes those endpoints.
 
-The value is a **host root**, not a versioned path. rig's `ClientBuilder` appends the
-provider-specific path (Gemini's `/v1beta/models/...`), and the batch lane's
-`GeminiBatch` versions a configured host root with `/v1beta` the same way, so one
-address serves both the interactive and batch paths.
+The value is a root the client versions itself, never a full endpoint path. rig's
+`ClientBuilder` appends the provider-specific path (Gemini's `/v1beta/models/...`),
+the batch lane's `GeminiBatch` versions a configured host root with `/v1beta` the
+same way, and the media clients append their own route (`/v2beta/...` for
+`stability`; `/images/generations` for `openai-images`, so give that one a URL
+through `/v1`).
 
 #### `wire`
 
@@ -205,8 +219,10 @@ synth    = "claude/claude-sonnet-4-6"       # the model that answers
 
 **Roles.** `explorer`, `synth`, and `image`. A misspelled role, or a misspelled
 per-slot key, is a load error rather than a silent no-op. The `image` slot is the
-media member: it points at a `stability`-kind backend (its model id picks the route —
-`core`, `ultra`, or an SD3.5 variant) and staffs the `generate` tool. It sends one
+media member: it points at a media-kind backend and staffs the `generate` tool. Its
+model id means what that kind says it means — for `stability` it picks the route
+(`core`, `ultra`, or an SD3.5 variant); for `openai-images` it is the `model` field
+(`gpt-image-1` hosted, or whatever a local sd-server loaded). It sends one
 generation request, not a reasoning loop, so the reasoning tunables (`effort`,
 `thinking_budget`, `temperature`, ...) written on it are inert — `kaibo://config`
 flags them under `inert_tunables`.
@@ -637,7 +653,7 @@ Which cast shape staffs which tool:
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
-| `generate` | a cast with an `image` slot (a media backend, kind `stability`) — plus `[cas]` on |
+| `generate` | a cast with an `image` slot (a media backend: kind `stability` or `openai-images`) — plus `[cas]` on |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
