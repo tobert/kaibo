@@ -1197,6 +1197,19 @@ where
                 // second re-ask. That is a stronger guarantee than a `finalized` flag,
                 // which a later edit could reset; the shape itself forbids the loop. Pinned
                 // by `an_empty_forced_write_up_turn_errors_and_is_never_retried_twice`.
+                //
+                // **Why not rig-agent's `on_model_turn_finished` + `ModelTurnAction::
+                // Retry`?** Evaluated 2026-08-02 (rig-agent 0.41 `hook.rs`) and rejected:
+                // the first-class retry is weaker than this recovery on the three counts
+                // that matter here. (1) `Retry(Feedback)` cannot constrain the retried
+                // turn — [`forced_finish_turn`] sends `ToolChoice::None`, so the model
+                // must write rather than spend the nudge on another tool call. (2) A hook
+                // retry "consumes the run's existing total model-call budget", so an
+                // empty answer at the cap would get no recovery, where this path runs the
+                // write-up turn deliberately outside the budget. (3) `Stop(reason)` is a
+                // string; [`empty_answer_error`]'s diagnostics (turns, tokens, the
+                // provider's finish_reason off the [`CompletionLog`]) would flatten into
+                // it. Re-evaluate if rig grows a constrained retry.
                 tracing::warn!(
                     model = model_name,
                     turns,

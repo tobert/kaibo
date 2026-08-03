@@ -145,6 +145,36 @@ fn deliberate_direct_deadline(synth_backend: &Backend) -> std::time::Duration {
     synth_backend.request_timeout + DELIBERATE_DEADLINE_MARGIN
 }
 
+/// Fold a `deliberate` dossier sweep's routed `attach` delivery into the dossier and
+/// hand back the routed images for the lane dispatch.
+///
+/// Text bodies, notes, and demotions become dossier text ([`sweep_evidence_block`]);
+/// images are returned separately because they ride the offline synth's single turn
+/// as native image parts, never as dossier text. `None` (attach disabled, or a sweep
+/// that routed nothing) leaves the dossier untouched and returns no images.
+///
+/// Extracted from the `deliberate` handler so the drain → stitch → images hand-off is
+/// pinned by a test: the images the sweep routed MUST be what the lane dispatch
+/// receives, and a refactor that drops them between drain and dispatch fails the
+/// suite instead of silently blinding the synth (DeepSeek cross-family review,
+/// 2026-07-26).
+fn stitch_dossier_delivery(
+    dossier: &mut String,
+    consumer: &SweepConsumer,
+    sink: Option<&std::sync::Arc<SweepAttachSink>>,
+) -> Vec<crate::attach::Attachment> {
+    match sink {
+        Some(sink) => {
+            let delivery = sink.drain();
+            if let Some(block) = sweep_evidence_block(consumer, &delivery) {
+                dossier.push_str(&block);
+            }
+            delivery.images()
+        }
+        None => Vec::new(),
+    }
+}
+
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
 /// Composes to any posture: `{oneshot:false}` ≈ the codebase-only surface; only
@@ -1710,16 +1740,7 @@ impl KaiboHandler {
         // Stitch whatever the dossier sweep routed via `attach` into the dossier text
         // itself (text bodies, notes, demotions); collect any routed images separately
         // — they ride the synth's single turn as native parts, not as dossier text.
-        let images: Vec<crate::attach::Attachment> = match &sink {
-            Some(sink) => {
-                let delivery = sink.drain();
-                if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
-                    dossier.push_str(&block);
-                }
-                delivery.images()
-            }
-            None => Vec::new(),
-        };
+        let images = stitch_dossier_delivery(&mut dossier, &consumer, sink.as_ref());
 
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
         // and the handle; both share the offline-synth preamble (`batch_system_prompt`,
@@ -3509,6 +3530,119 @@ mod tests {
             "a 3h-patience local synth must outlast the interactive ceiling ({:?}), not be capped by it",
             cfg.defaults.call_deadline
         );
+    }
+
+    /// The deliberate pipeline's image hand-off, pinned across the server seam: a file
+    /// the dossier sweep routes via the REAL `attach` tool must survive
+    /// drain → stitch → lane dispatch → the offline synth's single turn. The engine
+    /// tests pin each stage in isolation; this pins the hand-offs between them — the
+    /// exact place a refactor could drop the `images` value between drain and dispatch
+    /// with nothing failing (flagged by the DeepSeek cross-family review, 2026-07-26).
+    #[tokio::test]
+    async fn a_sweep_routed_image_survives_drain_stitch_and_direct_dispatch() {
+        use crate::sweep_attach::{SweepAttach, SweepAttachArgs};
+        use rig_agent::tool::{Tool as _, ToolContext};
+
+        // A workspace holding one real-by-magic-bytes PNG and one text file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend(std::iter::repeat_n(0xAB, 32));
+        std::fs::write(root.join("arch.png"), &png).unwrap();
+        std::fs::write(root.join("notes.md"), "the design in one line\n").unwrap();
+
+        // The sink and consumer exactly as the `deliberate` handler builds them:
+        // offline synth, vision on (the synth's cap is what admits the image).
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: std::sync::Arc::from("the offline synth (`scripted-synth`)"),
+            vision: true,
+        };
+        let sink = std::sync::Arc::new(SweepAttachSink::new(
+            8,
+            consumer.clone(),
+            std::collections::HashSet::new(),
+        ));
+
+        // Route both files through the real tool — the same resolve/read/classify/
+        // commit path a live explorer's `attach` call runs.
+        let tool = SweepAttach::new(
+            crate::sandbox::KaishWorker::spawn(&root).expect("spawn read-only worker"),
+            &root,
+            sink.clone(),
+            std::sync::Arc::new(crate::progress::NullSink),
+        );
+        let receipt = tool
+            .call(
+                &mut ToolContext::new(),
+                SweepAttachArgs {
+                    paths: vec!["arch.png".into(), "notes.md".into()],
+                    note: None,
+                },
+            )
+            .await
+            .expect("attach succeeds on both files");
+        assert!(
+            receipt.contains("attached: arch.png"),
+            "the image must route: {receipt}"
+        );
+
+        // Drain + stitch — the extracted handler step.
+        let mut dossier = String::from("src/x.rs:1 DOSSIER");
+        let images = stitch_dossier_delivery(&mut dossier, &consumer, Some(&sink));
+        assert!(
+            dossier.contains("notes.md"),
+            "the text body is stitched into the dossier: {dossier}"
+        );
+        assert!(
+            dossier.contains("arch.png"),
+            "the image is named in the dossier manifest: {dossier}"
+        );
+        assert_eq!(
+            images.len(),
+            1,
+            "exactly the routed image reaches the lane dispatch"
+        );
+
+        // Lane dispatch, direct: the image must land on the synth's single turn as a
+        // native image part.
+        let client = crate::test_support::ScriptedClient::builder()
+            .on_model("scripted-synth", |req| {
+                let carries_image = req.chat_history.iter().any(|m| {
+                    matches!(m, rig_core::completion::Message::User { content }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::UserContent::Image(_)
+                    )))
+                });
+                assert!(
+                    carries_image,
+                    "the routed image must ride the synth's turn as an image part"
+                );
+                Ok(crate::test_support::text_response("DELIBERATION: seen"))
+            })
+            .build();
+        let synth = crate::consult::Arm::new(
+            client.clone(),
+            "scripted-synth",
+            1 << 14,
+            None,
+            crate::consult::ModelCaps {
+                vision: true,
+                tool_result_images: true,
+            },
+        );
+        let (out, _usage) = crate::consult::deliberate_direct(
+            "does the diagram confirm it?",
+            &dossier,
+            &images,
+            &synth,
+            "system",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("scripted direct deliberation succeeds");
+        assert!(out.contains("DELIBERATION"), "the answer came back: {out}");
     }
 
     /// consult `attach` validates files are under the consult root (so the model's shell

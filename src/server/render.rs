@@ -47,6 +47,11 @@ enum FailureKind {
     TransientProvider,
     /// A non-transient model/provider error (auth, bad request). Retrying won't help.
     Provider,
+    /// A model ran and delivered no answer text (`consult/engine.rs::empty_answer_error`,
+    /// or the forced write-up turn's own failure wrapper). A model-side outcome that the
+    /// guard's diagnostics already frame as retryable — distinct from [`Provider`], whose
+    /// "retrying is unlikely to help" would contradict them.
+    EmptyAnswer,
     /// A kaibo-*side* failure (e.g. the synth's kaish kernel failed to build) — not the
     /// provider's fault, so we must not say it was.
     Internal,
@@ -59,7 +64,9 @@ enum FailureKind {
 /// transient *vocabulary* rather than a status code. A failure that reached a model wears
 /// one of kaibo's markers (`consult/engine.rs`): `"model loop failed: …"` from the tool
 /// loop, `"model call failed: …"` from a single-shot direct completion (`oneshot`,
-/// `deliberate`'s direct lane), `"model used all …"` from the forced final turn. An error
+/// `deliberate`'s direct lane), `"model used all …"` from the forced final turn, and
+/// `"returned an empty answer"` from the empty-answer guard (every lane's gate plus the
+/// forced write-up turn's failure wrapper). An error
 /// chain lacking every marker came from *before* a model ran (a kaish kernel build inside
 /// the toolset factory), so it's a kaibo-side failure, not the provider's.
 fn classify_failure(err: &anyhow::Error) -> FailureKind {
@@ -72,9 +79,16 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     if s.contains("wall-clock deadline") {
         return FailureKind::TransientProvider;
     }
+    // The empty-answer guard's marker (`empty_answer_error` and the forced-turn failure
+    // wrapper, `consult/engine.rs`). An empty answer definitionally means a model ran, so
+    // it counts toward `reached_a_model`; its own classification is decided *after* the
+    // transient vocabulary below, so a forced write-up turn that died on an overload is
+    // framed transient (the more specific retry guidance) rather than generically empty.
+    let empty_answer = s.contains("returned an empty answer");
     let reached_a_model = s.contains("model loop failed")
         || s.contains("model call failed")
-        || s.contains("model used all");
+        || s.contains("model used all")
+        || empty_answer;
     if !reached_a_model {
         return FailureKind::Internal;
     }
@@ -99,6 +113,8 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     ];
     if TRANSIENT.iter().any(|t| s.contains(t)) {
         FailureKind::TransientProvider
+    } else if empty_answer {
+        FailureKind::EmptyAnswer
     } else {
         FailureKind::Provider
     }
@@ -136,6 +152,12 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
         FailureKind::Provider => {
             "The model or its provider rejected the request; retrying is unlikely to help \
              — proceed without the consultation, or check the cast and config."
+        }
+        FailureKind::EmptyAnswer => {
+            "The model ran but delivered no answer text — a model-side outcome, not a \
+             kaibo bug. You may retry, and a different cast often helps; if the \
+             diagnostics report finish_reason \"length\", raise that slot's max_tokens \
+             so reasoning cannot starve the answer."
         }
         FailureKind::Internal => {
             "This is a kaibo-side error (not the provider) — please report it; you can \
@@ -426,7 +448,10 @@ pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
         line.push_str(&format!(" · {} cached", usage.cached_input_tokens));
     }
     if usage.cache_creation_input_tokens > 0 {
-        line.push_str(&format!(" · {} cache-write", usage.cache_creation_input_tokens));
+        line.push_str(&format!(
+            " · {} cache-write",
+            usage.cache_creation_input_tokens
+        ));
     }
     Some(line)
 }
@@ -676,6 +701,68 @@ mod tests {
             !text.to_lowercase().contains("you may retry")
                 && !text.to_lowercase().contains("retry this call"),
             "a non-transient error must not invite a retry: {text}"
+        );
+    }
+
+    /// An empty-answer failure (`consult/engine.rs::empty_answer_error`) means a model
+    /// ran and delivered no text — a model-side outcome. It must read as retryable and
+    /// must NOT be framed as a kaibo internal bug: the guard's own diagnostics say
+    /// "Retry, or try the same question on a different cast", and wrapping that in
+    /// "kaibo-side error — please report it" is contradictory guidance. (Live repro,
+    /// 2026-08-02: a starved deepseek oneshot — 256 reasoning tokens, empty content,
+    /// finish_reason "length" — surfaced as an Internal failure.)
+    #[test]
+    fn an_empty_answer_failure_invites_retry_and_is_not_called_a_kaibo_bug() {
+        for body in [
+            // The tool loop's gate (stopped without answering, no evidence gathered).
+            "model deepseek-v4-pro returned an EMPTY answer — it stopped without \
+             answering, and its transcript holds no tool results to write up. \
+             Diagnostics: 16 of 200 turns used; finish_reason \"stop\" reported by the \
+             provider. Retry, or try the same question on a different cast.",
+            // The single-shot lanes (oneshot, deliberate direct).
+            "model deepseek-v4-pro returned an EMPTY answer — the single toolless \
+             completion returned no answer text. Diagnostics: 1 of 1 turns used, 256 \
+             reasoning tokens reported; finish_reason \"length\" reported by the \
+             provider. Retry, or try the same question on a different cast.",
+            // The recovery's own failure wrapper (`run_phase`'s forced write-up turn).
+            "model deepseek-v4-pro returned an empty answer, and the forced \
+             final-answer turn also failed: prompt error",
+        ] {
+            let text = answer_text(&consultation_failed(
+                "consult",
+                "deepseek",
+                anyhow::anyhow!(body),
+            ));
+            let lower = text.to_lowercase();
+            assert!(
+                lower.contains("retry"),
+                "an empty answer is worth a retry: {body} -> {text}"
+            );
+            assert!(
+                !lower.contains("kaibo-side error") && !lower.contains("please report"),
+                "a model outcome must not be framed as a kaibo bug: {body} -> {text}"
+            );
+            assert!(
+                !lower.contains("retrying is unlikely to help"),
+                "must not contradict the guard's own retry advice: {body} -> {text}"
+            );
+        }
+    }
+
+    /// When the forced write-up turn itself died on a *transient* provider condition,
+    /// the transient framing wins — "retry" guidance with the overload named beats the
+    /// generic empty-answer framing, and both invite the same next step anyway.
+    #[test]
+    fn an_empty_answer_whose_forced_turn_hit_a_transient_error_stays_retryable() {
+        let err = anyhow::anyhow!(
+            "model deepseek-v4-pro returned an empty answer, and the forced final-answer \
+             turn also failed: ProviderError: {{\"type\":\"overloaded_error\"}}"
+        );
+        let text = answer_text(&consultation_failed("consult", "deepseek", err));
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("transient") && lower.contains("retry"),
+            "a transient failure inside the recovery is still framed transient: {text}"
         );
     }
 

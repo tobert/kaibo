@@ -276,9 +276,9 @@ impl std::str::FromStr for ModelRole {
 /// Lane lives on the **slot**, not the cast: a `deliberate` cast can pair an
 /// interactive explorer with an offline synth, and the synth slot's lane is what
 /// classifies the whole cast for the batch/interactive tool split (see
-/// [`Config::cast_offline_lane`]). `Direct` is forward-declared here — validated,
-/// parsed, and rendered — but no tool routes to it yet (see `server.rs`
-/// `reject_offline_cast`/the roster split).
+/// [`Config::cast_offline_lane`]). `deliberate` routes to `Direct` when a cast
+/// pairs an explorer with a direct-lane synth (see `cast_can_deliberate` and
+/// `CAST_ENUM_RULES`/`live_tools` in `server/mod.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lane {
@@ -2097,7 +2097,7 @@ fn builtin_backends(defaults: &Defaults) -> BTreeMap<String, Backend> {
     m
 }
 
-/// The four built-in casts: same-named single-backend compositions carrying
+/// The five built-in casts: same-named single-backend compositions carrying
 /// today's default models, so a missing config file and `cast = "anthropic"`
 /// reproduce kaibo's historical behavior byte-for-byte.
 fn builtin_casts() -> BTreeMap<String, Cast> {
@@ -5096,5 +5096,94 @@ mod tests {
             "#,
         )
         .is_err());
+    }
+
+    // --- The shipped template covers the config surface -------------------------
+
+    /// Every field a raw config struct accepts, as serde itself enumerates them.
+    /// `deny_unknown_fields` bakes the field list into the `Deserialize` impl, and
+    /// serde's unknown-field error recites it ("unknown field `…`, expected one of
+    /// `a`, `b`, …") — so feeding each struct one bogus key yields the full set with
+    /// no hand-kept list to drift from the parser. A new field lands in this
+    /// enumeration the moment it lands on the struct.
+    fn serde_fields<T: serde::de::DeserializeOwned>() -> Vec<String> {
+        let Err(err) = toml::from_str::<T>("kaibo_bogus_probe_key_zz = 1") else {
+            panic!("the probe key must be unknown to the struct");
+        };
+        let err = err.to_string();
+        let expected = err
+            .split("expected")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no expected-fields list in serde error: {err}"));
+        let fields: Vec<String> = expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !fields.is_empty(),
+            "serde error carried no field names: {err}"
+        );
+        fields
+    }
+
+    /// The shipped template (`kaibo://config/example`) promises "every option with
+    /// its default". This walks every raw struct's serde field set and requires each
+    /// name to appear somewhere in the template text — live, commented out, or as a
+    /// section header. History says the gap recurs: `[persistence]`,
+    /// `[orientation]`, `job_capacity`, `inline_attach_budget` (PR #110) and then
+    /// `max_attachments` (PR #96) all shipped before the template mentioned them.
+    /// With this, the next new knob fails the suite until the template names it.
+    #[test]
+    fn the_shipped_template_documents_every_config_field() {
+        let template = crate::server::CONFIG_EXAMPLE_TOML;
+        // Deliberately absent from the template: `profiles` is a tombstone whose only
+        // job is a migration-pointing load error, not a knob anyone should type.
+        let undocumented = ["profiles"];
+        let mut missing = Vec::new();
+        // A word-boundary match, not bare `contains`: short names (`id`, `log`,
+        // `lane`, `kind`) are substrings of ordinary prose (`guide`, `changelog`),
+        // and a bare containment check would keep passing after the knob's real
+        // documentation vanished (gemini cross-family review, 2026-08-02).
+        let mentions = |field: &str| {
+            let is_word =
+                |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            template.match_indices(field).any(|(i, _)| {
+                !is_word(template[..i].chars().next_back())
+                    && !is_word(template[i + field.len()..].chars().next())
+            })
+        };
+        let mut check = |strukt: &str, fields: Vec<String>| {
+            for f in fields {
+                if undocumented.contains(&f.as_str()) {
+                    continue;
+                }
+                if !mentions(&f) {
+                    missing.push(format!("{strukt}.{f}"));
+                }
+            }
+        };
+        check("RawConfig", serde_fields::<RawConfig>());
+        check("RawServer", serde_fields::<RawServer>());
+        check("RawTools", serde_fields::<RawTools>());
+        check("RawDefaults", serde_fields::<RawDefaults>());
+        check("RawTelemetry", serde_fields::<RawTelemetry>());
+        check("RawPersistence", serde_fields::<RawPersistence>());
+        check("RawContext", serde_fields::<RawContext>());
+        check("RawPrompts", serde_fields::<RawPrompts>());
+        check("RawOrientation", serde_fields::<RawOrientation>());
+        check("RawSandbox", serde_fields::<RawSandbox>());
+        check("RawKaish", serde_fields::<RawKaish>());
+        check("RawIgnore", serde_fields::<RawIgnore>());
+        check("RawBackend", serde_fields::<RawBackend>());
+        check("RawCast", serde_fields::<RawCast>());
+        check("RawSlotTable", serde_fields::<RawSlotTable>());
+        assert!(
+            missing.is_empty(),
+            "docs/config.example.toml promises \"every option with its default\" but \
+             never mentions: {missing:?} — add each knob to the template (a commented \
+             default line is enough)"
+        );
     }
 }

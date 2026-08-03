@@ -32,13 +32,16 @@ fn builtin_reproduces_the_historical_defaults() {
     // The per-request LLM deadline default: 15 min (see Defaults::default).
     assert_eq!(c.defaults.request_timeout, Duration::from_secs(900));
 
-    // Four built-in backends + four single-backend casts, carrying the model ids
+    // Five built-in backends + five single-backend casts, carrying the model ids
     // that used to live on the profiles. Named after their kind, except the OpenAI
-    // built-in, which is `openai-local` (it defaults to a local endpoint).
+    // built-in, which is `openai-local` (it defaults to a local endpoint). Every
+    // kind in the registry is enumerated here, so silently dropping a built-in
+    // fails this test.
     for kind in [
         ProviderKind::Anthropic,
         ProviderKind::DeepSeek,
         ProviderKind::Gemini,
+        ProviderKind::OpenRouter,
         ProviderKind::Openai,
     ] {
         let name = kind.builtin_name();

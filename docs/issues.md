@@ -321,6 +321,39 @@ advice split. Distinct from the upstream rig retry/backoff entry above — that'
 level 429/503 backoff; this is a mid-loop model fumble kaibo can re-prompt around itself.
 Surfaced by the DeepSeek CLI-subcommands review (2026-07-17).
 
+### Empty answers keep happening — the guard is a backstop, not a cure
+The empty-answer guard shipped 2026-08-02 (#115, meeting #116's finish_reason plumbing and
+the attach work in #118): no lane returns an empty answer as success. The tool loop gets one
+evidence-gated forced write-up turn (`consult/engine.rs::run_phase`, `empty_answer_error`),
+the turn-cap finalize and the single-shot lanes fail loudly with diagnostics (turns, tokens,
+the provider's own `finish_reason`), and batch has long had `finish_gated_answer`. But the
+guard changes the *failure mode*, not the *frequency*: DeepSeek still sometimes produces the
+textless terminal turn (Amy, 2026-08-02, same day the guard merged), and other families
+likely do too. Experiments the same day: a starved oneshot (256-token synth cap) repros the
+`finish_reason "length"` class on demand — reasoning ate the whole completion budget, guard
+errored loudly — while three grep-heavy review consults on the default deepseek cast all
+completed clean, so the wild stopped-without-answering class is sporadic (or already
+lowered by #114's role-identity preambles; n=3 can't tell). Open work, in order:
+- **Characterize from telemetry before touching prompts.** The plumbing to answer "which
+  models, how often, which finish_reason, does the forced re-ask rescue it" is all in place:
+  `gen_ai.response.finish_reason` on every `run_phase` span (#116), the `warn` event
+  "phase returned an empty answer with evidence gathered — forcing one final write-up turn"
+  (`engine.rs`), and `empty_answer_error`'s token/turn diagnostics in the error text.
+  Collect real occurrences from OTLP over normal use; the interesting split is
+  rescued-by-forced-turn vs. errored-anyway, and `finish_reason "stop"` (model chose to
+  stop) vs. `"length"` (starved — a `max_tokens` problem, different fix).
+- **Prevention is prompt work, and #114 already aims at it.** The measured failure shape is
+  a driver ending a turn with a tool call as its last act and no text (the 2026-08-01
+  DeepSeek run: explorer report delivered, fifteen greps returned, then a 14-token terminal
+  turn). #114's role-identity preambles ("the synth's final turn *is* the answer") target
+  exactly this; measure whether incidence drops post-#114 before adding more prompt mass.
+- **If the forced re-ask often fails**, consider a second differently-worded re-ask or
+  per-model shaping — but only with data showing the single re-ask isn't enough.
+- **The un-catchable neighbor, recorded so it isn't mistaken for a gap:** a non-empty but
+  vacuous answer ("I will now analyze…" then stop) passes the trim gate by construction.
+  If that shape shows up in practice it's a different problem (answer-quality, not
+  emptiness) and wants its own thinking, not a heuristic bolted onto this gate.
+
 ### Dossier checkpointing via the persistence store
 `deliberate`'s dossier (the synchronous explorer sweep) is the expensive artifact — minutes
 of live exploration — yet it lives only in memory until the offline synth consumes it.
@@ -334,41 +367,21 @@ DeepSeek CLI-subcommands review (2026-07-17).
 
 ## P3 — Infra, perf, polish
 
-### Server-level test: a sweep-routed image survives the whole `deliberate` handler
-The engine layer pins dossier stitching and `deliberate_direct`-with-images, but
-neither `deliberate_batch` nor `deliberate_direct_job` has a server-level test
-proving a sweep-routed image survives the full handler pipeline (dossier sweep →
-`sink.drain()` → image collection → lane dispatch). The code reads correctly
-(`src/server/mod.rs`, `deliberate`), and the engine tests cover the seams — but a
-future refactor could drop the `images` variable between drain and dispatch
-undetected. Flagged by the DeepSeek cross-family review of the explorer `attach`
-feature (2026-07-26).
-
-### Stale code comments + test assertions that predate the 5th backend / the direct lane
-Surfaced by a kaibo `or-gpt` (gpt-5.6-luna) review of PR #110, verified against the code.
-Three spots still describe a world with four built-ins and no tool routing to `direct`.
-None affects behavior; all three are places a reader (or a future us) would be misled, and
-the test one could let a real regression pass:
-
-- **`tests/config.rs`** (~:35) — "Four built-in backends + four single-backend casts", and
-  the loop below it iterates only Anthropic/DeepSeek/Gemini/Openai. `openrouter` is a real
-  built-in (`config.rs::builtin_registry`), so removing it would keep this test green.
-  Same undercount in a `src/server/config_resource.rs` test (~:831).
-- **`src/config.rs`** (~:225) — a doc-comment still says the `direct` lane has no tool
-  route. `deliberate` routes to it now (`config.rs::cast_can_deliberate`,
-  `server/mod.rs::CAST_ENUM_RULES`).
-
-Fix is mechanical; kept out of PR #110 because that one is a docs PR and this touches
-tests. Do it with the next change that lands in `tests/config.rs`.
-
-### Shipped config template omits four knobs its own resource description promises
-`kaibo://config/example`'s description said "every option with its default"; the template
-was missing `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`.
-Added in PR #110, so the claim is true again — **the open work is the guard**: nothing
-tests that the template covers the config surface, so the next new knob can silently
-reintroduce the gap. A test walking `RawConfig`'s field names against
-`CONFIG_EXAMPLE_TOML` would close it, in the spirit of the `no_write_path.rs` pinned-count
-guard. (The example's *parse* test exists already; coverage is the missing half.)
+### Batch results don't cross-check returned `custom_id`s against the submitted set
+From the 2026-08-02 batch error-propagation audit (DeepSeek agentic consult, key claims
+verified by hand — the audit's overall verdict was that per-item propagation is SOUND:
+loud per-item `Err`s on all three providers, `finish_gated_answer` on every succeeded
+path at `batch.rs:548/986/1625`, no error detail discarded). The one blind spot: none of
+the three result parsers (`parse_results_jsonl` `batch.rs:524`, `parse_gemini_inlined`
+`:975`, `parse_openai_output_jsonl` `:1579`) verifies that every submitted `custom_id`
+came back. A provider that silently drops an item yields N-1 results with no error about
+the missing one — "Batch complete — 9 result(s)" after submitting 10. Fix shape: carry
+the submitted count (or id set) on the handle and emit a synthetic per-item failure for
+each absentee at parse time. Two accepted-as-designed observations from the same audit,
+recorded so they aren't re-flagged: Anthropic has no batch-level `Failed` state ("ended"
+covers all outcomes; per-item errors live inside `Done`, and `job_list` is a triage view —
+`job_get` has the detail), and Gemini's errored-item summarizer probes only
+`error.message` before falling back to the full JSON (data preserved, label coarser).
 
 ### Release pipeline — harden native matrix + GitHub-native signing (plan in `docs/releases.md`)
 The full plan and its decisions live in **`docs/releases.md`** (living doc); this is the
