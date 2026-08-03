@@ -119,16 +119,26 @@ pub fn discovery_endpoint(backend: &Backend) -> Result<DiscoveryRequest> {
 /// loops on those kinds anyway.
 pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Result<DiscoveryRequest> {
     // A media kind publishes no model-listing endpoint in the `/models` shape this
-    // module speaks — Stability's model set is the small fixed route family
-    // (`generate/{core,ultra,sd3}`), documented rather than enumerable. Refusing
-    // loudly beats inventing a URL that would 404, and beats returning an empty
-    // list that would read as "this backend serves no models". Classified up front
-    // so the wire match below stays media-free.
+    // module speaks. Refusing loudly beats inventing a URL that would 404, and
+    // beats returning an empty list that would read as "this backend serves no
+    // models". Classified up front so the wire match below stays media-free; the
+    // hint is per media kind, since where a model id comes from differs by kind.
     let Some(wire) = backend.kind.wire() else {
+        let hint = match backend.kind.class() {
+            crate::credentials::ProviderClass::Media(crate::credentials::MediaKind::Stability) => {
+                "the documented generate routes: core, ultra, or an sd3.5 variant"
+            }
+            crate::credentials::ProviderClass::Media(
+                crate::credentials::MediaKind::OpenAiImages,
+            ) => "the endpoint's own model names, e.g. gpt-image-1 hosted or whatever a \
+                  local sd-server has loaded",
+            // The `else` above already proved this kind has no completion wire.
+            crate::credentials::ProviderClass::Wire(_) => unreachable!("wire() was None"),
+        };
         anyhow::bail!(
-            "backend {:?} is kind `{}`, which publishes no model-listing endpoint — \
-             its models are the documented generate routes (core, ultra, sd3), not a \
-             discoverable list",
+            "backend {:?} is kind `{}`, a media kind — it publishes no model-listing \
+             endpoint in the `/models` shape this tool speaks. Its models are named on \
+             a cast's `image` slot: {hint}",
             backend.name,
             backend.kind.canonical_name()
         )

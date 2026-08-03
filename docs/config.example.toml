@@ -435,8 +435,8 @@ wire = "responses"
 # `deep-dive`) so it can route by name without reading this file.
 #
 # Roles: explorer, synth (the reasoning phases), and image (the media member — it
-# points at a stability backend and staffs `generate`; see the image-slot example
-# below). A typo'd role is a loud load
+# points at a media backend, kind stability or openai-images, and staffs `generate`;
+# see the image-slot examples below). A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
 # naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
 #
@@ -496,20 +496,23 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 # image    = "sd/core"            # core | ultra | an sd3.5 variant (e.g. sd3.5-large)
 
 # --- The openai-images kind covers two shapes with one wire. Hosted OpenAI: no
-#     base_url (unset dials api.openai.com/v1) and key_optional = false, so a
-#     missing OPENAI_API_KEY / ~/.openai-key fails loudly instead of sending the
-#     placeholder. Local stable-diffusion.cpp sd-server: base_url through /v1 and
-#     no key at all — key_optional defaults true on this kind, exactly for this
-#     case. Provider knobs (size, quality, n, output_format, ...) ride the
-#     `generate` tool's fields, not the config. ---
+#     base_url (unset dials api.openai.com/v1); the key is required — the seeded
+#     default, so a missing OPENAI_API_KEY / ~/.openai-key fails loudly instead of
+#     sending a placeholder bearer to a paid endpoint. Local stable-diffusion.cpp
+#     sd-server: base_url through /v1 plus key_optional = true — keyless is an
+#     explicit opt-in on this kind, stated beside the local endpoint it belongs to.
+#     Provider knobs (size, quality, n, output_format, ...) ride the `generate`
+#     tool's fields, not the config; output_format is checked before the call and
+#     must be png, jpeg, or webp (the set kaibo's media store can name on disk). ---
 
 # [backends.oai-images]
-# kind = "openai-images"          # key: OPENAI_API_KEY / ~/.openai-key
-# key_optional = false            # hosted OpenAI needs a real key
+# kind = "openai-images"          # key: OPENAI_API_KEY / ~/.openai-key (required —
+#                                 # the default; a missing key fails at call setup)
 
 # [backends.sdcpp]
 # kind = "openai-images"
-# base_url = "http://localhost:1234/v1"   # keyless local sd-server
+# base_url = "http://localhost:1234/v1"   # local sd-server...
+# key_optional = true                     # ...which needs no key: explicit opt-in
 
 # [casts.hosted-artist]
 # image = "oai-images/gpt-image-1"        # the request's `model` field

@@ -475,11 +475,12 @@ the box with environment variables and built-in defaults, so a missing config fi
 not an error. `$XDG_CONFIG_HOME/kaibo/config.toml` lets you wire your own roster. The
 config has three concepts for configuring models:
 
-- **backend** — a *connection*: which wire protocol (`anthropic` | `deepseek` |
-  `gemini` | `openrouter` | `openai`), base URL, and where its key comes from. Secrets
-  never live in the TOML — only the *name* of an env var or the path to a key file.
-  `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every major
-  model family, reasoning on by default via its unified `effort` param.
+- **backend** — a *connection*: which wire protocol (the completion kinds `anthropic`
+  | `deepseek` | `gemini` | `openrouter` | `openai`, or the media kinds `stability` |
+  `openai-images` behind the `image` role), base URL, and where its key comes from.
+  Secrets never live in the TOML — only the *name* of an env var or the path to a key
+  file. `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every
+  major model family, reasoning on by default via its unified `effort` param.
 - **role** — a *job* a model does: `explorer` (fast sweeps), `synth` (the voice that
   answers), and `image` (the media member behind `generate`). A reasoning slot that
   reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).

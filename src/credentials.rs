@@ -63,12 +63,14 @@ pub enum ProviderKind {
     /// OpenAI's Images API (`POST {base}/images/generations`) — the second media kind,
     /// via `src/openai_images.rs`. One kind covers two real targets: hosted OpenAI
     /// image generation (the gpt-image-1 family) and any local server speaking the
-    /// same endpoint shape (stable-diffusion.cpp's sd-server). Its key posture
-    /// mirrors [`ProviderKind::Openai`], not Stability: the same `OPENAI_API_KEY` /
-    /// `~/.openai-key` sources, and `key_optional` by default because the local
-    /// sd-server case is keyless — an operator pointing at hosted OpenAI sets
-    /// `key_optional = false` explicitly. Like Stability, it is not in the built-in
-    /// backend list and staffs only `image` cast slots.
+    /// same endpoint shape (stable-diffusion.cpp's sd-server). Its key SOURCES
+    /// mirror [`ProviderKind::Openai`] (the same `OPENAI_API_KEY` / `~/.openai-key`
+    /// — one OpenAI credential, not two to maintain), but the key is REQUIRED by
+    /// default: this kind's default endpoint is hosted OpenAI, so a keyless seed
+    /// would 401 on the first paid call instead of failing at load (see
+    /// [`ProviderKind::key_optional`]). A keyless local sd-server backend sets
+    /// `key_optional = true` beside its explicit local `base_url`. Like Stability,
+    /// it is not in the built-in backend list and staffs only `image` cast slots.
     OpenAiImages,
 }
 
@@ -87,15 +89,18 @@ impl ProviderKind {
         Self::OpenAiImages,
     ];
 
-    /// Whether a missing credential is tolerated rather than a hard error. The two
-    /// OpenAI-shaped kinds are: the completion kind's default endpoint is a local
-    /// keyless server, and the images kind covers the keyless local sd-server case
-    /// with the same reasoning — an absent key falls back to a placeholder bearer
-    /// token ([`PLACEHOLDER_OPENAI_KEY`]), and an operator pointing either at hosted
-    /// OpenAI sets `key_optional = false` on the backend explicitly. The keyed
-    /// providers must fail loudly on a missing key.
+    /// Whether a missing credential is tolerated rather than a hard error. Only the
+    /// OpenAI-compatible *completion* provider is: its default endpoint is a local
+    /// keyless server, so an absent key coherently falls back to a placeholder
+    /// bearer token ([`PLACEHOLDER_OPENAI_KEY`]). The images kind shares its key
+    /// sources but seeds key-REQUIRED, because its default endpoint is hosted
+    /// OpenAI: a keyless seed there would let a minimal stanza load clean, staff
+    /// `generate`, and then send `Bearer no-auth` to api.openai.com — a 401 on the
+    /// first paid call instead of a loud load-time gap. A keyless local sd-server
+    /// backend opts in with `key_optional = true` explicitly, beside its explicit
+    /// local `base_url`. The keyed providers must fail loudly on a missing key.
     pub fn key_optional(self) -> bool {
-        matches!(self, ProviderKind::Openai | ProviderKind::OpenAiImages)
+        matches!(self, ProviderKind::Openai)
     }
 
     /// The stand-in credential a `key_optional` backend sends when no real key is
@@ -123,7 +128,8 @@ impl ProviderKind {
             | ProviderKind::DeepSeek
             | ProviderKind::OpenRouter
             | ProviderKind::Openai
-            // The keyless local sd-server case: header-bearer shaped, value ignored.
+            // Reached only when an operator sets `key_optional = true` for a local
+            // sd-server: header-bearer shaped, value ignored by such a server.
             | ProviderKind::OpenAiImages
             // Never reached: Stability is not `key_optional`, so a missing key is a
             // hard error long before a stand-in is wanted. It is a header-bearer wire,
@@ -271,6 +277,20 @@ pub enum MediaKind {
 pub enum ProviderClass {
     Wire(WireKind),
     Media(MediaKind),
+}
+
+/// The media-class kinds as a display list (``"`stability`, `openai-images`"``) —
+/// derived from [`ProviderKind::ALL`] through [`ProviderKind::class`], so guidance
+/// text built at format time never carries a hand-maintained kind list that goes
+/// stale when a media kind lands. (Text that must live in a `const` still names the
+/// kinds literally; this helper serves every site that formats at runtime.)
+pub fn media_kinds_list() -> String {
+    ProviderKind::ALL
+        .iter()
+        .filter(|k| k.is_media())
+        .map(|k| format!("`{}`", k.canonical_name()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl std::str::FromStr for ProviderKind {

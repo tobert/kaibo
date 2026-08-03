@@ -612,14 +612,39 @@ pub struct GenerateInput {
     #[serde(default)]
     pub cast: Option<String>,
 
-    /// Provider-native generation options passed through verbatim as string fields
-    /// (Stability: aspect_ratio "16:9", output_format png|jpeg|webp, seed,
-    /// negative_prompt, style_preset, ...; OpenAI-compatible images endpoints: size
-    /// "1024x1024", n, quality, output_format, ...). The provider validates its own
+    /// Provider-native generation options passed through verbatim — each value's
+    /// JSON type (string | number | boolean) is the type the provider receives, so
+    /// pass `n` as a number and ids like `user` as strings. (Stability:
+    /// aspect_ratio "16:9", output_format png|jpeg|webp, seed, negative_prompt,
+    /// style_preset, ...; OpenAI-compatible images endpoints: size "1024x1024", n,
+    /// quality, output_format png|jpeg|webp, ...). The provider validates its own
     /// knobs. `prompt` and `model` are reserved: use the prompt parameter and the
     /// cast's image slot.
     #[serde(default)]
-    pub fields: Option<std::collections::BTreeMap<String, String>>,
+    pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
+}
+
+/// One `generate` field value, as typed JSON: the schema face of
+/// [`crate::media::FieldValue`]. Untagged, so a caller writes plain JSON scalars
+/// (`{"n": 2, "size": "1024x1024", "transparent": true}`) and the stated type — not
+/// a guess re-derived from text — rides through to the provider's wire.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum GenerateFieldValue {
+    Bool(bool),
+    /// `serde_json::Number` keeps integers integral end to end (`2`, never `2.0`).
+    Num(serde_json::Number),
+    Str(String),
+}
+
+impl GenerateFieldValue {
+    fn into_field_value(self) -> crate::media::FieldValue {
+        match self {
+            GenerateFieldValue::Str(s) => crate::media::FieldValue::Str(s),
+            GenerateFieldValue::Num(n) => crate::media::FieldValue::Num(n),
+            GenerateFieldValue::Bool(b) => crate::media::FieldValue::Bool(b),
+        }
+    }
 }
 
 /// kaibo's MCP handler. Cheap to clone (rmcp clones it per request).
@@ -2476,7 +2501,8 @@ impl KaiboHandler {
             kaibo://cas/<digest> resource URI, the mime, the provider's seed when \
             reported, and the real file path when the store is on disk. \
             Provider-native options (aspect_ratio, size, n, output_format, seed, \
-            negative_prompt, style_preset, ...) pass through `fields` verbatim. An \
+            negative_prompt, style_preset, ...) pass through `fields` verbatim, each \
+            value's JSON type (string | number | boolean) preserved to the wire. An \
             operation the provider declares deferred returns a `job-N` handle for \
             job_wait/job_get instead (every route wired today answers in-call). \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
@@ -2501,10 +2527,10 @@ impl KaiboHandler {
             return Err(McpError::invalid_params(
                 format!(
                     "cast `{}` has no `image` slot — `generate` needs a cast whose \
-                     `image` slot points at a media backend (kind `stability` or \
-                     `openai-images`). kaibo://config lists the configured casts and \
-                     their slots.",
-                    cast.name
+                     `image` slot points at a media backend (kind {}). kaibo://config \
+                     lists the configured casts and their slots.",
+                    cast.name,
+                    crate::credentials::media_kinds_list(),
                 ),
                 None,
             ));
@@ -2520,7 +2546,12 @@ impl KaiboHandler {
         let arm = self.media_arms.build(backend, slot).map_err(|e| {
             McpError::invalid_params(format!("cast `{}` image slot: {e:#}", cast.name), None)
         })?;
-        let fields: Vec<(String, String)> = input.fields.unwrap_or_default().into_iter().collect();
+        let fields: Vec<(String, crate::media::FieldValue)> = input
+            .fields
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, value)| (name, value.into_field_value()))
+            .collect();
         // Reserved keys: recorded provenance must describe the request that actually
         // ran. `fields.prompt` would send prompt B while the sidecar records prompt A,
         // and `fields.model` would reroute the call (Stability's SD3 route, the
@@ -3622,17 +3653,21 @@ by waiting — the handles keep.
 
 ## Generate media: `generate`
 
-`generate` turns a text prompt into an image through the cast's `image` slot (a media
-backend such as Stability). It is advertised only when a configured cast carries that
-slot and the media CAS is on. The result is never inline bytes: each artifact lands in
-kaibo's content-addressed store and you get its digest as a `kaibo://cas/<digest>`
-resource URI (read it as an MCP resource for the bytes), the mime, the provider's seed,
-and — when the store is on disk — the real file path. Provider-native options ride the
-`fields` object verbatim (Stability: `aspect_ratio` \"16:9\", `output_format`
-png|jpeg|webp, `seed`, `negative_prompt`, `style_preset`). An operation the provider
-declares deferred hands back a `job-N` on the same collect verbs above — the lane is
-wired, though every Stability generate route today answers in-call. Every artifact gets
-a provenance sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
+`generate` turns a text prompt into images through the cast's `image` slot — a media
+backend: Stability's v2beta family, or an OpenAI-compatible images endpoint (hosted
+gpt-image, or a local stable-diffusion.cpp sd-server; one call may return several
+images via `n`). It is advertised only when a configured cast carries that slot and
+the media CAS is on. The result is never inline bytes: each artifact lands in kaibo's
+content-addressed store and you get its digest as a `kaibo://cas/<digest>` resource
+URI (read it as an MCP resource for the bytes), the mime, the provider's seed when
+reported, and — when the store is on disk — the real file path. Provider-native
+options ride the `fields` object verbatim, each value's JSON type preserved
+(Stability: `aspect_ratio` \"16:9\", `output_format` png|jpeg|webp, `seed`,
+`negative_prompt`, `style_preset`; OpenAI-compatible: `size` \"1024x1024\", `n`,
+`quality`, `output_format` png|jpeg|webp). An operation the provider declares
+deferred hands back a `job-N` on the same collect verbs above — the lane is wired,
+though every route wired today answers in-call. Every artifact gets a provenance
+sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
 
 ## Driving the read-only shell (`run_kaish`)
 
@@ -4785,9 +4820,12 @@ mod tests {
                 prompt: "A".to_string(),
                 cast: Some("artist".to_string()),
                 fields: Some(
-                    [("prompt".to_string(), "B".to_string())]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "prompt".to_string(),
+                        GenerateFieldValue::Str("B".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             }))
             .await
@@ -4803,9 +4841,12 @@ mod tests {
                 prompt: "A".to_string(),
                 cast: Some("artist".to_string()),
                 fields: Some(
-                    [("model".to_string(), "sd3.5-large".to_string())]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "model".to_string(),
+                        GenerateFieldValue::Str("sd3.5-large".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             }))
             .await

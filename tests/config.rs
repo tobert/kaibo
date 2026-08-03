@@ -1969,9 +1969,13 @@ fn an_image_slot_cannot_point_at_a_completion_backend() {
 // --- the openai-images kind ---------------------------------------------------
 
 /// The `openai-images` kind parses from TOML and seeds its defaults: the same key
-/// sources as the `openai` completion kind (`OPENAI_API_KEY` / `~/.openai-key`) and
-/// `key_optional = true` — the keyless local sd-server case is the seeded posture,
-/// and an operator dialing hosted OpenAI turns key_optional off explicitly.
+/// sources as the `openai` completion kind (`OPENAI_API_KEY` / `~/.openai-key`),
+/// but the key is REQUIRED. This kind's default endpoint is hosted OpenAI, so a
+/// keyless seed would let a minimal stanza load clean, staff `generate`, and then
+/// send `Bearer no-auth` to api.openai.com — a 401 on the first paid call instead
+/// of a loud config gap (the or-gpt cross-family review's posture reversal,
+/// 2026-08-03). A keyless local sd-server opts in with `key_optional = true`
+/// beside its explicit local `base_url`.
 #[test]
 fn openai_images_backend_parses_and_seeds_openai_key_sources() {
     let c = Config::from_toml_str(
@@ -1990,34 +1994,38 @@ fn openai_images_backend_parses_and_seeds_openai_key_sources() {
         b.api_key_file
     );
     assert!(
-        b.key_optional,
-        "key_optional seeds true — the keyless local sd-server case"
+        !b.key_optional,
+        "key_optional seeds FALSE — the default endpoint is hosted, so a missing \
+         key must fail loudly at resolve; a local sd-server opts in explicitly"
     );
 }
 
 /// base_url is optional on an openai-images backend, unlike a new `openai`
 /// completion backend (which must say where it points): unset means hosted OpenAI
 /// (`https://api.openai.com/v1`, resolved at arm construction), set points the same
-/// wire at a local sd-server. Both shapes load.
+/// wire at a local sd-server (which also sets `key_optional = true` — keyless is an
+/// explicit opt-in on this kind). Both shapes load.
 #[test]
 fn openai_images_base_url_is_optional_default_hosted() {
     let c = Config::from_toml_str(
         r#"
         [backends.hosted-imgs]
         kind = "openai-images"
-        key_optional = false
 
         [backends.sdcpp]
         kind = "openai-images"
         base_url = "http://localhost:1234/v1"
+        key_optional = true
         "#,
     )
     .expect("both the hosted (no base_url) and local shapes load");
     assert_eq!(c.backends["hosted-imgs"].base_url, None);
+    assert!(!c.backends["hosted-imgs"].key_optional);
     assert_eq!(
         c.backends["sdcpp"].base_url.as_deref(),
         Some("http://localhost:1234/v1")
     );
+    assert!(c.backends["sdcpp"].key_optional);
 }
 
 /// An openai-images backend staffs an image slot — the config half of the

@@ -43,9 +43,9 @@ async fn gpt_image_1_returns_real_png_bytes() {
         // The cheapest hosted shape; output_format png is gpt-image-1's default,
         // stated explicitly so the mime derivation is exercised end to end.
         fields: vec![
-            ("size".to_string(), "1024x1024".to_string()),
-            ("quality".to_string(), "low".to_string()),
-            ("output_format".to_string(), "png".to_string()),
+            ("size".to_string(), "1024x1024".into()),
+            ("quality".to_string(), "low".into()),
+            ("output_format".to_string(), "png".into()),
         ],
     };
 

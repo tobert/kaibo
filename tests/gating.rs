@@ -128,7 +128,8 @@ fn a_stock_install_does_not_advertise_deliberate() {
 
 /// An `image` slot on an `openai-images` backend staffs `generate` exactly the way a
 /// stability one does — the staffing gate is class-based, not stability-shaped. The
-/// keyless local sd-server posture (base_url set, no key anywhere) is the config
+/// keyless local sd-server posture (base_url set, `key_optional = true` explicit —
+/// the kind seeds key-required since its default endpoint is hosted) is the config
 /// under test, since it is the shape that must work with zero credentials.
 #[test]
 fn an_openai_images_cast_staffs_generate() {
@@ -137,6 +138,7 @@ fn an_openai_images_cast_staffs_generate() {
         [backends.sdcpp]
         kind = "openai-images"
         base_url = "http://localhost:1234/v1"
+        key_optional = true
         api_key_file = "/nonexistent-kaibo-test/openai"
 
         [casts.artist]

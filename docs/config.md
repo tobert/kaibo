@@ -59,7 +59,7 @@ Connection settings only. Models are never declared here.
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
 | `api_key_file` | path | seeded from `kind` | file source, checked second |
-| `key_optional` | bool | `true` for `openai` and `openai-images`, else `false` | allows a placeholder token |
+| `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
 | `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` only; load error elsewhere |
 | `request_timeout_secs` | integer > 0 | `[defaults]` value (900) | per-single-completion ceiling |
 
@@ -86,11 +86,14 @@ by re-declaration.
 - **`kind = "openai-images"`** — optional. Unset dials hosted OpenAI
   (`https://api.openai.com/v1`). Set, it points the same wire at any server speaking
   `/v1/images/generations` — a local stable-diffusion.cpp `sd-server`
-  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Key posture
-  mirrors the `openai` kind, not `stability`: the same `OPENAI_API_KEY` /
-  `~/.openai-key` sources, and `key_optional` defaults **true** (the keyless local
-  server case) — set `key_optional = false` on a backend aimed at hosted OpenAI so a
-  missing key fails loudly instead of sending the placeholder.
+  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Key sources
+  are shared with the `openai` kind (the same `OPENAI_API_KEY` / `~/.openai-key`),
+  but the key is **required by default**: the default endpoint is hosted, so a
+  keyless seed would send a placeholder bearer to a paid API and 401 on the first
+  call instead of failing loudly at setup. A keyless local `sd-server` backend sets
+  `key_optional = true` beside its local `base_url`. The `generate` tool's
+  `output_format` field for this kind must be `png`, `jpeg`, or `webp` — checked
+  before the call, since it names the stored artifact's on-disk format.
 - **Every other kind** — a load error. rig fixes those endpoints.
 
 The value is a root the client versions itself, never a full endpoint path. rig's

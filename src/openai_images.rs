@@ -41,18 +41,20 @@
 //! deliberately ignored for now: the provenance sidecar records the operator's
 //! prompt, the request that *ran*.
 //!
-//! # Fields ride verbatim, scalars typed
+//! # Fields ride verbatim, typed by the caller
 //!
 //! The passthrough posture is unchanged from Stability: `size`, `quality`, `n`,
 //! `style`, `output_format`, `background`, ... ride [`crate::media::MediaRequest::fields`]
 //! and the provider validates its own knobs; `prompt` and `model` stay reserved at
-//! the tool layer. The one wire difference: this API takes a JSON body, not a
-//! multipart form, and OpenAI type-checks it (`n` must be a JSON integer, not
-//! `"2"`). So [`field_value`] sends a field whose string parses as a bare JSON
-//! number or bool as that scalar, and everything else as a string — `n = "2"`
-//! becomes `2`, `size = "1024x1024"` stays a string. That is a wire-shape
-//! translation, not an allowlist: every field still goes through, kaibo still
-//! validates none of them.
+//! the tool layer. This API takes a JSON body that OpenAI type-checks (`n` must be
+//! a JSON integer, `user` must be a string), so the caller's stated JSON type
+//! rides through verbatim — [`crate::media::FieldValue`] carries string vs number
+//! vs bool from the tool face to the wire, with no re-typing in between (guessing
+//! from the text would turn a legitimate `user = "123"` into the number `123` and
+//! a provider 400). Two fields get provider-side treatment: `output_format` must
+//! name a format this kind can store (validated before the call, canonical
+//! spelling sent), and `response_format` is refused outright — kaibo owns it (see
+//! above).
 //!
 //! # Credentials
 //!
@@ -97,6 +99,16 @@ impl OutputFormat {
             "jpeg" => Ok(OutputFormat::Jpeg),
             "webp" => Ok(OutputFormat::Webp),
             other => Err(OpenAiImagesError::UnknownOutputFormat(other.to_string())),
+        }
+    }
+
+    /// The canonical lowercase wire spelling — what [`build_request_body`] sends,
+    /// regardless of how leniently [`parse`](Self::parse) read the caller's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Png => "png",
+            OutputFormat::Jpeg => "jpeg",
+            OutputFormat::Webp => "webp",
         }
     }
 
@@ -150,9 +162,19 @@ pub enum OpenAiImagesError {
     MissingB64 { index: usize, has_url: bool },
     /// A `b64_json` value that didn't decode as base64.
     InvalidB64 { index: usize, detail: String },
+    /// A `b64_json` that decoded to ZERO bytes — the empty string is valid base64,
+    /// so without this check it would sail through as a zero-byte artifact and land
+    /// in the CAS under a real digest. Never treated as success.
+    EmptyArtifact { index: usize },
     /// An `output_format` field naming a format outside the closed
     /// [`OutputFormat`] set — refused at request build, before the call.
     UnknownOutputFormat(String),
+    /// The caller put `response_format` in `fields`. kaibo owns that parameter:
+    /// artifacts must arrive as base64, and `url` in particular would spend real
+    /// credits generating artifacts kaibo then refuses to fetch. Refused at request
+    /// build, before the call — any value, even a redundant `"b64_json"`, so the
+    /// contract stays one-sided.
+    CallerResponseFormat,
 }
 
 impl std::fmt::Display for OpenAiImagesError {
@@ -194,10 +216,22 @@ impl std::fmt::Display for OpenAiImagesError {
                 f,
                 "Images API data[{index}].b64_json is not valid base64: {detail}"
             ),
+            OpenAiImagesError::EmptyArtifact { index } => write!(
+                f,
+                "Images API data[{index}].b64_json decoded to zero bytes — never \
+                 treated as a successful empty artifact"
+            ),
             OpenAiImagesError::UnknownOutputFormat(v) => write!(
                 f,
                 "output_format {v:?} is not one this kind can name on disk — expected \
                  png, jpeg, or webp (the Images API's own set)"
+            ),
+            OpenAiImagesError::CallerResponseFormat => write!(
+                f,
+                "`fields.response_format` is owned by kaibo — artifacts must arrive \
+                 as base64 (`url` would spend credits on artifacts kaibo refuses to \
+                 fetch), and kaibo already sends the right value per model family. \
+                 Omit the field"
             ),
         }
     }
@@ -206,17 +240,6 @@ impl std::fmt::Display for OpenAiImagesError {
 impl std::error::Error for OpenAiImagesError {}
 
 // --- Request building (pure) -------------------------------------------------
-
-/// A field value as the JSON scalar the API type-checks for: a string that parses
-/// as a bare JSON number or bool goes typed (`"2"` → `2`, `"true"` → `true`);
-/// everything else stays a string (`"1024x1024"`, `"high"`). See the module doc —
-/// this is wire-shape translation, not validation.
-fn field_value(raw: &str) -> Value {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(v @ (Value::Number(_) | Value::Bool(_))) => v,
-        _ => Value::String(raw.to_string()),
-    }
-}
 
 /// True for the model family that always returns base64 and REJECTS the
 /// `response_format` parameter (gpt-image-1, gpt-image-1-mini, and successors under
@@ -231,15 +254,19 @@ fn always_b64(model: &str) -> bool {
 ///
 /// - `model` and `prompt` come from the slot and the tool parameter (the tool layer
 ///   reserves both field names, so they cannot arrive in `request.fields`).
-/// - `response_format = "b64_json"` is seeded for every model family except
-///   gpt-image-1's (which rejects the parameter and always returns b64) — a caller
-///   field of the same name replaces the seed, the same last-write-wins merge
-///   Stability's `output_format` seed follows. Overriding it to `"url"` just moves
-///   the failure to [`parse_response`]'s loud b64 refusal.
-/// - Every `request.fields` entry rides through [`field_value`], in order.
-/// - The artifact format is the request's `output_format` field when present
-///   ([`OutputFormat::parse`] — unknown is a loud error here, before the call),
-///   else png.
+/// - `response_format = "b64_json"` is sent for every model family except
+///   gpt-image-1's (which rejects the parameter and always returns b64). The
+///   parameter is kaibo's alone: a caller `response_format` field is refused
+///   outright ([`OpenAiImagesError::CallerResponseFormat`]) — `url` would spend
+///   credits on artifacts kaibo then refuses, so the field never rides through.
+/// - Every other `request.fields` entry rides through verbatim as the JSON scalar
+///   the caller stated ([`crate::media::FieldValue::to_json`]) — no re-typing, the
+///   provider validates its own knobs.
+/// - The artifact format is the request's `output_format` field when present —
+///   which must be a *string* naming one of [`OutputFormat`]'s set (unknown, or a
+///   non-string value, is a loud error here, before the call) — else png. The
+///   parsed format's canonical lowercase spelling is what reaches the wire, so
+///   `" PNG "` is sent as `png`, not forwarded raw for the provider to refuse.
 pub fn build_request_body(
     model: &str,
     request: &MediaRequest,
@@ -256,12 +283,25 @@ pub fn build_request_body(
 
     let mut format = OutputFormat::Png;
     for (name, value) in &request.fields {
-        if name == "output_format" {
-            format = OutputFormat::parse(value)?;
+        match name.as_str() {
+            "response_format" => return Err(OpenAiImagesError::CallerResponseFormat),
+            "output_format" => {
+                // Must be a string naming a format this kind can store; a number or
+                // bool here is the caller's mistake, surfaced with its wire spelling.
+                let raw = value.as_str().ok_or_else(|| {
+                    OpenAiImagesError::UnknownOutputFormat(value.to_wire_string())
+                })?;
+                format = OutputFormat::parse(raw)?;
+                // The canonical spelling goes on the wire, not the raw value —
+                // `parse` was lenient (case, whitespace) so the wire can be exact.
+                body.insert(name.clone(), Value::String(format.as_str().to_string()));
+            }
+            _ => {
+                // Map insert: uniquely named by the tool layer's map face; the
+                // caller's stated JSON type rides verbatim.
+                body.insert(name.clone(), value.to_json());
+            }
         }
-        // Map insert: a caller field replaces a seeded default of the same name
-        // (fields are uniquely named by the tool layer's map face).
-        body.insert(name.clone(), field_value(value));
     }
     Ok((Value::Object(body), format))
 }
@@ -332,6 +372,12 @@ pub fn parse_response(
                 index,
                 detail: e.to_string(),
             })?;
+        // The empty string is VALID base64, so a decode success is not yet an
+        // artifact — zero bytes under a real digest is the silent-garbage shape
+        // this module refuses everywhere else.
+        if bytes.is_empty() {
+            return Err(OpenAiImagesError::EmptyArtifact { index });
+        }
         artifacts.push(MediaArtifact {
             bytes,
             mime: format.mime().to_string(),
@@ -451,11 +497,20 @@ mod tests {
     }
 
     fn request(fields: &[(&str, &str)]) -> MediaRequest {
+        typed_request(
+            &fields
+                .iter()
+                .map(|(k, v)| (*k, crate::media::FieldValue::from(*v)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn typed_request(fields: &[(&str, crate::media::FieldValue)]) -> MediaRequest {
         MediaRequest {
             prompt: "a lighthouse at dusk".to_string(),
             fields: fields
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
             input_image: None,
         }
@@ -554,40 +609,74 @@ mod tests {
         }
     }
 
-    /// Fields ride through verbatim in value, with bare JSON scalars typed the way
-    /// the API type-checks them: `n = "2"` must go as the integer 2 (OpenAI rejects
-    /// the string), `size` stays a string. A caller's `response_format` replaces
-    /// the seeded default rather than duplicating it.
+    /// The caller's stated JSON type rides through verbatim — no re-typing in
+    /// either direction. `n` passed as a number arrives as the integer `2` (never
+    /// `2.0`, never `"2"`); `user = "123"` passed as a STRING stays the string
+    /// `"123"` (the or-gpt review's case: value-based guessing would re-type it to
+    /// a number and draw a provider 400); a boolean survives typed.
     #[test]
-    fn request_body_types_scalars_and_lets_fields_override_seeds() {
+    fn request_body_carries_the_callers_stated_types_verbatim() {
+        use crate::media::FieldValue;
         let (body, format) = build_request_body(
             "dall-e-3",
-            &request(&[
-                ("n", "2"),
-                ("size", "1024x1024"),
-                ("quality", "high"),
-                ("output_format", "webp"),
-                ("response_format", "b64_json"),
+            &typed_request(&[
+                ("n", FieldValue::Num(serde_json::Number::from(2))),
+                ("size", FieldValue::Str("1024x1024".to_string())),
+                ("user", FieldValue::Str("123".to_string())),
+                ("transparent", FieldValue::Bool(true)),
+                ("output_format", FieldValue::Str("webp".to_string())),
             ]),
         )
         .unwrap();
-        assert_eq!(body.get("n"), Some(&Value::from(2)), "n goes typed");
+        assert_eq!(
+            body.get("n"),
+            Some(&Value::from(2)),
+            "a caller number is the JSON integer 2, not \"2\" or 2.0"
+        );
         assert_eq!(
             body.get("size").and_then(Value::as_str),
             Some("1024x1024"),
-            "size stays a string"
+            "a caller string stays a string"
         );
-        assert_eq!(body.get("quality").and_then(Value::as_str), Some("high"));
-        assert_eq!(format, OutputFormat::Webp, "output_format drives the mime");
         assert_eq!(
-            body.get("response_format").and_then(Value::as_str),
-            Some("b64_json"),
-            "one response_format, not two"
+            body.get("user"),
+            Some(&Value::String("123".to_string())),
+            "a numeric-LOOKING caller string is still a string — never re-typed"
+        );
+        assert_eq!(
+            body.get("transparent"),
+            Some(&Value::Bool(true)),
+            "a caller bool survives typed"
+        );
+        assert_eq!(format, OutputFormat::Webp, "output_format drives the mime");
+    }
+
+    /// A caller-supplied `response_format` is refused before the call, whatever the
+    /// value — kaibo owns that parameter (`url` would spend credits on artifacts
+    /// kaibo then refuses; even a redundant `b64_json` is rejected so the contract
+    /// stays one-sided), and the error says why.
+    #[test]
+    fn request_body_refuses_a_caller_response_format() {
+        for value in ["url", "b64_json"] {
+            let err = build_request_body("dall-e-3", &request(&[("response_format", value)]))
+                .expect_err("caller response_format must be refused");
+            assert_eq!(
+                err,
+                OpenAiImagesError::CallerResponseFormat,
+                "value {value:?}"
+            );
+        }
+        let msg = OpenAiImagesError::CallerResponseFormat.to_string();
+        assert!(
+            msg.contains("owned by kaibo") && msg.contains("base64"),
+            "the refusal explains the ownership and the b64 contract, got: {msg}"
         );
     }
 
     /// An unknown output_format fails at request build — before any credits are
     /// spent — not after the provider generated under a format the CAS can't name.
+    /// A non-string value there is the same refusal, rendered via its wire
+    /// spelling.
     #[test]
     fn request_body_refuses_unknown_output_format_before_the_call() {
         let err =
@@ -595,6 +684,30 @@ mod tests {
         assert_eq!(
             err,
             OpenAiImagesError::UnknownOutputFormat("avif".to_string())
+        );
+        let err = build_request_body(
+            "gpt-image-1",
+            &typed_request(&[(
+                "output_format",
+                crate::media::FieldValue::Num(serde_json::Number::from(3)),
+            )]),
+        )
+        .unwrap_err();
+        assert_eq!(err, OpenAiImagesError::UnknownOutputFormat("3".to_string()));
+    }
+
+    /// `parse` is lenient (case, whitespace) but the WIRE gets the canonical
+    /// spelling: `" PNG "` is sent as `png`, never forwarded raw for the provider
+    /// to refuse.
+    #[test]
+    fn request_body_sends_canonical_output_format_spelling() {
+        let (body, format) =
+            build_request_body("gpt-image-1", &request(&[("output_format", " PNG ")])).unwrap();
+        assert_eq!(format, OutputFormat::Png);
+        assert_eq!(
+            body.get("output_format").and_then(Value::as_str),
+            Some("png"),
+            "the canonical lowercase spelling reaches the wire"
         );
     }
 
@@ -697,6 +810,18 @@ mod tests {
             matches!(err, OpenAiImagesError::InvalidB64 { index: 0, .. }),
             "got {err:?}"
         );
+    }
+
+    /// The empty string is VALID base64, so decode success alone would wave a
+    /// zero-byte artifact into the CAS under a real digest — refused by its own
+    /// name instead.
+    #[test]
+    fn parse_response_empty_b64_is_refused_not_a_zero_byte_artifact() {
+        let body = serde_json::json!({
+            "data": [{ "b64_json": b64(b"real") }, { "b64_json": "" }],
+        });
+        let err = parse_response(200, body.to_string().as_bytes(), OutputFormat::Png).unwrap_err();
+        assert_eq!(err, OpenAiImagesError::EmptyArtifact { index: 1 });
     }
 
     /// Zero artifacts is never a success.

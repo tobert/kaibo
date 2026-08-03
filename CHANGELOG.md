@@ -20,10 +20,12 @@ record. Each later release appends a new section at the top.
 - **A second media kind: `openai-images`.** One backend kind covers hosted OpenAI
   image generation (gpt-image-1) *and* a local stable-diffusion.cpp `sd-server`,
   which speaks the same `/v1/images/generations` shape — `base_url` picks the
-  target (unset dials hosted OpenAI), keys ride the same `OPENAI_API_KEY` /
-  `~/.openai-key` sources as the `openai` kind, and the keyless local case works
-  with no credential at all. A single `generate` call can now return several
-  images (the `n` field), each stored under its own digest.
+  target (unset dials hosted OpenAI, so the key is required by default), keys ride
+  the same `OPENAI_API_KEY` / `~/.openai-key` sources as the `openai` kind, and a
+  keyless local server opts in with `key_optional = true`. A single `generate`
+  call can now return several images (the `n` field), each stored under its own
+  digest — and `fields` values keep their JSON types (`n` as a number, `user` as
+  a string) all the way to the provider, on every media kind.
 
 - **kaibo can now generate images.** A new `generate` tool turns a text prompt into
   artifacts through the cast's new `image` slot — a media backend (Stability's v2beta
