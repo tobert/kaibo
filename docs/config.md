@@ -19,7 +19,8 @@ of backends and casts. A missing file at the default path is not an error.
 ## The model: backends, roles, casts
 
 ```
-ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (the wire protocol)
+ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (completion wires)
+             | stability                                             (media wire)
 Backend      = { name, kind, base_url?, key source, request_timeout }
 Cast         = { name, role → ModelSlot }                  (freely spans backends)
 ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
@@ -28,11 +29,16 @@ ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
 Each concept owns one idea:
 
 - **backend** — a *connection*. Carries `kind` (the closed `ProviderKind` enum; it
-  selects the rig client and the request shape), `base_url`, a key source, and
-  `request_timeout`. Answers "how do I reach Gemini".
-- **role** — a *job* a model serves. Two exist: `explorer` and `synth`, the two agent
-  phases. There are no output or production roles, because kaibo reasons over code and
-  renders nothing. Image input is a slot capability (the `vision` pin), not a role.
+  selects the client and the request shape), `base_url`, a key source, and
+  `request_timeout`. Answers "how do I reach Gemini". Kinds divide into two classes:
+  the completion wires (everything through rig's completion clients) and the media
+  wire (`stability`, an image-generation API with no completion surface).
+- **role** — a *job* a model serves. Three exist: `explorer` and `synth`, the two
+  reasoning phases, and `image`, the media member that staffs the `generate` tool.
+  A reasoning role takes a completion backend; the `image` role takes a media backend
+  (kind `stability`) — pairing either with the wrong class is a load error naming the
+  fix. Image *input* is a slot capability (the `vision` pin on a reasoning slot), not
+  a role.
 - **cast** — a *composition*. A named assignment of models to roles. This is what the
   `cast` call parameter selects.
 
@@ -47,8 +53,8 @@ Connection settings only. Models are never declared here.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` | required on a new backend | closed enum; selects client + request shape |
-| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini`; load error elsewhere |
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` | required on a new backend | closed enum; selects client + request shape (`stability` is the media wire — image slots only) |
+| `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini`/`stability`; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
 | `api_key_file` | path | seeded from `kind` | file source, checked second |
@@ -73,6 +79,9 @@ by re-declaration.
 - **`kind = "anthropic"` / `kind = "gemini"`** — optional. Unset resolves to rig's
   built-in `https://api.anthropic.com` / `https://generativelanguage.googleapis.com`.
   Set, it points that wire protocol at a compatible gateway or proxy.
+- **`kind = "stability"`** — optional, same contract: unset dials
+  `https://api.stability.ai`; set, it points the media wire at a compatible
+  gateway or proxy.
 - **Every other kind** — a load error. rig fixes those endpoints.
 
 The value is a **host root**, not a versioned path. rig's `ClientBuilder` appends the
@@ -194,13 +203,18 @@ synth    = "claude/claude-sonnet-4-6"       # the model that answers
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
-**Roles.** `explorer` and `synth`. A misspelled role, or a misspelled per-slot key, is
-a load error rather than a silent no-op.
+**Roles.** `explorer`, `synth`, and `image`. A misspelled role, or a misspelled
+per-slot key, is a load error rather than a silent no-op. The `image` slot is the
+media member: it points at a `stability`-kind backend (its model id picks the route —
+`core`, `ultra`, or an SD3.5 variant) and staffs the `generate` tool. It sends one
+generation request, not a reasoning loop, so the reasoning tunables (`effort`,
+`thinking_budget`, `temperature`, ...) written on it are inert — `kaibo://config`
+flags them under `inert_tunables`.
 
-A cast may omit a role. The interactive built-ins carry both; the batch built-ins carry
-`synth` only. A user cast that omits a role is valid config, and the tool needing the
-missing role fails at call time naming the gap (`cast "lite" has no synth slot`). Absent
-means the capability is absent.
+A cast may omit a role. The interactive built-ins carry explorer + synth; the batch
+built-ins carry `synth` only; none carries `image`. A user cast that omits a role is
+valid config, and the tool needing the missing role fails at call time naming the gap
+(`cast "lite" has no synth slot`). Absent means the capability is absent.
 
 **Slot references.** An unknown backend in a slot is a load error naming the known
 backends. An empty model id is rejected at load, since it would otherwise surface as an
@@ -826,10 +840,13 @@ projects and a browsable CAS would let one project's team enumerate another's ar
 nothing is deleted to make room. The cap is opt-in because enforcing it costs an
 O(objects) walk of the store per new write.
 
-**Failure is loud.** In disk mode, a CAS dir that cannot open — including one that
-resolves inside an allowed project tree, which is refused the same way the state db is —
-fails startup with an error naming the escape hatches. Memory mode is the one warned
-degrade, mirroring the persistence posture it follows.
+**Failure is loud.** In disk mode, a structurally unusable CAS path fails startup with
+an error naming the escape hatches: a dir that resolves inside an allowed project tree
+(refused the same way the state db is), or a file sitting where the store or one of its
+ancestors must be a directory. Write errors that only a real write can reveal
+(permissions, disk full, a read-only mount) surface on the first generation instead —
+opening the store writes nothing, so it cannot probe for them. Memory mode is the one
+warned degrade, mirroring the persistence posture it follows.
 
 ## House rules: `[context]`
 

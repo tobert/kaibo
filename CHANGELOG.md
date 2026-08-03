@@ -27,7 +27,9 @@ record. Each later release appends a new section at the top.
   when the store is on disk. Provider-native options (`aspect_ratio`,
   `output_format`, `seed`, `negative_prompt`, ...) pass through a `fields` object
   verbatim. Operations the provider declares deferred return a `job-N` handle on the
-  existing `job_wait`/`job_get`/`job_list`/`job_cancel` verbs. The tool follows the
+  existing `job_wait`/`job_get`/`job_list`/`job_cancel` verbs (the lane ships
+  offline-tested; every Stability operation wired today is synchronous). The tool
+  follows the
   staffing discipline: no configured cast with an `image` slot (a stock install)
   means it is not advertised and costs nothing; `--no-generate` /
   `KAIBO_NO_GENERATE` / `[server.tools] generate = false` switch it off explicitly.

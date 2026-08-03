@@ -36,7 +36,8 @@ slot, `MediaModel`/`MediaArm` (complete outcomes are `Vec<MediaArtifact>` — on
 one provenance sidecar per artifact, Amy 2026-08-03), the `[cas]` lifecycle (disk with
 persistence / in-memory without, SEVERE-warned / `enabled = false` off, un-advertising the
 tools that need it), the `generate` tool (its own `--no-generate` flag, staffed by the
-`image` slot via `CAST_ENUM_RULES`, deferred shapes on the `job-N` verbs), and the
+`image` slot via `CAST_ENUM_RULES`, deferred shapes on the `job-N` verbs — the lane
+only; every Stability operation wired today is synchronous), and the
 operator-only `kaibo://cas/<digest>` retrieval resource. The tool returns digests +
 URIs (+ real path on disk), never inline bytes — as decided.
 

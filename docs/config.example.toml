@@ -311,18 +311,21 @@ scratch_limit_bytes = 67108864
 #                                          # 0 is a load error, not "refuse everything".
 
 # ---------------------------------------------------------------------------
-# [backends.<name>] — CONNECTIONS only: `kind` picks the wire protocol/rig client
-# (anthropic | deepseek | gemini | openai); the rest describes the wire (endpoint,
-# key source, per-request deadline). Models live on cast slots, never here.
+# [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
+# completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
+# reasoning slots; the media wire (stability) serves `image` slots only. The rest
+# describes the wire (endpoint, key source, per-request deadline). Models live on
+# cast slots, never here.
 #
 # Keys are referenced, never inlined: api_key_env names an env var, api_key_file a
 # path (~ ok). env wins over file. key_optional=true falls back to a placeholder
 # bearer token (keyless local servers). base_url is legal on the openai kind
-# (required for a new backend) and the anthropic and gemini kinds (optional —
-# unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com;
-# set it to point at an Anthropic/Gemini-API-compatible gateway/proxy instead —
-# a HOST ROOT in both cases, since rig appends its own versioned path). Every
-# other keyed kind rejects base_url at load (rig fixes those endpoints).
+# (required for a new backend), the anthropic and gemini kinds (optional —
+# unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
+# and the stability kind (optional — unset dials api.stability.ai); set it to point
+# the same wire at a compatible gateway/proxy instead — a HOST ROOT in every case,
+# since the client appends its own versioned path. Every other keyed kind rejects
+# base_url at load (rig fixes those endpoints).
 # ---------------------------------------------------------------------------
 
 # --- The five built-ins, shown with their current defaults. You only need to
@@ -430,8 +433,9 @@ wire = "responses"
 # The calling agent sees your cast names — name them for intent (`local-only`,
 # `deep-dive`) so it can route by name without reading this file.
 #
-# Roles: explorer, synth (the agent phases). There are no output/production roles —
-# kaibo reasons over code and renders nothing. A typo'd role is a loud load
+# Roles: explorer, synth (the reasoning phases), and image (the media member — it
+# points at a stability backend and staffs `generate`; see the image-slot example
+# below). A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
 # naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
 #
