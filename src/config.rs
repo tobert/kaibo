@@ -1930,11 +1930,28 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             ..ModelSlot::bare(&name, id)
         };
         let or = matches!(kind, ProviderKind::OpenRouter);
+        // Synth headroom pins, from measurement (2026-08-02, whole-file attach +
+        // exhaustive-review ask at the 16384 default): reasoning bills into the same
+        // completion budget as the answer, and deepseek-v4-pro spent HALF of a 10.6K
+        // completion on reasoning — so the deepseek and anthropic synths (both
+        // thinking-on by default, ceilings far above this) get 2× the [defaults]
+        // floor. The other built-ins are unmeasured and stay on the floor; the pin
+        // table lives with `builtin_synth_max_tokens_pins_are_deliberate`.
+        let synth_max_tokens = match kind {
+            ProviderKind::Anthropic | ProviderKind::DeepSeek => Some(32_768),
+            _ => None,
+        };
         // Both agent roles are seeded. A cast may omit one in config — absent means
         // the capability is absent, and nothing downstream errors on that.
         let slots = BTreeMap::from([
             (ModelRole::Explorer, slot(explorer, or.then_some(true))),
-            (ModelRole::Synth, slot(synth, None)),
+            (
+                ModelRole::Synth,
+                ModelSlot {
+                    max_tokens: synth_max_tokens,
+                    ..slot(synth, None)
+                },
+            ),
         ]);
         m.insert(name.clone(), Cast { name, slots });
     }
@@ -3321,6 +3338,36 @@ mod tests {
         assert_eq!(b.kind, ProviderKind::Anthropic);
         assert_eq!(b.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert!(!b.key_optional);
+    }
+
+    /// Built-in synth `max_tokens` pins are deliberate — a future edit moves this
+    /// test, not just the cast table. Measured 2026-08-02 at the 16384 default
+    /// (whole-file attach, exhaustive-review ask): deepseek-v4-pro used 10.6K of
+    /// 16.4K with half spent on reasoning, which bills into the same completion
+    /// budget as the answer — so the deepseek and anthropic synths get 2× headroom.
+    /// The unmeasured casts stay on the `[defaults]` floor (16384) rather than
+    /// guessing a ceiling.
+    #[test]
+    fn builtin_synth_max_tokens_pins_are_deliberate() {
+        let cfg = Config::builtin();
+        for (name, expected) in [
+            ("deepseek", Some(32_768)),
+            ("anthropic", Some(32_768)),
+            ("gemini", None),
+            ("openrouter", None),
+            ("openai-local", None),
+            ("gemini-batch", None),
+            ("anthropic-batch", None),
+        ] {
+            let cast = cfg.resolve_cast(name).unwrap();
+            let s = cast.require_slot(ModelRole::Synth).unwrap();
+            assert_eq!(s.max_tokens, expected, "synth max_tokens pin for {name:?}");
+            // Explorers sweep and cite; none has shown reasoning pressure, so every
+            // explorer slot inherits the [defaults] floor.
+            if let Some(e) = cast.slots.get(&ModelRole::Explorer) {
+                assert_eq!(e.max_tokens, None, "explorer stays on the floor for {name:?}");
+            }
+        }
     }
 
     /// Every interactive built-in cast exists, each single-backend with

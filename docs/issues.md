@@ -704,6 +704,36 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
 
+### Synth output budgets — measure the remaining casts before moving them
+
+Shipped 2026-08-03: output ceilings are normalized (`DiscoveredModel.output_ceiling`:
+OpenRouter `top_provider.max_completion_tokens`, Gemini `outputTokenLimit`) and
+rendered by `kaibo models` / `list_models`; the configure prompt and the
+`max_tokens` guide entry both say to size a synth slot from the ceiling; the built-in
+deepseek and anthropic casts pin synth `max_tokens = 32768`
+(`config.rs::builtin_casts`, test `builtin_synth_max_tokens_pins_are_deliberate`).
+
+The measurement that drove the pins (2026-08-02, attach `render.rs`,
+exhaustive-review ask, at the 16384 `[defaults]` floor):
+
+| cast | completion used / cap | reasoning share |
+|---|---|---|
+| deepseek | 10.6K / 16.4K | ~half of the completion |
+| or-glm | 10.2K / 16.4K | 0 |
+| or-kimi | 15,916 / 16,384 (97%) | hidden inside output; odd accounting, ~1.35 chars/token |
+
+Open work:
+
+- **The unmeasured built-ins stay on the 16384 floor** (gemini, openrouter/qwen,
+  openai-local, gemini-batch, anthropic-batch). Measure each the same way before
+  pinning — a pin without a measurement is a guess.
+- **or-kimi sits at 97% of its cap and its provider ceiling IS 16384** — raising it
+  is not an option; watch it for truncation/starvation and consider whether a
+  16384-capped reasoner belongs in a synth slot at all.
+- **Anthropic providers don't report a ceiling on `/v1/models`**, so the anthropic
+  pin rests on the DeepSeek measurement plus known thinking-on billing, not a
+  catalog number. Confirm with a live probe when convenient.
+
 ### OpenRouter cost + shaping follow-ups (measured $4 GLM consult, 2026-07-03)
 First live `or-glm` consult (GLM-5 explorer / GLM-5.2 synth, 8 whole files attached):
 203 chat turns in 21 min, 18.2M cumulative input tokens (16.4M cache reads) for ~40K
@@ -732,9 +762,9 @@ Remaining OpenRouter-specific forks:
 - **Per-slot output ceilings vary by pinned slug** (`top_provider.max_completion_tokens`:
   glm-5.2 32768, kimi-k2.7-code 16384, gpt-5.5 128000) and reasoning bills into the
   same completion budget — the `[defaults]` 16384 starved a real GLM oneshot answer
-  mid-sentence. Per-slot `max_tokens` already exists; the gap is doctrine: set a synth
-  slot's ceiling from the catalog when pinning a slug, and watch 16384-capped reasoners
-  (kimi) for starvation.
+  mid-sentence. The doctrine half shipped (ceilings rendered by `list_models`, sizing
+  guidance in the configure prompt and config guide — see "Synth output budgets"
+  above); still open here: watch 16384-capped reasoners (kimi) for starvation.
 - **Provider routing variance — data policy shipped, the rest open.** One slug routes
   to multiple upstream hosts differing in cache support, quantization, pricing, and
   parameter fidelity. `provider.data_collection = "deny"` now rides every request by

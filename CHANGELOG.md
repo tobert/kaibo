@@ -17,6 +17,15 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **Model listings now show each model's output ceiling.** `kaibo models` and the
+  `list_models` tool render the provider's advertised max completion tokens beside the
+  context window (OpenRouter's `top_provider.max_completion_tokens`, Gemini's
+  `outputTokenLimit`; providers that don't publish one show nothing), and the `--json` /
+  structured face carries it as `output_ceiling`. This is the number to size a synth
+  slot's `max_tokens` from — reasoning bills into the same completion budget as the
+  answer — and the `configure` prompt and the `max_tokens` entry in
+  `kaibo://config/guide` now both say so.
+
 - **The explorer can now hand whole files to whoever reads its report.** Inside
   `consult` and `deliberate`, the delegated investigator gets an `attach` tool: when a
   whole file is the evidence, it routes the file's real bytes (numbered, `cat -n`
@@ -59,6 +68,12 @@ record. Each later release appends a new section at the top.
   all three.
 
 ### Changed
+
+- **The built-in deepseek and anthropic casts give their synth more room to answer.**
+  Both pin the synth slot's `max_tokens` to 32768, twice the 16384 `[defaults]` floor,
+  because a measured consult showed deepseek-v4-pro spending half its completion budget
+  on reasoning before the answer even started. The `[defaults]` floor itself is
+  unchanged, and every other built-in cast stays on it until measured.
 
 - **kaibo's models now work from a role, not a job description.** Every preamble opens
   on who the model is on kaibo's team — "You are the synthesis agent", "You are the
