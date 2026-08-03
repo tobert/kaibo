@@ -38,16 +38,20 @@ use crate::config::{Backend, ModelSlot};
 use crate::credentials::{MediaKind, ProviderClass};
 
 /// One generation request, provider-neutral. The prompt is the portable half; every
-/// provider-native knob (seed, aspect ratio, negative prompt, output format, an
-/// explicit `model` form field, ...) rides `fields` untyped — kaibo keeps no
-/// allowlist, the provider answers for its own knobs, the same passthrough posture
-/// `additional_params` takes on the completion side.
+/// provider-native knob (seed, aspect ratio, negative prompt, output format, ...)
+/// rides `fields` untyped — kaibo keeps no allowlist, the provider answers for its own
+/// knobs, the same passthrough posture `additional_params` takes on the completion
+/// side. (`prompt` and `model` never ride `fields`: the tool layer reserves both, so
+/// the recorded provenance always describes the request that ran.)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaRequest {
     pub prompt: String,
-    /// `(name, value)` provider-native fields, order-preserving; a later entry with a
-    /// repeated name overrides the earlier one (Stability's `build_form_fields`
-    /// contract, adopted here as the neutral semantics).
+    /// `(name, value)` provider-native fields: **uniquely named**, in the order the
+    /// caller gave them (kept as a `Vec` because a provider may care about order —
+    /// the MCP face is a map, so duplicate names cannot arrive from a tool call). A
+    /// provider impl may seed its own defaults (Stability seeds `output_format`) and
+    /// lets a caller field of the same name replace the seeded default — that merge
+    /// is the provider's business, not a contract of this struct.
     pub fields: Vec<(String, String)>,
     /// Bytes of an input image, for the operations that take one (edit / upscale /
     /// image-to-image). `None` for text-to-image. Carried on the request now so the

@@ -173,6 +173,14 @@ pub enum CasError {
          the CAS directory by hand)"
     )]
     CapacityExceeded { max_bytes: u64, current_bytes: u64 },
+    /// The requested CAS root — or a path component on the way to it — exists but is
+    /// not a directory, so the store structurally cannot live there. Caught at
+    /// [`Cas::open`] so it fails startup, not the first paid generation.
+    #[error(
+        "media CAS path cannot be used: {0} is not a directory — the store needs a \
+         directory (or a creatable path whose existing ancestors are directories)"
+    )]
+    NotADirectory(String),
     /// A filesystem operation failed for a reason other than the ones above (permissions,
     /// disk full, an unreadable existing file, …), surfaced verbatim.
     #[error("media CAS io: {0}")]
@@ -367,6 +375,12 @@ pub struct Cas {
     /// The optional soft cap. `None` — the default — means no ceiling AND no size
     /// accounting: [`Cas::put`] never walks the store. See [`Cas::open`].
     max_bytes: Option<u64>,
+    /// Serializes [`Cas::put`] across threads sharing this store (clones share it —
+    /// the handler holds one `Arc<MediaStore>` across concurrent MCP calls).
+    /// Generation is rare and writes are small, so a plain mutex buys the whole
+    /// check-then-write path (dedup verify, cap accounting, object + sidecar) its
+    /// atomicity with no cleverness. See [`Cas::put`].
+    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl Cas {
@@ -408,9 +422,21 @@ impl Cas {
                 return Err(CasError::PathInAllowedTree(dir.display().to_string()));
             }
         }
+        // Structural check, still with zero side effects: the deepest EXISTING path on
+        // the way to the root must be a directory (the root itself included, when it
+        // exists). A file sitting there means every future write must fail — caught
+        // here so it fails startup, not the first paid generation. What this can NOT
+        // vouch for without writing is writability (permissions, disk full, a
+        // read-only mount); those still surface on first use.
+        if let Some(existing) = first_existing_ancestor(&dir) {
+            if !existing.is_dir() {
+                return Err(CasError::NotADirectory(existing.display().to_string()));
+            }
+        }
         Ok(Self {
             root: dir,
             max_bytes,
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -525,15 +551,31 @@ impl Cas {
     /// into a poisoned slot — the caller's data was never at risk, only the report of
     /// success was. A verified dedup is **not** re-checked against the soft cap — it adds
     /// zero new bytes, so it cannot be what pushes the store over the line. Otherwise (new
-    /// content) the soft cap is checked *before* any write: if the current total plus
-    /// `bytes.len()` would exceed `max_bytes`, the write is refused with
+    /// content) the soft cap is checked *before* any write, and it counts the whole
+    /// footprint this put would add — the artifact **and** its provenance sidecar,
+    /// which is real disk usage written by the same call: if the current total plus
+    /// both would exceed `max_bytes`, the write is refused with
     /// [`CasError::CapacityExceeded`] and nothing is written — never evicted, see the
     /// module doc.
+    ///
+    /// The whole body runs under the store's write mutex, so concurrent puts on
+    /// clones/`Arc`s of one store serialize: the dedup check, the cap accounting, and
+    /// the two writes are atomic with respect to each other. If `create_new` still
+    /// loses to something that appeared from outside this process (another kaibo, an
+    /// operator's copy), the existing bytes are read back and **verified** before
+    /// success is reported — never trusted from the path alone.
     pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
         let digest = Digest::of_bytes(bytes);
         let shard = self.shard_dir(&digest);
         let obj_path = self.object_path(&digest, ext);
         let sidecar_path = self.sidecar_path(&digest);
+
+        let _write_guard = self.write_lock.lock().expect("cas write mutex poisoned");
+
+        // Serialized up front so the cap admission below can count it — the sidecar is
+        // part of this put's disk footprint, not an afterthought.
+        let sidecar_json = serde_json::to_vec_pretty(provenance)
+            .map_err(|e| CasError::Serialize(e.to_string()))?;
 
         if obj_path.is_file() {
             // Dedup path: the module doc's "AlreadyExists means these exact bytes are
@@ -557,7 +599,7 @@ impl Cas {
             // all. This is the ONLY call site that walks the store, and it is reached only
             // when an operator opted into a ceiling — an uncapped CAS never sizes itself.
             let current = self.total_bytes()?;
-            let incoming = bytes.len() as u64;
+            let incoming = bytes.len() as u64 + sidecar_json.len() as u64;
             if current.saturating_add(incoming) > max_bytes {
                 return Err(CasError::CapacityExceeded {
                     max_bytes,
@@ -571,11 +613,25 @@ impl Cas {
                 CasError::Io(format!("creating cas shard dir {}: {e}", shard.display()))
             })?;
 
-        write_new_file(&obj_path, bytes)
+        let wrote = write_new_file(&obj_path, bytes)
             .map_err(|e| CasError::Io(format!("writing cas object {}: {e}", obj_path.display())))?;
+        if !wrote {
+            // The pre-check saw nothing here, yet `create_new` lost: something claimed
+            // the path from outside this process (the in-process race is excluded by
+            // the mutex above). The contract stands — an existing object is a VERIFIED
+            // no-op — so read back and verify before reporting success. A path that
+            // exists but cannot even be read (a dangling symlink, permissions) is a
+            // loud Io error, never a silent "someone else surely wrote it".
+            let existing = std::fs::read(&obj_path).map_err(|e| {
+                CasError::Io(format!(
+                    "cas object {} was claimed concurrently but cannot be read back to \
+                     verify: {e}",
+                    obj_path.display()
+                ))
+            })?;
+            verify(&digest, existing)?;
+        }
 
-        let sidecar_json = serde_json::to_vec_pretty(provenance)
-            .map_err(|e| CasError::Serialize(e.to_string()))?;
         write_new_file(&sidecar_path, &sidecar_json).map_err(|e| {
             CasError::Io(format!(
                 "writing cas provenance sidecar {}: {e}",
@@ -737,12 +793,13 @@ impl MediaStore {
 
 /// Create `path` as a brand-new file (`create_new` — `O_EXCL` on Unix), write `bytes` to
 /// it, and `sync_all` before returning — pushing both data and metadata to durable storage
-/// rather than leaving them in a page-cache buffer a crash could still lose. If `path`
-/// already exists this is a deliberate no-op (`Ok(())`, not an error): on a
-/// content-addressed path that *should* only mean these exact bytes are already there —
-/// see [`CasError::Corrupt`] and [`Cas::get`] for why callers can no longer take that on
-/// faith alone. Any other I/O failure (permissions, disk full, the parent directory
-/// missing) is propagated. There is no unlink, truncate, or rename anywhere in this
+/// rather than leaving them in a page-cache buffer a crash could still lose. Returns
+/// `Ok(true)` when this call wrote the file, `Ok(false)` when `path` already existed
+/// (nothing written) — the CALLER decides what an existing path means: [`Cas::put`]
+/// verifies an existing object's bytes before reporting success (see
+/// [`CasError::Corrupt`]), and treats an existing sidecar as fine. Any other I/O
+/// failure (permissions, disk full, the parent directory missing) is propagated.
+/// There is no unlink, truncate, or rename anywhere in this
 /// function or its caller — an "edit" is always a new digest, never a mutation of an
 /// existing object.
 ///
@@ -753,17 +810,18 @@ impl MediaStore {
 /// window is exactly why verification on read ([`Cas::get`]) and on dedup ([`Cas::put`])
 /// exists as the actual backstop — fsync narrows how often corruption occurs, verification
 /// is what guarantees it is never handed back silently when it does.
-fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     use std::io::Write;
 
     let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
     };
     file.write_all(bytes)?; // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
-    file.sync_all()
+    file.sync_all()?;
+    Ok(true)
 }
 
 /// Verify that `bytes` hashes to `digest`, consuming `bytes` into the `Ok` case so a
@@ -843,6 +901,21 @@ fn resolve_existing_ancestor(path: &Path) -> PathBuf {
         }
     }
     normalize(path)
+}
+
+/// The deepest existing path at-or-above `path` — `path` itself when it exists, else
+/// the nearest existing ancestor; `None` when nothing on the way up exists (an
+/// absolute path always bottoms out at `/`, so this is the degenerate relative case).
+/// Backs [`Cas::open`]'s structural check: whatever exists on the way to the root
+/// must be a directory, or no future write can succeed.
+fn first_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut cursor = path;
+    loop {
+        if cursor.exists() {
+            return Some(cursor);
+        }
+        cursor = cursor.parent()?;
+    }
 }
 
 /// Lexically clean a path (resolve `.` and `..` without touching the filesystem).

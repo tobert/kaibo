@@ -178,14 +178,16 @@ fn running_beat(last_progress: &Option<(String, u64)>) -> String {
     }
 }
 
-/// Render an async consultation job for the unified `job_get`: a status line while it runs,
-/// the grounded answer (and optional report) when it's done, the stored failure text on
-/// error, or a canceled notice. Mirrors the synchronous `consult` result shape so an
-/// agent reads the same thing whether it asked synchronously or collected a job.
+/// Render an async background job for the unified `job_get`: a status line while it runs,
+/// the result (and optional report) when it's done, the stored failure text on
+/// error, or a canceled notice. Producer-neutral on purpose — a `job-N` may be a
+/// consultation, a deliberation, or a deferred generation, and this render serves all
+/// of them; the label carries the producer's own description. A finished consultation
+/// still mirrors the synchronous `consult` result shape.
 pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
     match snap.state {
         JobState::Running => CallToolResult::success(vec![ContentBlock::text(format!(
-            "Consultation `{id}` is still running — {} ({}s elapsed){}. No need to wait: go \
+            "Job `{id}` is still running — {} ({}s elapsed){}. No need to wait: go \
              do other work and `job_get` it again later.",
             snap.label,
             snap.age.as_secs(),
@@ -201,7 +203,7 @@ pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
         }
         JobState::Failed(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
         JobState::Canceled => CallToolResult::success(vec![ContentBlock::text(format!(
-            "Consultation `{id}` was canceled."
+            "Job `{id}` was canceled."
         ))]),
     }
 }
@@ -348,9 +350,9 @@ pub(crate) fn batch_within_window(
 /// informative ("none"), so the section always renders.
 pub(super) fn render_jobs_section(jobs: &[(String, JobSnapshot)]) -> String {
     if jobs.is_empty() {
-        return "Consult jobs (this session): none.".to_string();
+        return "Background jobs (this session): none.".to_string();
     }
-    let mut s = String::from("Consult jobs (this session), newest first:");
+    let mut s = String::from("Background jobs (this session), newest first:");
     for (id, snap) in jobs {
         let state = match &snap.state {
             JobState::Running => {

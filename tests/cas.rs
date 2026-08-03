@@ -294,7 +294,10 @@ fn put_returns_corrupt_error_when_dedup_slot_is_poisoned() {
 
     // Poison the slot out-of-band, as if a prior crash left a truncated file there — before
     // any real `put` ever wrote to it.
-    let shard = cas.root().join(&digest.to_hex()[0..2]).join(&digest.to_hex()[2..4]);
+    let shard = cas
+        .root()
+        .join(&digest.to_hex()[0..2])
+        .join(&digest.to_hex()[2..4]);
     std::fs::create_dir_all(&shard).unwrap();
     let path = shard.join(format!("{}.png", digest.to_hex()));
     std::fs::write(&path, b"poisoned").unwrap();
@@ -363,7 +366,9 @@ fn path_for_uses_the_two_level_hex_shard_layout() {
     let rel = path.strip_prefix(cas.root()).unwrap();
     assert_eq!(
         rel,
-        Path::new(&hex[0..2]).join(&hex[2..4]).join(format!("{hex}.jpeg"))
+        Path::new(&hex[0..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.jpeg"))
     );
 }
 
@@ -376,7 +381,10 @@ fn put_writes_a_provenance_sidecar_next_to_the_object() {
 
     let obj_path = cas.path_for(&digest).unwrap();
     let sidecar_path = obj_path.with_extension("json");
-    assert!(sidecar_path.is_file(), "sidecar must exist next to the object");
+    assert!(
+        sidecar_path.is_file(),
+        "sidecar must exist next to the object"
+    );
 
     let raw = std::fs::read_to_string(&sidecar_path).unwrap();
     let parsed: Provenance = serde_json::from_str(&raw).unwrap();
@@ -475,8 +483,13 @@ fn an_uncapped_cas_never_walks_the_store_to_size_it() {
 
 #[test]
 fn soft_cap_refuses_a_write_that_would_exceed_it() {
-    let (cas, _d) = open(16); // 16 bytes total budget
+    // Budget for exactly one object-plus-sidecar footprint (admission counts both).
     let small = vec![1u8; 8];
+    let (probe, probe_dir) = open_uncapped();
+    probe.put(&small, Extension::Png, &prov()).unwrap();
+    let budget = dir_size(&probe_dir.path().join("cas"));
+
+    let (cas, _d) = open(budget);
     let d1 = cas.put(&small, Extension::Png, &prov()).unwrap();
 
     let too_big = vec![2u8; 100];
@@ -497,8 +510,13 @@ fn soft_cap_refuses_a_write_that_would_exceed_it() {
 /// because a naive "current + incoming" sum would look like it exceeds — it adds no bytes.
 #[test]
 fn soft_cap_does_not_block_a_dedup_write_of_existing_content() {
+    // Budget for exactly one footprint (object + sidecar): zero slack afterwards.
     let bytes = vec![7u8; 10];
-    let (cas, _d) = open(10); // exactly the size of one object, zero slack
+    let (probe, probe_dir) = open_uncapped();
+    probe.put(&bytes, Extension::Gif, &prov()).unwrap();
+    let budget = dir_size(&probe_dir.path().join("cas"));
+
+    let (cas, _d) = open(budget);
     let d1 = cas.put(&bytes, Extension::Gif, &prov()).unwrap();
     // Re-putting the identical bytes must still succeed even though the cap has no slack
     // left for "new" bytes — it isn't new, it's the same object.
@@ -569,7 +587,10 @@ fn media_store_paths_exist_on_disk_and_not_in_memory() {
     let bytes = b"artifact".to_vec();
     let d_disk = disk.put(&bytes, Extension::Jpeg, &prov()).unwrap();
     let d_mem = mem.put(&bytes, Extension::Jpeg, &prov()).unwrap();
-    assert_eq!(d_disk, d_mem, "the address is the content, mode-independent");
+    assert_eq!(
+        d_disk, d_mem,
+        "the address is the content, mode-independent"
+    );
 
     assert!(disk.path_for(&d_disk).is_some_and(|p| p.is_file()));
     assert!(disk.root().is_some());
@@ -595,7 +616,179 @@ fn extension_maps_mimes_both_ways_and_refuses_unknown() {
     for ext in Extension::ALL {
         assert_eq!(Extension::from_mime(ext.mime()), Some(ext));
     }
-    assert_eq!(Extension::from_mime("IMAGE/PNG; charset=binary"), Some(Extension::Png));
+    assert_eq!(
+        Extension::from_mime("IMAGE/PNG; charset=binary"),
+        Some(Extension::Png)
+    );
     assert_eq!(Extension::from_mime("audio/mpeg"), None);
     assert_eq!(Extension::from_mime("model/gltf-binary"), None);
+}
+
+// --- or-gpt review follow-ups (2026-08-03) ------------------------------------
+
+/// Sum of every file under `dir`, recursively — the store's true on-disk footprint.
+fn dir_size(dir: &Path) -> u64 {
+    fn walk(dir: &Path) -> u64 {
+        if !dir.is_dir() {
+            return 0;
+        }
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p)
+                } else {
+                    e.metadata().unwrap().len()
+                }
+            })
+            .sum()
+    }
+    walk(dir)
+}
+
+/// The cap admits an object only if the artifact AND its provenance sidecar both fit —
+/// the sidecar is real disk usage written by the same put, so an admission check that
+/// ignored it overshot the ceiling by the sidecar's size on every accepted write.
+#[test]
+fn soft_cap_admission_counts_the_provenance_sidecar() {
+    // Measure the true footprint of one put (object + sidecar) with no cap in the way.
+    let bytes = vec![9u8; 100];
+    let (probe, probe_dir) = open_uncapped();
+    probe.put(&bytes, Extension::Png, &prov()).unwrap();
+    let footprint = dir_size(&probe_dir.path().join("cas"));
+    assert!(
+        footprint > bytes.len() as u64,
+        "the sidecar adds real bytes beyond the artifact ({footprint})"
+    );
+
+    // One byte under the true footprint: refused up front, nothing written.
+    let (cas, d) = open(footprint - 1);
+    match cas.put(&bytes, Extension::Png, &prov()) {
+        Err(CasError::CapacityExceeded { .. }) => {}
+        other => panic!("a put whose sidecar would breach the cap must be refused, got {other:?}"),
+    }
+    assert_eq!(
+        dir_size(&d.path().join("cas")),
+        0,
+        "a refused put writes nothing at all"
+    );
+
+    // Exactly the footprint: accepted, and the real directory size respects the cap.
+    let (cas, d) = open(footprint);
+    cas.put(&bytes, Extension::Png, &prov()).unwrap();
+    assert_eq!(dir_size(&d.path().join("cas")), footprint);
+}
+
+/// A `create_new` that loses to something already sitting at the object path must
+/// verify what is there before reporting success — the doc contract says an existing
+/// object is a VERIFIED no-op. The deterministic stand-in for the concurrent race: a
+/// dangling symlink at the object path passes the `is_file()` pre-check as "nothing
+/// here" (it follows the link), then `O_EXCL` refuses with `AlreadyExists` — the exact
+/// post-pre-check appearance the race produces. Reporting Ok there would claim bytes
+/// were stored when nothing readable exists at the address.
+#[cfg(unix)]
+#[test]
+fn put_losing_create_new_after_the_precheck_still_verifies() {
+    let (cas, _d) = open_uncapped();
+    let bytes = b"raced-content".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+    let hex = digest.to_hex();
+    let shard = cas.root().join(&hex[0..2]).join(&hex[2..4]);
+    std::fs::create_dir_all(&shard).unwrap();
+    std::os::unix::fs::symlink(
+        "/nonexistent-kaibo-cas-target",
+        shard.join(format!("{hex}.png")),
+    )
+    .unwrap();
+
+    match cas.put(&bytes, Extension::Png, &prov()) {
+        Ok(_) => panic!(
+            "put must not report success when the path was claimed by something it \
+             could not verify"
+        ),
+        Err(CasError::Io(_) | CasError::Corrupt { .. }) => {}
+        Err(other) => panic!("unexpected error kind: {other:?}"),
+    }
+}
+
+/// Two concurrent puts of identical new content, on clones sharing one store: both
+/// callers return success only once a verified object AND its sidecar exist. `Cas`
+/// serializes its write path (handler clones share one `Arc<MediaStore>`, so
+/// concurrent MCP calls really do land here), and the dedup arm verifies rather than
+/// trusts — so whichever caller loses the race still speaks the truth when it
+/// reports success.
+#[test]
+fn concurrent_identical_puts_both_return_verified() {
+    let (cas, _d) = open_uncapped();
+    for round in 0u32..32 {
+        let bytes = format!("round-{round}-content").into_bytes();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let digests: Vec<Digest> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let cas = cas.clone();
+                    let bytes = bytes.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        cas.put(&bytes, Extension::Png, &prov())
+                            .expect("put succeeds")
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(digests[0], digests[1]);
+        // Both returned: the object must be present, verified, with its sidecar.
+        assert_eq!(
+            cas.get(&digests[0]).expect("verified read"),
+            Some(bytes.clone()),
+            "round {round}: the bytes both callers vouched for must be there, intact"
+        );
+        let hex = digests[0].to_hex();
+        let sidecar = cas
+            .root()
+            .join(&hex[0..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.json"));
+        assert!(
+            sidecar.is_file(),
+            "round {round}: the sidecar must exist once success was reported"
+        );
+    }
+}
+
+/// `Cas::open` refuses a root that structurally cannot become a store directory: an
+/// existing FILE at the root, or a file where an ancestor directory would have to be.
+/// Without this, startup passes and the failure surfaces only on the first PAID
+/// generation — the guide promises structural path errors fail at open.
+#[test]
+fn open_refuses_a_file_at_the_root_or_in_its_ancestry() {
+    let dir = TempDir::new().unwrap();
+
+    // A file sitting exactly at the requested root.
+    let file_root = dir.path().join("occupied");
+    std::fs::write(&file_root, b"not a directory").unwrap();
+    match Cas::open(&file_root, &[], None) {
+        Ok(_) => panic!("a file at the CAS root must be refused at open"),
+        Err(e) => assert!(
+            format!("{e}").contains("not a directory"),
+            "the error names the problem, got: {e}"
+        ),
+    }
+
+    // A file where an ancestor of the (not-yet-created) root would have to be a dir.
+    let nested = file_root.join("cas");
+    match Cas::open(&nested, &[], None) {
+        Ok(_) => panic!("a file in the root's ancestry must be refused at open"),
+        Err(e) => assert!(
+            format!("{e}").contains("not a directory"),
+            "the error names the problem, got: {e}"
+        ),
+    }
+
+    // A plain directory (or a path whose ancestors are dirs) still opens fine.
+    Cas::open(&dir.path().join("fresh").join("cas"), &[], None).expect("clean path opens");
 }
