@@ -212,7 +212,7 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     // fallback) — with ONE narrow, deliberate carve-out below. The store is fed the handler's
     // resolved allowed set so its containment guard refuses a state db inside any project
     // tree. When persistence is off, the handler keeps its in-memory sessions unchanged.
-    let handler = if persistence.enabled {
+    let (handler, persistence_active) = if persistence.enabled {
         let path = persistence
             .path
             .expect("an enabled persistence store has a resolved path (validated at load)");
@@ -224,7 +224,7 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
                     state_db = %path.display(),
                     "persistence enabled — sessions and batch handles are durable across restarts"
                 );
-                handler.with_session_store(store)
+                (handler.with_session_store(store), true)
             }
             // THE ONE CARVE-OUT (Windows / single-process platforms only): another kaibo
             // already holds the db. MP-WAL is 64-bit-Unix-only, so a `SingleProcessLocked`
@@ -242,7 +242,7 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
                      kaibo://config shows persistence.active=false). Close the other kaibo, \
                      point --state-db elsewhere, or set --no-persistence to silence this."
                 );
-                handler
+                (handler, false)
             }
             // A special-cased arm, like `SingleProcessLocked` above: the generic message
             // below never mentions --root/--allow-path, which is actually the most natural
@@ -277,8 +277,13 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
             "persistence disabled — sessions are in-memory (lost on restart), \
              batch handles held nowhere"
         );
-        handler
+        (handler, false)
     };
+    // Settle the media CAS now that persistence's runtime truth is known: disk while
+    // persistence is active, in-memory (with a SEVERE warning) while it is not, off
+    // when the operator said `[cas] enabled = false`. A disk-open failure is fatal —
+    // crash over a silent fallback to memory, same posture as the store above.
+    let handler = handler.finalize_media_store(persistence_active)?;
     // Log the resolved (canonicalized) allowed set so the operator can verify the
     // containment boundary without inspecting config files.
     tracing::info!(

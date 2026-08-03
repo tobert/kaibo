@@ -976,11 +976,20 @@ impl Default for PersistenceConfig {
 
 /// `[cas]` — the media content-addressed store where generated artifacts land.
 ///
-/// There is no `enabled` flag here on purpose: the CAS exists exactly when a tool that
-/// writes to it does, and those tools carry their own `--no-<tool>` gates plus the cast
-/// staffing gate. A second on/off switch would just be a way for the two to disagree.
+/// Lifecycle (Amy's ruling, 2026-08-03, reversing an earlier "no enabled flag" stance
+/// recorded here): the CAS is **on by default** and follows persistence — disk-backed at
+/// the fixed XDG data path while persistence is active, in-memory (artifacts lost on
+/// restart, warned LOUDLY at startup) while it is not. `enabled = false` is the explicit
+/// off switch, and it un-advertises every tool that needs the CAS — the same
+/// route-dropped posture the staffing gate takes, with the reason distinguishable in the
+/// startup warning and `kaibo://config` ("you disabled it" vs "nothing can staff it").
+/// The earlier stance ("the tool gates suffice") under-counted the modes: with disk /
+/// memory / off there are three states, and only an explicit flag makes "off" a choice
+/// rather than a side effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasConfig {
+    /// The explicit off switch (`[cas] enabled = false`). Default `true`.
+    pub enabled: bool,
     /// Where artifacts live. Defaults to `$XDG_DATA_HOME/kaibo/cas`, else
     /// `~/.local/share/kaibo/cas` — the *data* dir, not the state dir the session db
     /// uses, because these are artifacts the user paid for and may never be able to
@@ -1001,8 +1010,63 @@ pub struct CasConfig {
 impl Default for CasConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             dir: crate::cas::default_cas_dir(),
             max_bytes: None,
+        }
+    }
+}
+
+/// Which media store a running server holds — the three-way state `kaibo://config`
+/// reports and `main` builds from. Derived in exactly one place
+/// ([`Config::cas_mode`]) so the store `main` constructs, the mode the resource
+/// renders, and the CLI's prediction can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasMode {
+    /// Persistence is active and a CAS directory resolved: artifacts land on disk at
+    /// the fixed XDG data path, durable across restarts.
+    Disk,
+    /// The CAS is enabled but has nowhere durable to write (persistence inactive, or
+    /// no resolvable directory): artifacts are held in process memory for this run
+    /// only. Startup warns loudly; `kaibo://config` shows `mode = "memory"`.
+    Memory,
+    /// `[cas] enabled = false`: no store at all, and every tool that needs one is
+    /// un-advertised.
+    Off,
+}
+
+impl CasMode {
+    /// The word the `[cas]` render uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CasMode::Disk => "disk",
+            CasMode::Memory => "memory",
+            CasMode::Off => "off",
+        }
+    }
+}
+
+impl Config {
+    /// The media-store mode this config implies once `persistence_active` is known —
+    /// the ONE derivation of Amy's lifecycle ruling ("cas should be on when
+    /// persistence is, and ideally on but in memory only when it's not. but can be
+    /// disabled"). `main` builds the store from this; the `kaibo://config` render and
+    /// `kaibo config` report it; keeping one implementation is what stops the built
+    /// store and the reported mode from drifting.
+    ///
+    /// `persistence_active` is *runtime* truth, not `[persistence] enabled`: a store
+    /// that failed to open (the Windows `SingleProcessLocked` degrade) leaves this run
+    /// without durable state, and a CAS whose artifacts outlive the sessions that
+    /// name their digests would strand them — so the CAS degrades with it. A missing
+    /// directory (`dir = None`: neither `$XDG_DATA_HOME` nor `$HOME` resolvable) also
+    /// lands on `Memory` — loud in the startup warning, never a silently invented path.
+    pub fn cas_mode(&self, persistence_active: bool) -> CasMode {
+        if !self.cas.enabled {
+            CasMode::Off
+        } else if persistence_active && self.cas.dir.is_some() {
+            CasMode::Disk
+        } else {
+            CasMode::Memory
         }
     }
 }
@@ -1795,7 +1859,9 @@ impl Config {
                             lane.as_str()
                         );
                     }
-                    if lane == Lane::Batch && !crate::batch::batch_supported(&backends[&slot.backend]) {
+                    if lane == Lane::Batch
+                        && !crate::batch::batch_supported(&backends[&slot.backend])
+                    {
                         bail!(
                             "cast {name:?}: synth lane = \"batch\" but the synth backend \
                              {:?} ({}) has no batch API — a batch synth must sit on a \
@@ -2262,6 +2328,8 @@ struct RawPersistence {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCas {
+    /// The explicit off switch — absent means on (see [`CasConfig::enabled`]).
+    enabled: Option<bool>,
     /// `$VAR`/`~`-expanded like `root`/`allow_paths`, so `$XDG_DATA_HOME/art` resolves
     /// per-environment rather than landing as a literal token.
     dir: Option<String>,
@@ -2478,9 +2546,9 @@ impl RawBackend {
                     b.kind
                 );
             }
-            b.data_collection = v.parse().with_context(|| {
-                format!("backend {:?} data_collection", b.name)
-            })?;
+            b.data_collection = v
+                .parse()
+                .with_context(|| format!("backend {:?} data_collection", b.name))?;
         }
         if let Some(v) = &self.wire {
             // The knob only exists on the openai kind — naming it anywhere else
@@ -2756,6 +2824,7 @@ fn merge_cas(raw: RawCas) -> Result<CasConfig> {
         );
     }
     Ok(CasConfig {
+        enabled: raw.enabled.unwrap_or(true),
         dir,
         max_bytes: raw.max_bytes,
     })
@@ -3277,7 +3346,11 @@ fn expand_env_vars(s: &str) -> anyhow::Result<String> {
                     // give — and so both reference forms agree on what a name is. (The
                     // braced form *is* an explicit expansion request, so a bad name is an
                     // error here, unlike a bare `$1` which is simply not a reference.)
-                    let ok = if name.is_empty() { is_start(nc) } else { is_continue(nc) };
+                    let ok = if name.is_empty() {
+                        is_start(nc)
+                    } else {
+                        is_continue(nc)
+                    };
                     if !ok {
                         bail!(
                             "path {s:?} has an invalid character {nc:?} in a ${{...}} \
@@ -3390,19 +3463,19 @@ mod tests {
         );
 
         for bad in [
-            format!("${unset}"),       // bare form, undefined
-            format!("${{{unset}}}"),   // braced form, undefined
+            format!("${unset}"),     // bare form, undefined
+            format!("${{{unset}}}"), // braced form, undefined
             "${UNTERMINATED".to_string(),
             "${}".to_string(),
             // The braced form is an explicit expansion request, so an invalid name is a
             // loud parse error (not the misleading "not set" the env lookup would give).
-            "${1bad}".to_string(),     // can't start with a digit
-            "${A/B}".to_string(),      // `/` is not a name char
+            "${1bad}".to_string(), // can't start with a digit
+            "${A/B}".to_string(),  // `/` is not a name char
             // A stray `$` that begins no reference is a typo in a boundary path, refused
             // rather than kept as a silent literal. Write `$$` for a real literal `$`.
-            "/a/$ b".to_string(),      // `$` followed by a space
-            "/cost/$100".to_string(),  // `$` followed by a digit
-            "trailing$".to_string(),   // `$` at end of string
+            "/a/$ b".to_string(),     // `$` followed by a space
+            "/cost/$100".to_string(), // `$` followed by a digit
+            "trailing$".to_string(),  // `$` at end of string
         ] {
             assert!(
                 expand_env_vars(&bad).is_err(),
@@ -3618,7 +3691,10 @@ mod tests {
         );
         assert_eq!((s.backend.as_str(), s.id.as_str()), ("openrouter", synth));
         assert_eq!(e.vision, Some(true), "explorer flash is multimodal-in");
-        assert_eq!(s.vision, None, "text-only synth leaves the classifier's false to stand");
+        assert_eq!(
+            s.vision, None,
+            "text-only synth leaves the classifier's false to stand"
+        );
 
         let b = cfg.resolve_backend("openrouter").unwrap();
         assert_eq!(b.kind, ProviderKind::OpenRouter);
@@ -5147,8 +5223,7 @@ mod tests {
         // and a bare containment check would keep passing after the knob's real
         // documentation vanished (gemini cross-family review, 2026-08-02).
         let mentions = |field: &str| {
-            let is_word =
-                |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
             template.match_indices(field).any(|(i, _)| {
                 !is_word(template[..i].chars().next_back())
                     && !is_word(template[i + field.len()..].chars().next())

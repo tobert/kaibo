@@ -977,7 +977,9 @@ pub fn run_config(common: CommonArgs) -> i32 {
     };
     // `active` reflects whether a real invocation would hold the store open — for a
     // one-shot `config` print we don't open it, but persistence being enabled is what
-    // a consult here would activate, so report that.
+    // a consult here would activate, so report that. The CAS mode is predicted from
+    // the same assumption, through the one shared derivation (`Config::cas_mode`).
+    let cas_mode = resolver.config.cas_mode(persistence_enabled);
     let body = render_config_resource(
         &resolver.config,
         resolver.allowed_trees(),
@@ -985,6 +987,7 @@ pub fn run_config(common: CommonArgs) -> i32 {
         resolver.default_root_inferred(),
         resolver.followed_worktrees(),
         persistence_enabled,
+        cas_mode,
     );
     println!("{body}");
     EXIT_OK
@@ -1789,7 +1792,12 @@ mod tests {
             long_help.contains("EXIT CODES"),
             "long --help should carry the exit-code table:\n{long_help}"
         );
-        for code in ["0  an answer", "2  usage error", "3  setup/containment", "4  the work ran"] {
+        for code in [
+            "0  an answer",
+            "2  usage error",
+            "3  setup/containment",
+            "4  the work ran",
+        ] {
             assert!(
                 long_help.contains(code),
                 "long --help should document exit code {code:?}:\n{long_help}"

@@ -505,3 +505,97 @@ fn soft_cap_does_not_block_a_dedup_write_of_existing_content() {
     let d2 = cas.put(&bytes, Extension::Gif, &prov()).unwrap();
     assert_eq!(d1, d2);
 }
+
+// --- MemoryCas: same contract, no filesystem ---------------------------------
+
+use kaibo::cas::{MediaStore, MemoryCas};
+
+/// The in-memory store round-trips bytes by digest, with the extension (and thus
+/// the mime a resource read serves) intact — the degraded-mode contract for a run
+/// without persistence.
+#[test]
+fn memory_cas_put_then_get_round_trips_bytes_and_extension() {
+    let mem = MemoryCas::new(None);
+    let bytes = b"pretend-png".to_vec();
+    let digest = mem.put(&bytes, Extension::Png, &prov()).unwrap();
+    assert_eq!(digest, Digest::of_bytes(&bytes));
+    assert_eq!(mem.get(&digest), Some((bytes, Extension::Png)));
+    assert_eq!(mem.provenance(&digest).unwrap(), prov());
+}
+
+#[test]
+fn memory_cas_get_returns_none_for_unknown_digest() {
+    let mem = MemoryCas::new(None);
+    let missing = Digest::of_bytes(b"never stored");
+    assert_eq!(mem.get(&missing), None);
+}
+
+/// Identical content twice is one object and one digest — dedup, not accumulation.
+#[test]
+fn memory_cas_dedup_returns_the_same_digest() {
+    let mem = MemoryCas::new(None);
+    let d1 = mem.put(b"same", Extension::Webp, &prov()).unwrap();
+    let d2 = mem.put(b"same", Extension::Webp, &prov()).unwrap();
+    assert_eq!(d1, d2);
+}
+
+/// The soft cap keeps its meaning in memory: refuse loudly, never evict — and a
+/// dedup write of held content is exempt, exactly as on disk.
+#[test]
+fn memory_cas_cap_refuses_loudly_and_never_evicts() {
+    let mem = MemoryCas::new(Some(10));
+    let first = vec![1u8; 8];
+    let d1 = mem.put(&first, Extension::Png, &prov()).unwrap();
+    match mem.put(&[2u8; 100], Extension::Png, &prov()) {
+        Err(CasError::CapacityExceeded { max_bytes: 10, .. }) => {}
+        other => panic!("a write past the cap must be refused, got {other:?}"),
+    }
+    // Never evicts, and the dedup write of the held object still succeeds with no slack.
+    assert_eq!(mem.get(&d1).map(|(b, _)| b), Some(first.clone()));
+    assert_eq!(mem.put(&first, Extension::Png, &prov()).unwrap(), d1);
+}
+
+// --- MediaStore: one seam over both modes ------------------------------------
+
+/// Disk mode exposes the real filesystem path beside the digest; memory mode has no
+/// path at all (the kaibo://cas resource is its only retrieval channel). Both modes
+/// serve the same bytes+extension read.
+#[test]
+fn media_store_paths_exist_on_disk_and_not_in_memory() {
+    let (cas, _dir) = open_uncapped();
+    let disk = MediaStore::Disk(cas);
+    let mem = MediaStore::Memory(MemoryCas::new(None));
+
+    let bytes = b"artifact".to_vec();
+    let d_disk = disk.put(&bytes, Extension::Jpeg, &prov()).unwrap();
+    let d_mem = mem.put(&bytes, Extension::Jpeg, &prov()).unwrap();
+    assert_eq!(d_disk, d_mem, "the address is the content, mode-independent");
+
+    assert!(disk.path_for(&d_disk).is_some_and(|p| p.is_file()));
+    assert!(disk.root().is_some());
+    assert_eq!(disk.mode(), "disk");
+
+    assert_eq!(mem.path_for(&d_mem), None);
+    assert_eq!(mem.root(), None);
+    assert_eq!(mem.mode(), "memory");
+
+    assert_eq!(
+        disk.get(&d_disk).unwrap(),
+        Some((bytes.clone(), Extension::Jpeg))
+    );
+    assert_eq!(mem.get(&d_mem).unwrap(), Some((bytes, Extension::Jpeg)));
+}
+
+// --- Extension <-> mime -------------------------------------------------------
+
+/// The wire-mime mapping is closed and case/parameter-tolerant on parse (RFC 7231),
+/// canonical on render — and refuses anything the CAS cannot name on disk.
+#[test]
+fn extension_maps_mimes_both_ways_and_refuses_unknown() {
+    for ext in Extension::ALL {
+        assert_eq!(Extension::from_mime(ext.mime()), Some(ext));
+    }
+    assert_eq!(Extension::from_mime("IMAGE/PNG; charset=binary"), Some(Extension::Png));
+    assert_eq!(Extension::from_mime("audio/mpeg"), None);
+    assert_eq!(Extension::from_mime("model/gltf-binary"), None);
+}

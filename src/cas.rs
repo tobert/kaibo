@@ -291,6 +291,33 @@ impl Extension {
             Extension::Gif => "gif",
         }
     }
+
+    /// The canonical mime type this on-disk format serves as — what the
+    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back.
+    pub fn mime(&self) -> &'static str {
+        match self {
+            Extension::Png => "image/png",
+            Extension::Jpeg => "image/jpeg",
+            Extension::Webp => "image/webp",
+            Extension::Gif => "image/gif",
+        }
+    }
+
+    /// Map a wire mime string (a provider's own spelling, case-insensitive per RFC
+    /// 7231) onto the closed on-disk set. `None` for anything the CAS cannot name on
+    /// disk — the caller decides loudly what that means (see
+    /// `stability::MediaType::to_cas_extension` for the same refusal argued at length);
+    /// this helper never invents an extension for unknown bytes.
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        let essence = mime.split(';').next().unwrap_or(mime).trim();
+        match essence.to_ascii_lowercase().as_str() {
+            "image/png" => Some(Extension::Png),
+            "image/jpeg" => Some(Extension::Jpeg),
+            "image/webp" => Some(Extension::Webp),
+            "image/gif" => Some(Extension::Gif),
+            _ => None,
+        }
+    }
 }
 
 /// The provenance sidecar recorded next to every object: `prompt`, `model`, `cast`,
@@ -415,9 +442,16 @@ impl Cas {
     /// under. `None` if no object with this digest has ever been written (or an ancestor
     /// directory doesn't exist yet, which reads the same way: nothing is here).
     pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
+        self.entry_for(digest).map(|(path, _)| path)
+    }
+
+    /// [`path_for`](Self::path_for) plus which [`Extension`] the object was written
+    /// under — the extension carries the mime type a resource read needs to stamp on
+    /// the bytes, and re-deriving it from the path string would be a second parser.
+    pub fn entry_for(&self, digest: &Digest) -> Option<(PathBuf, Extension)> {
         Extension::ALL.into_iter().find_map(|ext| {
             let path = self.object_path(digest, ext);
-            path.is_file().then_some(path)
+            path.is_file().then_some((path, ext))
         })
     }
 
@@ -550,6 +584,154 @@ impl Cas {
         })?;
 
         Ok(digest)
+    }
+}
+
+/// One artifact held by the in-memory store: the bytes plus the metadata a disk
+/// object keeps in its filename (`ext`) and sidecar (`provenance`).
+#[derive(Debug, Clone)]
+struct MemObject {
+    bytes: Vec<u8>,
+    ext: Extension,
+    provenance: Provenance,
+}
+
+/// The in-memory CAS: the same content-addressed contract as [`Cas`] — the address is
+/// the content's own hash, `put` takes no destination, nothing is ever deleted or
+/// rewritten — held in a `HashMap` instead of on disk. This is the degraded mode Amy
+/// decided for a run without persistence ("cas should be on when persistence is, and
+/// ideally on but in memory only when it's not", 2026-07-30): artifacts stay
+/// retrievable by digest for the life of the process and are gone on restart, which
+/// startup warns about LOUDLY (see `main.rs`) and `kaibo://config` reports as
+/// `mode = "memory"`. Touches no filesystem at all, so the write-path guard
+/// (`tests/no_write_path.rs`) has nothing to bless here.
+///
+/// The optional `max_bytes` cap is honored with the same refuse-never-evict posture as
+/// [`Cas::put`] — in memory the accounting is a cheap sum over held objects, but the
+/// *meaning* of the knob (a ceiling that refuses, loudly) must not change with the mode.
+#[derive(Debug)]
+pub struct MemoryCas {
+    objects: std::sync::Mutex<std::collections::HashMap<Digest, MemObject>>,
+    max_bytes: Option<u64>,
+}
+
+impl MemoryCas {
+    pub fn new(max_bytes: Option<u64>) -> Self {
+        Self {
+            objects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_bytes,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Digest, MemObject>> {
+        self.objects.lock().expect("memory CAS mutex poisoned")
+    }
+
+    /// Store `bytes` under their own digest. A repeat of identical content is a
+    /// no-op returning the same digest (dedup needs no verification here: the map is
+    /// keyed by the digest of exactly the bytes it holds, and nothing between put and
+    /// get can corrupt process memory the way a torn disk write can). A new object is
+    /// checked against the cap first, mirroring [`Cas::put`].
+    pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
+        let digest = Digest::of_bytes(bytes);
+        let mut objects = self.lock();
+        if objects.contains_key(&digest) {
+            return Ok(digest);
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            let current: u64 = objects.values().map(|o| o.bytes.len() as u64).sum();
+            if current.saturating_add(bytes.len() as u64) > max_bytes {
+                return Err(CasError::CapacityExceeded {
+                    max_bytes,
+                    current_bytes: current,
+                });
+            }
+        }
+        objects.insert(
+            digest,
+            MemObject {
+                bytes: bytes.to_vec(),
+                ext,
+                provenance: provenance.clone(),
+            },
+        );
+        Ok(digest)
+    }
+
+    /// Read an object back by digest: the bytes and the extension it was stored
+    /// under. `None` if nothing with this digest was ever put.
+    pub fn get(&self, digest: &Digest) -> Option<(Vec<u8>, Extension)> {
+        self.lock().get(digest).map(|o| (o.bytes.clone(), o.ext))
+    }
+
+    /// The provenance recorded with an object, if it exists — the in-memory analogue
+    /// of reading a disk sidecar.
+    pub fn provenance(&self, digest: &Digest) -> Option<Provenance> {
+        self.lock().get(digest).map(|o| o.provenance.clone())
+    }
+}
+
+/// The media store a running kaibo actually holds: the disk [`Cas`] when persistence
+/// is active, the [`MemoryCas`] when it is not. One seam so every consumer (the
+/// generate lane, the `kaibo://cas/<digest>` resource, the `kaibo://config` render)
+/// dispatches over the mode instead of each carrying its own two-armed match — and so
+/// the *contract* (content-addressed, write-only, no destination parameter) is the
+/// same sentence in both modes.
+#[derive(Debug)]
+pub enum MediaStore {
+    Disk(Cas),
+    Memory(MemoryCas),
+}
+
+impl MediaStore {
+    /// Store an artifact; the digest is its address in either mode.
+    pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
+        match self {
+            MediaStore::Disk(cas) => cas.put(bytes, ext, provenance),
+            MediaStore::Memory(mem) => mem.put(bytes, ext, provenance),
+        }
+    }
+
+    /// Read an object back with the extension (and thus mime) it was stored under.
+    /// Disk reads verify content against the digest ([`Cas::get`]'s contract); memory
+    /// reads need no verification (see [`MemoryCas::put`]).
+    pub fn get(&self, digest: &Digest) -> Result<Option<(Vec<u8>, Extension)>> {
+        match self {
+            MediaStore::Disk(cas) => {
+                let Some((_, ext)) = cas.entry_for(digest) else {
+                    return Ok(None);
+                };
+                Ok(cas.get(digest)?.map(|bytes| (bytes, ext)))
+            }
+            MediaStore::Memory(mem) => Ok(mem.get(digest)),
+        }
+    }
+
+    /// The real filesystem path of an object — `Some` only in disk mode, where an
+    /// operator (or the calling agent, acting as the operator's proxy) can reach the
+    /// file directly. Memory mode has no path; the `kaibo://cas/<digest>` resource is
+    /// the only retrieval channel there.
+    pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
+        match self {
+            MediaStore::Disk(cas) => cas.path_for(digest),
+            MediaStore::Memory(_) => None,
+        }
+    }
+
+    /// The store's root directory — `Some` only in disk mode.
+    pub fn root(&self) -> Option<&Path> {
+        match self {
+            MediaStore::Disk(cas) => Some(cas.root()),
+            MediaStore::Memory(_) => None,
+        }
+    }
+
+    /// The mode word `kaibo://config` renders: `"disk"` or `"memory"`.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            MediaStore::Disk(_) => "disk",
+            MediaStore::Memory(_) => "memory",
+        }
     }
 }
 

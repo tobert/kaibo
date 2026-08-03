@@ -21,12 +21,13 @@ use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, Implementation,
-    JsonObject, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, LoggingLevel,
-    MetaObject, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
-    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
-    ReadResourceResponse, RequestMetaObject, ResourceContents, Resource, ResourceTemplate, Role,
-    ServerCapabilities, ServerInfo, SetLevelRequestParams, GetPromptResult,
+    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+    Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, LoggingLevel, MetaObject, PaginatedRequestParams,
+    ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    RequestMetaObject, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+    ServerInfo, SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -628,6 +629,13 @@ pub struct KaiboHandler {
     /// [`with_batch_providers`](Self::with_batch_providers) to exercise the submit/poll
     /// handler wiring offline. `Arc<dyn …>` so the derived `Clone` shares one factory.
     batch_providers: Arc<dyn crate::batch::BatchProviderFactory>,
+    /// The media CAS, in whichever mode the lifecycle resolved (see
+    /// [`Config::cas_mode`]): `None` when `[cas] enabled = false`. `new` seeds the
+    /// in-memory store (mirroring how sessions start in-memory);
+    /// [`finalize_media_store`](Self::finalize_media_store) upgrades it to the disk
+    /// store once `main` knows whether persistence actually came up. `Arc` so
+    /// per-request handler clones share one store.
+    media_cas: Option<Arc<crate::cas::MediaStore>>,
 }
 
 /// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, the predicate
@@ -991,8 +999,18 @@ impl KaiboHandler {
         // same allocation) for its many `self.config` uses.
         let config = Arc::new(config);
         let resolver = Resolver::from_config(config.clone())?;
+        // The media CAS starts in-memory when enabled — the same posture sessions take
+        // (memory until `main` proves durable state is really available). `main` calls
+        // `finalize_media_store` to upgrade to disk / warn / keep it off; a handler
+        // built for a test that never finalizes holds a working in-memory store.
+        let media_cas = config.cas.enabled.then(|| {
+            Arc::new(crate::cas::MediaStore::Memory(crate::cas::MemoryCas::new(
+                config.cas.max_bytes,
+            )))
+        });
         Ok(Self {
             config,
+            media_cas,
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
@@ -1032,6 +1050,89 @@ impl KaiboHandler {
     pub fn with_session_store(mut self, store: crate::store::SessionStore) -> Self {
         self.sessions = Sessions::Persistent(store);
         self
+    }
+
+    /// Settle the media CAS into its final mode, once `main` knows whether persistence
+    /// actually came up — the runtime half of [`Config::cas_mode`]'s derivation
+    /// (Amy's lifecycle ruling: on and disk-backed while persistence is; on but
+    /// in-memory when it's not; `[cas] enabled = false` turns it off).
+    ///
+    /// - **Disk**: open the store at the fixed XDG data dir (never a model-suppliable
+    ///   path), containment-checked against the resolved allowed set. An open failure is
+    ///   a LOUD startup error — crash over a silent fallback to memory, mirroring the
+    ///   session store's posture.
+    /// - **Memory**: keep the in-memory store `new` seeded, and warn SEVERELY: the
+    ///   operator is paying provider credits for artifacts that will not survive a
+    ///   restart, and must hear that at startup, not discover it after one.
+    /// - **Off**: the operator's explicit choice; say so once at info, nothing to build.
+    pub fn finalize_media_store(mut self, persistence_active: bool) -> Result<Self> {
+        match self.config.cas_mode(persistence_active) {
+            crate::config::CasMode::Off => {
+                tracing::info!(
+                    "media CAS disabled ([cas] enabled = false) — artifact-producing tools \
+                     are not advertised"
+                );
+                self.media_cas = None;
+            }
+            crate::config::CasMode::Memory => {
+                let why = if self.config.cas.dir.is_none() {
+                    "no CAS directory resolves (neither $XDG_DATA_HOME nor $HOME is set)"
+                } else {
+                    "persistence is not active this run"
+                };
+                tracing::warn!(
+                    "MEDIA CAS IS IN-MEMORY ONLY: {why}. Generated artifacts are fetchable \
+                     by digest for THIS RUN ONLY and will NOT survive a restart — they cost \
+                     real provider credits and may not be reproducible. kaibo://config shows \
+                     [cas] mode = \"memory\". To store artifacts durably, run with \
+                     persistence enabled (and a resolvable $XDG_DATA_HOME or $HOME)."
+                );
+                // `new` already seeded the in-memory store; nothing to swap.
+            }
+            crate::config::CasMode::Disk => {
+                let dir = self
+                    .config
+                    .cas
+                    .dir
+                    .clone()
+                    .expect("CasMode::Disk implies a resolved dir");
+                let allowed = self.allowed_set();
+                let allowed_refs: Vec<&std::path::Path> =
+                    allowed.iter().map(PathBuf::as_path).collect();
+                let cas = crate::cas::Cas::open(&dir, &allowed_refs, self.config.cas.max_bytes)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to open the media CAS at {}: {e}\nkaibo never \
+                                 invents a different path and never falls back silently to \
+                                 memory. Point [cas] dir somewhere outside every allowed \
+                                 tree, or set [cas] enabled = false to run without it.",
+                            dir.display()
+                        )
+                    })?;
+                tracing::info!(
+                    cas_dir = %dir.display(),
+                    "media CAS on disk — generated artifacts are durable across restarts"
+                );
+                self.media_cas = Some(Arc::new(crate::cas::MediaStore::Disk(cas)));
+            }
+        }
+        Ok(self)
+    }
+
+    /// The mode the handler's media store is *actually* in right now — what the
+    /// `kaibo://config` render reports. Derived from the live field, not re-derived
+    /// from config, so the resource can never describe a store the handler doesn't hold.
+    fn live_cas_mode(&self) -> crate::config::CasMode {
+        match self.media_cas.as_deref() {
+            None => crate::config::CasMode::Off,
+            Some(crate::cas::MediaStore::Disk(_)) => crate::config::CasMode::Disk,
+            Some(crate::cas::MediaStore::Memory(_)) => crate::config::CasMode::Memory,
+        }
+    }
+
+    /// The live media store, if the CAS is enabled — for tests and diagnostics.
+    pub fn media_store(&self) -> Option<&Arc<crate::cas::MediaStore>> {
+        self.media_cas.as_ref()
     }
 
     /// Swap in a batch-provider factory — the seam that lets tests drive the batch
@@ -2003,9 +2104,9 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(format_output(
-            &out,
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            format_output(&out),
+        )]))
     }
 
     #[tool(
@@ -2035,8 +2136,10 @@ impl KaiboHandler {
             None => self.config.backends.keys().cloned().collect(),
         };
 
-        let mut results: std::collections::BTreeMap<String, Result<Vec<crate::discover::DiscoveredModel>, String>> =
-            std::collections::BTreeMap::new();
+        let mut results: std::collections::BTreeMap<
+            String,
+            Result<Vec<crate::discover::DiscoveredModel>, String>,
+        > = std::collections::BTreeMap::new();
         for name in names {
             // A backend resolved above always resolves again here (nothing mutates
             // the registry mid-call); skip defensively rather than panic if that
@@ -2582,12 +2685,9 @@ impl KaiboHandler {
             batch_lines.push(line);
         }
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(render_wait(
-            &records,
-            &batch_lines,
-            &self.jobs,
-            timeout,
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            render_wait(&records, &batch_lines, &self.jobs, timeout),
+        )]))
     }
 
     /// Refuse a batch-shaped handle only when *no tool that produces one* is enabled —
@@ -2643,8 +2743,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         )
         // Identify as kaibo, not rmcp (from_build_env reports the rmcp crate).
         .with_server_info(
-            Implementation::new("kaibo", env!("CARGO_PKG_VERSION"))
-                .with_title("kaibo"),
+            Implementation::new("kaibo", env!("CARGO_PKG_VERSION")).with_title("kaibo"),
         )
         .with_protocol_version(ProtocolVersion::LATEST)
         // Judge provider usability from the live environment so a fresh install
@@ -2714,6 +2813,7 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.resolver.default_root_inferred(),
             self.followed_worktrees(),
             self.sessions.store().is_some(),
+            self.live_cas_mode(),
         )
     }
 
@@ -2733,7 +2833,8 @@ impl rmcp::ServerHandler for KaiboHandler {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, McpError> {
-        kaibo_prompt_messages(&request.name, request.arguments.as_ref()).map(GetPromptResponse::Complete)
+        kaibo_prompt_messages(&request.name, request.arguments.as_ref())
+            .map(GetPromptResponse::Complete)
     }
 }
 
@@ -2948,12 +3049,14 @@ fn kaibo_prompt_messages(
             // Blank/whitespace-vs-absent is normalized in `append_configure_goal` (the
             // one gate both this MCP path and the CLI's `run_configure` go through), so
             // this just extracts the raw value.
-            let goal = arguments.and_then(|a| a.get("goal")).and_then(|v| v.as_str());
+            let goal = arguments
+                .and_then(|a| a.get("goal"))
+                .and_then(|v| v.as_str());
             Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    Role::User,
-                    configure_prompt_text(goal),
-                )])
-                .with_description("Configure kaibo's models for this codebase"))
+                Role::User,
+                configure_prompt_text(goal),
+            )])
+            .with_description("Configure kaibo's models for this codebase"))
         }
         other => Err(McpError::invalid_params(
             format!("unknown prompt {other:?}; kaibo offers: {CONFIGURE_PROMPT_NAME}"),
@@ -3377,14 +3480,15 @@ fn read_kaibo_resource_with_config(
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
+    cas_mode: crate::config::CasMode,
 ) -> Result<ReadResourceResponse, McpError> {
     if uri == PROMPTS_URI {
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(
                 render_prompts_resource(config, None),
                 uri,
-            ),
-        ])));
+            )],
+        )));
     }
     if let Some(name) = uri.strip_prefix(PROMPTS_CAST_PREFIX) {
         // `kaibo://prompts/<cast>` — the cast's resolved framing (name or alias). An
@@ -3393,12 +3497,12 @@ fn read_kaibo_resource_with_config(
         let cast = config
             .resolve_cast(name)
             .map_err(|e| McpError::resource_not_found(format!("{e:#} (in {uri})"), None))?;
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(
                 render_prompts_resource(config, Some(cast)),
                 uri,
-            ),
-        ])));
+            )],
+        )));
     }
     if uri == CONFIG_URI {
         let body = render_config_resource(
@@ -3408,22 +3512,23 @@ fn read_kaibo_resource_with_config(
             default_root_inferred,
             followed_worktrees,
             persistence_active,
+            cas_mode,
         );
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(body, uri),
-        ])));
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(body, uri)],
+        )));
     }
     if uri == CONFIG_EXAMPLE_URI {
         // Static, config-independent — the embedded template verbatim.
-        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-            ResourceContents::text(CONFIG_EXAMPLE_TOML, uri),
-        ])));
+        return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::text(CONFIG_EXAMPLE_TOML, uri)],
+        )));
     }
     let body = render_resource(uri, schemas)
         .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
-    Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![
-        ResourceContents::text(body, uri),
-    ])))
+    Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+        vec![ResourceContents::text(body, uri)],
+    )))
 }
 
 /// The MCP token the client attached for progress, if any. Per the spec, progress
@@ -3502,7 +3607,7 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{NumberOrString, ContentBlock};
+    use rmcp::model::{ContentBlock, NumberOrString};
     use rmcp::ServerHandler;
     use serde_json::json;
 
@@ -3900,11 +4005,69 @@ mod tests {
     /// want a usable cast declare a `key_optional = true` backend (no credential needed);
     /// everything else resolves to `Unconfigured` and drops out.
     fn hermetic_handler_from_toml(toml: &str) -> KaiboHandler {
-        KaiboHandler::new_with_env(
-            Config::from_toml_str(toml).expect("config parses"),
-            |_| None,
-        )
+        KaiboHandler::new_with_env(Config::from_toml_str(toml).expect("config parses"), |_| {
+            None
+        })
         .expect("handler builds")
+    }
+
+    /// The media-CAS lifecycle on the handler: `new` seeds the in-memory store when
+    /// the CAS is enabled (mirroring sessions-start-in-memory) and holds nothing when
+    /// `[cas] enabled = false`; `finalize_media_store` upgrades to disk exactly when
+    /// persistence is active, keeps memory when it is not, and refuses a CAS dir
+    /// inside an allowed tree the same way the session store does.
+    #[test]
+    fn media_store_lifecycle_memory_disk_and_off() {
+        use crate::config::CasMode;
+
+        // Enabled (default): a working in-memory store from construction.
+        let h = handler();
+        assert_eq!(h.live_cas_mode(), CasMode::Memory);
+        assert!(h.media_store().is_some());
+
+        // Explicitly disabled: no store at all.
+        let off = handler_from_toml("[cas]\nenabled = false\n");
+        assert_eq!(off.live_cas_mode(), CasMode::Off);
+        assert!(off.media_store().is_none());
+        // Finalize keeps it off even with persistence active — the off switch wins.
+        let off = off.finalize_media_store(true).expect("finalize");
+        assert_eq!(off.live_cas_mode(), CasMode::Off);
+
+        // Persistence inactive: finalize keeps the in-memory store (the warned mode).
+        let h = handler().finalize_media_store(false).expect("finalize");
+        assert_eq!(h.live_cas_mode(), CasMode::Memory);
+
+        // Persistence active + a dir outside every allowed tree: disk, rooted there.
+        let cas_dir = tempfile::tempdir().unwrap();
+        let toml = format!("[cas]\ndir = \"{}\"\n", cas_dir.path().display());
+        let h = handler_from_toml(&toml)
+            .finalize_media_store(true)
+            .expect("finalize opens the disk store");
+        assert_eq!(h.live_cas_mode(), CasMode::Disk);
+        assert_eq!(
+            h.media_store().unwrap().root().unwrap(),
+            cas_dir.path(),
+            "the disk store roots at the configured dir"
+        );
+    }
+
+    /// A CAS dir that resolves inside an allowed project tree is refused at finalize —
+    /// loudly, with the escape hatches named — never opened and never silently moved.
+    #[test]
+    fn media_store_refuses_a_cas_dir_inside_an_allowed_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "[server]\nroot = \"{r}\"\n[cas]\ndir = \"{r}/cas\"\n",
+            r = root.path().display()
+        );
+        let Err(err) = handler_from_toml(&toml).finalize_media_store(true) else {
+            panic!("a CAS inside the project must be refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("media CAS") && msg.contains("enabled = false"),
+            "the error names the store and an escape hatch, got: {msg}"
+        );
     }
 
     /// The joined text of a successful `CallToolResult` — for asserting on a handler's
@@ -5427,6 +5590,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         )
         .expect("known uri must read");
         let result = match result {
@@ -5652,6 +5816,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         )
         .expect_err("an unknown cast must be a not-found");
         assert!(
@@ -5681,6 +5846,7 @@ mod tests {
                 false,
                 vec![],
                 false,
+                crate::config::CasMode::Memory,
             )
             .is_err(),
             "an unregistered builtin must be a not-found error"
@@ -5701,6 +5867,7 @@ mod tests {
                 false,
                 vec![],
                 false,
+                crate::config::CasMode::Memory,
             )
             .is_err(),
             "an unknown URI must be a not-found error, not an empty success"
@@ -5732,6 +5899,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         )
         .expect("example resource must be readable");
         let result = match result {
@@ -5826,7 +5994,15 @@ mod tests {
     fn read_kaibo_config_resource_is_readable() {
         let config = Config::builtin();
         let allowed = handler().allowed_set();
-        let body_str = render_config_resource(&config, &allowed, None, false, vec![], false);
+        let body_str = render_config_resource(
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // Sanity: the rendered document has something in it.
         assert!(
             !body_str.is_empty(),
@@ -5842,6 +6018,7 @@ mod tests {
             false,
             vec![],
             false,
+            crate::config::CasMode::Memory,
         );
         assert!(
             result.is_ok(),

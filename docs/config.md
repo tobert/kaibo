@@ -781,6 +781,49 @@ It is not silent. The startup log says so, and `kaibo://config` shows `persisten
 Close the other kaibo, point `--state-db` elsewhere, or pass `--no-persistence` to make it
 explicit. Every other open failure stays fatal.
 
+## Media CAS: `[cas]`
+
+**On by default, and it follows persistence.** The CAS is the content-addressed store
+where an artifact-producing tool (image generation) writes what it made. Its lifecycle
+has three states, reported as `mode` in `kaibo://config`'s `[cas]` section:
+
+| mode | when | what it means |
+|---|---|---|
+| `disk` | persistence is active | artifacts land at `dir`, durable across restarts |
+| `memory` | persistence is off or degraded, or no `dir` resolves | artifacts are fetchable by digest for this run only; startup warns loudly |
+| `off` | `enabled = false` | no store, and every tool that needs one is not advertised |
+
+```toml
+[cas]
+enabled   = true                            # default true; false un-advertises the tools that need it
+dir       = "$XDG_DATA_HOME/kaibo/cas"      # default; else ~/.local/share/kaibo/cas
+max_bytes = 8589934592                      # optional soft cap; omit for no cap (the default)
+```
+
+CLI/env: `--cas-dir` / `KAIBO_CAS_DIR` move the store; `--cas-max-bytes` /
+`KAIBO_CAS_MAX_BYTES` set the cap. `enabled` is file-only.
+
+**The address is the content.** Every object's filename is the SHA-256 of its bytes, so
+nothing (model or operator) can aim a write at a chosen path, and identical content is
+stored once. Objects are written once and never rewritten, unlinked, or evicted. Each
+object gets a `<hex>.json` provenance sidecar (prompt, model, cast, timestamp, mime,
+seed) so you can prune by hand with `find`/`jq`/`restic` — kaibo ships no GC.
+
+**Retrieval is operator-surface only.** A generation result returns each artifact's
+digest, a `kaibo://cas/<digest>` resource URI, and (in disk mode) the real filesystem
+path. The MCP client and CLI read those; the inner model team never sees the CAS — it is
+not mounted into kaish and no cast-facing tool reads it, because kaibo state spans
+projects and a browsable CAS would let one project's team enumerate another's artifacts.
+
+**`max_bytes` refuses, never evicts.** A write that would pass the cap fails loudly and
+nothing is deleted to make room. The cap is opt-in because enforcing it costs an
+O(objects) walk of the store per new write.
+
+**Failure is loud.** In disk mode, a CAS dir that cannot open — including one that
+resolves inside an allowed project tree, which is refused the same way the state db is —
+fails startup with an error naming the escape hatches. Memory mode is the one warned
+degrade, mirroring the persistence posture it follows.
+
 ## House rules: `[context]`
 
 kaibo's models work for other agents, so they benefit from inheriting the calling agent's

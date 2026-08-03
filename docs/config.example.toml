@@ -274,9 +274,12 @@ scratch_limit_bytes = 67108864
 
 # ---------------------------------------------------------------------------
 # [cas] — the media content-addressed store: where an artifact-producing tool writes
-# what it generated. There is NO enabled flag: the CAS exists exactly when such a tool
-# does, and those carry their own --no-<tool> gate plus the cast staffing gate, so a
-# second switch would only be a way for the two to disagree.
+# what it generated. On by default, and it follows persistence: while the state db is
+# open the CAS writes to disk at the dir below; while persistence is off (or degraded)
+# it runs IN MEMORY — artifacts stay fetchable by digest for this run only, and startup
+# warns loudly that they will not survive a restart. `enabled = false` turns it off
+# entirely and un-advertises every tool that needs it (the startup log and
+# kaibo://config's [cas] section say which state you are in, and why).
 #
 # It lives under the XDG *data* dir, deliberately NOT beside the state db: the session
 # store is reconstructible bookkeeping, while these are artifacts you spent real provider
@@ -299,6 +302,8 @@ scratch_limit_bytes = 67108864
 # ---------------------------------------------------------------------------
 
 # [cas]
+# enabled   = true                         # false turns the CAS off and un-advertises
+#                                          # every tool that needs it
 # dir       = "~/.local/share/kaibo/cas"   # default: $XDG_DATA_HOME/kaibo/cas
 # max_bytes = 8589934592                   # 8 GiB. OMIT for no cap (the default);
 #                                          # 0 is a load error, not "refuse everything".

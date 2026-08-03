@@ -2052,6 +2052,41 @@ fn cas_defaults_to_the_xdg_data_dir_and_no_cap() {
     );
 }
 
+/// `[cas] enabled = false` is the explicit off switch (Amy, 2026-08-03); on is the
+/// default, so an empty config runs with the CAS available.
+#[test]
+fn cas_enabled_defaults_true_and_the_file_can_turn_it_off() {
+    let c = Config::from_toml_str("").unwrap();
+    assert!(c.cas.enabled, "the CAS is on by default");
+    let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
+    assert!(!off.cas.enabled);
+}
+
+/// The one derivation of the CAS lifecycle: disabled wins over everything; otherwise
+/// the CAS follows *runtime* persistence truth — disk while a durable store is open,
+/// memory while it is not (including the degrade path where `[persistence]` is enabled
+/// but the store failed to open) or when no directory resolves.
+#[test]
+fn cas_mode_follows_persistence_and_the_off_switch_wins() {
+    use kaibo::config::CasMode;
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.cas_mode(true), CasMode::Disk);
+    assert_eq!(
+        c.cas_mode(false),
+        CasMode::Memory,
+        "no durable persistence means an in-memory CAS, not a stranded disk store"
+    );
+
+    let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
+    assert_eq!(off.cas_mode(true), CasMode::Off);
+    assert_eq!(off.cas_mode(false), CasMode::Off);
+
+    // No resolvable dir: enabled + persistence-active still cannot mean disk.
+    let mut no_dir = Config::from_toml_str("").unwrap();
+    no_dir.cas.dir = None;
+    assert_eq!(no_dir.cas_mode(true), CasMode::Memory);
+}
+
 /// The file layer sets both knobs, and `$VAR`/`~` in `dir` expand like every other path.
 #[test]
 fn cas_file_layer_sets_dir_and_cap() {

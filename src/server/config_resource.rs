@@ -29,6 +29,7 @@ pub(crate) fn render_config_resource(
     default_root_inferred: bool,
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
+    cas_mode: crate::config::CasMode,
 ) -> String {
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -91,6 +92,9 @@ pub(crate) fn render_config_resource(
         /// Durable-store state (on by default): whether persistence is enabled, the
         /// resolved state-db path, and whether the store is actually open right now.
         persistence: PersistenceDoc,
+        /// The media CAS: the on/off knob, the runtime mode (disk / memory / off),
+        /// and where disk mode writes.
+        cas: CasDoc,
         /// alias → canonical backend name. Aliases are valid slot-ref prefixes
         /// and per-call backend overrides, so callers must be able to discover
         /// them here — built-in and file-declared both.
@@ -214,6 +218,21 @@ pub(crate) fn render_config_resource(
         active: bool,
     }
 
+    /// The media CAS as resolved. `mode` is runtime truth (`"disk"` / `"memory"` /
+    /// `"off"`) from the store the handler actually holds — `"memory"` is the loud
+    /// degraded state (artifacts do not survive a restart; startup already warned).
+    /// `dir` is the configured directory whether or not the current mode uses it, so
+    /// an operator diagnosing `"memory"` still sees where disk mode would write.
+    #[derive(Serialize)]
+    struct CasDoc {
+        enabled: bool,
+        mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    }
+
     #[derive(Serialize)]
     struct BackendDoc {
         kind: String,
@@ -327,11 +346,12 @@ pub(crate) fn render_config_resource(
                 api_key_file: api_key_file.clone(),
                 key_optional: *key_optional,
                 request_timeout_secs: request_timeout.as_secs(),
-                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter)
-                    .then_some(match data_collection {
+                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter).then_some(
+                    match data_collection {
                         crate::config::DataCollection::Deny => "deny",
                         crate::config::DataCollection::Allow => "allow",
-                    }),
+                    },
+                ),
                 // Resolved, not raw: an unset `wire` still has an effective shape
                 // (the endpoint-exact heuristic), so render what the backend will
                 // actually do, not just what was configured.
@@ -588,6 +608,12 @@ pub(crate) fn render_config_resource(
                 .map(|p| p.display().to_string()),
             active: persistence_active,
         },
+        cas: CasDoc {
+            enabled: config.cas.enabled,
+            mode: cas_mode.as_str().to_string(),
+            dir: config.cas.dir.as_ref().map(|p| p.display().to_string()),
+            max_bytes: config.cas.max_bytes,
+        },
         backend_aliases: config.backend_aliases().clone(),
         backends,
         cast_aliases: config.cast_aliases().clone(),
@@ -627,7 +653,15 @@ mod tests {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/the-repo")];
         let followed = vec![std::path::PathBuf::from("/tmp/the-repo-feature")];
-        let body = render_config_resource(&config, &allowed, None, false, followed, false);
+        let body = render_config_resource(
+            &config,
+            &allowed,
+            None,
+            false,
+            followed,
+            false,
+            crate::config::CasMode::Memory,
+        );
         assert!(
             body.contains("[runtime]") && body.contains("follow_worktrees = true"),
             "runtime section must echo the follow knob:\n{body}"
@@ -659,7 +693,15 @@ mod tests {
     /// confusing failure this reporting exists to prevent.
     #[test]
     fn config_resource_runtime_explains_a_tool_no_cast_can_staff() {
-        let body = render_config_resource(&Config::builtin(), &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &Config::builtin(),
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let runtime = section(&body, "[runtime]");
         assert!(
             !runtime.contains("\"deliberate\""),
@@ -691,7 +733,15 @@ mod tests {
     fn config_resource_does_not_blame_casts_for_an_operator_disabled_tool() {
         let mut config = Config::builtin();
         config.tools.deliberate = false;
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         assert!(
             !section(&body, "[runtime.unstaffable_tools]").contains("deliberate"),
             "a flag-disabled tool belongs to [tools], not unstaffable_tools:\n{body}"
@@ -742,7 +792,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
             doc.get("casts")
@@ -819,7 +877,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
             doc.get("casts")
@@ -895,7 +961,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
             doc.get("casts")
@@ -979,7 +1053,15 @@ mod tests {
         )
         .unwrap();
 
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let render_flags = |cast: &str, role: &str| -> bool {
             doc.get("casts")
@@ -1045,7 +1127,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let wire = |name: &str| -> Option<String> {
             doc.get("backends")
@@ -1084,7 +1174,15 @@ mod tests {
     fn config_resource_renders_expected_fields() {
         let config = Config::builtin();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
-        let body = render_config_resource(&config, &allowed, None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // Structural presence checks — the resource is TOML or a document, not prose.
         for needle in [
             "allowed_paths",
@@ -1173,7 +1271,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // The header NAME is discoverable…
         assert!(
             body.contains("authorization"),
@@ -1193,7 +1299,15 @@ mod tests {
         // Enabled (the default) with the store open.
         let config =
             Config::from_toml_str("[persistence]\npath = \"/var/lib/kaibo/state.db\"\n").unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], true);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            true,
+            crate::config::CasMode::Disk,
+        );
         let section = body
             .split_once("[persistence]")
             .expect("a [persistence] table renders")
@@ -1207,11 +1321,54 @@ mod tests {
 
         // Disabled: off and inactive.
         let off = Config::from_toml_str("[persistence]\nenabled = false\n").unwrap();
-        let body = render_config_resource(&off, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &off,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         let section = body.split_once("[persistence]").expect("table renders").1;
         assert!(
             section.contains("enabled = false") && section.contains("active = false"),
             "a disabled store renders off and inactive:\n{body}"
+        );
+    }
+
+    /// The media CAS renders its knob AND its runtime mode — the three-way state
+    /// (disk / memory / off) an operator needs to see, with `"memory"` the loud
+    /// degraded case (artifacts do not survive a restart) and `dir` shown even then
+    /// so a diagnosing operator sees where disk mode would write.
+    #[test]
+    fn config_resource_shows_cas_state_in_all_three_modes() {
+        use crate::config::CasMode;
+
+        let config = Config::from_toml_str("[cas]\ndir = \"/srv/art\"\n").unwrap();
+        let body = render_config_resource(&config, &[], None, false, vec![], true, CasMode::Disk);
+        let section = body.split_once("[cas]").expect("a [cas] table renders").1;
+        assert!(
+            section.contains("enabled = true")
+                && section.contains(r#"mode = "disk""#)
+                && section.contains("/srv/art"),
+            "disk mode must show on, the mode word, and the dir:\n{body}"
+        );
+
+        let body =
+            render_config_resource(&config, &[], None, false, vec![], false, CasMode::Memory);
+        let section = body.split_once("[cas]").expect("table renders").1;
+        assert!(
+            section.contains(r#"mode = "memory""#) && section.contains("/srv/art"),
+            "memory mode must render as memory and still show the configured dir:\n{body}"
+        );
+
+        let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
+        let body = render_config_resource(&off, &[], None, false, vec![], false, CasMode::Off);
+        let section = body.split_once("[cas]").expect("table renders").1;
+        assert!(
+            section.contains("enabled = false") && section.contains(r#"mode = "off""#),
+            "the explicit off switch renders as off:\n{body}"
         );
     }
 
@@ -1233,7 +1390,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], false);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         for needle in ["[backend_aliases]", "[cast_aliases]"] {
             assert!(body.contains(needle), "must render {needle}:\n{body}");
         }
@@ -1280,7 +1445,15 @@ mod tests {
             unsafe {
                 std::env::set_var(var_name, SENTINEL);
             }
-            let b = render_config_resource(&config, &allowed, None, false, vec![], false);
+            let b = render_config_resource(
+                &config,
+                &allowed,
+                None,
+                false,
+                vec![],
+                false,
+                crate::config::CasMode::Memory,
+            );
             #[allow(deprecated)]
             unsafe {
                 std::env::remove_var(var_name);
@@ -1306,7 +1479,15 @@ mod tests {
         let file_path = tmp.path().to_string_lossy().to_string();
         let toml2 = format!("[backends.anthropic]\napi_key_file = \"{file_path}\"\n");
         let config2 = Config::from_toml_str(&toml2).expect("valid config");
-        let body2 = render_config_resource(&config2, &allowed, None, false, vec![], false);
+        let body2 = render_config_resource(
+            &config2,
+            &allowed,
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
         // The file path (source pointer) may appear, but not the file contents.
         assert!(
             !body2.contains(SENTINEL),
