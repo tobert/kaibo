@@ -200,7 +200,17 @@ pub fn parse_openai_models(v: &Value) -> Vec<DiscoveredModel> {
                 .to_string(),
             display_name: None,
             created: item.get("created").and_then(Value::as_i64),
-            context_window: None,
+            // OpenRouter carries the model's context at the top level, with the
+            // serving provider's figure under `top_provider` as the fallback; the
+            // other OpenAI-wire endpoints carry neither.
+            context_window: item
+                .get("context_length")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    item.get("top_provider")
+                        .and_then(|tp| tp.get("context_length"))
+                        .and_then(Value::as_u64)
+                }),
             // OpenRouter nests the completion ceiling under `top_provider`; the
             // other OpenAI-wire endpoints simply don't carry the field.
             output_ceiling: item
@@ -762,8 +772,9 @@ mod tests {
             "data": [
                 {
                     "id": "moonshotai/kimi-k2.7-code",
+                    "context_length": 262_144,
                     "top_provider": {
-                        "context_length": 262_144,
+                        "context_length": 131_072,
                         "max_completion_tokens": 16_384,
                     },
                 },
@@ -773,6 +784,10 @@ mod tests {
         let models = parse_openai_models(&body);
         assert_eq!(models[0].output_ceiling, Some(16_384));
         assert_eq!(models[1].output_ceiling, None);
+        // Context rides the same catalog: the model-level `context_length` wins,
+        // the `top_provider` figure is the fallback (live catalogs carry both).
+        assert_eq!(models[0].context_window, Some(262_144));
+        assert_eq!(models[1].context_window, Some(8192));
         // .raw keeps the nested object untouched either way.
         assert_eq!(
             models[0].raw["top_provider"]["max_completion_tokens"],
