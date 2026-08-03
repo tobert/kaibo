@@ -72,22 +72,32 @@ pub struct MediaArtifact {
 pub struct MediaJobId(pub String);
 
 /// One `generate` call's outcome. Sync operations resolve straight to `Complete`;
-/// a deferred operation's POST resolves to `Deferred`, and the artifact comes from
+/// a deferred operation's POST resolves to `Deferred`, and the artifacts come from
 /// [`MediaModel::poll`] later. Which shape a given operation has is the *provider's*
 /// declared fact (see `stability::Operation::shape`), never sniffed from a response.
+///
+/// `Complete` carries a **list**: many image models return several images per call
+/// (Amy's call, 2026-08-03), so one generation is one-to-many artifacts. Each artifact
+/// gets its own CAS digest and its own provenance sidecar downstream — a result is a
+/// list of digests, never a single blessed one. A provider that returns exactly one
+/// (Stability's ops today) hands back a one-element list; an *empty* list from a
+/// provider is that provider's bug to refuse at its own impl, not a shape this enum
+/// blesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaOutcome {
-    Complete(MediaArtifact),
+    Complete(Vec<MediaArtifact>),
     Deferred(MediaJobId),
 }
 
 /// One poll's outcome: still running, or done. A poll is never itself deferred
 /// again — `Pending` means "ask again later", with the cadence owned by the caller
 /// (the tool lane brings its own deadline/backoff; this seam never sleeps).
+/// `Complete` is a list for the same one-to-many reason as
+/// [`MediaOutcome::Complete`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaPollOutcome {
     Pending,
-    Complete(MediaArtifact),
+    Complete(Vec<MediaArtifact>),
 }
 
 /// A media-generation model: one generate call plus one poll, both provider-neutral.
@@ -183,9 +193,9 @@ mod tests {
 
     /// A scripted model: answers `generate` with a fixed outcome and `poll` with a
     /// pending-then-complete sequence — enough to prove the trait dispatches as an
-    /// object and the arm forwards faithfully.
+    /// object and the arm forwards faithfully, artifact *lists* included.
     struct Scripted {
-        artifact: MediaArtifact,
+        artifacts: Vec<MediaArtifact>,
         polls: std::sync::Mutex<usize>,
     }
 
@@ -205,7 +215,7 @@ mod tests {
             if *n == 1 {
                 Ok(MediaPollOutcome::Pending)
             } else {
-                Ok(MediaPollOutcome::Complete(self.artifact.clone()))
+                Ok(MediaPollOutcome::Complete(self.artifacts.clone()))
             }
         }
     }
@@ -218,13 +228,23 @@ mod tests {
         }
     }
 
+    fn webp_artifact() -> MediaArtifact {
+        MediaArtifact {
+            bytes: b"RIFF....WEBP".to_vec(),
+            mime: "image/webp".to_string(),
+            seed: None,
+        }
+    }
+
     /// The deferred round trip through the trait object: generate hands back a job,
-    /// the first poll is pending, the second completes with the artifact intact.
+    /// the first poll is pending, the second completes with EVERY artifact intact and
+    /// in order — the one-to-many shape (many image models return several images per
+    /// call) the outcome enums exist to carry.
     #[tokio::test]
-    async fn deferred_generate_then_poll_round_trip() {
+    async fn deferred_generate_then_poll_round_trip_with_multiple_artifacts() {
         let arm = MediaArm::new(
             Arc::new(Scripted {
-                artifact: png_artifact(),
+                artifacts: vec![png_artifact(), webp_artifact()],
                 polls: std::sync::Mutex::new(0),
             }),
             "sd/core",
@@ -242,7 +262,10 @@ mod tests {
         };
         assert_eq!(arm.poll(&job).await.unwrap(), MediaPollOutcome::Pending);
         let done = arm.poll(&job).await.unwrap();
-        assert_eq!(done, MediaPollOutcome::Complete(png_artifact()));
+        assert_eq!(
+            done,
+            MediaPollOutcome::Complete(vec![png_artifact(), webp_artifact()])
+        );
     }
 
     /// A completion backend cannot staff a media arm: the mirror image of
