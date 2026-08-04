@@ -59,19 +59,19 @@ mod resolver;
 
 pub use resolver::Resolver;
 
-// Re-exported for the CLI front door (`crate::cli`), which renders the same answer
-// footer, failure text, `kaibo://config` document, and `batch list` recency window the
-// MCP handler does.
+// Re-exported for the other front doors (`crate::cli`, `crate::acp`), which render
+// the same answer footer, non-fatal warnings, failure text, `kaibo://config`
+// document, and `batch list` recency window the MCP handler does.
 pub(crate) use config_resource::render_config_resource;
 pub(crate) use render::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
-    BATCH_RECENCY_WINDOW_SECS,
+    append_warnings, batch_within_window, consultation_failure_text, now_epoch_secs,
+    with_provenance, BATCH_RECENCY_WINDOW_SECS,
 };
 
 use render::{
-    append_warnings, batch_poll_brief, consult_result, consultation_failed, fmt_usage,
-    is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
-    wait_level_floor, wait_level_label,
+    batch_poll_brief, consult_result, consultation_failed, fmt_usage, is_batch_handle,
+    parse_batch_handle, render_job, render_jobs_section, render_wait, wait_level_floor,
+    wait_level_label,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.

@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::ConnectTo;
 use clap::{Args, Parser, Subcommand};
 use rig_core::completion::Usage;
 use rmcp::ErrorData as McpError;
@@ -130,6 +131,10 @@ pub enum Command {
     /// List available models a backend's provider actually serves — read-only model
     /// discovery via the backend's real /models endpoint, no cast/model in the loop.
     Models(ModelsArgs),
+    /// Run kaibo as an Agent Client Protocol (ACP) v1 agent on stdio, for ACP clients
+    /// (Zed, Toad, JetBrains) instead of an MCP client. Scaffold: `session/prompt`
+    /// answers with a canned notice until the consult loop is wired (chunk 2).
+    Acp,
     /// Print the resolved runtime configuration (the `kaibo://config` document).
     Config,
     /// Print the guided "set up my models" walkthrough — the CLI equivalent of the
@@ -1774,6 +1779,53 @@ pub async fn run_models(common: CommonArgs, args: ModelsArgs) -> i32 {
         EXIT_CONSULT_FAILURE
     } else {
         EXIT_OK
+    }
+}
+
+// ---------------------------------------------------------------------------
+// acp
+// ---------------------------------------------------------------------------
+
+/// Run `kaibo acp` — an ACP v1 agent on stdio, the same stdout-is-the-protocol /
+/// stderr-is-everything-else split `serve` (MCP) uses. Runs until the client closes
+/// the connection (clean EOF, exit 0) or the connection itself fails (exit 4 — a
+/// transport/handler fault after startup, not a pre-flight rejection, so it doesn't
+/// share `run_consult`'s usage/setup codes). A bad `--config`/cast-resolution error
+/// is still a pre-flight usage/setup rejection, same as every other front door.
+pub async fn run_acp(common: CommonArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("kaibo: config error: {e:#}");
+            return EXIT_USAGE;
+        }
+    };
+    // The default cast must resolve now, same check `serve` does at startup — an ACP
+    // client has no equivalent of `kaibo config` to discover the failure later.
+    if let Err(e) = config.resolve_cast(&config.default_cast) {
+        eprintln!("kaibo: default cast: {e:#}");
+        return EXIT_SETUP;
+    }
+    // Builds a `Resolver` under the hood (same containment/allowed-set setup every
+    // front door computes) — a bad `--root`/`--allow-path` is a setup rejection here
+    // too, not a silent empty boundary.
+    let state = match crate::acp::AcpAgentState::new(Arc::new(config)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("kaibo: acp setup: {e:#}");
+            return EXIT_SETUP;
+        }
+    };
+    match crate::acp::agent(state)
+        .connect_to(agent_client_protocol::Stdio::new())
+        .await
+    {
+        Ok(()) => EXIT_OK,
+        Err(e) => {
+            eprintln!("kaibo: acp connection failed: {e}");
+            EXIT_CONSULT_FAILURE
+        }
     }
 }
 

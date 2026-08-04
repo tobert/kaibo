@@ -3,7 +3,12 @@ name = "kaibo"
 description = "kaibo — a two-phase MCP consult agent that explores a read-only filesystem through kaish builtins"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+# Bumped 1.85 -> 1.88 for `agent-client-protocol` (below): 1.1.0+ of that crate
+# declares rust-version 1.88.0 (async closures — `async move |x| {..}` — used
+# throughout its handler-registration API), and we pin the exact 1.3.0. The
+# installed toolchain matters more than this field for actually building; this
+# is the honest MSRV floor now that ACP is a hard (non-optional) dependency.
+rust-version = "1.88"
 license = "MIT"
 
 [lib]
@@ -102,6 +107,25 @@ toml = "0.8"
 # tree transitively via kaish-kernel, named here so the dep is ours, not implicit.
 regex = "1"
 
+# The Agent Client Protocol (ACP) front door (`kaibo acp`, src/acp.rs) — an ACP v1
+# agent alongside the MCP server, so Zed/Toad/JetBrains-style clients can drive kaibo
+# directly. EXACT-pinned (`=1.3.0`): this is a spec-tracking crate whose crates.io
+# `1.x` line moved fast (0.x -> 1.x -> 2.0.0 in one summer) and whose API reshaped
+# substantially between minor releases even within 1.x (a builder + typed-dispatch
+# API replacing an older fixed-trait shape) — a bare `"1"` would silently ride a
+# breaking rewrite in. `2.0.0` implements the ACP v2 DRAFT (an `unstable_protocol_v2`
+# feature gate even within the crate itself); we speak v1, the shipping protocol every
+# real client (Zed, Toad, JetBrains) negotiates today. Verified pure-Rust and
+# aws-lc/mimalloc/TLS-free (`cargo tree -i aws-lc-rs`/`-i mimalloc` both empty with
+# this dep present) — its own transport stack is `async-io`/`blocking`/`futures`, no
+# TLS at all (stdio only, matching kaibo's own invariant). It carries `async-process`
+# transitively (for its CLIENT role, spawning a subprocess agent) — dead code on our
+# AGENT-only surface, never invoked, just weight in the dependency tree. Bumped our
+# own `rust-version` above (1.85 -> 1.88) to match: 1.1.0+ requires it (async
+# closures in its handler-registration API), so a bare `"1"` pin plus our old MSRV
+# would have resolved backward to 1.0.1's now-superseded API anyway.
+agent-client-protocol = "=1.3.0"
+
 # MCP server (stdio only — never bind a socket; the FS is the boundary).
 rmcp = { version = "3.0.0-beta.5", features = ["server", "transport-io", "macros"] }
 clap = { version = "4", features = ["derive"] }
@@ -174,8 +198,15 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 # `start_paused` tests (the deferred-generate poll loop) auto-advance tokio's clock
-# instead of really sleeping the poll interval.
-tokio = { version = "1", features = ["test-util"] }
+# instead of really sleeping the poll interval. `io-util` adds `tokio::io::duplex` +
+# `split`, feeding the ACP agent test (src/acp.rs) an in-memory transport pair.
+tokio = { version = "1", features = ["test-util", "io-util"] }
+# Bridges tokio's `AsyncRead`/`AsyncWrite` to the `futures` traits
+# `agent_client_protocol::ByteStreams` requires, so the ACP agent test (src/acp.rs)
+# can drive a real duplex-socket connection instead of calling handlers directly.
+# `default-features = false` + `compat` only: we need just the trait-bridging
+# wrappers, none of tokio-util's codec/net extras.
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
 # Request-body capture in `tests/effort_wire.rs` and `test_support::CaptureHttp`:
 # rig's `HttpClientExt` trait is typed in `bytes::Bytes`, so implementing a fake
 # transport needs the type by name. Already in the tree via reqwest/rig-core — zero
