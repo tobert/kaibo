@@ -1807,7 +1807,16 @@ pub async fn run_acp(common: CommonArgs) -> i32 {
         eprintln!("kaibo: default cast: {e:#}");
         return EXIT_SETUP;
     }
-    let state = crate::acp::AcpAgentState::new(&config);
+    // Builds a `Resolver` under the hood (same containment/allowed-set setup every
+    // front door computes) — a bad `--root`/`--allow-path` is a setup rejection here
+    // too, not a silent empty boundary.
+    let state = match crate::acp::AcpAgentState::new(Arc::new(config)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("kaibo: acp setup: {e:#}");
+            return EXIT_SETUP;
+        }
+    };
     match crate::acp::agent(state)
         .connect_to(agent_client_protocol::Stdio::new())
         .await
