@@ -84,6 +84,10 @@ use crate::session::Sessions;
 /// pinned to, and the in-flight turn's abort handle, if one is running.
 #[derive(Debug, Clone)]
 struct SessionRecord {
+    /// The session's consult root — already resolved through
+    /// [`AcpAgentState::resolve_session_cwd`] at `session/new`, so this is always
+    /// the CANONICALIZED path, contained in the allowed set. Never the client's raw
+    /// `cwd` string.
     cwd: PathBuf,
     mode_id: String,
     /// What `session/cancel` aborts. `None` between turns and while idle — a cancel
@@ -195,7 +199,10 @@ impl AcpAgentState {
         SessionId::new(format!("session-{n}"))
     }
 
-    /// Record a freshly created session, starting it on the default cast.
+    /// Record a freshly created session, starting it on the default cast. `cwd`
+    /// must already be the canonicalized, contained root from
+    /// [`Self::resolve_session_cwd`] — this method trusts its caller and does not
+    /// re-check containment.
     fn insert_session(&self, id: SessionId, cwd: PathBuf) {
         let mut sessions = self
             .inner
@@ -300,6 +307,22 @@ impl AcpAgentState {
             .reject_offline_cast(&cast, "session/prompt")
             .map_err(|e| e.message.to_string())?;
         Ok(cast)
+    }
+
+    /// Resolve and canonicalize a `session/new` `cwd` through the same containment
+    /// boundary every other front door enforces (`Resolver::resolve_root` —
+    /// symlinks and `..` resolved, then required at-or-under an allowed tree;
+    /// `--root`/`--allow-path`, the launch cwd when unset). Returns the
+    /// canonicalized path, which becomes this session's consult root. A `cwd`
+    /// outside the allowed set, or one that doesn't canonicalize at all
+    /// (nonexistent, not a directory), is refused here with the same clear error
+    /// `resolve_root` gives the MCP `path` argument — a loud refusal, never a
+    /// silent fallback to some other root.
+    fn resolve_session_cwd(&self, cwd: &std::path::Path) -> Result<PathBuf, String> {
+        self.inner
+            .resolver
+            .resolve_root(Some(cwd.to_string_lossy().into_owned()))
+            .map_err(|e| e.message.to_string())
     }
 
     /// Resolve one of `cast`'s slots into a live [`Arm`] — through the real
@@ -526,13 +549,28 @@ pub fn agent(state: AcpAgentState) -> impl ConnectTo<Client> {
             {
                 let state = state.clone();
                 async move |req: NewSessionRequest, responder, _cx| {
+                    // Containment first, same boundary as every other front door
+                    // (`Resolver::resolve_root`): an ACP client names its own `cwd`,
+                    // so it gets no more trust than an MCP caller's `path` argument.
+                    // Refuse loudly — outside the allowed set, or not even a real
+                    // directory — rather than minting a session pinned to whatever
+                    // the client asked for.
+                    let root = match state.resolve_session_cwd(&req.cwd) {
+                        Ok(r) => r,
+                        Err(msg) => {
+                            return responder.respond_with_error(
+                                Error::invalid_params().data(msg),
+                            )
+                        }
+                    };
                     let session_id = state.mint_session_id();
-                    state.insert_session(session_id.clone(), req.cwd.clone());
+                    state.insert_session(session_id.clone(), root.clone());
                     let modes =
                         SessionModeState::new(state.inner.default_cast.clone(), state.session_modes());
                     tracing::debug!(
                         session_id = %session_id,
                         cwd = %req.cwd.display(),
+                        resolved_root = %root.display(),
                         "acp: session/new"
                     );
                     responder.respond(NewSessionResponse::new(session_id).modes(modes))
@@ -773,6 +811,20 @@ mod tests {
         Config::builtin()
     }
 
+    /// `test_config()`, with `root` fixed to `root_dir` — mirrors
+    /// `handler_with_allowed` in `tests/containment.rs`: naming a root makes it
+    /// both the allowed tree and the inferred default root, so a
+    /// `session/new` whose `cwd` is `root_dir` (or a path under it) passes
+    /// containment. Every test that drives a real turn against a `project_dir()`
+    /// fixture needs this — `session/new` now enforces the same boundary the MCP
+    /// `path` argument always has, so an unrelated tempdir is no longer waved
+    /// through.
+    fn test_config_rooted(root_dir: &std::path::Path) -> Config {
+        let mut config = Config::builtin();
+        config.root = Some(root_dir.to_path_buf());
+        config
+    }
+
     /// A scripted arm over `client`, addressing model `model` — same shape
     /// `consult`'s own offline tests build (`src/consult/engine.rs`), vision off
     /// (nothing here attaches an image).
@@ -841,12 +893,22 @@ mod tests {
         assert!(response.auth_methods.is_empty());
     }
 
+    /// `session/new` with a `cwd` inside the allowed set (here, exactly the
+    /// resolver's configured `root`) is accepted: it returns a nonempty session id,
+    /// advertises one mode per configured cast, and — the point of this fix — the
+    /// session record now holds the CANONICALIZED root (what
+    /// `resolve_session_cwd`/`resolve_root` returned), not the client's raw `cwd`
+    /// string, since that canonicalized path is what every later `session/prompt`
+    /// turn runs `consult` against.
     #[tokio::test]
-    async fn session_new_returns_an_id_and_advertises_cast_modes() {
-        let state = AcpAgentState::new(Arc::new(test_config())).expect("resolver builds");
+    async fn session_new_with_an_in_bounds_cwd_returns_an_id_and_advertises_cast_modes() {
+        let root = project_dir();
+        let config = test_config_rooted(root.path());
+        let state = AcpAgentState::new(Arc::new(config)).expect("resolver builds");
         let (agent_transport, client_transport) = new_transport_pair();
-        let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
+        let agent_task = tokio::spawn(agent(state.clone()).connect_to(agent_transport));
 
+        let root_path = root.path().display().to_string();
         let response = ClientRole
             .builder()
             .name("test-client")
@@ -854,7 +916,7 @@ mod tests {
                 cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
-                cx.send_request(ClientNewSessionRequest::new("/tmp/kaibo-acp-test"))
+                cx.send_request(ClientNewSessionRequest::new(root_path))
                     .block_task()
                     .await
             })
@@ -880,6 +942,107 @@ mod tests {
         assert_eq!(
             modes.current_mode_id.to_string(),
             test_config().default_cast
+        );
+
+        // The point of this fix: the session's stored root is the canonicalized
+        // path `resolve_root` computed, so a later turn's `consult` call runs
+        // against exactly what containment vetted — not the client's raw string.
+        let canonicalized = std::fs::canonicalize(root.path()).expect("root canonicalizes");
+        let record = state
+            .session(&response.session_id)
+            .expect("session was recorded");
+        assert_eq!(
+            record.cwd, canonicalized,
+            "the session's consult root must be the canonicalized, contained cwd"
+        );
+    }
+
+    /// A `session/new` whose `cwd` cannot canonicalize at all (it doesn't exist) is
+    /// refused with a clear JSON-RPC error — never silently accepted and never
+    /// silently substituted with some other root. This behavior is new: chunk 2's
+    /// `session/new` accepted any `cwd` string, including this deliberately
+    /// nonexistent one, without ever driving it through containment.
+    #[tokio::test]
+    async fn session_new_refuses_a_cwd_that_does_not_exist() {
+        let state = AcpAgentState::new(Arc::new(test_config())).expect("resolver builds");
+        let (agent_transport, client_transport) = new_transport_pair();
+        let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
+
+        let result = ClientRole
+            .builder()
+            .name("test-client")
+            .connect_with(client_transport, async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(cx
+                    .send_request(ClientNewSessionRequest::new(
+                        "/tmp/kaibo-acp-test-cwd-does-not-exist",
+                    ))
+                    .block_task()
+                    .await)
+            })
+            .await
+            .expect("client-side connection failed");
+
+        agent_task
+            .await
+            .expect("agent task panicked")
+            .expect("agent-side connection failed");
+
+        let err = result.expect_err(
+            "a cwd that cannot canonicalize (nonexistent) must be refused, never silently \
+             accepted",
+        );
+        let data = err.data.as_ref().map(|d| d.to_string()).unwrap_or_default();
+        assert!(
+            err.message.contains("could not be resolved") || data.contains("could not be resolved"),
+            "the refusal names the canonicalization failure: {err:?}"
+        );
+    }
+
+    /// A `session/new` whose `cwd` is a real, existing directory — just one outside
+    /// every allowed tree — is refused the same as a nonexistent one. Containment
+    /// bounds *where* a session can point, not merely whether the path resolves.
+    #[tokio::test]
+    async fn session_new_refuses_a_cwd_outside_the_allowed_set() {
+        let allowed_root = project_dir();
+        let outside_root = project_dir();
+        let config = test_config_rooted(allowed_root.path());
+        let state = AcpAgentState::new(Arc::new(config)).expect("resolver builds");
+        let (agent_transport, client_transport) = new_transport_pair();
+        let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
+
+        let outside_path = outside_root.path().display().to_string();
+        let result = ClientRole
+            .builder()
+            .name("test-client")
+            .connect_with(client_transport, async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(cx
+                    .send_request(ClientNewSessionRequest::new(outside_path))
+                    .block_task()
+                    .await)
+            })
+            .await
+            .expect("client-side connection failed");
+
+        agent_task
+            .await
+            .expect("agent task panicked")
+            .expect("agent-side connection failed");
+
+        let err = result.expect_err(
+            "a cwd outside every allowed tree must be refused — an ACP client cannot aim \
+             kaibo's read-only shell at an arbitrary directory",
+        );
+        let data = err.data.as_ref().map(|d| d.to_string()).unwrap_or_default();
+        assert!(
+            err.message.contains("outside the allowed set")
+                || data.contains("outside the allowed set"),
+            "the refusal names the containment boundary: {err:?}"
         );
     }
 
@@ -916,13 +1079,13 @@ mod tests {
                 scripted_arm(&client, "scripted-synth"),
             ),
         );
-        let state = AcpAgentState::new_scripted(&test_config(), arms);
+        let root = project_dir();
+        let state = AcpAgentState::new_scripted(&test_config_rooted(root.path()), arms);
         let (agent_transport, client_transport) = new_transport_pair();
         let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
 
         let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = updates.clone();
-        let root = project_dir();
         let root_path = root.path().display().to_string();
 
         let prompt_response = ClientRole
@@ -1024,11 +1187,11 @@ mod tests {
                 scripted_arm(&client, "scripted-synth"),
             ),
         );
-        let state = AcpAgentState::new_scripted(&test_config(), arms);
+        let root = project_dir();
+        let state = AcpAgentState::new_scripted(&test_config_rooted(root.path()), arms);
         let (agent_transport, client_transport) = new_transport_pair();
         let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
 
-        let root = project_dir();
         let root_path = root.path().display().to_string();
 
         let (first, second) = ClientRole
@@ -1099,13 +1262,13 @@ mod tests {
                 scripted_arm(&client, "scripted-synth-b"),
             ),
         );
-        let state = AcpAgentState::new_scripted(&test_config(), arms);
+        let root = project_dir();
+        let state = AcpAgentState::new_scripted(&test_config_rooted(root.path()), arms);
         let (agent_transport, client_transport) = new_transport_pair();
         let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
 
         let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = updates.clone();
-        let root = project_dir();
         let root_path = root.path().display().to_string();
 
         ClientRole
@@ -1197,11 +1360,11 @@ mod tests {
                 scripted_arm(&client, "scripted-synth"),
             ),
         );
-        let state = AcpAgentState::new_scripted(&test_config(), arms);
+        let root = project_dir();
+        let state = AcpAgentState::new_scripted(&test_config_rooted(root.path()), arms);
         let (agent_transport, client_transport) = new_transport_pair();
         let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
 
-        let root = project_dir();
         let root_path = root.path().display().to_string();
 
         let response = ClientRole
@@ -1257,11 +1420,11 @@ mod tests {
                 scripted_arm(&client, "scripted-synth"),
             ),
         );
-        let state = AcpAgentState::new_scripted(&test_config(), arms);
+        let root = project_dir();
+        let state = AcpAgentState::new_scripted(&test_config_rooted(root.path()), arms);
         let (agent_transport, client_transport) = new_transport_pair();
         let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
 
-        let root = project_dir();
         let root_path = root.path().display().to_string();
 
         let response = ClientRole
@@ -1307,10 +1470,11 @@ mod tests {
     /// silently dropped or forwarded to the model.
     #[tokio::test]
     async fn a_non_text_content_block_is_refused() {
-        let state = AcpAgentState::new(Arc::new(test_config())).expect("resolver builds");
+        let root = project_dir();
+        let state =
+            AcpAgentState::new(Arc::new(test_config_rooted(root.path()))).expect("resolver builds");
         let (agent_transport, client_transport) = new_transport_pair();
         let agent_task = tokio::spawn(agent(state).connect_to(agent_transport));
-        let root = project_dir();
         let root_path = root.path().display().to_string();
 
         let result = ClientRole
