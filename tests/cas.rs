@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kaibo::cas::{Cas, CasError, Digest, Extension, Provenance};
+use kaibo::cas::{Backing, Cas, CasError, Digest, Extension, Provenance};
 use tempfile::TempDir;
 
 fn prov() -> Provenance {
@@ -1057,4 +1057,126 @@ fn open_refuses_a_file_at_the_root_or_in_its_ancestry() {
 
     // A plain directory (or a path whose ancestors are dirs) still opens fine.
     Cas::open(&dir.path().join("fresh").join("cas"), &[], None).expect("clean path opens");
+}
+
+// --- Backing-filesystem guard: ephemeral disk is still ephemeral --------------
+
+// The scenario this guard defends, stated once: a container with no volume mounted looks
+// exactly like disk mode. Persistence comes up, the CAS opens on what appears to be a
+// filesystem, kaibo accepts a `generate` prompt, spends the operator's provider credits,
+// writes the artifact — and the whole filesystem evaporates when the container exits.
+// Nothing in the store's own contract can notice: overlayfs answers writes and reads
+// exactly like ext4 right up until it doesn't exist.
+
+/// The warning has to carry four things, because an operator reading one line of startup
+/// log is the only chance this has to land: which filesystem was detected, which
+/// directory is on it, what will happen to the artifacts, and the fix (mount a volume).
+#[test]
+fn the_ephemeral_backing_warning_names_the_fs_the_dir_the_loss_and_the_fix() {
+    let msg = kaibo::cas::ephemeral_backing_warning("overlayfs", Path::new("/data/kaibo/cas"));
+    assert!(msg.contains("overlayfs"), "names the filesystem: {msg}");
+    assert!(
+        msg.contains("/data/kaibo/cas"),
+        "names the directory: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("not survive") || msg.to_lowercase().contains("lost"),
+        "says what happens to the artifacts: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("volume"),
+        "names the fix — mount a volume: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("credit") || msg.to_lowercase().contains("paid"),
+        "and why it costs something real: {msg}"
+    );
+}
+
+/// A durable filesystem says nothing at all. This guard is a warning, not a survey — an
+/// operator on ext4 must not learn a new line of startup noise.
+#[test]
+fn a_durable_backing_is_reported_as_durable_and_says_nothing() {
+    assert_eq!(Backing::Durable.ephemeral_fs(), None);
+    assert_eq!(Backing::Unknown.ephemeral_fs(), None);
+    assert_eq!(
+        Backing::Ephemeral { fs: "tmpfs" }.ephemeral_fs(),
+        Some("tmpfs")
+    );
+}
+
+/// **A probe that cannot answer says `Unknown`, never `Ephemeral`.** An unreadable
+/// `f_type` is not evidence of ephemerality, and a guard that warned every time it failed
+/// to look would train operators to ignore it — the one thing a severe warning cannot
+/// afford.
+///
+/// The reachable version of "cannot answer" is a relative path with nothing existing
+/// anywhere up its chain: there is no directory to ask about, and the walk bottoms out
+/// rather than guessing at the current directory. (The other no-answer paths — an
+/// unsupported platform, a `statfs` failure, a path holding an interior NUL — land on the
+/// same arm by construction.)
+#[test]
+fn a_probe_that_cannot_answer_reports_unknown_not_ephemeral() {
+    let nowhere = Path::new("kaibo-no-such-relative-dir-9f2c/deeper/still");
+    assert!(!nowhere.exists(), "the fixture must not exist");
+    assert_eq!(
+        kaibo::cas::probe_backing(nowhere),
+        Backing::Unknown,
+        "nothing to ask about is not proof of anything"
+    );
+}
+
+/// A path that does not exist is NOT a probe failure — it is the fresh-install case, and
+/// answering it from the nearest existing ancestor is the whole reason this guard fires
+/// on a fresh container at all. `/` exists on every machine, so a nonexistent path under
+/// it answers durably rather than shrugging.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_nonexistent_path_answers_from_its_nearest_existing_ancestor() {
+    let missing = Path::new("/nonexistent-kaibo-probe-target/deeper/still");
+    assert_ne!(
+        kaibo::cas::probe_backing(missing),
+        Backing::Unknown,
+        "the ancestor walk means a not-yet-created dir still gets a real answer"
+    );
+}
+
+/// Opportunistic real teeth: `/dev/shm` is tmpfs on essentially every Linux, so when it
+/// is there the probe must actually detect it — the scripted seam elsewhere proves the
+/// wiring, and this proves the syscall. Skipped cleanly where it does not exist, the way
+/// the repo's other environment-dependent tests do.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_real_probe_detects_tmpfs_on_dev_shm() {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        eprintln!("skipping: /dev/shm is not present, so there is no known tmpfs to probe");
+        return;
+    }
+    match kaibo::cas::probe_backing(shm) {
+        Backing::Ephemeral { fs } => assert_eq!(fs, "tmpfs", "/dev/shm is tmpfs"),
+        other => panic!("/dev/shm must probe as ephemeral tmpfs, got {other:?}"),
+    }
+}
+
+/// The probe answers about a directory that does not exist yet by asking about the
+/// deepest ancestor that does — the CAS root is created lazily on first write, so the
+/// startup check would otherwise be `Unknown` on every fresh install and never fire in
+/// the one scenario it exists for (a fresh container).
+#[test]
+#[cfg(target_os = "linux")]
+fn the_probe_answers_for_a_not_yet_created_cas_dir() {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        eprintln!("skipping: /dev/shm is not present");
+        return;
+    }
+    let unborn = shm.join("kaibo-probe-not-created").join("cas");
+    assert!(!unborn.exists(), "the fixture path must not exist");
+    match kaibo::cas::probe_backing(&unborn) {
+        Backing::Ephemeral { fs } => assert_eq!(fs, "tmpfs"),
+        other => {
+            panic!("a not-yet-created dir must answer from its nearest ancestor, got {other:?}")
+        }
+    }
 }

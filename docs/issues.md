@@ -46,15 +46,6 @@ range); the address string is unchanged.
 
 **Open work that remains:**
 
-- **A loud guard when the CAS is on ephemeral DISK storage.** The ghcr image is a
-  first-class distribution path, and a disk CAS at `$XDG_DATA_HOME/kaibo/cas` in a
-  container with no volume mounted will accept the prompt, **spend the user's provider
-  credits**, verify and write the artifact, then destroy it on exit. Ranked the top
-  remaining risk by the Gemini design pass. **Decided (Amy, 2026-07-30): detect
-  overlay/tmpfs backing and warn severely, then proceed** — not a refusal gated on an
-  acknowledgement flag. The memory-mode SEVERE warn that shipped covers the
-  no-persistence path; this remaining piece is the disk mode whose backing store is
-  secretly ephemeral (statfs the CAS dir, warn on overlay/tmpfs magic).
 - **Cross-agent CAS sharing is DEFERRED** (Amy, 2026-08-03): no tracking of which agent
   created which object, no allow-listing, until a concrete need shows up. The CAS's job
   in one line, hers: "cas should be a way for the kaibo agents to get stuff to the

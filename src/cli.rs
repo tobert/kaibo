@@ -1005,6 +1005,14 @@ pub fn run_config(common: CommonArgs) -> i32 {
     // a consult here would activate, so report that. The CAS mode is predicted from
     // the same assumption, through the one shared derivation (`Config::cas_mode`).
     let cas_mode = resolver.config.cas_mode(persistence_enabled);
+    // Probe the backing filesystem here too, on the same prediction. `kaibo config` is
+    // the natural place an operator checks *before* spending anything, and answering
+    // "disk" without saying the disk is a container's overlay would make this the one
+    // surface that still hides it. Read-only and cheap; only meaningful in disk mode.
+    let cas_ephemeral_fs = match (cas_mode, resolver.config.cas.dir.as_deref()) {
+        (crate::config::CasMode::Disk, Some(dir)) => crate::cas::probe_backing(dir).ephemeral_fs(),
+        _ => None,
+    };
     let body = render_config_resource(
         &resolver.config,
         resolver.allowed_trees(),
@@ -1013,6 +1021,7 @@ pub fn run_config(common: CommonArgs) -> i32 {
         resolver.followed_worktrees(),
         persistence_enabled,
         cas_mode,
+        cas_ephemeral_fs,
     );
     println!("{body}");
     EXIT_OK

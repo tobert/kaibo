@@ -17,6 +17,18 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **kaibo warns when the media CAS is on a disk that will not survive the
+  container.** A container with no volume mounted looks exactly like durable disk
+  mode: persistence comes up, the store opens, artifacts write and read back — and
+  the whole filesystem evaporates on exit, after you have paid provider credits for
+  what was in it. On Linux, startup now checks the CAS directory's backing
+  filesystem and warns severely on overlayfs, tmpfs, or ramfs, naming the filesystem
+  and the directory. It **proceeds** — a throwaway store is a legitimate thing to
+  run on purpose — and `kaibo://config` reports the finding under `[cas] backing`
+  (as does `kaibo config`), so it is checkable before you spend anything instead of
+  only in startup log. A durable filesystem, or a check that cannot answer, says
+  nothing at all.
+
 - **`read_cas` — read a stored artifact back by digest.** Metadata comes first on
   every response: mime, total size, binary or not, the artifact's label when its
   record carries one, the range served, and the real file path when the store is on

@@ -22,6 +22,11 @@ use super::ToolGating;
 /// values. The backend struct stores sources, not secrets; this renderer reads only
 /// those source fields. If Config ever gains a resolved-key cache, do not read it here.
 /// Tests in this file assert the contract holds.
+// The inputs are inherently many — the resolved config plus five pieces of runtime truth
+// the renderer cannot reach for itself (allowed set, default root and how it was chosen,
+// live worktrees, persistence, CAS mode and its backing). Bundling them into a struct
+// would relocate the list, not shorten it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_config_resource(
     config: &Config,
     allowed_set: &[PathBuf],
@@ -30,6 +35,7 @@ pub(crate) fn render_config_resource(
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
     cas_mode: crate::config::CasMode,
+    cas_ephemeral_fs: Option<&'static str>,
 ) -> String {
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -235,6 +241,15 @@ pub(crate) fn render_config_resource(
         dir: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
+        /// The ephemeral filesystem the store is sitting on, when the startup probe
+        /// found one — absent otherwise, so a normal install reads exactly as before.
+        ///
+        /// Present here and not only in the startup log because startup log is the thing
+        /// an operator scrolls past, or never sees at all when a client launched kaibo
+        /// for them. `mode = "disk"` claims durability; this is the line that qualifies
+        /// it, at a place they can query after the fact.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backing: Option<String>,
     }
 
     /// `[artifacts]` as resolved: may the inner model team save what it writes?
@@ -630,6 +645,12 @@ pub(crate) fn render_config_resource(
             mode: cas_mode.as_str().to_string(),
             dir: config.cas.dir.as_ref().map(|p| p.display().to_string()),
             max_bytes: config.cas.max_bytes,
+            backing: cas_ephemeral_fs.map(|fs| {
+                format!(
+                    "{fs} — EPHEMERAL: artifacts here will not survive this container \
+                         or host. Mount a volume at [cas] dir to keep them."
+                )
+            }),
         },
         artifacts: ArtifactsDoc {
             enabled: config.artifacts.enabled,
@@ -681,6 +702,7 @@ mod tests {
             followed,
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         assert!(
             body.contains("[runtime]") && body.contains("follow_worktrees = true"),
@@ -712,6 +734,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         assert!(
             body.contains(r#"kind = "openai-images""#),
@@ -752,6 +775,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let runtime = section(&body, "[runtime]");
         assert!(
@@ -792,6 +816,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         assert!(
             !section(&body, "[runtime.unstaffable_tools]").contains("deliberate"),
@@ -851,6 +876,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
@@ -936,6 +962,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
@@ -1020,6 +1047,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
@@ -1112,6 +1140,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let render_flags = |cast: &str, role: &str| -> bool {
@@ -1186,6 +1215,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let wire = |name: &str| -> Option<String> {
@@ -1233,6 +1263,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         // Structural presence checks — the resource is TOML or a document, not prose.
         for needle in [
@@ -1330,6 +1361,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         // The header NAME is discoverable…
         assert!(
@@ -1358,6 +1390,7 @@ mod tests {
             vec![],
             true,
             crate::config::CasMode::Disk,
+            None,
         );
         let section = body
             .split_once("[persistence]")
@@ -1380,6 +1413,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let section = body.split_once("[persistence]").expect("table renders").1;
         assert!(
@@ -1397,7 +1431,8 @@ mod tests {
         use crate::config::CasMode;
 
         let config = Config::from_toml_str("[cas]\ndir = \"/srv/art\"\n").unwrap();
-        let body = render_config_resource(&config, &[], None, false, vec![], true, CasMode::Disk);
+        let body =
+            render_config_resource(&config, &[], None, false, vec![], true, CasMode::Disk, None);
         let section = body.split_once("[cas]").expect("a [cas] table renders").1;
         assert!(
             section.contains("enabled = true")
@@ -1406,8 +1441,16 @@ mod tests {
             "disk mode must show on, the mode word, and the dir:\n{body}"
         );
 
-        let body =
-            render_config_resource(&config, &[], None, false, vec![], false, CasMode::Memory);
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            CasMode::Memory,
+            None,
+        );
         let section = body.split_once("[cas]").expect("table renders").1;
         assert!(
             section.contains(r#"mode = "memory""#) && section.contains("/srv/art"),
@@ -1415,7 +1458,8 @@ mod tests {
         );
 
         let off = Config::from_toml_str("[cas]\nenabled = false\n").unwrap();
-        let body = render_config_resource(&off, &[], None, false, vec![], false, CasMode::Off);
+        let body =
+            render_config_resource(&off, &[], None, false, vec![], false, CasMode::Off, None);
         let section = body.split_once("[cas]").expect("table renders").1;
         assert!(
             section.contains("enabled = false") && section.contains(r#"mode = "off""#),
@@ -1449,6 +1493,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         for needle in ["[backend_aliases]", "[cast_aliases]"] {
             assert!(body.contains(needle), "must render {needle}:\n{body}");
@@ -1504,6 +1549,7 @@ mod tests {
                 vec![],
                 false,
                 crate::config::CasMode::Memory,
+                None,
             );
             #[allow(deprecated)]
             unsafe {
@@ -1538,6 +1584,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         // The file path (source pointer) may appear, but not the file contents.
         assert!(
