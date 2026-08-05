@@ -107,9 +107,28 @@ pub const FORMATS: &[(&str, Extension)] = &[
     ("markdown", Extension::Md),
 ];
 
-/// The format names, for a schema `enum` and for error text.
+/// The format names, for the schema description and the coercion note.
 fn format_names() -> Vec<&'static str> {
     FORMATS.iter().map(|(name, _)| *name).collect()
+}
+
+/// Resolve a `format` ask to a container. **Assume text**: a name outside [`FORMATS`]
+/// resolves to [`Extension::Txt`] rather than refusing — the content arrived as a JSON
+/// string, so it IS UTF-8 text whatever the model called it, and `text/plain` is a true
+/// label where a refusal would burn the whole payload's output tokens to enforce a mime
+/// vocabulary. `format` is a hint, not a gate; the binary paths belong to `generate`.
+/// `None` when the ask was unknown lets the caller *state* the coercion in its result —
+/// stated, never silent.
+pub fn resolve_format(asked: Option<&str>) -> (Extension, Option<String>) {
+    let asked = asked.map(str::trim).filter(|f| !f.is_empty());
+    match asked {
+        None => (Extension::Txt, None),
+        Some(name) => FORMATS
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, ext)| (*ext, None))
+            .unwrap_or((Extension::Txt, Some(name.to_string()))),
+    }
 }
 
 /// The most bytes a `label` may carry, and it is not a courtesy limit.
@@ -186,8 +205,6 @@ pub enum SaveError {
         used: usize,
         actual: usize,
     },
-    /// `format` names something outside [`FORMATS`].
-    UnknownFormat { asked: String },
     /// `label` came in blank. The label is what the caller reads beside the URI, so an
     /// artifact with no description is one the caller cannot act on.
     MissingLabel,
@@ -233,12 +250,6 @@ impl std::fmt::Display for SaveError {
                 "This call has saved {used} bytes and this artifact adds {actual} more, \
                  which is past the limit of {cap} bytes for one call. Nothing was saved. \
                  Save a smaller selection, and report the rest in your answer."
-            ),
-            SaveError::UnknownFormat { asked } => write!(
-                f,
-                "`format` was {asked:?}. The formats available are {}. Nothing was saved. \
-                 Choose one of those and save again.",
-                format_names().join(" and ")
             ),
             SaveError::MissingLabel => write!(
                 f,
@@ -386,17 +397,10 @@ impl ArtifactSink {
                 actual: label.len(),
             });
         }
-        let asked = format
-            .map(str::trim)
-            .filter(|f| !f.is_empty())
-            .unwrap_or("text");
-        let ext = FORMATS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(asked))
-            .map(|(_, ext)| *ext)
-            .ok_or_else(|| SaveError::UnknownFormat {
-                asked: asked.to_string(),
-            })?;
+        // Assume text: an unknown format name resolves to Txt instead of refusing —
+        // see `resolve_format` for the argument. The coercion is surfaced by the tool's
+        // `call`, which runs the same resolution to build its note.
+        let (ext, _coerced) = resolve_format(format);
         let bytes = content.as_bytes();
         if bytes.len() > self.caps.per_artifact_bytes {
             return Err(SaveError::TooLarge {
@@ -512,7 +516,7 @@ pub struct SaveArtifactArgs {
     pub label: String,
     /// The bytes themselves.
     pub content: String,
-    /// `text` or `jsonl`; `text` when omitted.
+    /// A format hint (`text`, `jsonl`, `markdown`); anything else, or nothing, is text.
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -550,8 +554,10 @@ impl Tool for SaveArtifact {
              one or two representative entries where they illustrate the coverage. The \
              full content reaches the caller through the artifact.\n\n\
              Use this for material the caller wants to keep or to run: a generated \
-             corpus, a long inventory, a fixture. Reach for it when the content is bulk. \
-             Keep your reasoning and your conclusions in the answer itself.\n\n\
+             corpus, a long inventory, a report, a source file, a fixture. Any UTF-8 \
+             content ships as text unless `jsonl` or `markdown` fits it better. Reach \
+             for it when the content is bulk. Keep your reasoning and your conclusions \
+             in the answer itself.\n\n\
              Limits for one call: {per_artifact_bytes} bytes per artifact, \
              {artifacts_per_call} artifacts, {total_bytes_per_call} bytes in total. A \
              save past a limit is refused and stores nothing, and the refusal says which \
@@ -575,8 +581,11 @@ impl Tool for SaveArtifact {
                 },
                 "format": {
                     "type": "string",
-                    "enum": format_names(),
-                    "description": "the shape of the content; `text` when omitted"
+                    "description": format!(
+                        "a hint for the stored mime: {}; anything else, or nothing, \
+                         stores as text",
+                        format_names().join(" | ")
+                    )
                 }
             },
             "required": ["label", "content"]
@@ -594,8 +603,20 @@ impl Tool for SaveArtifact {
         // Exactly this line for exactly these bytes, every time. A word about whether the
         // content was new would answer "is this already in the store?" for arbitrary bytes,
         // across every project this kaibo serves — see the module doc's existence-oracle note.
+        // The coercion note depends only on the *request*, never on store state, so it
+        // keeps that property.
+        let (_, coerced) = resolve_format(args.format.as_deref());
+        let note = match coerced {
+            Some(asked) => format!(
+                " (`format` {:?} is not a name kaibo knows, so it stored as text/plain — \
+                 the formats are {})",
+                asked,
+                format_names().join(", ")
+            ),
+            None => String::new(),
+        };
         Ok(format!(
-            "Saved. The caller will receive this artifact with your answer, at \
+            "Saved{note}. The caller will receive this artifact with your answer, at \
              {}{}. Name that URI in your answer and describe what the artifact covers.",
             crate::cas::CAS_URI_PREFIX,
             digest.to_hex()

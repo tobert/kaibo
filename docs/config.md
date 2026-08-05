@@ -928,10 +928,13 @@ see the server's posture before asking.
 | artifacts per MCP call | 8 |
 | bytes per MCP call | 8 MiB |
 | label | one line, 200 bytes |
-| formats | `text`, `jsonl` |
+| formats | `text`, `jsonl`, `markdown` — a hint; anything else stores as text |
 
 A save past a limit is **refused and stores nothing**; the refusal names the limit, the
-actual size, and the way forward. Nothing is ever truncated — a digest handed back for
+actual size, and the way forward. The format is the one non-gate: the content arrives as
+a JSON string, so it is UTF-8 text by construction — source code, a config, a log all
+ship as `text` — and an unknown format name stores as `text/plain` with the coercion
+stated in the tool result, never refused. Binary artifacts come only from `generate`. Nothing is ever truncated — a digest handed back for
 content that is not what the model wrote would be silent corruption. The per-artifact
 limit is a backstop rather than a working ceiling: the content rides in tool-call
 arguments, so the model's own `max_tokens` binds first. The label is bounded and must be a

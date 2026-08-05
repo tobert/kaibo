@@ -216,25 +216,52 @@ fn an_omitted_format_stores_text() {
     assert_eq!(s.saved()[0].mime, Extension::Txt.mime());
 }
 
-/// A format outside the allowlist is refused loudly, naming what IS available, and
-/// stores nothing. The allowlist is a serving concern rather than a safety boundary
-/// (a model can put anything inside a `.txt`), but a silently-coerced format would
-/// mislabel the bytes the caller retrieves.
+/// **Assume text.** A format name kaibo does not know stores as text — never a
+/// refusal. This deliberately inverts the original allowlist refusal (Amy,
+/// 2026-08-05: "assume text unless something is obviously binary"): the content
+/// arrived as a JSON string, so it IS UTF-8 text whatever the model called it, and
+/// `text/plain` is a true label where a refusal would burn the model's whole payload
+/// to enforce a mime vocabulary — the discover-by-failing cost this design treats as
+/// uniquely expensive. `format` is a hint, not a gate; the binary paths belong to
+/// `generate`.
 #[test]
-fn a_format_outside_the_allowlist_is_refused_and_stores_nothing() {
+fn an_unknown_format_stores_as_text() {
     let s = sink();
-    for asked in ["png", "sh", "application/json", "exe"] {
-        let msg = match s.save("payload", "body", Some(asked)) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("format {asked:?} must be refused"),
-        };
-        assert!(msg.contains(asked), "the refusal must echo the ask: {msg}");
-        assert!(
-            msg.contains("text") && msg.contains("jsonl"),
-            "the refusal must name what IS available, got: {msg}"
-        );
+    for asked in ["rust", "sh", "application/json", "markdwon"] {
+        s.save("source", "fn main() {}\n", Some(asked))
+            .unwrap_or_else(|e| panic!("format {asked:?} must store as text, got: {e}"));
     }
-    assert!(s.saved().is_empty(), "nothing was stored");
+    let saved = s.saved();
+    assert_eq!(saved.len(), 4);
+    for a in &saved {
+        assert_eq!(a.mime, Extension::Txt.mime(), "coerced to text: {a:?}");
+    }
+}
+
+/// The coercion is stated, not silent: the tool's own result line tells the model an
+/// unknown name stored as text and names the formats that exist, so the next save can
+/// ask for `markdown` and get it.
+#[tokio::test]
+async fn the_tool_result_states_an_unknown_format_stored_as_text() {
+    use kaibo::artifact::SaveArtifact;
+    use rig_agent::tool::{Tool, ToolContext};
+    let tool = SaveArtifact::new(Arc::new(sink()));
+    let out = tool
+        .call(
+            &mut ToolContext::default(),
+            serde_json::from_value(serde_json::json!({
+                "label": "a source file",
+                "content": "fn main() {}\n",
+                "format": "rust"
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("an unknown format stores as text");
+    assert!(
+        out.contains("text/plain") && out.contains("markdown"),
+        "the result states the coercion and names the real formats, got: {out}"
+    );
 }
 
 /// A blank label is refused: the caller reads the label beside the URI, so an artifact
