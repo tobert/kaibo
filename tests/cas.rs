@@ -624,6 +624,131 @@ fn extension_maps_mimes_both_ways_and_refuses_unknown() {
     assert_eq!(Extension::from_mime("model/gltf-binary"), None);
 }
 
+// --- Lookup: the sidecar's mime is the authority ------------------------------
+
+/// A provenance sidecar recording `mime`, everything else fixed — the shape
+/// `store_generated_artifacts` writes (the sidecar's mime always describes the object
+/// stored beside it).
+fn prov_mime(mime: &str) -> Provenance {
+    Provenance {
+        mime: mime.into(),
+        ..prov()
+    }
+}
+
+/// The shard path a digest's object would live at, computed the way `Cas` does — so a
+/// test can build (or inspect) a store layout by hand.
+fn object_path(root: &Path, digest: &Digest, ext: &str) -> PathBuf {
+    let hex = digest.to_hex();
+    root.join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(format!("{hex}.{ext}"))
+}
+
+/// **The lookup reads the sidecar, not a probe order.** One content can legitimately be
+/// stored under two container formats (the address is the *content* hash, so the second
+/// put lands at the same digest), and the sidecar written with the first put is the
+/// record of what this object actually is. A probe that walks `Extension::ALL` in
+/// declaration order answers with whichever variant it happens to try first, which is a
+/// mislabel the `kaibo://cas/<digest>` resource then stamps onto the bytes.
+///
+/// Stored webp-first, png-second: probe order says PNG, the recorded provenance says
+/// WEBP. The recorded provenance wins.
+#[test]
+fn lookup_reports_the_extension_the_sidecar_recorded_not_the_probe_order() {
+    let (cas, _dir) = open_uncapped();
+    let bytes = b"one content, two container names".to_vec();
+
+    cas.put(&bytes, Extension::Webp, &prov_mime("image/webp"))
+        .expect("first put records the sidecar");
+    let digest = cas
+        .put(&bytes, Extension::Png, &prov_mime("image/png"))
+        .expect("second put is a verified dedup at the same address");
+
+    let (path, ext) = cas.entry_for(&digest).expect("the object is findable");
+    assert_eq!(
+        ext,
+        Extension::Webp,
+        "the sidecar recorded image/webp, so that is what this object IS — got {ext:?}"
+    );
+    assert!(
+        path.extension().is_some_and(|e| e == "webp"),
+        "the located path must be the object the sidecar describes, got {}",
+        path.display()
+    );
+}
+
+/// The fallback that keeps a decade-old store readable: an object with **no sidecar**
+/// beside it (the crash window between the object write and the sidecar write is real —
+/// see `write_new_file`'s fsync note) still resolves by probing the container formats.
+/// Making the sidecar the authority must not make it a *requirement*.
+#[test]
+fn an_object_with_no_sidecar_still_resolves_by_probe() {
+    let (cas, _dir) = open_uncapped();
+    let bytes = b"orphaned object, sidecar never landed".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+    let path = object_path(cas.root(), &digest, "jpeg");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+
+    let (found, ext) = cas
+        .entry_for(&digest)
+        .expect("a sidecar-less object must still be findable");
+    assert_eq!(found, path);
+    assert_eq!(ext, Extension::Jpeg);
+    assert_eq!(cas.get(&digest).unwrap(), Some(bytes));
+}
+
+/// A sidecar whose `mime` the store cannot name on disk (an older kaibo, a
+/// hand-edited file) falls back to the probe rather than reporting the object missing.
+/// Losing a paid-for artifact to an unrecognized metadata string would be the exact
+/// silent-data-loss shape this store refuses.
+#[test]
+fn an_unmappable_sidecar_mime_falls_back_to_the_probe() {
+    let (cas, _dir) = open_uncapped();
+    let bytes = b"stored under a mime this kaibo does not know".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+    let shard = object_path(cas.root(), &digest, "png");
+    std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+    std::fs::write(&shard, &bytes).unwrap();
+    std::fs::write(
+        shard.with_extension("json"),
+        serde_json::to_vec(&prov_mime("application/octet-stream")).unwrap(),
+    )
+    .unwrap();
+
+    let (_, ext) = cas
+        .entry_for(&digest)
+        .expect("an unmappable sidecar mime must not hide the object");
+    assert_eq!(ext, Extension::Png);
+}
+
+/// The text formats round-trip through the same address-is-the-content contract the
+/// images do: put bytes under a text container, read them back by digest, and get the
+/// format the sidecar recorded. This is what the sidecar-as-authority change bought —
+/// a lookup that answers correctly for a format declared after the image set.
+#[test]
+fn text_and_jsonl_artifacts_round_trip_by_digest() {
+    let (cas, _dir) = open_uncapped();
+    for (ext, body) in [
+        (
+            Extension::Txt,
+            "a model-authored report\n".as_bytes().to_vec(),
+        ),
+        (
+            Extension::Jsonl,
+            "{\"a\":1}\n{\"a\":2}\n".as_bytes().to_vec(),
+        ),
+    ] {
+        let digest = cas.put(&body, ext, &prov_mime(ext.mime())).expect("put");
+        assert_eq!(cas.get(&digest).unwrap(), Some(body.clone()));
+        let (path, found) = cas.entry_for(&digest).expect("findable by digest");
+        assert_eq!(found, ext);
+        assert!(path.extension().is_some_and(|e| e == ext.as_str()));
+        assert!(!ext.is_image(), "authored text is not a rendered image");
+    }
+}
+
 // --- or-gpt review follow-ups (2026-08-03) ------------------------------------
 
 /// Sum of every file under `dir`, recursively — the store's true on-disk footprint.

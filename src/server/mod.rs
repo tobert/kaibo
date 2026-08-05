@@ -3885,15 +3885,23 @@ fn store_generated_artifacts(
         .iter()
         .enumerate()
         .map(|(i, artifact)| {
-            crate::cas::Extension::from_mime(&artifact.mime).ok_or_else(|| {
-                anyhow!(
-                    "artifact {} has mime {:?}, which the media store cannot name on \
-                     disk yet — refusing the whole result rather than storing it under \
-                     an invented extension; nothing was stored",
-                    i + 1,
-                    artifact.mime
-                )
-            })
+            // `is_image` and not merely "the store can name it": the store also names
+            // the text formats `save_artifact` writes, and an images provider handing
+            // back a text body is a provider fault, not an artifact. Keeping the
+            // refusal keyed to the media lane's own shape is what stopped growing
+            // `Extension` from quietly widening what `generate` accepts.
+            crate::cas::Extension::from_mime(&artifact.mime)
+                .filter(crate::cas::Extension::is_image)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "artifact {} has mime {:?}, which is not an image format the \
+                         media store can name on disk — refusing the whole result \
+                         rather than storing it under an invented extension; nothing \
+                         was stored",
+                        i + 1,
+                        artifact.mime
+                    )
+                })
         })
         .collect::<Result<_>>()?;
     let timestamp = now_epoch_secs();

@@ -265,29 +265,41 @@ impl Digest {
     }
 }
 
-/// A generated image's on-disk container format. Deliberately a closed enum, not a
+/// An artifact's on-disk container format. Deliberately a closed enum, not a
 /// caller-supplied string: this is the *only* caller-influenced component of an
 /// object's path (the digest supplies the rest), so it must be a small, fixed set kaibo
 /// controls — a free string here would reopen the aim-the-write hole the digest closes
-/// for the rest of the path. Extend this list as new providers/formats land; never
+/// for the rest of the path. Extend this list as new producers/formats land; never
 /// widen it to `String`.
+///
+/// The image variants come from `generate` (a provider rendered them); the text
+/// variants come from `save_artifact` (a model on kaibo's own team authored them).
+/// [`Extension::is_image`] tells them apart, which is what keeps `generate`'s "an
+/// images provider returned something that is not an image" refusal exactly as loud as
+/// it was when this enum held images alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extension {
     Png,
     Jpeg,
     Webp,
     Gif,
+    /// Plain UTF-8 text: a model-authored report, corpus, or listing.
+    Txt,
+    /// JSON Lines: one JSON value per line, the shape a machine consumer streams.
+    Jsonl,
 }
 
 impl Extension {
-    /// Every variant, in the order [`Cas::path_for`]/[`Cas::get`] probe them — a digest
-    /// alone doesn't say which format it was written under, so a lookup by digest tries
-    /// each in turn until one exists on disk.
-    pub const ALL: [Extension; 4] = [
+    /// Every variant, in the order [`Cas::entry_for`] probes them when an object has no
+    /// readable provenance sidecar to name its format. The sidecar is the authority;
+    /// this order only decides the answer for an object that lost one.
+    pub const ALL: [Extension; 6] = [
         Extension::Png,
         Extension::Jpeg,
         Extension::Webp,
         Extension::Gif,
+        Extension::Txt,
+        Extension::Jsonl,
     ];
 
     /// The bare filename extension (no leading dot).
@@ -297,25 +309,48 @@ impl Extension {
             Extension::Jpeg => "jpeg",
             Extension::Webp => "webp",
             Extension::Gif => "gif",
+            Extension::Txt => "txt",
+            Extension::Jsonl => "jsonl",
         }
     }
 
     /// The canonical mime type this on-disk format serves as — what the
-    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back.
+    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back, and what a
+    /// producer records in the provenance sidecar so [`Cas::entry_for`] can read the
+    /// format straight back out.
     pub fn mime(&self) -> &'static str {
         match self {
             Extension::Png => "image/png",
             Extension::Jpeg => "image/jpeg",
             Extension::Webp => "image/webp",
             Extension::Gif => "image/gif",
+            Extension::Txt => "text/plain; charset=utf-8",
+            Extension::Jsonl => "application/jsonl",
         }
     }
 
-    /// Map a wire mime string (a provider's own spelling, case-insensitive per RFC
+    /// Is this a rendered image (a `generate` output) rather than authored text?
+    /// `generate` prevalidates on this, so an images provider handing back a
+    /// `text/plain` body is still refused loudly instead of stored as an artifact:
+    /// growing this enum for `save_artifact` must not quietly widen what the media
+    /// lane accepts.
+    pub fn is_image(&self) -> bool {
+        match self {
+            Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => true,
+            Extension::Txt | Extension::Jsonl => false,
+        }
+    }
+
+    /// Map a wire mime string (a producer's own spelling, case-insensitive per RFC
     /// 7231) onto the closed on-disk set. `None` for anything the CAS cannot name on
     /// disk — the caller decides loudly what that means (see
     /// `stability::MediaType::to_cas_extension` for the same refusal argued at length);
     /// this helper never invents an extension for unknown bytes.
+    ///
+    /// Parameters are dropped before matching, so our own canonical
+    /// `text/plain; charset=utf-8` and a bare `text/plain` name the same format. The
+    /// JSON Lines aliases are all accepted on parse because that format never got one
+    /// registered spelling; [`Extension::mime`] renders exactly one of them.
     pub fn from_mime(mime: &str) -> Option<Self> {
         let essence = mime.split(';').next().unwrap_or(mime).trim();
         match essence.to_ascii_lowercase().as_str() {
@@ -323,6 +358,11 @@ impl Extension {
             "image/jpeg" => Some(Extension::Jpeg),
             "image/webp" => Some(Extension::Webp),
             "image/gif" => Some(Extension::Gif),
+            "text/plain" => Some(Extension::Txt),
+            "application/jsonl"
+            | "application/x-ndjson"
+            | "application/jsonlines"
+            | "application/x-jsonlines" => Some(Extension::Jsonl),
             _ => None,
         }
     }
@@ -333,6 +373,12 @@ impl Extension {
 /// with no built-in GC — a user (or their own script) can `find`/`jq` over these sidecars
 /// and prune intelligently instead of guessing at opaque hashed bytes. See the module
 /// doc's "No GC here, on purpose" section.
+///
+/// `mime` is also load-bearing at runtime: it is what [`Cas::entry_for`] reads to name
+/// an object's format in one lookup rather than probing every container format kaibo
+/// knows. Record the format the object actually is (`Extension::mime` is the canonical
+/// spelling) — a sidecar that disagrees with the bytes beside it mislabels the artifact
+/// on retrieval.
 ///
 /// # Every new field must be `Option`, or carry `#[serde(default)]`
 ///
@@ -463,18 +509,50 @@ impl Cas {
             .join(format!("{}.json", digest.to_hex()))
     }
 
-    /// The path an object would live at, if it exists — probing every [`Extension`]
-    /// variant in turn, since a bare digest doesn't say which format it was written
-    /// under. `None` if no object with this digest has ever been written (or an ancestor
-    /// directory doesn't exist yet, which reads the same way: nothing is here).
+    /// The path an object would live at, if it exists. `None` if no object with this
+    /// digest has ever been written (or an ancestor directory doesn't exist yet, which
+    /// reads the same way: nothing is here).
     pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
         self.entry_for(digest).map(|(path, _)| path)
+    }
+
+    /// Read an object's provenance sidecar, if one is there and parses. `None` covers
+    /// three cases the caller treats alike — no sidecar (an object whose write crashed
+    /// between the two files; see [`write_new_file`]), an unreadable one, and one whose
+    /// JSON doesn't deserialize — because each means the same thing to a lookup: this
+    /// object cannot tell us what it is, so something else has to.
+    pub fn provenance_for(&self, digest: &Digest) -> Option<Provenance> {
+        let bytes = std::fs::read(self.sidecar_path(digest)).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// [`path_for`](Self::path_for) plus which [`Extension`] the object was written
     /// under — the extension carries the mime type a resource read needs to stamp on
     /// the bytes, and re-deriving it from the path string would be a second parser.
+    ///
+    /// **The sidecar is the authority.** Every object written by this store gets a
+    /// `<hex>.json` sidecar whose `mime` describes it, so one read of that file names
+    /// the format directly: one lookup, not a walk of every container format kaibo
+    /// knows. That matters more as the set grows past images — a probe answers with
+    /// whichever variant it happens to try first, which for content stored under two
+    /// names is a *mislabel* the `kaibo://cas/<digest>` resource then stamps onto the
+    /// bytes, and for a large set is N stats per read.
+    ///
+    /// **The probe is the fallback, never the requirement.** An object whose sidecar
+    /// is missing, unreadable, or names a mime this kaibo cannot map still resolves by
+    /// trying [`Extension::ALL`]. This store never rewrites, so an old or orphaned
+    /// object can't be migrated into the new scheme — losing one to a metadata gap
+    /// would be exactly the silent data loss the module refuses.
     pub fn entry_for(&self, digest: &Digest) -> Option<(PathBuf, Extension)> {
+        if let Some(ext) = self
+            .provenance_for(digest)
+            .and_then(|p| Extension::from_mime(&p.mime))
+        {
+            let path = self.object_path(digest, ext);
+            if path.is_file() {
+                return Some((path, ext));
+            }
+        }
         Extension::ALL.into_iter().find_map(|ext| {
             let path = self.object_path(digest, ext);
             path.is_file().then_some((path, ext))
