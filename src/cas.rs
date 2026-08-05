@@ -109,25 +109,42 @@
 //! file in the store on the *write* path, for every new object, over a store that never
 //! deletes and is sharded two levels deep; that walk is O(objects) and only slows down as
 //! the store fills. An operator who never asked for a ceiling should not pay it, so they
-//! do not. Cleanup is theirs to do (`find -mtime` over the sidecars); a TTL may come later.
+//! do not. Cleanup, if an operator wants any, is theirs to do; kaibo offers no verb for it
+//! yet, and the shape a good one wants is an index kaibo maintains rather than a walk of
+//! the store (see "No GC here" below).
 //!
 //! When a cap *is* set, a [`Cas::put`] that would push the store's total size over it is
 //! refused with [`CasError::CapacityExceeded`] — loudly, before any bytes are written. It never deletes anything to make room: eviction would
 //! quietly make "write-only" a lie (a lie exactly one write-time trust judgment away from
 //! looking corrupt), and disk-full-in-effect is precisely the crash-over-corrupt case
-//! kaibo's read-only posture already treats as correct. A dedup write of content already
-//! on disk is exempt from the check (it adds zero bytes, so it cannot be what pushed the
-//! store over the line) — see [`Cas::put`].
+//! kaibo's read-only posture already treats as correct. The check runs on **every** put,
+//! including one whose content is already here: exempting a dedup is right about disk
+//! usage and wrong about disclosure, because succeeding for held bytes while refusing new
+//! ones lets a caller ask *is this content in the store?* across every project this kaibo
+//! has served. See [`Cas::put`] for the full argument, and [`MemoryCas::put`] for the same
+//! ordering in the other mode.
 //!
-//! # No GC here, on purpose — the sidecar is why that's honest
+//! # No GC here, on purpose
 //!
-//! kaibo does not prune this store. The user backs it up or prunes it by hand (`find
-//! -mtime`, `restic`, …) if they want to. For that to be an honest position rather than a
-//! punt, every object gets a `<hex>.json` provenance sidecar (prompt, model, cast,
-//! timestamp, mime, seed) next to it — the metadata a human (or a script) needs to prune
-//! intelligently instead of guessing at opaque bytes. Because nothing here is ever
-//! rewritten, that sidecar's schema can only ever grow *compatibly* — see
-//! [`Provenance`]'s doc for the rule that keeps a decade-old sidecar readable.
+//! kaibo does not prune this store, and the reason is the store's own shape rather than a
+//! deferred feature: the address is the content hash and nothing is ever unlinked, so an
+//! object at a given digest is the same object forever and no reference anyone holds can
+//! go stale. Deletion would trade that guarantee away.
+//!
+//! Every object also gets a `<hex>.json` provenance sidecar (prompt, model, cast,
+//! timestamp, mime, seed, and how it was produced) beside it, which makes an object
+//! **self-describing to whoever holds its address**: one lookup by digest says what these
+//! bytes are, where they came from, and what format to serve them as. That is its job,
+//! and it is the access pattern the whole store is built for.
+//!
+//! It is not a scan target. Sweeping the tree to survey the store gets slower as the
+//! store fills — 65,536 shards, a `readdir` and a parse per object — and nothing here is
+//! indexed for it. Operator-facing inventory (someday: `kaibo cas ls`/`du`) wants an index
+//! kaibo maintains, not a walk; see `docs/issues.md`.
+//!
+//! Because nothing here is ever rewritten, the sidecar's schema can only ever grow
+//! *compatibly* — see [`Provenance`]'s doc for the rule that keeps a decade-old sidecar
+//! readable.
 //!
 //! # Never mounted into kaish
 //!
@@ -149,6 +166,16 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// The resource-URI prefix an object is addressed by: `kaibo://cas/<digest>`. Declared
+/// here, beside the store, so the MCP resource route and every producer that *renders* an
+/// address (`generate`'s result lines, `save_artifact`'s footer) spell it one way.
+///
+/// Reading that resource is **operator surface only** (Amy's ruling, 2026-08-03): the MCP
+/// client and the CLI resolve it; the inner model team never can. The CAS is not mounted
+/// into kaish and no cast-facing tool reads it, because kaibo state spans projects and a
+/// browsable CAS would let one project's team enumerate another's artifacts.
+pub const CAS_URI_PREFIX: &str = "kaibo://cas/";
 
 /// The CAS's error surface. A persistence-adjacent module wants a typed error callers
 /// can match on, mirroring [`crate::store::StoreError`]'s posture (thiserror over
@@ -207,6 +234,24 @@ pub enum CasError {
     /// story — see the module doc).
     #[error("media CAS provenance sidecar serialize: {0}")]
     Serialize(String),
+    /// **The object landed; its provenance sidecar did not.** [`Cas::put`] writes the
+    /// object first and the sidecar second, so an I/O failure between them leaves the
+    /// content durably stored and retrievable — the probe fallback in
+    /// [`Cas::entry_for`] finds a sidecar-less object — while the call still has to
+    /// report a failure, because the provenance record the store's whole no-GC stance
+    /// rests on is missing.
+    ///
+    /// Its own variant, rather than a plain [`CasError::Io`], because the two demand
+    /// opposite things of a caller: an `Io` failure means the bytes are not there and
+    /// "nothing was saved" is true, while this means they ARE there and saying nothing
+    /// was saved is a lie about durable data. The digest rides along because it is the
+    /// only way back to bytes that no longer describe themselves.
+    #[error(
+        "media CAS object {digest} was stored, but its provenance sidecar could not be \
+         written ({cause}) — the bytes are durable and retrievable at that digest, and \
+         this store never rewrites, so the record cannot be filled in later"
+    )]
+    ProvenanceNotRecorded { digest: String, cause: String },
 }
 
 pub type Result<T> = std::result::Result<T, CasError>;
@@ -265,29 +310,44 @@ impl Digest {
     }
 }
 
-/// A generated image's on-disk container format. Deliberately a closed enum, not a
+/// An artifact's on-disk container format. Deliberately a closed enum, not a
 /// caller-supplied string: this is the *only* caller-influenced component of an
 /// object's path (the digest supplies the rest), so it must be a small, fixed set kaibo
 /// controls — a free string here would reopen the aim-the-write hole the digest closes
-/// for the rest of the path. Extend this list as new providers/formats land; never
+/// for the rest of the path. Extend this list as new producers/formats land; never
 /// widen it to `String`.
+///
+/// The image variants come from `generate` (a provider rendered them); the text
+/// variants come from `save_artifact` (a model on kaibo's own team authored them).
+/// [`Extension::is_image`] tells them apart, which is what keeps `generate`'s "an
+/// images provider returned something that is not an image" refusal exactly as loud as
+/// it was when this enum held images alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extension {
     Png,
     Jpeg,
     Webp,
     Gif,
+    /// Plain UTF-8 text: a model-authored report, corpus, or listing.
+    Txt,
+    /// JSON Lines: one JSON value per line, the shape a machine consumer streams.
+    Jsonl,
+    /// Markdown: the shape a model naturally writes a report in.
+    Md,
 }
 
 impl Extension {
-    /// Every variant, in the order [`Cas::path_for`]/[`Cas::get`] probe them — a digest
-    /// alone doesn't say which format it was written under, so a lookup by digest tries
-    /// each in turn until one exists on disk.
-    pub const ALL: [Extension; 4] = [
+    /// Every variant, in the order [`Cas::entry_for`] probes them when an object has no
+    /// readable provenance sidecar to name its format. The sidecar is the authority;
+    /// this order only decides the answer for an object that lost one.
+    pub const ALL: [Extension; 7] = [
         Extension::Png,
         Extension::Jpeg,
         Extension::Webp,
         Extension::Gif,
+        Extension::Txt,
+        Extension::Jsonl,
+        Extension::Md,
     ];
 
     /// The bare filename extension (no leading dot).
@@ -297,25 +357,62 @@ impl Extension {
             Extension::Jpeg => "jpeg",
             Extension::Webp => "webp",
             Extension::Gif => "gif",
+            Extension::Txt => "txt",
+            Extension::Jsonl => "jsonl",
+            Extension::Md => "md",
         }
     }
 
     /// The canonical mime type this on-disk format serves as — what the
-    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back.
+    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back, and what a
+    /// producer records in the provenance sidecar so [`Cas::entry_for`] can read the
+    /// format straight back out.
     pub fn mime(&self) -> &'static str {
         match self {
             Extension::Png => "image/png",
             Extension::Jpeg => "image/jpeg",
             Extension::Webp => "image/webp",
             Extension::Gif => "image/gif",
+            Extension::Txt => "text/plain; charset=utf-8",
+            Extension::Jsonl => "application/jsonl",
+            Extension::Md => "text/markdown; charset=utf-8",
         }
     }
 
-    /// Map a wire mime string (a provider's own spelling, case-insensitive per RFC
+    /// Is this a rendered image (a `generate` output) rather than authored text?
+    /// `generate` prevalidates on this, so an images provider handing back a
+    /// `text/plain` body is still refused loudly instead of stored as an artifact:
+    /// growing this enum for `save_artifact` must not quietly widen what the media
+    /// lane accepts.
+    pub fn is_image(&self) -> bool {
+        match self {
+            Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => true,
+            Extension::Txt | Extension::Jsonl | Extension::Md => false,
+        }
+    }
+
+    /// Should retrieval serve this format as a **string** rather than base64? The
+    /// producers mark what they make — `save_artifact` writes these formats from UTF-8
+    /// input, `generate` writes images — and this is where retrieval reads the mark.
+    /// Deliberately not `!is_image()`: a future format (audio, an archive) is neither
+    /// an image nor text, so each new variant must answer both questions on its own.
+    pub fn is_textual(&self) -> bool {
+        match self {
+            Extension::Txt | Extension::Jsonl | Extension::Md => true,
+            Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => false,
+        }
+    }
+
+    /// Map a wire mime string (a producer's own spelling, case-insensitive per RFC
     /// 7231) onto the closed on-disk set. `None` for anything the CAS cannot name on
     /// disk — the caller decides loudly what that means (see
     /// `stability::MediaType::to_cas_extension` for the same refusal argued at length);
     /// this helper never invents an extension for unknown bytes.
+    ///
+    /// Parameters are dropped before matching, so our own canonical
+    /// `text/plain; charset=utf-8` and a bare `text/plain` name the same format. The
+    /// JSON Lines aliases are all accepted on parse because that format never got one
+    /// registered spelling; [`Extension::mime`] renders exactly one of them.
     pub fn from_mime(mime: &str) -> Option<Self> {
         let essence = mime.split(';').next().unwrap_or(mime).trim();
         match essence.to_ascii_lowercase().as_str() {
@@ -323,16 +420,30 @@ impl Extension {
             "image/jpeg" => Some(Extension::Jpeg),
             "image/webp" => Some(Extension::Webp),
             "image/gif" => Some(Extension::Gif),
+            "text/plain" => Some(Extension::Txt),
+            "text/markdown" | "text/x-markdown" => Some(Extension::Md),
+            "application/jsonl"
+            | "application/x-ndjson"
+            | "application/jsonlines"
+            | "application/x-jsonlines" => Some(Extension::Jsonl),
             _ => None,
         }
     }
 }
 
 /// The provenance sidecar recorded next to every object: `prompt`, `model`, `cast`,
-/// `timestamp` (epoch seconds), `mime`, and `seed`. This is the whole point of shipping
-/// with no built-in GC — a user (or their own script) can `find`/`jq` over these sidecars
-/// and prune intelligently instead of guessing at opaque hashed bytes. See the module
-/// doc's "No GC here, on purpose" section.
+/// `timestamp` (epoch seconds), `mime`, `seed`, and the authorship fields that say which
+/// tool produced it and, for authored text, who wrote it. This is the whole point of shipping
+/// with no built-in GC: an object reached **by its address** describes itself, instead of
+/// being opaque hashed bytes. Read it by digest, the way everything in this store is read
+/// — not by sweeping the tree, which does not scale and is not what this is for. See the
+/// module doc's "No GC here, on purpose" section.
+///
+/// `mime` is also load-bearing at runtime: it is what [`Cas::entry_for`] reads to name
+/// an object's format in one lookup rather than probing every container format kaibo
+/// knows. Record the format the object actually is (`Extension::mime` is the canonical
+/// spelling) — a sidecar that disagrees with the bytes beside it mislabels the artifact
+/// on retrieval.
 ///
 /// # Every new field must be `Option`, or carry `#[serde(default)]`
 ///
@@ -363,6 +474,39 @@ pub struct Provenance {
     /// its own), and `String` rather than an integer because it is an opaque provider
     /// token we echo back, never arithmetic we perform.
     pub seed: Option<String>,
+
+    // --- Authorship: who made these bytes, and by which route --------------
+    //
+    // Downstream, someone will *execute* an artifact's contents — the motivating
+    // case for `save_artifact` is a corpus of shell commands. The sidecar is the
+    // record they decide trust from, so it has to distinguish a provider's render
+    // from a model's writing. `model` and `cast` already name the team; these name
+    // the route and the intent.
+    //
+    // Each is written only when it applies, so a sidecar carries no null-filled
+    // fields it has nothing to say about, and a `generate` sidecar's shape is what
+    // it always was apart from the `tool` line that now names its producer.
+    /// The kaibo tool that recorded this artifact: `generate` for a provider render,
+    /// `save_artifact` for bytes a model on kaibo's own team wrote. Absent on any
+    /// sidecar written before this field existed, which means `generate` — the only
+    /// producer kaibo had then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Which reasoning slot the authoring model filled (`synth` today — only the
+    /// consult driver loop can save). Absent for a provider render, which fills the
+    /// `image` slot and has no author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    /// The authoring model's own one-line description of what it saved. Written by
+    /// the model, so read it as a claim rather than a fact — it is what makes a
+    /// hand-pruning pass over the store legible, next to a `prompt` that describes
+    /// the question rather than this artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The consult session this artifact was authored in, when the call carried one.
+    /// Ties an artifact back to the conversation that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// A content-addressed store of generated media artifacts, rooted at a fixed,
@@ -396,8 +540,8 @@ impl Cas {
     /// store fills, which is exactly the cost an operator who never asked for a ceiling
     /// should not pay. Amy's call (2026-07-30): leave the accounting off until someone has
     /// a problem that needs it. Disk-full is the real backstop and the OS reports it
-    /// honestly; pruning is `find -mtime` over the provenance sidecars (see the module
-    /// doc's "No GC here, on purpose").
+    /// honestly, and kaibo ships no pruning verb (see the module doc's "No GC here, on
+    /// purpose").
     ///
     /// Unlike [`crate::store::SessionStore::open`], this does **not** create any
     /// directory — there is nothing to eagerly create. The root (and every shard
@@ -463,18 +607,50 @@ impl Cas {
             .join(format!("{}.json", digest.to_hex()))
     }
 
-    /// The path an object would live at, if it exists — probing every [`Extension`]
-    /// variant in turn, since a bare digest doesn't say which format it was written
-    /// under. `None` if no object with this digest has ever been written (or an ancestor
-    /// directory doesn't exist yet, which reads the same way: nothing is here).
+    /// The path an object would live at, if it exists. `None` if no object with this
+    /// digest has ever been written (or an ancestor directory doesn't exist yet, which
+    /// reads the same way: nothing is here).
     pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
         self.entry_for(digest).map(|(path, _)| path)
+    }
+
+    /// Read an object's provenance sidecar, if one is there and parses. `None` covers
+    /// three cases the caller treats alike — no sidecar (an object whose write crashed
+    /// between the two files; see [`write_new_file`]), an unreadable one, and one whose
+    /// JSON doesn't deserialize — because each means the same thing to a lookup: this
+    /// object cannot tell us what it is, so something else has to.
+    pub fn provenance_for(&self, digest: &Digest) -> Option<Provenance> {
+        let bytes = std::fs::read(self.sidecar_path(digest)).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// [`path_for`](Self::path_for) plus which [`Extension`] the object was written
     /// under — the extension carries the mime type a resource read needs to stamp on
     /// the bytes, and re-deriving it from the path string would be a second parser.
+    ///
+    /// **The sidecar is the authority.** Every object written by this store gets a
+    /// `<hex>.json` sidecar whose `mime` describes it, so one read of that file names
+    /// the format directly: one lookup, not a walk of every container format kaibo
+    /// knows. That matters more as the set grows past images — a probe answers with
+    /// whichever variant it happens to try first, which for content stored under two
+    /// names is a *mislabel* the `kaibo://cas/<digest>` resource then stamps onto the
+    /// bytes, and for a large set is N stats per read.
+    ///
+    /// **The probe is the fallback, never the requirement.** An object whose sidecar
+    /// is missing, unreadable, or names a mime this kaibo cannot map still resolves by
+    /// trying [`Extension::ALL`]. This store never rewrites, so an old or orphaned
+    /// object can't be migrated into the new scheme — losing one to a metadata gap
+    /// would be exactly the silent data loss the module refuses.
     pub fn entry_for(&self, digest: &Digest) -> Option<(PathBuf, Extension)> {
+        if let Some(ext) = self
+            .provenance_for(digest)
+            .and_then(|p| Extension::from_mime(&p.mime))
+        {
+            let path = self.object_path(digest, ext);
+            if path.is_file() {
+                return Some((path, ext));
+            }
+        }
         Extension::ALL.into_iter().find_map(|ext| {
             let path = self.object_path(digest, ext);
             path.is_file().then_some((path, ext))
@@ -549,14 +725,23 @@ impl Cas {
     /// [`CasError::Corrupt`]). If that check fails, the write returns
     /// `Err(CasError::Corrupt)` rather than silently discarding the caller's good bytes
     /// into a poisoned slot — the caller's data was never at risk, only the report of
-    /// success was. A verified dedup is **not** re-checked against the soft cap — it adds
-    /// zero new bytes, so it cannot be what pushes the store over the line. Otherwise (new
-    /// content) the soft cap is checked *before* any write, and it counts the whole
-    /// footprint this put would add — the artifact **and** its provenance sidecar,
-    /// which is real disk usage written by the same call: if the current total plus
-    /// both would exceed `max_bytes`, the write is refused with
-    /// [`CasError::CapacityExceeded`] and nothing is written — never evicted, see the
-    /// module doc.
+    /// success was.
+    ///
+    /// # The cap admits every put the same way, dedup or not
+    ///
+    /// When a cap is configured it is checked *before* any write, counting the whole
+    /// footprint this put would add — the artifact **and** its provenance sidecar, which
+    /// is real disk usage written by the same call — and a put past it is refused with
+    /// [`CasError::CapacityExceeded`], nothing written and nothing evicted.
+    ///
+    /// That check runs **whether or not the content is already here**, which is a
+    /// deliberate reversal (2026-08-05). Exempting a dedup is correct about disk usage —
+    /// re-putting held content adds no bytes — and wrong about disclosure. Once a *model*
+    /// can drive puts (`save_artifact`), "succeeded" versus "refused" at a full store
+    /// answers *is this content already in the store?* for arbitrary bytes, over a store
+    /// that spans every project this kaibo has served. Making admission independent of
+    /// what the store holds closes that oracle: a full store is uniformly closed. The
+    /// price is a wasted no-op write at exactly-full, which loses nothing.
     ///
     /// The whole body runs under the store's write mutex, so concurrent puts on
     /// clones/`Arc`s of one store serialize: the dedup check, the cap accounting, and
@@ -564,6 +749,14 @@ impl Cas {
     /// loses to something that appeared from outside this process (another kaibo, an
     /// operator's copy), the existing bytes are read back and **verified** before
     /// success is reported — never trusted from the path alone.
+    ///
+    /// # One failure that is not a failure to store
+    ///
+    /// The object is written before the sidecar, so a sidecar write that fails leaves the
+    /// content durable and retrievable. That returns
+    /// [`CasError::ProvenanceNotRecorded`] — carrying the digest — rather than a plain
+    /// [`CasError::Io`], because a caller that renders "nothing was saved" from it would
+    /// be lying about data that is on disk and reachable.
     pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
         let digest = Digest::of_bytes(bytes);
         let shard = self.shard_dir(&digest);
@@ -576,6 +769,23 @@ impl Cas {
         // part of this put's disk footprint, not an afterthought.
         let sidecar_json = serde_json::to_vec_pretty(provenance)
             .map_err(|e| CasError::Serialize(e.to_string()))?;
+
+        // Cap admission FIRST, and unconditionally when a cap is configured — before the
+        // dedup read below, so nothing about the outcome depends on whether these bytes
+        // are already here. See the "admits every put the same way" section above: a
+        // dedup exemption is an existence oracle over every project's artifacts. This is
+        // still the ONLY call site that walks the store, and it is still reached only
+        // when an operator opted into a ceiling; an uncapped CAS never sizes itself.
+        if let Some(max_bytes) = self.max_bytes {
+            let current = self.total_bytes()?;
+            let incoming = bytes.len() as u64 + sidecar_json.len() as u64;
+            if current.saturating_add(incoming) > max_bytes {
+                return Err(CasError::CapacityExceeded {
+                    max_bytes,
+                    current_bytes: current,
+                });
+            }
+        }
 
         if obj_path.is_file() {
             // Dedup path: the module doc's "AlreadyExists means these exact bytes are
@@ -594,18 +804,6 @@ impl Cas {
                 ))
             })?;
             verify(&digest, existing)?;
-        } else if let Some(max_bytes) = self.max_bytes {
-            // New content, and a cap is configured: measure before growing the store at
-            // all. This is the ONLY call site that walks the store, and it is reached only
-            // when an operator opted into a ceiling — an uncapped CAS never sizes itself.
-            let current = self.total_bytes()?;
-            let incoming = bytes.len() as u64 + sidecar_json.len() as u64;
-            if current.saturating_add(incoming) > max_bytes {
-                return Err(CasError::CapacityExceeded {
-                    max_bytes,
-                    current_bytes: current,
-                });
-            }
         }
 
         std::fs::create_dir_all(&shard) // media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)
@@ -632,11 +830,15 @@ impl Cas {
             verify(&digest, existing)?;
         }
 
+        // Past this point the object IS stored. A sidecar failure is still a failure —
+        // the provenance record is what makes the no-GC stance honest — but it is not a
+        // failure to store, and reporting it as a bare Io error invites a caller to tell
+        // its user "nothing was saved" about durable, reachable bytes. Carry the digest.
         write_new_file(&sidecar_path, &sidecar_json).map_err(|e| {
-            CasError::Io(format!(
-                "writing cas provenance sidecar {}: {e}",
-                sidecar_path.display()
-            ))
+            CasError::ProvenanceNotRecorded {
+                digest: digest.to_hex(),
+                cause: e.to_string(),
+            }
         })?;
 
         Ok(digest)
@@ -650,6 +852,13 @@ struct MemObject {
     bytes: Vec<u8>,
     ext: Extension,
     provenance: Provenance,
+    /// Size of `provenance` in its serialized form — the same representation the disk
+    /// store writes to a sidecar. Held rather than recomputed so the cap sum stays a
+    /// cheap add, and held at all because memory mode really does keep this data: a cap
+    /// that counted only content bytes would let a capped store hold more than the
+    /// operator asked for, and would make one `max_bytes` mean two different things in
+    /// the two modes.
+    provenance_bytes: u64,
 }
 
 /// The in-memory CAS: the same content-addressed contract as [`Cas`] — the address is
@@ -686,22 +895,37 @@ impl MemoryCas {
     /// Store `bytes` under their own digest. A repeat of identical content is a
     /// no-op returning the same digest (dedup needs no verification here: the map is
     /// keyed by the digest of exactly the bytes it holds, and nothing between put and
-    /// get can corrupt process memory the way a torn disk write can). A new object is
-    /// checked against the cap first, mirroring [`Cas::put`].
+    /// get can corrupt process memory the way a torn disk write can).
+    ///
+    /// The cap is checked **before** the dedup short-circuit and counts the provenance
+    /// alongside the content, both mirroring [`Cas::put`] exactly. The admission order is
+    /// the load-bearing half: short-circuiting on "already held" before the cap would let
+    /// a full store answer *is this content here?* by succeeding for held bytes and
+    /// refusing for new ones — an existence oracle over every project's artifacts. One
+    /// meaning per knob, one outcome per full store, in both modes.
     pub fn put(&self, bytes: &[u8], ext: Extension, provenance: &Provenance) -> Result<Digest> {
         let digest = Digest::of_bytes(bytes);
+        // Serialized the same way the disk sidecar is, so `max_bytes` admits the same
+        // footprint in either mode.
+        let provenance_bytes = serde_json::to_vec_pretty(provenance)
+            .map_err(|e| CasError::Serialize(e.to_string()))?
+            .len() as u64;
         let mut objects = self.lock();
-        if objects.contains_key(&digest) {
-            return Ok(digest);
-        }
         if let Some(max_bytes) = self.max_bytes {
-            let current: u64 = objects.values().map(|o| o.bytes.len() as u64).sum();
-            if current.saturating_add(bytes.len() as u64) > max_bytes {
+            let current: u64 = objects
+                .values()
+                .map(|o| o.bytes.len() as u64 + o.provenance_bytes)
+                .sum();
+            let incoming = bytes.len() as u64 + provenance_bytes;
+            if current.saturating_add(incoming) > max_bytes {
                 return Err(CasError::CapacityExceeded {
                     max_bytes,
                     current_bytes: current,
                 });
             }
+        }
+        if objects.contains_key(&digest) {
+            return Ok(digest);
         }
         objects.insert(
             digest,
@@ -709,6 +933,7 @@ impl MemoryCas {
                 bytes: bytes.to_vec(),
                 ext,
                 provenance: provenance.clone(),
+                provenance_bytes,
             },
         );
         Ok(digest)
@@ -724,6 +949,12 @@ impl MemoryCas {
     /// of reading a disk sidecar.
     pub fn provenance(&self, digest: &Digest) -> Option<Provenance> {
         self.lock().get(digest).map(|o| o.provenance.clone())
+    }
+
+    /// The container format this digest is held under, without copying its bytes — the
+    /// in-memory analogue of [`Cas::entry_for`]'s extension half.
+    pub fn extension_for(&self, digest: &Digest) -> Option<Extension> {
+        self.lock().get(digest).map(|o| o.ext)
     }
 }
 
@@ -745,6 +976,26 @@ impl MediaStore {
         match self {
             MediaStore::Disk(cas) => cas.put(bytes, ext, provenance),
             MediaStore::Memory(mem) => mem.put(bytes, ext, provenance),
+        }
+    }
+
+    /// **The store's own answer for what an object IS**, without reading its bytes: the
+    /// container format, and through it the mime the `kaibo://cas/<digest>` resource will
+    /// stamp and the extension the on-disk path carries.
+    ///
+    /// A producer's *requested* format is not that answer. The address is the content
+    /// hash, so identical bytes saved as `jsonl` after they were already stored as `txt`
+    /// land at the same digest; the second put writes a second container file while the
+    /// sidecar — the authority, see [`Cas::entry_for`] — still says `txt`. A caller that
+    /// rendered its own request would advertise `application/jsonl` beside a `.txt` path
+    /// and a `text/plain` resource read. Ask the store instead, always.
+    ///
+    /// Refusing the second put would be the other way to fix that, and it is worse: the
+    /// refusal itself would reveal that the content was already present.
+    pub fn extension_for(&self, digest: &Digest) -> Option<Extension> {
+        match self {
+            MediaStore::Disk(cas) => cas.entry_for(digest).map(|(_, ext)| ext),
+            MediaStore::Memory(mem) => mem.extension_for(digest),
         }
     }
 

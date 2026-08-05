@@ -63,6 +63,42 @@ is resident tool cost and curation. `MediaType::to_cas_extension` already refuse
 and `model/gltf-binary` loudly so that adding one forces a deliberate naming decision rather
 than silently writing bytes nobody can open.
 
+### CAS retention changed character with `save_artifact` — the store wants operator verbs and a GC story
+
+The no-GC stance was honest while `generate` was the only producer: every artifact cost a
+paid provider call, so minting was rare and self-limiting, and `find -mtime` over the
+sidecars was proportionate cleanup. `save_artifact` (shipped 2026-08-05) breaks that
+assumption — a consult can mint eight artifacts a call for the price of tokens it was
+already spending, against an append-only store that never unlinks. XDG data grows without
+bound and the operator's only tools are shell commands over a two-level sharded tree.
+
+What it wants, roughly in order: `kaibo cas ls` / `kaibo cas du`, so an operator can *see*
+what accumulated without learning the shard layout — then a pruning story.
+
+**Neither should be built on a filesystem sweep.** The sidecar is metadata for an object
+you already have the address of; it is not an index. Surveying the store by walking it
+means 65,536 shards and a read-plus-parse per object, and it degrades exactly as the store
+grows — which is the condition that makes anyone want `ls` in the first place. The shape
+these verbs want is an index kaibo maintains as it writes (its own persistence store is
+the obvious home: it is already open, already at a fixed XDG path no model steers, and
+already the place kaibo records what it did). That also makes `du` an O(1) read instead of
+a full walk, and would let the `[cas] max_bytes` admission stop walking the store on every
+capped write.
+
+Pruning is the harder half and a real design question rather than a missing command: the
+store's safety argument is that it never unlinks (`src/cas.rs`'s module doc), so a GC verb
+is a new mutation surface needing its own justification, its own containment check, and
+probably its own blessed line in `tests/no_write_path.rs`. A TTL sweep, an explicit
+`kaibo cas rm <digest>`, and "the operator prunes by hand, with better visibility" are
+three answers with different blast radii.
+
+Related gap worth folding in when this is picked up: **cancelling a `consult_submit` job
+aborts the future, so artifacts it saved before the cancel are never reported** — they are
+durable and readable by digest, but their addresses are lost unless the call carried a
+`session_id` (whose persisted answer keeps the footer). Surfacing them would mean the job
+record carrying the call's artifact sink, which touches every producer's `jobs.rs`
+signature; documented in `docs/config.md` rather than papered over.
+
 ### Someday: the CAS as kaish's egress gateway (design note, not scheduled)
 Amy's direction 2026-07-25, explicitly *"need to think about it more"* — recorded so the
 reasoning survives, not to be built. The shape she wants: kaish can **read** from the CAS

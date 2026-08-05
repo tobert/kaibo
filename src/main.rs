@@ -95,6 +95,7 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         common.state_db.clone(),
         common.cas_dir.clone(),
         common.cas_max_bytes,
+        gates.allow_save_artifact,
         common.max_attachments,
     );
 

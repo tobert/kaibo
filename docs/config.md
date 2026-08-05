@@ -820,9 +820,11 @@ explicit. Every other open failure stays fatal.
 
 ## Media CAS: `[cas]`
 
-**On by default, and it follows persistence.** The CAS is the content-addressed store
-where an artifact-producing tool (image generation) writes what it made. Its lifecycle
-has three states, reported as `mode` in `kaibo://config`'s `[cas]` section:
+**On by default, and it follows persistence.** The CAS is the content-addressed store an
+artifact-producing tool writes into. Two produce today: `generate` (images a provider
+rendered) and `save_artifact` (bulk text a consult's model wrote, see `[artifacts]`
+below). Its lifecycle has three states, reported as `mode` in `kaibo://config`'s `[cas]`
+section:
 
 | mode | when | what it means |
 |---|---|---|
@@ -842,9 +844,24 @@ CLI/env: `--cas-dir` / `KAIBO_CAS_DIR` move the store; `--cas-max-bytes` /
 
 **The address is the content.** Every object's filename is the SHA-256 of its bytes, so
 nothing (model or operator) can aim a write at a chosen path, and identical content is
-stored once. Objects are written once and never rewritten, unlinked, or evicted. Each
-object gets a `<hex>.json` provenance sidecar (prompt, model, cast, timestamp, mime,
-seed) so you can prune by hand with `find`/`jq`/`restic` — kaibo ships no GC.
+stored once. Objects are written once and never rewritten, unlinked, or evicted — which
+is why kaibo ships no GC: an object at a given digest stays that object forever, so no
+address anyone holds goes stale.
+
+Each object gets a `<hex>.json` provenance sidecar (prompt, model, cast, timestamp, mime,
+seed, and which tool produced it). It makes an object self-describing **to whoever holds
+its address**: one lookup by digest says what the bytes are and what format to serve them
+as. Read it that way. The store is not built to be swept — a survey means walking 65,536
+shards and parsing a file per object, and it only gets slower as the store fills. Operator
+inventory verbs are tracked in `docs/issues.md` and want an index kaibo maintains, not a
+scan.
+
+The sidecar is **first-writer-wins**: it records the first write of a given content and is
+never rewritten. Save bytes the store already holds and the record stays the original
+one — which may name a different call, a different cast, or `generate`. It is metadata for
+an operator, not an audit trail, and a content-addressed store that never rewrites cannot
+be one. For a durable per-call record, kaibo's answers are the tool-call telemetry each
+save emits and the session the answer was recorded into.
 
 **Retrieval is operator-surface only.** A generation result returns each artifact's
 digest, a `kaibo://cas/<digest>` resource URI, and (in disk mode) the real filesystem
@@ -854,7 +871,10 @@ projects and a browsable CAS would let one project's team enumerate another's ar
 
 **`max_bytes` refuses, never evicts.** A write that would pass the cap fails loudly and
 nothing is deleted to make room. The cap is opt-in because enforcing it costs an
-O(objects) walk of the store per new write.
+O(objects) walk of the store per new write. When a cap is set, *every* write is admitted
+the same way, including one whose content the store already holds: exempting those would
+let a full store answer "is this content already here?" by succeeding for held bytes and
+refusing for new ones, across every project this kaibo has served.
 
 **Failure is loud.** In disk mode, a structurally unusable CAS path fails startup with
 an error naming the escape hatches: a dir that resolves inside an allowed project tree
@@ -863,6 +883,87 @@ ancestors must be a directory. Write errors that only a real write can reveal
 (permissions, disk full, a read-only mount) surface on the first generation instead —
 opening the store writes nothing, so it cannot probe for them. Memory mode is the one
 warned degrade, mirroring the persistence posture it follows.
+
+## Saving artifacts: `[artifacts]`
+
+**Off by default.** This is the only switch in kaibo whose default is off. Everything in
+`[tools]` is advertised unless you disable it; this one is disabled unless you enable it,
+because it is the only surface where a *model* decides that bytes become durable.
+
+`save_artifact` is a tool injected into the `consult` driver's own toolset. The model
+hands kaibo bulk content it wrote and gets back a digest; the answer's footer names each
+`kaibo://cas/<digest>` and you decide whether to read it. The point is your context
+window: a consult asked to produce a generated corpus, a long inventory, or a fixture no
+longer has to spend the answer on material you may only want to store.
+
+```toml
+[artifacts]
+enabled = false                             # default false; true grants standing permission
+```
+
+CLI/env: `--allow-save-artifact` (serve only) / `KAIBO_ARTIFACTS_ENABLED`. Unlike the
+`KAIBO_NO_*` flags, the env var sets the knob either way and the CLI flag *enables* — the
+built-in default is the conservative end of the range, so a layer that could only disable
+would have nothing to say.
+
+**Three conditions, all required.** The tool is absent from the model's toolset unless
+every one holds:
+
+| condition | surface | who decides |
+|---|---|---|
+| `[artifacts] enabled = true` | config / env / CLI | the operator, standing |
+| `save_artifacts: true` on the call | the `consult` tool argument | the calling agent, per call |
+| the media CAS is live | `[cas] enabled`, above | the operator |
+
+A call that passes `save_artifacts` on a server missing either of the other two is
+**refused**, with a message naming which one — never answered quietly without the
+artifacts it asked for. `kaibo://config` reports `[artifacts] enabled`, so a caller can
+see the server's posture before asking.
+
+**Limits are fixed and not configurable.**
+
+| limit | value |
+|---|---|
+| bytes per artifact | 1 MiB |
+| artifacts per MCP call | 8 |
+| bytes per MCP call | 8 MiB |
+| label | one line, 200 bytes |
+| formats | `text`, `jsonl`, `markdown` — a hint; anything else stores as text |
+
+A save past a limit is **refused and stores nothing**; the refusal names the limit, the
+actual size, and the way forward. The format is the one non-gate: the content arrives as
+a JSON string, so it is UTF-8 text by construction — source code, a config, a log all
+ship as `text` — and an unknown format name stores as `text/plain` with the coercion
+stated in the tool result, never refused. Binary artifacts come only from `generate`. Nothing is ever truncated — a digest handed back for
+content that is not what the model wrote would be silent corruption. The per-artifact
+limit is a backstop rather than a working ceiling: the content rides in tool-call
+arguments, so the model's own `max_tokens` binds first. The label is bounded and must be a
+single line because it is rendered into the answer's footer, where a line break could
+forge entries the caller would read as real artifacts.
+
+**What the model cannot do.** It can write and it can never read. There is no list verb,
+no read verb, and no `kaibo://cas` access from inside the loop. The result of a save is a
+digest and nothing else: it never reports whether the content was already in the store,
+because that answer would let one project's model team probe another's artifacts. Refusals
+are sanitized for the same reason — the model is told what to do next, never the store's
+path or how full it is. Only the `consult` driver loop gets the tool; delegated explorer
+sweeps never do.
+
+**Where the digests are written down.** The answer's footer names every artifact this call
+saved, with its mime, size, label, and (in disk mode) its path. A consult that saved and
+then *failed* reports them too, in the failure text — the bytes are durable either way,
+and a result without their addresses would strand them. A call carrying a `session_id`
+also persists the footer with the answer, so the digests sit in kaibo's state db beside
+the conversation that produced them.
+
+One gap, stated plainly: **cancelling a running `consult_submit` job aborts it mid-flight,
+so anything it had already saved is not reported.** Those artifacts exist and are readable
+by digest, but the digests are gone unless the call also carried a `session_id`. Avoid it
+by threading a session, or by letting a job finish.
+
+The provenance sidecar beside each object is housekeeping metadata, first-writer-wins —
+see the `[cas]` section above for what it does and does not claim. Retention is yours:
+kaibo never prunes, and this tool makes minting cheap.
 
 ## House rules: `[context]`
 

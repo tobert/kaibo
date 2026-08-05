@@ -20,6 +20,11 @@ fn prov() -> Provenance {
         timestamp: 1_753_000_000,
         mime: "image/png".into(),
         seed: Some("9259671".into()),
+        // A provider render: the tool that produced it, and no author.
+        tool: Some("generate".into()),
+        slot: None,
+        label: None,
+        session: None,
     }
 }
 
@@ -506,22 +511,53 @@ fn soft_cap_refuses_a_write_that_would_exceed_it() {
     assert_eq!(cas.get(&rejected_digest).unwrap(), None);
 }
 
-/// A dedup write of content already on disk must not be penalized by the cap check just
-/// because a naive "current + incoming" sum would look like it exceeds — it adds no bytes.
+/// **A full store refuses a dedup exactly as it refuses a new write, and that inversion
+/// is deliberate.**
+///
+/// This test used to pin the opposite — a dedup write was *exempt* from the cap, on the
+/// reasoning that re-putting held content adds no bytes so a naive `current + incoming`
+/// sum shouldn't penalize it. That reasoning is sound about disk usage and wrong about
+/// disclosure, and `save_artifact` is what made it matter: once a *model* can drive puts,
+/// "succeeded" versus "CapacityExceeded" at a full store answers **is this content
+/// already in the store?** for arbitrary bytes. The CAS spans every project this kaibo
+/// has ever served, so that is an existence oracle over other projects' artifacts,
+/// readable by a model whose prompt an untrusted repository can influence.
+///
+/// The cure is to make the admission decision independent of what the store already
+/// holds: when a cap is configured, every put computes the same admission, so a full
+/// store is uniformly closed. The cost is the exempted case — re-putting held content at
+/// exactly-full — which is a wasted no-op write, not lost data (the object is still
+/// there, still readable). Trading that for a closed oracle is the right way round.
 #[test]
-fn soft_cap_does_not_block_a_dedup_write_of_existing_content() {
+fn soft_cap_refuses_a_dedup_write_indistinguishably_from_a_new_one() {
     // Budget for exactly one footprint (object + sidecar): zero slack afterwards.
-    let bytes = vec![7u8; 10];
+    let held = vec![7u8; 10];
     let (probe, probe_dir) = open_uncapped();
-    probe.put(&bytes, Extension::Gif, &prov()).unwrap();
+    probe.put(&held, Extension::Gif, &prov()).unwrap();
     let budget = dir_size(&probe_dir.path().join("cas"));
 
     let (cas, _d) = open(budget);
-    let d1 = cas.put(&bytes, Extension::Gif, &prov()).unwrap();
-    // Re-putting the identical bytes must still succeed even though the cap has no slack
-    // left for "new" bytes — it isn't new, it's the same object.
-    let d2 = cas.put(&bytes, Extension::Gif, &prov()).unwrap();
-    assert_eq!(d1, d2);
+    let d1 = cas.put(&held, Extension::Gif, &prov()).unwrap();
+
+    // The oracle probe: at a full store, ask for content the store HAS and content it
+    // does NOT. Both must come back the same kind of refusal — an attacker learns
+    // nothing about which was which.
+    let absent = vec![9u8; 10];
+    let held_again = cas.put(&held, Extension::Gif, &prov());
+    let fresh = cas.put(&absent, Extension::Gif, &prov());
+    for (what, result) in [("already-held", held_again), ("absent", fresh)] {
+        match result {
+            Err(CasError::CapacityExceeded { .. }) => {}
+            other => panic!(
+                "a full store must refuse {what} content the same way, got {other:?} — \
+                 a difference here is an existence oracle"
+            ),
+        }
+    }
+
+    // And nothing was evicted or lost to the refusal: the held object is still readable.
+    assert_eq!(cas.get(&d1).unwrap(), Some(held));
+    assert_eq!(cas.get(&Digest::of_bytes(&absent)).unwrap(), None);
 }
 
 // --- MemoryCas: same contract, no filesystem ---------------------------------
@@ -557,20 +593,67 @@ fn memory_cas_dedup_returns_the_same_digest() {
     assert_eq!(d1, d2);
 }
 
-/// The soft cap keeps its meaning in memory: refuse loudly, never evict — and a
-/// dedup write of held content is exempt, exactly as on disk.
+/// The soft cap keeps its meaning in memory: refuse loudly, never evict. The *meaning* of
+/// the knob must not change with the mode, and neither must its disclosure behavior — see
+/// the disk twin, `soft_cap_refuses_a_dedup_write_indistinguishably_from_a_new_one`, for
+/// why a dedup at a full store is no longer exempt.
 #[test]
 fn memory_cas_cap_refuses_loudly_and_never_evicts() {
-    let mem = MemoryCas::new(Some(10));
+    // Room for one small object plus its serialized provenance, and no more.
     let first = vec![1u8; 8];
+    let budget = 8 + serde_json::to_vec_pretty(&prov()).unwrap().len() as u64;
+    let mem = MemoryCas::new(Some(budget));
     let d1 = mem.put(&first, Extension::Png, &prov()).unwrap();
     match mem.put(&[2u8; 100], Extension::Png, &prov()) {
-        Err(CasError::CapacityExceeded { max_bytes: 10, .. }) => {}
+        Err(CasError::CapacityExceeded { .. }) => {}
         other => panic!("a write past the cap must be refused, got {other:?}"),
     }
-    // Never evicts, and the dedup write of the held object still succeeds with no slack.
+    // Never evicts: the held object survives the refusal.
     assert_eq!(mem.get(&d1).map(|(b, _)| b), Some(first.clone()));
-    assert_eq!(mem.put(&first, Extension::Png, &prov()).unwrap(), d1);
+
+    // And the oracle stays closed in memory mode too: held and absent content at a full
+    // store are refused the same way.
+    let absent = vec![3u8; 8];
+    for (what, result) in [
+        ("already-held", mem.put(&first, Extension::Png, &prov())),
+        ("absent", mem.put(&absent, Extension::Png, &prov())),
+    ] {
+        match result {
+            Err(CasError::CapacityExceeded { .. }) => {}
+            other => panic!(
+                "a full memory store must refuse {what} content the same way, got \
+                 {other:?} — a difference here is an existence oracle"
+            ),
+        }
+    }
+}
+
+/// **Memory admission counts the provenance it stores.** `MemoryCas` holds a `Provenance`
+/// clone beside every object, so counting only content bytes understates the store's real
+/// footprint and lets a capped memory store hold more than the operator asked for. Disk
+/// admission has always counted the serialized sidecar; memory now counts the same
+/// representation, so one `max_bytes` means the same thing in both modes.
+#[test]
+fn memory_cap_admission_counts_the_provenance_sidecar() {
+    let body = vec![5u8; 16];
+    let sidecar = serde_json::to_vec_pretty(&prov()).unwrap().len() as u64;
+
+    // Exactly enough for content + sidecar: admitted.
+    let exact = MemoryCas::new(Some(16 + sidecar));
+    exact
+        .put(&body, Extension::Png, &prov())
+        .expect("content plus its provenance fits exactly");
+
+    // One byte short of that: refused. Under the old accounting this fit, because the
+    // provenance it stores was invisible to the check.
+    let short = MemoryCas::new(Some(16 + sidecar - 1));
+    match short.put(&body, Extension::Png, &prov()) {
+        Err(CasError::CapacityExceeded { .. }) => {}
+        other => panic!(
+            "the provenance is part of what memory mode stores, so it must be part of \
+             what the cap admits, got {other:?}"
+        ),
+    }
 }
 
 // --- MediaStore: one seam over both modes ------------------------------------
@@ -622,6 +705,189 @@ fn extension_maps_mimes_both_ways_and_refuses_unknown() {
     );
     assert_eq!(Extension::from_mime("audio/mpeg"), None);
     assert_eq!(Extension::from_mime("model/gltf-binary"), None);
+}
+
+/// **An object that landed while its sidecar failed must say so, and must name the
+/// digest.** `put` writes the object first and the provenance second, so an I/O failure
+/// between them leaves bytes durably stored and retrievable (the probe fallback finds a
+/// sidecar-less object) while the call returns `Err`. A caller told only "it failed" then
+/// reports "nothing was saved" about content that is, in fact, saved — and the digest is
+/// the one thing that makes it reachable again, so the error has to carry it.
+///
+/// Driven by making the shard directory read-only with the object already in place: the
+/// object write is a no-op dedup, and the sidecar's `create_new` gets EACCES.
+#[test]
+#[cfg(unix)]
+fn an_object_that_landed_without_its_sidecar_reports_the_digest() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (cas, _d) = open_uncapped();
+    let bytes = b"the object lands, the sidecar does not".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+
+    // Place the object by hand, then close the shard to new files.
+    let shard = object_path(cas.root(), &digest, "txt");
+    let shard_dir = shard.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    std::fs::write(&shard, &bytes).unwrap();
+    std::fs::set_permissions(&shard_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    // Root (or CAP_DAC_OVERRIDE) ignores the mode bits, so the premise wouldn't hold —
+    // detect it the way `get_surfaces_io_error_for_unreadable_existing_object` does,
+    // before drawing any conclusion from the result.
+    let can_write_anyway = std::fs::write(shard_dir.join("probe"), b"x").is_ok();
+
+    let result = cas.put(&bytes, Extension::Txt, &prov_mime(Extension::Txt.mime()));
+    let _ = std::fs::set_permissions(&shard_dir, std::fs::Permissions::from_mode(0o755));
+
+    if can_write_anyway {
+        eprintln!(
+            "skipping: this process can write into a 0o500 directory (likely running as \
+             root) — cannot exercise a sidecar-write failure here"
+        );
+        return;
+    }
+
+    match result {
+        Err(CasError::ProvenanceNotRecorded { digest: hex, .. }) => {
+            assert_eq!(
+                hex,
+                digest.to_hex(),
+                "the error must name the address the bytes are actually reachable at"
+            );
+        }
+        other => panic!(
+            "an object that landed without its sidecar must be its own error kind \
+             carrying the digest, got {other:?}"
+        ),
+    }
+    // And the claim is true: the bytes really are retrievable at that digest.
+    assert_eq!(cas.get(&digest).unwrap(), Some(bytes));
+}
+
+// --- Lookup: the sidecar's mime is the authority ------------------------------
+
+/// A provenance sidecar recording `mime`, everything else fixed — the shape
+/// `store_generated_artifacts` writes (the sidecar's mime always describes the object
+/// stored beside it).
+fn prov_mime(mime: &str) -> Provenance {
+    Provenance {
+        mime: mime.into(),
+        ..prov()
+    }
+}
+
+/// The shard path a digest's object would live at, computed the way `Cas` does — so a
+/// test can build (or inspect) a store layout by hand.
+fn object_path(root: &Path, digest: &Digest, ext: &str) -> PathBuf {
+    let hex = digest.to_hex();
+    root.join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(format!("{hex}.{ext}"))
+}
+
+/// **The lookup reads the sidecar, not a probe order.** One content can legitimately be
+/// stored under two container formats (the address is the *content* hash, so the second
+/// put lands at the same digest), and the sidecar written with the first put is the
+/// record of what this object actually is. A probe that walks `Extension::ALL` in
+/// declaration order answers with whichever variant it happens to try first, which is a
+/// mislabel the `kaibo://cas/<digest>` resource then stamps onto the bytes.
+///
+/// Stored webp-first, png-second: probe order says PNG, the recorded provenance says
+/// WEBP. The recorded provenance wins.
+#[test]
+fn lookup_reports_the_extension_the_sidecar_recorded_not_the_probe_order() {
+    let (cas, _dir) = open_uncapped();
+    let bytes = b"one content, two container names".to_vec();
+
+    cas.put(&bytes, Extension::Webp, &prov_mime("image/webp"))
+        .expect("first put records the sidecar");
+    let digest = cas
+        .put(&bytes, Extension::Png, &prov_mime("image/png"))
+        .expect("second put is a verified dedup at the same address");
+
+    let (path, ext) = cas.entry_for(&digest).expect("the object is findable");
+    assert_eq!(
+        ext,
+        Extension::Webp,
+        "the sidecar recorded image/webp, so that is what this object IS — got {ext:?}"
+    );
+    assert!(
+        path.extension().is_some_and(|e| e == "webp"),
+        "the located path must be the object the sidecar describes, got {}",
+        path.display()
+    );
+}
+
+/// The fallback that keeps a decade-old store readable: an object with **no sidecar**
+/// beside it (the crash window between the object write and the sidecar write is real —
+/// see `write_new_file`'s fsync note) still resolves by probing the container formats.
+/// Making the sidecar the authority must not make it a *requirement*.
+#[test]
+fn an_object_with_no_sidecar_still_resolves_by_probe() {
+    let (cas, _dir) = open_uncapped();
+    let bytes = b"orphaned object, sidecar never landed".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+    let path = object_path(cas.root(), &digest, "jpeg");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+
+    let (found, ext) = cas
+        .entry_for(&digest)
+        .expect("a sidecar-less object must still be findable");
+    assert_eq!(found, path);
+    assert_eq!(ext, Extension::Jpeg);
+    assert_eq!(cas.get(&digest).unwrap(), Some(bytes));
+}
+
+/// A sidecar whose `mime` the store cannot name on disk (an older kaibo, a
+/// hand-edited file) falls back to the probe rather than reporting the object missing.
+/// Losing a paid-for artifact to an unrecognized metadata string would be the exact
+/// silent-data-loss shape this store refuses.
+#[test]
+fn an_unmappable_sidecar_mime_falls_back_to_the_probe() {
+    let (cas, _dir) = open_uncapped();
+    let bytes = b"stored under a mime this kaibo does not know".to_vec();
+    let digest = Digest::of_bytes(&bytes);
+    let shard = object_path(cas.root(), &digest, "png");
+    std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+    std::fs::write(&shard, &bytes).unwrap();
+    std::fs::write(
+        shard.with_extension("json"),
+        serde_json::to_vec(&prov_mime("application/octet-stream")).unwrap(),
+    )
+    .unwrap();
+
+    let (_, ext) = cas
+        .entry_for(&digest)
+        .expect("an unmappable sidecar mime must not hide the object");
+    assert_eq!(ext, Extension::Png);
+}
+
+/// The text formats round-trip through the same address-is-the-content contract the
+/// images do: put bytes under a text container, read them back by digest, and get the
+/// format the sidecar recorded. This is what the sidecar-as-authority change bought —
+/// a lookup that answers correctly for a format declared after the image set.
+#[test]
+fn text_and_jsonl_artifacts_round_trip_by_digest() {
+    let (cas, _dir) = open_uncapped();
+    for (ext, body) in [
+        (
+            Extension::Txt,
+            "a model-authored report\n".as_bytes().to_vec(),
+        ),
+        (
+            Extension::Jsonl,
+            "{\"a\":1}\n{\"a\":2}\n".as_bytes().to_vec(),
+        ),
+    ] {
+        let digest = cas.put(&body, ext, &prov_mime(ext.mime())).expect("put");
+        assert_eq!(cas.get(&digest).unwrap(), Some(body.clone()));
+        let (path, found) = cas.entry_for(&digest).expect("findable by digest");
+        assert_eq!(found, ext);
+        assert!(path.extension().is_some_and(|e| e == ext.as_str()));
+        assert!(!ext.is_image(), "authored text is not a rendered image");
+    }
 }
 
 // --- or-gpt review follow-ups (2026-08-03) ------------------------------------

@@ -1022,6 +1022,33 @@ impl Default for CasConfig {
     }
 }
 
+/// `[artifacts]` — whether the inner model team may save what it writes.
+///
+/// **kaibo's first inverted capability, and deliberately so.** Every other tool switch is
+/// a `--no-<tool>` flag: on unless the operator turns it off. This one is off unless the
+/// operator turns it on, because it is the only surface where a *model* decides that
+/// bytes become durable. The default posture of a kaibo install stays exactly what it was
+/// before this existed.
+///
+/// It is one half of a two-key gate (Amy, 2026-08-05: "a code review consult has no
+/// business minting artifacts; the fuzzing job does"). This key is the operator's
+/// standing permission. The other is per call — `save_artifacts` on the `consult` tool —
+/// so enabling it here does not put the tool in front of every consult, only in front of
+/// the ones that asked. Both keys plus a live media CAS are required, and none of the
+/// three implies the others.
+///
+/// Precedence follows the usual ladder (per-call > CLI > env > file > built-in), with one
+/// difference worth naming: the CLI layer *enables* here where `--no-<tool>` only ever
+/// disables. That asymmetry is the inversion, not a hole — the file, the environment, and
+/// the command line are all the operator speaking, and the built-in default is the
+/// conservative end of the range rather than the permissive one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArtifactsConfig {
+    /// `[artifacts] enabled = true` / `KAIBO_ARTIFACTS_ENABLED` / `--allow-save-artifact`.
+    /// Default `false`.
+    pub enabled: bool,
+}
+
 /// Which media store a running server holds — the three-way state `kaibo://config`
 /// reports and `main` builds from. Derived in exactly one place
 /// ([`Config::cas_mode`]) so the store `main` constructs, the mode the resource
@@ -1120,6 +1147,9 @@ pub struct Config {
     pub persistence: PersistenceConfig,
     /// `[cas]` — where generated media artifacts land, and an optional size ceiling.
     pub cas: CasConfig,
+    /// `[artifacts]` — whether the inner model team may save what it writes. Off by
+    /// default; see [`ArtifactsConfig`].
+    pub artifacts: ArtifactsConfig,
     /// House-rules files spliced into each consultation tool's preamble (the
     /// `[context]` table). Defaults to reading `AGENTS.md` when present.
     pub context: ContextConfig,
@@ -1941,6 +1971,11 @@ impl Config {
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
         let cas = merge_cas(raw.cas.unwrap_or_default())?;
+        // Inverted: absent means off. `unwrap_or(false)` is the whole merge, so it stays
+        // inline rather than earning a `merge_artifacts` that would only restate it.
+        let artifacts = ArtifactsConfig {
+            enabled: raw.artifacts.unwrap_or_default().enabled.unwrap_or(false),
+        };
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
@@ -1973,6 +2008,7 @@ impl Config {
             telemetry,
             persistence,
             cas,
+            artifacts,
             context,
             prompts,
             orientation,
@@ -2015,8 +2051,16 @@ impl Config {
         state_db: Option<PathBuf>,
         cas_dir: Option<PathBuf>,
         cas_max_bytes: Option<u64>,
+        allow_save_artifact: bool,
         max_attachments: Option<usize>,
     ) {
+        // The one flag here that ENABLES rather than narrows. `[artifacts] enabled`
+        // defaults off (see `ArtifactsConfig`), so a CLI layer that could only disable
+        // would have nothing to say; the file, the env, and the command line are all the
+        // operator, and the conservative end of this range is the built-in default.
+        if allow_save_artifact {
+            self.artifacts.enabled = true;
+        }
         if let Some(root) = root {
             self.root = Some(root);
         }
@@ -2336,6 +2380,7 @@ struct RawConfig {
     telemetry: Option<RawTelemetry>,
     persistence: Option<RawPersistence>,
     cas: Option<RawCas>,
+    artifacts: Option<RawArtifacts>,
     context: Option<RawContext>,
     prompts: Option<RawPrompts>,
     orientation: Option<RawOrientation>,
@@ -2383,6 +2428,14 @@ struct RawCas {
     /// per-environment rather than landing as a literal token.
     dir: Option<String>,
     max_bytes: Option<u64>,
+}
+
+/// `[artifacts]` as written in the file. `enabled` absent means **off** — the inverted
+/// default (see [`ArtifactsConfig`]). Env: `KAIBO_ARTIFACTS_ENABLED`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawArtifacts {
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3201,7 +3254,39 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_CAS_MAX_BYTES") {
         cas.max_bytes = Some(parse_env_int("KAIBO_CAS_MAX_BYTES", &v)?);
     }
+
+    // save_artifact's operator key. It sets the parsed bool either way (unlike the
+    // `KAIBO_NO_*` flags, which can only disable) because its built-in default is OFF, so
+    // a disable-only layer would have nothing to say — and it is parsed STRICTLY, unlike
+    // every other flag here. See `parse_strict_bool`.
+    let artifacts = raw.artifacts.get_or_insert_with(Default::default);
+    if let Some(v) = get("KAIBO_ARTIFACTS_ENABLED") {
+        artifacts.enabled = Some(parse_strict_bool("KAIBO_ARTIFACTS_ENABLED", &v)?);
+    }
     Ok(())
+}
+
+/// Parse a boolean env value that must not be guessed at: exactly `1`/`true`/`yes` or
+/// `0`/`false`/`no`, case-insensitive and trimmed. Anything else is a loud load error.
+///
+/// The rest of kaibo's env flags use a permissive convention — anything that is not empty,
+/// `0`, `false`, or `no` means on. That is fine for a knob whose enabled state is the safe
+/// one, and exactly wrong for `[artifacts] enabled`: under it, `KAIBO_ARTIFACTS_ENABLED=off`
+/// and `=disabled` both **enable** the one capability that lets a model make bytes
+/// durable, and so does any typo. An operator who wrote `off` meaning off would get the
+/// opposite of their intent, silently, with nothing about the running server saying so.
+/// Crash over that — a startup error naming the accepted spellings costs one restart, and
+/// the alternative costs the posture the flag exists to hold.
+fn parse_strict_bool(name: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => bail!(
+            "{name}={other:?} is not a value kaibo will guess at. This flag decides \
+             whether the model team may write durable artifacts, so it accepts only \
+             1 / true / yes to enable, and 0 / false / no to disable."
+        ),
+    }
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, v: &str) -> Result<T>
@@ -5338,6 +5423,8 @@ mod tests {
         check("RawDefaults", serde_fields::<RawDefaults>());
         check("RawTelemetry", serde_fields::<RawTelemetry>());
         check("RawPersistence", serde_fields::<RawPersistence>());
+        check("RawCas", serde_fields::<RawCas>());
+        check("RawArtifacts", serde_fields::<RawArtifacts>());
         check("RawContext", serde_fields::<RawContext>());
         check("RawPrompts", serde_fields::<RawPrompts>());
         check("RawOrientation", serde_fields::<RawOrientation>());
@@ -5352,6 +5439,27 @@ mod tests {
             "docs/config.example.toml promises \"every option with its default\" but \
              never mentions: {missing:?} — add each knob to the template (a commented \
              default line is enough)"
+        );
+
+        // The field-name check above has a blind spot, and `[artifacts]` found it: a
+        // whole NEW stanza whose only knob reuses a name another stanza already has
+        // (`enabled`, `path`, `dir`) passes while the template says nothing about the
+        // stanza at all. So also require each top-level section to appear as a HEADER —
+        // live or commented — which is what an operator actually scans for.
+        let section_missing: Vec<String> = serde_fields::<RawConfig>()
+            .into_iter()
+            .filter(|s| !undocumented.contains(&s.as_str()))
+            // `[section]` or a sub-table of it (`[kaish.ignore]`, `[backends.<name>]`):
+            // several stanzas only ever appear in their sub-tabled form.
+            .filter(|s| {
+                !template.contains(&format!("[{s}]")) && !template.contains(&format!("[{s}."))
+            })
+            .collect();
+        assert!(
+            section_missing.is_empty(),
+            "docs/config.example.toml never shows these stanzas as a section header: \
+             {section_missing:?} — an operator scans for `[section]`, so a knob \
+             documented only by its bare name is not documented"
         );
     }
 }

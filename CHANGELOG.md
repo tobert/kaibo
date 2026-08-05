@@ -17,6 +17,18 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **A consult can hand you bulk output as an artifact instead of spending your
+  context on it.** Ask with `save_artifacts: true` and the investigating model can
+  write a generated corpus, a long inventory, or a fixture into kaibo's media store;
+  the answer names each `kaibo://cas/<digest>` and you choose what to read. Off
+  unless an operator turns it on — `[artifacts] enabled = true`,
+  `KAIBO_ARTIFACTS_ENABLED`, or `--allow-save-artifact` (serve only) — which makes it
+  kaibo's first opt-in capability rather than a `--no-<tool>` gate. Limits are fixed
+  (1 MiB per artifact, 8 artifacts and 8 MiB per call) and a save past one is refused
+  rather than truncated, naming the limit it hit. A consult that saved and then failed
+  still reports the digests, and a call with a `session_id` keeps them beside the
+  conversation.
+
 - **A second media kind: `openai-images`.** One backend kind covers hosted OpenAI
   image generation (gpt-image-1) *and* a local stable-diffusion.cpp `sd-server`,
   which speaks the same `/v1/images/generations` shape — `base_url` picks the

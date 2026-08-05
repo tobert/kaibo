@@ -940,6 +940,7 @@ fn cli_cast_wins_over_env_and_file() {
         None,   // no --state-db
         None,   // --cas-dir
         None,   // --cas-max-bytes
+        false,  // no --allow-save-artifact
         None,   // no --max-attachments
     );
     assert_eq!(c.default_cast, "deepseek", "--cast beats env and file");
@@ -973,9 +974,10 @@ fn empty_cli_allow_paths_preserves_lower_layers() {
         vec![],
         false,
         None,
-        None, // --cas-dir
-        None, // --cas-max-bytes
-        None, // --max-attachments
+        None,  // --cas-dir
+        None,  // --cas-max-bytes
+        false, // --allow-save-artifact
+        None,  // --max-attachments
     );
     // The env/file-layer value must survive.
     assert!(
@@ -2293,6 +2295,7 @@ fn cas_cli_wins_and_absent_flags_do_not_clobber() {
         None,
         Some(std::path::PathBuf::from("/from/cli")), // --cas-dir
         None,                                        // --cas-max-bytes NOT passed
+        false,                                       // --allow-save-artifact
         None,                                        // --max-attachments NOT passed
     );
     assert_eq!(
@@ -2304,6 +2307,131 @@ fn cas_cli_wins_and_absent_flags_do_not_clobber() {
         c.cas.max_bytes,
         Some(111),
         "an absent --cas-max-bytes must leave the file's value alone, not reset it"
+    );
+}
+
+// --- [artifacts]: kaibo's one inverted capability ----------------------------
+
+/// **The default is OFF**, and that is the whole point of this stanza. Every other tool
+/// switch is on unless an operator turns it off; this one is the reverse, because it is
+/// the only surface where a *model* decides that bytes become durable. A regression here
+/// would silently change the posture of every kaibo install.
+#[test]
+fn artifacts_are_disabled_by_default() {
+    assert!(
+        !Config::builtin().artifacts.enabled,
+        "the built-in default must be off"
+    );
+    assert!(
+        !Config::from_toml_str("").unwrap().artifacts.enabled,
+        "an empty config file must not enable it either"
+    );
+    assert!(
+        !Config::from_toml_str("[artifacts]\n")
+            .unwrap()
+            .artifacts
+            .enabled,
+        "an empty [artifacts] stanza is not a request to turn it on"
+    );
+}
+
+#[test]
+fn artifacts_enabled_in_the_file_turns_it_on() {
+    assert!(
+        Config::from_toml_str("[artifacts]\nenabled = true\n")
+            .unwrap()
+            .artifacts
+            .enabled
+    );
+}
+
+/// `deny_unknown_fields`, like every other section: a typo'd knob is a loud load error,
+/// never a silently-ignored request to enable something.
+#[test]
+fn artifacts_unknown_key_is_refused() {
+    assert!(Config::from_toml_str("[artifacts]\nenable = true\n").is_err());
+}
+
+/// Env can set the knob EITHER way (unlike the `KAIBO_NO_*` flags, which can only
+/// disable) — because this knob's built-in default is off, so a layer that could only
+/// disable would have nothing to say.
+#[test]
+fn artifacts_env_sets_the_knob_both_ways() {
+    let with = |val: &str| {
+        let env: HashMap<&str, &str> = [("KAIBO_ARTIFACTS_ENABLED", val)].into_iter().collect();
+        Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string()))
+            .unwrap()
+            .artifacts
+            .enabled
+    };
+    for on in ["1", "true", "yes", "TRUE", " Yes "] {
+        assert!(with(on), "{on:?} must enable");
+    }
+    for off in ["0", "false", "no", "FALSE", " No "] {
+        assert!(!with(off), "{off:?} must disable");
+    }
+}
+
+/// **This one env flag refuses to guess.** kaibo's other env flags are permissive —
+/// anything not empty/`0`/`false`/`no` means on — which for THIS flag would turn `off`,
+/// `disabled`, and every typo into "let the model write durable bytes", the opposite of
+/// what the operator wrote, silently. So it accepts only the listed spellings and fails
+/// startup on anything else, naming them.
+#[test]
+fn artifacts_env_refuses_a_value_it_would_have_to_guess_at() {
+    for bad in ["off", "disabled", "ture", "on", "", "2"] {
+        let env: HashMap<&str, &str> = [("KAIBO_ARTIFACTS_ENABLED", bad)].into_iter().collect();
+        let err = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string()))
+            .expect_err(&format!("{bad:?} must be a loud load error, never a guess"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("KAIBO_ARTIFACTS_ENABLED"),
+            "the error names the variable: {msg}"
+        );
+        assert!(
+            msg.contains("true") && msg.contains("false"),
+            "and the spellings it accepts: {msg}"
+        );
+    }
+}
+
+/// The CLI is the top layer here too, and it runs the OTHER way from `--no-<tool>`: the
+/// flag enables. An absent flag never clobbers a lower layer that already turned it on.
+#[test]
+fn artifacts_cli_flag_enables_and_absence_does_not_clobber() {
+    let apply = |mut c: Config, flag: bool| {
+        c.apply_cli(
+            None,
+            None,
+            ToolDisables::default(),
+            vec![],
+            false,
+            false,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            flag, // --allow-save-artifact
+            None, // --max-attachments
+        );
+        c.artifacts.enabled
+    };
+    assert!(
+        apply(Config::from_toml_str("").unwrap(), true),
+        "--allow-save-artifact turns it on over the off default"
+    );
+    assert!(
+        apply(
+            Config::from_toml_str("[artifacts]\nenabled = true\n").unwrap(),
+            false
+        ),
+        "an absent flag must leave a file-enabled knob alone"
+    );
+    assert!(
+        !apply(Config::from_toml_str("").unwrap(), false),
+        "no flag and no file means off"
     );
 }
 
@@ -2326,6 +2454,7 @@ fn persistence_cli_wins_over_lower_layers() {
         Some(std::path::PathBuf::from("/from/cli.db")), // --state-db
         None,                                           // --cas-dir
         None,                                           // --cas-max-bytes
+        false,                                          // no --allow-save-artifact
         None,                                           // no --max-attachments
     );
     assert!(!c.persistence.enabled, "--no-persistence wins");

@@ -95,6 +95,9 @@ pub(crate) fn render_config_resource(
         /// The media CAS: the on/off knob, the runtime mode (disk / memory / off),
         /// and where disk mode writes.
         cas: CasDoc,
+        /// `[artifacts]`: whether this server allows the model team to save artifacts.
+        /// Off by default; a call must also pass `save_artifacts`.
+        artifacts: ArtifactsDoc,
         /// alias → canonical backend name. Aliases are valid slot-ref prefixes
         /// and per-call backend overrides, so callers must be able to discover
         /// them here — built-in and file-declared both.
@@ -232,6 +235,17 @@ pub(crate) fn render_config_resource(
         dir: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
+    }
+
+    /// `[artifacts]` as resolved: may the inner model team save what it writes?
+    ///
+    /// Rendered even though it is one bool, because it is the only tool switch whose
+    /// default is OFF and the only one a *call* also has to ask for. Without it here, a
+    /// caller whose `save_artifacts` was refused has no way to see which of the two keys
+    /// this server is missing.
+    #[derive(Serialize)]
+    struct ArtifactsDoc {
+        enabled: bool,
     }
 
     #[derive(Serialize)]
@@ -616,6 +630,9 @@ pub(crate) fn render_config_resource(
             mode: cas_mode.as_str().to_string(),
             dir: config.cas.dir.as_ref().map(|p| p.display().to_string()),
             max_bytes: config.cas.max_bytes,
+        },
+        artifacts: ArtifactsDoc {
+            enabled: config.artifacts.enabled,
         },
         backend_aliases: config.backend_aliases().clone(),
         backends,

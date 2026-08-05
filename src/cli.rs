@@ -233,8 +233,12 @@ pub struct CommonArgs {
     pub max_attachments: Option<usize>,
 }
 
-/// The per-tool `--no-<tool>` gates — serve-only (they only make sense for the
-/// long-lived server). The shared flags live on [`Cli::common`] as globals.
+/// The per-tool gates — serve-only (they only make sense for the long-lived server).
+/// The shared flags live on [`Cli::common`] as globals.
+///
+/// All but one are `--no-<tool>`, which can only narrow what the server advertises.
+/// `--allow-save-artifact` runs the other way: it is the operator key for a capability
+/// whose built-in default is off. See [`crate::config::ArtifactsConfig`].
 #[derive(Args, Debug, Clone, Default)]
 pub struct ServeGates {
     /// Don't advertise the `consult` tool.
@@ -261,6 +265,14 @@ pub struct ServeGates {
     /// Don't advertise the `generate` tool (media generation).
     #[arg(long)]
     pub no_generate: bool,
+
+    /// Let a consult save bulk output as artifacts in kaibo's media store, when the
+    /// call also asks for it with `save_artifacts` (both keys are required, and the
+    /// media CAS must be on). OFF by default — this is the one capability a model,
+    /// rather than the operator, decides to use. Also KAIBO_ARTIFACTS_ENABLED /
+    /// [artifacts] enabled.
+    #[arg(long = "allow-save-artifact")]
+    pub allow_save_artifact: bool,
 }
 
 impl ServeGates {
@@ -534,6 +546,12 @@ fn load_config(common: &CommonArgs) -> anyhow::Result<Config> {
         common.state_db.clone(),
         common.cas_dir.clone(),
         common.cas_max_bytes,
+        // The CLI front doors have no client key to pair with the operator key —
+        // `save_artifacts` is an MCP `consult` argument — so a CLI consult never gets the
+        // tool, and passing `true` here would be a promise nothing keeps. It stays off
+        // rather than silently inert (`--allow-save-artifact` is a serve-only gate on
+        // `ServeGates` for exactly this reason).
+        false,
         common.max_attachments,
     );
     Ok(config)
@@ -761,6 +779,9 @@ async fn resolve_and_run(
         },
         synth_max_turns: args.synth_max_turns.unwrap_or(default_synth_turns),
         attachments,
+        // No client key on this front door (see `load_config`), so no sink and no
+        // `save_artifact` in the CLI consult's toolset.
+        artifacts: None,
     };
 
     match consult(

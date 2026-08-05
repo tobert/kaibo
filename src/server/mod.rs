@@ -69,7 +69,8 @@ pub(crate) use render::{
 };
 
 use render::{
-    append_warnings, batch_poll_brief, consult_result, consultation_failed, fmt_usage,
+    batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
+    consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
     is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
     wait_level_floor, wait_level_label,
 };
@@ -111,7 +112,7 @@ const TOOLS_URI: &str = "kaibo://tools";
 /// the inner model team never can — the CAS is not mounted into kaish and no
 /// cast-facing tool reads it, because kaibo state spans projects and a browsable CAS
 /// would let one project's team enumerate another's artifacts.
-const CAS_RES_PREFIX: &str = "kaibo://cas/";
+const CAS_RES_PREFIX: &str = crate::cas::CAS_URI_PREFIX;
 /// The RFC 6570 template `list_resource_templates` advertises for the CAS reads.
 const CAS_URI_TEMPLATE: &str = "kaibo://cas/{digest}";
 /// The system preambles kaibo hands each model-driven phase — explorer, consult
@@ -343,6 +344,12 @@ pub struct ConsultInput {
     /// the whole files a change touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
+
+    /// Let this consult save bulk output (a generated corpus, a long inventory) into
+    /// kaibo's artifact store instead of the answer; the answer names each
+    /// `kaibo://cas/<digest>` to read. Off by default, and the server must allow it.
+    #[serde(default)]
+    pub save_artifacts: bool,
 }
 
 /// Arguments to the `explore` tool: a single-phase explorer sweep. Explorer-only —
@@ -1257,10 +1264,30 @@ impl KaiboHandler {
             .map_err(|e| McpError::invalid_params(format!("{e} (in {uri})"), None))?;
         match store.get(&digest) {
             Ok(Some((bytes, ext))) => {
-                use base64::Engine as _;
-                let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
+                // Textual formats come back as the string they are — the producer
+                // marked them (save_artifact writes UTF-8 text; the sidecar mime
+                // carries the mark), so a client fetching a corpus gets usable text,
+                // not base64 to decode. Bytes that fail to decode fall back to the
+                // blob form untouched: a lossy decode would serve different bytes
+                // than were stored, and the blob form is itself the honest "treat
+                // this as binary" signal.
+                let contents = if ext.is_textual() {
+                    match String::from_utf8(bytes) {
+                        Ok(text) => ResourceContents::text(text, uri).with_mime_type(ext.mime()),
+                        Err(e) => {
+                            use base64::Engine as _;
+                            let blob =
+                                base64::engine::general_purpose::STANDARD.encode(e.into_bytes());
+                            ResourceContents::blob(blob, uri).with_mime_type(ext.mime())
+                        }
+                    }
+                } else {
+                    use base64::Engine as _;
+                    let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    ResourceContents::blob(blob, uri).with_mime_type(ext.mime())
+                };
                 Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
-                    vec![ResourceContents::blob(blob, uri).with_mime_type(ext.mime())],
+                    vec![contents],
                 )))
             }
             Ok(None) => Err(McpError::resource_not_found(
@@ -1527,6 +1554,64 @@ impl KaiboHandler {
         self.resolver.resolve_root(path)
     }
 
+    /// Build this call's [`ArtifactSink`], or refuse loudly.
+    ///
+    /// The two-key gate, resolved in one place so `consult` and `consult_submit` cannot
+    /// drift: the operator's standing permission (`[artifacts] enabled`), the caller's
+    /// per-call `save_artifacts`, and a live media CAS. All three, or no sink — and with
+    /// no sink there is no `save_artifact` in the driver's toolset at all.
+    ///
+    /// A caller that asked and cannot be served gets an **error**, never a quiet consult
+    /// with no artifacts in it. The request is explicit, so a silently-dropped capability
+    /// would leave the caller reading an answer that swallowed the bulk it asked to have
+    /// stored, with nothing saying why. The message names which key is missing and where
+    /// to turn it on.
+    fn artifact_sink(
+        &self,
+        asked: bool,
+        question: &str,
+        session: Option<&str>,
+        cast: &str,
+        synth_model: &str,
+    ) -> Result<Option<Arc<crate::artifact::ArtifactSink>>, McpError> {
+        if !asked {
+            return Ok(None);
+        }
+        if !self.config.artifacts.enabled {
+            return Err(McpError::invalid_params(
+                "`save_artifacts` was requested, but this kaibo does not allow the model \
+                 team to save artifacts. An operator enables it with `[artifacts] enabled \
+                 = true` in config.toml, `KAIBO_ARTIFACTS_ENABLED=1`, or \
+                 `--allow-save-artifact`, then reconnects. Re-run without \
+                 `save_artifacts` to get the answer inline."
+                    .to_string(),
+                None,
+            ));
+        }
+        let Some(store) = self.media_cas.clone() else {
+            return Err(McpError::invalid_params(
+                "`save_artifacts` was requested, but the media CAS is off ([cas] enabled \
+                 = false), so a saved artifact would have nowhere to land. Re-enable the \
+                 CAS and reconnect, or re-run without `save_artifacts`."
+                    .to_string(),
+                None,
+            ));
+        };
+        Ok(Some(Arc::new(crate::artifact::ArtifactSink::new(
+            store,
+            crate::artifact::ArtifactAuthor {
+                prompt: question.to_string(),
+                model: synth_model.to_string(),
+                cast: cast.to_string(),
+                // Only the consult DRIVER loop carries the tool, and that loop runs on
+                // the synth arm. A sweep's sub-agent cannot reach a sink (see
+                // `ConsultConfig::artifacts`), so there is no other slot to record.
+                slot: "synth",
+                session: session.map(str::to_string),
+            },
+        ))))
+    }
+
     /// Shim over [`Resolver::resolve_attachments`].
     pub async fn resolve_attachments(
         &self,
@@ -1614,6 +1699,13 @@ impl KaiboHandler {
             },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             attachments,
+            artifacts: self.artifact_sink(
+                input.save_artifacts,
+                &input.question,
+                input.session_id.as_deref(),
+                &cast.name,
+                &synth.model,
+            )?,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -1649,7 +1741,16 @@ impl KaiboHandler {
             Ok(out) => out,
             // A provider/model-loop failure is a clean tool-result error the host can
             // proceed past, not a JSON-RPC internal_error. See `consultation_failed`.
-            Err(e) => return Ok(consultation_failed("consult", &cast.name, e)),
+            // Artifacts saved before the failure are named in the failure text too — they
+            // are durable either way, and a result without their digests orphans them.
+            Err(e) => {
+                return Ok(consultation_failed_with_artifacts(
+                    "consult",
+                    &cast.name,
+                    e,
+                    cfg.artifacts.as_deref(),
+                ))
+            }
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
@@ -1659,8 +1760,10 @@ impl KaiboHandler {
         // Fold any non-fatal warnings (a failed session record) back into the answer
         // text before the footer — the MCP client has no structured warnings channel, so
         // it sees them inline exactly as #76 shipped (the CLI keeps them off `--json`).
-        let answer = with_provenance(
-            append_warnings(out.answer, &out.warnings),
+        let answer = consult_answer_text(
+            out.answer,
+            &out.warnings,
+            cfg.artifacts.as_deref(),
             &cast.name,
             &[("explorer", &explorer.model), ("synth", &synth.model)],
             &out.usage,
@@ -1745,6 +1848,17 @@ impl KaiboHandler {
             },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             attachments,
+            // Same two-key gate as the sync lane, and refused here for the same reason —
+            // synchronously, before a job exists, so a caller asking for something this
+            // server cannot do gets a clean error rather than a handle that comes back
+            // missing the artifacts it asked for.
+            artifacts: self.artifact_sink(
+                input.save_artifacts,
+                &input.question,
+                input.session_id.as_deref(),
+                &cast.name,
+                &synth.model,
+            )?,
         };
 
         // Owned captures for the `'static` spawned task. The session store is `Clone`
@@ -1775,8 +1889,10 @@ impl KaiboHandler {
             .await
             {
                 Ok(out) => {
-                    let answer = with_provenance(
-                        append_warnings(out.answer, &out.warnings),
+                    let answer = consult_answer_text(
+                        out.answer,
+                        &out.warnings,
+                        cfg.artifacts.as_deref(),
                         &cast_name,
                         &[
                             ("explorer", explorer_model.as_str()),
@@ -1790,8 +1906,15 @@ impl KaiboHandler {
                     })
                 }
                 // Render the failure to its final text here (classification + guidance),
-                // so `job_get` wraps a ready string without re-deriving anything.
-                Err(e) => Err(consultation_failure_text("consult", &cast_name, e)),
+                // so `job_get` wraps a ready string without re-deriving anything — with
+                // any artifacts this job saved before failing named in it, since they are
+                // durable whether or not the answer arrived.
+                Err(e) => Err(consultation_failure_text_with_artifacts(
+                    "consult",
+                    &cast_name,
+                    e,
+                    cfg.artifacts.as_deref(),
+                )),
             }
         });
 
@@ -3885,15 +4008,23 @@ fn store_generated_artifacts(
         .iter()
         .enumerate()
         .map(|(i, artifact)| {
-            crate::cas::Extension::from_mime(&artifact.mime).ok_or_else(|| {
-                anyhow!(
-                    "artifact {} has mime {:?}, which the media store cannot name on \
-                     disk yet — refusing the whole result rather than storing it under \
-                     an invented extension; nothing was stored",
-                    i + 1,
-                    artifact.mime
-                )
-            })
+            // `is_image` and not merely "the store can name it": the store also names
+            // the text formats `save_artifact` writes, and an images provider handing
+            // back a text body is a provider fault, not an artifact. Keeping the
+            // refusal keyed to the media lane's own shape is what stopped growing
+            // `Extension` from quietly widening what `generate` accepts.
+            crate::cas::Extension::from_mime(&artifact.mime)
+                .filter(crate::cas::Extension::is_image)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "artifact {} has mime {:?}, which is not an image format the \
+                         media store can name on disk — refusing the whole result \
+                         rather than storing it under an invented extension; nothing \
+                         was stored",
+                        i + 1,
+                        artifact.mime
+                    )
+                })
         })
         .collect::<Result<_>>()?;
     let timestamp = now_epoch_secs();
@@ -3911,6 +4042,13 @@ fn store_generated_artifacts(
             timestamp,
             mime: artifact.mime.clone(),
             seed: artifact.seed.clone(),
+            // A provider rendered these bytes; no model on kaibo's team authored them,
+            // so the authorship fields stay absent and the sidecar keeps the shape it
+            // has always had apart from naming its producer.
+            tool: Some("generate".to_string()),
+            slot: None,
+            label: None,
+            session: None,
         };
         let digest =
             store
@@ -4500,6 +4638,87 @@ mod tests {
         .expect("handler builds")
     }
 
+    /// **The two-key gate on `save_artifact`, all four combinations.**
+    ///
+    /// A sink exists only when the operator enabled `[artifacts]`, the call passed
+    /// `save_artifacts`, and the media CAS is live. No sink means the tool is not in the
+    /// driver's toolset at all (`ConsultConfig::artifacts` is what `consult_tools` reads),
+    /// so this is the whole gate — there is no second place it could leak through.
+    ///
+    /// A caller that asked and cannot be served gets a refusal naming which key is
+    /// missing, never a quiet consult that swallowed the bulk it was told to store.
+    #[test]
+    fn save_artifact_needs_the_operator_key_the_call_key_and_a_live_cas() {
+        let ask = |save_artifacts: bool| ConsultInput {
+            question: "q".into(),
+            context: None,
+            path: None,
+            cast: None,
+            explorer_model: None,
+            explorer_backend: None,
+            synth_model: None,
+            synth_backend: None,
+            session_id: Some("sess-1".into()),
+            explorer_max_turns: None,
+            synth_max_turns: None,
+            include_report: false,
+            attach: Vec::new(),
+            save_artifacts,
+        };
+        let sink = |h: &KaiboHandler, input: &ConsultInput| {
+            h.artifact_sink(
+                input.save_artifacts,
+                &input.question,
+                input.session_id.as_deref(),
+                "deepseek",
+                "deepseek/deepseek-v4-pro",
+            )
+        };
+
+        // Operator key OFF (the default posture of every kaibo install).
+        let off = handler();
+        assert!(
+            sink(&off, &ask(false))
+                .expect("not asking is never an error")
+                .is_none(),
+            "no key asked, no sink"
+        );
+        let err = sink(&off, &ask(true)).expect_err("asking for a disabled capability must refuse");
+        assert!(
+            err.message.contains("[artifacts] enabled")
+                && err.message.contains("--allow-save-artifact"),
+            "the refusal names how an operator turns it on: {}",
+            err.message
+        );
+
+        // Operator key ON, call key OFF: still no sink, and no error — the caller asked
+        // for nothing.
+        let on = handler_from_toml("[artifacts]\nenabled = true\n");
+        assert!(
+            sink(&on, &ask(false))
+                .expect("not asking is never an error")
+                .is_none(),
+            "the operator's permission is standing, not automatic"
+        );
+
+        // Both keys, CAS live: a sink.
+        assert!(
+            sink(&on, &ask(true))
+                .expect("both keys and a live CAS")
+                .is_some(),
+            "all three conditions hold, so the driver gets the tool"
+        );
+
+        // Both keys, CAS off: refused, naming the CAS rather than the artifacts flag.
+        let no_cas = handler_from_toml("[artifacts]\nenabled = true\n\n[cas]\nenabled = false\n");
+        let err = sink(&no_cas, &ask(true)).expect_err("no store means no artifact");
+        assert!(
+            err.message.contains("[cas] enabled = false"),
+            "the refusal names the missing key precisely: {}",
+            err.message
+        );
+    }
+
     /// The media-CAS lifecycle on the handler: `new` seeds the in-memory store when
     /// the CAS is enabled (mirroring sessions-start-in-memory) and holds nothing when
     /// `[cas] enabled = false`; `finalize_media_store` upgrades to disk exactly when
@@ -4923,7 +5142,12 @@ mod tests {
         let small = png(b"tiny");
         let big = png(&[7u8; 4096]);
         // A capped in-memory store: #1 fits, #2 breaches. Both mimes prevalidate.
-        let toml = format!("{MEDIA_CAST_TOML}\n[cas]\nmax_bytes = 64\n");
+        // The budget has to clear #1's content PLUS its provenance — memory-mode
+        // admission counts the serialized provenance it stores, the same footprint disk
+        // mode has always counted (a cap that ignored it meant two different things in
+        // the two modes). 2 KiB leaves room for one small artifact and its record, and
+        // none for a 4 KiB second.
+        let toml = format!("{MEDIA_CAST_TOML}\n[cas]\nmax_bytes = 2048\n");
         let h = hermetic_handler_from_toml(&toml).with_media_arms(Arc::new(ScriptedMediaArms(
             Arc::new(SyncArtifacts(vec![small.clone(), big])),
         )));
@@ -5144,6 +5368,92 @@ enabled = false
         assert!(
             canceled.contains(&handle) && !canceled.contains("Consultation"),
             "the cancel ack names the job without calling it a consultation:\n{canceled}"
+        );
+    }
+
+    /// A minimal textual-artifact sidecar for driving the resource read directly.
+    fn textual_provenance() -> crate::cas::Provenance {
+        crate::cas::Provenance {
+            prompt: "q".to_string(),
+            model: "m".to_string(),
+            cast: "c".to_string(),
+            timestamp: 1,
+            mime: "text/plain; charset=utf-8".to_string(),
+            seed: None,
+            tool: Some("save_artifact".to_string()),
+            slot: Some("synth".to_string()),
+            label: Some("a test artifact".to_string()),
+            session: None,
+        }
+    }
+
+    /// A textual artifact reads back as **text**, not base64. The producers mark what
+    /// they make — `save_artifact` writes text formats, `generate` writes images — and
+    /// the sidecar mime carries that mark to retrieval, so a client fetching a corpus
+    /// gets the string it can use, not a blob it must decode first.
+    #[tokio::test]
+    async fn cas_resource_serves_textual_artifacts_as_text() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let store = h.media_store().expect("media CAS is on").clone();
+        let content = "line one\nline two\n";
+        let digest = store
+            .put(
+                content.as_bytes(),
+                crate::cas::Extension::Txt,
+                &textual_provenance(),
+            )
+            .expect("put succeeds");
+        let hex = digest.to_hex();
+        let uri = format!("kaibo://cas/{hex}");
+        let ReadResourceResponse::Complete(result) =
+            h.read_cas_resource(&hex, &uri).expect("stored digest reads")
+        else {
+            panic!("expected a complete read");
+        };
+        let ResourceContents::TextResourceContents {
+            text, mime_type, ..
+        } = &result.contents[0]
+        else {
+            panic!(
+                "a textual artifact reads as text, got {:?}",
+                result.contents[0]
+            );
+        };
+        assert_eq!(text, content);
+        assert_eq!(mime_type.as_deref(), Some("text/plain; charset=utf-8"));
+    }
+
+    /// Bytes under a textual extension that do not decode as UTF-8 fall back to a blob
+    /// — never a lossy decode that would hand back different bytes than were stored.
+    /// The blob form itself is the marking that says "treat this as binary"; the mime
+    /// still reports what the object claims to be.
+    #[tokio::test]
+    async fn cas_resource_falls_back_to_blob_for_undecodable_text() {
+        use base64::Engine as _;
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let store = h.media_store().expect("media CAS is on").clone();
+        let bytes: &[u8] = &[0x66, 0x6f, 0x6f, 0xff, 0xfe, 0x62, 0x61, 0x72];
+        let digest = store
+            .put(bytes, crate::cas::Extension::Txt, &textual_provenance())
+            .expect("put succeeds");
+        let hex = digest.to_hex();
+        let uri = format!("kaibo://cas/{hex}");
+        let ReadResourceResponse::Complete(result) =
+            h.read_cas_resource(&hex, &uri).expect("stored digest reads")
+        else {
+            panic!("expected a complete read");
+        };
+        let ResourceContents::BlobResourceContents { blob, .. } = &result.contents[0] else {
+            panic!(
+                "undecodable bytes read as a blob, got {:?}",
+                result.contents[0]
+            );
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .expect("valid base64"),
+            bytes
         );
     }
 
