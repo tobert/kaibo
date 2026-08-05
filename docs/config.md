@@ -863,11 +863,43 @@ an operator, not an audit trail, and a content-addressed store that never rewrit
 be one. For a durable per-call record, kaibo's answers are the tool-call telemetry each
 save emits and the session the answer was recorded into.
 
-**Retrieval is operator-surface only.** A generation result returns each artifact's
-digest, a `kaibo://cas/<digest>` resource URI, and (in disk mode) the real filesystem
-path. The MCP client and CLI read those; the inner model team never sees the CAS — it is
-not mounted into kaish and no cast-facing tool reads it, because kaibo state spans
-projects and a browsable CAS would let one project's team enumerate another's artifacts.
+**Retrieval is the `read_cas` tool, and it is operator-surface only.** Every producer
+names its artifacts by a `kaibo://cas/<digest>` address; `read_cas` takes the digest out
+of one and hands the content back. The MCP client calls it; the inner model team never can
+— the CAS is not mounted into kaish and no cast-facing tool reads it, because kaibo state
+spans projects and a browsable CAS would let one project's team enumerate another's
+artifacts. There is no `kaibo cas` CLI command; on disk, the path a read reports is how an
+operator reaches an object with their own tools.
+
+Reads are **metadata-first and bounded**, and the default depends on what the object is:
+
+| ask | text object | image | any other binary |
+|---|---|---|---|
+| `length: 0` | metadata only | metadata only | metadata only |
+| no `length` | metadata + up to 64 KiB from `offset` | the whole image, viewable, when it is ≤ 5 MiB; otherwise metadata only | metadata only |
+| `offset` + `length` | metadata + that range as text | metadata + that range as base64 | metadata + that range as base64 |
+
+Metadata is always the first content block: digest, URI, mime, total bytes, binary or not,
+the label when the object's record carries one, a `provenance:` line when it has no record
+at all, the range served, and the real file path **in disk mode only** — memory mode has
+no file, so there is nothing to point at. `length` is capped at 1 MiB; a larger ask is
+refused rather than trimmed, so a caller's next `offset` is never wrong.
+
+**A binary object is never dumped as base64 unless you ask for a range.** An image past
+5 MiB comes back as metadata (plus the path, on disk) rather than ~7 MiB of base64 in your
+context — open the file, or page it deliberately.
+
+**Paging always advances.** A window that begins or ends inside a multi-byte character
+comes back as base64 of exactly the bytes you asked for, with a note saying why, so the
+served range still moves. Resuming at the range you were handed always terminates and
+always reassembles the object byte for byte.
+
+`kaibo://cas/<digest>` **was** an MCP resource until 2026-08-05 and no longer is. Two
+reasons. Hosts treat resources as ambient context — some prefetch, some auto-attach —
+which is the wrong posture for bytes a model just wrote; a tool call is deliberate, with
+explicit arguments and a permission prompt. And `resources/read` is whole-blob with no
+negotiation: a measured 3.8 MB PNG produced roughly 5 MB of base64 in one read. The URI
+string survives as the artifact's name; only the resource route is gone.
 
 **`max_bytes` refuses, never evicts.** A write that would pass the cap fails loudly and
 nothing is deleted to make room. The cap is opt-in because enforcing it costs an
@@ -942,7 +974,7 @@ single line because it is rendered into the answer's footer, where a line break 
 forge entries the caller would read as real artifacts.
 
 **What the model cannot do.** It can write and it can never read. There is no list verb,
-no read verb, and no `kaibo://cas` access from inside the loop. The result of a save is a
+no read verb, and no `read_cas` in the inner toolset. The result of a save is a
 digest and nothing else: it never reports whether the content was already in the store,
 because that answer would let one project's model team probe another's artifacts. Refusals
 are sanitized for the same reason — the model is told what to do next, never the store's

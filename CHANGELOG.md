@@ -17,6 +17,18 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`read_cas` — read a stored artifact back by digest.** Metadata comes first on
+  every response: mime, total size, binary or not, the artifact's label when its
+  record carries one, the range served, and the real file path when the store is on
+  disk (open that directly for anything large). Reads are bounded, and the default
+  fits the object: text gives up to 64 KiB from `offset` and tells you the total so
+  you can page; an image up to 5 MiB arrives whole and viewable, a larger one as
+  metadata alone; any other binary gives metadata until you ask for a range. `length`
+  is capped at 1 MiB and a larger ask is refused rather than trimmed, and paging always
+  advances — a window landing inside a multi-byte character returns those exact bytes
+  as base64 with a note, so a caller resuming at the range it was handed never stalls.
+  Advertised whenever the media CAS is on.
+
 - **A consult can hand you bulk output as an artifact instead of spending your
   context on it.** Ask with `save_artifacts: true` and the investigating model can
   write a generated corpus, a long inventory, or a fixture into kaibo's media store;
@@ -45,7 +57,7 @@ record. Each later release appends a new section at the top.
   `[casts.artist] image = "sd/core"`. The tool never inlines bytes: every artifact
   lands in kaibo's content-addressed media store under its own SHA-256 digest with a
   provenance sidecar (prompt, model, cast, timestamp, mime, seed), and the result
-  lists per-artifact `kaibo://cas/<digest>` resource URIs — plus the real file path
+  lists per-artifact `kaibo://cas/<digest>` addresses — plus the real file path
   when the store is on disk. Provider-native options (`aspect_ratio`,
   `output_format`, `seed`, `negative_prompt`, ...) pass through a `fields` object
   verbatim. Operations the provider declares deferred return a `job-N` handle on the
@@ -65,11 +77,10 @@ record. Each later release appends a new section at the top.
   gains a `[cas]` section reporting the knob and the live mode
   (`disk` / `memory` / `off`).
 
-- **Artifact retrieval is operator-surface only.** The new `kaibo://cas/{digest}` MCP
-  resource serves an artifact's bytes (base64, correct mime) to the calling client —
-  the inner model team never sees the CAS: it is not mounted into kaish and no
-  cast-facing tool reads it, so one project's team can never enumerate another
-  project's artifacts.
+- **Artifact retrieval is operator-surface only.** The `read_cas` tool serves an
+  artifact's content to the calling client — the inner model team never sees the CAS:
+  it is not mounted into kaish and no cast-facing tool reads it, so one project's team
+  can never enumerate another project's artifacts.
 
 - **Model listings show each model's output ceiling.** `kaibo models` and `list_models`
   render the provider's advertised max completion tokens beside the context window
@@ -116,6 +127,12 @@ record. Each later release appends a new section at the top.
   the template you copy, `kaibo://config` is the resolved live state, and
   `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
   all three.
+
+### Removed
+
+- **The `kaibo://cas/<digest>` MCP resource** — briefly on `main`, never in a release,
+  replaced before shipping by the `read_cas` tool above. A stale request for that URI
+  answers with the migration rather than a bare unknown-resource error.
 
 ### Changed
 

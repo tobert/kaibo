@@ -729,9 +729,8 @@ fn two_threads_racing_the_last_budget_slot_produce_exactly_one_save() {
 
 // --- Memory mode has no path to show ------------------------------------------
 
-/// In memory mode the `kaibo://cas/<digest>` resource is the ONLY retrieval channel —
-/// there is no file. A footer claiming a path would send the caller after something that
-/// does not exist.
+/// In memory mode `read_cas` is the ONLY retrieval channel — there is no file. A footer
+/// claiming a path would send the caller after something that does not exist.
 #[test]
 fn the_memory_mode_footer_names_no_path() {
     let s = sink();

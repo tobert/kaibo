@@ -323,8 +323,8 @@ scratch_limit_bytes = 67108864
 #
 # What it buys: a consult producing bulk output (a generated corpus, a long inventory, a
 # fixture) writes it into the CAS and names the digest in its answer, instead of
-# spending your context window on material you may only want to keep. You read it at
-# kaibo://cas/<digest>, or you do not.
+# spending your context window on material you may only want to keep. You read it back
+# with the `read_cas` tool (metadata first, bounded ranges), or you do not.
 #
 # Limits are fixed, not configurable: 1 MiB per artifact, 8 artifacts and 8 MiB per call,
 # and a one-line label of at most 200 bytes. A save past a limit is refused and stores

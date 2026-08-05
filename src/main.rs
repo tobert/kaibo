@@ -198,8 +198,13 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     // exactly as useless as the state we already refuse, so refuse it the same way and for
     // the same reason: crashing beats running silently useless. The per-tool warnings above
     // have already named what each tool wanted; this says the surface came out empty.
+    //
+    // "Empty" means empty of tools that DO something — see `FOLLOWER_TOOL_NAMES`. A
+    // surface of nothing but `read_cas` and the job verbs can fetch what earlier runs
+    // produced and nothing else, and `read_cas` rides the media CAS, which is on by
+    // default: counting it would leave this guard unable to fire on any stock install.
     anyhow::ensure!(
-        !handler.advertised_tools().is_empty(),
+        handler.has_substantive_tools(),
         "no tools left to advertise — every tool is either disabled by a --no-<tool> flag \
          or has no configured cast that can staff it (the warnings above name what each one \
          needs). Fix by configuring a cast with a working provider key, or by re-enabling a \

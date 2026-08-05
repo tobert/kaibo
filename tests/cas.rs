@@ -659,8 +659,8 @@ fn memory_cap_admission_counts_the_provenance_sidecar() {
 // --- MediaStore: one seam over both modes ------------------------------------
 
 /// Disk mode exposes the real filesystem path beside the digest; memory mode has no
-/// path at all (the kaibo://cas resource is its only retrieval channel). Both modes
-/// serve the same bytes+extension read.
+/// path at all (`read_cas` is its only retrieval channel). Both modes serve the same
+/// bytes+extension read.
 #[test]
 fn media_store_paths_exist_on_disk_and_not_in_memory() {
     let (cas, _dir) = open_uncapped();
@@ -791,7 +791,7 @@ fn object_path(root: &Path, digest: &Digest, ext: &str) -> PathBuf {
 /// put lands at the same digest), and the sidecar written with the first put is the
 /// record of what this object actually is. A probe that walks `Extension::ALL` in
 /// declaration order answers with whichever variant it happens to try first, which is a
-/// mislabel the `kaibo://cas/<digest>` resource then stamps onto the bytes.
+/// mislabel `read_cas` then reports for the bytes.
 ///
 /// Stored webp-first, png-second: probe order says PNG, the recorded provenance says
 /// WEBP. The recorded provenance wins.
