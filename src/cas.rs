@@ -1109,6 +1109,118 @@ fn verify(digest: &Digest, bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// --- The backing-filesystem guard -------------------------------------------
+//
+// Disk mode means "artifacts survive a restart", and on a container with no volume
+// mounted that sentence is false while every other signal says it is true: persistence
+// comes up, `Cas::open` succeeds, writes land, reads verify. overlayfs behaves exactly
+// like ext4 right up to the moment the container exits and takes the store with it. So
+// the store cannot notice from the inside — the only tell is what the directory is
+// sitting on, and that is a question for startup, once, out of band.
+//
+// Amy's design ruling (2026-07-30): **warn severely, then proceed.** Not a refusal, and
+// not gated on an acknowledgement flag. Running on tmpfs is a legitimate thing to do
+// deliberately (a scratch run, a test rig, a cache you mean to throw away); what is not
+// legitimate is *discovering* it after paying for a generation. The guard's whole job is
+// to make sure the operator heard it.
+
+/// What the filesystem under an object store turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backing {
+    /// A filesystem whose contents die with the process's container or host: overlayfs
+    /// with no volume, tmpfs, ramfs. Carries the name so the warning can say which.
+    Ephemeral { fs: &'static str },
+    /// Nothing here says the store is ephemeral.
+    Durable,
+    /// The probe could not answer — an unsupported platform, a stat failure, a path with
+    /// an interior NUL.
+    ///
+    /// **Deliberately not folded into either other arm.** Treating it as ephemeral would
+    /// warn on every non-Linux install and train operators to ignore the one message
+    /// that has to land; treating it as durable would *claim* something the probe never
+    /// established. Not knowing is its own answer, and the only correct response to it
+    /// is silence (at debug, for whoever is actually debugging).
+    Unknown,
+}
+
+impl Backing {
+    /// The ephemeral filesystem's name, or `None` for anything that is not a positive
+    /// ephemerality finding. The predicate every caller wants: only `Ephemeral` speaks.
+    pub fn ephemeral_fs(&self) -> Option<&'static str> {
+        match self {
+            Backing::Ephemeral { fs } => Some(fs),
+            Backing::Durable | Backing::Unknown => None,
+        }
+    }
+}
+
+/// The startup warning for a CAS sitting on an ephemeral filesystem.
+///
+/// Pure, so its content is testable without a subscriber, and separate from the
+/// `tracing` call so the *wording* is a thing with a test rather than a string literal
+/// buried in a match arm. It carries four facts because an operator gets one chance to
+/// read this: which filesystem, which directory, what happens to the artifacts, and the
+/// fix.
+pub fn ephemeral_backing_warning(fs: &str, dir: &Path) -> String {
+    format!(
+        "MEDIA CAS IS ON AN EPHEMERAL FILESYSTEM: {dir} is backed by {fs}. kaibo will \
+         store generated artifacts there and they will read back correctly for this run, \
+         but they will NOT survive this container or host — they are paid for with real \
+         provider credits and may not be reproducible. If you meant this (a scratch run), \
+         carry on; if you did not, mount a volume at that path (or point [cas] dir at one) \
+         and restart. kaibo://config reports this under [cas] backing.",
+        dir = dir.display(),
+    )
+}
+
+/// Ask what filesystem `dir` is sitting on.
+///
+/// Answers for a directory that **does not exist yet** by asking about its nearest
+/// existing ancestor: the CAS root is created lazily on the first write, so a probe that
+/// insisted on the leaf would return [`Backing::Unknown`] on every fresh install — which
+/// is precisely the fresh-container case this guard exists for.
+#[cfg(target_os = "linux")]
+pub fn probe_backing(dir: &Path) -> Backing {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(existing) = first_existing_ancestor(dir) else {
+        return Backing::Unknown;
+    };
+    let Ok(c_path) = CString::new(existing.as_os_str().as_bytes()) else {
+        // An interior NUL means we cannot ask. Not knowing is not evidence.
+        return Backing::Unknown;
+    };
+    // SAFETY: `buf` is a zeroed, owned `statfs`; `c_path` is a valid NUL-terminated path.
+    // `statfs` only writes into `buf` and reads the path, and reports failure via `rc`.
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return Backing::Unknown;
+    }
+    // Keep the low 32 bits so the compare is width-agnostic across arches — the same
+    // treatment `store.rs`'s network-fs guard gives `f_type`.
+    match (buf.f_type as i64) & 0xFFFF_FFFF {
+        0x794C_7630 => Backing::Ephemeral { fs: "overlayfs" },
+        0x0102_1994 => Backing::Ephemeral { fs: "tmpfs" },
+        0x8584_58F6 => Backing::Ephemeral { fs: "ramfs" },
+        _ => Backing::Durable,
+    }
+}
+
+/// Non-Linux: a quiet no-op. The magics are not portable, and the container-without-a-
+/// volume scenario this guard defends is a Linux one. The seam is the point — a platform
+/// that grows its own detection (a macOS `statfs` `f_fstypename` compare, say) replaces
+/// this arm and every caller is already written against [`Backing`].
+#[cfg(not(target_os = "linux"))]
+pub fn probe_backing(_dir: &Path) -> Backing {
+    Backing::Unknown
+}
+
+/// The probe a caller injects. Production passes [`probe_backing`]; tests script the
+/// answer, because the one thing a test cannot arrange portably is what filesystem it is
+/// running on.
+pub type BackingProbe = fn(&Path) -> Backing;
+
 /// The default media CAS directory: `$XDG_DATA_HOME/kaibo/cas`, else
 /// `~/.local/share/kaibo/cas` — the XDG *data* dir, deliberately not the *state* dir
 /// [`crate::store`] uses (see the module doc's "Why `$XDG_DATA_HOME`" section). `None`

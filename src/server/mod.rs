@@ -740,6 +740,19 @@ pub struct KaiboHandler {
     /// store once `main` knows whether persistence actually came up. `Arc` so
     /// per-request handler clones share one store.
     media_cas: Option<Arc<crate::cas::MediaStore>>,
+    /// How the CAS directory's backing filesystem is probed at startup. A field rather
+    /// than a direct call so a test can script the answer — what filesystem the test
+    /// process happens to be running on is the one thing it cannot arrange portably.
+    backing_probe: crate::cas::BackingProbe,
+    /// The ephemeral filesystem the CAS turned out to sit on, if any — set by
+    /// [`finalize_media_store`](Self::finalize_media_store) in disk mode, and reported by
+    /// `kaibo://config` under `[cas] backing`.
+    ///
+    /// The startup warning is the loud channel, but startup log is exactly the thing an
+    /// operator scrolls past or never sees (a client launched kaibo for them). Leaving
+    /// the finding somewhere queryable is what turns "we told you" into "you can check" —
+    /// the same reason memory mode reports `mode = "memory"` rather than only warning.
+    cas_ephemeral_fs: Option<&'static str>,
     /// How `generate` builds its media arm — the injection seam mirroring
     /// `batch_providers`: production seeds [`crate::media::LiveMediaArms`]; tests swap
     /// in a factory returning a scripted model via
@@ -1173,6 +1186,8 @@ impl KaiboHandler {
         Ok(Self {
             config,
             media_cas,
+            backing_probe: crate::cas::probe_backing,
+            cas_ephemeral_fs: None,
             tool_router,
             tool_schemas: Arc::new(builtin_schemas()?),
             sessions,
@@ -1272,10 +1287,32 @@ impl KaiboHandler {
                             dir.display()
                         )
                     })?;
-                tracing::info!(
-                    cas_dir = %dir.display(),
-                    "media CAS on disk — generated artifacts are durable across restarts"
-                );
+                // Disk mode's promise is "durable across restarts", and on a container
+                // with no volume mounted that promise is false while everything else
+                // looks fine. Ask what the directory is actually sitting on, and if the
+                // answer is a filesystem that dies with the container, say so LOUDLY —
+                // then proceed (Amy, 2026-07-30). Not a refusal and no ack flag: running
+                // on tmpfs on purpose is legitimate, discovering it after paying for a
+                // generation is not.
+                match (self.backing_probe)(&dir).ephemeral_fs() {
+                    Some(fs) => {
+                        tracing::warn!("{}", crate::cas::ephemeral_backing_warning(fs, &dir));
+                        self.cas_ephemeral_fs = Some(fs);
+                    }
+                    // Durable, or the probe could not answer. Neither is worth a word at
+                    // startup: one is the expected case, and the other established
+                    // nothing. The debug line is for whoever is actually debugging.
+                    None => {
+                        tracing::debug!(
+                            cas_dir = %dir.display(),
+                            "media CAS backing filesystem: nothing indicates it is ephemeral"
+                        );
+                        tracing::info!(
+                            cas_dir = %dir.display(),
+                            "media CAS on disk — generated artifacts are durable across restarts"
+                        );
+                    }
+                }
                 self.media_cas = Some(Arc::new(crate::cas::MediaStore::Disk(cas)));
             }
         }
@@ -1309,6 +1346,23 @@ impl KaiboHandler {
     ) -> Self {
         self.batch_providers = providers;
         self
+    }
+
+    /// Swap in the backing-filesystem probe — the seam that lets a test say what the CAS
+    /// directory is sitting on, since the real answer depends on where the test process
+    /// happens to be running. A builder, like
+    /// [`with_media_arms`](Self::with_media_arms); apply it BEFORE
+    /// [`finalize_media_store`](Self::finalize_media_store), which is what reads it.
+    #[cfg(test)]
+    pub fn with_backing_probe(mut self, probe: crate::cas::BackingProbe) -> Self {
+        self.backing_probe = probe;
+        self
+    }
+
+    /// The ephemeral filesystem the CAS is sitting on, if the startup probe found one.
+    /// `None` covers durable, unknown, and every non-disk mode.
+    pub fn cas_ephemeral_fs(&self) -> Option<&'static str> {
+        self.cas_ephemeral_fs
     }
 
     /// Swap in a media-arm factory — the seam that lets tests drive the `generate`
@@ -3378,6 +3432,7 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.followed_worktrees(),
             self.sessions.store().is_some(),
             self.live_cas_mode(),
+            self.cas_ephemeral_fs,
         )
     }
 
@@ -4213,6 +4268,7 @@ fn read_kaibo_resource_with_config(
     followed_worktrees: Vec<PathBuf>,
     persistence_active: bool,
     cas_mode: crate::config::CasMode,
+    cas_ephemeral_fs: Option<&'static str>,
 ) -> Result<ReadResourceResponse, McpError> {
     if uri == PROMPTS_URI {
         return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
@@ -4245,6 +4301,7 @@ fn read_kaibo_resource_with_config(
             followed_worktrees,
             persistence_active,
             cas_mode,
+            cas_ephemeral_fs,
         );
         return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
             vec![ResourceContents::text(body, uri)],
@@ -4836,6 +4893,121 @@ mod tests {
             err.message.contains("[cas] enabled = false"),
             "the refusal names the missing key precisely: {}",
             err.message
+        );
+    }
+
+    /// A handler in real DISK mode at a temp dir, with the backing probe scripted — the
+    /// one fact a test cannot arrange portably is what filesystem it is running on.
+    fn disk_handler_with_probe(
+        dir: &std::path::Path,
+        probe: crate::cas::BackingProbe,
+    ) -> KaiboHandler {
+        let toml = format!("[cas]\ndir = \"{}\"\n", dir.join("cas").display());
+        hermetic_handler_from_toml(&toml)
+            .with_backing_probe(probe)
+            .finalize_media_store(true)
+            .expect("disk-backed store opens")
+    }
+
+    fn probe_overlayfs(_: &std::path::Path) -> crate::cas::Backing {
+        crate::cas::Backing::Ephemeral { fs: "overlayfs" }
+    }
+    fn probe_durable(_: &std::path::Path) -> crate::cas::Backing {
+        crate::cas::Backing::Durable
+    }
+    fn probe_unknown(_: &std::path::Path) -> crate::cas::Backing {
+        crate::cas::Backing::Unknown
+    }
+
+    /// The `[cas]` section of a handler's rendered `kaibo://config`.
+    fn cas_section(h: &KaiboHandler) -> String {
+        let body = render_config_resource(
+            &h.config,
+            &[],
+            None,
+            false,
+            vec![],
+            true,
+            h.live_cas_mode(),
+            h.cas_ephemeral_fs(),
+        );
+        let start = body.find("[cas]").expect("a [cas] section");
+        let rest = &body[start..];
+        let end = rest[1..].find("\n[").map(|i| i + 1).unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// **Disk mode on an ephemeral filesystem is recorded, not just logged.**
+    ///
+    /// The scenario: a container with no volume mounted. Persistence comes up, the CAS
+    /// opens, `mode = "disk"` — every signal says durable, and the whole store vanishes
+    /// on exit. The startup warning is the loud channel, but startup log is exactly what
+    /// an operator scrolls past or never sees when a client launched kaibo for them, so
+    /// the finding also has to be somewhere they can query afterwards. That is the same
+    /// reason memory mode reports `mode = "memory"` instead of only warning.
+    #[test]
+    fn an_ephemeral_cas_backing_is_recorded_and_surfaced_in_the_config_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = disk_handler_with_probe(dir.path(), probe_overlayfs);
+
+        assert_eq!(h.live_cas_mode(), crate::config::CasMode::Disk);
+        assert_eq!(
+            h.cas_ephemeral_fs(),
+            Some("overlayfs"),
+            "the finding is kept, not discarded after the log line"
+        );
+
+        let cas = cas_section(&h);
+        assert!(cas.contains("overlayfs"), "names the filesystem: {cas}");
+        assert!(
+            cas.to_uppercase().contains("EPHEMERAL"),
+            "and says what that means: {cas}"
+        );
+        assert!(cas.to_lowercase().contains("volume"), "and the fix: {cas}");
+        assert!(
+            cas.contains("mode = \"disk\""),
+            "beside the mode it is qualifying: {cas}"
+        );
+    }
+
+    /// **A durable filesystem leaves no trace at all**, and neither does a probe that
+    /// could not answer. An operator on ext4 must not gain a line, and an unreadable
+    /// `f_type` establishes nothing — a guard that spoke on every failure to look would
+    /// be ignored by the time it mattered.
+    #[test]
+    fn a_durable_or_unreadable_backing_leaves_the_config_untouched() {
+        for (what, probe) in [
+            ("durable", probe_durable as crate::cas::BackingProbe),
+            ("unknown", probe_unknown as crate::cas::BackingProbe),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = disk_handler_with_probe(dir.path(), probe);
+            assert_eq!(h.cas_ephemeral_fs(), None, "{what}: nothing to record");
+            let cas = cas_section(&h);
+            assert!(
+                !cas.contains("backing"),
+                "{what}: no backing line at all, got: {cas}"
+            );
+        }
+    }
+
+    /// The guard is disk-only. Memory mode already warns severely about exactly this
+    /// loss, on its own terms; probing what a store that is not on a filesystem is
+    /// sitting on would be a second warning about a fact the first one already owns.
+    #[test]
+    fn memory_mode_never_reports_a_backing_filesystem() {
+        // Persistence inactive → memory mode, even though a dir resolves.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!("[cas]\ndir = \"{}\"\n", dir.path().join("cas").display());
+        let h = hermetic_handler_from_toml(&toml)
+            .with_backing_probe(probe_overlayfs)
+            .finalize_media_store(false)
+            .expect("memory-mode handler");
+        assert_eq!(h.live_cas_mode(), crate::config::CasMode::Memory);
+        assert_eq!(
+            h.cas_ephemeral_fs(),
+            None,
+            "memory mode owns its own durability warning; this guard stays out of it"
         );
     }
 
@@ -5944,6 +6116,7 @@ enabled = false
             Vec::new(),
             false,
             crate::config::CasMode::Memory,
+            None,
         )
         .expect_err("the CAS resource route no longer exists");
         // Recognized, not served: a host with a cached template gets told where the
@@ -7509,6 +7682,7 @@ enabled = false
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         )
         .expect("known uri must read");
         let result = match result {
@@ -7735,6 +7909,7 @@ enabled = false
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         )
         .expect_err("an unknown cast must be a not-found");
         assert!(
@@ -7765,6 +7940,7 @@ enabled = false
                 vec![],
                 false,
                 crate::config::CasMode::Memory,
+                None,
             )
             .is_err(),
             "an unregistered builtin must be a not-found error"
@@ -7786,6 +7962,7 @@ enabled = false
                 vec![],
                 false,
                 crate::config::CasMode::Memory,
+                None,
             )
             .is_err(),
             "an unknown URI must be a not-found error, not an empty success"
@@ -7818,6 +7995,7 @@ enabled = false
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         )
         .expect("example resource must be readable");
         let result = match result {
@@ -7920,6 +8098,7 @@ enabled = false
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         // Sanity: the rendered document has something in it.
         assert!(
@@ -7937,6 +8116,7 @@ enabled = false
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         assert!(
             result.is_ok(),
