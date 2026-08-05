@@ -150,6 +150,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// The resource-URI prefix an object is addressed by: `kaibo://cas/<digest>`. Declared
+/// here, beside the store, so the MCP resource route and every producer that *renders* an
+/// address (`generate`'s result lines, `save_artifact`'s footer) spell it one way.
+///
+/// Reading that resource is **operator surface only** (Amy's ruling, 2026-08-03): the MCP
+/// client and the CLI resolve it; the inner model team never can. The CAS is not mounted
+/// into kaish and no cast-facing tool reads it, because kaibo state spans projects and a
+/// browsable CAS would let one project's team enumerate another's artifacts.
+pub const CAS_URI_PREFIX: &str = "kaibo://cas/";
+
 /// The CAS's error surface. A persistence-adjacent module wants a typed error callers
 /// can match on, mirroring [`crate::store::StoreError`]'s posture (thiserror over
 /// kaibo's usual anyhow-everywhere interior).
@@ -369,7 +379,8 @@ impl Extension {
 }
 
 /// The provenance sidecar recorded next to every object: `prompt`, `model`, `cast`,
-/// `timestamp` (epoch seconds), `mime`, and `seed`. This is the whole point of shipping
+/// `timestamp` (epoch seconds), `mime`, `seed`, and the authorship fields that say which
+/// tool produced it and, for authored text, who wrote it. This is the whole point of shipping
 /// with no built-in GC — a user (or their own script) can `find`/`jq` over these sidecars
 /// and prune intelligently instead of guessing at opaque hashed bytes. See the module
 /// doc's "No GC here, on purpose" section.
@@ -409,6 +420,39 @@ pub struct Provenance {
     /// its own), and `String` rather than an integer because it is an opaque provider
     /// token we echo back, never arithmetic we perform.
     pub seed: Option<String>,
+
+    // --- Authorship: who made these bytes, and by which route --------------
+    //
+    // Downstream, someone will *execute* an artifact's contents — the motivating
+    // case for `save_artifact` is a corpus of shell commands. The sidecar is the
+    // record they decide trust from, so it has to distinguish a provider's render
+    // from a model's writing. `model` and `cast` already name the team; these name
+    // the route and the intent.
+    //
+    // Each is written only when it applies, so a sidecar carries no null-filled
+    // fields it has nothing to say about, and a `generate` sidecar's shape is what
+    // it always was apart from the `tool` line that now names its producer.
+    /// The kaibo tool that recorded this artifact: `generate` for a provider render,
+    /// `save_artifact` for bytes a model on kaibo's own team wrote. Absent on any
+    /// sidecar written before this field existed, which means `generate` — the only
+    /// producer kaibo had then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Which reasoning slot the authoring model filled (`synth` today — only the
+    /// consult driver loop can save). Absent for a provider render, which fills the
+    /// `image` slot and has no author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    /// The authoring model's own one-line description of what it saved. Written by
+    /// the model, so read it as a claim rather than a fact — it is what makes a
+    /// hand-pruning pass over the store legible, next to a `prompt` that describes
+    /// the question rather than this artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The consult session this artifact was authored in, when the call carried one.
+    /// Ties an artifact back to the conversation that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// A content-addressed store of generated media artifacts, rooted at a fixed,

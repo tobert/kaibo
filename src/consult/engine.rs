@@ -26,6 +26,7 @@ use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::artifact::SaveArtifact;
 use crate::attach::Attachment;
 use crate::completion_watch::{watched, CompletionLog, Watched};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
@@ -1952,6 +1953,15 @@ fn consult_tools(
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
     if synth.caps.vision {
         tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
+    }
+    // save_artifact, when the server built a sink for this call (all three keys held:
+    // operator config, the caller's `save_artifacts`, a live media CAS). The DRIVER only
+    // — a delegated sweep builds its toolset in `run_explore_phase` from the explore
+    // rung, which carries no sink, so this cannot reach one. Every rebuild of this
+    // toolset (the main loop, the forced final turn) shares the one sink, so the
+    // per-call caps count the call rather than the turn.
+    if let Some(sink) = &cfg.artifacts {
+        tools.push(traced(SaveArtifact::new(Arc::clone(sink))));
     }
     Ok(tools)
 }
@@ -6358,6 +6368,182 @@ mod tests {
         assert!(
             seeing_names.iter().any(|n| n == "view_image"),
             "view_image present with vision, got {seeing_names:?}"
+        );
+    }
+
+    /// A `ConsultConfig` carrying an artifact sink over an in-memory store — the shape
+    /// the server builds when all three keys hold.
+    fn cfg_with_artifact_sink() -> (ConsultConfig, Arc<crate::artifact::ArtifactSink>) {
+        let sink = Arc::new(crate::artifact::ArtifactSink::new(
+            Arc::new(crate::cas::MediaStore::Memory(crate::cas::MemoryCas::new(
+                None,
+            ))),
+            crate::artifact::ArtifactAuthor {
+                prompt: "q".into(),
+                model: "synth-model".into(),
+                cast: "test".into(),
+                slot: "synth",
+                session: None,
+            },
+        ));
+        let cfg = ConsultConfig {
+            artifacts: Some(Arc::clone(&sink)),
+            ..ConsultConfig::default()
+        };
+        (cfg, sink)
+    }
+
+    /// `save_artifact` reaches the driver's toolset exactly when the server built a sink
+    /// for this call, and never otherwise. The `None` arm is the default posture of every
+    /// kaibo install — the tool does not exist, so a driver cannot call it whatever it
+    /// decides to try.
+    #[test]
+    fn save_artifact_is_in_the_driver_toolset_only_with_a_sink() {
+        let dir = tempdir().unwrap();
+        let client = ScriptedClient::builder().build();
+        let explorer = arm(&client, "explorer-model");
+        let synth = arm(&client, "synth-model");
+        let names = |cfg: &ConsultConfig| -> Vec<String> {
+            consult_tools(
+                &explorer,
+                dir.path(),
+                cfg,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Usage::new())),
+                &synth,
+            )
+            .expect("toolset builds")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+        };
+
+        let without = names(&ConsultConfig::default());
+        assert!(
+            !without.iter().any(|n| n == "save_artifact"),
+            "no sink means no tool at all, got {without:?}"
+        );
+
+        let (cfg, _sink) = cfg_with_artifact_sink();
+        let with = names(&cfg);
+        assert!(
+            with.iter().any(|n| n == "save_artifact"),
+            "a sink puts the tool in the driver's toolset, got {with:?}"
+        );
+    }
+
+    /// **A delegated sweep never gets `save_artifact`.** v1 is driver-loop only, and the
+    /// placement enforces it: a sweep's toolset is built from the explore rung, which has
+    /// no sink to read. Driven end to end on a real nested sweep so this pins the
+    /// *running* toolset rather than a construction detail.
+    #[tokio::test]
+    async fn a_delegated_sweep_never_carries_save_artifact() {
+        const SYNTH: &str = "capable-synth";
+        const EXPLORER: &str = "cheap-explorer";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                assert!(
+                    has_tool(req, "save_artifact"),
+                    "the driver has the tool in this run, so the sweep's absence is a \
+                     real contrast: {:?}",
+                    req.tools
+                );
+                if !transcript_text(req).contains("SWEPT") {
+                    Ok(tool_call_response(
+                        "t1",
+                        "explore",
+                        json!({ "question": "what is here?" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER"))
+                }
+            })
+            .on_model(EXPLORER, |req| {
+                assert!(
+                    !has_tool(req, "save_artifact"),
+                    "a delegated sweep must never be handed save_artifact: {:?}",
+                    req.tools
+                );
+                Ok(text_response("SWEPT: src/foo.rs:1"))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let (cfg, sink) = cfg_with_artifact_sink();
+        let out = consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+        assert_eq!(out.answer, "ANSWER");
+        assert!(
+            sink.saved().is_empty(),
+            "nothing was saved in this run, so nothing is in the ledger"
+        );
+    }
+
+    /// The load-bearing offline e2e: a scripted driver calls `save_artifact` mid-loop,
+    /// the bytes land in the store under their own digest, and the caller's footer names
+    /// that digest by its resource URI. If the tool were wired into the toolset but its
+    /// results never reached the caller, this is what would catch it.
+    #[tokio::test]
+    async fn a_driver_that_saves_an_artifact_reports_it_in_the_callers_footer() {
+        const SYNTH: &str = "capable-synth";
+        const CORPUS: &str = "cat -n /etc/passwd\ngrep -rn foo .\n";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("kaibo://cas/") {
+                    Ok(tool_call_response(
+                        "t-save",
+                        "save_artifact",
+                        json!({
+                            "label": "the fuzz corpus",
+                            "content": CORPUS,
+                            "format": "text",
+                        }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: the corpus is in the artifact."))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("unused")))
+            .build();
+
+        let dir = project_with_marker();
+        let (cfg, sink) = cfg_with_artifact_sink();
+        let out = consult_with(
+            "generate a fuzz corpus",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let saved = sink.saved();
+        assert_eq!(saved.len(), 1, "one save_artifact call, one artifact");
+        assert_eq!(
+            saved[0].digest,
+            crate::cas::Digest::of_bytes(CORPUS.as_bytes()).to_hex(),
+            "the artifact is addressed by the content the model actually wrote"
+        );
+        assert_eq!(saved[0].label, "the fuzz corpus");
+
+        let delivered = crate::artifact::with_artifacts(out.answer, cfg.artifacts.as_deref());
+        assert!(delivered.starts_with("ANSWER:"), "the answer stays first");
+        assert!(
+            delivered.contains(&format!("kaibo://cas/{}", saved[0].digest)),
+            "the caller's footer must name the artifact's resource URI, got: {delivered}"
+        );
+        assert!(
+            delivered.contains("the fuzz corpus"),
+            "the footer carries the model's own label, got: {delivered}"
         );
     }
 

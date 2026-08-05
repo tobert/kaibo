@@ -111,7 +111,7 @@ const TOOLS_URI: &str = "kaibo://tools";
 /// the inner model team never can — the CAS is not mounted into kaish and no
 /// cast-facing tool reads it, because kaibo state spans projects and a browsable CAS
 /// would let one project's team enumerate another's artifacts.
-const CAS_RES_PREFIX: &str = "kaibo://cas/";
+const CAS_RES_PREFIX: &str = crate::cas::CAS_URI_PREFIX;
 /// The RFC 6570 template `list_resource_templates` advertises for the CAS reads.
 const CAS_URI_TEMPLATE: &str = "kaibo://cas/{digest}";
 /// The system preambles kaibo hands each model-driven phase — explorer, consult
@@ -343,6 +343,12 @@ pub struct ConsultInput {
     /// the whole files a change touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
+
+    /// Let this consult save bulk output (a generated corpus, a long inventory) into
+    /// kaibo's artifact store instead of the answer; the answer names each
+    /// `kaibo://cas/<digest>` to read. Off by default, and the server must allow it.
+    #[serde(default)]
+    pub save_artifacts: bool,
 }
 
 /// Arguments to the `explore` tool: a single-phase explorer sweep. Explorer-only —
@@ -1527,6 +1533,64 @@ impl KaiboHandler {
         self.resolver.resolve_root(path)
     }
 
+    /// Build this call's [`ArtifactSink`], or refuse loudly.
+    ///
+    /// The two-key gate, resolved in one place so `consult` and `consult_submit` cannot
+    /// drift: the operator's standing permission (`[artifacts] enabled`), the caller's
+    /// per-call `save_artifacts`, and a live media CAS. All three, or no sink — and with
+    /// no sink there is no `save_artifact` in the driver's toolset at all.
+    ///
+    /// A caller that asked and cannot be served gets an **error**, never a quiet consult
+    /// with no artifacts in it. The request is explicit, so a silently-dropped capability
+    /// would leave the caller reading an answer that swallowed the bulk it asked to have
+    /// stored, with nothing saying why. The message names which key is missing and where
+    /// to turn it on.
+    fn artifact_sink(
+        &self,
+        asked: bool,
+        question: &str,
+        session: Option<&str>,
+        cast: &str,
+        synth_model: &str,
+    ) -> Result<Option<Arc<crate::artifact::ArtifactSink>>, McpError> {
+        if !asked {
+            return Ok(None);
+        }
+        if !self.config.artifacts.enabled {
+            return Err(McpError::invalid_params(
+                "`save_artifacts` was requested, but this kaibo does not allow the model \
+                 team to save artifacts. An operator enables it with `[artifacts] enabled \
+                 = true` in config.toml, `KAIBO_ARTIFACTS_ENABLED=1`, or \
+                 `--allow-save-artifact`, then reconnects. Re-run without \
+                 `save_artifacts` to get the answer inline."
+                    .to_string(),
+                None,
+            ));
+        }
+        let Some(store) = self.media_cas.clone() else {
+            return Err(McpError::invalid_params(
+                "`save_artifacts` was requested, but the media CAS is off ([cas] enabled \
+                 = false), so a saved artifact would have nowhere to land. Re-enable the \
+                 CAS and reconnect, or re-run without `save_artifacts`."
+                    .to_string(),
+                None,
+            ));
+        };
+        Ok(Some(Arc::new(crate::artifact::ArtifactSink::new(
+            store,
+            crate::artifact::ArtifactAuthor {
+                prompt: question.to_string(),
+                model: synth_model.to_string(),
+                cast: cast.to_string(),
+                // Only the consult DRIVER loop carries the tool, and that loop runs on
+                // the synth arm. A sweep's sub-agent cannot reach a sink (see
+                // `ConsultConfig::artifacts`), so there is no other slot to record.
+                slot: "synth",
+                session: session.map(str::to_string),
+            },
+        ))))
+    }
+
     /// Shim over [`Resolver::resolve_attachments`].
     pub async fn resolve_attachments(
         &self,
@@ -1614,6 +1678,13 @@ impl KaiboHandler {
             },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             attachments,
+            artifacts: self.artifact_sink(
+                input.save_artifacts,
+                &input.question,
+                input.session_id.as_deref(),
+                &cast.name,
+                &synth.model,
+            )?,
         };
 
         // Multi-turn: a session_id binds this turn to a thread (replay prior turns,
@@ -1660,7 +1731,10 @@ impl KaiboHandler {
         // text before the footer — the MCP client has no structured warnings channel, so
         // it sees them inline exactly as #76 shipped (the CLI keeps them off `--json`).
         let answer = with_provenance(
-            append_warnings(out.answer, &out.warnings),
+            crate::artifact::with_artifacts(
+                append_warnings(out.answer, &out.warnings),
+                cfg.artifacts.as_deref(),
+            ),
             &cast.name,
             &[("explorer", &explorer.model), ("synth", &synth.model)],
             &out.usage,
@@ -1745,6 +1819,17 @@ impl KaiboHandler {
             },
             synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
             attachments,
+            // Same two-key gate as the sync lane, and refused here for the same reason —
+            // synchronously, before a job exists, so a caller asking for something this
+            // server cannot do gets a clean error rather than a handle that comes back
+            // missing the artifacts it asked for.
+            artifacts: self.artifact_sink(
+                input.save_artifacts,
+                &input.question,
+                input.session_id.as_deref(),
+                &cast.name,
+                &synth.model,
+            )?,
         };
 
         // Owned captures for the `'static` spawned task. The session store is `Clone`
@@ -1776,7 +1861,10 @@ impl KaiboHandler {
             {
                 Ok(out) => {
                     let answer = with_provenance(
-                        append_warnings(out.answer, &out.warnings),
+                        crate::artifact::with_artifacts(
+                            append_warnings(out.answer, &out.warnings),
+                            cfg.artifacts.as_deref(),
+                        ),
                         &cast_name,
                         &[
                             ("explorer", explorer_model.as_str()),
@@ -3919,6 +4007,13 @@ fn store_generated_artifacts(
             timestamp,
             mime: artifact.mime.clone(),
             seed: artifact.seed.clone(),
+            // A provider rendered these bytes; no model on kaibo's team authored them,
+            // so the authorship fields stay absent and the sidecar keeps the shape it
+            // has always had apart from naming its producer.
+            tool: Some("generate".to_string()),
+            slot: None,
+            label: None,
+            session: None,
         };
         let digest =
             store
@@ -4506,6 +4601,87 @@ mod tests {
             None
         })
         .expect("handler builds")
+    }
+
+    /// **The two-key gate on `save_artifact`, all four combinations.**
+    ///
+    /// A sink exists only when the operator enabled `[artifacts]`, the call passed
+    /// `save_artifacts`, and the media CAS is live. No sink means the tool is not in the
+    /// driver's toolset at all (`ConsultConfig::artifacts` is what `consult_tools` reads),
+    /// so this is the whole gate — there is no second place it could leak through.
+    ///
+    /// A caller that asked and cannot be served gets a refusal naming which key is
+    /// missing, never a quiet consult that swallowed the bulk it was told to store.
+    #[test]
+    fn save_artifact_needs_the_operator_key_the_call_key_and_a_live_cas() {
+        let ask = |save_artifacts: bool| ConsultInput {
+            question: "q".into(),
+            context: None,
+            path: None,
+            cast: None,
+            explorer_model: None,
+            explorer_backend: None,
+            synth_model: None,
+            synth_backend: None,
+            session_id: Some("sess-1".into()),
+            explorer_max_turns: None,
+            synth_max_turns: None,
+            include_report: false,
+            attach: Vec::new(),
+            save_artifacts,
+        };
+        let sink = |h: &KaiboHandler, input: &ConsultInput| {
+            h.artifact_sink(
+                input.save_artifacts,
+                &input.question,
+                input.session_id.as_deref(),
+                "deepseek",
+                "deepseek/deepseek-v4-pro",
+            )
+        };
+
+        // Operator key OFF (the default posture of every kaibo install).
+        let off = handler();
+        assert!(
+            sink(&off, &ask(false))
+                .expect("not asking is never an error")
+                .is_none(),
+            "no key asked, no sink"
+        );
+        let err = sink(&off, &ask(true)).expect_err("asking for a disabled capability must refuse");
+        assert!(
+            err.message.contains("[artifacts] enabled")
+                && err.message.contains("--allow-save-artifact"),
+            "the refusal names how an operator turns it on: {}",
+            err.message
+        );
+
+        // Operator key ON, call key OFF: still no sink, and no error — the caller asked
+        // for nothing.
+        let on = handler_from_toml("[artifacts]\nenabled = true\n");
+        assert!(
+            sink(&on, &ask(false))
+                .expect("not asking is never an error")
+                .is_none(),
+            "the operator's permission is standing, not automatic"
+        );
+
+        // Both keys, CAS live: a sink.
+        assert!(
+            sink(&on, &ask(true))
+                .expect("both keys and a live CAS")
+                .is_some(),
+            "all three conditions hold, so the driver gets the tool"
+        );
+
+        // Both keys, CAS off: refused, naming the CAS rather than the artifacts flag.
+        let no_cas = handler_from_toml("[artifacts]\nenabled = true\n\n[cas]\nenabled = false\n");
+        let err = sink(&no_cas, &ask(true)).expect_err("no store means no artifact");
+        assert!(
+            err.message.contains("[cas] enabled = false"),
+            "the refusal names the missing key precisely: {}",
+            err.message
+        );
     }
 
     /// The media-CAS lifecycle on the handler: `new` seeds the in-memory store when

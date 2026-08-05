@@ -17,6 +17,7 @@
 //! store and the media CAS, refuse to resolve into any allowed tree) — and cannot
 //! shell out to external commands.
 
+pub mod artifact;
 pub mod attach;
 pub mod batch;
 pub mod cas;

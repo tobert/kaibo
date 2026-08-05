@@ -120,6 +120,19 @@ pub struct ConsultConfig {
     /// path lands under the consult's root and classifies by content before filling
     /// this. `Default` is empty.
     pub attachments: Vec<ConsultAttachment>,
+    /// Where the driver's `save_artifact` calls land, or `None` (the default) for no
+    /// such tool in the toolset at all.
+    ///
+    /// The server builds one sink per MCP call, and only when all three keys hold: the
+    /// operator enabled `[artifacts]`, this call asked with `save_artifacts`, and the
+    /// media CAS is live. `None` is byte-for-byte the pre-artifact consult.
+    ///
+    /// It rides **this** rung, not [`ExploreConfig`], and that placement is the
+    /// enforcement of "v1 is driver-loop only": a delegated `explore′` sweep is built
+    /// from the explore rung, which has no field to read, so a sweep cannot be handed
+    /// the tool by accident. `deliberate`'s dossier stage shares that rung and is
+    /// likewise out of reach.
+    pub artifacts: Option<Arc<crate::artifact::ArtifactSink>>,
 }
 
 impl Default for ConsultConfig {
@@ -128,6 +141,7 @@ impl Default for ConsultConfig {
             explore: ExploreConfig::default(),
             synth_max_turns: crate::config::Defaults::default().synth_max_turns,
             attachments: Vec::new(),
+            artifacts: None,
         }
     }
 }

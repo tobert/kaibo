@@ -20,6 +20,11 @@ fn prov() -> Provenance {
         timestamp: 1_753_000_000,
         mime: "image/png".into(),
         seed: Some("9259671".into()),
+        // A provider render: the tool that produced it, and no author.
+        tool: Some("generate".into()),
+        slot: None,
+        label: None,
+        session: None,
     }
 }
 
