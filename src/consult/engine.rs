@@ -6439,6 +6439,68 @@ mod tests {
         );
     }
 
+    /// Verbs that belong to the MCP **client** and never to the inner model team.
+    ///
+    /// `read_cas` is retrieval for the operator's agent: the CAS spans every project this
+    /// kaibo has served, so a model that could read it by digest — or worse, enumerate it
+    /// — would cross the operator/model-team line from the retrieval side, exactly as a
+    /// mounted CAS would. It replaced a resource that was operator-surface-only for that
+    /// reason, and the boundary moves with it.
+    ///
+    /// `save_artifact` is the interesting contrast: it IS an inner tool, but only on the
+    /// driver loop and only with a sink, which is why the sweep assertions below name
+    /// both and the driver assertions name only `read_cas`.
+    const CLIENT_ONLY_VERBS: [&str; 5] = [
+        "read_cas",
+        "generate",
+        "job_get",
+        "job_list",
+        "consult_submit",
+    ];
+
+    /// **No client-surface verb ever reaches the consult driver's toolset**, whether or
+    /// not artifacts are enabled and whether or not the synth can see. The inner team
+    /// investigates and may write into the store; reading the store back is the
+    /// operator's, and this pins the line at the place the toolset is actually built.
+    #[test]
+    fn the_driver_toolset_never_carries_a_client_surface_verb() {
+        let dir = tempdir().unwrap();
+        let client = ScriptedClient::builder().build();
+        let explorer = arm(&client, "explorer-model");
+        let names = |cfg: &ConsultConfig, synth: &Arm| -> Vec<String> {
+            consult_tools(
+                &explorer,
+                dir.path(),
+                cfg,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Usage::new())),
+                synth,
+            )
+            .expect("toolset builds")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+        };
+        let (with_sink, _sink) = cfg_with_artifact_sink();
+        for (what, cfg, synth) in [
+            ("default", ConsultConfig::default(), arm(&client, "s")),
+            ("with a sink", with_sink, arm(&client, "s")),
+            (
+                "vision synth",
+                ConsultConfig::default(),
+                vision_arm(&client, "s"),
+            ),
+        ] {
+            let live = names(&cfg, &synth);
+            for verb in CLIENT_ONLY_VERBS {
+                assert!(
+                    !live.contains(&verb.to_string()),
+                    "{what}: the driver must never carry {verb}, got {live:?}"
+                );
+            }
+        }
+    }
+
     /// **A delegated sweep never gets `save_artifact`.** v1 is driver-loop only, and the
     /// placement enforces it: a sweep's toolset is built from the explore rung, which has
     /// no sink to read. Driven end to end on a real nested sweep so this pins the
@@ -6466,11 +6528,13 @@ mod tests {
                 }
             })
             .on_model(EXPLORER, |req| {
-                assert!(
-                    !has_tool(req, "save_artifact"),
-                    "a delegated sweep must never be handed save_artifact: {:?}",
-                    req.tools
-                );
+                for verb in CLIENT_ONLY_VERBS {
+                    assert!(
+                        !has_tool(req, verb),
+                        "a delegated sweep must never be handed {verb}: {:?}",
+                        req.tools
+                    );
+                }
                 Ok(text_response("SWEPT: src/foo.rs:1"))
             })
             .build();

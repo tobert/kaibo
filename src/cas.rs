@@ -167,12 +167,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The resource-URI prefix an object is addressed by: `kaibo://cas/<digest>`. Declared
-/// here, beside the store, so the MCP resource route and every producer that *renders* an
-/// address (`generate`'s result lines, `save_artifact`'s footer) spell it one way.
+/// The URI prefix an object is addressed by: `kaibo://cas/<digest>`. Declared here,
+/// beside the store, so every producer that *renders* an address (`generate`'s result
+/// lines, `save_artifact`'s footer) spells it one way.
 ///
-/// Reading that resource is **operator surface only** (Amy's ruling, 2026-08-03): the MCP
-/// client and the CLI resolve it; the inner model team never can. The CAS is not mounted
+/// A **name, not a route.** It was an MCP resource until 2026-08-05; retrieval is now the
+/// `read_cas` tool, which takes the digest out of this string. Reading is **operator
+/// surface only** (Amy's ruling, 2026-08-03), and that survived the move: the MCP client
+/// and the CLI retrieve; the inner model team never can. The CAS is not mounted
 /// into kaish and no cast-facing tool reads it, because kaibo state spans projects and a
 /// browsable CAS would let one project's team enumerate another's artifacts.
 pub const CAS_URI_PREFIX: &str = "kaibo://cas/";
@@ -364,7 +366,7 @@ impl Extension {
     }
 
     /// The canonical mime type this on-disk format serves as — what the
-    /// `kaibo://cas/<digest>` resource stamps on a blob it hands back, and what a
+    /// `read_cas` reports for an object it hands back, and what a
     /// producer records in the provenance sidecar so [`Cas::entry_for`] can read the
     /// format straight back out.
     pub fn mime(&self) -> &'static str {
@@ -633,7 +635,7 @@ impl Cas {
     /// the format directly: one lookup, not a walk of every container format kaibo
     /// knows. That matters more as the set grows past images — a probe answers with
     /// whichever variant it happens to try first, which for content stored under two
-    /// names is a *mislabel* the `kaibo://cas/<digest>` resource then stamps onto the
+    /// names is a *mislabel* `read_cas` then reports for the
     /// bytes, and for a large set is N stats per read.
     ///
     /// **The probe is the fallback, never the requirement.** An object whose sidecar
@@ -960,7 +962,7 @@ impl MemoryCas {
 
 /// The media store a running kaibo actually holds: the disk [`Cas`] when persistence
 /// is active, the [`MemoryCas`] when it is not. One seam so every consumer (the
-/// generate lane, the `kaibo://cas/<digest>` resource, the `kaibo://config` render)
+/// generate lane, the `read_cas` tool, the `kaibo://config` render)
 /// dispatches over the mode instead of each carrying its own two-armed match — and so
 /// the *contract* (content-addressed, write-only, no destination parameter) is the
 /// same sentence in both modes.
@@ -980,7 +982,7 @@ impl MediaStore {
     }
 
     /// **The store's own answer for what an object IS**, without reading its bytes: the
-    /// container format, and through it the mime the `kaibo://cas/<digest>` resource will
+    /// container format, and through it the mime `read_cas` will
     /// stamp and the extension the on-disk path carries.
     ///
     /// A producer's *requested* format is not that answer. The address is the content
@@ -996,6 +998,21 @@ impl MediaStore {
         match self {
             MediaStore::Disk(cas) => cas.entry_for(digest).map(|(_, ext)| ext),
             MediaStore::Memory(mem) => mem.extension_for(digest),
+        }
+    }
+
+    /// The housekeeping record beside an object, in whichever mode holds it — the disk
+    /// sidecar, or the memory store's clone of it. `None` when the object is unknown, or
+    /// (on disk) when its sidecar is missing or unreadable, which
+    /// [`Cas::provenance_for`] treats alike because a lookup can do nothing with any of
+    /// the three.
+    ///
+    /// Read by address, like everything else here: this is what makes an object
+    /// self-describing to whoever holds its digest — `read_cas` takes the label from it.
+    pub fn provenance(&self, digest: &Digest) -> Option<Provenance> {
+        match self {
+            MediaStore::Disk(cas) => cas.provenance_for(digest),
+            MediaStore::Memory(mem) => mem.provenance(digest),
         }
     }
 
@@ -1016,8 +1033,8 @@ impl MediaStore {
 
     /// The real filesystem path of an object — `Some` only in disk mode, where an
     /// operator (or the calling agent, acting as the operator's proxy) can reach the
-    /// file directly. Memory mode has no path; the `kaibo://cas/<digest>` resource is
-    /// the only retrieval channel there.
+    /// file directly. Memory mode has no path; `read_cas` is the only retrieval channel
+    /// there.
     pub fn path_for(&self, digest: &Digest) -> Option<PathBuf> {
         match self {
             MediaStore::Disk(cas) => cas.path_for(digest),
