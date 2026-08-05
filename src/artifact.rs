@@ -101,7 +101,11 @@ impl Default for Caps {
 /// This is a *serving* concern, not a safety boundary — a model can put anything inside
 /// a `.txt`, and the byte caps are the real limit. What it buys is a retrieval that says
 /// something true about the bytes: `kaibo://cas/<digest>` stamps a mime from this table.
-pub const FORMATS: &[(&str, Extension)] = &[("text", Extension::Txt), ("jsonl", Extension::Jsonl)];
+pub const FORMATS: &[(&str, Extension)] = &[
+    ("text", Extension::Txt),
+    ("jsonl", Extension::Jsonl),
+    ("markdown", Extension::Md),
+];
 
 /// The format names, for a schema `enum` and for error text.
 fn format_names() -> Vec<&'static str> {

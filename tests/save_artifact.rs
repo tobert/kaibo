@@ -190,6 +190,23 @@ fn text_and_jsonl_are_stored_under_their_own_container_and_mime() {
     assert_eq!(saved[1].digest, jsonl.to_hex());
 }
 
+/// Markdown is a first-class format: the shape a model naturally writes a report in,
+/// stored under its own container with a mime that says so, and textual on retrieval
+/// (`is_textual`), so a client reads the report as a string.
+#[test]
+fn markdown_is_stored_under_its_own_container_and_reads_as_text() {
+    let (s, _dir) = disk_sink();
+    let md = s
+        .save("a report", "# Findings\n\n- one\n", Some("markdown"))
+        .unwrap();
+    let saved = s.saved();
+    assert_eq!(saved[0].mime, "text/markdown; charset=utf-8");
+    assert_eq!(saved[0].digest, md.to_hex());
+    assert!(Extension::Md.is_textual() && !Extension::Md.is_image());
+    assert_eq!(Extension::from_mime("text/markdown"), Some(Extension::Md));
+    assert_eq!(Extension::from_mime("text/x-markdown"), Some(Extension::Md));
+}
+
 /// Omitting `format` means text — the common case, and a default the model does not
 /// have to think about.
 #[test]

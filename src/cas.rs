@@ -332,19 +332,22 @@ pub enum Extension {
     Txt,
     /// JSON Lines: one JSON value per line, the shape a machine consumer streams.
     Jsonl,
+    /// Markdown: the shape a model naturally writes a report in.
+    Md,
 }
 
 impl Extension {
     /// Every variant, in the order [`Cas::entry_for`] probes them when an object has no
     /// readable provenance sidecar to name its format. The sidecar is the authority;
     /// this order only decides the answer for an object that lost one.
-    pub const ALL: [Extension; 6] = [
+    pub const ALL: [Extension; 7] = [
         Extension::Png,
         Extension::Jpeg,
         Extension::Webp,
         Extension::Gif,
         Extension::Txt,
         Extension::Jsonl,
+        Extension::Md,
     ];
 
     /// The bare filename extension (no leading dot).
@@ -356,6 +359,7 @@ impl Extension {
             Extension::Gif => "gif",
             Extension::Txt => "txt",
             Extension::Jsonl => "jsonl",
+            Extension::Md => "md",
         }
     }
 
@@ -371,6 +375,7 @@ impl Extension {
             Extension::Gif => "image/gif",
             Extension::Txt => "text/plain; charset=utf-8",
             Extension::Jsonl => "application/jsonl",
+            Extension::Md => "text/markdown; charset=utf-8",
         }
     }
 
@@ -382,7 +387,7 @@ impl Extension {
     pub fn is_image(&self) -> bool {
         match self {
             Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => true,
-            Extension::Txt | Extension::Jsonl => false,
+            Extension::Txt | Extension::Jsonl | Extension::Md => false,
         }
     }
 
@@ -393,7 +398,7 @@ impl Extension {
     /// an image nor text, so each new variant must answer both questions on its own.
     pub fn is_textual(&self) -> bool {
         match self {
-            Extension::Txt | Extension::Jsonl => true,
+            Extension::Txt | Extension::Jsonl | Extension::Md => true,
             Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => false,
         }
     }
@@ -416,6 +421,7 @@ impl Extension {
             "image/webp" => Some(Extension::Webp),
             "image/gif" => Some(Extension::Gif),
             "text/plain" => Some(Extension::Txt),
+            "text/markdown" | "text/x-markdown" => Some(Extension::Md),
             "application/jsonl"
             | "application/x-ndjson"
             | "application/jsonlines"
