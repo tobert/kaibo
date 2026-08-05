@@ -386,6 +386,18 @@ impl Extension {
         }
     }
 
+    /// Should retrieval serve this format as a **string** rather than base64? The
+    /// producers mark what they make — `save_artifact` writes these formats from UTF-8
+    /// input, `generate` writes images — and this is where retrieval reads the mark.
+    /// Deliberately not `!is_image()`: a future format (audio, an archive) is neither
+    /// an image nor text, so each new variant must answer both questions on its own.
+    pub fn is_textual(&self) -> bool {
+        match self {
+            Extension::Txt | Extension::Jsonl => true,
+            Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => false,
+        }
+    }
+
     /// Map a wire mime string (a producer's own spelling, case-insensitive per RFC
     /// 7231) onto the closed on-disk set. `None` for anything the CAS cannot name on
     /// disk — the caller decides loudly what that means (see

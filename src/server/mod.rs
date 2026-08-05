@@ -1264,10 +1264,30 @@ impl KaiboHandler {
             .map_err(|e| McpError::invalid_params(format!("{e} (in {uri})"), None))?;
         match store.get(&digest) {
             Ok(Some((bytes, ext))) => {
-                use base64::Engine as _;
-                let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
+                // Textual formats come back as the string they are — the producer
+                // marked them (save_artifact writes UTF-8 text; the sidecar mime
+                // carries the mark), so a client fetching a corpus gets usable text,
+                // not base64 to decode. Bytes that fail to decode fall back to the
+                // blob form untouched: a lossy decode would serve different bytes
+                // than were stored, and the blob form is itself the honest "treat
+                // this as binary" signal.
+                let contents = if ext.is_textual() {
+                    match String::from_utf8(bytes) {
+                        Ok(text) => ResourceContents::text(text, uri).with_mime_type(ext.mime()),
+                        Err(e) => {
+                            use base64::Engine as _;
+                            let blob =
+                                base64::engine::general_purpose::STANDARD.encode(e.into_bytes());
+                            ResourceContents::blob(blob, uri).with_mime_type(ext.mime())
+                        }
+                    }
+                } else {
+                    use base64::Engine as _;
+                    let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    ResourceContents::blob(blob, uri).with_mime_type(ext.mime())
+                };
                 Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
-                    vec![ResourceContents::blob(blob, uri).with_mime_type(ext.mime())],
+                    vec![contents],
                 )))
             }
             Ok(None) => Err(McpError::resource_not_found(
@@ -5348,6 +5368,92 @@ enabled = false
         assert!(
             canceled.contains(&handle) && !canceled.contains("Consultation"),
             "the cancel ack names the job without calling it a consultation:\n{canceled}"
+        );
+    }
+
+    /// A minimal textual-artifact sidecar for driving the resource read directly.
+    fn textual_provenance() -> crate::cas::Provenance {
+        crate::cas::Provenance {
+            prompt: "q".to_string(),
+            model: "m".to_string(),
+            cast: "c".to_string(),
+            timestamp: 1,
+            mime: "text/plain; charset=utf-8".to_string(),
+            seed: None,
+            tool: Some("save_artifact".to_string()),
+            slot: Some("synth".to_string()),
+            label: Some("a test artifact".to_string()),
+            session: None,
+        }
+    }
+
+    /// A textual artifact reads back as **text**, not base64. The producers mark what
+    /// they make — `save_artifact` writes text formats, `generate` writes images — and
+    /// the sidecar mime carries that mark to retrieval, so a client fetching a corpus
+    /// gets the string it can use, not a blob it must decode first.
+    #[tokio::test]
+    async fn cas_resource_serves_textual_artifacts_as_text() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let store = h.media_store().expect("media CAS is on").clone();
+        let content = "line one\nline two\n";
+        let digest = store
+            .put(
+                content.as_bytes(),
+                crate::cas::Extension::Txt,
+                &textual_provenance(),
+            )
+            .expect("put succeeds");
+        let hex = digest.to_hex();
+        let uri = format!("kaibo://cas/{hex}");
+        let ReadResourceResponse::Complete(result) =
+            h.read_cas_resource(&hex, &uri).expect("stored digest reads")
+        else {
+            panic!("expected a complete read");
+        };
+        let ResourceContents::TextResourceContents {
+            text, mime_type, ..
+        } = &result.contents[0]
+        else {
+            panic!(
+                "a textual artifact reads as text, got {:?}",
+                result.contents[0]
+            );
+        };
+        assert_eq!(text, content);
+        assert_eq!(mime_type.as_deref(), Some("text/plain; charset=utf-8"));
+    }
+
+    /// Bytes under a textual extension that do not decode as UTF-8 fall back to a blob
+    /// — never a lossy decode that would hand back different bytes than were stored.
+    /// The blob form itself is the marking that says "treat this as binary"; the mime
+    /// still reports what the object claims to be.
+    #[tokio::test]
+    async fn cas_resource_falls_back_to_blob_for_undecodable_text() {
+        use base64::Engine as _;
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let store = h.media_store().expect("media CAS is on").clone();
+        let bytes: &[u8] = &[0x66, 0x6f, 0x6f, 0xff, 0xfe, 0x62, 0x61, 0x72];
+        let digest = store
+            .put(bytes, crate::cas::Extension::Txt, &textual_provenance())
+            .expect("put succeeds");
+        let hex = digest.to_hex();
+        let uri = format!("kaibo://cas/{hex}");
+        let ReadResourceResponse::Complete(result) =
+            h.read_cas_resource(&hex, &uri).expect("stored digest reads")
+        else {
+            panic!("expected a complete read");
+        };
+        let ResourceContents::BlobResourceContents { blob, .. } = &result.contents[0] else {
+            panic!(
+                "undecodable bytes read as a blob, got {:?}",
+                result.contents[0]
+            );
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .expect("valid base64"),
+            bytes
         );
     }
 
