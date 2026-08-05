@@ -174,7 +174,8 @@ use serde::{Deserialize, Serialize};
 /// A **name, not a route.** It was an MCP resource until 2026-08-05; retrieval is now the
 /// `read_cas` tool, which takes the digest out of this string. Reading is **operator
 /// surface only** (Amy's ruling, 2026-08-03), and that survived the move: the MCP client
-/// and the CLI retrieve; the inner model team never can. The CAS is not mounted
+/// retrieves; the inner model team never can. There is no CLI artifact command — on disk,
+/// an operator reaches an object by the path a read reports. The CAS is not mounted
 /// into kaish and no cast-facing tool reads it, because kaibo state spans projects and a
 /// browsable CAS would let one project's team enumerate another's artifacts.
 pub const CAS_URI_PREFIX: &str = "kaibo://cas/";
@@ -627,8 +628,8 @@ impl Cas {
     }
 
     /// [`path_for`](Self::path_for) plus which [`Extension`] the object was written
-    /// under — the extension carries the mime type a resource read needs to stamp on
-    /// the bytes, and re-deriving it from the path string would be a second parser.
+    /// under — the extension carries the mime type a read needs to report for the
+    /// bytes, and re-deriving it from the path string would be a second parser.
     ///
     /// **The sidecar is the authority.** Every object written by this store gets a
     /// `<hex>.json` sidecar whose `mime` describes it, so one read of that file names
@@ -990,7 +991,7 @@ impl MediaStore {
     /// land at the same digest; the second put writes a second container file while the
     /// sidecar — the authority, see [`Cas::entry_for`] — still says `txt`. A caller that
     /// rendered its own request would advertise `application/jsonl` beside a `.txt` path
-    /// and a `text/plain` resource read. Ask the store instead, always.
+    /// and a `text/plain` read. Ask the store instead, always.
     ///
     /// Refusing the second put would be the other way to fix that, and it is worse: the
     /// refusal itself would reveal that the content was already present.

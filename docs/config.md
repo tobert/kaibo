@@ -865,23 +865,34 @@ save emits and the session the answer was recorded into.
 
 **Retrieval is the `read_cas` tool, and it is operator-surface only.** Every producer
 names its artifacts by a `kaibo://cas/<digest>` address; `read_cas` takes the digest out
-of one and hands the content back. The MCP client and CLI call it; the inner model team
-never can — the CAS is not mounted into kaish and no cast-facing tool reads it, because
-kaibo state spans projects and a browsable CAS would let one project's team enumerate
-another's artifacts.
+of one and hands the content back. The MCP client calls it; the inner model team never can
+— the CAS is not mounted into kaish and no cast-facing tool reads it, because kaibo state
+spans projects and a browsable CAS would let one project's team enumerate another's
+artifacts. There is no `kaibo cas` CLI command; on disk, the path a read reports is how an
+operator reaches an object with their own tools.
 
-Reads are **metadata-first and bounded**:
+Reads are **metadata-first and bounded**, and the default depends on what the object is:
 
-| ask | you get |
-|---|---|
-| `length: 0` | metadata only — mime, total bytes, binary or not, the label, and the file path in disk mode |
-| no `length` | metadata plus the first 64 KiB from `offset`, never the whole object |
-| `offset` + `length` | metadata plus exactly that range (`length` up to 1 MiB) |
+| ask | text object | image | any other binary |
+|---|---|---|---|
+| `length: 0` | metadata only | metadata only | metadata only |
+| no `length` | metadata + up to 64 KiB from `offset` | the whole image, viewable, when it is ≤ 5 MiB; otherwise metadata only | metadata only |
+| `offset` + `length` | metadata + that range as text | metadata + that range as base64 | metadata + that range as base64 |
 
-Text comes back as text. A small image (up to 5 MiB) with no range asked for comes back as
-a viewable image; a larger one comes back as metadata and a path, because base64 in a
-context window helps nobody — open the file, or ask for a range explicitly. A binary
-object is never dumped as base64 unless you asked for a range.
+Metadata is always the first content block: digest, URI, mime, total bytes, binary or not,
+the label when the object's record carries one, a `provenance:` line when it has no record
+at all, the range served, and the real file path **in disk mode only** — memory mode has
+no file, so there is nothing to point at. `length` is capped at 1 MiB; a larger ask is
+refused rather than trimmed, so a caller's next `offset` is never wrong.
+
+**A binary object is never dumped as base64 unless you ask for a range.** An image past
+5 MiB comes back as metadata (plus the path, on disk) rather than ~7 MiB of base64 in your
+context — open the file, or page it deliberately.
+
+**Paging always advances.** A window that begins or ends inside a multi-byte character
+comes back as base64 of exactly the bytes you asked for, with a note saying why, so the
+served range still moves. Resuming at the range you were handed always terminates and
+always reassembles the object byte for byte.
 
 `kaibo://cas/<digest>` **was** an MCP resource until 2026-08-05 and no longer is. Two
 reasons. Hosts treat resources as ambient context — some prefetch, some auto-attach —
