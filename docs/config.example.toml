@@ -358,30 +358,33 @@ scratch_limit_bytes = 67108864
 # base_url at load (rig fixes those endpoints).
 # ---------------------------------------------------------------------------
 
-# --- The five built-ins, shown with their current defaults. You only need to
-#     list a backend here to CHANGE something; these blocks are illustrative.
-#     Their alias names (claude, google, local, lemonade, gemma, gemma4) are
-#     reserved at both levels — naming a new backend or cast after one is a
-#     loud collision error. ---
+# --- The five built-ins, shown COMMENTED OUT with their current defaults. They
+#     ship in code already — kaibo runs with all five even when this whole file is
+#     absent — so uncomment one only to CHANGE something (a gateway base_url, a
+#     different key file, ...); these blocks are illustrative, not required
+#     configuration to copy verbatim. Their alias names (claude, google, local,
+#     lemonade, gemma, gemma4) are reserved at both levels regardless of whether
+#     you uncomment them — naming a new backend or cast after one is a loud
+#     collision error. ---
 
-[backends.anthropic]                         # alias: claude
-kind = "anthropic"
-api_key_env  = "ANTHROPIC_API_KEY"
-api_key_file = "~/.anthropic-key.txt"
+# [backends.anthropic]                         # alias: claude
+# kind = "anthropic"
+# api_key_env  = "ANTHROPIC_API_KEY"
+# api_key_file = "~/.anthropic-key.txt"
 # Uncomment to dial an Anthropic-Messages-API-compatible gateway/proxy (e.g. a
 # corporate LLM gateway) instead of api.anthropic.com directly. Optional —
 # unlike the openai kind, unset still resolves to rig's built-in endpoint.
 # base_url = "https://llm-gateway.example.internal"
 
-[backends.deepseek]
-kind = "deepseek"
-api_key_env  = "DEEPSEEK_API_KEY"
-api_key_file = "~/.deepseek-key"
+# [backends.deepseek]
+# kind = "deepseek"
+# api_key_env  = "DEEPSEEK_API_KEY"
+# api_key_file = "~/.deepseek-key"
 
-[backends.gemini]                            # alias: google
-kind = "gemini"
-api_key_env  = "GEMINI_API_KEY"
-api_key_file = "~/.gemini-api-key"
+# [backends.gemini]                            # alias: google
+# kind = "gemini"
+# api_key_env  = "GEMINI_API_KEY"
+# api_key_file = "~/.gemini-api-key"
 # Uncomment to dial a Gemini-API-compatible gateway/proxy (e.g. a corporate LLM
 # gateway) instead of generativelanguage.googleapis.com directly. Optional —
 # unset still resolves to rig's built-in endpoint. A HOST ROOT, same as the
@@ -402,19 +405,19 @@ api_key_file = "~/.gemini-api-key"
 # leaking quietly. `data_collection = "allow"` is the explicit opt-in: kaibo
 # emits no restriction and your OpenRouter account settings govern. This knob
 # exists only on the openrouter kind — anywhere else it's a load error.
-[backends.openrouter]
-kind = "openrouter"
-api_key_env  = "OPENROUTER_API_KEY"
-api_key_file = "~/.openrouter-key"
+# [backends.openrouter]
+# kind = "openrouter"
+# api_key_env  = "OPENROUTER_API_KEY"
+# api_key_file = "~/.openrouter-key"
 # kaibo always denies unless you uncomment this line:
 # data_collection = "allow"
 
-[backends.openai-local]                            # aliases: local, lemonade, gemma, gemma4
-kind = "openai"
-base_url = "http://localhost:13305/api/v1"   # also overridable via OPENAI_BASE_URL
-api_key_env  = "OPENAI_API_KEY"
-api_key_file = "~/.openai-key"
-key_optional = true                          # keyless local default → placeholder
+# [backends.openai-local]                            # aliases: local, lemonade, gemma, gemma4
+# kind = "openai"
+# base_url = "http://localhost:13305/api/v1"   # also overridable via OPENAI_BASE_URL
+# api_key_env  = "OPENAI_API_KEY"
+# api_key_file = "~/.openai-key"
+# key_optional = true                          # keyless local default → placeholder
 
 # --- New backends: any number of openai-kind endpoints, each its own connection.
 #     A new backend must declare its `kind`; it seeds that kind's default key
@@ -476,6 +479,13 @@ wire = "responses"
 # slash. A slot ref borrows the backend's CONNECTION only — it never follows
 # another cast, so chains and cycles are structurally impossible. An unknown
 # backend in a slot is a load error naming the known backends.
+#
+# Backends and casts are SEPARATE NAMESPACES, so the same name may legally head
+# both — [backends.gpt] below (a connection) and [casts.gpt] further down (a
+# composition) are two different things that happen to share a name, not a
+# collision. A cast's slot still spells out which backend it wants
+# (`{ backend = "gpt", id = "…" }`), so the shared name never needs
+# disambiguating at the point of use.
 # ---------------------------------------------------------------------------
 
 # --- Advanced — a chimera: mix model FAMILIES across roles, a different lineage per

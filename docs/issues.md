@@ -66,41 +66,26 @@ is resident tool cost and curation. `MediaType::to_cas_extension` already refuse
 and `model/gltf-binary` loudly so that adding one forces a deliberate naming decision rather
 than silently writing bytes nobody can open.
 
-### CAS retention changed character with `save_artifact` — the store wants operator verbs and a GC story
+### CAS retention — no index, by design (Amy, 2026-08-05)
 
-The no-GC stance was honest while `generate` was the only producer: every artifact cost a
-paid provider call, so minting was rare and self-limiting, and `find -mtime` over the
-sidecars was proportionate cleanup. `save_artifact` (shipped 2026-08-05) breaks that
-assumption — a consult can mint eight artifacts a call for the price of tokens it was
-already spending, against an append-only store that never unlinks. XDG data grows without
-bound and the operator's only tools are shell commands over a two-level sharded tree.
+`save_artifact` (2026-08-05) raised the visibility question harder than `generate` ever
+did — a consult can mint several artifacts a call against an append-only, two-level-sharded
+store that never unlinks. Ruled: no `kaibo cas ls`/`du`/`rm`, and no index to back them.
+The store stays opaque, on purpose — reached only by the address a caller already holds.
+Tracking of what was created lives WITH the conversation that made it, not with the store:
+a session turn already records the artifact footer (digest, mime, size), so those digests
+sit beside the conversation in the persistence store. Operator cleanup, if wanted, is plain
+file mtime over the object tree (e.g. `find $XDG_DATA_HOME/kaibo/cas -mtime +30 -type f
+-delete`) — a one-off shell habit, not a kaibo workflow, and not mentioned again beyond
+this line. The one walk the store still does: `[cas] max_bytes` (opt-in) sums the store on
+every write to enforce its cap — accepted cost, since it only runs for an operator who
+chose a ceiling.
 
-What it wants, roughly in order: `kaibo cas ls` / `kaibo cas du`, so an operator can *see*
-what accumulated without learning the shard layout — then a pruning story.
-
-**Neither should be built on a filesystem sweep.** The sidecar is metadata for an object
-you already have the address of; it is not an index. Surveying the store by walking it
-means 65,536 shards and a read-plus-parse per object, and it degrades exactly as the store
-grows — which is the condition that makes anyone want `ls` in the first place. The shape
-these verbs want is an index kaibo maintains as it writes (its own persistence store is
-the obvious home: it is already open, already at a fixed XDG path no model steers, and
-already the place kaibo records what it did). That also makes `du` an O(1) read instead of
-a full walk, and would let the `[cas] max_bytes` admission stop walking the store on every
-capped write.
-
-Pruning is the harder half and a real design question rather than a missing command: the
-store's safety argument is that it never unlinks (`src/cas.rs`'s module doc), so a GC verb
-is a new mutation surface needing its own justification, its own containment check, and
-probably its own blessed line in `tests/no_write_path.rs`. A TTL sweep, an explicit
-`kaibo cas rm <digest>`, and "the operator prunes by hand, with better visibility" are
-three answers with different blast radii.
-
-Related gap worth folding in when this is picked up: **cancelling a `consult_submit` job
-aborts the future, so artifacts it saved before the cancel are never reported** — they are
-durable and readable by digest, but their addresses are lost unless the call carried a
-`session_id` (whose persisted answer keeps the footer). Surfacing them would mean the job
-record carrying the call's artifact sink, which touches every producer's `jobs.rs`
-signature; documented in `docs/config.md` rather than papered over.
+**Still open:** cancelling a `consult_submit` job aborts the future, so artifacts it saved
+before the cancel are never reported in the answer — durable and readable by digest, but
+their addresses are lost unless the call carried a `session_id` (whose persisted answer
+keeps the footer). Fixing this means the job record itself carrying the call's artifact
+sink, which touches every producer's `jobs.rs` signature.
 
 ### Someday: the CAS as kaish's egress gateway (design note, not scheduled)
 Amy's direction 2026-07-25, explicitly *"need to think about it more"* — recorded so the
@@ -818,26 +803,6 @@ endpoint still surfaces as a mid-call error. A startup check (key presence + an
 `openai` `base_url/models` ping) would fail faster and, under casts, report degraded
 teams up front — "cast `chimera` is degraded: backend `sd` unreachable" beats a
 mid-consult error. An MCP resource enumerating models could ride along.
-
-### `config.example.toml` clarity — illustrative stanzas read as required; `gpt` dual-name
-Surfaced by the cross-model review of the cast-roster change (an Anthropic `consult`
-cross-checking the example against `config.rs`, plus a deepseek/gemini/anthropic
-parse-back, 2026-06-29). Both are doc-clarity, not correctness — the example parses and
-all three families read it right otherwise — so they were left out of the roster PR:
-- **The four built-in backend stanzas are shown uncommented.** The
-  `[backends.anthropic/deepseek/gemini/openai-local]` block sits live even though the
-  preceding comment says they're illustrative and you only list a backend to *change*
-  something. An operator scanning the file may copy all four as if required — the
-  getting-started block and `[telemetry]` are commented-out for exactly this reason.
-  Comment them out (or collapse to one representative stanza). Care needed: the example's
-  casts resolve against these backends, so a wrong cut breaks
-  `tests/config.rs::the_shipped_example_config_parses` (which is the guard that makes the
-  pass safe).
-- **`gpt` names both `[backends.gpt]` and `[casts.gpt]`.** The namespaces are separate so
-  this is legal, but the file reserves *alias* names "at both levels" without saying a
-  *primary* name may be shared across the backend/cast namespaces — a reader can't tell the
-  co-naming is intentional vs. a latent collision. One clarifying clause near the
-  `[casts.<name>]` header settles it.
 
 ---
 

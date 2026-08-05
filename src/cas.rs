@@ -109,9 +109,8 @@
 //! file in the store on the *write* path, for every new object, over a store that never
 //! deletes and is sharded two levels deep; that walk is O(objects) and only slows down as
 //! the store fills. An operator who never asked for a ceiling should not pay it, so they
-//! do not. Cleanup, if an operator wants any, is theirs to do; kaibo offers no verb for it
-//! yet, and the shape a good one wants is an index kaibo maintains rather than a walk of
-//! the store (see "No GC here" below).
+//! do not. Cleanup, if an operator wants any, is theirs to do — kaibo builds no index and
+//! offers no scan verb for it, on purpose (see "No GC here" below).
 //!
 //! When a cap *is* set, a [`Cas::put`] that would push the store's total size over it is
 //! refused with [`CasError::CapacityExceeded`] — loudly, before any bytes are written. It never deletes anything to make room: eviction would
@@ -137,10 +136,16 @@
 //! bytes are, where they came from, and what format to serve them as. That is its job,
 //! and it is the access pattern the whole store is built for.
 //!
-//! It is not a scan target. Sweeping the tree to survey the store gets slower as the
-//! store fills — 65,536 shards, a `readdir` and a parse per object — and nothing here is
-//! indexed for it. Operator-facing inventory (someday: `kaibo cas ls`/`du`) wants an index
-//! kaibo maintains, not a walk; see `docs/issues.md`.
+//! It is not a scan target, and stays that way on purpose (Amy, 2026-08-05: no index,
+//! ever). Sweeping the tree to survey the store gets slower as the store fills — 65,536
+//! shards, a `readdir` and a parse per object — and kaibo builds nothing here to make that
+//! walk cheap, because it never runs one: the store stays opaque, reached only by the
+//! address a caller already holds. Tracking of what was created lives WITH the
+//! conversation that created it, not in the store — a `consult`/`oneshot` session turn
+//! already records the artifact footer (digest, mime, size), so those digests sit beside
+//! the conversation in the persistence store, not in a CAS-side index. An operator's
+//! cleanup, if wanted, is plain file mtime on the object tree for now; see
+//! `docs/issues.md`.
 //!
 //! Because nothing here is ever rewritten, the sidecar's schema can only ever grow
 //! *compatibly* — see [`Provenance`]'s doc for the rule that keeps a decade-old sidecar
