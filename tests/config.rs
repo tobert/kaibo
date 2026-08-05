@@ -2364,11 +2364,35 @@ fn artifacts_env_sets_the_knob_both_ways() {
             .artifacts
             .enabled
     };
-    assert!(with("1"));
-    assert!(with("true"));
-    assert!(!with("0"));
-    assert!(!with("false"));
-    assert!(!with("no"));
+    for on in ["1", "true", "yes", "TRUE", " Yes "] {
+        assert!(with(on), "{on:?} must enable");
+    }
+    for off in ["0", "false", "no", "FALSE", " No "] {
+        assert!(!with(off), "{off:?} must disable");
+    }
+}
+
+/// **This one env flag refuses to guess.** kaibo's other env flags are permissive —
+/// anything not empty/`0`/`false`/`no` means on — which for THIS flag would turn `off`,
+/// `disabled`, and every typo into "let the model write durable bytes", the opposite of
+/// what the operator wrote, silently. So it accepts only the listed spellings and fails
+/// startup on anything else, naming them.
+#[test]
+fn artifacts_env_refuses_a_value_it_would_have_to_guess_at() {
+    for bad in ["off", "disabled", "ture", "on", "", "2"] {
+        let env: HashMap<&str, &str> = [("KAIBO_ARTIFACTS_ENABLED", bad)].into_iter().collect();
+        let err = Config::load_with(None, None, |k| env.get(k).map(|s| s.to_string()))
+            .expect_err(&format!("{bad:?} must be a loud load error, never a guess"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("KAIBO_ARTIFACTS_ENABLED"),
+            "the error names the variable: {msg}"
+        );
+        assert!(
+            msg.contains("true") && msg.contains("false"),
+            "and the spellings it accepts: {msg}"
+        );
+    }
 }
 
 /// The CLI is the top layer here too, and it runs the OTHER way from `--no-<tool>`: the

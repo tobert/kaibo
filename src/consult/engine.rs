@@ -2183,10 +2183,17 @@ pub(crate) async fn consult_session_turn(
     // the model's words uncorrupted (each front door renders warnings its own way). The
     // in-memory arm never errors, so today's default is byte-for-byte unchanged.
     if let Some((store, id)) = session {
-        if let Err(e) = store
-            .record(id, QaTurn::new(question, out.answer.clone()))
-            .await
-        {
+        // Record the answer WITH this call's artifact footer, not the bare answer. The
+        // digests are the only handle on bytes that outlive the call, and kaibo prunes
+        // nothing, so they need somewhere durable — and the session turn already sits in
+        // the state db beside the conversation that produced them, at no schema cost. A
+        // later turn replaying this thread then sees what it saved, which is the honest
+        // continuity too: the model asked for the artifact, so the thread should remember
+        // its address. This is the *persisted* view; the client's copy is rendered by the
+        // server, where warnings ride between the answer and the footer.
+        let recorded =
+            crate::artifact::with_artifacts(out.answer.clone(), cfg.artifacts.as_deref());
+        if let Err(e) = store.record(id, QaTurn::new(question, recorded)).await {
             tracing::warn!(
                 session = id,
                 error = %e,
@@ -6483,6 +6490,109 @@ mod tests {
         assert!(
             sink.saved().is_empty(),
             "nothing was saved in this run, so nothing is in the ledger"
+        );
+    }
+
+    /// **A consult that saves and then fails keeps the artifact.** The sink lives on the
+    /// call, not the loop, so a provider error on a later turn cannot unwrite bytes that
+    /// are already durable. This pins the half the engine owns; the server renders those
+    /// digests into the failure text (see `consultation_failure_text_with_artifacts`), and
+    /// without both halves a failed consult would silently orphan real content.
+    #[tokio::test]
+    async fn artifacts_saved_before_a_failure_survive_the_failure() {
+        const SYNTH: &str = "capable-synth";
+        const BODY: &str = "half the corpus\n";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("kaibo://cas/") {
+                    Ok(tool_call_response(
+                        "t-save",
+                        "save_artifact",
+                        json!({ "label": "partial corpus", "content": BODY }),
+                    ))
+                } else {
+                    // Saved, then the provider falls over.
+                    Err(provider_error("overloaded_error"))
+                }
+            })
+            .on_model("cheap-explorer", |_r| Ok(text_response("unused")))
+            .build();
+
+        let dir = project_with_marker();
+        let (cfg, sink) = cfg_with_artifact_sink();
+        let err = consult_with(
+            "make a corpus",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect_err("the scripted provider fails after the save");
+        assert!(
+            format!("{err:#}").contains("overloaded"),
+            "the failure is the provider's, got: {err:#}"
+        );
+
+        let saved = sink.saved();
+        assert_eq!(saved.len(), 1, "the save happened and stands");
+        assert_eq!(
+            saved[0].digest,
+            crate::cas::Digest::of_bytes(BODY.as_bytes()).to_hex()
+        );
+    }
+
+    /// **The answer recorded into a session carries the artifact footer.**
+    ///
+    /// The digests are the only handle on bytes that outlive the call, and kaibo ships no
+    /// GC, so where they get written down matters. The session turn is the natural place:
+    /// it already sits in the state db beside the conversation that produced them, needs
+    /// no schema, and a later turn replaying this thread sees what it saved. Recording the
+    /// bare answer instead would leave the db holding a conversation about artifacts whose
+    /// addresses it does not contain.
+    #[tokio::test]
+    async fn the_recorded_session_answer_carries_the_artifact_footer() {
+        const SYNTH: &str = "capable-synth";
+        const BODY: &str = "one\ntwo\nthree\n";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if !transcript_text(req).contains("kaibo://cas/") {
+                    Ok(tool_call_response(
+                        "t-save",
+                        "save_artifact",
+                        json!({ "label": "the inventory", "content": BODY }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: see the artifact."))
+                }
+            })
+            .on_model("cheap-explorer", |_r| Ok(text_response("unused")))
+            .build();
+
+        let dir = project_with_marker();
+        let (cfg, sink) = cfg_with_artifact_sink();
+        let sessions = store();
+        consult_session_turn(
+            Some((&sessions, "s-1")),
+            "make an inventory",
+            None,
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
+
+        let digest = sink.saved()[0].digest.clone();
+        let history = sessions.history("s-1").await.expect("session history");
+        assert_eq!(history.len(), 1, "one turn recorded");
+        assert!(
+            history[0].answer.contains(&format!("kaibo://cas/{digest}")),
+            "the persisted answer must carry the digest, got: {:?}",
+            history[0].answer
         );
     }
 

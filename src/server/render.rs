@@ -137,6 +137,61 @@ pub(super) fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) ->
     ))])
 }
 
+/// [`consultation_failed`] for a consult that may have saved artifacts before it failed:
+/// the same classified failure text, with this call's artifact footer appended.
+///
+/// A consult can save durably and *then* fail — a provider error on a later turn, an
+/// empty final answer, a wall-clock deadline. The bytes are already in the store, so a
+/// failure result carrying no digests orphans them: the caller has no address to read
+/// and, kaibo shipping no GC, no way back to them short of walking the store by hand.
+/// The artifacts are real whether or not the answer arrived, so they are reported either
+/// way. `None`, or a sink nothing was saved through, leaves the text byte-for-byte
+/// [`consultation_failed`]'s.
+pub(super) fn consultation_failed_with_artifacts(
+    tool: &str,
+    cast: &str,
+    err: anyhow::Error,
+    sink: Option<&crate::artifact::ArtifactSink>,
+) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(
+        consultation_failure_text_with_artifacts(tool, cast, err, sink),
+    )])
+}
+
+/// [`consultation_failure_text`] plus this call's artifact footer — the text half of
+/// [`consultation_failed_with_artifacts`], split out so the deferred lane
+/// (`consult_submit`, which stores a ready string in a failed job) composes it the same
+/// way rather than by hand.
+pub(crate) fn consultation_failure_text_with_artifacts(
+    tool: &str,
+    cast: &str,
+    err: anyhow::Error,
+    sink: Option<&crate::artifact::ArtifactSink>,
+) -> String {
+    crate::artifact::with_artifacts(consultation_failure_text(tool, cast, err), sink)
+}
+
+/// The final answer text for a completed consult, composed once for both lanes.
+///
+/// Order is the contract, and it is why this is a function rather than two call sites:
+/// the model's answer, then any non-fatal warnings (a failed session record — kept out of
+/// the answer body so a machine consumer gets the model's words uncorrupted), then this
+/// call's artifact footer, then the provenance line naming the cast and models. The sync
+/// `consult` and the deferred `consult_submit` must produce the same shape, and a lane
+/// that quietly dropped the footer would strand durably-written artifacts.
+pub(crate) fn consult_answer_text(
+    answer: String,
+    warnings: &[String],
+    sink: Option<&crate::artifact::ArtifactSink>,
+    cast: &str,
+    models: &[(&str, &str)],
+    usage: &rig_core::completion::Usage,
+) -> String {
+    let with_warnings = append_warnings(answer, warnings);
+    let with_footer = crate::artifact::with_artifacts(with_warnings, sink);
+    with_provenance(with_footer, cast, models, usage)
+}
+
 /// The rendered failure text (detail + classified guidance) for a consultation that
 /// errored — the body of [`consultation_failed`], split out so the async path
 /// ([`consult_submit`]) can store a ready string in a [`JobState::Failed`] and the
@@ -629,6 +684,99 @@ mod tests {
 
     /// The text channel of a result (the answer). Panics if it isn't a single
     /// text block, which is the only shape `consult_result` produces.
+    /// A sink with one artifact already saved — a call that reached the store before
+    /// whatever happened next.
+    fn populated_sink() -> crate::artifact::ArtifactSink {
+        let sink = crate::artifact::ArtifactSink::new(
+            std::sync::Arc::new(crate::cas::MediaStore::Memory(crate::cas::MemoryCas::new(
+                None,
+            ))),
+            crate::artifact::ArtifactAuthor {
+                prompt: "q".into(),
+                model: "m".into(),
+                cast: "c".into(),
+                slot: "synth",
+                session: None,
+            },
+        );
+        sink.save("the corpus", "one\ntwo\n", None)
+            .expect("the save lands");
+        sink
+    }
+
+    /// **A failed consult still names what it saved.** A consult can write durably and
+    /// then fail — a provider error on a later turn, an empty answer, a deadline. The
+    /// bytes are in the store either way, and kaibo prunes nothing, so a failure result
+    /// carrying no digests leaves the caller with content it cannot address and no way
+    /// back to it. Both lanes compose their failure text through this one function.
+    #[test]
+    fn a_failure_text_carries_the_artifacts_the_call_saved() {
+        let sink = populated_sink();
+        let digest = sink.saved()[0].digest.clone();
+        let text = consultation_failure_text_with_artifacts(
+            "consult",
+            "deepseek",
+            anyhow::anyhow!("model loop failed: ProviderError: overloaded_error"),
+            Some(&sink),
+        );
+        assert!(
+            text.contains("overloaded_error"),
+            "the failure detail survives: {text}"
+        );
+        assert!(
+            text.contains(&format!("kaibo://cas/{digest}")),
+            "and so does the address of what was already written: {text}"
+        );
+        assert!(text.contains("the corpus"), "with its label: {text}");
+
+        // Nothing saved (or no sink at all) leaves the text exactly as it was.
+        let plain = consultation_failure_text(
+            "consult",
+            "deepseek",
+            anyhow::anyhow!("model loop failed: ProviderError: overloaded_error"),
+        );
+        assert_eq!(
+            consultation_failure_text_with_artifacts(
+                "consult",
+                "deepseek",
+                anyhow::anyhow!("model loop failed: ProviderError: overloaded_error"),
+                None,
+            ),
+            plain
+        );
+    }
+
+    /// **Both consult lanes compose the same answer.** The sync tool and the deferred job
+    /// used to build their final text separately, which is exactly how one of them ends up
+    /// dropping the artifact footer and stranding durably-written content. One function,
+    /// one order: answer, then warnings, then artifacts, then provenance.
+    #[test]
+    fn the_shared_answer_render_orders_answer_warnings_artifacts_then_provenance() {
+        let sink = populated_sink();
+        let digest = sink.saved()[0].digest.clone();
+        let text = consult_answer_text(
+            "ANSWER BODY".into(),
+            &["a warning".to_string()],
+            Some(&sink),
+            "deepseek",
+            &[("synth", "deepseek-v4-pro")],
+            &rig_core::completion::Usage::new(),
+        );
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} must appear in: {text}"))
+        };
+        assert!(at("ANSWER BODY") < at("a warning"), "answer first: {text}");
+        assert!(
+            at("a warning") < at(&format!("kaibo://cas/{digest}")),
+            "warnings before the artifact footer: {text}"
+        );
+        assert!(
+            at(&format!("kaibo://cas/{digest}")) < at("deepseek-v4-pro"),
+            "and the provenance line last: {text}"
+        );
+    }
+
     fn answer_text(result: &CallToolResult) -> String {
         assert_eq!(
             result.content.len(),

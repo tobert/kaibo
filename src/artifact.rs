@@ -108,10 +108,24 @@ fn format_names() -> Vec<&'static str> {
     FORMATS.iter().map(|(name, _)| *name).collect()
 }
 
+/// The most bytes a `label` may carry, and it is not a courtesy limit.
+///
+/// The label is the one model-authored string that reaches the caller *outside* the
+/// content — it is rendered into the structured footer beside a URI. Two things follow.
+/// Unbounded, it is metadata that rides around the byte caps: a model could deliver
+/// kilobytes per save in a field nothing counts. And unvalidated, it is an injection
+/// surface: a newline lets a model forge extra numbered entries or a `path:` line in the
+/// footer, so the caller reads artifacts kaibo never wrote. Hence a modest ceiling and a
+/// hard refusal of any control character, checked before anything touches the store.
+///
+/// 200 bytes is a full descriptive sentence and nowhere near a payload.
+pub const MAX_LABEL_BYTES: usize = 200;
+
 /// Who authored an artifact, resolved once per MCP call from the cast and slot actually
-/// running. Recorded into every sidecar this call writes, so a later reader can tell a
-/// model's writing from a provider's render — the trust record that matters when
-/// somebody decides whether to *execute* an artifact's contents.
+/// running. Recorded into the sidecar the *first* write of a given content produces —
+/// housekeeping metadata that makes an object self-describing when an operator reaches
+/// it **by address**. See [`ArtifactSink::save`] on what that record does and does not
+/// claim.
 #[derive(Debug, Clone)]
 pub struct ArtifactAuthor {
     /// The question this consult is answering. Recorded as the sidecar's `prompt`, the
@@ -133,12 +147,24 @@ pub struct ArtifactAuthor {
 pub struct SavedArtifact {
     /// The address: 64 lowercase hex, the content's own SHA-256.
     pub digest: String,
-    /// The mime the `kaibo://cas/<digest>` resource will stamp on these bytes.
+    /// The mime the `kaibo://cas/<digest>` resource will stamp on these bytes — read
+    /// back from the **store** after the write, never the format this save asked for.
+    /// The two can differ: identical bytes saved as `jsonl` when they are already held
+    /// as `txt` land at the same address, and the store's answer is `txt`. Rendering the
+    /// request instead would advertise a mime the resource will not serve and a path
+    /// that does not exist. See [`MediaStore::extension_for`].
     pub mime: &'static str,
     /// Size of the content, in bytes.
     pub bytes: usize,
-    /// The model's own one-line description.
+    /// The model's one-line description, validated (bounded, no control characters —
+    /// see [`MAX_LABEL_BYTES`]) before it reaches this struct, because it is rendered
+    /// into the structured footer.
     pub label: String,
+    /// True when the bytes are durably stored but their provenance sidecar could not be
+    /// written ([`crate::cas::CasError::ProvenanceNotRecorded`]). The artifact still
+    /// belongs in the footer — it is real and retrievable — so the ledger carries it and
+    /// the footer says the record is missing rather than pretending it is there.
+    pub provenance_missing: bool,
 }
 
 /// A refusal, always loud, always naming the way out. Every variant carries the cap it
@@ -161,8 +187,26 @@ pub enum SaveError {
     /// `label` came in blank. The label is what the caller reads beside the URI, so an
     /// artifact with no description is one the caller cannot act on.
     MissingLabel,
-    /// The store itself refused (capacity, I/O, a corrupt object at this address).
-    Store(String),
+    /// `label` is past [`MAX_LABEL_BYTES`], or carries a control character (a newline
+    /// especially — see that constant for why the footer cannot take one).
+    BadLabel { cap: usize, actual: usize },
+    /// The bytes are stored and reachable, but their provenance sidecar is not — the
+    /// store's own [`crate::cas::CasError::ProvenanceNotRecorded`]. An error, because
+    /// the housekeeping record the operator prunes by is missing, but emphatically NOT
+    /// "nothing was saved": the digest names durable content and rides the footer.
+    StoredWithoutProvenance { digest: String },
+    /// The store refused the write (capacity, I/O, a corrupt object at this address).
+    ///
+    /// Holds the **typed** error rather than its rendered text, because the two audiences
+    /// need opposite things from it. The operator wants everything — the CAS path, the
+    /// store's current usage, the OS error — and gets it on the tracing log at the sink.
+    /// The model gets a sanitized sentence, because [`crate::cas::CasError`]'s own
+    /// `Display` carries filesystem paths (kaibo's XDG data dir, which the model has no
+    /// business learning) and, for a capacity refusal, `current_bytes` of a store shared
+    /// across every project this kaibo has served. That number is a side channel: it
+    /// tells a model how much other projects' work is sitting in the store, and watching
+    /// it move across calls tells it more.
+    Store(crate::cas::CasError),
 }
 
 impl std::fmt::Display for SaveError {
@@ -198,10 +242,33 @@ impl std::fmt::Display for SaveError {
                  the artifact's URI, so give one short line saying what this artifact \
                  holds, and save again."
             ),
-            SaveError::Store(e) => write!(
+            SaveError::BadLabel { cap, actual } => write!(
                 f,
-                "kaibo's artifact store refused this write: {e}. Nothing was saved. Report \
-                 what you found in your answer instead."
+                "`label` is {actual} bytes and must be one single line of at most {cap} \
+                 bytes, with no line breaks. Nothing was saved. Shorten it to one plain \
+                 sentence naming what this artifact holds, and save again. Put the detail \
+                 in your answer, where there is room for it."
+            ),
+            SaveError::StoredWithoutProvenance { digest } => write!(
+                f,
+                "The artifact WAS saved and the caller will receive it at {}{digest}. \
+                 kaibo could not record its housekeeping metadata beside it, so name the \
+                 URI in your answer and describe what the artifact covers, so the caller \
+                 knows what it holds.",
+                crate::cas::CAS_URI_PREFIX
+            ),
+            // Sanitized on purpose — see `SaveError::Store`. Two kinds, because they call
+            // for different next moves, and neither carries a number or a path.
+            SaveError::Store(crate::cas::CasError::CapacityExceeded { .. }) => write!(
+                f,
+                "kaibo's artifact store has no room for this artifact, so nothing was \
+                 saved. A smaller artifact may still fit. Report what you found in your \
+                 answer instead, and say that saving was refused for lack of room."
+            ),
+            SaveError::Store(_) => write!(
+                f,
+                "kaibo's artifact store refused this write, so nothing was saved. Report \
+                 what you found in your answer instead, and say that saving was refused."
             ),
         }
     }
@@ -276,6 +343,26 @@ impl ArtifactSink {
     ///
     /// The return value is the digest and nothing more. Whether these bytes were already
     /// in the store is deliberately unobservable — see the module doc.
+    ///
+    /// # The sidecar is first-writer-wins, and it is housekeeping, not an audit trail
+    ///
+    /// The provenance sidecar is written with `create_new` and an existing one is left
+    /// alone, so the record beside a given content describes its **first** write. Save
+    /// content another call already stored and the sidecar keeps that call's cast, model,
+    /// label, and session — or names `generate`, if a provider rendered those exact bytes
+    /// first. This save still enters *this* call's ledger and this call's footer, so the
+    /// caller sees the label it was given; only the on-disk record is the older one.
+    ///
+    /// That is fine because of what the sidecar is for: **housekeeping metadata that
+    /// makes an object self-describing to whoever holds its address**. It is read the way
+    /// everything in this store is read — by digest, one lookup — and it is what lets
+    /// [`crate::cas::Cas::entry_for`] name an object's format in a single stat. It is
+    /// deliberately not a per-save audit record and must not be described as one: a
+    /// content-addressed store that never rewrites structurally cannot hold one write's
+    /// worth of metadata per save. Where a durable per-call record is wanted, the honest
+    /// sources are the tool-call telemetry every save emits (a traced `save_artifact`
+    /// span) and the session the answer was recorded into, whose persisted text carries
+    /// this call's digests.
     pub fn save(
         &self,
         label: &str,
@@ -285,6 +372,15 @@ impl ArtifactSink {
         let label = label.trim();
         if label.is_empty() {
             return Err(SaveError::MissingLabel);
+        }
+        // Bounded and single-line, checked before the store is touched: the label is
+        // rendered into the structured footer, so a newline forges footer entries and an
+        // unbounded one is payload the byte caps never see. See `MAX_LABEL_BYTES`.
+        if label.len() > MAX_LABEL_BYTES || label.chars().any(char::is_control) {
+            return Err(SaveError::BadLabel {
+                cap: MAX_LABEL_BYTES,
+                actual: label.len(),
+            });
         }
         let asked = format
             .map(str::trim)
@@ -331,18 +427,57 @@ impl ArtifactSink {
             label: Some(label.to_string()),
             session: self.author.session.clone(),
         };
-        let digest = self
-            .store
-            .put(bytes, ext, &provenance)
-            .map_err(|e| SaveError::Store(e.to_string()))?;
+        // Three outcomes, not two. The middle one — bytes stored, provenance not — is
+        // still a save, so it enters the ledger and rides the footer; denying it would
+        // orphan durable content behind a message claiming nothing happened.
+        let (digest, provenance_missing) = match self.store.put(bytes, ext, &provenance) {
+            Ok(digest) => (digest, false),
+            Err(crate::cas::CasError::ProvenanceNotRecorded { digest, cause }) => {
+                tracing::warn!(
+                    digest = %digest,
+                    cause = %cause,
+                    "artifact stored without its provenance sidecar — the bytes are \
+                     durable and retrievable, the housekeeping record is not"
+                );
+                let parsed = crate::cas::Digest::from_hex(&digest)
+                    .expect("the store renders its own digests in canonical hex");
+                (parsed, true)
+            }
+            Err(e) => {
+                // The operator gets the whole typed error, paths and usage included; the
+                // model gets `SaveError`'s sanitized rendering. See `SaveError::Store`.
+                tracing::warn!(error = %e, "artifact store refused a save_artifact write");
+                return Err(SaveError::Store(e));
+            }
+        };
+
+        // What the artifact IS, per the store — not what this save asked for. They differ
+        // whenever identical content is already held under another container format, and
+        // the footer must agree with the resource read and the on-disk path. A `None`
+        // here is not reachable through a successful put; treat it as loud-but-recoverable
+        // rather than panicking on the caller's paid-for save.
+        let stored_ext = self.store.extension_for(&digest).unwrap_or_else(|| {
+            tracing::warn!(
+                digest = %digest.to_hex(),
+                "artifact stored but the store cannot name its format — falling back to \
+                 the requested one for the footer"
+            );
+            ext
+        });
 
         ledger.total_bytes += bytes.len();
         ledger.saved.push(SavedArtifact {
             digest: digest.to_hex(),
-            mime: ext.mime(),
+            mime: stored_ext.mime(),
             bytes: bytes.len(),
             label: label.to_string(),
+            provenance_missing,
         });
+        if provenance_missing {
+            return Err(SaveError::StoredWithoutProvenance {
+                digest: digest.to_hex(),
+            });
+        }
         Ok(digest)
     }
 }
@@ -416,7 +551,8 @@ impl Tool for SaveArtifact {
              Limits for one call: {per_artifact_bytes} bytes per artifact, \
              {artifacts_per_call} artifacts, {total_bytes_per_call} bytes in total. A \
              save past a limit is refused and stores nothing, and the refusal says which \
-             limit it hit. Split large content into several artifacts to stay inside them."
+             limit it hit. Split large content into several artifacts to stay inside \
+             them. Write `label` as one single line of at most {MAX_LABEL_BYTES} bytes."
         )
     }
 
@@ -426,7 +562,7 @@ impl Tool for SaveArtifact {
             "properties": {
                 "label": {
                     "type": "string",
-                    "description": "one short line saying what this artifact holds; the \
+                    "description": "one single line saying what this artifact holds; the \
                                     caller reads it beside the artifact's URI"
                 },
                 "content": {
@@ -504,6 +640,12 @@ fn artifact_footer(saved: &[SavedArtifact], store: &MediaStore) -> String {
             .and_then(|d| store.path_for(&d))
         {
             out.push_str(&format!("\n   path: {}", path.display()));
+        }
+        if a.provenance_missing {
+            out.push_str(
+                "\n   note: kaibo could not write this artifact's housekeeping metadata \
+                 beside it; the content itself is stored and readable at the URI above.",
+            );
         }
     }
     out

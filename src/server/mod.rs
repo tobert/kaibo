@@ -69,7 +69,8 @@ pub(crate) use render::{
 };
 
 use render::{
-    append_warnings, batch_poll_brief, consult_result, consultation_failed, fmt_usage,
+    batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
+    consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
     is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
     wait_level_floor, wait_level_label,
 };
@@ -1720,7 +1721,16 @@ impl KaiboHandler {
             Ok(out) => out,
             // A provider/model-loop failure is a clean tool-result error the host can
             // proceed past, not a JSON-RPC internal_error. See `consultation_failed`.
-            Err(e) => return Ok(consultation_failed("consult", &cast.name, e)),
+            // Artifacts saved before the failure are named in the failure text too — they
+            // are durable either way, and a result without their digests orphans them.
+            Err(e) => {
+                return Ok(consultation_failed_with_artifacts(
+                    "consult",
+                    &cast.name,
+                    e,
+                    cfg.artifacts.as_deref(),
+                ))
+            }
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
@@ -1730,11 +1740,10 @@ impl KaiboHandler {
         // Fold any non-fatal warnings (a failed session record) back into the answer
         // text before the footer — the MCP client has no structured warnings channel, so
         // it sees them inline exactly as #76 shipped (the CLI keeps them off `--json`).
-        let answer = with_provenance(
-            crate::artifact::with_artifacts(
-                append_warnings(out.answer, &out.warnings),
-                cfg.artifacts.as_deref(),
-            ),
+        let answer = consult_answer_text(
+            out.answer,
+            &out.warnings,
+            cfg.artifacts.as_deref(),
             &cast.name,
             &[("explorer", &explorer.model), ("synth", &synth.model)],
             &out.usage,
@@ -1860,11 +1869,10 @@ impl KaiboHandler {
             .await
             {
                 Ok(out) => {
-                    let answer = with_provenance(
-                        crate::artifact::with_artifacts(
-                            append_warnings(out.answer, &out.warnings),
-                            cfg.artifacts.as_deref(),
-                        ),
+                    let answer = consult_answer_text(
+                        out.answer,
+                        &out.warnings,
+                        cfg.artifacts.as_deref(),
                         &cast_name,
                         &[
                             ("explorer", explorer_model.as_str()),
@@ -1878,8 +1886,15 @@ impl KaiboHandler {
                     })
                 }
                 // Render the failure to its final text here (classification + guidance),
-                // so `job_get` wraps a ready string without re-deriving anything.
-                Err(e) => Err(consultation_failure_text("consult", &cast_name, e)),
+                // so `job_get` wraps a ready string without re-deriving anything — with
+                // any artifacts this job saved before failing named in it, since they are
+                // durable whether or not the answer arrived.
+                Err(e) => Err(consultation_failure_text_with_artifacts(
+                    "consult",
+                    &cast_name,
+                    e,
+                    cfg.artifacts.as_deref(),
+                )),
             }
         });
 
@@ -5107,7 +5122,12 @@ mod tests {
         let small = png(b"tiny");
         let big = png(&[7u8; 4096]);
         // A capped in-memory store: #1 fits, #2 breaches. Both mimes prevalidate.
-        let toml = format!("{MEDIA_CAST_TOML}\n[cas]\nmax_bytes = 64\n");
+        // The budget has to clear #1's content PLUS its provenance — memory-mode
+        // admission counts the serialized provenance it stores, the same footprint disk
+        // mode has always counted (a cap that ignored it meant two different things in
+        // the two modes). 2 KiB leaves room for one small artifact and its record, and
+        // none for a 4 KiB second.
+        let toml = format!("{MEDIA_CAST_TOML}\n[cas]\nmax_bytes = 2048\n");
         let h = hermetic_handler_from_toml(&toml).with_media_arms(Arc::new(ScriptedMediaArms(
             Arc::new(SyncArtifacts(vec![small.clone(), big])),
         )));

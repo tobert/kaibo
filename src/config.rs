@@ -3255,19 +3255,38 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
         cas.max_bytes = Some(parse_env_int("KAIBO_CAS_MAX_BYTES", &v)?);
     }
 
-    // save_artifact's operator key. Same on/off grammar as the `KAIBO_NO_*` flags, but it
-    // sets the parsed bool either way — like `KAIBO_TELEMETRY_ENABLED`, and unlike them,
-    // because this knob's built-in default is OFF, so an env layer that could only
-    // disable would have nothing to say.
+    // save_artifact's operator key. It sets the parsed bool either way (unlike the
+    // `KAIBO_NO_*` flags, which can only disable) because its built-in default is OFF, so
+    // a disable-only layer would have nothing to say — and it is parsed STRICTLY, unlike
+    // every other flag here. See `parse_strict_bool`.
     let artifacts = raw.artifacts.get_or_insert_with(Default::default);
     if let Some(v) = get("KAIBO_ARTIFACTS_ENABLED") {
-        let on = {
-            let v = v.trim().to_ascii_lowercase();
-            !v.is_empty() && v != "0" && v != "false" && v != "no"
-        };
-        artifacts.enabled = Some(on);
+        artifacts.enabled = Some(parse_strict_bool("KAIBO_ARTIFACTS_ENABLED", &v)?);
     }
     Ok(())
+}
+
+/// Parse a boolean env value that must not be guessed at: exactly `1`/`true`/`yes` or
+/// `0`/`false`/`no`, case-insensitive and trimmed. Anything else is a loud load error.
+///
+/// The rest of kaibo's env flags use a permissive convention — anything that is not empty,
+/// `0`, `false`, or `no` means on. That is fine for a knob whose enabled state is the safe
+/// one, and exactly wrong for `[artifacts] enabled`: under it, `KAIBO_ARTIFACTS_ENABLED=off`
+/// and `=disabled` both **enable** the one capability that lets a model make bytes
+/// durable, and so does any typo. An operator who wrote `off` meaning off would get the
+/// opposite of their intent, silently, with nothing about the running server saying so.
+/// Crash over that — a startup error naming the accepted spellings costs one restart, and
+/// the alternative costs the posture the flag exists to hold.
+fn parse_strict_bool(name: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => bail!(
+            "{name}={other:?} is not a value kaibo will guess at. This flag decides \
+             whether the model team may write durable artifacts, so it accepts only \
+             1 / true / yes to enable, and 0 / false / no to disable."
+        ),
+    }
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, v: &str) -> Result<T>
