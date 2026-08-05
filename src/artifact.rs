@@ -170,7 +170,7 @@ pub struct ArtifactAuthor {
 pub struct SavedArtifact {
     /// The address: 64 lowercase hex, the content's own SHA-256.
     pub digest: String,
-    /// The mime the `kaibo://cas/<digest>` resource will stamp on these bytes — read
+    /// The mime `read_cas` will report for these bytes — read
     /// back from the **store** after the write, never the format this save asked for.
     /// The two can differ: identical bytes saved as `jsonl` when they are already held
     /// as `txt` land at the same address, and the store's answer is `txt`. Rendering the
@@ -646,7 +646,7 @@ fn artifact_footer(saved: &[SavedArtifact], store: &MediaStore) -> String {
         return String::new();
     }
     let mut out = format!(
-        "\n\n---\nSaved {} artifact{} (retrieve by reading the resource URI):",
+        "\n\n---\nSaved {} artifact{} (read one with `read_cas`, passing the digest):",
         saved.len(),
         if saved.len() == 1 { "" } else { "s" }
     );

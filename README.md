@@ -457,8 +457,9 @@ OpenAI-compatible image endpoints (hosted gpt-image, or a local stable-diffusion
 `sd-server` speaking the same `/v1/images/generations` shape). The bytes never inline into
 your context: each artifact lands in kaibo's content-addressed media store with a
 provenance sidecar (prompt, model, cast, seed), and the result lists per-artifact
-digests as `kaibo://cas/<digest>` resource URIs — plus the real file path when the
-store is on disk. Advertised only when a configured cast carries an `image` slot and
+digests as `kaibo://cas/<digest>` addresses — plus the real file path when the store is
+on disk. Fetch one with the `read_cas` tool: metadata first, bounded ranges on request,
+and a small image comes back viewable rather than as a wall of base64. Advertised only when a configured cast carries an `image` slot and
 the `[cas]` store is on; the project stays untouched — the store lives at a fixed XDG
 data path the model can't steer. See "Media CAS" in [`docs/config.md`](docs/config.md).
 

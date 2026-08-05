@@ -38,8 +38,11 @@ persistence / in-memory without, SEVERE-warned / `enabled = false` off, un-adver
 tools that need it), the `generate` tool (its own `--no-generate` flag, staffed by the
 `image` slot via `CAST_ENUM_RULES`, deferred shapes on the `job-N` verbs — the lane
 only; every Stability operation wired today is synchronous), and the
-operator-only `kaibo://cas/<digest>` retrieval resource. The tool returns digests +
-URIs (+ real path on disk), never inline bytes — as decided.
+operator-only retrieval surface. The tool returns digests + `kaibo://cas/<digest>`
+addresses (+ real path on disk), never inline bytes — as decided. Retrieval shipped as a
+`kaibo://cas/<digest>` *resource* and became the `read_cas` *tool* on 2026-08-05
+(resources are ambient context in most hosts, and `resources/read` is whole-blob with no
+range); the address string is unchanged.
 
 **Open work that remains:**
 

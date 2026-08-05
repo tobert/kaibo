@@ -13,8 +13,11 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// `job_cancel`/`job_list`/`job_wait` are *shared* — they manage both kinds of handle
 /// and stay advertised as long as either capability is on, so they belong to neither
 /// flag. `list_models` is its own gate — a read-only operator/config tool, no model in
-/// the loop, independent of everything else here.
-const ALL_TOOLS: [&str; 13] = [
+/// the loop, independent of everything else here. `read_cas` has no flag at all: it is
+/// the client's artifact-retrieval verb, live exactly while the media CAS is (see
+/// `read_cas_is_advertised_only_while_the_media_cas_is_on`), so every `--no-<tool>` case
+/// below keeps it.
+const ALL_TOOLS: [&str; 14] = [
     "batch_submit",
     "consult",
     "consult_submit",
@@ -27,6 +30,7 @@ const ALL_TOOLS: [&str; 13] = [
     "job_wait",
     "list_models",
     "oneshot",
+    "read_cas",
     "run_kaish",
 ];
 

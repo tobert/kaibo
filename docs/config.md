@@ -863,11 +863,32 @@ an operator, not an audit trail, and a content-addressed store that never rewrit
 be one. For a durable per-call record, kaibo's answers are the tool-call telemetry each
 save emits and the session the answer was recorded into.
 
-**Retrieval is operator-surface only.** A generation result returns each artifact's
-digest, a `kaibo://cas/<digest>` resource URI, and (in disk mode) the real filesystem
-path. The MCP client and CLI read those; the inner model team never sees the CAS — it is
-not mounted into kaish and no cast-facing tool reads it, because kaibo state spans
-projects and a browsable CAS would let one project's team enumerate another's artifacts.
+**Retrieval is the `read_cas` tool, and it is operator-surface only.** Every producer
+names its artifacts by a `kaibo://cas/<digest>` address; `read_cas` takes the digest out
+of one and hands the content back. The MCP client and CLI call it; the inner model team
+never can — the CAS is not mounted into kaish and no cast-facing tool reads it, because
+kaibo state spans projects and a browsable CAS would let one project's team enumerate
+another's artifacts.
+
+Reads are **metadata-first and bounded**:
+
+| ask | you get |
+|---|---|
+| `length: 0` | metadata only — mime, total bytes, binary or not, the label, and the file path in disk mode |
+| no `length` | metadata plus the first 64 KiB from `offset`, never the whole object |
+| `offset` + `length` | metadata plus exactly that range (`length` up to 1 MiB) |
+
+Text comes back as text. A small image (up to 2 MiB) with no range asked for comes back as
+a viewable image; a larger one comes back as metadata and a path, because base64 in a
+context window helps nobody — open the file, or ask for a range explicitly. A binary
+object is never dumped as base64 unless you asked for a range.
+
+`kaibo://cas/<digest>` **was** an MCP resource until 2026-08-05 and no longer is. Two
+reasons. Hosts treat resources as ambient context — some prefetch, some auto-attach —
+which is the wrong posture for bytes a model just wrote; a tool call is deliberate, with
+explicit arguments and a permission prompt. And `resources/read` is whole-blob with no
+negotiation: a measured 3.8 MB PNG produced roughly 5 MB of base64 in one read. The URI
+string survives as the artifact's name; only the resource route is gone.
 
 **`max_bytes` refuses, never evicts.** A write that would pass the cap fails loudly and
 nothing is deleted to make room. The cap is opt-in because enforcing it costs an
@@ -942,7 +963,7 @@ single line because it is rendered into the answer's footer, where a line break 
 forge entries the caller would read as real artifacts.
 
 **What the model cannot do.** It can write and it can never read. There is no list verb,
-no read verb, and no `kaibo://cas` access from inside the loop. The result of a save is a
+no read verb, and no `read_cas` in the inner toolset. The result of a save is a
 digest and nothing else: it never reports whether the content was already in the store,
 because that answer would let one project's model team probe another's artifacts. Refusals
 are sanitized for the same reason — the model is told what to do next, never the store's

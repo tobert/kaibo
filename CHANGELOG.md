@@ -17,6 +17,16 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`read_cas` — a tool for reading artifacts back, replacing the
+  `kaibo://cas/<digest>` resource.** Pass a digest and metadata comes first: mime,
+  total size, binary or not, the artifact's label, the range served, and the real
+  file path when the store is on disk (open that directly for anything large).
+  Reads are bounded — `length: 0` is a cheap look at what an object is, omitting
+  `length` returns the first 64 KiB and tells you the total, and `offset` pages the
+  rest. Text arrives as text; a small image arrives as an image you can see, and a
+  large one as metadata and a path instead of a wall of base64. Advertised whenever
+  the media CAS is on.
+
 - **A consult can hand you bulk output as an artifact instead of spending your
   context on it.** Ask with `save_artifacts: true` and the investigating model can
   write a generated corpus, a long inventory, or a fixture into kaibo's media store;
@@ -45,7 +55,7 @@ record. Each later release appends a new section at the top.
   `[casts.artist] image = "sd/core"`. The tool never inlines bytes: every artifact
   lands in kaibo's content-addressed media store under its own SHA-256 digest with a
   provenance sidecar (prompt, model, cast, timestamp, mime, seed), and the result
-  lists per-artifact `kaibo://cas/<digest>` resource URIs — plus the real file path
+  lists per-artifact `kaibo://cas/<digest>` addresses — plus the real file path
   when the store is on disk. Provider-native options (`aspect_ratio`,
   `output_format`, `seed`, `negative_prompt`, ...) pass through a `fields` object
   verbatim. Operations the provider declares deferred return a `job-N` handle on the
@@ -116,6 +126,17 @@ record. Each later release appends a new section at the top.
   the template you copy, `kaibo://config` is the resolved live state, and
   `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
   all three.
+
+### Removed
+
+- **The `kaibo://cas/<digest>` MCP resource, replaced by the `read_cas` tool above.**
+  Resources are ambient — hosts prefetch them, attach them to a turn, treat them as
+  context — which is a reasonable posture for a config file kaibo publishes and the
+  wrong one for bytes a model just wrote; a tool call is deliberate, with explicit
+  arguments and a permission prompt in most hosts. And `resources/read` had no way to
+  ask for less than everything: a 3.8 MB artifact came back as roughly 5 MB of base64
+  in a single read. The `kaibo://cas/<digest>` **string** is unchanged and still names
+  every artifact in footers and results — `read_cas` takes the digest out of it.
 
 ### Changed
 

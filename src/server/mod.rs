@@ -52,6 +52,7 @@ use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::{SessionStore, Sessions};
 use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
 
+mod cas_read;
 mod config_resource;
 mod containment;
 mod render;
@@ -107,14 +108,18 @@ const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
 /// on demand, not in every agent's startup context (the AGENTS.md prompt-writing split:
 /// terse where it's always loaded, generous where it's pulled).
 const TOOLS_URI: &str = "kaibo://tools";
-/// Generated-artifact retrieval by content digest: `kaibo://cas/<sha256-hex>`.
-/// OPERATOR SURFACE ONLY (Amy's ruling, 2026-08-03): the MCP client and CLI read it;
-/// the inner model team never can — the CAS is not mounted into kaish and no
-/// cast-facing tool reads it, because kaibo state spans projects and a browsable CAS
-/// would let one project's team enumerate another's artifacts.
+/// How an artifact is NAMED wherever kaibo prints one: `kaibo://cas/<sha256-hex>`.
+///
+/// It is an identifier, not a route. It was an MCP resource until 2026-08-05; retrieval
+/// is now the `read_cas` tool, which takes the digest out of this string (see
+/// [`cas_read`]'s module doc for why a tool and not a resource). The string stays because
+/// footers, answers, and `generate` results all need a stable name for an artifact.
+///
+/// OPERATOR SURFACE ONLY (Amy's ruling, 2026-08-03), and that survived the move: the MCP
+/// client and CLI retrieve; the inner model team never can — the CAS is not mounted into
+/// kaish and no cast-facing tool reads it, because kaibo state spans projects and a
+/// browsable CAS would let one project's team enumerate another's artifacts.
 const CAS_RES_PREFIX: &str = crate::cas::CAS_URI_PREFIX;
-/// The RFC 6570 template `list_resource_templates` advertises for the CAS reads.
-const CAS_URI_TEMPLATE: &str = "kaibo://cas/{digest}";
 /// The system preambles kaibo hands each model-driven phase — explorer, consult
 /// driver, oneshot, and the offline batch/deliberate synth — rendered through the exact
 /// same [`resolve_phase_preamble`](crate::consult::resolve_phase_preamble) seam the live
@@ -605,6 +610,30 @@ pub struct ListModelsInput {
     pub backend: Option<String>,
 }
 
+/// Arguments for [`KaiboHandler::read_cas`] — a digest and an optional byte range.
+///
+/// No path of any kind, in either direction: the address is the content hash, so there is
+/// nothing to aim. The range exists because `resources/read`, which this replaces, had no
+/// way to ask for less than everything.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadCasInput {
+    /// The artifact's content digest: 64 lowercase hex, exactly as a `generate` result or
+    /// a consult's artifact footer prints it (the `kaibo://cas/<digest>` tail).
+    pub digest: String,
+
+    /// Byte offset to read from. Default 0. Past the end is an empty range with the
+    /// metadata, not an error — that is how a paging loop learns where the object ended.
+    #[serde(default)]
+    pub offset: Option<usize>,
+
+    /// How many bytes to read. Omit for a bounded default window (65536 bytes) from
+    /// `offset`; `0` for metadata only. Reads a base64 range of a binary object, which is
+    /// otherwise never served unasked.
+    #[serde(default)]
+    pub length: Option<usize>,
+}
+
 /// Arguments to `generate`: media generation through the cast's `image` slot. No
 /// `path` — generation reads no project (the prompt is the whole input), so there is
 /// nothing to scope to an allowed tree.
@@ -837,7 +866,7 @@ pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 13] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
     "consult",
     "consult_submit",
     "explore",
@@ -846,12 +875,25 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 13] = [
     "run_kaish",
     "batch_submit",
     "generate",
+    "read_cas",
     "job_get",
     "job_cancel",
     "job_list",
     "job_wait",
     "list_models",
 ];
+
+/// Tools that only *collect* or *retrieve* what other tools produce. They are a real
+/// surface, but they are not on their own a reason for a server to exist: a kaibo whose
+/// entire offering is "fetch a handle" or "read a digest" cannot investigate, answer, or
+/// generate anything, which is the useless-server state startup already refuses.
+///
+/// The `job_*` verbs enforce this through their own liveness (they need a producer).
+/// `read_cas` cannot: it keys on the media CAS, which is ON by default, so counting it
+/// would make the empty-surface guard in `main` unreachable for every stock install — a
+/// check that can no longer fire is a check that no longer protects anything.
+pub(crate) const FOLLOWER_TOOL_NAMES: &[&str] =
+    &["read_cas", "job_get", "job_cancel", "job_list", "job_wait"];
 
 /// Which tools this config actually advertises: the operator's `--no-<tool>` flags AND
 /// a cast that can staff each one.
@@ -882,6 +924,12 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     // ([cas] enabled = false is the operator's explicit choice; the startup log and
     // kaibo://config's [cas] section name it, distinct from the unstaffable warning).
     let generate_live = gating.generate && can_staff("generate") && config.cas.enabled;
+    // `read_cas` is the retrieval half of the artifact contract, keyed on the SAME
+    // liveness the resource it replaces was keyed on: a live media CAS, nothing else. It
+    // takes no cast (there is no model in a byte range) and it is deliberately NOT tied to
+    // `[artifacts] enabled` — that flag gates whether the model team may *write*, while
+    // `generate`'s artifacts need retrieving whether or not a consult may save.
+    let read_cas_live = config.cas.enabled;
     let jobs_live = consult_live || batch_live || deliberate_live || generate_live;
 
     [
@@ -902,6 +950,9 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // Media generation through the cast's image slot; a deferred operation mints a
         // `job-N`, so it is a job producer like the three above.
         (generate_live, "generate"),
+        // Client-side retrieval by digest. Operator surface, like the resource it
+        // replaces: the inner model team never carries it.
+        (read_cas_live, "read_cas"),
         // The collect verbs follow their producers — see the fn doc. "Live" folds the
         // flag AND staffing together, so a producer nothing can staff keeps them no more
         // than a producer the operator switched off does: neither mints a handle.
@@ -1244,63 +1295,6 @@ impl KaiboHandler {
         self.media_cas.as_ref()
     }
 
-    /// Serve one `kaibo://cas/<digest>` read: the artifact's bytes as a base64 blob
-    /// stamped with its mime. The retrieval half of the `generate` contract — the tool
-    /// returns digests, this resource returns the bytes, and only to the operator
-    /// surface (the MCP client / CLI caller); the inner model team has no path here.
-    /// The digest is validated before it goes anywhere near a lookup
-    /// ([`crate::cas::Digest::from_hex`] — 64 lowercase hex or refused), a missing
-    /// object is a clean not-found, and a corrupt or unreadable object is a loud error,
-    /// never folded into "not found".
-    fn read_cas_resource(&self, hex: &str, uri: &str) -> Result<ReadResourceResponse, McpError> {
-        let Some(store) = &self.media_cas else {
-            return Err(McpError::resource_not_found(
-                "the media CAS is disabled ([cas] enabled = false); no artifacts are held"
-                    .to_string(),
-                None,
-            ));
-        };
-        let digest = crate::cas::Digest::from_hex(hex)
-            .map_err(|e| McpError::invalid_params(format!("{e} (in {uri})"), None))?;
-        match store.get(&digest) {
-            Ok(Some((bytes, ext))) => {
-                // Textual formats come back as the string they are — the producer
-                // marked them (save_artifact writes UTF-8 text; the sidecar mime
-                // carries the mark), so a client fetching a corpus gets usable text,
-                // not base64 to decode. Bytes that fail to decode fall back to the
-                // blob form untouched: a lossy decode would serve different bytes
-                // than were stored, and the blob form is itself the honest "treat
-                // this as binary" signal.
-                let contents = if ext.is_textual() {
-                    match String::from_utf8(bytes) {
-                        Ok(text) => ResourceContents::text(text, uri).with_mime_type(ext.mime()),
-                        Err(e) => {
-                            use base64::Engine as _;
-                            let blob =
-                                base64::engine::general_purpose::STANDARD.encode(e.into_bytes());
-                            ResourceContents::blob(blob, uri).with_mime_type(ext.mime())
-                        }
-                    }
-                } else {
-                    use base64::Engine as _;
-                    let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    ResourceContents::blob(blob, uri).with_mime_type(ext.mime())
-                };
-                Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
-                    vec![contents],
-                )))
-            }
-            Ok(None) => Err(McpError::resource_not_found(
-                format!(
-                    "no artifact with digest {hex} — it was never generated on this \
-                     store, or (in memory mode) it did not survive a restart"
-                ),
-                None,
-            )),
-            Err(e) => Err(McpError::internal_error(format!("{e}"), None)),
-        }
-    }
-
     /// Swap in a batch-provider factory — the seam that lets tests drive the batch
     /// handlers (`batch_submit`, `deliberate`'s batch lane, the `job_*` batch arms) with a
     /// scripted double instead of real network clients. A builder, like
@@ -1335,6 +1329,16 @@ impl KaiboHandler {
     pub fn apply_log_level(&self, level: LoggingLevel) {
         self.mcp_log_level
             .store(mcp_log::rank(level), Ordering::Relaxed);
+    }
+
+    /// Does this server offer anything beyond collecting and retrieving? See
+    /// [`FOLLOWER_TOOL_NAMES`] — `main`'s empty-surface guard asks this rather than
+    /// "is the list empty", because a surface of nothing but followers is the same
+    /// useless server by a different route.
+    pub fn has_substantive_tools(&self) -> bool {
+        self.advertised_tools()
+            .iter()
+            .any(|name| !FOLLOWER_TOOL_NAMES.contains(&name.as_str()))
     }
 
     /// Tool names this handler advertises, after gating. For tests/diagnostics.
@@ -2616,13 +2620,96 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Read one stored artifact by its digest — what `generate` and a \
+            consult's `save_artifact` hand back as kaibo://cas/<digest>. Metadata \
+            always comes first: mime, total size, whether it is binary, the artifact's \
+            label, the range served, and the real file path when the store is on disk \
+            (open that directly with your own tools for anything large). Reads are \
+            BOUNDED: `length` 0 is metadata only, omitting `length` returns the first \
+            65536 bytes, and `offset` pages through the rest — the metadata's total \
+            tells you how far. Text comes back as text. A small image comes back as a \
+            viewable image; a large one comes back as metadata and a path, never a wall \
+            of base64. Ask for `length` explicitly to get a base64 range of any binary."
+    )]
+    pub async fn read_cas(
+        &self,
+        Parameters(input): Parameters<ReadCasInput>,
+    ) -> Result<CallToolResult, McpError> {
+        // The route is dropped when the CAS is off, so this is a belt for a direct caller
+        // that bypasses the advertised list.
+        let Some(store) = &self.media_cas else {
+            return Err(McpError::invalid_params(
+                "the media CAS is disabled ([cas] enabled = false); no artifacts are \
+                 held, so there is nothing to read."
+                    .to_string(),
+                None,
+            ));
+        };
+        // Validated before it can become part of a path — the same structural guard the
+        // resource this tool replaces applied, and the reason a traversal-shaped
+        // "digest" never reaches a lookup.
+        let digest = crate::cas::Digest::from_hex(&input.digest)
+            .map_err(|e| McpError::invalid_params(format!("{e}"), None))?;
+
+        // Whole-object read, verified against the digest, THEN sliced. See
+        // `cas_read`'s module doc: the store's verify-before-return guarantee is worth
+        // more than the local I/O a ranged read would save, and the budget this tool
+        // exists to protect is the caller's context, not the disk.
+        let (bytes, ext) = match store.get(&digest) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "no artifact with digest {} — it was never produced on this \
+                         store, or (in memory mode) it did not survive a restart",
+                        input.digest
+                    ),
+                    None,
+                ))
+            }
+            // Corrupt or unreadable stays loud and distinct: an object whose bytes do not
+            // hash to their address is not "missing", and folding the two would let real
+            // corruption read as an ordinary absence.
+            Err(e) => return Err(McpError::internal_error(format!("{e}"), None)),
+        };
+        let label = store.provenance(&digest).and_then(|p| p.label);
+        let path = store.path_for(&digest);
+        let view = cas_read::plan(
+            &cas_read::CasObject {
+                digest: &input.digest,
+                ext,
+                bytes: &bytes,
+                label: label.as_deref(),
+                path: path.as_deref(),
+            },
+            input.offset.unwrap_or(0),
+            input.length,
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
+
+        // Metadata leads every response — a caller that reads only the first block still
+        // learns what this object is, how big it is, and where the rest of it lives.
+        let mut blocks = vec![ContentBlock::text(view.meta)];
+        match view.body {
+            cas_read::Body::None => {}
+            cas_read::Body::Text(text) => blocks.push(ContentBlock::text(text)),
+            cas_read::Body::Base64(data) => blocks.push(ContentBlock::text(data)),
+            // The one hop to the eye: hosts render an image content block straight to a
+            // vision model, the same mechanism the inner `view_image` tool rides.
+            cas_read::Body::Image { data, mime } => blocks.push(ContentBlock::image(data, mime)),
+        }
+        Ok(CallToolResult::success(blocks))
+    }
+
+    #[tool(
         description = "Generate images from a text prompt with the cast's `image` \
             model (a media backend: Stability, or an OpenAI-compatible images \
             endpoint — hosted gpt-image or a local stable-diffusion.cpp sd-server). \
             Bytes are never inlined: each artifact lands in kaibo's content-addressed \
             media store and the result lists per-artifact digests — a \
-            kaibo://cas/<digest> resource URI, the mime, the provider's seed when \
-            reported, and the real file path when the store is on disk. \
+            kaibo://cas/<digest> address, the mime, the provider's seed when reported, \
+            and the real file path when the store is on disk. Fetch one with `read_cas` \
+            (metadata first, ranges on request; a small image comes back viewable). \
             Provider-native options (aspect_ratio, size, n, output_format, seed, \
             negative_prompt, style_preset, ...) pass through `fields` verbatim, each \
             value's JSON type (string | number | boolean) preserved to the wire. An \
@@ -3256,7 +3343,7 @@ impl rmcp::ServerHandler for KaiboHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult {
-            resource_templates: kaibo_resource_templates(self.media_cas.is_some()),
+            resource_templates: kaibo_resource_templates(),
             ..Default::default()
         })
     }
@@ -3266,12 +3353,6 @@ impl rmcp::ServerHandler for KaiboHandler {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        // Generated-artifact reads by digest — handled here, not in the pure dispatch,
-        // because they need the handler's live media store. Operator surface only: MCP
-        // resources reach the client, never the inner model team.
-        if let Some(hex) = request.uri.strip_prefix(CAS_RES_PREFIX) {
-            return self.read_cas_resource(hex, &request.uri);
-        }
         // Compute the runtime-derived worktree set here (it needs the handler's
         // allowed_set and reflects worktrees that exist *now*); the renderer is a
         // pure function of its inputs, so it can't reach back for this itself.
@@ -3580,7 +3661,7 @@ pub(crate) fn configure_prompt_text_cli(goal: Option<&str>) -> String {
 
 /// The URI templates kaibo advertises: per-builtin help and per-cast prompts, each
 /// addressed by name.
-fn kaibo_resource_templates(cas_on: bool) -> Vec<rmcp::model::ResourceTemplate> {
+fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
     let builtin = ResourceTemplate::new(BUILTIN_URI_TEMPLATE, "kaish builtin help")
         .with_description(
             "Help for a single kaish builtin — parameters and examples. \
@@ -3593,20 +3674,12 @@ fn kaibo_resource_templates(cas_on: bool) -> Vec<rmcp::model::ResourceTemplate> 
              `preamble`s folded in as a live call resolves them. e.g. kaibo://prompts/deepseek",
         )
         .with_mime_type("text/markdown");
-    let mut templates = vec![builtin, prompts];
-    // Advertised only while a media store exists — a template whose every read would
-    // error is the resource-shaped version of the unstaffable-tool lie the staffing
-    // gate exists to prevent.
-    if cas_on {
-        templates.push(
-            ResourceTemplate::new(CAS_URI_TEMPLATE, "kaibo: generated artifact by digest")
-                .with_description(
-                    "One generated artifact's bytes, addressed by the content digest a \
-                     `generate` result returned (64 lowercase hex).",
-                ),
-        );
-    }
-    templates
+    // Artifact retrieval is deliberately NOT here. It was a `kaibo://cas/{digest}`
+    // template until 2026-08-05, and it is now the `read_cas` tool: hosts treat resources
+    // as ambient context to prefetch or attach, which is the wrong posture for
+    // model-authored bytes, and `resources/read` is whole-blob with no way to ask what an
+    // object is before pulling all of it. See `cas_read`'s module doc.
+    vec![builtin, prompts]
 }
 
 /// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
@@ -3781,9 +3854,9 @@ backend: Stability's v2beta family, or an OpenAI-compatible images endpoint (hos
 gpt-image, or a local stable-diffusion.cpp sd-server; one call may return several
 images via `n`). It is advertised only when a configured cast carries that slot and
 the media CAS is on. The result is never inline bytes: each artifact lands in kaibo's
-content-addressed store and you get its digest as a `kaibo://cas/<digest>` resource
-URI (read it as an MCP resource for the bytes), the mime, the provider's seed when
-reported, and — when the store is on disk — the real file path. Provider-native
+content-addressed store and you get its digest as a `kaibo://cas/<digest>` address, the
+mime, the provider's seed when reported, and — when the store is on disk — the real file
+path. Provider-native
 options ride the `fields` object verbatim, each value's JSON type preserved
 (Stability: `aspect_ratio` \"16:9\", `output_format` png|jpeg|webp, `seed`,
 `negative_prompt`, `style_preset`; OpenAI-compatible: `size` \"1024x1024\", `n`,
@@ -3791,6 +3864,17 @@ options ride the `fields` object verbatim, each value's JSON type preserved
 deferred hands back a `job-N` on the same collect verbs above — the lane is wired,
 though every route wired today answers in-call. Every artifact gets a provenance
 sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
+
+## Reading artifacts back: `read_cas`
+
+`read_cas` is the retrieval half — for you, the client, never for kaibo's own models.
+Pass the digest from a `kaibo://cas/<digest>` address and you get **metadata first**:
+mime, total bytes, whether it is binary, the artifact's label, the range served, and the
+real file path when the store is on disk. Reads are bounded on purpose. `length: 0` is a
+cheap look at what an object is; omitting `length` returns the first 65536 bytes and tells
+you the total, and `offset` pages the rest. Text arrives as text. A small image arrives as
+an image you can actually see; a large one arrives as metadata and a path, because a
+megabyte of base64 helps nobody — open the file, or ask for a range explicitly.
 
 ## Driving the read-only shell (`run_kaish`)
 
@@ -4029,7 +4113,7 @@ fn store_generated_artifacts(
         .collect::<Result<_>>()?;
     let timestamp = now_epoch_secs();
     let mut lines = vec![format!(
-        "Generated {} artifact{}:",
+        "Generated {} artifact{} (read one with `read_cas`, passing the digest):",
         artifacts.len(),
         if artifacts.len() == 1 { "" } else { "s" }
     )];
@@ -5387,83 +5471,170 @@ enabled = false
         }
     }
 
-    /// A textual artifact reads back as **text**, not base64. The producers mark what
-    /// they make — `save_artifact` writes text formats, `generate` writes images — and
-    /// the sidecar mime carries that mark to retrieval, so a client fetching a corpus
-    /// gets the string it can use, not a blob it must decode first.
-    #[tokio::test]
-    async fn cas_resource_serves_textual_artifacts_as_text() {
-        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
-        let store = h.media_store().expect("media CAS is on").clone();
-        let content = "line one\nline two\n";
-        let digest = store
-            .put(
-                content.as_bytes(),
-                crate::cas::Extension::Txt,
-                &textual_provenance(),
-            )
-            .expect("put succeeds");
-        let hex = digest.to_hex();
-        let uri = format!("kaibo://cas/{hex}");
-        let ReadResourceResponse::Complete(result) =
-            h.read_cas_resource(&hex, &uri).expect("stored digest reads")
-        else {
-            panic!("expected a complete read");
-        };
-        let ResourceContents::TextResourceContents {
-            text, mime_type, ..
-        } = &result.contents[0]
-        else {
-            panic!(
-                "a textual artifact reads as text, got {:?}",
-                result.contents[0]
-            );
-        };
-        assert_eq!(text, content);
-        assert_eq!(mime_type.as_deref(), Some("text/plain; charset=utf-8"));
+    /// Call `read_cas` and unwrap the success, for the many shapes below.
+    async fn read(
+        h: &KaiboHandler,
+        digest: &str,
+        offset: Option<usize>,
+        length: Option<usize>,
+    ) -> CallToolResult {
+        h.read_cas(Parameters(ReadCasInput {
+            digest: digest.to_string(),
+            offset,
+            length,
+        }))
+        .await
+        .expect("a stored digest reads")
     }
 
-    /// Bytes under a textual extension that do not decode as UTF-8 fall back to a blob
-    /// — never a lossy decode that would hand back different bytes than were stored.
-    /// The blob form itself is the marking that says "treat this as binary"; the mime
-    /// still reports what the object claims to be.
+    /// The metadata block — always the FIRST content block, on every response.
+    fn meta_of(r: &CallToolResult) -> String {
+        r.content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("every response leads with metadata")
+    }
+
+    /// A handler with the media CAS on and one textual artifact stored; returns the hex.
+    fn with_text_artifact(h: &KaiboHandler, content: &[u8]) -> String {
+        h.media_store()
+            .expect("media CAS is on")
+            .put(content, crate::cas::Extension::Txt, &textual_provenance())
+            .expect("put succeeds")
+            .to_hex()
+    }
+
+    /// **Metadata leads, and `length: 0` is the cheap HEAD.** The whole point of
+    /// replacing `resources/read`: ask what an object is for a few dozen tokens instead
+    /// of pulling it to find out. The label the sidecar carries rides along, so a caller
+    /// can tell one digest from another without reading either.
     #[tokio::test]
-    async fn cas_resource_falls_back_to_blob_for_undecodable_text() {
+    async fn read_cas_length_zero_returns_metadata_only() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let hex = with_text_artifact(&h, &b"z".repeat(9000));
+        let r = read(&h, &hex, None, Some(0)).await;
+        assert_eq!(r.content.len(), 1, "metadata only, no body block");
+        let meta = meta_of(&r);
+        for needle in [
+            hex.as_str(),
+            "mime: text/plain",
+            "bytes: 9000",
+            "binary: false",
+            "label: a test artifact",
+        ] {
+            assert!(
+                meta.contains(needle),
+                "metadata must carry {needle}: {meta}"
+            );
+        }
+    }
+
+    /// **The default read is bounded.** An omitted `length` returns the first window and
+    /// says how much more there is — the behavior `resources/read` structurally could not
+    /// offer, and the reason a 3.8 MB artifact no longer lands whole in a context window.
+    /// Paging with `offset` reassembles the object exactly.
+    #[tokio::test]
+    async fn read_cas_defaults_to_a_bounded_window_and_pages_with_offset() {
+        use super::cas_read::DEFAULT_READ_BYTES;
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let total = DEFAULT_READ_BYTES + 250;
+        let content: Vec<u8> = (0..total).map(|i| b'a' + (i % 26) as u8).collect();
+        let hex = with_text_artifact(&h, &content);
+
+        let first = read(&h, &hex, None, None).await;
+        let head = first.content[1].as_text().expect("text body").text.clone();
+        assert_eq!(
+            head.len(),
+            DEFAULT_READ_BYTES,
+            "the default window, not the whole object"
+        );
+        assert!(
+            meta_of(&first).contains(&total.to_string()),
+            "and the total, so paging is informed: {}",
+            meta_of(&first)
+        );
+
+        let second = read(&h, &hex, Some(DEFAULT_READ_BYTES), None).await;
+        let tail = second.content[1].as_text().expect("text body").text.clone();
+        assert_eq!(
+            format!("{head}{tail}").as_bytes(),
+            content.as_slice(),
+            "the pages reassemble the artifact byte for byte"
+        );
+    }
+
+    /// An offset past the end is a clean empty response, not a failure — a paging loop
+    /// finds the end by reading past it.
+    #[tokio::test]
+    async fn read_cas_offset_past_the_end_is_empty_not_an_error() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let hex = with_text_artifact(&h, b"tiny");
+        let r = read(&h, &hex, Some(4096), None).await;
+        assert_eq!(r.content.len(), 1, "metadata only");
+        assert!(meta_of(&r).contains("bytes: 4"), "{}", meta_of(&r));
+    }
+
+    /// A `length` past the ceiling is refused, naming the ceiling — never silently
+    /// clamped, which would leave the caller's next offset wrong.
+    #[tokio::test]
+    async fn read_cas_refuses_a_length_past_the_ceiling() {
+        use super::cas_read::MAX_READ_BYTES;
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let hex = with_text_artifact(&h, b"tiny");
+        let err = h
+            .read_cas(Parameters(ReadCasInput {
+                digest: hex,
+                offset: None,
+                length: Some(MAX_READ_BYTES + 1),
+            }))
+            .await
+            .expect_err("past the ceiling is refused");
+        assert!(
+            err.message.contains(&MAX_READ_BYTES.to_string()),
+            "the refusal names the ceiling: {}",
+            err.message
+        );
+    }
+
+    /// A textual artifact arrives as **text**, not base64 to decode. The producers mark
+    /// what they make (`save_artifact` writes text formats, `generate` writes images) and
+    /// the sidecar mime carries that mark to retrieval.
+    #[tokio::test]
+    async fn read_cas_serves_textual_artifacts_as_text() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let hex = with_text_artifact(&h, b"line one\nline two\n");
+        let r = read(&h, &hex, None, None).await;
+        assert_eq!(
+            r.content[1].as_text().expect("text body").text,
+            "line one\nline two\n"
+        );
+    }
+
+    /// Bytes stored under a textual extension that are not UTF-8 fall back to base64 of
+    /// exactly those bytes — never a lossy decode, which would hand back content the
+    /// store does not hold.
+    #[tokio::test]
+    async fn read_cas_falls_back_to_base64_for_undecodable_text() {
         use base64::Engine as _;
         let h = media_handler(Arc::new(SyncArtifacts(vec![])));
-        let store = h.media_store().expect("media CAS is on").clone();
         let bytes: &[u8] = &[0x66, 0x6f, 0x6f, 0xff, 0xfe, 0x62, 0x61, 0x72];
-        let digest = store
-            .put(bytes, crate::cas::Extension::Txt, &textual_provenance())
-            .expect("put succeeds");
-        let hex = digest.to_hex();
-        let uri = format!("kaibo://cas/{hex}");
-        let ReadResourceResponse::Complete(result) =
-            h.read_cas_resource(&hex, &uri).expect("stored digest reads")
-        else {
-            panic!("expected a complete read");
-        };
-        let ResourceContents::BlobResourceContents { blob, .. } = &result.contents[0] else {
-            panic!(
-                "undecodable bytes read as a blob, got {:?}",
-                result.contents[0]
-            );
-        };
+        let hex = with_text_artifact(&h, bytes);
+        let r = read(&h, &hex, None, None).await;
+        let body = r.content[1].as_text().expect("base64 body").text.clone();
         assert_eq!(
             base64::engine::general_purpose::STANDARD
-                .decode(blob)
+                .decode(&body)
                 .expect("valid base64"),
             bytes
         );
     }
 
-    /// The `kaibo://cas/<digest>` read: bytes come back base64 with the right mime, an
-    /// unknown digest is a clean not-found, and a malformed digest is refused before it
-    /// goes near a lookup. Operator surface — served straight off the handler's store.
+    /// **A small image takes one hop to the eye**: an image content block, which hosts
+    /// render straight to a vision model. This is the retrieval shape `generate`'s output
+    /// actually wants, and the one a resource read could never produce.
     #[tokio::test]
-    async fn cas_resource_serves_stored_bytes_and_validates_the_digest() {
-        use base64::Engine as _;
-        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"resource-bytes")])));
+    async fn read_cas_returns_a_small_image_as_an_image_block() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"pretend-png-bytes")])));
         h.generate(Parameters(GenerateInput {
             prompt: "p".to_string(),
             cast: Some("artist".to_string()),
@@ -5471,44 +5642,210 @@ enabled = false
         }))
         .await
         .expect("generate succeeds");
+        let hex = crate::cas::Digest::of_bytes(b"pretend-png-bytes").to_hex();
 
-        let digest = crate::cas::Digest::of_bytes(b"resource-bytes");
-        let hex = digest.to_hex();
-        let uri = format!("kaibo://cas/{hex}");
-        let ReadResourceResponse::Complete(result) = h
-            .read_cas_resource(&hex, &uri)
-            .expect("stored digest reads")
-        else {
-            panic!("expected a complete read");
-        };
-        let ResourceContents::BlobResourceContents {
-            blob, mime_type, ..
-        } = &result.contents[0]
-        else {
-            panic!("an artifact read is a blob, got {:?}", result.contents[0]);
-        };
-        assert_eq!(mime_type.as_deref(), Some("image/png"));
+        let r = read(&h, &hex, None, None).await;
+        assert!(
+            meta_of(&r).contains("binary: true"),
+            "metadata still leads: {}",
+            meta_of(&r)
+        );
+        let image = r.content[1].as_image().expect("an image content block");
+        assert_eq!(image.mime_type, "image/png");
+        use base64::Engine as _;
         assert_eq!(
             base64::engine::general_purpose::STANDARD
-                .decode(blob)
+                .decode(&image.data)
                 .expect("valid base64"),
-            b"resource-bytes"
+            b"pretend-png-bytes"
         );
+    }
 
-        let missing = crate::cas::Digest::of_bytes(b"never-generated").to_hex();
+    /// **An image past the inline threshold is metadata only** — no image block, and no
+    /// base64 wall either. The measured failure this whole tool exists to prevent: a
+    /// 3.8 MB PNG became ~5 MB of base64 through the resource route. Over the threshold
+    /// the useful move is the path, not the bytes.
+    #[tokio::test]
+    async fn read_cas_refuses_to_inline_an_image_past_the_threshold() {
+        use super::cas_read::INLINE_IMAGE_MAX_BYTES;
+        let big = vec![3u8; INLINE_IMAGE_MAX_BYTES + 1];
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(&big)])));
+        h.generate(Parameters(GenerateInput {
+            prompt: "p".to_string(),
+            cast: Some("artist".to_string()),
+            fields: None,
+        }))
+        .await
+        .expect("generate succeeds");
+        let hex = crate::cas::Digest::of_bytes(&big).to_hex();
+
+        let r = read(&h, &hex, None, None).await;
+        assert_eq!(
+            r.content.len(),
+            1,
+            "metadata only — neither an image block nor a base64 dump"
+        );
+        assert!(meta_of(&r).contains("binary: true"));
+
+        // But an explicit range still works: the caller asked, so it gets bytes.
+        let ranged = read(&h, &hex, Some(0), Some(8)).await;
+        assert_eq!(ranged.content.len(), 2, "an explicit range is served");
+    }
+
+    /// Disk mode names the real file, so a caller holding a shell can go direct instead
+    /// of paging megabytes through a model. Memory mode has no file and says nothing.
+    #[tokio::test]
+    async fn read_cas_metadata_carries_the_path_only_in_disk_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "{MEDIA_CAST_TOML}\n[cas]\ndir = \"{}\"\n",
+            dir.path().join("cas").display()
+        );
+        let h = hermetic_handler_from_toml(&toml)
+            .finalize_media_store(true)
+            .expect("disk-backed store");
+        let hex = with_text_artifact(&h, b"on disk");
+        let meta = meta_of(&read(&h, &hex, None, Some(0)).await);
+        assert!(meta.contains("path: "), "disk mode names the file: {meta}");
+        assert!(meta.contains(".txt"), "with its real extension: {meta}");
+
+        let mem = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let mem_hex = with_text_artifact(&mem, b"in memory");
+        let mem_meta = meta_of(&read(&mem, &mem_hex, None, Some(0)).await);
+        assert!(
+            !mem_meta.contains("path: "),
+            "memory mode has no file to name: {mem_meta}"
+        );
+    }
+
+    /// The digest is validated before it can touch a lookup, an unknown one is a clean
+    /// not-found, and neither folds into the other. Ported from the resource this tool
+    /// replaced — the guarantees survive the change of surface.
+    #[tokio::test]
+    async fn read_cas_validates_the_digest_and_reports_a_miss_cleanly() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+
+        let missing = crate::cas::Digest::of_bytes(b"never-produced").to_hex();
         let err = h
-            .read_cas_resource(&missing, &format!("kaibo://cas/{missing}"))
+            .read_cas(Parameters(ReadCasInput {
+                digest: missing,
+                offset: None,
+                length: None,
+            }))
+            .await
             .expect_err("unknown digest is not found");
         assert!(err.message.contains("no artifact"), "got: {}", err.message);
 
+        for bad in ["../../etc/passwd", "ABCD", "", &"f".repeat(63)] {
+            let err = h
+                .read_cas(Parameters(ReadCasInput {
+                    digest: bad.to_string(),
+                    offset: None,
+                    length: None,
+                }))
+                .await
+                .expect_err("a malformed digest never reaches a lookup");
+            assert!(
+                err.message.contains("64 lowercase hex"),
+                "the refusal names the rule, got: {}",
+                err.message
+            );
+        }
+    }
+
+    /// A corrupt object stays a LOUD, distinct failure — never folded into "not found",
+    /// which would let real corruption read as an ordinary absence.
+    #[tokio::test]
+    async fn read_cas_surfaces_a_corrupt_object_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "{MEDIA_CAST_TOML}\n[cas]\ndir = \"{}\"\n",
+            dir.path().join("cas").display()
+        );
+        let h = hermetic_handler_from_toml(&toml)
+            .finalize_media_store(true)
+            .expect("disk-backed store");
+        let hex = with_text_artifact(&h, b"honest content");
+        let digest = crate::cas::Digest::from_hex(&hex).unwrap();
+        let path = h.media_store().unwrap().path_for(&digest).unwrap();
+        std::fs::write(&path, b"tampered content").unwrap();
+
         let err = h
-            .read_cas_resource("../../etc/passwd", "kaibo://cas/../../etc/passwd")
-            .expect_err("a traversal-shaped digest is refused");
+            .read_cas(Parameters(ReadCasInput {
+                digest: hex,
+                offset: None,
+                length: None,
+            }))
+            .await
+            .expect_err("a corrupt object is an error");
         assert!(
-            err.message.contains("64 lowercase hex"),
-            "the refusal names the rule, got: {}",
+            err.message.contains("corrupt"),
+            "and it says so rather than reporting a miss: {}",
             err.message
         );
+    }
+
+    /// `read_cas` is advertised exactly when the media CAS is live — the same liveness the
+    /// resource it replaces keyed on. It takes no cast, so nothing else gates it.
+    #[test]
+    fn read_cas_is_advertised_only_while_the_media_cas_is_on() {
+        let on = handler();
+        assert!(
+            on.advertised_tools().contains(&"read_cas".to_string()),
+            "a live CAS advertises retrieval, got {:?}",
+            on.advertised_tools()
+        );
+        let off = handler_from_toml("[cas]\nenabled = false\n");
+        assert!(
+            !off.advertised_tools().contains(&"read_cas".to_string()),
+            "no store, no retrieval verb, got {:?}",
+            off.advertised_tools()
+        );
+    }
+
+    /// **The `kaibo://cas/<digest>` RESOURCE is gone.** Retrieval is a tool now, and the
+    /// route it replaced must not linger: a resource read of that URI is refused like any
+    /// other unknown URI, and the templates no longer advertise it. The URI string itself
+    /// survives as the artifact's name — this pins that only the *serving* went away.
+    #[tokio::test]
+    async fn the_cas_resource_route_is_gone() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![])));
+        let hex = with_text_artifact(&h, b"still reachable by tool");
+        let uri = format!("kaibo://cas/{hex}");
+
+        let err = read_kaibo_resource_with_config(
+            &uri,
+            &[],
+            &Config::builtin(),
+            &[],
+            None,
+            false,
+            Vec::new(),
+            false,
+            crate::config::CasMode::Memory,
+        )
+        .expect_err("the CAS resource route no longer exists");
+        assert!(
+            err.message.to_lowercase().contains("unknown"),
+            "an artifact URI is now just an unknown resource: {}",
+            err.message
+        );
+
+        assert!(
+            // The prefix, not a bare "cas" — `kaibo://prompts/{cast}` contains that
+            // substring and is a template we still very much serve.
+            !kaibo_resource_templates()
+                .iter()
+                .any(|t| t.uri_template.starts_with(crate::cas::CAS_URI_PREFIX)),
+            "and no template advertises it, got {:?}",
+            kaibo_resource_templates()
+                .iter()
+                .map(|t| t.uri_template.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // The bytes are still reachable — through the tool.
+        read(&h, &hex, None, None).await;
     }
 
     /// The joined text of a successful `CallToolResult` — for asserting on a handler's
@@ -6816,7 +7153,7 @@ enabled = false
 
     #[test]
     fn advertises_the_per_builtin_template() {
-        let templates = kaibo_resource_templates(true);
+        let templates = kaibo_resource_templates();
         assert!(
             templates
                 .iter()
@@ -7250,7 +7587,7 @@ enabled = false
     /// message names the known casts (so a caller recovers to a real cast name).
     #[test]
     fn per_cast_prompts_template_advertised_and_unknown_cast_is_not_found() {
-        let templates: Vec<String> = kaibo_resource_templates(true)
+        let templates: Vec<String> = kaibo_resource_templates()
             .into_iter()
             .map(|t| t.uri_template)
             .collect();
