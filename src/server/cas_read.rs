@@ -71,12 +71,14 @@ pub const MAX_READ_BYTES: usize = 1 << 20;
 
 /// The largest image `read_cas` will hand back as a rendered image content block.
 ///
-/// Sized to the artifacts kaibo itself mints: a 1024×1024 PNG from Stability or
-/// gpt-image lands around 1–2 MB, so the common case of "look at what I just generated"
-/// takes one hop. Above it the caller gets metadata and (in disk mode) a path, because
-/// base64 inflates by about a third on the way into a context window and the useful move
-/// for a large image is to open the file, not to inline it.
-pub const INLINE_IMAGE_MAX_BYTES: usize = 1 << 21;
+/// Sized loose on purpose (Amy, 2026-08-05: "5MB and we'll see who complains"): a
+/// 1024×1024 PNG from Stability or gpt-image lands around 1–2 MB, so the common case of
+/// "look at what I just generated" takes one hop with room over it. Above the line the
+/// caller gets metadata and (in disk mode) a path, because base64 inflates by about a
+/// third on the way into a context window and the useful move for a very large image is
+/// to open the file, not to inline it. If hosts complain (Anthropic's per-image API cap
+/// is ~5 MB and base64 of 5 MiB lands past it), tighten here — one constant.
+pub const INLINE_IMAGE_MAX_BYTES: usize = 5 << 20;
 
 /// One stored object, resolved and verified, as [`plan`] sees it.
 pub struct CasObject<'a> {

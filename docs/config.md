@@ -878,7 +878,7 @@ Reads are **metadata-first and bounded**:
 | no `length` | metadata plus the first 64 KiB from `offset`, never the whole object |
 | `offset` + `length` | metadata plus exactly that range (`length` up to 1 MiB) |
 
-Text comes back as text. A small image (up to 2 MiB) with no range asked for comes back as
+Text comes back as text. A small image (up to 5 MiB) with no range asked for comes back as
 a viewable image; a larger one comes back as metadata and a path, because base64 in a
 context window helps nobody — open the file, or ask for a range explicitly. A binary
 object is never dumped as base64 unless you asked for a range.
