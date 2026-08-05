@@ -63,6 +63,26 @@ is resident tool cost and curation. `MediaType::to_cas_extension` already refuse
 and `model/gltf-binary` loudly so that adding one forces a deliberate naming decision rather
 than silently writing bytes nobody can open.
 
+### CAS retention changed character with `save_artifact` — the store wants operator verbs and a GC story
+
+The no-GC stance was honest while `generate` was the only producer: every artifact cost a
+paid provider call, so minting was rare and self-limiting, and `find -mtime` over the
+sidecars was proportionate cleanup. `save_artifact` (shipped 2026-08-05) breaks that
+assumption — a consult can mint eight artifacts a call for the price of tokens it was
+already spending, against an append-only store that never unlinks. XDG data grows without
+bound and the operator's only tools are shell commands over a two-level sharded tree.
+
+What it wants, roughly in order: `kaibo cas ls` / `kaibo cas du` (list and size by sidecar
+metadata — cast, tool, age, label — so an operator can *see* what accumulated without
+learning the shard layout), then a pruning story. Pruning is the hard half, and a real
+design question rather than a missing command: the store's safety argument is that it
+never unlinks (`src/cas.rs`'s module doc), so a GC verb is a new mutation surface needing
+its own justification, its own containment check, and probably its own blessed line in
+`tests/no_write_path.rs`. A TTL sweep, an explicit `kaibo cas rm <digest>`, and "the
+operator prunes by hand, with better visibility" are three answers with different blast
+radii. Not blocking; the sidecars already carry enough metadata (authorship included) that
+the ls/du half is straightforward whenever we want it.
+
 ### Someday: the CAS as kaish's egress gateway (design note, not scheduled)
 Amy's direction 2026-07-25, explicitly *"need to think about it more"* — recorded so the
 reasoning survives, not to be built. The shape she wants: kaish can **read** from the CAS

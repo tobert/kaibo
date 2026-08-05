@@ -864,6 +864,71 @@ ancestors must be a directory. Write errors that only a real write can reveal
 opening the store writes nothing, so it cannot probe for them. Memory mode is the one
 warned degrade, mirroring the persistence posture it follows.
 
+## Saving artifacts: `[artifacts]`
+
+**Off by default.** This is the only switch in kaibo whose default is off. Everything in
+`[tools]` is advertised unless you disable it; this one is disabled unless you enable it,
+because it is the only surface where a *model* decides that bytes become durable.
+
+`save_artifact` is a tool injected into the `consult` driver's own toolset. The model
+hands kaibo bulk content it wrote and gets back a digest; the answer's footer names each
+`kaibo://cas/<digest>` and you decide whether to read it. The point is your context
+window: a consult asked to produce a generated corpus, a long inventory, or a fixture no
+longer has to spend the answer on material you may only want to store.
+
+```toml
+[artifacts]
+enabled = false                             # default false; true grants standing permission
+```
+
+CLI/env: `--allow-save-artifact` (serve only) / `KAIBO_ARTIFACTS_ENABLED`. Unlike the
+`KAIBO_NO_*` flags, the env var sets the knob either way and the CLI flag *enables* — the
+built-in default is the conservative end of the range, so a layer that could only disable
+would have nothing to say.
+
+**Three conditions, all required.** The tool is absent from the model's toolset unless
+every one holds:
+
+| condition | surface | who decides |
+|---|---|---|
+| `[artifacts] enabled = true` | config / env / CLI | the operator, standing |
+| `save_artifacts: true` on the call | the `consult` tool argument | the calling agent, per call |
+| the media CAS is live | `[cas] enabled`, above | the operator |
+
+A call that passes `save_artifacts` on a server missing either of the other two is
+**refused**, with a message naming which one — never answered quietly without the
+artifacts it asked for. `kaibo://config` reports `[artifacts] enabled`, so a caller can
+see the server's posture before asking.
+
+**Limits are fixed and not configurable.**
+
+| limit | value |
+|---|---|
+| bytes per artifact | 1 MiB |
+| artifacts per MCP call | 8 |
+| bytes per MCP call | 8 MiB |
+| formats | `text`, `jsonl` |
+
+A save past a limit is **refused and stores nothing**; the refusal names the limit, the
+actual size, and the way forward. Nothing is ever truncated — a digest handed back for
+content that is not what the model wrote would be silent corruption. The per-artifact
+limit is a backstop rather than a working ceiling: the content rides in tool-call
+arguments, so the model's own `max_tokens` binds first.
+
+**What the model cannot do.** It can write and it can never read. There is no list verb,
+no read verb, and no `kaibo://cas` access from inside the loop. The result of a save is a
+digest and nothing else: it never reports whether the content was already in the store,
+because that answer would let one project's model team probe another's artifacts. Only
+the `consult` driver loop gets the tool; delegated explorer sweeps never do.
+
+**Authorship is recorded.** Each saved artifact's `<hex>.json` sidecar carries
+`tool = "save_artifact"` plus the cast, the model, the slot, the session, and the model's
+own one-line label, alongside the fields a `generate` sidecar has. The contents are
+model-written and something downstream may run them, so the sidecar is the trust record.
+
+Retention is yours, as with everything in the CAS: kaibo never prunes, and this tool
+makes minting cheap. See the `[cas]` section above.
+
 ## House rules: `[context]`
 
 kaibo's models work for other agents, so they benefit from inheriting the calling agent's

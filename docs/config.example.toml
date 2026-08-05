@@ -311,6 +311,30 @@ scratch_limit_bytes = 67108864
 #                                          # 0 is a load error, not "refuse everything".
 
 # ---------------------------------------------------------------------------
+# [artifacts] — may the model team save what it writes? OFF by default.
+#
+# kaibo's one inverted switch. Every knob in [tools] is on until you turn it off; this
+# one is off until you turn it on, because it is the only surface where a MODEL decides
+# that bytes become durable. Turning it on grants standing permission, not automatic
+# behavior: the call must also pass `save_artifacts`, and [cas] above must be live. All
+# three, or the model never sees the tool.
+#
+# What it buys: a consult producing bulk output (a generated corpus, a long inventory, a
+# fixture) writes it into the CAS and names the digest in its answer, instead of
+# spending your context window on material you may only want to keep. You read it at
+# kaibo://cas/<digest>, or you do not.
+#
+# Limits are fixed, not configurable: 1 MiB per artifact, 8 artifacts and 8 MiB per
+# call. A save past a limit is refused and stores nothing. Every saved artifact records
+# its author in the provenance sidecar (tool, cast, model, slot, the model's own label),
+# because the contents are model-written and something downstream may run them.
+# Env: KAIBO_ARTIFACTS_ENABLED. CLI: --allow-save-artifact (serve only).
+# ---------------------------------------------------------------------------
+
+# [artifacts]
+# enabled = false                          # true lets a consult that ASKS save artifacts
+
+# ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
 # completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
 # reasoning slots; the media kinds (stability | openai-images) serve `image` slots

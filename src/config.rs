@@ -5421,5 +5421,26 @@ mod tests {
              never mentions: {missing:?} — add each knob to the template (a commented \
              default line is enough)"
         );
+
+        // The field-name check above has a blind spot, and `[artifacts]` found it: a
+        // whole NEW stanza whose only knob reuses a name another stanza already has
+        // (`enabled`, `path`, `dir`) passes while the template says nothing about the
+        // stanza at all. So also require each top-level section to appear as a HEADER —
+        // live or commented — which is what an operator actually scans for.
+        let section_missing: Vec<String> = serde_fields::<RawConfig>()
+            .into_iter()
+            .filter(|s| !undocumented.contains(&s.as_str()))
+            // `[section]` or a sub-table of it (`[kaish.ignore]`, `[backends.<name>]`):
+            // several stanzas only ever appear in their sub-tabled form.
+            .filter(|s| {
+                !template.contains(&format!("[{s}]")) && !template.contains(&format!("[{s}."))
+            })
+            .collect();
+        assert!(
+            section_missing.is_empty(),
+            "docs/config.example.toml never shows these stanzas as a section header: \
+             {section_missing:?} — an operator scans for `[section]`, so a knob \
+             documented only by its bare name is not documented"
+        );
     }
 }
