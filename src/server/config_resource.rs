@@ -1136,6 +1136,7 @@ mod tests {
             vec![],
             false,
             crate::config::CasMode::Memory,
+            None,
         );
         let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
         let inert = |cast: &str, role: &str| -> Vec<String> {
