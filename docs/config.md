@@ -852,9 +852,11 @@ Each object gets a `<hex>.json` provenance sidecar (prompt, model, cast, timesta
 seed, and which tool produced it). It makes an object self-describing **to whoever holds
 its address**: one lookup by digest says what the bytes are and what format to serve them
 as. Read it that way. The store is not built to be swept — a survey means walking 65,536
-shards and parsing a file per object, and it only gets slower as the store fills. Operator
-inventory verbs are tracked in `docs/issues.md` and want an index kaibo maintains, not a
-scan.
+shards and parsing a file per object, and it only gets slower as the store fills, so kaibo
+builds no index and offers no scan verb over it. Access is by address; a saved digest also
+rides the session turn that produced it, so tracking what was created lives with the
+conversation, not the store. An operator's cleanup, if wanted, is plain file mtime on the
+object tree for now — see `docs/issues.md`.
 
 The sidecar is **first-writer-wins**: it records the first write of a given content and is
 never rewritten. Save bytes the store already holds and the record stays the original

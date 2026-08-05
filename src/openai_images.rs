@@ -609,6 +609,37 @@ mod tests {
         }
     }
 
+    /// `always_b64` is a prefix match, not an exact-name match — boundary cases the
+    /// three-model table above doesn't reach. The bare family name (no `-1`/`-mini`
+    /// suffix) still counts, matching is case- and surrounding-whitespace-insensitive,
+    /// and a model that merely *contains* the string without leading it (or leads
+    /// with something else entirely) does not match — a prefix, not a substring.
+    #[test]
+    fn always_b64_is_a_case_insensitive_trimmed_prefix_match() {
+        for model in [
+            "gpt-image",        // bare family name, no version suffix
+            "GPT-IMAGE",        // case-insensitive
+            "  gpt-image-1  ",  // surrounding whitespace trimmed before matching
+            "Gpt-Image-1-Mini", // mixed case
+        ] {
+            assert!(
+                always_b64(model),
+                "expected {model:?} to match the gpt-image family"
+            );
+        }
+        for model in [
+            "dall-e-3",
+            "sd-gpt-image", // contains the string but does not lead with it
+            "gptimage-1",   // missing the separating hyphen
+            "",
+        ] {
+            assert!(
+                !always_b64(model),
+                "expected {model:?} not to match the gpt-image family"
+            );
+        }
+    }
+
     /// The caller's stated JSON type rides through verbatim — no re-typing in
     /// either direction. `n` passed as a number arrives as the integer `2` (never
     /// `2.0`, never `"2"`); `user = "123"` passed as a STRING stays the string

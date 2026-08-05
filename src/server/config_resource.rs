@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, Lane, ModelSlot};
-use crate::consult::ModelShape;
+use crate::consult::{ModelShape, ThinkingStyleOverride};
+use crate::credentials::WireKind;
 
 use super::ToolGating;
 
@@ -476,6 +477,21 @@ pub(crate) fn render_config_resource(
                         }
                         if temperature.is_some() && !sampling_sinks {
                             inert.push("temperature");
+                        }
+                        // The Anthropic thinking-style escape hatch only reaches the
+                        // wire on an Anthropic slot — `ModelShape::resolve` reads `ovr`
+                        // in exactly one match arm. Every other wire classifies its
+                        // thinking style from the model id alone and never consults the
+                        // override, so a style forced on this slot (a per-slot override
+                        // or an inherited `[defaults].thinking_style`, both already
+                        // folded into `t.thinking_style`) is silently dropped there.
+                        // `Auto` stays quiet: it is the no-override default and behaves
+                        // identically to an absent override on every wire, Anthropic
+                        // included.
+                        if t.thinking_style != ThinkingStyleOverride::Auto
+                            && backend.kind.wire() != Some(WireKind::Anthropic)
+                        {
+                            inert.push("thinking_style");
                         }
                         inert
                     } else {
@@ -1066,8 +1082,10 @@ mod tests {
         };
         assert_eq!(
             inert("lab_cast", "synth"),
-            vec!["effort"],
-            "a [defaults] effort on a toggle-less wire is just as inert as a slot one"
+            vec!["effort", "thinking_style"],
+            "a [defaults] effort on a toggle-less wire is just as inert as a slot one, \
+             and the [defaults] thinking_style forced onto a non-Anthropic wire is \
+             equally never consulted"
         );
         assert_eq!(
             inert("forced", "synth"),
@@ -1084,6 +1102,67 @@ mod tests {
             inert("bat_deep", "synth").is_empty(),
             "a batch slot deeper than the floor keeps its effort: {:?}",
             inert("bat_deep", "synth")
+        );
+    }
+
+    /// `thinking_style` reaches the wire only on an Anthropic slot —
+    /// `ModelShape::resolve` reads the override in exactly one match arm (Anthropic's,
+    /// picking adaptive vs budget tier). Every other wire classifies its thinking
+    /// style from the model id alone and never looks at the override, so a style
+    /// forced on a non-Anthropic slot is a pure no-op there — the render must flag it
+    /// the same way it flags an inert `thinking_budget`/`effort`/`temperature`, not
+    /// show it as if it were shaping the request.
+    #[test]
+    fn config_render_flags_thinking_style_inert_on_a_non_anthropic_slot() {
+        let config = Config::from_toml_str(
+            r#"
+            # Forced on a DeepSeek slot: DeepSeek's shape never consults the override.
+            [casts.ds_forced]
+            synth = { backend = "deepseek", id = "deepseek-v4-pro", thinking_style = "adaptive" }
+
+            # The identical override on an Anthropic slot moves the wire's shape (it
+            # picks the adaptive tier over Haiku's default budget tier), so it must
+            # NOT be flagged.
+            [casts.anthropic_forced]
+            synth = { backend = "anthropic", id = "claude-haiku-4-5", thinking_style = "adaptive" }
+            "#,
+        )
+        .unwrap();
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+        );
+        let doc: toml::Value = toml::from_str(&body).expect("render is valid TOML");
+        let inert = |cast: &str, role: &str| -> Vec<String> {
+            doc.get("casts")
+                .and_then(|c| c.get(cast))
+                .and_then(|c| c.get(role))
+                .and_then(|s| s.get("inert_tunables"))
+                .map(|a| {
+                    a.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            inert("ds_forced", "synth"),
+            vec!["thinking_style"],
+            "a thinking_style override on a DeepSeek slot is never consulted by \
+             ModelShape::resolve and must render as inert"
+        );
+        assert!(
+            inert("anthropic_forced", "synth").is_empty(),
+            "the same override on an Anthropic slot moves the wire's shape and must \
+             stay unflagged: {:?}",
+            inert("anthropic_forced", "synth")
         );
     }
 
