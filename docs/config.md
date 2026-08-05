@@ -908,6 +908,21 @@ the same way, including one whose content the store already holds: exempting tho
 let a full store answer "is this content already here?" by succeeding for held bytes and
 refusing for new ones, across every project this kaibo has served.
 
+**Disk mode warns when the disk is not really a disk.** On Linux, startup checks what
+filesystem the CAS directory sits on. If it is overlayfs, tmpfs, or ramfs — the shape of a
+container with no volume mounted — kaibo logs a severe warning and **proceeds**. It is not
+a refusal and there is no acknowledgement flag: running on a throwaway filesystem on
+purpose is legitimate, and what is not legitimate is finding out only after a generation
+has been paid for. The warning names the filesystem and the directory; `kaibo://config`
+reports the same finding under `[cas] backing`, and `kaibo config` prints it, so you can
+check before spending anything rather than hunting through startup log after.
+
+The fix is to mount a volume at the CAS directory, or point `[cas] dir` at one. A durable
+filesystem produces no warning and no `backing` line. So does a check that cannot answer
+(a non-Linux host, or a `statfs` that fails) — an unreadable filesystem type is not
+evidence of anything, and a guard that spoke every time it failed to look would be tuned
+out by the time it mattered.
+
 **Failure is loud.** In disk mode, a structurally unusable CAS path fails startup with
 an error naming the escape hatches: a dir that resolves inside an allowed project tree
 (refused the same way the state db is), or a file sitting where the store or one of its
