@@ -86,7 +86,24 @@ pub struct CasObject<'a> {
     pub ext: Extension,
     pub bytes: &'a [u8],
     /// The model's own one-line description, when the sidecar carries one.
+    ///
+    /// `None` covers two different situations, which is why it does not stand alone: a
+    /// record that carries no label, and no record at all. See `provenance_present`.
     pub label: Option<&'a str>,
+    /// Whether this object has a provenance record beside it.
+    ///
+    /// Separate from `label` because "the record says nothing about this" and "there is
+    /// no record" are different facts, and only the second is worth a line. An object can
+    /// legitimately lack one: `CasError::ProvenanceNotRecorded` mints exactly this state
+    /// (the object landed, the sidecar write failed), and the extension-probe fallback in
+    /// `Cas::entry_for` serves objects whose sidecar is missing or unreadable. This store
+    /// never rewrites, so such an object stays recordless forever — worth saying once,
+    /// rather than leaving a caller to read "no label" as "nothing was written down".
+    ///
+    /// The sidecar is best-effort housekeeping, not a promised record (Amy's ruling), so
+    /// a *present* record with no label renders nothing at all: a `label: (none)` line on
+    /// every generated image would be noise on the common case.
+    pub provenance_present: bool,
     /// The real filesystem path — disk mode only. Memory mode has no file.
     pub path: Option<&'a Path>,
 }
@@ -146,6 +163,7 @@ pub fn plan(obj: &CasObject, offset: usize, length: Option<usize>) -> Result<Cas
                 obj,
                 total,
                 &format!("the whole object, {total} bytes, as a rendered image"),
+                None,
             ),
             body: Body::Image {
                 data: encode(obj.bytes),
@@ -166,17 +184,21 @@ pub fn plan(obj: &CasObject, offset: usize, length: Option<usize>) -> Result<Cas
     let end = start.saturating_add(want).min(total);
 
     if end <= start {
-        let why = if start >= total && offset > 0 {
+        let why = if total == 0 {
+            "nothing: this object is empty".to_string()
+        } else if start >= total {
             format!("nothing: offset {offset} is at or past the end of {total} bytes")
         } else if length.is_some() {
             "nothing: metadata only".to_string()
-        } else {
-            "nothing: this object is binary, so pass a `length` for a base64 range (or \
-             open the file at the path above, when there is one)"
+        } else if obj.path.is_some() {
+            "nothing: this object is binary, so pass a `length` for a base64 range, or \
+             open the file at the path above"
                 .to_string()
+        } else {
+            "nothing: this object is binary, so pass a `length` for a base64 range".to_string()
         };
         return Ok(CasView {
-            meta: render_meta(obj, total, &why),
+            meta: render_meta(obj, total, &why, None),
             body: Body::None,
         });
     }
@@ -185,19 +207,51 @@ pub fn plan(obj: &CasObject, offset: usize, length: Option<usize>) -> Result<Cas
     // serve the largest whole-character range inside it and report THAT range — the
     // caller's next offset has to be a byte position it can actually resume from.
     if obj.ext.is_textual() {
-        if let Some((from, to, text)) = utf8_window(obj.bytes, start, end) {
-            return Ok(CasView {
-                meta: render_meta(obj, total, &format!("bytes {from}..{to} of {total}")),
-                body: Body::Text(text.to_string()),
-            });
+        match text_window(obj.bytes, start, end) {
+            TextWindow::Whole { to, text } => {
+                return Ok(CasView {
+                    meta: render_meta(obj, total, &format!("bytes {start}..{to} of {total}"), None),
+                    body: Body::Text(text.to_string()),
+                })
+            }
+            // **The cursor must always move.** A window too narrow to hold one whole
+            // character used to trim to nothing and report `bytes N..N`; a caller
+            // resuming at the endpoint it was handed read the same byte forever, with no
+            // way to detect it. Serving the exact bytes as base64 is imperfect and
+            // *escapable*: the range advances over them, the note says why they are not
+            // text, and the caller widens `length` or realigns `offset`.
+            //
+            // Refusing was the other option and is worse. A mechanical pager cannot act
+            // on a refusal; always-advances is a property it can build on.
+            TextWindow::SplitCharacter => {
+                return Ok(CasView {
+                    meta: render_meta(
+                        obj,
+                        total,
+                        &format!("bytes {start}..{end} of {total}"),
+                        Some(
+                            "these bytes begin or end inside a multi-byte character, so \
+                             they are base64 rather than text — widen `length` or move \
+                             `offset` to a character boundary to read this span as text",
+                        ),
+                    ),
+                    body: Body::Base64(encode(&obj.bytes[start..end])),
+                })
+            }
+            // Not UTF-8 at all. Hand back the exact bytes asked for, base64 — a lossy
+            // decode would serve different content than was stored, and the base64 form
+            // is itself the honest "treat this as binary" signal.
+            TextWindow::NotText => {}
         }
-        // Not UTF-8 at all. Hand back the exact bytes asked for, base64 — a lossy decode
-        // would serve different content than was stored, and the base64 form is itself
-        // the honest "treat this as binary" signal.
     }
 
     Ok(CasView {
-        meta: render_meta(obj, total, &format!("bytes {start}..{end} of {total}")),
+        meta: render_meta(
+            obj,
+            total,
+            &format!("bytes {start}..{end} of {total}"),
+            None,
+        ),
         body: Body::Base64(encode(&obj.bytes[start..end])),
     })
 }
@@ -209,7 +263,7 @@ fn encode(bytes: &[u8]) -> String {
 
 /// The metadata block that leads every response. One `key: value` per line — cheap to
 /// read, cheap to parse — with the optional lines simply absent rather than empty.
-fn render_meta(obj: &CasObject, total: usize, served: &str) -> String {
+fn render_meta(obj: &CasObject, total: usize, served: &str, note: Option<&str>) -> String {
     let mut out = format!(
         "digest: {digest}\nuri: {prefix}{digest}\nmime: {mime}\nbytes: {total}\nbinary: {binary}",
         digest = obj.digest,
@@ -220,38 +274,61 @@ fn render_meta(obj: &CasObject, total: usize, served: &str) -> String {
     if let Some(label) = obj.label {
         out.push_str(&format!("\nlabel: {label}"));
     }
+    if !obj.provenance_present {
+        out.push_str("\nprovenance: absent (this object was stored without its sidecar)");
+    }
     if let Some(path) = obj.path {
         out.push_str(&format!("\npath: {}", path.display()));
     }
     out.push_str(&format!("\nserved: {served}"));
+    if let Some(note) = note {
+        out.push_str(&format!("\nnote: {note}"));
+    }
     out
 }
 
-/// The largest whole-character UTF-8 range inside `[start, end)`, with the range it
-/// actually covers. `None` when the bytes are not UTF-8 at all, which is the caller's
-/// signal to fall back to base64 rather than decode lossily.
+/// What a byte window over textual content turned out to hold.
+enum TextWindow<'a> {
+    /// At least one whole character, starting exactly where the caller asked and ending
+    /// at `to` — which may be earlier than the window's end, because the tail can cut a
+    /// character short.
+    Whole { to: usize, text: &'a str },
+    /// The window cannot produce text starting where the caller asked: it begins inside a
+    /// multi-byte character, or it starts one it has no room to finish. **Never an empty
+    /// [`TextWindow::Whole`]** — see [`plan`] for why that difference is the whole bug.
+    SplitCharacter,
+    /// Not UTF-8 at all, whatever the extension claims.
+    NotText,
+}
+
+/// The whole-character UTF-8 text at `[start, end)`, always **beginning at `start`**.
 ///
-/// Two adjustments, for the two ways a byte window can split a character: the start may
-/// land on a continuation byte (no decoder can begin there), and the end may cut the last
-/// character short. Both are ordinary when paging text by byte offset, so neither is
-/// treated as a failure.
-fn utf8_window(bytes: &[u8], start: usize, end: usize) -> Option<(usize, usize, &str)> {
-    let mut from = start;
-    while from < end && (bytes[from] & 0xC0) == 0x80 {
-        from += 1;
+/// Only the tail is ever trimmed. An earlier version also stepped `start` forward off a
+/// leading continuation byte, which looks like the symmetric courtesy and is silent data
+/// loss: the skipped bytes appear in no response, so a caller paging by the ranges it is
+/// handed reassembles an object with holes in it. A window that cannot begin where it was
+/// asked to begin is [`TextWindow::SplitCharacter`] instead, and `plan` serves those exact
+/// bytes as base64 — imperfect, but complete and escapable.
+fn text_window(bytes: &[u8], start: usize, end: usize) -> TextWindow<'_> {
+    // A continuation byte is a place no decoder can start reading from.
+    if (bytes[start] & 0xC0) == 0x80 {
+        return TextWindow::SplitCharacter;
     }
-    match std::str::from_utf8(&bytes[from..end]) {
-        Ok(text) => Some((from, end, text)),
+    let to = match std::str::from_utf8(&bytes[start..end]) {
+        Ok(_) => end,
         // `error_len: None` means the input ended mid-character — the window's tail, not
         // corruption. Serve up to the last whole character and leave the rest for the
         // next page.
-        Err(e) if e.error_len().is_none() => {
-            let to = from + e.valid_up_to();
-            std::str::from_utf8(&bytes[from..to])
-                .ok()
-                .map(|text| (from, to, text))
-        }
-        Err(_) => None,
+        Err(e) if e.error_len().is_none() => start + e.valid_up_to(),
+        Err(_) => return TextWindow::NotText,
+    };
+    // The window starts a character it has no room to finish.
+    if to <= start {
+        return TextWindow::SplitCharacter;
+    }
+    match std::str::from_utf8(&bytes[start..to]) {
+        Ok(text) => TextWindow::Whole { to, text },
+        Err(_) => TextWindow::NotText,
     }
 }
 
@@ -273,6 +350,7 @@ mod tests {
             ext: Extension::Txt,
             bytes,
             label,
+            provenance_present: true,
             path: None,
         }
     }
@@ -283,6 +361,7 @@ mod tests {
             ext: Extension::Png,
             bytes,
             label: None,
+            provenance_present: true,
             path: None,
         }
     }
@@ -501,6 +580,206 @@ mod tests {
                 .meta
                 .contains("path:"),
             "memory mode has no file to name"
+        );
+    }
+
+    /// The byte range a response says it served, parsed out of the metadata — what a
+    /// mechanical pager reads to pick its next `offset`.
+    fn served_range(meta: &str) -> Option<(usize, usize)> {
+        let line = meta.lines().find(|l| l.starts_with("served: bytes "))?;
+        let span = line
+            .trim_start_matches("served: bytes ")
+            .split(" of ")
+            .next()?;
+        let (a, b) = span.split_once("..")?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    }
+
+    /// **A missing sidecar is its own state, and the metadata says so.**
+    ///
+    /// Three things a caller can be looking at, and they are not the same: an object whose
+    /// record carries a label, one whose record carries none, and one with no record at
+    /// all. The last is real — it is exactly what `CasError::ProvenanceNotRecorded` mints
+    /// and what the extension-probe fallback serves — and silence about it would let a
+    /// caller read "no label" as "nothing was written down here", which is a different
+    /// and much weaker claim.
+    ///
+    /// A `label:` line when there is a label, a `provenance:` line when there is no
+    /// record, and neither when the record simply has no label to give.
+    #[test]
+    fn the_metadata_distinguishes_no_label_from_no_provenance_at_all() {
+        let bytes = b"content";
+
+        let labeled = text_obj(bytes, Some("the inventory"));
+        let m = plan(&labeled, 0, Some(0)).unwrap().meta;
+        assert!(m.contains("label: the inventory"), "{m}");
+        assert!(
+            !m.contains("provenance:"),
+            "a present record says nothing: {m}"
+        );
+
+        let unlabeled = CasObject {
+            label: None,
+            ..text_obj(bytes, None)
+        };
+        let m = plan(&unlabeled, 0, Some(0)).unwrap().meta;
+        assert!(!m.contains("label:"), "no label, no line: {m}");
+        assert!(
+            !m.contains("provenance:"),
+            "a record that simply has no label is not a missing record: {m}"
+        );
+
+        let orphaned = CasObject {
+            provenance_present: false,
+            ..text_obj(bytes, None)
+        };
+        let m = plan(&orphaned, 0, Some(0)).unwrap().meta;
+        assert!(
+            m.contains("provenance: absent"),
+            "a missing record is stated: {m}"
+        );
+        assert!(!m.contains("label:"), "and still invents no label: {m}");
+    }
+
+    /// **A window that holds no complete character must still advance.**
+    ///
+    /// `é` is two bytes. Asking for one of them used to trim the window to nothing and
+    /// report `served: bytes 0..0` — a caller resuming at the endpoint it was handed reads
+    /// the same byte forever. Serving zero bytes while claiming a range is worse than
+    /// serving something imperfect: a pager cannot detect it and cannot escape it.
+    ///
+    /// So the exact bytes asked for come back as base64, the served range covers them, and
+    /// a note says why they are not text. The cursor moves; the caller can widen or
+    /// realign; nothing loops.
+    #[test]
+    fn a_window_holding_no_whole_character_advances_over_the_bytes_it_was_given() {
+        let obj = text_obj("é".as_bytes(), None);
+        let view = plan(&obj, 0, Some(1)).expect("a legal range");
+        assert_eq!(
+            view.body,
+            Body::Base64(b64(&[0xC3])),
+            "the exact byte asked for, not an empty string"
+        );
+        assert_eq!(
+            served_range(&view.meta),
+            Some((0, 1)),
+            "and the range advances past it: {}",
+            view.meta
+        );
+        assert!(
+            view.meta.contains("note: "),
+            "with a note saying why it is not text: {}",
+            view.meta
+        );
+    }
+
+    /// The same, trimmed at *both* edges: a window entirely inside one 4-byte character is
+    /// all continuation bytes, so neither edge can be salvaged.
+    #[test]
+    fn a_window_inside_one_character_advances_over_the_bytes_it_was_given() {
+        let obj = text_obj("😀".as_bytes(), None); // F0 9F 98 80
+        let view = plan(&obj, 1, Some(2)).expect("a legal range");
+        assert_eq!(view.body, Body::Base64(b64(&[0x9F, 0x98])));
+        assert_eq!(
+            served_range(&view.meta),
+            Some((1, 3)),
+            "the cursor advances over exactly what was asked for: {}",
+            view.meta
+        );
+    }
+
+    /// **The property a pager actually relies on: the cursor always moves.** Walk a
+    /// multi-byte corpus at every small window size; each response's served range must
+    /// start where the last one ended and end strictly later, until the object runs out.
+    /// The old trim-to-empty behavior hangs this test rather than failing an assertion,
+    /// so it carries its own iteration bound.
+    #[test]
+    fn paging_a_multibyte_corpus_always_advances_to_eof() {
+        let corpus = "aé漢😀b\nzこんにちは😀é";
+        let obj = text_obj(corpus.as_bytes(), None);
+        let total = corpus.len();
+
+        for window in 1..=6 {
+            let mut cursor = 0usize;
+            let mut steps = 0;
+            while cursor < total {
+                steps += 1;
+                assert!(
+                    steps <= total + 2,
+                    "window {window}: paging did not terminate — stuck at {cursor}"
+                );
+                let view = plan(&obj, cursor, Some(window)).expect("a legal range");
+                let (from, to) = served_range(&view.meta)
+                    .unwrap_or_else(|| panic!("window {window} at {cursor}: {}", view.meta));
+                assert_eq!(
+                    from, cursor,
+                    "window {window}: the range starts where asked"
+                );
+                assert!(
+                    to > cursor,
+                    "window {window} at {cursor}: served {from}..{to} does not advance"
+                );
+                assert!(to <= total, "window {window}: {to} is past the object");
+                cursor = to;
+            }
+            assert_eq!(
+                cursor, total,
+                "window {window}: paging lands exactly on the end"
+            );
+        }
+    }
+
+    /// Reassembly is the other half of the contract: whatever form each page came back in,
+    /// the bytes a caller collects are the object.
+    #[test]
+    fn pages_of_a_multibyte_corpus_reassemble_the_original_bytes() {
+        use base64::Engine as _;
+        let corpus = "aé漢😀b";
+        let obj = text_obj(corpus.as_bytes(), None);
+        let mut out: Vec<u8> = Vec::new();
+        let mut cursor = 0;
+        // Bounded like its sibling: a non-advancing cursor is the failure under test, and
+        // a test that hangs on the bug reports nothing.
+        for _ in 0..corpus.len() + 2 {
+            if cursor >= corpus.len() {
+                break;
+            }
+            let view = plan(&obj, cursor, Some(3)).unwrap();
+            let (_, to) = served_range(&view.meta).unwrap();
+            match &view.body {
+                Body::Text(t) => out.extend_from_slice(t.as_bytes()),
+                Body::Base64(d) => out.extend_from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(d)
+                        .expect("valid base64"),
+                ),
+                other => panic!("unexpected body {other:?}"),
+            }
+            cursor = to;
+        }
+        assert_eq!(
+            cursor,
+            corpus.len(),
+            "paging terminated at the end, not by the bound"
+        );
+        assert_eq!(out, corpus.as_bytes(), "the pages reassemble the object");
+    }
+
+    /// A zero-byte textual object says it is empty — it used to fall through to the
+    /// "this object is binary" wording, which is simply not true of an empty `.txt`.
+    #[test]
+    fn an_empty_object_says_it_is_empty() {
+        let view = plan(&text_obj(b"", None), 0, None).unwrap();
+        assert_eq!(view.body, Body::None);
+        assert!(
+            view.meta.contains("empty"),
+            "an empty textual object says so: {}",
+            view.meta
+        );
+        assert!(
+            !view.meta.contains("binary, so pass"),
+            "and does not claim to be binary: {}",
+            view.meta
         );
     }
 

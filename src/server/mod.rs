@@ -116,9 +116,11 @@ const TOOLS_URI: &str = "kaibo://tools";
 /// footers, answers, and `generate` results all need a stable name for an artifact.
 ///
 /// OPERATOR SURFACE ONLY (Amy's ruling, 2026-08-03), and that survived the move: the MCP
-/// client and CLI retrieve; the inner model team never can — the CAS is not mounted into
-/// kaish and no cast-facing tool reads it, because kaibo state spans projects and a
-/// browsable CAS would let one project's team enumerate another's artifacts.
+/// client retrieves, through `read_cas`; the inner model team never can — the CAS is not
+/// mounted into kaish and no cast-facing tool reads it, because kaibo state spans projects
+/// and a browsable CAS would let one project's team enumerate another's artifacts. (kaibo's
+/// CLI has no artifact command at all today; on disk, the metadata's path is what an
+/// operator's own tools use.)
 const CAS_RES_PREFIX: &str = crate::cas::CAS_URI_PREFIX;
 /// The system preambles kaibo hands each model-driven phase — explorer, consult
 /// driver, oneshot, and the offline batch/deliberate synth — rendered through the exact
@@ -627,9 +629,10 @@ pub struct ReadCasInput {
     #[serde(default)]
     pub offset: Option<usize>,
 
-    /// How many bytes to read. Omit for a bounded default window (65536 bytes) from
-    /// `offset`; `0` for metadata only. Reads a base64 range of a binary object, which is
-    /// otherwise never served unasked.
+    /// How many bytes to read, capped at 1048576 — a larger ask is refused, not trimmed.
+    /// `0` is metadata only. Omit it for the per-kind default: up to 65536 bytes of TEXT
+    /// from `offset`, a whole image when one qualifies, and metadata alone for any other
+    /// binary (a base64 range is served only when you ask for one).
     #[serde(default)]
     pub length: Option<usize>,
 }
@@ -1309,9 +1312,9 @@ impl KaiboHandler {
     }
 
     /// Swap in a media-arm factory — the seam that lets tests drive the `generate`
-    /// lane (sync store-and-answer, the deferred job, the CAS resource) with a
-    /// scripted [`crate::media::MediaModel`] instead of a real provider client. A
-    /// builder, like [`with_batch_providers`](Self::with_batch_providers).
+    /// lane (sync store-and-answer, the deferred job, and `read_cas` over what it
+    /// stored) with a scripted [`crate::media::MediaModel`] instead of a real provider
+    /// client. A builder, like [`with_batch_providers`](Self::with_batch_providers).
     #[cfg(test)]
     pub fn with_media_arms(mut self, arms: Arc<dyn crate::media::MediaArmFactory>) -> Self {
         self.media_arms = arms;
@@ -2625,11 +2628,14 @@ impl KaiboHandler {
             always comes first: mime, total size, whether it is binary, the artifact's \
             label, the range served, and the real file path when the store is on disk \
             (open that directly with your own tools for anything large). Reads are \
-            BOUNDED: `length` 0 is metadata only, omitting `length` returns the first \
-            65536 bytes, and `offset` pages through the rest — the metadata's total \
-            tells you how far. Text comes back as text. A small image comes back as a \
-            viewable image; a large one comes back as metadata and a path, never a wall \
-            of base64. Ask for `length` explicitly to get a base64 range of any binary."
+            BOUNDED, and what you get depends on the object. TEXT: omitting `length` \
+            returns up to 65536 bytes from `offset`, and `offset` pages the rest — the \
+            metadata's total tells you how far. IMAGE: a whole image up to 5 MiB comes \
+            back viewable; a larger one comes back as metadata alone (plus the file path \
+            in disk mode). ANY BINARY: omitting `length` returns metadata only, never a \
+            wall of base64 — pass `length` to get a base64 range. `length` 0 is metadata \
+            only for anything. `length` is capped at 1048576 bytes and a larger ask is \
+            refused, not trimmed."
     )]
     pub async fn read_cas(
         &self,
@@ -2672,7 +2678,12 @@ impl KaiboHandler {
             // corruption read as an ordinary absence.
             Err(e) => return Err(McpError::internal_error(format!("{e}"), None)),
         };
-        let label = store.provenance(&digest).and_then(|p| p.label);
+        // The record and the label are two facts, not one: an object can have a record
+        // that carries no label, or no record at all (a sidecar write that failed, or one
+        // that went missing — `Cas::entry_for`'s probe fallback still serves the object).
+        // The metadata says which.
+        let provenance = store.provenance(&digest);
+        let label = provenance.as_ref().and_then(|p| p.label.clone());
         let path = store.path_for(&digest);
         let view = cas_read::plan(
             &cas_read::CasObject {
@@ -2680,6 +2691,7 @@ impl KaiboHandler {
                 ext,
                 bytes: &bytes,
                 label: label.as_deref(),
+                provenance_present: provenance.is_some(),
                 path: path.as_deref(),
             },
             input.offset.unwrap_or(0),
@@ -3869,12 +3881,21 @@ sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
 
 `read_cas` is the retrieval half — for you, the client, never for kaibo's own models.
 Pass the digest from a `kaibo://cas/<digest>` address and you get **metadata first**:
-mime, total bytes, whether it is binary, the artifact's label, the range served, and the
-real file path when the store is on disk. Reads are bounded on purpose. `length: 0` is a
-cheap look at what an object is; omitting `length` returns the first 65536 bytes and tells
-you the total, and `offset` pages the rest. Text arrives as text. A small image arrives as
-an image you can actually see; a large one arrives as metadata and a path, because a
-megabyte of base64 helps nobody — open the file, or ask for a range explicitly.
+mime, total bytes, whether it is binary, the artifact's label when its record carries one,
+the range served, and the real file path when the store is on disk.
+
+Reads are bounded, and the default depends on what the object is. Text: omitting `length`
+gives up to 65536 bytes from `offset`, and `offset` pages the rest — the metadata's total
+says how far. An image up to 5 MiB with no range asked for arrives whole and viewable; a
+larger one arrives as metadata alone, plus the file path when the store is on disk. Any
+other binary gives metadata only until you ask: pass `length` for a base64 range, capped
+at 1048576 bytes (a larger ask is refused rather than trimmed). `length: 0` is the cheap
+look at any object.
+
+Paging always advances. A window that lands inside a multi-byte character comes back as
+base64 of exactly the bytes you asked for, with a note saying so — so the served range
+still moves and you can widen `length` or realign `offset`, rather than reading the same
+byte forever.
 
 ## Driving the read-only shell (`run_kaish`)
 
@@ -4234,6 +4255,21 @@ fn read_kaibo_resource_with_config(
         return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
             vec![ResourceContents::text(CONFIG_EXAMPLE_TOML, uri)],
         )));
+    }
+    // A host that cached the old resource template still asks for this. The route is
+    // gone and stays gone — but a bare "unknown resource" tells a caller nothing about
+    // where its artifacts went, and the digest it already holds is the whole argument it
+    // needs. Recognized, never served: the answer is a pointer to `read_cas`.
+    if let Some(hex) = uri.strip_prefix(crate::cas::CAS_URI_PREFIX) {
+        return Err(McpError::resource_not_found(
+            format!(
+                "the {}<digest> resource was removed — artifact retrieval is now the \
+                 `read_cas` tool. Call read_cas with digest {hex} (it takes an optional \
+                 `offset`/`length`, and answers metadata first).",
+                crate::cas::CAS_URI_PREFIX
+            ),
+            None,
+        ));
     }
     let body = render_resource(uri, schemas)
         .ok_or_else(|| McpError::resource_not_found(format!("unknown resource: {uri}"), None))?;
@@ -5718,6 +5754,49 @@ enabled = false
         );
     }
 
+    /// **An object whose sidecar is gone still reads, and says its record is gone.**
+    ///
+    /// This is a real state, not a hypothetical: `Cas::put` writes the object first and
+    /// the sidecar second, so a failure between them leaves exactly this, and
+    /// `Cas::entry_for`'s probe fallback is what keeps such an object reachable. The store
+    /// never rewrites, so it stays recordless — a caller deciding whether to trust the
+    /// bytes deserves to know that, rather than reading "no label" as "nothing to say".
+    #[tokio::test]
+    async fn read_cas_reports_an_object_whose_provenance_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "{MEDIA_CAST_TOML}\n[cas]\ndir = \"{}\"\n",
+            dir.path().join("cas").display()
+        );
+        let h = hermetic_handler_from_toml(&toml)
+            .finalize_media_store(true)
+            .expect("disk-backed store");
+        let hex = with_text_artifact(&h, b"the object outlives its record");
+        let digest = crate::cas::Digest::from_hex(&hex).unwrap();
+
+        // With the sidecar in place: the label rides, and nothing claims a missing record.
+        let meta = meta_of(&read(&h, &hex, None, Some(0)).await);
+        assert!(meta.contains("label: a test artifact"), "{meta}");
+        assert!(!meta.contains("provenance:"), "{meta}");
+
+        // Now take the record away, leaving the object.
+        let object = h.media_store().unwrap().path_for(&digest).unwrap();
+        std::fs::remove_file(object.with_extension("json")).expect("remove the sidecar");
+
+        let r = read(&h, &hex, None, None).await;
+        let meta = meta_of(&r);
+        assert!(
+            meta.contains("provenance: absent"),
+            "the missing record is stated: {meta}"
+        );
+        assert!(!meta.contains("label:"), "and no label is invented: {meta}");
+        assert_eq!(
+            r.content[1].as_text().expect("text body").text,
+            "the object outlives its record",
+            "and the bytes still come back — a lost record is not a lost object"
+        );
+    }
+
     /// The digest is validated before it can touch a lookup, an unknown one is a clean
     /// not-found, and neither folds into the other. Ported from the resource this tool
     /// replaced — the guarantees survive the change of surface.
@@ -5785,6 +5864,48 @@ enabled = false
         );
     }
 
+    /// **A server whose whole surface is `read_cas` does nothing, and says so.**
+    ///
+    /// `has_substantive_tools` is what `main`'s empty-surface guard actually asks, and
+    /// until this test it was only exercised through configurations the *flag* guard
+    /// rejects first — so the follower rule itself was never pinned. Build the real
+    /// degenerate server: every flag off, no staffable cast, media CAS on. It advertises
+    /// exactly one tool, that tool is a follower, and the answer is no.
+    ///
+    /// This matters because `read_cas` rides a store that is ON by default. Counted as
+    /// substantive, it would keep the guard from ever firing on a stock install — a check
+    /// that cannot fire protects nothing.
+    #[test]
+    fn a_surface_of_only_read_cas_is_not_substantive() {
+        let h = hermetic_handler_from_toml(
+            "[server.tools]\nconsult = false\nexplore = false\ndeliberate = false\n\
+             oneshot = false\nrun_kaish = false\nbatch = false\nlist_models = false\n\
+             generate = false\n",
+        );
+        assert_eq!(
+            h.advertised_tools(),
+            vec!["read_cas".to_string()],
+            "the degenerate surface is exactly the follower"
+        );
+        assert!(
+            !h.has_substantive_tools(),
+            "a server that can only hand back what earlier runs produced is the useless \
+             server the startup guard exists to refuse"
+        );
+
+        // And the same handler with one castless tool back on IS substantive — the rule
+        // is about followers, not about being small.
+        let with_shell = hermetic_handler_from_toml(
+            "[server.tools]\nconsult = false\nexplore = false\ndeliberate = false\n\
+             oneshot = false\nbatch = false\nlist_models = false\ngenerate = false\n",
+        );
+        assert!(
+            with_shell.has_substantive_tools(),
+            "run_kaish alone is a narrow server, not an empty one: {:?}",
+            with_shell.advertised_tools()
+        );
+    }
+
     /// `read_cas` is advertised exactly when the media CAS is live — the same liveness the
     /// resource it replaces keyed on. It takes no cast, so nothing else gates it.
     #[test]
@@ -5825,9 +5946,16 @@ enabled = false
             crate::config::CasMode::Memory,
         )
         .expect_err("the CAS resource route no longer exists");
+        // Recognized, not served: a host with a cached template gets told where the
+        // bytes went, with the digest it already has as the argument to use.
         assert!(
-            err.message.to_lowercase().contains("unknown"),
-            "an artifact URI is now just an unknown resource: {}",
+            err.message.contains("read_cas") && err.message.contains(&hex),
+            "the removal must hand a stale caller its migration: {}",
+            err.message
+        );
+        assert!(
+            !err.message.to_lowercase().contains("unknown resource"),
+            "and not the bare unknown-resource message: {}",
             err.message
         );
 
