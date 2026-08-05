@@ -305,6 +305,14 @@ record. Each later release appends a new section at the top.
   blind to `lane = "batch"` — rendering a batch slot's `effort` and `temperature` as
   effective when batch sends no sampling at all and floors the effort.
 
+- **`kaibo://config` now flags `thinking_style` as inert on a non-Anthropic slot.**
+  The override only moves anything on the Anthropic wire (it picks the adaptive vs.
+  budget tier there); every other wire classifies its thinking style from the model
+  id alone and never reads it, so a `thinking_style` forced on a DeepSeek/Gemini/
+  OpenRouter/generic-OpenAI slot — on the slot itself or inherited from
+  `[defaults]` — used to render as if it were shaping the request when it was a
+  pure no-op.
+
 - **The startup warning and `kaibo://config` can no longer disagree about an effort.**
   They answer from one shared rule now, so a value the batch lane lifts is reported by
   both (it used to be flagged in the resource and stay silent at startup), and the
