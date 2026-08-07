@@ -259,8 +259,9 @@ human at a terminal can drive kaibo directly:
 | `consult` | `kaibo consult "question" [--cast … --attach … --session … --json]` |
 | `oneshot` | `kaibo oneshot "prompt" [--attach … --json]` (context also via stdin: `oneshot "review this" < diff.txt`) |
 | `explore` | `kaibo explore "question" [--cast … --json]` |
+| `deliberate` | `kaibo deliberate "question" [--cast … --attach … --dossier … --json]` |
 | `run_kaish` | `kaibo kaish -c 'script'` |
-| `batch_submit`, `job_get`/`job_list` (batch handles) | `kaibo batch submit \| get \| list` |
+| `batch_submit`, `job_get`/`job_list`/`job_cancel` (batch handles) | `kaibo batch submit \| get \| list \| cancel` |
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
 | `configure` prompt | `kaibo configure [goal]` |
@@ -272,8 +273,27 @@ kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 **Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
 explicit spelling for the same thing, and may become required in the future.
 
-`consult_submit`/`job_wait` and `deliberate`'s direct lane are not fully implemented
-on the CLI yet — tracked as [#82](https://github.com/tobert/kaibo/issues/82).
+`kaibo deliberate` ends two ways, because its two lanes are genuinely different work.
+A **batch** cast submits to the provider and prints the durable handle — the
+deliberation outlives the process, and `kaibo batch get <handle>` collects it later:
+
+```sh
+HANDLE=$(kaibo deliberate "is this abstraction right?" --cast gemini-deliberate)
+kaibo batch get "$HANDLE"          # minutes to hours later, or after a reboot
+```
+
+A **direct** cast has no handle to give — the job would be this process — so it runs
+the long local completion in the foreground and prints the answer, saying on stderr
+that it is waiting. Either way kaibo keeps the dossier and names its digest; pass that
+back as `--dossier` to put the same evidence in front of a second cast with no explorer
+sweep at all, across front doors:
+
+```sh
+kaibo deliberate "second opinion, same evidence" --cast fable --dossier kaibo://cas/<digest>
+```
+
+`consult_submit`/`job_wait` remain MCP-only: their value is keeping work running inside
+a long-lived session, which does not map onto a process that exits.
 
 **stdout is the answer, stderr is everything else.** Progress, logs, and warnings
 go to stderr, so piping stays clean; the answer (with the same provenance footer

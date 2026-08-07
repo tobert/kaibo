@@ -36,10 +36,10 @@ use rig_core::completion::Usage;
 use rmcp::ErrorData as McpError;
 
 use crate::batch::{BatchItem, BatchPoll};
-use crate::config::{Config, ModelRole, ToolDisables};
+use crate::config::{Config, Lane, ModelRole, ToolDisables};
 use crate::consult::{
-    batch_system_prompt, consult, explore_with, oneshot as run_oneshot_engine, ConsultConfig,
-    ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
+    batch_system_prompt, consult, deliberation_prompt, explore_with, oneshot as run_oneshot_engine,
+    ConsultConfig, ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
 };
 use crate::progress::TerminalSink;
 use crate::sandbox::KaishWorker;
@@ -49,6 +49,7 @@ use crate::server::{
     CONFIG_EXAMPLE_TOML,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
+use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
 pub const EXIT_OK: i32 = 0;
@@ -123,6 +124,9 @@ pub enum Command {
     Oneshot(OneshotArgs),
     /// Survey the codebase and print a cited report (the evidence half of consult).
     Explore(ExploreArgs),
+    /// Investigate, then hand that evidence to a heavyweight OFFLINE synth — a frontier
+    /// model on the provider's batch lane, or a big local model taking the time it takes.
+    Deliberate(DeliberateArgs),
     /// Run one kaish (sh-like) command against the read-only project and print its output.
     Kaish(KaishArgs),
     /// Provider batch lanes — submit a fan-out, get results, list live/recovered handles.
@@ -416,6 +420,64 @@ pub struct ExploreArgs {
     pub json: bool,
 }
 
+/// `kaibo deliberate` — investigate, then reason offline over the evidence.
+///
+/// The two lanes end differently, and that is the whole shape of this command. A **batch**
+/// cast submits to the provider and prints a durable handle: the work outlives this
+/// process, and `kaibo batch get <handle>` collects it whenever. A **direct** cast has no
+/// handle to give — the job would be this process — so it runs the long local completion
+/// in the foreground and prints the answer, which is the CLI's usual contract. Either way
+/// the dossier is kept, and `--dossier` hands a kept one to a second cast with no sweep.
+#[derive(Args, Debug)]
+pub struct DeliberateArgs {
+    /// The hard question to reason through. Say in prose what you want deliberated —
+    /// kaibo's explorer locates and reads the real, current code to build the dossier the
+    /// offline synth then reasons over.
+    pub question: String,
+
+    /// Project to investigate. Optional — defaults to the root/allowed cwd; must resolve
+    /// to at-or-under an allowed tree.
+    #[arg(long, value_name = "DIR")]
+    pub path: Option<String>,
+
+    /// Workspace file central to the question: the dossier-building explorer is directed
+    /// to read it WHOLE, so its content reaches the offline synth through the dossier.
+    /// Text only. Repeatable.
+    #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
+    pub attach: Vec<String>,
+
+    /// Reuse a dossier kaibo already kept instead of sweeping for a new one: the digest
+    /// an earlier deliberation printed, bare or as its `kaibo://cas/<digest>` URI. No
+    /// explorer runs, so this costs one synth — the way to put the same evidence in front
+    /// of a second cast. The explorer flags below have nothing to act on with it and are
+    /// refused rather than ignored.
+    #[arg(long, value_name = "DIGEST")]
+    pub dossier: Option<String>,
+
+    /// Override the explorer (dossier-building) model id (verbatim; pair with
+    /// --explorer-backend to also retarget).
+    #[arg(long, value_name = "ID")]
+    pub explorer_model: Option<String>,
+    /// Run the explorer override on this backend (name or alias). Requires --explorer-model.
+    #[arg(long, value_name = "BACKEND")]
+    pub explorer_backend: Option<String>,
+    /// Override the synth (deliberating) model id. Its lane — batch or direct — still
+    /// comes from the cast. Pair with --synth-backend to also retarget.
+    #[arg(long, value_name = "ID")]
+    pub synth_model: Option<String>,
+    /// Run the synth override on this backend (name or alias). Requires --synth-model.
+    #[arg(long, value_name = "BACKEND")]
+    pub synth_backend: Option<String>,
+    /// Max tool-loop turns for the dossier-building explorer sweep (default 100).
+    #[arg(long, value_name = "N")]
+    pub explorer_max_turns: Option<usize>,
+
+    /// Emit a JSON envelope on stdout instead of prose. A batch cast's envelope carries
+    /// the handle to collect later; a direct cast's carries the answer it waited for.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `kaibo kaish` — one non-interactive kaish command through the same READ-ONLY sandbox
 /// the `run_kaish` MCP tool uses. Scriptable single execution only: no readline, no
 /// REPL. The process exits with kaish's own exit code (0 ok, 126 blocked, 124 timed out).
@@ -455,6 +517,8 @@ pub enum BatchCmd {
     Get(BatchGetArgs),
     /// List batches the providers still know about, plus handles recovered from the store.
     List(BatchListArgs),
+    /// Ask the provider to stop a batch. Already-finished items still collect with `get`.
+    Cancel(BatchGetArgs),
 }
 
 /// `kaibo batch submit` — like `oneshot`, no tools/codebase access: each prompt carries
@@ -1253,6 +1317,458 @@ async fn explore_inner(
 }
 
 // ---------------------------------------------------------------------------
+// deliberate
+// ---------------------------------------------------------------------------
+
+/// Settle this run's media CAS, the same three ways the MCP server does
+/// ([`crate::cas::open_media_store`]).
+///
+/// `persistence_active` is what the durable store actually did, not what config asked
+/// for — the identical rule the server applies, so the same install lands in the same
+/// mode on either road. A disk-open failure is fatal here too: kaibo never quietly
+/// downgrades to a memory store that loses what you paid for.
+fn open_media_cas(
+    resolver: &Resolver,
+    persistence_active: bool,
+) -> Result<Option<Arc<crate::cas::MediaStore>>, SetupError> {
+    let allowed = resolver.allowed_set();
+    let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+    let (store, _ephemeral) = crate::cas::open_media_store(
+        &resolver.config.cas,
+        resolver.config.cas_mode(persistence_active),
+        &refs,
+        crate::cas::probe_backing,
+    )
+    .map_err(|e| SetupError {
+        kind: "setup",
+        message: format!("{e:#}"),
+        code: EXIT_SETUP,
+    })?;
+    Ok(store.map(Arc::new))
+}
+
+/// Run `kaibo deliberate` — investigate, then reason offline over the evidence.
+///
+/// Which lane the cast carries decides what this process does with its life, and the two
+/// answers are honest opposites: a batch cast prints a durable handle and exits (the work
+/// is the provider's now), a direct cast waits for the local model and prints the answer
+/// (this process IS the job — there is nothing else to hold it). Issue #82 held the
+/// direct lane off the CLI while a `job-N` looked like the only shape; it isn't.
+pub async fn run_deliberate(common: CommonArgs, args: DeliberateArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    match deliberate_inner(&common, &args, &resolver).await {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(args.json, kind, message, code),
+    }
+}
+
+async fn deliberate_inner(
+    common: &CommonArgs,
+    args: &DeliberateArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    // A reuse call carrying explorer flags is self-contradictory; say so before resolving
+    // anything, so it costs nothing. Shared with the MCP handler.
+    if let Some(refusal) = crate::server::inert_explorer_args(crate::server::ExplorerArgs {
+        dossier: args.dossier.as_deref(),
+        attach: &args.attach,
+        model: args.explorer_model.as_deref(),
+        backend: args.explorer_backend.as_deref(),
+        max_turns: args.explorer_max_turns,
+    }) {
+        return Err(SetupError {
+            kind: "usage",
+            message: refusal,
+            code: EXIT_USAGE,
+        });
+    }
+    let root = resolver
+        .resolve_root(args.path.clone())
+        .map_err(SetupError::setup)?;
+    let mut cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    // deliberate = investigate → OFFLINE synth. Capture the lane from the chosen cast
+    // BEFORE any override runs: an override retargets the model, never the mechanism, and
+    // `apply_model_override` replaces the slot with a laneless one (see the MCP handler's
+    // `deliberation_lane_with_overrides` for the invariant this mirrors).
+    let lane = cast.synth_lane().ok_or_else(|| SetupError {
+        kind: "usage",
+        message: format!(
+            "cast `{}` has no offline synth — `deliberate` needs a cast pairing an \
+             explorer with a synth on the `batch` or `direct` lane (the example config's \
+             `fable`/`gemini-deliberate`/`local-direct`, or your own). For an answer this \
+             turn, use `kaibo consult`.",
+            cast.name
+        ),
+        code: EXIT_USAGE,
+    })?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Explorer,
+            args.explorer_model.as_deref(),
+            args.explorer_backend.as_deref(),
+            "explorer_model",
+            "explorer_backend",
+        )
+        .map_err(SetupError::usage)?;
+    resolver
+        .apply_model_override(
+            &mut cast,
+            ModelRole::Synth,
+            args.synth_model.as_deref(),
+            args.synth_backend.as_deref(),
+            "synth_model",
+            "synth_backend",
+        )
+        .map_err(SetupError::usage)?;
+    let system = batch_system_prompt(resolver.resolved_prompts(&cast).batch.as_deref());
+
+    // The durable store settles two things at once: whether a batch handle can be
+    // recorded, and (as the server's own rule) whether the CAS is disk or memory.
+    let store = open_batch_store(resolver).await;
+    let media = open_media_cas(resolver, store.is_some())?;
+
+    // Stage 1 — build the dossier, or reuse one already kept.
+    let (dossier, images, dossier_usage, kept, explorer_model) = if let Some(reference) =
+        args.dossier.as_deref()
+    {
+        let (text, kept) =
+            crate::server::load_dossier(media.as_ref(), reference).map_err(|message| {
+                SetupError {
+                    kind: "usage",
+                    message,
+                    code: EXIT_USAGE,
+                }
+            })?;
+        (text, Vec::new(), Usage::new(), Some(kept), None)
+    } else {
+        let explorer = resolver
+            .arm(&cast, ModelRole::Explorer)
+            .map_err(SetupError::setup)?;
+        let explorer_model = explorer.model.clone();
+        let attachments = resolver
+            .resolve_sweep_attachments(&root, &args.attach, "deliberate")
+            .await
+            .map_err(SetupError::setup)?;
+        let cfg = ExploreConfig {
+            phase: PhaseContext {
+                progress: Arc::new(TerminalSink),
+                house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
+                prompts: resolver.resolved_prompts(&cast),
+                orientation: resolver
+                    .orientation(&root)
+                    .await
+                    .map_err(SetupError::setup)?,
+                call_deadline: resolver.config.defaults.call_deadline,
+            },
+            explorer_max_turns: args
+                .explorer_max_turns
+                .unwrap_or(resolver.config.defaults.explorer_max_turns),
+            sandbox: resolver.config.sandbox.clone(),
+            max_attachments: resolver.config.defaults.max_attachments,
+        };
+        // The offline synth's caps decide what the sweep may route to it — resolved
+        // key-free, before the sweep spends anything, exactly as the MCP handler does.
+        let synth_slot = cast
+            .require_slot(ModelRole::Synth)
+            .map_err(|e| SetupError {
+                kind: "usage",
+                message: e.to_string(),
+                code: EXIT_USAGE,
+            })?;
+        let synth_backend = resolver
+            .config
+            .resolve_backend(&synth_slot.backend)
+            .map_err(|e| SetupError {
+                kind: "setup",
+                message: e.to_string(),
+                code: EXIT_SETUP,
+            })?;
+        let synth_caps = ModelCaps::resolve(synth_backend.kind, &synth_slot.id, synth_slot.vision);
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::OfflineSynth,
+            label: Arc::from(format!(
+                "the offline synth (`{}`) on cast `{}`",
+                synth_slot.id, cast.name
+            )),
+            vision: synth_caps.vision,
+        };
+        let sink = (resolver.config.defaults.max_attachments > 0).then(|| {
+            Arc::new(SweepAttachSink::new(
+                resolver.config.defaults.max_attachments,
+                consumer.clone(),
+                std::collections::HashSet::new(),
+            ))
+        });
+        let (mut dossier, usage) = match explore_with(
+            &args.question,
+            root,
+            &explorer,
+            &cfg,
+            &attachments,
+            sink.as_ref(),
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => return Ok(fail_consultation(args.json, "deliberate", &cast.name, e)),
+        };
+        let (images, kept) = crate::server::stitch_and_keep(
+            &mut dossier,
+            &consumer,
+            sink.as_ref(),
+            media.as_ref(),
+            &args.question,
+            &cast.name,
+            &explorer_model,
+        );
+        (dossier, images, usage, kept, Some(explorer_model))
+    };
+
+    // Stage 2 — the lane decides how this process ends.
+    match lane {
+        Lane::Batch => {
+            deliberate_batch_cli(
+                args,
+                resolver,
+                &cast,
+                &dossier,
+                &images,
+                &system,
+                dossier_usage,
+                kept.as_ref(),
+                explorer_model.as_deref(),
+                store,
+            )
+            .await
+        }
+        Lane::Direct => {
+            deliberate_direct_cli(
+                args,
+                resolver,
+                &cast,
+                &dossier,
+                &images,
+                &system,
+                dossier_usage,
+                kept.as_ref(),
+                explorer_model.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
+/// Stage 2, batch lane: submit and hand back the durable handle. The work outlives this
+/// process — `kaibo batch get <handle>` collects it, exactly as it collects a
+/// `kaibo batch submit`. stdout carries the handle alone so a script can pipe it.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct, named stage-2 input
+async fn deliberate_batch_cli(
+    args: &DeliberateArgs,
+    resolver: &Resolver,
+    cast: &crate::config::Cast,
+    dossier: &str,
+    images: &[crate::attach::Attachment],
+    system: &str,
+    dossier_usage: Usage,
+    kept: Option<&crate::server::KeptDossier>,
+    explorer_model: Option<&str>,
+    store: Option<crate::store::SessionStore>,
+) -> Result<i32, SetupError> {
+    let slot = cast
+        .require_slot(ModelRole::Synth)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    let backend = resolver
+        .config
+        .resolve_backend(&slot.backend)
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: e.to_string(),
+            code: EXIT_SETUP,
+        })?;
+    let backend_name = backend.name.clone();
+    let model = slot.id.clone();
+    let provider =
+        crate::batch::submitter(backend, slot, &resolver.config.defaults).map_err(|e| {
+            SetupError {
+                kind: "setup",
+                message: format!("{e:#}"),
+                code: EXIT_SETUP,
+            }
+        })?;
+    let items = vec![BatchItem {
+        custom_id: "0".to_string(),
+        prompt: deliberation_prompt(&args.question, dossier),
+    }];
+    let provider_id = match provider.submit(system, images, &items).await {
+        Ok(id) => id,
+        Err(e) => return Ok(fail_consultation(args.json, "deliberate", &cast.name, e)),
+    };
+    let handle = format!("{backend_name}/{provider_id}");
+    // Persist the handle with the dossier's address on its label — the same record the
+    // MCP handler writes, so a handle recovered by `kaibo batch list` leads back to the
+    // evidence whichever front door launched it.
+    if let Some(store) = store {
+        let label = match kept {
+            Some(k) => format!(
+                "deliberate · synth `{model}` · dossier {}{}",
+                crate::cas::CAS_URI_PREFIX,
+                k.digest
+            ),
+            None => format!("deliberate · synth `{model}`"),
+        };
+        if let Err(e) = store
+            .put_batch(&backend_name, &provider_id, Some(&label))
+            .await
+        {
+            tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
+        }
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "handle": handle,
+                "cast": cast.name,
+                "models": {"explorer": explorer_model, "synth": model},
+                "dossier": kept.map(|k| k.digest.clone()),
+                "usage": usage_json(&dossier_usage),
+            })
+        );
+    } else {
+        println!("{handle}");
+        let stage_one = match explorer_model {
+            Some(m) => format!("dossier built (explorer `{m}`)"),
+            None => "dossier reused (no explorer ran)".to_string(),
+        };
+        eprintln!(
+            "kaibo: {stage_one}, handed to the batch lane on cast `{}` (synth `{model}`) — \
+             `kaibo batch get {handle}` for the deliberation.{}",
+            cast.name,
+            crate::server::dossier_ack(kept)
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+/// Stage 2, direct lane: run the long local completion in the FOREGROUND and print the
+/// answer.
+///
+/// The MCP server hands this lane a session-scoped `job-N` because it has a process to
+/// hold the job open. A one-shot CLI invocation does not — it would submit, exit, and take
+/// the job with it (issue #82). So the process *is* the job: it waits, prints, and exits,
+/// which is also the CLI's ordinary contract. The wall-clock backstop is the synth
+/// backend's own `request_timeout`, shared with the MCP lane, because a local model that
+/// takes three hours is the point rather than a hang.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct, named stage-2 input
+async fn deliberate_direct_cli(
+    args: &DeliberateArgs,
+    resolver: &Resolver,
+    cast: &crate::config::Cast,
+    dossier: &str,
+    images: &[crate::attach::Attachment],
+    system: &str,
+    dossier_usage: Usage,
+    kept: Option<&crate::server::KeptDossier>,
+    explorer_model: Option<&str>,
+) -> Result<i32, SetupError> {
+    let synth = resolver
+        .arm(cast, ModelRole::Synth)
+        .map_err(SetupError::setup)?;
+    let synth_slot = cast
+        .require_slot(ModelRole::Synth)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    let synth_backend = resolver
+        .config
+        .resolve_backend(&synth_slot.backend)
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: e.to_string(),
+            code: EXIT_SETUP,
+        })?;
+    let deadline = crate::server::deliberate_direct_deadline(synth_backend);
+    // Say what is about to happen before it happens: this blocks for as long as the local
+    // model needs, and a caller staring at a silent terminal deserves to know why.
+    eprintln!(
+        "kaibo: deliberating on cast `{}` (direct synth `{}`) — one long local completion, \
+         this process waits for it.",
+        cast.name, synth.model
+    );
+    match crate::consult::deliberate_direct(
+        &args.question,
+        dossier,
+        images,
+        &synth,
+        system,
+        deadline,
+    )
+    .await
+    {
+        Ok((answer, synth_usage)) => {
+            let usage = dossier_usage + synth_usage;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "answer": answer,
+                        "cast": cast.name,
+                        "models": {"explorer": explorer_model, "synth": synth.model},
+                        "dossier": kept.map(|k| k.digest.clone()),
+                        "usage": usage_json(&usage),
+                    })
+                );
+            } else {
+                let mut roles: Vec<(&str, &str)> = Vec::with_capacity(2);
+                if let Some(m) = explorer_model {
+                    roles.push(("explorer", m));
+                }
+                roles.push(("synth", &synth.model));
+                println!(
+                    "{}",
+                    with_provenance(
+                        crate::server::with_dossier(answer, kept),
+                        &cast.name,
+                        &roles,
+                        &usage
+                    )
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(args.json, "deliberate", &cast.name, e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // kaish
 // ---------------------------------------------------------------------------
 
@@ -1366,6 +1882,7 @@ pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
         BatchCmd::Submit(a) => a.json,
         BatchCmd::Get(a) => a.json,
         BatchCmd::List(a) => a.json,
+        BatchCmd::Cancel(a) => a.json,
     };
     let config = match load_config(&common) {
         Ok(c) => c,
@@ -1381,6 +1898,7 @@ pub async fn run_batch(common: CommonArgs, args: BatchArgs) -> i32 {
         BatchCmd::Submit(a) => batch_submit_inner(&common, &a, &resolver).await,
         BatchCmd::Get(a) => batch_get_inner(&a, &resolver).await,
         BatchCmd::List(a) => batch_list_inner(&a, &resolver).await,
+        BatchCmd::Cancel(a) => batch_cancel_inner(&a, &resolver).await,
     };
     match outcome {
         Ok(code) => code,
@@ -1566,20 +2084,27 @@ async fn batch_submit_inner(
     Ok(EXIT_OK)
 }
 
-async fn batch_get_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32, SetupError> {
-    let (backend_name, provider_id) = args
-        .handle
+/// Split a `backend/provider-id` handle, or refuse it by name.
+///
+/// The split is unambiguous because a backend name carries no `/` (enforced at config
+/// load), so the FIRST `/` is always the boundary even when the provider id contains more
+/// (a Gemini id is `batches/<id>`). Shared by every verb that takes a handle.
+fn split_batch_handle(handle: &str) -> Result<(&str, &str), SetupError> {
+    handle
         .split_once('/')
         .filter(|(b, id)| !b.is_empty() && !id.is_empty())
         .ok_or_else(|| SetupError {
             kind: "usage",
             message: format!(
-                "batch handle {:?} must be \"backend/provider-id\" — pass the handle \
-                 `kaibo batch submit` printed",
-                args.handle
+                "batch handle {handle:?} must be \"backend/provider-id\" — pass the handle \
+                 `kaibo batch submit` or `kaibo deliberate` printed"
             ),
             code: EXIT_USAGE,
-        })?;
+        })
+}
+
+async fn batch_get_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    let (backend_name, provider_id) = split_batch_handle(&args.handle)?;
     let backend = resolver
         .config
         .resolve_backend(backend_name)
@@ -1606,6 +2131,74 @@ async fn batch_get_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32
             Ok(EXIT_OK)
         }
         Err(e) => Ok(fail_consultation(args.json, "batch get", backend_name, e)),
+    }
+}
+
+/// Ask the provider to stop a batch.
+///
+/// Cancellation is a REQUEST, not a guarantee: a provider finishes what is already in
+/// flight, so the honest word to a caller is "requested" and the way to learn what
+/// actually happened is `kaibo batch get` (whose poll reports the terminal state and any
+/// items that landed anyway). kaibo deletes no record here — a canceled batch's finished
+/// items are still yours, and still cost what they cost.
+async fn batch_cancel_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    let (backend_name, provider_id) = split_batch_handle(&args.handle)?;
+    let backend = resolver
+        .config
+        .resolve_backend(backend_name)
+        .map_err(|e| SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        })?;
+    // A backend with no batch lane at all is the caller naming the wrong thing, not a
+    // broken setup — say which kinds have one rather than failing later, deeper, and less
+    // clearly on the poller construction (DeepSeek cross-family review, 2026-08-07).
+    if !crate::batch::batch_supported(backend) {
+        return Err(SetupError {
+            kind: "usage",
+            message: format!(
+                "backend {:?} ({:?}) has no batch lane, so it holds no batch to cancel \
+                 (batch-capable: {}).",
+                backend.name,
+                backend.kind,
+                crate::batch::supported_kinds_list()
+            ),
+            code: EXIT_USAGE,
+        });
+    }
+    // Poll and cancel need only the connection, never a cast or a model — which is why a
+    // handle stays addressable from any front door, after any restart.
+    let provider = crate::batch::poller(backend).map_err(|e| SetupError {
+        kind: "setup",
+        message: format!("{e:#}"),
+        code: EXIT_SETUP,
+    })?;
+    match provider.cancel(provider_id).await {
+        Ok(()) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "handle": args.handle,
+                        "status": "cancel_requested",
+                    })
+                );
+            } else {
+                eprintln!(
+                    "kaibo: requested cancellation of `{}` — `kaibo batch get {}` for the \
+                     final state and any items that finished first.",
+                    args.handle, args.handle
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(
+            args.json,
+            "batch cancel",
+            backend_name,
+            e,
+        )),
     }
 }
 
@@ -2263,6 +2856,244 @@ mod tests {
         let err = batch_submit_inner(&common, &submit, &resolver)
             .await
             .expect_err("an interactive cast on batch submit must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+    }
+
+    /// `kaibo deliberate` takes the same arguments as the MCP tool under the CLI's
+    /// spellings, and the global flags still land on `common`.
+    #[test]
+    fn deliberate_subcommand_parses_its_flags() {
+        let cli = Cli::parse_from([
+            "kaibo",
+            "deliberate",
+            "is this abstraction right?",
+            "--cast",
+            "gemini-deliberate",
+            "--path",
+            "/tmp/proj",
+            "--attach",
+            "src/a.rs",
+            "--attach",
+            "src/b.rs",
+            "--synth-model",
+            "other-synth",
+            "--explorer-max-turns",
+            "7",
+            "--json",
+        ]);
+        assert_eq!(cli.common.cast.as_deref(), Some("gemini-deliberate"));
+        match cli.command {
+            Some(Command::Deliberate(d)) => {
+                assert_eq!(d.question, "is this abstraction right?");
+                assert_eq!(d.path.as_deref(), Some("/tmp/proj"));
+                assert_eq!(d.attach, vec!["src/a.rs", "src/b.rs"]);
+                assert_eq!(d.synth_model.as_deref(), Some("other-synth"));
+                assert_eq!(d.explorer_max_turns, Some(7));
+                assert!(d.json);
+                assert_eq!(d.dossier, None);
+            }
+            other => panic!("expected deliberate, got {other:?}"),
+        }
+    }
+
+    /// The reuse road on the CLI: the explorer flags `--dossier` makes inert are refused
+    /// **by name**, before anything resolves — never stripped, which would run a call the
+    /// caller did not ask for and hand back an answer that looks like it honored them.
+    #[tokio::test]
+    async fn deliberate_with_a_dossier_and_attach_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let digest = "aa".repeat(32);
+        let cli = Cli::parse_from([
+            "kaibo",
+            "deliberate",
+            "q",
+            "--dossier",
+            &digest,
+            "--attach",
+            "src/x.rs",
+        ]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Deliberate(d)) => d,
+            other => panic!("expected deliberate, got {other:?}"),
+        };
+        let err = deliberate_inner(&common, &args, &resolver)
+            .await
+            .expect_err("`--attach` with `--dossier` must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("`attach`"),
+            "the refusal names the inert flag: {}",
+            err.message
+        );
+    }
+
+    /// A cast with no OFFLINE synth cannot deliberate; the refusal names casts that can
+    /// and points at `consult` for an answer this turn. Exit 2, before any network.
+    #[tokio::test]
+    async fn deliberate_on_an_interactive_cast_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        // `anthropic` is interactive — its synth sits on no offline lane.
+        let cli = Cli::parse_from(["kaibo", "deliberate", "q", "--cast", "anthropic"]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Deliberate(d)) => d,
+            other => panic!("expected deliberate, got {other:?}"),
+        };
+        let err = deliberate_inner(&common, &args, &resolver)
+            .await
+            .expect_err("an interactive cast on deliberate must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("no offline synth") && err.message.contains("kaibo consult"),
+            "the refusal explains the lane and names the alternative: {}",
+            err.message
+        );
+    }
+
+    /// `batch cancel` takes a handle, and the shared split every handle verb uses keeps
+    /// `get` and `cancel` from drifting apart. The FIRST `/` is the boundary, so a Gemini
+    /// id keeps its own slashes.
+    #[test]
+    fn batch_cancel_parses_a_handle_and_refuses_a_malformed_one() {
+        let cli = Cli::parse_from(["kaibo", "batch", "cancel", "gem/batches/abc"]);
+        match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Cancel(c) => assert_eq!(c.handle, "gem/batches/abc"),
+                other => panic!("expected cancel, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        }
+
+        let (backend, id) = split_batch_handle("gem/batches/abc").expect("a valid handle splits");
+        assert_eq!((backend, id), ("gem", "batches/abc"));
+
+        for bad in ["no-slash", "/leading", "trailing/"] {
+            let err = split_batch_handle(bad).expect_err("a malformed handle is refused");
+            assert_eq!(err.code, EXIT_USAGE);
+            assert!(
+                err.message.contains("backend/provider-id"),
+                "the refusal shows the shape: {}",
+                err.message
+            );
+        }
+    }
+
+    /// A cast that can actually deliberate, for the tests that need one — no built-in
+    /// pairs an explorer with an offline synth (see `tests/gating.rs`), so a fixture is
+    /// the only way to reach the road past the lane check. `key_optional` keeps it
+    /// resolvable with no credential in the environment.
+    const DELIBERATE_CAST_TOML: &str = r#"
+        [backends.gem]
+        kind = "gemini"
+        key_optional = true
+
+        [casts.mydeliberate]
+        explorer = "gem/some-lite"
+        synth    = { backend = "gem", id = "some-pro", lane = "batch" }
+    "#;
+
+    /// **The lane must be captured BEFORE the model overrides run.** `apply_model_override`
+    /// replaces a slot with a *laneless* one, so reading `synth_lane()` afterward sees
+    /// `None` and refuses every deliberate-capable cast as "no offline synth" — the
+    /// headline feature broken for everyone by a two-line reordering. The MCP road pins
+    /// this in `deliberation_lane_with_overrides`; the CLI inlines the same order and had
+    /// nothing holding it (DeepSeek cross-family review, 2026-08-07).
+    ///
+    /// Driving it: a deliberate cast WITH a synth override must get past the lane check.
+    /// It fails further along on this keyless fixture, which is fine — any outcome except
+    /// the lane refusal proves the capture survived the override.
+    #[tokio::test]
+    async fn the_deliberate_lane_survives_a_synth_override_on_the_cli() {
+        let config = Config::from_toml_str(DELIBERATE_CAST_TOML).expect("fixture config parses");
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from([
+            "kaibo",
+            "deliberate",
+            "q",
+            "--cast",
+            "mydeliberate",
+            "--synth-model",
+            "some-other-pro",
+        ]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Deliberate(d)) => d,
+            other => panic!("expected deliberate, got {other:?}"),
+        };
+        if let Err(err) = deliberate_inner(&common, &args, &resolver).await {
+            assert!(
+                !err.message.contains("no offline synth"),
+                "the lane must be captured before the synth override runs, but the call \
+                 was refused as laneless: {}",
+                err.message
+            );
+        }
+    }
+
+    /// A cancel naming a backend with no batch lane is refused as a USAGE error naming the
+    /// batch-capable kinds — not left to fail deeper and less clearly when the poller is
+    /// built (DeepSeek cross-family review, 2026-08-07).
+    #[tokio::test]
+    async fn batch_cancel_on_a_backend_without_a_batch_lane_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        // `deepseek` is a real, configured backend whose kind has no batch lane.
+        let cli = Cli::parse_from(["kaibo", "batch", "cancel", "deepseek/abc"]);
+        let args = match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Cancel(c) => c,
+                other => panic!("expected cancel, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        };
+        let err = batch_cancel_inner(&args, &resolver)
+            .await
+            .expect_err("a backend with no batch lane must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("no batch lane"),
+            "the refusal says why, not just that it failed: {}",
+            err.message
+        );
+    }
+
+    /// A cancel naming a backend that does not exist is a usage error before any network —
+    /// the same pre-flight `batch get` applies.
+    #[tokio::test]
+    async fn batch_cancel_on_an_unknown_backend_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from(["kaibo", "batch", "cancel", "nosuchbackend/abc"]);
+        let args = match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Cancel(c) => c,
+                other => panic!("expected cancel, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        };
+        let err = batch_cancel_inner(&args, &resolver)
+            .await
+            .expect_err("an unknown backend must be refused");
         assert_eq!(err.code, EXIT_USAGE);
         assert_eq!(err.kind, "usage");
     }

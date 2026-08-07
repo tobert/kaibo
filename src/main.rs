@@ -47,6 +47,9 @@ async fn main() -> Result<()> {
         Some(Command::Explore(args)) => {
             std::process::exit(kaibo::cli::run_explore(cli.common, args).await)
         }
+        Some(Command::Deliberate(args)) => {
+            std::process::exit(kaibo::cli::run_deliberate(cli.common, args).await)
+        }
         Some(Command::Kaish(args)) => {
             std::process::exit(kaibo::cli::run_kaish(cli.common, args).await)
         }

@@ -65,12 +65,18 @@ pub use resolver::Resolver;
 // footer, failure text, `kaibo://config` document, and `batch list` recency window the
 // MCP handler does.
 pub(crate) use config_resource::render_config_resource;
+// `deliberate` is the same two stages on either road, so the CLI borrows the pieces
+// rather than growing a second copy of them: how a dossier is kept and loaded, how it is
+// named back to the caller, which explorer arguments a reuse call must refuse, and the
+// direct lane's wall-clock backstop.
+pub(crate) use dossier::{
+    dossier_ack, inert_explorer_args, keep_dossier, load_dossier, with_dossier, ExplorerArgs,
+    KeptDossier,
+};
 pub(crate) use render::{
     batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
     BATCH_RECENCY_WINDOW_SECS,
 };
-
-use dossier::{dossier_ack, keep_dossier, with_dossier, KeptDossier};
 use render::{
     batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
     consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
@@ -160,7 +166,7 @@ const DELIBERATE_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::fro
 /// slow local model keeps its full configured patience without forcing the interactive
 /// ceiling high (a 3h local `deliberate` needs a 3h `request_timeout` set anyway, and
 /// inherits it here). Pure, so the sizing decision is pinned without spawning a job.
-fn deliberate_direct_deadline(synth_backend: &Backend) -> std::time::Duration {
+pub(crate) fn deliberate_direct_deadline(synth_backend: &Backend) -> std::time::Duration {
     synth_backend.request_timeout + DELIBERATE_DEADLINE_MARGIN
 }
 
@@ -202,7 +208,7 @@ fn stitch_dossier_delivery(
 /// disagrees with what was actually sent, which is worse than keeping nothing. Composed
 /// here so a test can pin the order (DeepSeek cross-family review, 2026-08-07); the
 /// handler calls this rather than the two steps by hand.
-fn stitch_and_keep(
+pub(crate) fn stitch_and_keep(
     dossier: &mut String,
     consumer: &SweepConsumer,
     sink: Option<&std::sync::Arc<SweepAttachSink>>,
@@ -1277,78 +1283,20 @@ impl KaiboHandler {
     ///   restart, and must hear that at startup, not discover it after one.
     /// - **Off**: the operator's explicit choice; say so once at info, nothing to build.
     pub fn finalize_media_store(mut self, persistence_active: bool) -> Result<Self> {
-        match self.config.cas_mode(persistence_active) {
-            crate::config::CasMode::Off => {
-                tracing::info!(
-                    "media CAS disabled ([cas] enabled = false) — artifact-producing tools \
-                     are not advertised"
-                );
-                self.media_cas = None;
-            }
-            crate::config::CasMode::Memory => {
-                let why = if self.config.cas.dir.is_none() {
-                    "no CAS directory resolves (neither $XDG_DATA_HOME nor $HOME is set)"
-                } else {
-                    "persistence is not active this run"
-                };
-                tracing::warn!(
-                    "MEDIA CAS IS IN-MEMORY ONLY: {why}. Generated artifacts are fetchable \
-                     by digest for THIS RUN ONLY and will NOT survive a restart — they cost \
-                     real provider credits and may not be reproducible. kaibo://config shows \
-                     [cas] mode = \"memory\". To store artifacts durably, run with \
-                     persistence enabled (and a resolvable $XDG_DATA_HOME or $HOME)."
-                );
-                // `new` already seeded the in-memory store; nothing to swap.
-            }
-            crate::config::CasMode::Disk => {
-                let dir = self
-                    .config
-                    .cas
-                    .dir
-                    .clone()
-                    .expect("CasMode::Disk implies a resolved dir");
-                let allowed = self.allowed_set();
-                let allowed_refs: Vec<&std::path::Path> =
-                    allowed.iter().map(PathBuf::as_path).collect();
-                let cas = crate::cas::Cas::open(&dir, &allowed_refs, self.config.cas.max_bytes)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to open the media CAS at {}: {e}\nkaibo never \
-                                 invents a different path and never falls back silently to \
-                                 memory. Point [cas] dir somewhere outside every allowed \
-                                 tree, or set [cas] enabled = false to run without it.",
-                            dir.display()
-                        )
-                    })?;
-                // Disk mode's promise is "durable across restarts", and on a container
-                // with no volume mounted that promise is false while everything else
-                // looks fine. Ask what the directory is actually sitting on, and if the
-                // answer is a filesystem that dies with the container, say so LOUDLY —
-                // then proceed (Amy, 2026-07-30). Not a refusal and no ack flag: running
-                // on tmpfs on purpose is legitimate, discovering it after paying for a
-                // generation is not.
-                match (self.backing_probe)(&dir).ephemeral_fs() {
-                    Some(fs) => {
-                        tracing::warn!("{}", crate::cas::ephemeral_backing_warning(fs, &dir));
-                        self.cas_ephemeral_fs = Some(fs);
-                    }
-                    // Durable, or the probe could not answer. Neither is worth a word at
-                    // startup: one is the expected case, and the other established
-                    // nothing. The debug line is for whoever is actually debugging.
-                    None => {
-                        tracing::debug!(
-                            cas_dir = %dir.display(),
-                            "media CAS backing filesystem: nothing indicates it is ephemeral"
-                        );
-                        tracing::info!(
-                            cas_dir = %dir.display(),
-                            "media CAS on disk — generated artifacts are durable across restarts"
-                        );
-                    }
-                }
-                self.media_cas = Some(Arc::new(crate::cas::MediaStore::Disk(cas)));
-            }
-        }
+        let allowed = self.allowed_set();
+        let allowed_refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+        // The three-state decision itself lives in `cas::open_media_store`, shared with the
+        // CLI front door — see that function for why one copy. This wrapper is the
+        // handler's half: hold the store, and remember an ephemeral finding for
+        // `kaibo://config` to report.
+        let (store, ephemeral) = crate::cas::open_media_store(
+            &self.config.cas,
+            self.config.cas_mode(persistence_active),
+            &allowed_refs,
+            self.backing_probe,
+        )?;
+        self.media_cas = store.map(Arc::new);
+        self.cas_ephemeral_fs = ephemeral;
         Ok(self)
     }
 
@@ -2131,7 +2079,13 @@ impl KaiboHandler {
     ) -> Result<CallToolResult, McpError> {
         // A reuse call that also carries explorer arguments is self-contradictory; say so
         // before resolving anything, so it costs nothing.
-        if let Some(refusal) = dossier::inert_explorer_args(&input) {
+        if let Some(refusal) = dossier::inert_explorer_args(dossier::ExplorerArgs {
+            dossier: input.dossier.as_deref(),
+            attach: &input.attach,
+            model: input.explorer_model.as_deref(),
+            backend: input.explorer_backend.as_deref(),
+            max_turns: input.explorer_max_turns,
+        }) {
             return Err(McpError::invalid_params(refusal, None));
         }
         let root = self.resolve_root(input.path)?;
