@@ -39,7 +39,7 @@ loop. Each consultation tool is that loop wearing different clothes:
 Both model-driven tools name their cast + answering model(s) in a provenance footer
 (`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
 
-Eight `--no-<tool>` capability flags gate the surface (all on by default; `consult` also
+A `--no-<tool>` capability flag per tool gates the surface (all on by default; `consult` also
 gates `consult_submit`, `batch` gates `batch_submit`, `generate` additionally needs the
 media CAS on, and the `job_*` verbs follow their live producers — a deferred `generate`
 mints a `job-N` like the other producers). A tool also needs a cast that can **staff**
@@ -86,13 +86,10 @@ project and cannot run external commands.
   so an edit is copy-on-write) and never mounted into kaish, whose read side would
   otherwise enumerate every project's artifacts. `tests/no_write_path.rs` blesses only
   individually **marked lines**, each pinned to its file *and to the specific call it
-  excuses*, at a *pinned exact count* — five today: the store's one `create_dir_all`, the
-  three needles the CAS's O_EXCL write trips, and `kaibo cas read` handing an artifact's
-  bytes to **stdout**, which creates no file (the shell already opened and aimed that
-  descriptor) but trips the same needle. A new write site can't ride in behind an existing
-  marker, and a marker can't excuse a call it wasn't blessed for — pasting the CLI's marker
-  onto an `fs::write` to a caller-named path still fails. Every other `std::fs` mutation in
-  `src/` fails the guard.
+  excuses*, with the tree-wide total pinned to an exact count. So a new write site cannot
+  ride in behind an existing marker, and a marker cannot excuse a call it was not blessed
+  for. That test is the source for which lines are blessed and how many; read it there
+  rather than restating it here. Every other `std::fs` mutation in `src/` fails the guard.
   Anything further that must *record* or *emit* is its own individually-gated mediated
   tool, never a general filesystem escape hatch or a loosening of the four levers.
   Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
