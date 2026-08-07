@@ -244,6 +244,24 @@ published sentence is not whether it names an internal detail, but whether the r
 that detail to predict what kaibo does. `src/server/dossier.rs` holds its whole design
 argument in the module doc and publishes none of it.
 
+**Rulings.** Each of these answers a question the first audit of this guidance could not
+settle from the guide alone (2026-08-07, `src/cli.rs`).
+
+- **A subcommand's one-line summary is imperative**, like an example label: it sits beside
+  the command name and says what running it does. "Ask one question and exit", not "A
+  one-shot question".
+- **The 2048-character budget is `server.rs`'s alone.** It is a host truncation of MCP
+  instructions and tool descriptions. `--help` has no such limit, so a `cli.rs` line that
+  needs a second sentence to state a default or a consequence gets one.
+- **Backticks are the only markdown in a clap doc comment.** clap prints the rest
+  literally, so `**bold**` reaches the reader as asterisks.
+- **A refusal fixable only in config.toml names the exact key, then `kaibo example-config`
+  for the shape.** The CLI caller is a person or an agent with file access; both can act on
+  a key name, and neither can act on "configure it properly". Name `kaibo configure` only
+  when the fix is multi-step setup rather than one key.
+- **`family` is a kaibo term** — a model lineage from one vendor, as in "a model outside
+  your own family". About forty uses, one sense. Use it; do not paraphrase it.
+
 Three audiences are optimized differently:
 
 - **Client-facing text** — the MCP server instructions and each tool's `description`
