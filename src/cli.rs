@@ -1996,7 +1996,7 @@ async fn generate_inner(
                                 ),
                             ));
                         }
-                        tokio::time::sleep(GENERATE_POLL_INTERVAL).await;
+                        tokio::time::sleep(crate::server::GENERATE_POLL_INTERVAL).await;
                     }
                     Err(e) => return Ok(fail_consultation(args.json, "generate", &cast.name, e)),
                 }
@@ -2027,10 +2027,6 @@ async fn generate_inner(
     }
     Ok(EXIT_OK)
 }
-
-/// How often a foreground `kaibo generate` asks a deferred provider job whether it is
-/// done — the CLI twin of the server's poll cadence.
-const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Run `kaibo cas read` — read one artifact by the address you already hold.
 pub async fn run_cas(common: CommonArgs, args: CasArgs) -> i32 {
@@ -3362,10 +3358,81 @@ mod tests {
         );
     }
 
-    /// `kaibo cas read` takes either spelling kaibo prints, and refuses anything that is
-    /// not a digest — a traversal-shaped string never gets near a path.
+    /// A real read, end to end: a disk-mode store, an object put in it, and the digest
+    /// read back through the command — the path that reaches `plan` and then writes to
+    /// stdout. Everything else here stops at a refusal, so without this the byte-serving
+    /// half of the command has no test at all (DeepSeek cross-family review, 2026-08-07).
     #[tokio::test]
-    async fn cas_read_refuses_a_string_that_is_not_a_digest() {
+    async fn cas_read_serves_a_stored_object_by_its_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().join("proj"));
+        std::fs::create_dir_all(dir.path().join("proj")).unwrap();
+        // Disk mode needs persistence active AND a resolvable cas dir, both outside the
+        // allowed tree — the same containment rule the store enforces in production.
+        config.persistence.enabled = true;
+        config.persistence.path = Some(dir.path().join("state.db"));
+        config.cas.dir = Some(dir.path().join("cas"));
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        // Put an object the way a producer would, through the store's own write path.
+        let cas = crate::cas::Cas::open(&dir.path().join("cas"), &[], None).expect("cas opens");
+        let digest = cas
+            .put(
+                b"the artifact body",
+                crate::cas::Extension::Txt,
+                &crate::cas::Provenance {
+                    prompt: "p".into(),
+                    model: "m".into(),
+                    cast: "c".into(),
+                    timestamp: 0,
+                    mime: "text/plain".into(),
+                    seed: None,
+                    tool: Some("generate".into()),
+                    slot: None,
+                    label: Some("a stored artifact".into()),
+                    session: None,
+                },
+            )
+            .expect("the object stores");
+
+        // Both spellings kaibo prints resolve to the same object.
+        for reference in [
+            digest.to_hex(),
+            format!("{}{}", crate::cas::CAS_URI_PREFIX, digest.to_hex()),
+        ] {
+            let cli = Cli::parse_from(["kaibo", "cas", "read", &reference]);
+            let args = match cli.command {
+                Some(Command::Cas(c)) => match c.cmd {
+                    CasCmd::Read(r) => r,
+                },
+                other => panic!("expected cas read, got {other:?}"),
+            };
+            let code = cas_read_inner(&args, &resolver)
+                .await
+                .unwrap_or_else(|e| panic!("reading {reference} must succeed: {}", e.message));
+            assert_eq!(code, EXIT_OK);
+        }
+
+        // A digest this store never held is a usage error naming the digest, not a crash.
+        let cli = Cli::parse_from(["kaibo", "cas", "read", &"bb".repeat(32)]);
+        let args = match cli.command {
+            Some(Command::Cas(c)) => match c.cmd {
+                CasCmd::Read(r) => r,
+            },
+            other => panic!("expected cas read, got {other:?}"),
+        };
+        let err = cas_read_inner(&args, &resolver)
+            .await
+            .expect_err("an absent digest is refused");
+        assert_eq!(err.code, EXIT_USAGE);
+    }
+
+    /// A memory-mode store is empty in a new process, so `kaibo cas read` refuses and
+    /// names the mode. Reporting "not found" would send a caller hunting for a typo in an
+    /// address that was never the problem.
+    #[tokio::test]
+    async fn cas_read_in_memory_mode_says_so_instead_of_reporting_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::builtin();
         config.root = Some(dir.path().to_path_buf());

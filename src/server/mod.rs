@@ -4243,10 +4243,11 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
     out
 }
 
-/// How often a deferred `generate` job re-polls its provider. The provider owns no
-/// cadence (`MediaModel::poll` is one shot by contract); this background job does,
-/// bounded overall by `[defaults] call_deadline`.
-const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often a deferred `generate` re-polls its provider. The provider owns no cadence
+/// (`MediaModel::poll` is one shot by contract); the waiting side does, bounded overall by
+/// `[defaults] call_deadline`. Shared with the CLI's foreground poll so one knob describes
+/// both — a caller waiting at a terminal and a background job are the same request.
+pub(crate) const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Store every artifact of one completed generation in the media store and render the
 /// per-artifact result lines: `kaibo://cas/<digest>`, the mime, the provider seed when

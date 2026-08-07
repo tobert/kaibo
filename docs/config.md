@@ -829,15 +829,12 @@ artifact-producing tool writes into. Three produce today:
 | `save_artifact` | bulk text a consult's model wrote | `[artifacts] enabled` **and** a per-call `save_artifacts` (see below) |
 | `deliberate` | the explorer dossier each deliberation was built on | none — the CAS being on is the only key |
 
-`deliberate` is the one kaibo writes on its own, because the dossier is kaibo's own
-byproduct of a call you already made rather than something a model chose to save. Each
-deliberation's reply names the dossier's `kaibo://cas/<digest>`; pass that digest back as
-the tool's `dossier` argument to run a second synth over the same evidence with no
-explorer sweep. Sizing note: dossiers are the bulkiest thing most installs put in this
-store, so an install that deliberates often accumulates faster than the two
-opt-in producers suggest. A store that refuses the write (a full `max_bytes`, an I/O
-error) costs you the record and never the deliberation — it is logged and the call
-proceeds.
+`deliberate` needs no key of its own — kaibo writes the dossier, not a model. Each
+deliberation names its dossier's `kaibo://cas/<digest>`; pass that digest back as the
+`dossier` argument to run a second synth over the same evidence with no explorer sweep.
+Size the store for dossiers: they are the bulkiest objects most installs hold, and they
+accumulate on every deliberation. A refused write (a full `max_bytes`, an I/O error) is
+logged and the deliberation proceeds — you lose the record, never the answer.
 
 Its lifecycle has three states, reported as `mode` in `kaibo://config`'s `[cas]`
 section:
@@ -888,25 +885,23 @@ client or the CLI caller runs them; the inner model team never can — the CAS i
 mounted into kaish and no cast-facing tool reads it, because kaibo state spans projects
 and a browsable CAS would let one project's team enumerate another's artifacts.
 
-`read` is the only verb either surface offers, and that is the whole of the store's
-interface. There is no listing, no usage report, and no delete, because none of them can
-exist without an index this store deliberately does not keep. Retention stays file mtime
-over the object tree, with your own tools.
+`read` is the only verb on either surface. There is no listing, no usage report, and no
+delete — each needs an index this store does not keep. Prune by file mtime over the object
+tree with your own tools.
 
-The two surfaces differ in exactly one way, because their output goes to different places:
+The two surfaces serve the same object differently, because they write to different
+places:
 
 | | `read_cas` (MCP) | `kaibo cas read` (CLI) |
 |---|---|---|
-| metadata | the first content block | **stderr** |
-| text content | a bounded window | **stdout** |
-| binary content | base64 only when a range is asked for; a small image as a rendered block | **raw bytes on stdout** |
+| metadata | leads as the first content block | goes to stderr, so stdout stays the payload |
+| text content | returns a bounded window | goes to stdout as text |
+| binary content | returns base64 only for an explicit range; returns a small image as a rendered block | goes to stdout as raw bytes — `kaibo cas read <digest> > arch.png` needs no flag |
+| `--json` | not applicable | puts metadata and body in one stdout envelope, base64 for binary |
 
-The MCP rules exist to protect a context window. A pipe has no such budget, and someone
-asking for an image by its digest expects its bytes — so `kaibo cas read <digest> >
-arch.png` works with no flag, and metadata never contaminates the payload. `--json` puts
-both in one envelope on stdout, base64-encoding a binary body. The CLI command runs in
-disk mode only: an in-memory store is empty in a new process, so it says that plainly
-rather than reporting a digest as "not found".
+`kaibo cas read` runs in disk mode only. It refuses in memory mode and names the mode — a
+memory store is empty in a new process, so every digest would otherwise read as "not
+found".
 
 Reads are **metadata-first and bounded**, and the default depends on what the object is:
 

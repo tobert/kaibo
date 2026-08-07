@@ -391,6 +391,40 @@ mod tests {
         }
     }
 
+    /// `Delivery` changes the CLAIM, never the body: the same small image is planned
+    /// identically either way, and only the sentence describing how it is served differs.
+    /// A terminal renders nothing, so saying "as a rendered image" there would describe
+    /// something that did not happen.
+    #[test]
+    fn delivery_changes_only_what_the_metadata_claims() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let obj = png_obj(&png);
+        let rendered = plan(&obj, 0, None, Delivery::Rendered).expect("a legal read");
+        let bytes = plan(&obj, 0, None, Delivery::Bytes).expect("a legal read");
+
+        assert_eq!(
+            rendered.body, bytes.body,
+            "the body a delivery mode gets is the same body"
+        );
+        assert!(
+            rendered.meta.contains("as a rendered image"),
+            "an MCP host renders the block: {}",
+            rendered.meta
+        );
+        assert!(
+            !bytes.meta.contains("rendered"),
+            "a stream renders nothing, so the metadata must not claim it: {}",
+            bytes.meta
+        );
+        assert!(
+            bytes
+                .meta
+                .contains(&format!("the whole object, {} bytes", png.len())),
+            "both modes still name exactly what was served: {}",
+            bytes.meta
+        );
+    }
+
     /// **Metadata leads on every response, including the one that carries nothing else.**
     /// `length: 0` is the cheap HEAD: what is this, how big, what is it called, where does
     /// it live — for a few dozen tokens instead of the object.
@@ -503,7 +537,8 @@ mod tests {
     #[test]
     fn a_length_past_the_ceiling_is_refused_with_the_ceiling_and_the_recovery() {
         let obj = text_obj(b"small", None);
-        let err = plan(&obj, 0, Some(MAX_READ_BYTES + 1), Delivery::Rendered).expect_err("past the ceiling");
+        let err = plan(&obj, 0, Some(MAX_READ_BYTES + 1), Delivery::Rendered)
+            .expect_err("past the ceiling");
         assert!(
             err.contains(&MAX_READ_BYTES.to_string()),
             "the refusal names the ceiling: {err}"
@@ -512,7 +547,8 @@ mod tests {
             err.to_lowercase().contains("offset"),
             "and the recovery is paging: {err}"
         );
-        plan(&obj, 0, Some(MAX_READ_BYTES), Delivery::Rendered).expect("exactly at the ceiling is fine");
+        plan(&obj, 0, Some(MAX_READ_BYTES), Delivery::Rendered)
+            .expect("exactly at the ceiling is fine");
     }
 
     /// Textual content arrives as text a caller can use, never base64 it must decode.
@@ -647,7 +683,9 @@ mod tests {
             label: None,
             ..text_obj(bytes, None)
         };
-        let m = plan(&unlabeled, 0, Some(0), Delivery::Rendered).unwrap().meta;
+        let m = plan(&unlabeled, 0, Some(0), Delivery::Rendered)
+            .unwrap()
+            .meta;
         assert!(!m.contains("label:"), "no label, no line: {m}");
         assert!(
             !m.contains("provenance:"),
@@ -658,7 +696,9 @@ mod tests {
             provenance_present: false,
             ..text_obj(bytes, None)
         };
-        let m = plan(&orphaned, 0, Some(0), Delivery::Rendered).unwrap().meta;
+        let m = plan(&orphaned, 0, Some(0), Delivery::Rendered)
+            .unwrap()
+            .meta;
         assert!(
             m.contains("provenance: absent"),
             "a missing record is stated: {m}"
@@ -733,7 +773,8 @@ mod tests {
                     steps <= total + 2,
                     "window {window}: paging did not terminate — stuck at {cursor}"
                 );
-                let view = plan(&obj, cursor, Some(window), Delivery::Rendered).expect("a legal range");
+                let view =
+                    plan(&obj, cursor, Some(window), Delivery::Rendered).expect("a legal range");
                 let (from, to) = served_range(&view.meta)
                     .unwrap_or_else(|| panic!("window {window} at {cursor}: {}", view.meta));
                 assert_eq!(
