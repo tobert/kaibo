@@ -1226,6 +1226,96 @@ pub fn probe_backing(_dir: &Path) -> Backing {
 /// running on.
 pub type BackingProbe = fn(&Path) -> Backing;
 
+/// Settle the media store for one run — the single place either front door opens a CAS.
+///
+/// Both roads reach the same three states, so both must reach them the same way: `Off`
+/// when the operator said so, `Disk` while persistence is active and a directory
+/// resolves, and `Memory` otherwise with a warning loud enough that nobody pays a
+/// provider for bytes that die at exit. It lived inside the MCP handler until the CLI
+/// needed a store of its own (`kaibo deliberate` keeps a dossier, `kaibo cas` reads one),
+/// and two copies of a three-state decision is how the two front doors start disagreeing
+/// about what "durable" means.
+///
+/// Returns the store and, in disk mode, the ephemeral filesystem the directory sits on —
+/// the caller surfaces that finding (`kaibo://config`'s `[cas] backing`). A disk-open
+/// failure is a hard error on both roads: kaibo never invents a different path and never
+/// falls back silently to memory.
+///
+/// `probe` is a parameter rather than a direct call so a test can drive the ephemeral
+/// branch without a container.
+pub fn open_media_store(
+    cas: &crate::config::CasConfig,
+    mode: crate::config::CasMode,
+    allowed: &[&Path],
+    probe: BackingProbe,
+) -> Result<(Option<MediaStore>, Option<&'static str>)> {
+    match mode {
+        crate::config::CasMode::Off => {
+            tracing::info!(
+                "media CAS disabled ([cas] enabled = false) — artifact-producing tools \
+                 are not advertised"
+            );
+            Ok((None, None))
+        }
+        crate::config::CasMode::Memory => {
+            let why = if cas.dir.is_none() {
+                "no CAS directory resolves (neither $XDG_DATA_HOME nor $HOME is set)"
+            } else {
+                "persistence is not active this run"
+            };
+            tracing::warn!(
+                "MEDIA CAS IS IN-MEMORY ONLY: {why}. Generated artifacts are fetchable \
+                 by digest for THIS RUN ONLY and will NOT survive a restart — they cost \
+                 real provider credits and may not be reproducible. kaibo://config shows \
+                 [cas] mode = \"memory\". To store artifacts durably, run with \
+                 persistence enabled (and a resolvable $XDG_DATA_HOME or $HOME)."
+            );
+            Ok((
+                Some(MediaStore::Memory(MemoryCas::new(cas.max_bytes))),
+                None,
+            ))
+        }
+        crate::config::CasMode::Disk => {
+            let dir = cas
+                .dir
+                .clone()
+                .expect("CasMode::Disk implies a resolved dir");
+            let store = Cas::open(&dir, allowed, cas.max_bytes).map_err(|e| {
+                CasError::Io(format!(
+                    "failed to open the media CAS at {}: {e}\nkaibo never invents a \
+                     different path and never falls back silently to memory. Point [cas] \
+                     dir somewhere outside every allowed tree, or set [cas] enabled = \
+                     false to run without it.",
+                    dir.display()
+                ))
+            })?;
+            // Disk mode's promise is "durable across restarts", and on a container with
+            // no volume mounted that promise is false while everything else looks fine.
+            // Ask what the directory is actually sitting on, and if the answer is a
+            // filesystem that dies with the container, say so LOUDLY — then proceed
+            // (Amy, 2026-07-30). Not a refusal and no ack flag: running on tmpfs on
+            // purpose is legitimate, discovering it after paying for a generation is not.
+            let ephemeral = probe(&dir).ephemeral_fs();
+            match ephemeral {
+                Some(fs) => tracing::warn!("{}", ephemeral_backing_warning(fs, &dir)),
+                // Durable, or the probe could not answer. Neither is worth a word at
+                // startup: one is the expected case, and the other established nothing.
+                None => {
+                    tracing::debug!(
+                        cas_dir = %dir.display(),
+                        "media CAS backing filesystem: nothing indicates it is ephemeral"
+                    );
+                    tracing::info!(
+                        cas_dir = %dir.display(),
+                        "media CAS on disk — generated artifacts are durable across restarts"
+                    );
+                }
+            }
+            Ok((Some(MediaStore::Disk(store)), ephemeral))
+        }
+    }
+}
+
 /// The default media CAS directory: `$XDG_DATA_HOME/kaibo/cas`, else
 /// `~/.local/share/kaibo/cas` — the XDG *data* dir, deliberately not the *state* dir
 /// [`crate::store`] uses (see the module doc's "Why `$XDG_DATA_HOME`" section). `None`
