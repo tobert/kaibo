@@ -14,6 +14,104 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-07 — the dossier stops being invisible
+
+`deliberate` had a hole in the middle of it. An explorer sweep builds a dossier — minutes
+of live reading, and on one measured run a 652k-token sweep over three trees — then hands
+it to an offline synth that reasons for hours. Nothing recorded the middle. When that
+run's answer came back, there was no way to ask the only question that mattered: *what did
+the synth actually receive?* Amy, from the kaish session: "I want to have the dossiers
+tossed into cas so we can peek at them or reuse them sometimes."
+
+Peek and reuse are one feature with two ends, and the second end is the interesting one.
+Peeking is auditing. Reusing is arbitrage: the dossier is the expensive half, so handing
+the same one to a second cast costs a synth and nothing else — and it makes a two-model
+comparison *fair*, because the evidence is byte-identical and only the model differs.
+Without it, "ask DeepSeek and Fable the same question" really means asking two questions
+over two different sweeps, and any difference in the answers is confounded by what each
+explorer happened to look at.
+
+Three decisions did most of the work:
+
+**It rides `[cas] enabled`, not `[artifacts] enabled`.** The two-key gate on
+`save_artifact` exists for one specific reason — that surface is where a *model* decides
+bytes become durable. A dossier is kaibo's own byproduct of a call the operator already
+made. No model chose the content, wrote the label, or asked for the save. Putting it
+behind the artifacts key would teach operators that the key means "kaibo writes things",
+when it means "a model does", and that confusion gets expensive later.
+
+**Keeping never fails the call.** A refused write (a full `max_bytes`, an I/O error) costs
+the record, never the deliberation the caller is paying for — loud on the operator's log,
+invisible to the model team. Same posture as the ephemeral-backing warning: what you have
+already paid for proceeds.
+
+**Refuse the inert arguments, don't strip them.** A reuse call runs no sweep, so `attach`
+and the explorer overrides have nothing to act on. Silently ignoring `attach` is the quiet
+kind of wrong: the caller attached a file, got a real deliberation, and would have no way
+to learn the file never reached it. The synth overrides stay live, because retargeting
+which model reads the evidence is the whole point.
+
+Two things fell out that weren't the plan. The batch lane had never persisted its handle
+at all — `batch_submit` did, `deliberate` didn't — which on the *long* lane is the ordinary
+case rather than the edge one: a restart mid-deliberation lost the way back. It records
+the handle now, with the dossier's address on its label, so `job_list` after a restart
+leads to both the deliberation and the evidence. And the reuse road accepts any *text*
+artifact, not only something `deliberate` wrote — the caller is the operator's proxy
+handing kaibo its own stored evidence, so a report or a parked transcript is as legitimate
+as a dossier. Binary is refused by name.
+
+Reuse also means a synth-only offline cast (`fable`, `anthropic-batch`) can serve a
+`deliberate` call, since no explorer arm has to resolve. Advertisement gating deliberately
+did *not* move: the route still appears only where a cast can staff the full job, because
+advertising a tool whose headline behavior cannot run is worse than the gap. Written down
+in `issues.md` rather than fixed.
+
+## 2026-08-05 — the media arc: the model team gets a way to hand you bulk, and you get a way to read it
+
+Written late, on 2026-08-07, for five PRs that shipped without their story (#125–#129).
+Amy's note on the omission is why this entry exists: "that shoulda gone with the PRs."
+
+The arc solved one problem from both ends. A consult that produces *bulk* — a fuzz corpus,
+a per-file inventory, a generated fixture — had exactly one channel: the answer text,
+which is the caller's context window. A driver that dumps ten kilobytes there has spent
+the caller's budget on material the caller may only want to store.
+
+**`save_artifact` (#125)** gave the model team a second channel: hand kaibo bytes, get a
+digest. One way by construction — the tool can write and can never read, list, or probe,
+because the CAS spans every project this kaibo has served, so "is this content already
+here?" answered for arbitrary bytes is a cross-project existence oracle. Not a theoretical
+worry: the two-family review caught a real one, where a capacity refusal arrived *before*
+the dedup branch and so answered the question through timing. The fix was ordering —
+admission runs before dedup, in both stores. The design also permanently dropped a `from:`
+path parameter (inline `content` is the only input this tool will ever take), and made
+every cap refuse rather than truncate, because a digest for content that is not what the
+model wrote is the silent corruption this codebase refuses.
+
+**`read_cas` (#126)** gave the operator the other end, and in doing so *replaced* the
+`kaibo://cas/<digest>` resource. Two reasons, both measured. Hosts treat resources as
+ambient context — some prefetch, some auto-attach — which is exactly the wrong posture for
+bytes a model just wrote; a tool call is deliberate, with arguments and a permission
+prompt. And `resources/read` is whole-blob: a 3.8 MB PNG produced roughly 5 MB of base64
+in one read, and only host mercy kept it out of a context window. The tool is
+metadata-first and bounded, and its own review fix batch caught a second real bug — a
+paging window could drop bytes on reassembly. Ranges always advance now, which is exactly
+what a caller resuming at the range it was handed depends on.
+
+Two smaller ships closed the arc. **#127** made disk-mode CAS warn severely when it sits
+on overlayfs/tmpfs/ramfs — a container with no volume mounted looks exactly like durable
+disk, right up until it evaporates with what you paid for inside it. It warns and proceeds
+(a throwaway store is legitimate; discovering it afterward is not), and `kaibo://config`
+reports it under `[cas] backing` so it is checkable before spending. **#128** carried
+accuracy fixes, including the ruling that the CAS stays opaque: no index, no scan verbs,
+cleanup by file mtime. What was created is tracked *with the conversation* that made it —
+the session turn records the artifact footer — not with the store.
+
+**#129 is the lesson.** #127 and #128 merged back to back; each was textually clean
+against `main` and against the other, and their union did not compile — one branch added
+an eighth parameter to `render_config_resource`, the other added a test calling it with
+seven. A clean three-way merge says nothing about semantics. Update the second branch
+against `main` before merging it, even when GitHub is green.
+
 ## 2026-08-03 — Output ceilings surfaced, and the feature's first catch was its own premise
 
 Configure-time agents were sizing synth `max_tokens` blind: the ceiling arrived in

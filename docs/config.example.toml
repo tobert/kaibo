@@ -283,6 +283,11 @@ scratch_limit_bytes = 67108864
 # entirely and un-advertises every tool that needs it (the startup log and
 # kaibo://config's [cas] section say which state you are in, and why).
 #
+# Three tools write here: `generate` (rendered images), `save_artifact` (bulk text a
+# model saved — see [artifacts]), and `deliberate`, which keeps every dossier it builds
+# so you can read it back or hand it to a second synth. Dossiers need no extra key and
+# are usually the bulk of the store; see kaibo://config/guide.
+#
 # It lives under the XDG *data* dir, deliberately NOT beside the state db: the session
 # store is reconstructible bookkeeping, while these are artifacts you spent real provider
 # credits on and may never be able to reproduce (the seed is recorded in a sidecar, but

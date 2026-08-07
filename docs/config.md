@@ -821,9 +821,25 @@ explicit. Every other open failure stays fatal.
 ## Media CAS: `[cas]`
 
 **On by default, and it follows persistence.** The CAS is the content-addressed store an
-artifact-producing tool writes into. Two produce today: `generate` (images a provider
-rendered) and `save_artifact` (bulk text a consult's model wrote, see `[artifacts]`
-below). Its lifecycle has three states, reported as `mode` in `kaibo://config`'s `[cas]`
+artifact-producing tool writes into. Three produce today:
+
+| producer | what it stores | opt-in |
+|---|---|---|
+| `generate` | images a provider rendered | a cast with an `image` slot |
+| `save_artifact` | bulk text a consult's model wrote | `[artifacts] enabled` **and** a per-call `save_artifacts` (see below) |
+| `deliberate` | the explorer dossier each deliberation was built on | none — the CAS being on is the only key |
+
+`deliberate` is the one kaibo writes on its own, because the dossier is kaibo's own
+byproduct of a call you already made rather than something a model chose to save. Each
+deliberation's reply names the dossier's `kaibo://cas/<digest>`; pass that digest back as
+the tool's `dossier` argument to run a second synth over the same evidence with no
+explorer sweep. Sizing note: dossiers are the bulkiest thing most installs put in this
+store, so an install that deliberates often accumulates faster than the two
+opt-in producers suggest. A store that refuses the write (a full `max_bytes`, an I/O
+error) costs you the record and never the deliberation — it is logged and the call
+proceeds.
+
+Its lifecycle has three states, reported as `mode` in `kaibo://config`'s `[cas]`
 section:
 
 | mode | when | what it means |
