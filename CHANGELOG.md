@@ -17,6 +17,18 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`kaibo deliberate` on the command line, and `kaibo batch cancel`.** Deliberate was
+  MCP-only for no recorded reason on its batch lane, and for a good one on its direct
+  lane (that lane's handle lives in the running server's memory, so a one-shot process
+  would submit, exit, and take the job with it — [#82](https://github.com/tobert/kaibo/issues/82)). Both are answered now. A batch
+  cast prints the durable handle and exits, so `HANDLE=$(kaibo deliberate …)` then
+  `kaibo batch get "$HANDLE"` works across reboots; a direct cast runs the long local
+  completion in the foreground and prints the answer, telling you on stderr that it is
+  waiting. `--dossier` reuses a kept dossier with no sweep — including one built over
+  MCP, since both front doors share the same store. And the CLI could submit and list
+  batches but never stop one; `kaibo batch cancel <handle>` closes that, wording the
+  result as the request it is, since a provider finishes what is already in flight.
+
 - **`deliberate` keeps its dossier, and can reuse one.** The explorer sweep a
   deliberation is built on is the expensive half — it can run hundreds of thousands
   of tokens — and it used to be consumed invisibly: no way to see what the offline
