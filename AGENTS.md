@@ -212,9 +212,7 @@ x86_64-unknown-linux-musl`. Verify the boundary with `cargo tree -i aws-lc-rs`
 
 Every prompt, preamble, tool description, help line, and error string is text some model
 reads. When we touch one, we **re-read the whole block and judge it whole** — not the diff
-by itself. Compression improves in one direction only (改善 — steady, incremental
-improvement): each time we edit a block, it should say the same thing in fewer tokens, or
-say more in the same tokens. It should not collect extra clauses.
+by itself.
 
 **kaibo adopts kaish's `docs/style.md`** — that guide names kaibo as an adopter, and it is
 the source for *how* our prose reads: a small vocabulary, one word per concept, exact
@@ -229,11 +227,6 @@ strictly its rules apply to that file — and kaibo's files sort like this.
 | Terms only, one line per bullet | `CHANGELOG.md` |
 | Terms only | `README.md`, `docs/*.md` |
 | Exempt | `docs/devlog.md` — it tells the story from one person's view, and that needs a voice |
-
-**Compression and the reason clause do not conflict.** Keep the clause when a reader who
-knows the reason can predict what happens in a case the rule does not name. Cut it when it
-only repeats the rule in other words. When the source records no reason, state the rule
-alone rather than inventing one.
 
 **Error strings carry the Full weight above — every rule in the guide applies — and they
 are the most valuable prose we own.**
@@ -392,10 +385,10 @@ even for a one-line doc fix.
 - **A changelog bullet is one line: the change, and at most one clause of reason.** The
   full reasoning belongs in the pull request body, which becomes the merge commit, so the
   bullet does not carry it. If a bullet needs three numbers and three reasons, write three
-  bullets. **Entries get shorter over time**, the same one-way standard compression follows
-  in model-facing text: when you add an entry, shorten any entry near it that runs to a
-  paragraph, and shorten the whole unreleased section before you retitle it for a release.
-  Someone scanning for what changed should not have to read an argument.
+  bullets. **Entries get shorter over time.** When you add an entry, shorten any entry near
+  it that is longer than one line, and shorten the whole unreleased section before you
+  retitle it for a release. Someone scanning for what changed should not have to read the
+  reasoning behind it.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
