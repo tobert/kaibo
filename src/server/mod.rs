@@ -55,6 +55,7 @@ use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
 mod cas_read;
 mod config_resource;
 mod containment;
+mod dossier;
 mod render;
 mod resolver;
 
@@ -69,6 +70,7 @@ pub(crate) use render::{
     BATCH_RECENCY_WINDOW_SECS,
 };
 
+use dossier::{dossier_ack, keep_dossier, with_dossier, KeptDossier};
 use render::{
     batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
     consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
@@ -2175,6 +2177,16 @@ impl KaiboHandler {
         // itself (text bodies, notes, demotions); collect any routed images separately
         // — they ride the synth's single turn as native parts, not as dossier text.
         let images = stitch_dossier_delivery(&mut dossier, &consumer, sink.as_ref());
+        // Keep the finished dossier before stage 2 spends anything on it, so a
+        // deliberation that fails, times out, or comes back thin still leaves the evidence
+        // it was built from readable. Never fatal — see `server::dossier`.
+        let kept = keep_dossier(
+            self.media_cas.as_ref(),
+            &input.question,
+            &dossier,
+            &cast.name,
+            &explorer_model,
+        );
 
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
         // and the handle; both share the offline-synth preamble (`batch_system_prompt`,
@@ -2191,6 +2203,7 @@ impl KaiboHandler {
                     &images,
                     &system,
                     dossier_usage,
+                    kept.as_ref(),
                 )
                 .await
             }
@@ -2202,6 +2215,7 @@ impl KaiboHandler {
                 &images,
                 &system,
                 dossier_usage,
+                kept.as_ref(),
             ),
         }
     }
@@ -2233,6 +2247,11 @@ impl KaiboHandler {
         // provider's batch result (not rendered here), but the caller should still see
         // what the build cost rather than have it silently dropped on this lane.
         dossier_usage: Usage,
+        // Where the dossier landed in the media CAS, when it was kept. This lane is the
+        // long one — a batch deliberation runs for hours and is collected by a later
+        // `job_get`, possibly after a restart — so the address rides both the ack and the
+        // persisted handle's label, and survives the server session either way.
+        kept: Option<&KeptDossier>,
     ) -> Result<CallToolResult, McpError> {
         let (slot, backend, _caps) = self.batch_synth(cast)?;
         let backend_name = backend.name.clone();
@@ -2252,6 +2271,29 @@ impl KaiboHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         let handle = format!("{backend_name}/{provider_id}");
+        // Persist the handle so a restart can re-list and re-address this deliberation,
+        // exactly as `batch_submit` does — this lane runs for hours, so a restart in the
+        // middle is the ordinary case, not the edge one. The label carries the synth model
+        // AND the dossier's address, which is what makes the evidence recoverable from
+        // `job_list` alone after the ack has scrolled out of the caller's context. A store
+        // failure is logged, never fatal: the batch is already live at the provider, so
+        // failing here would strand it.
+        if let Some(store) = self.sessions.store() {
+            let label = match kept {
+                Some(k) => format!(
+                    "deliberate · synth `{model}` · dossier {}{}",
+                    crate::cas::CAS_URI_PREFIX,
+                    k.digest
+                ),
+                None => format!("deliberate · synth `{model}`"),
+            };
+            if let Err(e) = store
+                .put_batch(&backend_name, &provider_id, Some(&label))
+                .await
+            {
+                tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
+            }
+        }
         // Fold the dossier build's real cost into the ack — the synth's own tokens land
         // later on the provider's batch result, but the build spend is knowable now.
         let dossier_cost = fmt_usage(&dossier_usage)
@@ -2261,8 +2303,9 @@ impl KaiboHandler {
             "Dossier built (explorer `{explorer_model}`{dossier_cost}) and handed to the batch \
              lane as `{handle}` — cast `{}`, synth `{model}` at max thinking. It deliberates \
              offline; collect it with `job_get {handle}` (durable — survives restart), or stop it \
-             with `job_cancel {handle}`. Nothing to wait on now.",
-            cast.name
+             with `job_cancel {handle}`. Nothing to wait on now.{}",
+            cast.name,
+            dossier_ack(kept)
         );
         Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
@@ -2286,6 +2329,10 @@ impl KaiboHandler {
         // The dossier stage's explorer tokens, summed into the final footer with the
         // synth's — the footer names both roles, so it counts both.
         dossier_usage: Usage,
+        // Where the dossier landed, when it was kept — named in the ack now and in the
+        // finished answer later, so a `job_get` that arrives long after the ack still
+        // carries the evidence trail.
+        kept: Option<&KeptDossier>,
     ) -> Result<CallToolResult, McpError> {
         let synth = self.arm(cast, ModelRole::Synth)?;
         let synth_model = synth.model.clone();
@@ -2314,6 +2361,7 @@ impl KaiboHandler {
         let dossier = dossier.to_string();
         let images = images.to_vec();
         let system = system.to_string();
+        let kept_for_job = kept.cloned();
         let label = format!("cast `{cast_name}` deliberate (direct synth `{synth_model}`)");
 
         let job_id = self.jobs.submit(label, progress_log, async move {
@@ -2324,7 +2372,10 @@ impl KaiboHandler {
             {
                 Ok((answer, synth_usage)) => Ok(JobResult {
                     answer: with_provenance(
-                        answer,
+                        // The dossier line sits between the answer and the provenance
+                        // footer: it is part of what this deliberation is grounded in,
+                        // not part of who ran it.
+                        with_dossier(answer, kept_for_job.as_ref()),
                         &cast_name,
                         &[
                             ("explorer", explorer_model.as_str()),
@@ -2343,8 +2394,9 @@ impl KaiboHandler {
              `{job_id}` — cast `{}`. This is one long local completion (it can take a \
              while): `job_wait {job_id}` parks for it, `job_get {job_id}` collects, \
              `job_cancel {job_id}` stops it. Session-scoped — the job lives for this \
-             server session only.",
-            cast.name
+             server session only.{}",
+            cast.name,
+            dossier_ack(kept)
         );
         Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
@@ -7068,6 +7120,11 @@ enabled = false
                 &[],
                 "offline-synth-system",
                 dossier_usage,
+                Some(&KeptDossier {
+                    digest: "cd".repeat(32),
+                    bytes: 29,
+                    path: None,
+                }),
             )
             .await
             .expect("scripted deliberate_batch succeeds");
@@ -7076,6 +7133,10 @@ enabled = false
         assert!(
             ack.contains("gem/msgbatch_d"),
             "the reply carries the durable batch handle"
+        );
+        assert!(
+            ack.contains(&format!("kaibo://cas/{}", "cd".repeat(32))),
+            "the ack names the kept dossier's address: {ack}"
         );
         assert!(
             ack.contains("tokens · 200 in · 20 out"),
@@ -7103,6 +7164,80 @@ enabled = false
                 && items[0].prompt.contains("DOSSIER: src/x.rs:1 fn retry"),
             "the one item is the deliberation_prompt — question AND dossier: {}",
             items[0].prompt
+        );
+    }
+
+    /// A batch deliberation runs for hours, so the ack that named its dossier is long gone
+    /// (or the server restarted) by the time anyone collects it. The dossier's address
+    /// must therefore be recoverable from kaibo's own durable record: `deliberate`'s batch
+    /// lane persists its handle — which it did not do at all before dossiers were kept —
+    /// with a label naming the synth AND the dossier, and `job_list` surfaces both after a
+    /// restart. Without this, keeping the dossier would still lose the way back to it on
+    /// the one lane where losing it is likely.
+    #[tokio::test]
+    async fn a_deliberate_batch_handle_recovers_with_its_dossier_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let cap = std::num::NonZeroUsize::new(8).unwrap();
+        let digest = "ef".repeat(32);
+
+        let store = crate::store::SessionStore::open(&db, cap, &[])
+            .await
+            .unwrap();
+        // Empty provider listing, so the recovered section is the only way back.
+        let scripted = Arc::new(
+            crate::batch::ScriptedBatch::new("msgbatch_dl", vec![]).with_listing(vec![], false),
+        );
+        let h = handler_from_toml(BATCH_CASTS_TOML)
+            .with_batch_providers(Arc::new(crate::batch::ScriptedBatchProviders(
+                scripted.clone(),
+            )))
+            .with_session_store(store.clone());
+        let cast = h.config.resolve_cast("mydeliberate").unwrap().clone();
+
+        h.deliberate_batch(
+            &cast,
+            "gem/some-lite",
+            "Is the retry safe?",
+            "DOSSIER: src/x.rs:1 fn retry",
+            &[],
+            "offline-synth-system",
+            Usage::new(),
+            Some(&KeptDossier {
+                digest: digest.clone(),
+                bytes: 29,
+                path: None,
+            }),
+        )
+        .await
+        .expect("scripted deliberate_batch succeeds");
+
+        // Simulated restart: a new handler and a store reopened on the same db file.
+        let store2 = crate::store::SessionStore::open(&db, cap, &[])
+            .await
+            .unwrap();
+        let empty = Arc::new(
+            crate::batch::ScriptedBatch::new("unused", vec![]).with_listing(vec![], false),
+        );
+        let h2 = handler_from_toml(BATCH_CASTS_TOML)
+            .with_batch_providers(Arc::new(crate::batch::ScriptedBatchProviders(empty)))
+            .with_session_store(store2);
+        let listing = result_text(
+            h2.job_list(Parameters(ListInput {
+                backend: None,
+                all: false,
+            }))
+            .await
+            .expect("job_list succeeds"),
+        );
+
+        assert!(
+            listing.contains("gem/msgbatch_dl"),
+            "a deliberate batch handle must survive a restart:\n{listing}"
+        );
+        assert!(
+            listing.contains(&format!("kaibo://cas/{digest}")),
+            "the recovered handle must name the dossier it was built from:\n{listing}"
         );
     }
 
