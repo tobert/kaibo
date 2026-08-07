@@ -881,13 +881,32 @@ an operator, not an audit trail, and a content-addressed store that never rewrit
 be one. For a durable per-call record, kaibo's answers are the tool-call telemetry each
 save emits and the session the answer was recorded into.
 
-**Retrieval is the `read_cas` tool, and it is operator-surface only.** Every producer
-names its artifacts by a `kaibo://cas/<digest>` address; `read_cas` takes the digest out
-of one and hands the content back. The MCP client calls it; the inner model team never can
-— the CAS is not mounted into kaish and no cast-facing tool reads it, because kaibo state
-spans projects and a browsable CAS would let one project's team enumerate another's
-artifacts. There is no `kaibo cas` CLI command; on disk, the path a read reports is how an
-operator reaches an object with their own tools.
+**Retrieval is operator-surface only.** Every producer names its artifacts by a
+`kaibo://cas/<digest>` address, and two commands take the digest out of one and hand the
+content back: the `read_cas` MCP tool, and `kaibo cas read` on the command line. The MCP
+client or the CLI caller runs them; the inner model team never can — the CAS is not
+mounted into kaish and no cast-facing tool reads it, because kaibo state spans projects
+and a browsable CAS would let one project's team enumerate another's artifacts.
+
+`read` is the only verb either surface offers, and that is the whole of the store's
+interface. There is no listing, no usage report, and no delete, because none of them can
+exist without an index this store deliberately does not keep. Retention stays file mtime
+over the object tree, with your own tools.
+
+The two surfaces differ in exactly one way, because their output goes to different places:
+
+| | `read_cas` (MCP) | `kaibo cas read` (CLI) |
+|---|---|---|
+| metadata | the first content block | **stderr** |
+| text content | a bounded window | **stdout** |
+| binary content | base64 only when a range is asked for; a small image as a rendered block | **raw bytes on stdout** |
+
+The MCP rules exist to protect a context window. A pipe has no such budget, and someone
+asking for an image by its digest expects its bytes — so `kaibo cas read <digest> >
+arch.png` works with no flag, and metadata never contaminates the payload. `--json` puts
+both in one envelope on stdout, base64-encoding a binary body. The CLI command runs in
+disk mode only: an in-memory store is empty in a new process, so it says that plainly
+rather than reporting a digest as "not found".
 
 Reads are **metadata-first and bounded**, and the default depends on what the object is:
 

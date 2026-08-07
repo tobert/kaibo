@@ -2131,12 +2131,16 @@ async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, 
         provenance_present: provenance.is_some(),
         path: path.as_deref(),
     };
-    let view = crate::server::plan_cas_read(&obj, args.offset, args.length, crate::server::Delivery::Bytes).map_err(|message| {
-        SetupError {
-            kind: "usage",
-            message,
-            code: EXIT_USAGE,
-        }
+    let view = crate::server::plan_cas_read(
+        &obj,
+        args.offset,
+        args.length,
+        crate::server::Delivery::Bytes,
+    )
+    .map_err(|message| SetupError {
+        kind: "usage",
+        message,
+        code: EXIT_USAGE,
     })?;
 
     // `--json` keeps the MCP shape: one object on stdout, a binary body base64-encoded
@@ -3290,6 +3294,130 @@ mod tests {
             .expect_err("an interactive cast on batch submit must be refused");
         assert_eq!(err.code, EXIT_USAGE);
         assert_eq!(err.kind, "usage");
+    }
+
+    /// `--field` carries a TYPE, because a provider's wire distinguishes `2` from `"2"`
+    /// and a shell has only strings. The value's own JSON syntax is what decides, so
+    /// nothing extra has to be learned — and a value that is not JSON at all is exactly
+    /// what it looks like.
+    #[test]
+    fn a_generate_field_takes_its_type_from_the_value() {
+        use crate::media::FieldValue;
+
+        let (k, v) = parse_generate_field("n=2").expect("a number");
+        assert_eq!(k, "n");
+        assert!(
+            matches!(&v, FieldValue::Num(n) if n.to_string() == "2"),
+            "an integer must stay integral, got {v:?}"
+        );
+        assert!(matches!(
+            parse_generate_field("transparent=true").unwrap().1,
+            FieldValue::Bool(true)
+        ));
+        // Not JSON, and not a mistake: the common case for an image knob.
+        assert!(matches!(
+            parse_generate_field("size=1024x1024").unwrap().1,
+            FieldValue::Str(s) if s == "1024x1024"
+        ));
+        // A quoted JSON string keeps its content, not its quotes.
+        assert!(matches!(
+            parse_generate_field("style=\"3d-model\"").unwrap().1,
+            FieldValue::Str(s) if s == "\"3d-model\""
+        ));
+        // The value may itself contain `=` — only the FIRST one splits.
+        let (k, v) = parse_generate_field("prompt_suffix=a=b").expect("split on the first =");
+        assert_eq!(k, "prompt_suffix");
+        assert!(matches!(v, FieldValue::Str(s) if s == "a=b"));
+
+        for bad in ["noequals", "=value"] {
+            let err = parse_generate_field(bad).expect_err("must be refused");
+            assert_eq!(err.code, EXIT_USAGE);
+        }
+    }
+
+    /// A cast with no `image` slot cannot generate, and the refusal says what a cast needs
+    /// rather than failing later in a provider call. Exit 2, before any network.
+    #[tokio::test]
+    async fn generate_on_a_cast_without_an_image_slot_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from(["kaibo", "generate", "a cat", "--cast", "deepseek"]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Generate(g)) => g,
+            other => panic!("expected generate, got {other:?}"),
+        };
+        let err = generate_inner(&common, &args, &resolver)
+            .await
+            .expect_err("a cast with no image slot must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("`image` slot"),
+            "the refusal names what the cast is missing: {}",
+            err.message
+        );
+    }
+
+    /// `kaibo cas read` takes either spelling kaibo prints, and refuses anything that is
+    /// not a digest — a traversal-shaped string never gets near a path.
+    #[tokio::test]
+    async fn cas_read_refuses_a_string_that_is_not_a_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        // Persistence off ⇒ the store is in-memory ⇒ nothing is readable. That refusal
+        // comes first and says so plainly, which is the honest answer: hunting for a typo
+        // in a digest that was never the problem is the failure mode to avoid.
+        config.persistence.enabled = false;
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from(["kaibo", "cas", "read", "../../etc/passwd"]);
+        let args = match cli.command {
+            Some(Command::Cas(c)) => match c.cmd {
+                CasCmd::Read(r) => r,
+            },
+            other => panic!("expected cas read, got {other:?}"),
+        };
+        let err = cas_read_inner(&args, &resolver)
+            .await
+            .expect_err("an in-memory store holds nothing to read");
+        assert!(
+            err.message.contains("in-memory"),
+            "a memory-mode read says why nothing can be found: {}",
+            err.message
+        );
+        assert_eq!(err.code, EXIT_SETUP);
+    }
+
+    /// The `cas` group carries exactly one verb, and it parses its window flags.
+    #[test]
+    fn cas_read_parses_its_window() {
+        let cli = Cli::parse_from([
+            "kaibo",
+            "cas",
+            "read",
+            "kaibo://cas/abc",
+            "--offset",
+            "64",
+            "--length",
+            "128",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Command::Cas(c)) => match c.cmd {
+                CasCmd::Read(r) => {
+                    assert_eq!(r.digest, "kaibo://cas/abc");
+                    assert_eq!(r.offset, 64);
+                    assert_eq!(r.length, Some(128));
+                    assert!(r.json);
+                }
+            },
+            other => panic!("expected cas read, got {other:?}"),
+        }
     }
 
     /// `kaibo deliberate` takes the same arguments as the MCP tool under the CLI's

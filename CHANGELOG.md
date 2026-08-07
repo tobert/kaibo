@@ -17,6 +17,16 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`kaibo generate` and `kaibo cas read`.** The CLI can now render an image into kaibo's
+  artifact store and read anything back out of it, which completes the MCP-to-CLI parity
+  sweep. `kaibo cas read <digest> > arch.png` gives you the bytes with no flag to
+  remember: metadata goes to stderr and content to stdout, text as text and binary as raw
+  bytes, because the bounded base64 rules the MCP tool follows exist to protect a model's
+  context window and a pipe has no such budget. `read` is the only verb — the store stays
+  opaque and index-free, so there is still no listing, usage report, or delete. A
+  deferred `generate` polls in the foreground rather than handing back a handle nothing
+  could collect.
+
 - **`kaibo deliberate` on the command line, and `kaibo batch cancel`.** Deliberate was
   MCP-only for no recorded reason on its batch lane, and for a good one on its direct
   lane (that lane's handle lives in the running server's memory, so a one-shot process

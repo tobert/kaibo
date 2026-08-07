@@ -14,6 +14,61 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-07 — finishing the CLI, and what a front door is allowed to be
+
+Amy, looking at the morning's work: *"hm did we ever say why deliberate isn't on the cli?
+I think we built deliberate around the same time as cli mode and it just wasn't ready. so
+maybe the easier fix is to finish exposing kaibo features on cli."*
+
+The history turned out to be nearly the opposite of the memory, and worth writing down so
+it isn't re-derived a third time. `deliberate` shipped 2026-07-02; the CLI front door
+shipped 2026-07-17, two weeks *later*, starting as `consult` + `config` and growing
+outward. Deliberate was finished and stable when the CLI arrived. It just never got its
+turn.
+
+Issue #82 (2026-07-18) *did* record a reason — but only for the **direct** lane, and it is
+a good one: that lane's handle is a `job-N` held in a running server's memory, so a
+one-shot CLI process would submit, exit, and take the job with it. The batch lane had no
+reason at all; its handle is durable *at the provider*, which is precisely the property
+that gave `batch submit` a CLI story on day one. Two gaps, one explained and one not, and
+the explained one had been quietly generalized into "deliberate is MCP-only".
+
+**Amy's call dissolved the hard half in one sentence: on the direct lane, the process
+*is* the job.** It blocks, prints the answer, exits — the CLI's ordinary contract — and
+needs no daemon, no durable job store, and none of the "candidate directions" #82 was
+holding open. The same answer then served `generate`'s deferred lane, which had the
+identical shape. What made this look hard for three weeks was assuming a CLI had to
+imitate the server's async surface rather than being allowed its own.
+
+The rest of the sweep — `batch cancel` (the CLI could submit and list but never stop),
+`generate`, `kaibo cas read` — was ordinary work. Two things in it are worth keeping.
+
+**A front door may differ from the tool where the reason for the rule doesn't apply.**
+`read_cas` is metadata-first, bounded, and refuses to dump base64 nobody asked for. Those
+rules exist to protect a *context window*. A pipe has no context window. Amy: *"we do know
+when we might output binary and the caller likely knows they're gonna get binary."* So
+`kaibo cas read` follows the CLI's own standing contract instead — metadata to stderr,
+content to stdout, text as text and binary as raw bytes — and `kaibo cas read <digest> >
+arch.png` works with no flag to remember. A `--raw` flag was designed, built, and deleted
+once it was clear it was a worse spelling of the default. Both surfaces still share one
+planner, which grew a `Delivery` mode so its metadata stops claiming "as a rendered image"
+where nothing renders.
+
+**The write-path guard got stricter in the change that added to it.** Serving those bytes
+means a `write_all` to stdout, which the guard cannot distinguish from writing a file, so
+it became the fifth blessed line — a real decision, taken visibly, with the pinned count
+moving 4 → 5. Writing to stdout creates nothing: it is a descriptor the operator's shell
+already opened and aimed, so the store still has no destination parameter anywhere. The
+useful part came from the teeth test written for the new marker, which failed: blessings
+were pinned per-(file, marker) but not per-*needle*, so pasting the new marker onto an
+`fs::write(out_path, …)` would have laundered a caller-named destination straight through
+— and the CLI is exactly where a `--out FILE` flag gets proposed. Needle pinning is back.
+A guard that grows a carve-out is the right moment to ask what else it was not checking.
+
+Left MCP-only on purpose: `consult_submit` and `job_wait`. Their value is work continuing
+inside a session that outlives the call, and a process that exits has nothing to offer
+there. That is a real difference between the front doors, not a gap in one of them.
+
 ## 2026-08-07 — the dossier stops being invisible
 
 `deliberate` had a hole in the middle of it. An explorer sweep builds a dossier — minutes
