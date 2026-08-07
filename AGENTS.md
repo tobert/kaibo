@@ -85,10 +85,14 @@ project and cannot run external commands.
   parameter for a model to aim; it is write-only (`create_new`; no unlink/truncate/rename,
   so an edit is copy-on-write) and never mounted into kaish, whose read side would
   otherwise enumerate every project's artifacts. `tests/no_write_path.rs` blesses only
-  those two files' individually **marked lines**, at a *pinned exact count* — four today,
-  since the store's one `create_dir_all` plus the CAS's O_EXCL write trips three separate
-  needles — so a new write site can't ride in behind an existing marker without failing
-  that test. Every other `std::fs` mutation in `src/` still fails the guard.
+  individually **marked lines**, each pinned to its file *and to the specific call it
+  excuses*, at a *pinned exact count* — five today: the store's one `create_dir_all`, the
+  three needles the CAS's O_EXCL write trips, and `kaibo cas read` handing an artifact's
+  bytes to **stdout**, which creates no file (the shell already opened and aimed that
+  descriptor) but trips the same needle. A new write site can't ride in behind an existing
+  marker, and a marker can't excuse a call it wasn't blessed for — pasting the CLI's marker
+  onto an `fs::write` to a caller-named path still fails. Every other `std::fs` mutation in
+  `src/` fails the guard.
   Anything further that must *record* or *emit* is its own individually-gated mediated
   tool, never a general filesystem escape hatch or a loosening of the four levers.
   Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
@@ -210,34 +214,45 @@ x86_64-unknown-linux-musl`. Verify the boundary with `cargo tree -i aws-lc-rs`
 ## Writing for models
 
 Every prompt, preamble, tool description, help line, and error string is text some model
-reads. When we touch one, we **re-read the whole block and judge it holistically** — not
-the diff in isolation. The ratchet is *compression* (改善): over time a block should carry
-more impact per token and avoid accreting clauses.
+reads. When we touch one, we **re-read the whole block and judge it whole** — not the diff
+by itself. Compression improves in one direction only (改善 — steady, incremental
+improvement): each time we edit a block, it should say the same thing in fewer tokens, or
+say more in the same tokens. It should not collect extra clauses.
 
 **kaibo adopts kaish's `docs/style.md`** — that guide names kaibo as an adopter, and it is
-the source for *how* our prose reads: a small vocabulary, one term per concept, exact
-numbers, the constraint before the hedge, and one clause of rationale after a rule. Read it
-before writing help text or operator docs. Its weights land on kaibo like this:
+the source for *how* our prose reads: a small vocabulary, one word per concept, exact
+numbers, the constraint stated before any qualifier, and one clause of reason after a rule.
+Read it before you write help text or operator docs. It sorts files by *weight* — how
+strictly its rules apply to that file — and kaibo's files sort like this.
 
 | Weight | kaibo files |
 |---|---|
 | Full | every tool `description` and schema param doc in `server.rs`; every clap `about`, arg doc, and `--help` line in `cli.rs`; **every error, refusal, and diagnostic string a tool or command returns** |
-| Partial — keep the terms and the published/internal boundary, relax the rest | preambles and the kaish cheatsheet (`consult/prompts.rs`, `kaish_syntax.rs`), and `///` on `pub` items |
+| Partial — keep the terms and the published/internal boundary; relax the rest | preambles and the kaish cheatsheet (`consult/prompts.rs`, `kaish_syntax.rs`), and `///` on `pub` items |
 | Terms only, one line per bullet | `CHANGELOG.md` |
 | Terms only | `README.md`, `docs/*.md` |
-| Exempt | `docs/devlog.md` — it tells the story from a point of view, and a story needs a voice |
+| Exempt | `docs/devlog.md` — it tells the story from one person's view, and that needs a voice |
 
-**Error strings are full weight, and they are the highest-value prose we own.** A model
-reads a refusal far more often than it reads a description, and the refusal arrives exactly
-when the reader is stuck. Name what was refused, why, and the way out — `save_artifact`'s
-`SaveError` and `deliberate`'s inert-argument refusal are the models to copy.
+**Compression and the reason clause do not conflict.** Keep the clause when a reader who
+knows the reason can predict what happens in a case the rule does not name. Cut it when it
+only repeats the rule in other words. When the source records no reason, state the rule
+alone rather than inventing one.
 
-**Comments: published and internal are different surfaces.** A tool `description`, a schema
-param doc, and a clap arg doc all ship to a model. A `///` on a private item, a `//` line,
-and a module doc-comment do not — that is where mechanism belongs. The test is not whether
-a sentence names an internal, but whether the reader needs that internal to predict
-behavior. `src/server/dossier.rs` keeps its whole design argument in the module doc and
-ships none of it.
+**Error strings carry the Full weight above — every rule in the guide applies — and they
+are the most valuable prose we own.**
+A model reads a refusal more often than it reads a description, and it reads one at the
+moment it is blocked — so a refusal changes what the model does next more reliably than any
+other text we write. Name three things: what was refused, why, and what to do instead.
+`SaveError` in `src/artifact.rs` and `inert_explorer_args` in `src/server/dossier.rs` are
+the two to copy.
+
+**Some text kaibo writes reaches a model; the rest never does.** *Published* means kaibo
+sends it to a model: a tool `description`, a schema param doc, a clap arg doc, a help topic, an
+error string. Everything else is internal — a `///` on a private item, a `//` line, a
+module doc-comment — and internal is where implementation detail belongs. The test for a
+published sentence is not whether it names an internal detail, but whether the reader needs
+that detail to predict what kaibo does. `src/server/dossier.rs` holds its whole design
+argument in the module doc and publishes none of it.
 
 Three audiences are optimized differently:
 
@@ -377,13 +392,13 @@ even for a one-line doc fix.
   Write what a *user* notices, not the file diff. Internal-only refactors need no entry —
   the git log is their record (mirrors the `docs/issues.md` "delete when shipped"
   discipline).
-- **A changelog bullet is one line: the rule, and one clause of why.** This is the one
-  place where "keep the why" does not win, because the full narrative already lives in the
-  pull request body, which becomes the merge commit. If a bullet needs three numbers and
-  three reasons, it is three bullets. **Terser over time** is a ratchet, like compression
-  in the model-facing text: when you add an entry, the paragraph-shaped ones nearby are
-  fair game to cut down, and a release is a good moment to sweep the section you are about
-  to retitle. A reader scanning for what changed should not have to read an argument.
+- **A changelog bullet is one line: the change, and at most one clause of reason.** The
+  full reasoning belongs in the pull request body, which becomes the merge commit, so the
+  bullet does not carry it. If a bullet needs three numbers and three reasons, write three
+  bullets. **Entries get shorter over time**, the same one-way standard compression follows
+  in model-facing text: when you add an entry, shorten any entry near it that runs to a
+  paragraph, and shorten the whole unreleased section before you retitle it for a release.
+  Someone scanning for what changed should not have to read an argument.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
