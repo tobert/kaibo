@@ -17,44 +17,25 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
-- **`kaibo generate` and `kaibo cas read`.** The CLI can now render an image into kaibo's
-  artifact store and read anything back out of it, which completes the MCP-to-CLI parity
-  sweep. `kaibo cas read <digest> > arch.png` gives you the bytes with no flag to
-  remember: metadata goes to stderr and content to stdout, text as text and binary as raw
-  bytes, because the bounded base64 rules the MCP tool follows exist to protect a model's
-  context window and a pipe has no such budget. `read` is the only verb — the store stays
-  opaque and index-free, so there is still no listing, usage report, or delete. A
-  deferred `generate` polls in the foreground rather than handing back a handle nothing
-  could collect.
-
-- **`kaibo deliberate` on the command line, and `kaibo batch cancel`.** Deliberate was
-  MCP-only for no recorded reason on its batch lane, and for a good one on its direct
-  lane (that lane's handle lives in the running server's memory, so a one-shot process
-  would submit, exit, and take the job with it — [#82](https://github.com/tobert/kaibo/issues/82)). Both are answered now. A batch
-  cast prints the durable handle and exits, so `HANDLE=$(kaibo deliberate …)` then
-  `kaibo batch get "$HANDLE"` works across reboots; a direct cast runs the long local
-  completion in the foreground and prints the answer, telling you on stderr that it is
-  waiting. `--dossier` reuses a kept dossier with no sweep — including one built over
-  MCP, since both front doors share the same store. And the CLI could submit and list
-  batches but never stop one; `kaibo batch cancel <handle>` closes that, wording the
-  result as the request it is, since a provider finishes what is already in flight.
-
-- **`deliberate` keeps its dossier, and can reuse one.** The explorer sweep a
-  deliberation is built on is the expensive half — it can run hundreds of thousands
-  of tokens — and it used to be consumed invisibly: no way to see what the offline
-  synth actually reasoned over, and no way to ask a second model the same question
-  without paying for the sweep again. kaibo now stores the finished dossier in its
-  media CAS and names it in the reply (and in the answer when the deliberation
-  lands), so you can `read_cas` it. Pass that digest back as `dossier` and no
-  explorer runs at all: the same evidence goes to whichever cast you point at, for
-  the price of one synth — which is also the fair way to compare two synths, since
-  only the model differs. Any stored text artifact can serve as a dossier, not only
-  one `deliberate` wrote. It rides the CAS's own switch (`[cas] enabled`) with no
-  new key to turn on, a store that refuses the write costs you the record and never
-  the deliberation, and the explorer arguments (`attach`, the explorer overrides,
-  `explorer_max_turns`) are refused on a reuse call rather than silently ignored.
-  Batch deliberations now persist their handle too, with the dossier's address on
-  it, so `job_list` still leads back to the evidence after a restart.
+- **`deliberate` keeps its dossier, and `--dossier` reuses one.** The explorer sweep is
+  the expensive half of a deliberation, so it is now stored and addressable — read it back
+  with `read_cas`, or hand the digest to a second cast to reason over the same evidence for
+  the price of one synth. Rides `[cas] enabled`; no new key.
+- **A refused dossier write never fails the deliberation** — you lose the record, not the
+  answer.
+- **Batch deliberations persist their handle**, labelled with the dossier's address, so
+  `job_list` leads back to the evidence after a restart.
+- **`kaibo deliberate` on the command line.** A batch cast prints the durable handle and
+  exits (`HANDLE=$(kaibo deliberate …)`, then `kaibo batch get "$HANDLE"`); a direct cast
+  runs the long local completion in the foreground and prints the answer, because a
+  one-shot process has no server to hold a job open ([#82](https://github.com/tobert/kaibo/issues/82)).
+- **`kaibo batch cancel <handle>`** — the CLI could submit and list but never stop. The
+  wording says "requested", because a provider finishes what is already in flight.
+- **`kaibo generate`** renders into the artifact store; a deferred render polls in the
+  foreground rather than returning a handle nothing could collect.
+- **`kaibo cas read <digest>`** reads an artifact back: metadata to stderr, content to
+  stdout — text as text, binary as raw bytes, so `> arch.png` needs no flag. `read` is the
+  only verb; the store keeps no index, so there is no listing, usage report, or delete.
 
 - **kaibo warns when the media CAS is on a disk that will not survive the
   container.** A container with no volume mounted looks exactly like durable disk

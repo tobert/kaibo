@@ -39,7 +39,7 @@ loop. Each consultation tool is that loop wearing different clothes:
 Both model-driven tools name their cast + answering model(s) in a provenance footer
 (`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
 
-Eight `--no-<tool>` capability flags gate the surface (all on by default; `consult` also
+A `--no-<tool>` capability flag per tool gates the surface (all on by default; `consult` also
 gates `consult_submit`, `batch` gates `batch_submit`, `generate` additionally needs the
 media CAS on, and the `job_*` verbs follow their live producers — a deferred `generate`
 mints a `job-N` like the other producers). A tool also needs a cast that can **staff**
@@ -85,10 +85,11 @@ project and cannot run external commands.
   parameter for a model to aim; it is write-only (`create_new`; no unlink/truncate/rename,
   so an edit is copy-on-write) and never mounted into kaish, whose read side would
   otherwise enumerate every project's artifacts. `tests/no_write_path.rs` blesses only
-  those two files' individually **marked lines**, at a *pinned exact count* — four today,
-  since the store's one `create_dir_all` plus the CAS's O_EXCL write trips three separate
-  needles — so a new write site can't ride in behind an existing marker without failing
-  that test. Every other `std::fs` mutation in `src/` still fails the guard.
+  individually **marked lines**, each pinned to its file *and to the specific call it
+  excuses*, with the tree-wide total pinned to an exact count. So a new write site cannot
+  ride in behind an existing marker, and a marker cannot excuse a call it was not blessed
+  for. That test is the source for which lines are blessed and how many; read it there
+  rather than restating it here. Every other `std::fs` mutation in `src/` fails the guard.
   Anything further that must *record* or *emit* is its own individually-gated mediated
   tool, never a general filesystem escape hatch or a loosening of the four levers.
   Read-*scope* is also bounded: every call's path must canonicalize (symlinks,
@@ -209,12 +210,59 @@ x86_64-unknown-linux-musl`. Verify the boundary with `cargo tree -i aws-lc-rs`
 
 ## Writing for models
 
-Every prompt, preamble, tool description, and cheatsheet is text some model reads.
-When we touch one, we **re-read the whole block and judge it holistically** — not the
-diff in isolation. The ratchet is *compression* (改善): over time a block should carry
-more impact per token and avoid accreting clauses.
+Every prompt, preamble, tool description, help line, and error string is text some model
+reads. When we touch one, we **re-read the whole block and judge it whole** — not the diff
+by itself.
 
-Two audiences are optimized differently:
+**kaibo adopts kaish's `docs/style.md`** — that guide names kaibo as an adopter, and it is
+the source for *how* our prose reads: a small vocabulary, one word per concept, exact
+numbers, the constraint stated before any qualifier, and one clause of reason after a rule.
+Read it before you write help text or operator docs. It sorts files by *weight* — how
+strictly its rules apply to that file — and kaibo's files sort like this.
+
+| Weight | kaibo files |
+|---|---|
+| Full | every tool `description` and schema param doc in `server.rs`; every clap `about`, arg doc, and `--help` line in `cli.rs`; **every error, refusal, and diagnostic string a tool or command returns** |
+| Partial — keep the terms and the published/internal boundary; relax the rest | preambles and the kaish cheatsheet (`consult/prompts.rs`, `kaish_syntax.rs`), and `///` on `pub` items |
+| Terms only, one line per bullet | `CHANGELOG.md` |
+| Terms only | `README.md`, `docs/*.md` |
+| Exempt | `docs/devlog.md` — it tells the story from one person's view, and that needs a voice |
+
+**Error strings carry the Full weight above — every rule in the guide applies — and they
+are the most valuable prose we own.**
+A model reads a refusal more often than it reads a description, and it reads one at the
+moment it is blocked — so a refusal changes what the model does next more reliably than any
+other text we write. Name three things: what was refused, why, and what to do instead.
+`SaveError` in `src/artifact.rs` and `inert_explorer_args` in `src/server/dossier.rs` are
+the two to copy.
+
+**Some text kaibo writes reaches a model; the rest never does.** *Published* means kaibo
+sends it to a model: a tool `description`, a schema param doc, a clap arg doc, a help topic, an
+error string. Everything else is internal — a `///` on a private item, a `//` line, a
+module doc-comment — and internal is where implementation detail belongs. The test for a
+published sentence is not whether it names an internal detail, but whether the reader needs
+that detail to predict what kaibo does. `src/server/dossier.rs` holds its whole design
+argument in the module doc and publishes none of it.
+
+**Rulings.** Each of these answers a question the first audit of this guidance could not
+settle from the guide alone (2026-08-07, `src/cli.rs`).
+
+- **A subcommand's one-line summary is imperative**, like an example label: it sits beside
+  the command name and says what running it does. "Ask one question and exit", not "A
+  one-shot question".
+- **The 2048-character budget is `server.rs`'s alone.** It is a host truncation of MCP
+  instructions and tool descriptions. `--help` has no such limit, so a `cli.rs` line that
+  needs a second sentence to state a default or a consequence gets one.
+- **Backticks are the only markdown in a clap doc comment.** clap prints the rest
+  literally, so `**bold**` reaches the reader as asterisks.
+- **A refusal fixable only in config.toml names the exact key, then `kaibo example-config`
+  for the shape.** The CLI caller is a person or an agent with file access; both can act on
+  a key name, and neither can act on "configure it properly". Name `kaibo configure` only
+  when the fix is multi-step setup rather than one key.
+- **`family` is a kaibo term** — a model lineage from one vendor, as in "a model outside
+  your own family". About forty uses, one sense. Use it; do not paraphrase it.
+
+Three audiences are optimized differently:
 
 - **Client-facing text** — the MCP server instructions and each tool's `description`
   in `server.rs`, read by the *calling* agent. Density is existential here because it's
@@ -237,30 +285,24 @@ Two audiences are optimized differently:
   instructions, read by the commercial models *we* drive, with windows in the hundreds
   of thousands to millions of tokens. Here verbosity is *licensed where it shapes
   behavior*: say it a few ways, frame positively, be explicit (see **Driving the
-  models**). Verbose to install behavior, never verbose by default. **Plain, literal
-  English**: declarative sentences, roughly one instruction each, concrete nouns, no
-  idiom, no metaphor, no em-dash clause chains. The reason is the roster — most of our
-  synths are not English-first (DeepSeek, GLM, Qwen, Kimi) and the small local models
-  already fixate on odd phrasing — so figurative English is a comprehension tax charged
-  to exactly the models we most need to work well. This is the clarity half of the
-  operator-docs bullet below, and it applies here with *more* force, not less. Plain is
-  not terse: keep the repetition that installs an obligation, drop the decoration around
-  it. `built_in_preambles_are_written_without_em_dash_clause_chains` holds the
+  models**). Verbose to install behavior, never verbose by default — plain is not terse:
+  keep the repetition that installs an obligation, drop the decoration around it. Why
+  "Subset, not slang" binds hardest here: most of our synths are not English-first
+  (DeepSeek, GLM, Qwen, Kimi) and the small local models already fixate on odd phrasing,
+  so figurative English is a comprehension tax charged to exactly the models we most need
+  to work well. `built_in_preambles_are_written_without_em_dash_clause_chains` holds the
   mechanical half.
 - **Operator-facing docs** — `docs/config.example.toml`, `docs/config.md`, `README.md`.
   The first two are **embedded in the binary** (`include_str!`) and served as
   `kaibo://config/example` and `kaibo://config/guide`, so a model reads them as often as
-  a person does. They are shipped product, not repo notes. Write them as **technical
-  reference**: state the rule, name the default, show the shape. Declarative sentences
-  over conversational asides; a table or labelled list over a paragraph that buries three
-  facts in a clause chain. No em-dash pile-ups, no rhetorical questions, no voice.
-  Someone skimming for one key should find it without reading the prose around it, and a
-  non-native English reader should not have to parse an idiom to get a default value.
-  Split the two by job: the **template** says what to type (a knob, its default, one line
-  on what it does, a pointer for the rest); the **guide** explains semantics and
-  interactions. Detail that isn't a knob belongs in the guide — the template is read
-  start to finish by whoever is configuring kaibo, so every line there is a line they pay
-  for.
+  a person does. They are shipped product, not repo notes: technical reference, not a
+  record of how we decided. State the rule, name the default, show the shape, and keep the
+  rationale to the clause after the dash — the argument behind a decision goes in the
+  devlog, and the story of the change goes in the pull request. Split the two files by
+  job: the **template** says what to type (a knob, its default, one line on what it does,
+  a pointer for the rest); the **guide** explains semantics and interactions. Detail that
+  isn't a knob belongs in the guide — the template is read start to finish by whoever is
+  configuring kaibo, so every line there is a line they pay for.
 
 ## Driving the models
 
@@ -355,9 +397,16 @@ even for a one-line doc fix.
   TLS change is a hard look), but don't skip the PR.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
-  Same "why not what" ethos as commits: write what a *user* notices, not the file
-  diff. Internal-only refactors need no entry — the git log is their record (mirrors
-  the `docs/issues.md` "delete when shipped" discipline).
+  Write what a *user* notices, not the file diff. Internal-only refactors need no entry —
+  the git log is their record (mirrors the `docs/issues.md` "delete when shipped"
+  discipline).
+- **A changelog bullet is one line: the change, and at most one clause of reason.** The
+  full reasoning belongs in the pull request body, which becomes the merge commit, so the
+  bullet does not carry it. If a bullet needs three numbers and three reasons, write three
+  bullets. **Entries get shorter over time.** When you add an entry, shorten any entry near
+  it that is longer than one line, and shorten the whole unreleased section before you
+  retitle it for a release. Someone scanning for what changed should not have to read the
+  reasoning behind it.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
