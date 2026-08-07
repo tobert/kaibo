@@ -209,12 +209,37 @@ x86_64-unknown-linux-musl`. Verify the boundary with `cargo tree -i aws-lc-rs`
 
 ## Writing for models
 
-Every prompt, preamble, tool description, and cheatsheet is text some model reads.
-When we touch one, we **re-read the whole block and judge it holistically** — not the
-diff in isolation. The ratchet is *compression* (改善): over time a block should carry
+Every prompt, preamble, tool description, help line, and error string is text some model
+reads. When we touch one, we **re-read the whole block and judge it holistically** — not
+the diff in isolation. The ratchet is *compression* (改善): over time a block should carry
 more impact per token and avoid accreting clauses.
 
-Two audiences are optimized differently:
+**kaibo adopts kaish's `docs/style.md`** — that guide names kaibo as an adopter, and it is
+the source for *how* our prose reads: a small vocabulary, one term per concept, exact
+numbers, the constraint before the hedge, and one clause of rationale after a rule. Read it
+before writing help text or operator docs. Its weights land on kaibo like this:
+
+| Weight | kaibo files |
+|---|---|
+| Full | every tool `description` and schema param doc in `server.rs`; every clap `about`, arg doc, and `--help` line in `cli.rs`; **every error, refusal, and diagnostic string a tool or command returns** |
+| Partial — keep the terms and the published/internal boundary, relax the rest | preambles and the kaish cheatsheet (`consult/prompts.rs`, `kaish_syntax.rs`), and `///` on `pub` items |
+| Terms only, one line per bullet | `CHANGELOG.md` |
+| Terms only | `README.md`, `docs/*.md` |
+| Exempt | `docs/devlog.md` — it tells the story from a point of view, and a story needs a voice |
+
+**Error strings are full weight, and they are the highest-value prose we own.** A model
+reads a refusal far more often than it reads a description, and the refusal arrives exactly
+when the reader is stuck. Name what was refused, why, and the way out — `save_artifact`'s
+`SaveError` and `deliberate`'s inert-argument refusal are the models to copy.
+
+**Comments: published and internal are different surfaces.** A tool `description`, a schema
+param doc, and a clap arg doc all ship to a model. A `///` on a private item, a `//` line,
+and a module doc-comment do not — that is where mechanism belongs. The test is not whether
+a sentence names an internal, but whether the reader needs that internal to predict
+behavior. `src/server/dossier.rs` keeps its whole design argument in the module doc and
+ships none of it.
+
+Three audiences are optimized differently:
 
 - **Client-facing text** — the MCP server instructions and each tool's `description`
   in `server.rs`, read by the *calling* agent. Density is existential here because it's
@@ -237,30 +262,24 @@ Two audiences are optimized differently:
   instructions, read by the commercial models *we* drive, with windows in the hundreds
   of thousands to millions of tokens. Here verbosity is *licensed where it shapes
   behavior*: say it a few ways, frame positively, be explicit (see **Driving the
-  models**). Verbose to install behavior, never verbose by default. **Plain, literal
-  English**: declarative sentences, roughly one instruction each, concrete nouns, no
-  idiom, no metaphor, no em-dash clause chains. The reason is the roster — most of our
-  synths are not English-first (DeepSeek, GLM, Qwen, Kimi) and the small local models
-  already fixate on odd phrasing — so figurative English is a comprehension tax charged
-  to exactly the models we most need to work well. This is the clarity half of the
-  operator-docs bullet below, and it applies here with *more* force, not less. Plain is
-  not terse: keep the repetition that installs an obligation, drop the decoration around
-  it. `built_in_preambles_are_written_without_em_dash_clause_chains` holds the
+  models**). Verbose to install behavior, never verbose by default — plain is not terse:
+  keep the repetition that installs an obligation, drop the decoration around it. Why
+  "Subset, not slang" binds hardest here: most of our synths are not English-first
+  (DeepSeek, GLM, Qwen, Kimi) and the small local models already fixate on odd phrasing,
+  so figurative English is a comprehension tax charged to exactly the models we most need
+  to work well. `built_in_preambles_are_written_without_em_dash_clause_chains` holds the
   mechanical half.
 - **Operator-facing docs** — `docs/config.example.toml`, `docs/config.md`, `README.md`.
   The first two are **embedded in the binary** (`include_str!`) and served as
   `kaibo://config/example` and `kaibo://config/guide`, so a model reads them as often as
-  a person does. They are shipped product, not repo notes. Write them as **technical
-  reference**: state the rule, name the default, show the shape. Declarative sentences
-  over conversational asides; a table or labelled list over a paragraph that buries three
-  facts in a clause chain. No em-dash pile-ups, no rhetorical questions, no voice.
-  Someone skimming for one key should find it without reading the prose around it, and a
-  non-native English reader should not have to parse an idiom to get a default value.
-  Split the two by job: the **template** says what to type (a knob, its default, one line
-  on what it does, a pointer for the rest); the **guide** explains semantics and
-  interactions. Detail that isn't a knob belongs in the guide — the template is read
-  start to finish by whoever is configuring kaibo, so every line there is a line they pay
-  for.
+  a person does. They are shipped product, not repo notes: technical reference, not a
+  record of how we decided. State the rule, name the default, show the shape, and keep the
+  rationale to the clause after the dash — the argument behind a decision goes in the
+  devlog, and the story of the change goes in the pull request. Split the two files by
+  job: the **template** says what to type (a knob, its default, one line on what it does,
+  a pointer for the rest); the **guide** explains semantics and interactions. Detail that
+  isn't a knob belongs in the guide — the template is read start to finish by whoever is
+  configuring kaibo, so every line there is a line they pay for.
 
 ## Driving the models
 
@@ -355,9 +374,16 @@ even for a one-line doc fix.
   TLS change is a hard look), but don't skip the PR.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
-  Same "why not what" ethos as commits: write what a *user* notices, not the file
-  diff. Internal-only refactors need no entry — the git log is their record (mirrors
-  the `docs/issues.md` "delete when shipped" discipline).
+  Write what a *user* notices, not the file diff. Internal-only refactors need no entry —
+  the git log is their record (mirrors the `docs/issues.md` "delete when shipped"
+  discipline).
+- **A changelog bullet is one line: the rule, and one clause of why.** This is the one
+  place where "keep the why" does not win, because the full narrative already lives in the
+  pull request body, which becomes the merge commit. If a bullet needs three numbers and
+  three reasons, it is three bullets. **Terser over time** is a ratchet, like compression
+  in the model-facing text: when you add an entry, the paragraph-shaped ones nearby are
+  fair game to cut down, and a release is a good moment to sweep the section you are about
+  to retitle. A reader scanning for what changed should not have to read an argument.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
