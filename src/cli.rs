@@ -13,7 +13,7 @@
 //!   [`TerminalSink`](crate::progress::TerminalSink)). `--json` swaps stdout for a
 //!   structured envelope (answer + provenance + usage + warnings) — and the `answer`
 //!   field is the model's raw words, never kaibo's injected notices.
-//! - **exit codes have teeth.** `0` = an answer; `2` = a **usage** error — a bad
+//! - **exit codes have defined behavior.** `0` = an answer; `2` = a **usage** error — a bad
 //!   argument, an unknown or wrong-for-the-tool cast, an image on a vision-blind cast
 //!   (also clap's own arg-parse errors, and config load); `3` = a **setup/containment**
 //!   rejection — a path or attachment outside the allowed set, a missing/unbuildable
@@ -71,7 +71,7 @@ pub const EXIT_CONSULT_FAILURE: i32 = 4;
 /// or script reading `--help` cold, rather than the doc-comments above or the README.
 const EXIT_CODES_HELP: &str = "\
 EXIT CODES
-    0  an answer
+    0  success — an answer, a report, or the requested output
     2  usage error — a bad argument, an unknown or wrong-for-the-tool cast, an
        image on a vision-blind cast, or a clap argument-parse error
     3  setup/containment rejection — a path or attachment outside the allowed
@@ -84,10 +84,10 @@ this table (0 ok, 126 blocked, 124 timed out).";
 
 /// kaibo — read-only codebase consultation from a model outside your own
 /// family. Ask a question; a synthesis agent (DeepSeek, Gemini, Anthropic, OpenRouter,
-/// or local — pick with `--cast`) reads the project READ-ONLY and answers with
-/// `file:line` citations, never modifying anything. Bare `kaibo` is the MCP server
-/// (stdio); `kaibo consult` is the one-shot CLI; `kaibo config` prints the resolved
-/// configuration.
+/// or local — pick with `--cast`) reads the project and answers with `file:line`
+/// citations. kaibo never writes to your project. Bare `kaibo` runs the MCP server on
+/// stdio; `kaibo consult` answers one question and exits; `kaibo config` prints the
+/// resolved configuration.
 #[derive(Parser, Debug)]
 #[command(name = "kaibo", version, after_long_help = EXIT_CODES_HELP)]
 pub struct Cli {
@@ -119,24 +119,26 @@ pub enum Command {
     Serve(ServeGates),
     /// Ask one read-only consultation question; the cited answer prints to stdout.
     Consult(ConsultArgs),
-    /// A toolless second opinion: no codebase access, the model answers from your prompt
-    /// (plus piped stdin and `--attach` files) and its own knowledge.
+    /// Get a toolless second opinion: no codebase access, the model answers from your
+    /// prompt (plus piped stdin and `--attach` files) and its own knowledge.
     Oneshot(OneshotArgs),
     /// Survey the codebase and print a cited report (the evidence half of consult).
     Explore(ExploreArgs),
-    /// Investigate, then hand that evidence to a heavyweight OFFLINE synth — a frontier
-    /// model on the provider's batch lane, or a big local model taking the time it takes.
+    /// Investigate the codebase, then send that evidence to an offline synth model. A
+    /// batch-lane cast prints a durable handle and exits; a direct-lane cast waits for a
+    /// local model and prints the answer.
     Deliberate(DeliberateArgs),
     /// Run one kaish (sh-like) command against the read-only project and print its output.
     Kaish(KaishArgs),
-    /// Provider batch lanes — submit a fan-out, get results, list live/recovered handles.
+    /// Provider batch lanes — submit many prompts at once, collect results, list handles.
     Batch(BatchArgs),
-    /// Generate an image into kaibo's artifact store; prints the digest to read it back.
+    /// Generate an image into kaibo's artifact store and print the digest that reads it
+    /// back.
     Generate(GenerateCliArgs),
     /// Read an artifact kaibo stored, by its digest.
     Cas(CasArgs),
-    /// List available models a backend's provider actually serves — read-only model
-    /// discovery via the backend's real /models endpoint, no cast/model in the loop.
+    /// List the models a backend serves, read from its own /models endpoint. No cast is
+    /// resolved and no model runs.
     Models(ModelsArgs),
     /// Print the resolved runtime configuration (the `kaibo://config` document).
     Config,
@@ -211,9 +213,9 @@ pub struct CommonArgs {
     #[arg(long = "user-context-file", value_name = "FILE", action = clap::ArgAction::Append, global = true)]
     pub user_context_file: Vec<PathBuf>,
 
-    /// Don't persist sessions or batch handles — run fully in-memory. By default kaibo
-    /// keeps a small state db so a `--session` survives a restart and is shared across
-    /// front doors. Also KAIBO_NO_PERSISTENCE.
+    /// Don't persist sessions or batch handles — run fully in memory. By default kaibo
+    /// keeps a state db so a `--session` survives a restart and is shared between the CLI
+    /// and the MCP server. Also KAIBO_NO_PERSISTENCE.
     #[arg(long, global = true)]
     pub no_persistence: bool,
 
@@ -222,21 +224,24 @@ pub struct CommonArgs {
     #[arg(long = "state-db", value_name = "FILE", global = true)]
     pub state_db: Option<PathBuf>,
 
-    /// Directory for the media CAS (generated artifacts). Overrides KAIBO_CAS_DIR /
+    /// Directory for the artifact store (generated images and saved output). Overrides
+    /// KAIBO_CAS_DIR /
     /// [cas] dir / the default ($XDG_DATA_HOME/kaibo/cas).
     #[arg(long = "cas-dir", value_name = "DIR", global = true)]
     pub cas_dir: Option<PathBuf>,
 
-    /// Soft cap on total media-CAS size, in bytes. Unset means NO cap and no size
-    /// accounting; setting one makes every new write first sum the whole store.
-    /// Overrides KAIBO_CAS_MAX_BYTES / [cas] max_bytes.
+    /// Cap on total artifact-store size, in bytes. A write that would exceed it is
+    /// refused and nothing is deleted — kaibo never evicts an artifact you paid for.
+    /// Unset (the default) means no cap and no size accounting; setting one makes every
+    /// new write sum the whole store first. Overrides KAIBO_CAS_MAX_BYTES /
+    /// [cas] max_bytes.
     #[arg(long = "cas-max-bytes", value_name = "BYTES", global = true)]
     pub cas_max_bytes: Option<u64>,
 
-    /// Cap on how many files one explorer sweep may route with its `attach` tool
-    /// (the bytes ride to whoever reads the sweep's report — the consult driver, or
-    /// deliberate's offline synth). `0` turns the tool off. Also KAIBO_MAX_ATTACHMENTS
-    /// / [defaults] max_attachments.
+    /// Cap on how many files one explorer sweep may attach with its `attach` tool;
+    /// default 32. The attached files are sent to whatever reads that sweep's report:
+    /// the consult's synth model, or deliberate's offline synth. `0` removes the tool
+    /// entirely. Also KAIBO_MAX_ATTACHMENTS / [defaults] max_attachments.
     #[arg(long = "max-attachments", value_name = "N", global = true)]
     pub max_attachments: Option<usize>,
 }
@@ -249,7 +254,8 @@ pub struct CommonArgs {
 /// whose built-in default is off. See [`crate::config::ArtifactsConfig`].
 #[derive(Args, Debug, Clone, Default)]
 pub struct ServeGates {
-    /// Don't advertise the `consult` tool.
+    /// Don't advertise the `consult` tool. This also drops `consult_submit` and the job
+    /// verbs that only `consult` produces.
     #[arg(long)]
     pub no_consult: bool,
     /// Don't advertise the `explore` tool.
@@ -274,9 +280,9 @@ pub struct ServeGates {
     #[arg(long)]
     pub no_generate: bool,
 
-    /// Let a consult save bulk output as artifacts in kaibo's media store, when the
+    /// Let a consult save bulk output as artifacts in kaibo's artifact store, when the
     /// call also asks for it with `save_artifacts` (both keys are required, and the
-    /// media CAS must be on). OFF by default — this is the one capability a model,
+    /// artifact store must be on). OFF by default — this is the one capability a model,
     /// rather than the operator, decides to use. Also KAIBO_ARTIFACTS_ENABLED /
     /// [artifacts] enabled.
     #[arg(long = "allow-save-artifact")]
@@ -304,7 +310,8 @@ impl ServeGates {
 #[derive(Args, Debug)]
 pub struct ConsultArgs {
     /// The question to investigate. Say in prose what you did or want to know — kaibo
-    /// locates and reads the real, current code itself, so your intent beats a diff.
+    /// locates and reads the real, current code itself, so describe the change in your
+    /// own words instead of pasting a diff.
     pub question: String,
 
     /// Project to explore. Optional — defaults to the root/allowed cwd; must resolve
@@ -312,8 +319,10 @@ pub struct ConsultArgs {
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
 
-    /// Workspace file to put in front of the investigation (inlined if small, else read
-    /// whole by the model; an image needs a vision-capable cast). Repeatable.
+    /// Workspace file to give the investigation. Files are inlined into the prompt in
+    /// the order you pass them, while the `[defaults] inline_attach_budget` lasts (262144
+    /// bytes by default); past that the model is directed to read the file whole instead.
+    /// An image needs a vision-capable cast. Repeatable.
     #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
     pub attach: Vec<String>,
 
@@ -349,15 +358,19 @@ pub struct ConsultArgs {
     #[arg(long, value_name = "N")]
     pub synth_max_turns: Option<usize>,
 
-    /// Also print the explorer's aggregated report (under `report` in --json; appended
-    /// on a rule below otherwise). Empty when the consult delegated no sweep.
+    /// Also print the explorer's aggregated report. Under --json it is the `report`
+    /// field on stdout; otherwise it goes to stderr under a `--- explorer report ---`
+    /// header, so a pipe still captures only the answer. Empty when the consult
+    /// delegated no sweep.
     #[arg(long)]
     pub include_report: bool,
 
     /// Emit a JSON envelope on stdout (answer + provenance + usage + warnings) instead
-    /// of prose, for a script caller. Note: an argument-parse error prints usage to
-    /// stderr and exits 2 with nothing on stdout — the JSON envelope is guaranteed only
-    /// once the arguments parse.
+    /// of prose, for a script caller. A failure emits `{"error": …, "kind": …}` instead,
+    /// where `kind` is one of `config`, `usage`, `setup`, `persistence`, or
+    /// `consultation_failure`. An argument-parse error is the exception: usage goes to
+    /// stderr and the process exits 2 with nothing on stdout, so the envelope is
+    /// guaranteed only once the arguments parse.
     #[arg(long)]
     pub json: bool,
 }
@@ -367,9 +380,10 @@ pub struct ConsultArgs {
 /// stdin, `… < notes.md`) and `--attach`ed files. Pick the answering team with `--cast`.
 #[derive(Args, Debug)]
 pub struct OneshotArgs {
-    /// The prompt to send the model. Context piped on stdin is appended (the
-    /// `oneshot "review this" < diff.txt` idiom). No codebase access, so include (or
-    /// `--attach`) whatever the answer needs.
+    /// The prompt to send the model. Context piped on stdin is appended, as in
+    /// `kaibo oneshot "review this" < diff.txt`. Piped input must be text; non-text input
+    /// is refused with exit 2. No codebase access, so include (or `--attach`) whatever
+    /// the answer needs.
     pub prompt: String,
 
     /// Workspace file to inline as context — kaibo reads it so its bytes never pass
@@ -395,7 +409,7 @@ pub struct OneshotArgs {
 /// the trail it followed, not a synthesized answer.
 #[derive(Args, Debug)]
 pub struct ExploreArgs {
-    /// What to survey or map. Say in prose what you want charted — kaibo's explorer
+    /// What to survey or map. Say in prose what you want mapped — kaibo's explorer
     /// locates and reads the real, current code and reports back with citations.
     pub question: String,
 
@@ -530,11 +544,11 @@ pub struct GenerateCliArgs {
 
 /// `kaibo cas` — read what kaibo stored, by address.
 ///
-/// **`read` is the only verb, on purpose.** The store is content-addressed and opaque:
-/// you reach an object with a digest you already hold, and there is deliberately no
-/// listing, no usage report, and no delete — none of those can exist without an index the
-/// store does not keep (`docs/config.md`). Retention is file mtime over the object tree,
-/// with your own tools.
+/// `read` is the only verb, on purpose. The store is content-addressed and opaque: you
+/// reach an object with a digest you already hold. There is no listing, no usage report,
+/// and no delete, because none of those can exist without an index the store does not
+/// keep. kaibo never deletes an artifact — to reclaim space, delete files under the store
+/// directory yourself by mtime; `kaibo config` prints that path.
 #[derive(Args, Debug)]
 pub struct CasArgs {
     #[command(subcommand)]
@@ -547,8 +561,8 @@ pub enum CasCmd {
     Read(CasReadArgs),
 }
 
-/// `kaibo cas read` — metadata-first, bounded retrieval, the same rules the `read_cas`
-/// MCP tool applies, because they are one planner.
+/// `kaibo cas read` — metadata first, then a bounded window of content. The same rules
+/// the `read_cas` MCP tool applies.
 #[derive(Args, Debug)]
 pub struct CasReadArgs {
     /// The artifact's digest, bare or as its full `kaibo://cas/<digest>` URI — whichever
@@ -560,9 +574,10 @@ pub struct CasReadArgs {
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub offset: usize,
 
-    /// How many bytes to serve. Omitted, a text object gives a bounded window and a
-    /// binary one gives metadata alone; `0` is metadata only for anything. Refused past
-    /// the per-read ceiling rather than trimmed, so your next `offset` is never wrong.
+    /// How many bytes to serve. Omitted, a text object gives a 65536-byte window from
+    /// `offset` and a binary object gives metadata alone; `0` is metadata only for any
+    /// object. A length above 1048576 bytes is refused rather than trimmed, so your next
+    /// `offset` is never wrong.
     #[arg(long, value_name = "N")]
     pub length: Option<usize>,
 
@@ -571,8 +586,9 @@ pub struct CasReadArgs {
     pub json: bool,
 }
 
-/// `kaibo batch` — the provider batch lanes (offline, max thinking, half price) exactly
-/// as the MCP verbs drive them.
+/// `kaibo batch` — the provider batch lanes. Work runs offline at the provider and
+/// returns hours later, typically at half the interactive price. Same behavior as the
+/// MCP batch verbs.
 #[derive(Args, Debug)]
 pub struct BatchArgs {
     #[command(subcommand)]
@@ -582,7 +598,8 @@ pub struct BatchArgs {
 #[derive(Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum BatchCmd {
-    /// Fan self-contained prompts to a batch cast; prints the durable `backend/id` handle.
+    /// Submit self-contained prompts to a batch cast; prints the durable
+    /// `backend/provider-id` handle.
     Submit(BatchSubmitArgs),
     /// Fetch a batch by handle — a progress line while it runs, per-item answers when done.
     Get(BatchGetArgs),
@@ -596,7 +613,7 @@ pub enum BatchCmd {
 /// its own context (or shared `--attach` files). Needs a batch-capable cast/backend.
 #[derive(Args, Debug)]
 pub struct BatchSubmitArgs {
-    /// The prompts to fan out, one batch item each. At least one required.
+    /// The prompts to submit, one batch item each. At least one required.
     #[arg(required = true, value_name = "PROMPT")]
     pub prompts: Vec<String>,
 
@@ -631,7 +648,7 @@ pub struct BatchGetArgs {
 /// `kaibo batch list` — the way back to a batch whose handle you lost.
 #[derive(Args, Debug)]
 pub struct BatchListArgs {
-    /// Which backend (name or alias) to list. Omit to sweep every batch-capable backend.
+    /// Which backend (name or alias) to list. Omit to query every batch-capable backend.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -649,7 +666,7 @@ pub struct BatchListArgs {
 /// No cast, no model in the loop — a pure operator/config query.
 #[derive(Args, Debug)]
 pub struct ModelsArgs {
-    /// Which backend (name or alias) to query. Omit to sweep every configured backend.
+    /// Which backend (name or alias) to query. Omit to query every configured backend.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -953,7 +970,10 @@ async fn open_sessions(
     }
     let path = persistence.path.clone().ok_or_else(|| SetupError {
         kind: "config",
-        message: "persistence is enabled but no state-db path resolved".to_string(),
+        message: "kaibo cannot start a `--session`: persistence is on but no state db path is \
+             set. Name one with `--state-db FILE`, set `[persistence] path` in config.toml, \
+             or pass `--no-persistence` to keep this session in memory for this run only."
+            .to_string(),
         code: EXIT_USAGE,
     })?;
     let allowed = resolver.allowed_set();
@@ -963,11 +983,11 @@ async fn open_sessions(
         .map_err(|e| SetupError {
             kind: "persistence",
             message: format!(
-                "failed to open the persistence state db at {}: {e:#}. \
-                 Fix the path/permissions, or point elsewhere with --state-db. \
-                 Or pass --no-persistence to run this `--session` in memory for this \
-                 invocation only — the thread works now but is lost when the process exits \
-                 (it won't survive or be shared with the MCP server).",
+                "kaibo could not open the persistence state db at {}: {e:#}. Fix the \
+                 path or its permissions, or name another with --state-db. Or pass \
+                 --no-persistence to keep this `--session` in memory for this run only — \
+                 the session works now, and is lost when the process exits, so it is never \
+                 shared with the MCP server.",
                 path.display()
             ),
             code: EXIT_SETUP,
@@ -1889,7 +1909,10 @@ fn parse_generate_field(raw: &str) -> Result<(String, crate::media::FieldValue),
     if key.is_empty() {
         return Err(SetupError {
             kind: "usage",
-            message: format!("`--field {raw}` has an empty key"),
+            message: format!(
+                "`--field {raw}` has an empty key — write `--field KEY=VALUE`, for example \
+                 `--field n=2`"
+            ),
             code: EXIT_USAGE,
         });
     }
@@ -1934,7 +1957,10 @@ async fn generate_inner(
     let arm = crate::media::MediaArmFactory::build(&crate::media::LiveMediaArms, backend, slot)
         .map_err(|e| SetupError {
             kind: "setup",
-            message: format!("cast `{}` image slot: {e:#}", cast.name),
+            message: format!(
+                "`generate` cannot use cast `{}`: its `image` slot did not build — {e:#}",
+                cast.name
+            ),
             code: EXIT_SETUP,
         })?;
     let mut fields = Vec::with_capacity(args.fields.len());
@@ -1946,8 +1972,9 @@ async fn generate_inner(
     let persistence = open_batch_store(resolver).await;
     let store = open_media_cas(resolver, persistence.is_some())?.ok_or_else(|| SetupError {
         kind: "usage",
-        message: "the media CAS is disabled ([cas] enabled = false), so `generate` has \
-                  nowhere to store what it renders. Re-enable it and run again."
+        message: "kaibo's artifact store is disabled (`[cas] enabled = false`), so \
+                  `generate` has nowhere to put what it renders. Set `[cas] enabled = true` \
+                  in config.toml and run again."
             .to_string(),
         code: EXIT_USAGE,
     })?;
@@ -1988,9 +2015,11 @@ async fn generate_inner(
                                 "generate",
                                 &cast.name,
                                 anyhow::anyhow!(
-                                    "still pending after {}s (the call_deadline budget) — \
-                                     provider job id `{}` may still finish on the \
-                                     provider's side, but kaibo has stopped polling it",
+                                    "kaibo stopped waiting after {}s, the `[defaults] \
+                                     call_deadline` budget. The provider may still finish \
+                                     job `{}`, and you may still be billed for it. Raise \
+                                     `call_deadline` in config.toml and run again if this \
+                                     model needs longer.",
                                     deadline.as_secs(),
                                     job.0
                                 ),
@@ -2062,8 +2091,9 @@ async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, 
     let mode = resolver.config.cas_mode(persistence.is_some());
     let store = open_media_cas(resolver, persistence.is_some())?.ok_or_else(|| SetupError {
         kind: "usage",
-        message: "the media CAS is disabled ([cas] enabled = false), so kaibo holds no \
-                  artifacts to read."
+        message: "kaibo's artifact store is disabled (`[cas] enabled = false`), so kaibo \
+                  holds no artifacts to read. Set `[cas] enabled = true` in config.toml to \
+                  turn it on."
             .to_string(),
         code: EXIT_USAGE,
     })?;
@@ -2104,7 +2134,12 @@ async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, 
         Ok(None) => {
             return Err(SetupError {
                 kind: "usage",
-                message: format!("no artifact with digest {hex} — this store never held it."),
+                message: format!(
+                    "no artifact with digest {hex} in kaibo's artifact store. Pass a digest \
+                     kaibo printed — a `generate` result, or one from a \
+                     `kaibo://cas/<digest>` footer. `kaibo config` shows which store \
+                     directory this process reads."
+                ),
                 code: EXIT_USAGE,
             })
         }
@@ -2192,7 +2227,11 @@ async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, 
                 .and_then(|()| out.flush())
                 .map_err(|e| SetupError {
                     kind: "setup",
-                    message: format!("writing artifact bytes to stdout: {e}"),
+                    message: format!(
+                        "kaibo could not write the artifact to stdout, so the output is \
+                 incomplete: {e}. Redirect to a file and run again: \
+                 `kaibo cas read <digest> > out.png`."
+                    ),
                     code: EXIT_SETUP,
                 })?;
         }
@@ -2259,7 +2298,11 @@ pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
     let worker = match KaishWorker::spawn_with(&root, resolver.config.sandbox.clone()) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("kaibo: could not start kaish: {e:#}");
+            eprintln!(
+                "kaibo: could not start the kaish shell, so nothing ran: {e:#}. Check that \
+                 the project path is a readable directory — `kaibo config` prints the \
+                 allowed trees and the default root."
+            );
             return EXIT_SETUP;
         }
     };
@@ -2297,7 +2340,11 @@ pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
         // rejection — so it's exit 4, not a setup code. (An honest script/blocked/timeout
         // outcome came back Ok(out) above with kaish's own code.)
         Err(e) => {
-            eprintln!("kaibo: kaish execution failed: {e:#}");
+            eprintln!(
+                "kaibo: the kaish shell failed while running your script, so its output is \
+                 incomplete: {e:#}. This is a kaibo failure, not a script error — a script's \
+                 own exit codes are 0, 126 (blocked), and 124 (timed out)."
+            );
             EXIT_CONSULT_FAILURE
         }
     }
@@ -2381,10 +2428,11 @@ fn batch_backends(resolver: &Resolver, backend: Option<&str>) -> Result<Vec<Stri
             return Err(SetupError {
                 kind: "usage",
                 message: format!(
-                    "backend {:?} ({:?}) has no batch lane (batch-capable: {}). Omit --backend \
-                     to list every batch-capable backend.",
+                    "backend `{}` (kind `{}`) has no batch lane, so kaibo cannot list its \
+                     batches. Batch-capable kinds: {}. Omit --backend to list every \
+                     batch-capable backend.",
                     b.name,
-                    b.kind,
+                    b.kind.canonical_name(),
                     supported_kinds_list()
                 ),
                 code: EXIT_USAGE,
@@ -2402,7 +2450,14 @@ fn batch_backends(resolver: &Resolver, backend: Option<&str>) -> Result<Vec<Stri
     if names.is_empty() {
         return Err(SetupError {
             kind: "setup",
-            message: "no batch-capable backend is configured".to_string(),
+            message: format!(
+                "no configured backend has a batch lane, so there is nothing to list. \
+                 Batch-capable kinds: {}. Add a backend of one of those kinds — \
+                 `kaibo example-config` prints an annotated template, and `kaibo config` \
+                 shows what kaibo resolved.",
+                supported_kinds_list()
+            )
+            .to_string(),
             code: EXIT_SETUP,
         });
     }
@@ -2590,10 +2645,10 @@ async fn batch_cancel_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<
         return Err(SetupError {
             kind: "usage",
             message: format!(
-                "backend {:?} ({:?}) has no batch lane, so it holds no batch to cancel \
-                 (batch-capable: {}).",
+                "backend `{}` (kind `{}`) has no batch lane, so it holds no batch to \
+                 cancel. Batch-capable kinds: {}.",
                 backend.name,
-                backend.kind,
+                backend.kind.canonical_name(),
                 crate::batch::supported_kinds_list()
             ),
             code: EXIT_USAGE,
@@ -2753,8 +2808,8 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
                 })
                 .collect();
             println!(
-                "\nRecovered batch handles (kaibo-submitted, from the store — `kaibo batch get` \
-                 one for live status):\n{}",
+                "\nRecovered batch handles (submitted by kaibo, read from the state db — \
+                 run `kaibo batch get <handle>` for live status):\n{}",
                 lines.join("\n")
             );
         }
@@ -2799,7 +2854,10 @@ pub async fn run_models(common: CommonArgs, args: ModelsArgs) -> i32 {
         return fail_preflight(
             args.json,
             "setup",
-            "no backend is configured".to_string(),
+            "no backend is configured, so there is nothing to query. Add a \
+             `[backends.<name>]` section to config.toml — `kaibo example-config` prints an \
+             annotated template, and `kaibo config` shows the resolved configuration."
+                .to_string(),
             EXIT_SETUP,
         );
     }
@@ -2852,7 +2910,9 @@ mod tests {
             "long --help should carry the exit-code table:\n{long_help}"
         );
         for code in [
-            "0  an answer",
+            // Row 0 says "success", not "an answer": `config`, `models`, `example-config`,
+            // and `cas read` all exit 0 without producing an answer.
+            "0  success",
             "2  usage error",
             "3  setup/containment",
             "4  the work ran",

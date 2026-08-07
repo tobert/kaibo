@@ -15,6 +15,16 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--include-report`'s help described the wrong stream.** It said the report is appended
+  below the answer; it goes to stderr, so a script that piped stdout lost it silently.
+- **`--cas-max-bytes` was documented as a "soft cap".** A write past it is refused and
+  nothing is evicted — an operator would have found that out by losing a generation.
+- **`kaibo batch` advertised "half price"** as a fact kaibo does not control. It now says
+  "typically", and the refusals that name a provider kind print the config spelling
+  (`deepseek`) instead of the Rust one (`DeepSeek`).
+
 ### Added
 
 - **`deliberate` keeps its dossier, and `--dossier` reuses one.** The explorer sweep is
