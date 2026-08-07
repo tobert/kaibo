@@ -27,6 +27,18 @@
 //! per-file pinning below keeps exactly that property; only the *count* it must satisfy
 //! grows from one to four (1 in `store.rs` + 3 in `cas.rs`).
 //!
+//! **Blessed site 3** (2026-08-07): `kaibo cas read` writing an artifact's bytes to
+//! **stdout**. Different in kind from the other two, and worth saying why it is here at
+//! all. It creates nothing on any filesystem — stdout is a descriptor the operator's shell
+//! already opened and aimed, so this store still has no destination parameter anywhere and
+//! no model can steer it. It is blessed rather than exempted-by-cleverness because the
+//! needle (`.write_all(`) cannot tell a file from a pipe, and a guard that tried to would
+//! be the kind of regex that fails silently in the wrong direction. The bounded,
+//! base64-averse rules an MCP read follows exist to protect a *context window*; a pipe has
+//! no such budget, and a caller who asked for an image by digest expects its bytes — so
+//! this front door serves them, visibly and countably (Amy, 2026-08-07: "we do know when
+//! we might output binary and the caller likely knows they're gonna get binary").
+//!
 //! The carve-out is deliberately narrow, and this test keeps its teeth:
 //! - a blessed line is exempted **only** when its file is one of the two blessed files
 //!   *and* the line's own raw text carries that file's marker — nothing else qualifies
@@ -75,23 +87,55 @@ const FORBIDDEN: &[&str] = &[
 /// per-line property already (the marker has to be ON the offending line), so needle-
 /// pinning added no additional narrowness store.rs's single needle didn't already get for
 /// free.
-const BLESSED: &[(&str, &str)] = &[
-    (
-        "store.rs",
-        "state-dir-create: blessed by the read-only invariant amendment",
-    ),
-    (
-        "cas.rs",
-        "media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)",
-    ),
+const BLESSED: &[Blessed] = &[
+    Blessed {
+        file: "store.rs",
+        marker: "state-dir-create: blessed by the read-only invariant amendment",
+        needles: &["create_dir_all("],
+    },
+    Blessed {
+        file: "cas.rs",
+        marker: "media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)",
+        // One object write touches three seams; the `create_new` open hits two needles on
+        // one physical line.
+        needles: &[
+            "create_dir_all(",
+            "OpenOptions::",
+            ".write(",
+            ".write_all(",
+        ],
+    },
+    Blessed {
+        file: "cli.rs",
+        marker: "cas-stdout-bytes: blessed by the media CAS invariant amendment (AGENTS.md)",
+        // Handing bytes to an already-open descriptor, and nothing else. A path-taking
+        // call is a different capability and must fail here even with the marker on it.
+        needles: &[".write_all("],
+    },
 ];
+
+/// One blessed write site: which file may carry it, the marker its line must show, and
+/// **which** forbidden calls that marker excuses.
+///
+/// The needle list was reintroduced on 2026-08-07 (it had been dropped when `cas.rs`
+/// needed three needles under one marker). Without it, a marker excuses *any* forbidden
+/// call on its line, so pasting `cli.rs`'s marker onto an `fs::write(out_path, …)` would
+/// launder a caller-named destination past this guard — and the CLI is exactly where a
+/// "just write it to a file for me" flag would be proposed. Caught by
+/// `teeth_cli_writes_without_the_marker_fail`.
+struct Blessed {
+    file: &'static str,
+    marker: &'static str,
+    needles: &'static [&'static str],
+}
 
 /// The exact number of blessed marker lines expected tree-wide: 1 in `store.rs`
 /// (`create_state_dir`'s `create_dir_all`) + 3 in `cas.rs` (the shard-dir `create_dir_all`,
 /// the `create_new` open, and the `write_all` of the bytes — see `src/cas.rs`'s module
-/// doc and the count breakdown in this file's module doc). Pinned so a new write site
-/// can't silently ride in behind an existing marker.
-const EXPECTED_BLESSED_LINES: usize = 4;
+/// doc and the count breakdown in this file's module doc) + 1 in `cli.rs` (`kaibo cas
+/// read` handing an artifact's bytes to stdout). Pinned so a new write site can't
+/// silently ride in behind an existing marker.
+const EXPECTED_BLESSED_LINES: usize = 5;
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -122,16 +166,21 @@ fn strip_line_comment(line: &str) -> &str {
     }
 }
 
-/// Is this a blessed occurrence? Exempt when `basename` matches one of [`BLESSED`]'s
-/// files and `raw_line` (comment included) carries *that file's* marker text. No needle
-/// pin: blessing is inherently per-line (the marker must be on the offending line
-/// itself), so a marker on the right line already can't drift onto an unrelated line
-/// carrying a different forbidden call — see the module doc for why `cas.rs` needs this
-/// generalization over `store.rs`'s original single `(file, needle, marker)` pin.
-fn is_blessed(basename: &str, raw_line: &str) -> bool {
+/// Is this needle blessed on this line? All three must hold: the file carries a blessing,
+/// the line's own raw text (comment included) shows that blessing's marker, and the needle
+/// is one the blessing actually excuses.
+fn is_blessed_needle(basename: &str, raw_line: &str, needle: &str) -> bool {
+    BLESSED.iter().any(|b| {
+        basename == b.file && raw_line.contains(b.marker) && b.needles.contains(&needle)
+    })
+}
+
+/// Does this line carry a blessing marker at all? Used for the tree-wide count, which
+/// pins how many blessed *lines* exist regardless of how many needles each excuses.
+fn is_blessed_line(basename: &str, raw_line: &str) -> bool {
     BLESSED
         .iter()
-        .any(|(file, marker)| basename == *file && raw_line.contains(marker))
+        .any(|b| basename == b.file && raw_line.contains(b.marker))
 }
 
 /// Forbidden needles found in one file's production code, honoring the blessed
@@ -142,7 +191,7 @@ fn scan_source(basename: &str, source: &str) -> Vec<String> {
     for raw in production_code(source).lines() {
         let code = strip_line_comment(raw);
         for needle in FORBIDDEN {
-            if code.contains(needle) && !is_blessed(basename, raw) {
+            if code.contains(needle) && !is_blessed_needle(basename, raw, needle) {
                 hits.push(needle.to_string());
             }
         }
@@ -155,7 +204,7 @@ fn scan_source(basename: &str, source: &str) -> Vec<String> {
 fn blessed_count(basename: &str, source: &str) -> usize {
     production_code(source)
         .lines()
-        .filter(|raw| is_blessed(basename, raw))
+        .filter(|raw| is_blessed_line(basename, raw))
         .count()
 }
 
@@ -207,7 +256,7 @@ fn blessed_marker_count_matches_exactly() {
     assert_eq!(
         total, EXPECTED_BLESSED_LINES,
         "expected exactly {EXPECTED_BLESSED_LINES} blessed write sites tree-wide (1 in \
-         src/store.rs + 3 in src/cas.rs), found {total}"
+         src/store.rs + 3 in src/cas.rs + 1 in src/cli.rs), found {total}"
     );
 }
 
@@ -218,7 +267,7 @@ fn blessed_marker_count_matches_exactly() {
 fn teeth_blessed_line_is_exempt() {
     let src = format!(
         "    std::fs::create_dir_all(dir) // {}\n",
-        BLESSED[0].1
+        BLESSED[0].marker
     );
     assert!(
         scan_source("store.rs", &src).is_empty(),
@@ -229,7 +278,7 @@ fn teeth_blessed_line_is_exempt() {
 /// A `create_dir_all` in any OTHER file fails, even carrying store.rs's marker text.
 #[test]
 fn teeth_create_dir_all_elsewhere_fails() {
-    let src = format!("    std::fs::create_dir_all(x) // {}\n", BLESSED[0].1);
+    let src = format!("    std::fs::create_dir_all(x) // {}\n", BLESSED[0].marker);
     assert!(
         !scan_source("server.rs", &src).is_empty(),
         "create_dir_all outside store.rs must fail even with the marker"
@@ -252,12 +301,45 @@ fn teeth_unmarked_create_dir_all_in_store_fails() {
 fn teeth_other_write_in_store_fails() {
     let src = format!(
         "    std::fs::create_dir_all(dir) // {}\n    std::fs::write(p, b)?;\n",
-        BLESSED[0].1
+        BLESSED[0].marker
     );
     let v = scan_source("store.rs", &src);
     assert!(
         v.iter().any(|s| s.contains("fs::write(")),
         "a non-blessed write in store.rs must still fail, got: {v:?}"
+    );
+}
+
+/// The blessed stdout write in `cli.rs` is exempt on its own marked line.
+#[test]
+fn teeth_cli_stdout_bytes_line_is_exempt() {
+    let src = format!("            out.write_all(&bytes[start..end]) // {}\n", BLESSED[2].marker);
+    assert!(
+        scan_source("cli.rs", &src).is_empty(),
+        "the marked stdout write in cli.rs must be exempt"
+    );
+}
+
+/// ...and an UNMARKED write in `cli.rs` still fails, as does the marked one anywhere else.
+/// The CLI is the front door most likely to grow a "just write it to a file for me" flag,
+/// so this is the direction that matters.
+#[test]
+fn teeth_cli_writes_without_the_marker_fail() {
+    assert!(
+        !scan_source("cli.rs", "    std::fs::write(out_path, &bytes)?;\n").is_empty(),
+        "an unmarked fs::write in cli.rs must fail — a --out flag is a new capability, \
+         not a variation on serving stdout"
+    );
+    let marked = format!("    std::fs::write(out_path, &bytes) // {}\n", BLESSED[2].marker);
+    assert!(
+        !scan_source("cli.rs", &marked).is_empty(),
+        "cli.rs's marker blesses the stdout needle only — it must not launder an \
+         fs::write onto a caller-named path"
+    );
+    let elsewhere = format!("    out.write_all(&bytes) // {}\n", BLESSED[2].marker);
+    assert!(
+        !scan_source("server.rs", &elsewhere).is_empty(),
+        "cli.rs's marker must not exempt a write in another file"
     );
 }
 
@@ -276,7 +358,7 @@ fn teeth_test_module_writes_are_ignored() {
 /// needles hit on one physical line, one marker), and the `.write_all(` of the bytes.
 #[test]
 fn teeth_cas_blessed_lines_are_exempt() {
-    let marker = BLESSED[1].1;
+    let marker = BLESSED[1].marker;
     let src = format!(
         "    std::fs::create_dir_all(&shard) // {marker}\n\
          \n\
@@ -319,7 +401,7 @@ fn teeth_forbidden_call_in_cas_without_marker_fails() {
 /// the pin is per-file, not a tree-wide magic comment.
 #[test]
 fn teeth_cas_marker_in_wrong_file_fails() {
-    let marker = BLESSED[1].1;
+    let marker = BLESSED[1].marker;
     let src = format!("    std::fs::create_dir_all(x) // {marker}\n");
     assert!(
         !scan_source("server.rs", &src).is_empty(),
@@ -332,8 +414,8 @@ fn teeth_cas_marker_in_wrong_file_fails() {
 /// own marker text.
 #[test]
 fn teeth_wrong_marker_for_file_fails() {
-    let store_marker = BLESSED[0].1;
-    let cas_marker = BLESSED[1].1;
+    let store_marker = BLESSED[0].marker;
+    let cas_marker = BLESSED[1].marker;
 
     let src_cas = format!("    std::fs::create_dir_all(x) // {store_marker}\n");
     assert!(

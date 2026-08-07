@@ -131,6 +131,10 @@ pub enum Command {
     Kaish(KaishArgs),
     /// Provider batch lanes — submit a fan-out, get results, list live/recovered handles.
     Batch(BatchArgs),
+    /// Generate an image into kaibo's artifact store; prints the digest to read it back.
+    Generate(GenerateCliArgs),
+    /// Read an artifact kaibo stored, by its digest.
+    Cas(CasArgs),
     /// List available models a backend's provider actually serves — read-only model
     /// discovery via the backend's real /models endpoint, no cast/model in the loop.
     Models(ModelsArgs),
@@ -496,6 +500,73 @@ pub struct KaishArgs {
 
     /// Emit a JSON object `{stdout, stderr, exit_code}` instead of raw streams (the
     /// process still exits with kaish's exit code).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo generate` — render an image through the cast's `image` slot into kaibo's own
+/// artifact store, and print the digest that reads it back.
+///
+/// Never writes into your project: the address is the content's hash and the store is
+/// kaibo's, which is the same contract the MCP tool holds. `kaibo cas read <digest>`
+/// fetches it, and in disk mode the printed path reaches it with any tool you like.
+#[derive(Args, Debug)]
+pub struct GenerateCliArgs {
+    /// What to generate, described in prose.
+    pub prompt: String,
+
+    /// A provider-native option, `key=value`, passed through verbatim. Repeatable. The
+    /// value is read as JSON when it parses as one, so `--field n=2` sends a number and
+    /// `--field transparent=true` a boolean; anything else rides as a string
+    /// (`--field size=1024x1024`). The provider validates its own knobs. `prompt` and
+    /// `model` are reserved — use the argument and the cast's image slot.
+    #[arg(long = "field", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    pub fields: Vec<String>,
+
+    /// Emit a JSON envelope on stdout (the artifacts and their digests) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `kaibo cas` — read what kaibo stored, by address.
+///
+/// **`read` is the only verb, on purpose.** The store is content-addressed and opaque:
+/// you reach an object with a digest you already hold, and there is deliberately no
+/// listing, no usage report, and no delete — none of those can exist without an index the
+/// store does not keep (`docs/config.md`). Retention is file mtime over the object tree,
+/// with your own tools.
+#[derive(Args, Debug)]
+pub struct CasArgs {
+    #[command(subcommand)]
+    pub cmd: CasCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CasCmd {
+    /// Read one artifact by digest — metadata first, then a bounded window of content.
+    Read(CasReadArgs),
+}
+
+/// `kaibo cas read` — metadata-first, bounded retrieval, the same rules the `read_cas`
+/// MCP tool applies, because they are one planner.
+#[derive(Args, Debug)]
+pub struct CasReadArgs {
+    /// The artifact's digest, bare or as its full `kaibo://cas/<digest>` URI — whichever
+    /// kaibo printed.
+    pub digest: String,
+
+    /// Start reading at this byte offset (default 0). Every read's metadata names the
+    /// total size, so you can page without guessing.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub offset: usize,
+
+    /// How many bytes to serve. Omitted, a text object gives a bounded window and a
+    /// binary one gives metadata alone; `0` is metadata only for anything. Refused past
+    /// the per-read ceiling rather than trimmed, so your next `offset` is never wrong.
+    #[arg(long, value_name = "N")]
+    pub length: Option<usize>,
+
+    /// Emit a JSON envelope on stdout (metadata + the served body) instead of prose.
     #[arg(long)]
     pub json: bool,
 }
@@ -1766,6 +1837,367 @@ async fn deliberate_direct_cli(
         }
         Err(e) => Ok(fail_consultation(args.json, "deliberate", &cast.name, e)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// generate / cas
+// ---------------------------------------------------------------------------
+
+/// Run `kaibo generate` — render through the cast's `image` slot into kaibo's store.
+pub async fn run_generate(common: CommonArgs, args: GenerateCliArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    match generate_inner(&common, &args, &resolver).await {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(args.json, kind, message, code),
+    }
+}
+
+/// Split one `--field key=value`, reading the value as JSON when it parses as one.
+///
+/// A provider's wire cares about the difference between `2` and `"2"`, and a shell has
+/// only strings — so the value's own JSON syntax carries the type, and anything that is
+/// not valid JSON is exactly what it looks like: a string. That keeps `--field n=2` a
+/// number and `--field size=1024x1024` a string with no extra flag to learn.
+fn parse_generate_field(raw: &str) -> Result<(String, crate::media::FieldValue), SetupError> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| SetupError {
+        kind: "usage",
+        message: format!(
+            "`--field {raw}` must be KEY=VALUE, e.g. `--field aspect_ratio=16:9` or \
+             `--field n=2`"
+        ),
+        code: EXIT_USAGE,
+    })?;
+    if key.is_empty() {
+        return Err(SetupError {
+            kind: "usage",
+            message: format!("`--field {raw}` has an empty key"),
+            code: EXIT_USAGE,
+        });
+    }
+    let typed = match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Bool(b)) => crate::media::FieldValue::Bool(b),
+        Ok(serde_json::Value::Number(n)) => crate::media::FieldValue::Num(n),
+        // A JSON string, or anything that isn't JSON at all, is a string either way.
+        _ => crate::media::FieldValue::Str(value.to_string()),
+    };
+    Ok((key.to_string(), typed))
+}
+
+async fn generate_inner(
+    common: &CommonArgs,
+    args: &GenerateCliArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    let slot = cast.slot(ModelRole::Image).ok_or_else(|| SetupError {
+        kind: "usage",
+        message: format!(
+            "cast `{}` has no `image` slot — `generate` needs a cast whose `image` slot \
+             points at a media backend (kind {}). `kaibo config` lists the configured \
+             casts and their slots.",
+            cast.name,
+            crate::credentials::media_kinds_list(),
+        ),
+        code: EXIT_USAGE,
+    })?;
+    let backend = resolver
+        .config
+        .resolve_backend(&slot.backend)
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: format!("{e:#}"),
+            code: EXIT_SETUP,
+        })?;
+    // Building the arm resolves the provider key — a missing one is the operator's setup
+    // gap, named with the cast and slot.
+    let arm = crate::media::MediaArmFactory::build(&crate::media::LiveMediaArms, backend, slot)
+        .map_err(|e| SetupError {
+            kind: "setup",
+            message: format!("cast `{}` image slot: {e:#}", cast.name),
+            code: EXIT_SETUP,
+        })?;
+    let mut fields = Vec::with_capacity(args.fields.len());
+    for raw in &args.fields {
+        fields.push(parse_generate_field(raw)?);
+    }
+    // The store settles the same way it does on the MCP road, and an artifact with
+    // nowhere to land is refused before a provider is paid.
+    let persistence = open_batch_store(resolver).await;
+    let store = open_media_cas(resolver, persistence.is_some())?.ok_or_else(|| SetupError {
+        kind: "usage",
+        message: "the media CAS is disabled ([cas] enabled = false), so `generate` has \
+                  nowhere to store what it renders. Re-enable it and run again."
+            .to_string(),
+        code: EXIT_USAGE,
+    })?;
+
+    let request = crate::media::MediaRequest {
+        prompt: args.prompt.clone(),
+        fields,
+        // Text-to-image only from the CLI today: the edit/upscale operations that take an
+        // input image would need a file to read, and the CLI has no such argument yet.
+        input_image: None,
+    };
+    let outcome = match arm.generate(&request).await {
+        Ok(o) => o,
+        Err(e) => return Ok(fail_consultation(args.json, "generate", &cast.name, e)),
+    };
+    // A deferred generation has no `job-N` to hand back here — this process is the job,
+    // exactly as `deliberate`'s direct lane is. It polls on the provider's cadence until
+    // the call deadline, then says plainly that kaibo stopped watching while the provider
+    // may not have stopped working.
+    let artifacts = match outcome {
+        crate::media::MediaOutcome::Complete(artifacts) => artifacts,
+        crate::media::MediaOutcome::Deferred(job) => {
+            eprintln!(
+                "kaibo: the provider is rendering in the background — this process waits \
+                 for it (cast `{}`, image `{}`).",
+                cast.name,
+                arm.slot_ref()
+            );
+            let deadline = resolver.config.defaults.call_deadline;
+            let started = tokio::time::Instant::now();
+            loop {
+                match arm.poll(&job).await {
+                    Ok(crate::media::MediaPollOutcome::Complete(a)) => break a,
+                    Ok(crate::media::MediaPollOutcome::Pending) => {
+                        if started.elapsed() > deadline {
+                            return Ok(fail_consultation(
+                                args.json,
+                                "generate",
+                                &cast.name,
+                                anyhow::anyhow!(
+                                    "still pending after {}s (the call_deadline budget) — \
+                                     provider job id `{}` may still finish on the \
+                                     provider's side, but kaibo has stopped polling it",
+                                    deadline.as_secs(),
+                                    job.0
+                                ),
+                            ));
+                        }
+                        tokio::time::sleep(GENERATE_POLL_INTERVAL).await;
+                    }
+                    Err(e) => return Ok(fail_consultation(args.json, "generate", &cast.name, e)),
+                }
+            }
+        }
+    };
+    let text = match crate::server::store_generated_artifacts(
+        &store,
+        &artifacts,
+        &args.prompt,
+        arm.slot_ref(),
+        &cast.name,
+    ) {
+        Ok(t) => t,
+        Err(e) => return Ok(fail_consultation(args.json, "generate", &cast.name, e)),
+    };
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "result": text,
+                "cast": cast.name,
+                "image": arm.slot_ref(),
+            })
+        );
+    } else {
+        println!("{text}");
+    }
+    Ok(EXIT_OK)
+}
+
+/// How often a foreground `kaibo generate` asks a deferred provider job whether it is
+/// done — the CLI twin of the server's poll cadence.
+const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run `kaibo cas read` — read one artifact by the address you already hold.
+pub async fn run_cas(common: CommonArgs, args: CasArgs) -> i32 {
+    init_cli_logging();
+    let CasCmd::Read(args) = args.cmd;
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    match cas_read_inner(&args, &resolver).await {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(args.json, kind, message, code),
+    }
+}
+
+async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, SetupError> {
+    let persistence = open_batch_store(resolver).await;
+    let mode = resolver.config.cas_mode(persistence.is_some());
+    let store = open_media_cas(resolver, persistence.is_some())?.ok_or_else(|| SetupError {
+        kind: "usage",
+        message: "the media CAS is disabled ([cas] enabled = false), so kaibo holds no \
+                  artifacts to read."
+            .to_string(),
+        code: EXIT_USAGE,
+    })?;
+    // Memory mode is worth saying out loud on THIS command: a fresh process gets a fresh
+    // empty store, so no digest can ever resolve. Reporting "not found" alone would send
+    // someone hunting for a typo in an address that was never the problem.
+    if mode == crate::config::CasMode::Memory {
+        return Err(SetupError {
+            kind: "setup",
+            message: "kaibo's artifact store is in-memory this run (persistence is off or \
+                      no data directory resolves), and an in-memory store is empty in a \
+                      new process — nothing is readable by digest. Enable persistence \
+                      (and a resolvable $XDG_DATA_HOME or $HOME) to keep artifacts on \
+                      disk; `kaibo config` shows the store's mode."
+                .to_string(),
+            code: EXIT_SETUP,
+        });
+    }
+    // Either spelling kaibo prints is accepted — refusing the exact string we handed back
+    // would be a puzzle, not a guardrail.
+    let hex = args
+        .digest
+        .trim()
+        .strip_prefix(crate::cas::CAS_URI_PREFIX)
+        .unwrap_or(args.digest.trim());
+    let digest = crate::cas::Digest::from_hex(hex).map_err(|e| SetupError {
+        kind: "usage",
+        message: format!(
+            "{e} — pass the digest kaibo printed, either bare or as its full {}<digest> URI.",
+            crate::cas::CAS_URI_PREFIX
+        ),
+        code: EXIT_USAGE,
+    })?;
+    // The store verifies content against its address before a byte comes back, so a
+    // corrupt object is loud here rather than silently served.
+    let (bytes, ext) = match store.get(&digest) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return Err(SetupError {
+                kind: "usage",
+                message: format!("no artifact with digest {hex} — this store never held it."),
+                code: EXIT_USAGE,
+            })
+        }
+        Err(e) => {
+            return Err(SetupError {
+                kind: "setup",
+                message: format!("{e:#}"),
+                code: EXIT_SETUP,
+            })
+        }
+    };
+
+    let provenance = store.provenance(&digest);
+    let path = store.path_for(&digest);
+    let obj = crate::server::CasObject {
+        digest: hex,
+        ext,
+        bytes: &bytes,
+        label: provenance.as_ref().and_then(|p| p.label.as_deref()),
+        provenance_present: provenance.is_some(),
+        path: path.as_deref(),
+    };
+    let view = crate::server::plan_cas_read(&obj, args.offset, args.length, crate::server::Delivery::Bytes).map_err(|message| {
+        SetupError {
+            kind: "usage",
+            message,
+            code: EXIT_USAGE,
+        }
+    })?;
+
+    // `--json` keeps the MCP shape: one object on stdout, a binary body base64-encoded
+    // because JSON has no other way to carry bytes.
+    if args.json {
+        let body = match &view.body {
+            crate::server::CasBody::None => None,
+            crate::server::CasBody::Text(t) => Some(t.clone()),
+            crate::server::CasBody::Base64(b) => Some(b.clone()),
+            crate::server::CasBody::Image { data, .. } => Some(data.clone()),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "metadata": view.meta,
+                "body": body,
+                "binary": !ext.is_textual(),
+            })
+        );
+        return Ok(EXIT_OK);
+    }
+
+    // Prose form follows the CLI's standing contract — **stdout is the payload, stderr is
+    // everything else** — which is what makes `kaibo cas read <digest> > arch.png` work
+    // with no flag to remember. The metadata a `read_cas` caller needs in-band goes to
+    // stderr here, because a terminal caller reads it with their eyes and a script must
+    // not have to strip it.
+    //
+    // The rules that bound an MCP read exist to protect a CONTEXT WINDOW. A pipe has no
+    // such budget, and someone who asked for a PNG by its digest knows what is coming — so
+    // a binary object's content goes out as bytes, never as base64 nobody wants. That is
+    // the one place this front door legitimately differs from the tool.
+    eprintln!("{}", view.meta);
+    match view.body {
+        crate::server::CasBody::None => {}
+        crate::server::CasBody::Text(t) => println!("{t}"),
+        // Binary: the exact bytes the metadata just described, straight to stdout. This is
+        // the single blessed write site outside the two stores — see the marker, and
+        // `tests/no_write_path.rs`, whose pinned count makes it impossible to add another
+        // one quietly. Nothing is created on any filesystem here: stdout is a descriptor
+        // the operator's shell already opened and aimed, so kaibo still has no
+        // destination parameter anywhere in this store's surface.
+        crate::server::CasBody::Base64(_) | crate::server::CasBody::Image { .. } => {
+            let start = args.offset.min(bytes.len());
+            let end = match args.length {
+                Some(n) => start.saturating_add(n).min(bytes.len()),
+                None => bytes.len(),
+            };
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(&bytes[start..end]) // cas-stdout-bytes: blessed by the media CAS invariant amendment (AGENTS.md)
+                .and_then(|()| out.flush())
+                .map_err(|e| SetupError {
+                    kind: "setup",
+                    message: format!("writing artifact bytes to stdout: {e}"),
+                    code: EXIT_SETUP,
+                })?;
+        }
+    }
+    Ok(EXIT_OK)
 }
 
 // ---------------------------------------------------------------------------

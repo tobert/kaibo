@@ -64,6 +64,10 @@ pub use resolver::Resolver;
 // Re-exported for the CLI front door (`crate::cli`), which renders the same answer
 // footer, failure text, `kaibo://config` document, and `batch list` recency window the
 // MCP handler does.
+// The CLI reads artifacts by digest too (`kaibo cas read`), and a read's RULES —
+// what leads, what is bounded, what is never dumped as base64 — belong to one planner,
+// not to whichever front door asked.
+pub(crate) use cas_read::{plan as plan_cas_read, Body as CasBody, CasObject, Delivery};
 pub(crate) use config_resource::render_config_resource;
 // `deliberate` is the same two stages on either road, so the CLI borrows the pieces
 // rather than growing a second copy of them: how a dossier is kept and loaded, how it is
@@ -2859,6 +2863,9 @@ impl KaiboHandler {
             },
             input.offset.unwrap_or(0),
             input.length,
+            // An MCP host renders the image block; the CLI, serving bytes to a stream,
+            // passes `Bytes` so the metadata never claims a rendering that didn't happen.
+            cas_read::Delivery::Rendered,
         )
         .map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -4257,7 +4264,7 @@ const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// mid-loop (I/O, the soft cap) returns an error that NAMES the digests already
 /// stored: they exist, they were paid for, and they stay retrievable by those
 /// addresses — an error that hid them would orphan them.
-fn store_generated_artifacts(
+pub(crate) fn store_generated_artifacts(
     store: &crate::cas::MediaStore,
     artifacts: &[crate::media::MediaArtifact],
     prompt: &str,
