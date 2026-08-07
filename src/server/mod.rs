@@ -194,6 +194,28 @@ fn stitch_dossier_delivery(
     }
 }
 
+/// Stitch a dossier sweep's delivery, then keep the finished dossier — in that order.
+///
+/// The order is the whole reason this is one function. [`stitch_dossier_delivery`]
+/// *appends* the routed text bodies to the dossier, so keeping it first would store a
+/// dossier missing evidence the synth then reasons over — an audit record that quietly
+/// disagrees with what was actually sent, which is worse than keeping nothing. Composed
+/// here so a test can pin the order (DeepSeek cross-family review, 2026-08-07); the
+/// handler calls this rather than the two steps by hand.
+fn stitch_and_keep(
+    dossier: &mut String,
+    consumer: &SweepConsumer,
+    sink: Option<&std::sync::Arc<SweepAttachSink>>,
+    store: Option<&Arc<crate::cas::MediaStore>>,
+    question: &str,
+    cast: &str,
+    explorer_model: &str,
+) -> (Vec<crate::attach::Attachment>, Option<KeptDossier>) {
+    let images = stitch_dossier_delivery(dossier, consumer, sink);
+    let kept = keep_dossier(store, question, dossier, cast, explorer_model);
+    (images, kept)
+}
+
 /// Which tools to advertise. All on by default; each `--no-<tool>` flips one off.
 ///
 /// Composes to any posture: `{oneshot:false}` ≈ the codebase-only surface; only
@@ -2092,6 +2114,21 @@ impl KaiboHandler {
         peer: Peer<RoleServer>,
         meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
+        self.deliberate_call(input, progress_sink(peer, &meta)).await
+    }
+
+    /// The `deliberate` handler, with the live peer already reduced to a progress sink.
+    ///
+    /// Split from the tool entry point for one reason: a `Peer` needs a real MCP
+    /// connection, so the whole handler was unreachable from a test. Everything the reuse
+    /// road does — the inert-argument refusal, resolution order, the load, the hand-off to
+    /// a lane — is in here, where a test can drive it with a `NullSink` (DeepSeek
+    /// cross-family review, 2026-08-07).
+    async fn deliberate_call(
+        &self,
+        input: DeliberateInput,
+        progress: Arc<dyn ProgressSink>,
+    ) -> Result<CallToolResult, McpError> {
         // A reuse call that also carries explorer arguments is self-contradictory; say so
         // before resolving anything, so it costs nothing.
         if let Some(refusal) = dossier::inert_explorer_args(&input) {
@@ -2144,7 +2181,6 @@ impl KaiboHandler {
             // are spent. Only the deliberation (Stage 2) is handed off async. Attachments
             // reach the dossier-builder as read-WHOLE directives (the sweep semantics), so
             // their content flows to the offline synth through the dossier it writes.
-            let progress = progress_sink(peer, &meta);
             let defaults = &self.config.defaults;
             let attachments = self
                 .resolve_sweep_attachments(&root, &input.attach, "deliberate")
@@ -2210,17 +2246,17 @@ impl KaiboHandler {
             progress.emit(PhaseEvent::PhaseFinished {
                 phase: "deliberate.dossier",
             });
-            // Stitch whatever the dossier sweep routed via `attach` into the dossier text
-            // itself (text bodies, notes, demotions); collect any routed images separately
-            // — they ride the synth's single turn as native parts, not as dossier text.
-            let images = stitch_dossier_delivery(&mut dossier, &consumer, sink.as_ref());
-            // Keep the finished dossier before stage 2 spends anything on it, so a
-            // deliberation that fails, times out, or comes back thin still leaves the
-            // evidence it was built from readable. Never fatal — see `server::dossier`.
-            let kept = keep_dossier(
+            // Stitch whatever the sweep routed via `attach` into the dossier text itself
+            // (text bodies, notes, demotions), then keep the finished dossier — that
+            // order, so what is stored is what stage 2 receives. Routed images come back
+            // separately: they ride the synth's single turn as native parts, never as
+            // dossier text. Keeping is never fatal — see `server::dossier`.
+            let (images, kept) = stitch_and_keep(
+                &mut dossier,
+                &consumer,
+                sink.as_ref(),
                 self.media_cas.as_ref(),
                 &input.question,
-                &dossier,
                 &cast.name,
                 &explorer_model,
             );
@@ -4615,9 +4651,39 @@ mod tests {
             "the image must route: {receipt}"
         );
 
-        // Drain + stitch — the extracted handler step.
+        // Drain + stitch + keep — the extracted handler step, in the handler's order.
+        // Keeping BEFORE stitching would store a dossier missing the routed evidence the
+        // synth then reasons over: an audit record that disagrees with what was sent.
+        let store: Arc<crate::cas::MediaStore> = Arc::new(crate::cas::MediaStore::Memory(
+            crate::cas::MemoryCas::new(None),
+        ));
         let mut dossier = String::from("src/x.rs:1 DOSSIER");
-        let images = stitch_dossier_delivery(&mut dossier, &consumer, Some(&sink));
+        let (images, kept) = stitch_and_keep(
+            &mut dossier,
+            &consumer,
+            Some(&sink),
+            Some(&store),
+            "does the diagram confirm it?",
+            "scripted",
+            "scripted-explorer",
+        );
+        let kept = kept.expect("a live store keeps the dossier");
+        let stored = String::from_utf8(
+            store
+                .get(&crate::cas::Digest::from_hex(&kept.digest).unwrap())
+                .expect("readable")
+                .expect("present")
+                .0,
+        )
+        .unwrap();
+        assert_eq!(
+            stored, dossier,
+            "what is kept must be the STITCHED dossier — the exact text stage 2 receives"
+        );
+        assert!(
+            stored.contains("notes.md"),
+            "a dossier kept before stitching would be missing the routed evidence: {stored}"
+        );
         assert!(
             dossier.contains("notes.md"),
             "the text body is stitched into the dossier: {dossier}"
@@ -7232,6 +7298,121 @@ enabled = false
                 && items[0].prompt.contains("DOSSIER: src/x.rs:1 fn retry"),
             "the one item is the deliberation_prompt — question AND dossier: {}",
             items[0].prompt
+        );
+    }
+
+    /// The reuse road, driven end to end through the real handler: a stored dossier goes in
+    /// as `dossier`, NO explorer runs, and the offline synth receives exactly the stored
+    /// bytes.
+    ///
+    /// The lane tests drive `deliberate_batch` directly, so they cannot see the handler's
+    /// own wiring — the branch that skips stage 1, what it hands the lane, or whether the
+    /// ack still claims an explorer ran. This is that wiring (gap named by the DeepSeek
+    /// cross-family review, 2026-08-07).
+    #[tokio::test]
+    async fn the_reuse_road_runs_the_synth_over_the_stored_dossier_with_no_explorer() {
+        let scripted = Arc::new(crate::batch::ScriptedBatch::new("msgbatch_reuse", vec![]));
+        let h = handler_from_toml(BATCH_CASTS_TOML).with_batch_providers(Arc::new(
+            crate::batch::ScriptedBatchProviders(scripted.clone()),
+        ));
+
+        // A dossier already in the store, put there the way an earlier call would have.
+        let text = "DOSSIER\nsrc/x.rs:1 fn retry\nsrc/x.rs:9 unbounded backoff\n";
+        let kept = dossier::keep_dossier(
+            h.media_store(),
+            "an earlier question",
+            text,
+            "mydeliberate",
+            "gem/some-lite",
+        )
+        .expect("the test handler has a live memory CAS");
+
+        let out = h
+            .deliberate_call(
+                DeliberateInput {
+                    question: "does the second synth see the same evidence?".into(),
+                    attach: vec![],
+                    path: None,
+                    cast: Some("mydeliberate".into()),
+                    explorer_model: None,
+                    explorer_backend: None,
+                    synth_model: None,
+                    synth_backend: None,
+                    explorer_max_turns: None,
+                    dossier: Some(kept.digest.clone()),
+                },
+                Arc::new(NullSink),
+            )
+            .await
+            .expect("a reuse call succeeds");
+
+        let ack = result_text(out);
+        assert!(
+            ack.contains("Dossier reused") && ack.contains("no explorer ran"),
+            "the ack must not claim a sweep that never happened: {ack}"
+        );
+        assert!(
+            ack.contains(&format!("kaibo://cas/{}", kept.digest)),
+            "the ack names the dossier it reasoned over: {ack}"
+        );
+
+        // The stored bytes are what reached the synth — verbatim, beside the new question.
+        // Anything less and reuse is not reuse.
+        let submits = scripted.submits();
+        assert_eq!(submits.len(), 1, "one deliberation was submitted");
+        let (_system, attach, items) = &submits[0];
+        assert!(
+            attach.is_empty(),
+            "no sweep ran, so nothing routed images into the submit"
+        );
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].prompt.contains(text)
+                && items[0]
+                    .prompt
+                    .contains("does the second synth see the same evidence?"),
+            "the reused dossier AND the new question must both reach the synth: {}",
+            items[0].prompt
+        );
+    }
+
+    /// A reuse call carrying explorer arguments is refused by the handler, and a dossier
+    /// kaibo does not hold is an error — never a silent fall back to sweeping, since the
+    /// caller asked to reason over specific evidence.
+    #[tokio::test]
+    async fn the_handler_refuses_a_reuse_call_it_cannot_serve_as_asked() {
+        let h = handler_from_toml(BATCH_CASTS_TOML);
+        let reuse = |attach: Vec<String>, digest: &str| DeliberateInput {
+            question: "q".into(),
+            attach,
+            path: None,
+            cast: Some("mydeliberate".into()),
+            explorer_model: None,
+            explorer_backend: None,
+            synth_model: None,
+            synth_backend: None,
+            explorer_max_turns: None,
+            dossier: Some(digest.to_string()),
+        };
+
+        let err = h
+            .deliberate_call(reuse(vec!["src/x.rs".into()], &"aa".repeat(32)), Arc::new(NullSink))
+            .await
+            .expect_err("`attach` on a reuse call is refused");
+        assert!(
+            err.message.contains("`attach`"),
+            "the refusal names the inert argument: {}",
+            err.message
+        );
+
+        let err = h
+            .deliberate_call(reuse(vec![], &"aa".repeat(32)), Arc::new(NullSink))
+            .await
+            .expect_err("an unknown digest is refused");
+        assert!(
+            err.message.contains("never stored here"),
+            "the refusal says the dossier is not held: {}",
+            err.message
         );
     }
 
