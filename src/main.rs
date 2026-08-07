@@ -56,6 +56,10 @@ async fn main() -> Result<()> {
         Some(Command::Batch(args)) => {
             std::process::exit(kaibo::cli::run_batch(cli.common, args).await)
         }
+        Some(Command::Generate(args)) => {
+            std::process::exit(kaibo::cli::run_generate(cli.common, args).await)
+        }
+        Some(Command::Cas(args)) => std::process::exit(kaibo::cli::run_cas(cli.common, args).await),
         Some(Command::Models(args)) => {
             std::process::exit(kaibo::cli::run_models(cli.common, args).await)
         }

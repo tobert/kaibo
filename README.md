@@ -261,6 +261,8 @@ human at a terminal can drive kaibo directly:
 | `explore` | `kaibo explore "question" [--cast … --json]` |
 | `deliberate` | `kaibo deliberate "question" [--cast … --attach … --dossier … --json]` |
 | `run_kaish` | `kaibo kaish -c 'script'` |
+| `generate` | `kaibo generate "prompt" [--cast … --field k=v --json]` |
+| `read_cas` | `kaibo cas read <digest> [--offset … --length … --json]` |
 | `batch_submit`, `job_get`/`job_list`/`job_cancel` (batch handles) | `kaibo batch submit \| get \| list \| cancel` |
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
@@ -291,6 +293,19 @@ sweep at all, across front doors:
 ```sh
 kaibo deliberate "second opinion, same evidence" --cast fable --dossier kaibo://cas/<digest>
 ```
+
+`kaibo cas read` follows the CLI's contract rather than the tool's: **metadata to stderr,
+content to stdout** — text as text, binary as raw bytes. So the obvious thing works:
+
+```sh
+kaibo cas read <digest> > arch.png     # bytes, no flag, no base64
+kaibo cas read <digest>                # a text artifact reads on your terminal
+```
+
+The bounded, base64-averse rules `read_cas` follows exist to protect a model's context
+window; a pipe has no such budget. `read` is the only verb — the store is content-addressed
+and opaque, with no listing, usage report, or delete, because none of those can exist
+without an index it deliberately does not keep.
 
 `consult_submit`/`job_wait` remain MCP-only: their value is keeping work running inside
 a long-lived session, which does not map onto a process that exits.

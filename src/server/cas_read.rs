@@ -136,7 +136,27 @@ pub struct CasView {
 /// [`MAX_READ_BYTES`]. Refused rather than clamped, because a caller that asked for 4 MiB
 /// and silently got 1 MiB would page from the wrong place next time; the message names
 /// the ceiling and the recovery.
-pub fn plan(obj: &CasObject, offset: usize, length: Option<usize>) -> Result<CasView, String> {
+/// How the caller's side will deliver a body, which changes exactly one sentence: what a
+/// whole small image is *served as*.
+///
+/// The rules of a read belong to one planner, but the claim "as a rendered image" is only
+/// true where a host turns an image block into pixels. A terminal gets bytes on a
+/// descriptor, and saying otherwise would be kaibo describing something that did not
+/// happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// An MCP host renders the image content block.
+    Rendered,
+    /// The bytes go to a stream the caller already aimed (the CLI).
+    Bytes,
+}
+
+pub fn plan(
+    obj: &CasObject,
+    offset: usize,
+    length: Option<usize>,
+    delivery: Delivery,
+) -> Result<CasView, String> {
     if let Some(asked) = length {
         if asked > MAX_READ_BYTES {
             return Err(format!(
@@ -162,7 +182,12 @@ pub fn plan(obj: &CasObject, offset: usize, length: Option<usize>) -> Result<Cas
             meta: render_meta(
                 obj,
                 total,
-                &format!("the whole object, {total} bytes, as a rendered image"),
+                &match delivery {
+                    Delivery::Rendered => {
+                        format!("the whole object, {total} bytes, as a rendered image")
+                    }
+                    Delivery::Bytes => format!("the whole object, {total} bytes"),
+                },
                 None,
             ),
             body: Body::Image {
@@ -366,6 +391,40 @@ mod tests {
         }
     }
 
+    /// `Delivery` changes the CLAIM, never the body: the same small image is planned
+    /// identically either way, and only the sentence describing how it is served differs.
+    /// A terminal renders nothing, so saying "as a rendered image" there would describe
+    /// something that did not happen.
+    #[test]
+    fn delivery_changes_only_what_the_metadata_claims() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let obj = png_obj(&png);
+        let rendered = plan(&obj, 0, None, Delivery::Rendered).expect("a legal read");
+        let bytes = plan(&obj, 0, None, Delivery::Bytes).expect("a legal read");
+
+        assert_eq!(
+            rendered.body, bytes.body,
+            "the body a delivery mode gets is the same body"
+        );
+        assert!(
+            rendered.meta.contains("as a rendered image"),
+            "an MCP host renders the block: {}",
+            rendered.meta
+        );
+        assert!(
+            !bytes.meta.contains("rendered"),
+            "a stream renders nothing, so the metadata must not claim it: {}",
+            bytes.meta
+        );
+        assert!(
+            bytes
+                .meta
+                .contains(&format!("the whole object, {} bytes", png.len())),
+            "both modes still name exactly what was served: {}",
+            bytes.meta
+        );
+    }
+
     /// **Metadata leads on every response, including the one that carries nothing else.**
     /// `length: 0` is the cheap HEAD: what is this, how big, what is it called, where does
     /// it live — for a few dozen tokens instead of the object.
@@ -373,7 +432,7 @@ mod tests {
     fn length_zero_is_metadata_only() {
         let body = "x".repeat(5000);
         let obj = text_obj(body.as_bytes(), Some("the inventory"));
-        let view = plan(&obj, 0, Some(0)).expect("a HEAD is always legal");
+        let view = plan(&obj, 0, Some(0), Delivery::Rendered).expect("a HEAD is always legal");
         assert_eq!(view.body, Body::None, "no content at length 0");
         assert!(view.meta.contains("5000"), "the total leads: {}", view.meta);
         assert!(
@@ -397,7 +456,7 @@ mod tests {
     #[test]
     fn a_missing_label_is_omitted_not_faked() {
         let obj = text_obj(b"hi", None);
-        let view = plan(&obj, 0, Some(0)).unwrap();
+        let view = plan(&obj, 0, Some(0), Delivery::Rendered).unwrap();
         assert!(
             !view.meta.contains("label:"),
             "no label line without a label: {}",
@@ -413,7 +472,7 @@ mod tests {
         let total = DEFAULT_READ_BYTES * 3;
         let body = "y".repeat(total);
         let obj = text_obj(body.as_bytes(), None);
-        let view = plan(&obj, 0, None).expect("a default read is legal");
+        let view = plan(&obj, 0, None, Delivery::Rendered).expect("a default read is legal");
         match &view.body {
             Body::Text(t) => assert_eq!(
                 t.len(),
@@ -439,8 +498,8 @@ mod tests {
             .collect();
         let obj = text_obj(body.as_bytes(), None);
 
-        let first = plan(&obj, 0, None).unwrap();
-        let second = plan(&obj, DEFAULT_READ_BYTES, None).unwrap();
+        let first = plan(&obj, 0, None, Delivery::Rendered).unwrap();
+        let second = plan(&obj, DEFAULT_READ_BYTES, None, Delivery::Rendered).unwrap();
         let (Body::Text(a), Body::Text(b)) = (&first.body, &second.body) else {
             panic!("both pages are text");
         };
@@ -463,7 +522,7 @@ mod tests {
     #[test]
     fn an_offset_past_the_end_is_an_empty_range_not_an_error() {
         let obj = text_obj(b"short", None);
-        let view = plan(&obj, 9_999, None).expect("past the end is legal");
+        let view = plan(&obj, 9_999, None, Delivery::Rendered).expect("past the end is legal");
         assert_eq!(view.body, Body::None, "nothing left to serve");
         assert!(
             view.meta.contains('5'),
@@ -478,7 +537,8 @@ mod tests {
     #[test]
     fn a_length_past_the_ceiling_is_refused_with_the_ceiling_and_the_recovery() {
         let obj = text_obj(b"small", None);
-        let err = plan(&obj, 0, Some(MAX_READ_BYTES + 1)).expect_err("past the ceiling");
+        let err = plan(&obj, 0, Some(MAX_READ_BYTES + 1), Delivery::Rendered)
+            .expect_err("past the ceiling");
         assert!(
             err.contains(&MAX_READ_BYTES.to_string()),
             "the refusal names the ceiling: {err}"
@@ -487,14 +547,15 @@ mod tests {
             err.to_lowercase().contains("offset"),
             "and the recovery is paging: {err}"
         );
-        plan(&obj, 0, Some(MAX_READ_BYTES)).expect("exactly at the ceiling is fine");
+        plan(&obj, 0, Some(MAX_READ_BYTES), Delivery::Rendered)
+            .expect("exactly at the ceiling is fine");
     }
 
     /// Textual content arrives as text a caller can use, never base64 it must decode.
     #[test]
     fn textual_content_arrives_as_text() {
         let obj = text_obj(b"line one\nline two\n", None);
-        let view = plan(&obj, 0, None).unwrap();
+        let view = plan(&obj, 0, None, Delivery::Rendered).unwrap();
         assert_eq!(view.body, Body::Text("line one\nline two\n".to_string()));
     }
 
@@ -504,7 +565,7 @@ mod tests {
     fn a_binary_range_is_base64_of_exactly_those_bytes() {
         let bytes: Vec<u8> = (0u8..=255).collect();
         let obj = png_obj(&bytes);
-        let view = plan(&obj, 10, Some(20)).unwrap();
+        let view = plan(&obj, 10, Some(20), Delivery::Rendered).unwrap();
         assert_eq!(view.body, Body::Base64(b64(&bytes[10..30])));
     }
 
@@ -514,7 +575,7 @@ mod tests {
     #[test]
     fn a_binary_object_serves_no_body_unless_a_range_is_asked_for() {
         let big = vec![7u8; INLINE_IMAGE_MAX_BYTES + 1];
-        let view = plan(&png_obj(&big), 0, None).unwrap();
+        let view = plan(&png_obj(&big), 0, None, Delivery::Rendered).unwrap();
         assert_eq!(
             view.body,
             Body::None,
@@ -533,7 +594,7 @@ mod tests {
     #[test]
     fn a_small_image_with_no_range_comes_back_as_an_image_block() {
         let bytes = vec![9u8; 1024];
-        let view = plan(&png_obj(&bytes), 0, None).unwrap();
+        let view = plan(&png_obj(&bytes), 0, None, Delivery::Rendered).unwrap();
         assert_eq!(
             view.body,
             Body::Image {
@@ -553,7 +614,7 @@ mod tests {
     #[test]
     fn an_explicit_range_on_a_small_image_returns_base64_not_an_image_block() {
         let bytes = vec![9u8; 1024];
-        let view = plan(&png_obj(&bytes), 0, Some(16)).unwrap();
+        let view = plan(&png_obj(&bytes), 0, Some(16), Delivery::Rendered).unwrap();
         assert_eq!(view.body, Body::Base64(b64(&bytes[..16])));
     }
 
@@ -568,14 +629,14 @@ mod tests {
             ..text_obj(bytes, None)
         };
         assert!(
-            plan(&on_disk, 0, Some(0))
+            plan(&on_disk, 0, Some(0), Delivery::Rendered)
                 .unwrap()
                 .meta
                 .contains("/var/lib/kaibo/cas/ab/cd/abcd.txt"),
             "disk mode names the file"
         );
         assert!(
-            !plan(&text_obj(bytes, None), 0, Some(0))
+            !plan(&text_obj(bytes, None), 0, Some(0), Delivery::Rendered)
                 .unwrap()
                 .meta
                 .contains("path:"),
@@ -611,7 +672,7 @@ mod tests {
         let bytes = b"content";
 
         let labeled = text_obj(bytes, Some("the inventory"));
-        let m = plan(&labeled, 0, Some(0)).unwrap().meta;
+        let m = plan(&labeled, 0, Some(0), Delivery::Rendered).unwrap().meta;
         assert!(m.contains("label: the inventory"), "{m}");
         assert!(
             !m.contains("provenance:"),
@@ -622,7 +683,9 @@ mod tests {
             label: None,
             ..text_obj(bytes, None)
         };
-        let m = plan(&unlabeled, 0, Some(0)).unwrap().meta;
+        let m = plan(&unlabeled, 0, Some(0), Delivery::Rendered)
+            .unwrap()
+            .meta;
         assert!(!m.contains("label:"), "no label, no line: {m}");
         assert!(
             !m.contains("provenance:"),
@@ -633,7 +696,9 @@ mod tests {
             provenance_present: false,
             ..text_obj(bytes, None)
         };
-        let m = plan(&orphaned, 0, Some(0)).unwrap().meta;
+        let m = plan(&orphaned, 0, Some(0), Delivery::Rendered)
+            .unwrap()
+            .meta;
         assert!(
             m.contains("provenance: absent"),
             "a missing record is stated: {m}"
@@ -654,7 +719,7 @@ mod tests {
     #[test]
     fn a_window_holding_no_whole_character_advances_over_the_bytes_it_was_given() {
         let obj = text_obj("é".as_bytes(), None);
-        let view = plan(&obj, 0, Some(1)).expect("a legal range");
+        let view = plan(&obj, 0, Some(1), Delivery::Rendered).expect("a legal range");
         assert_eq!(
             view.body,
             Body::Base64(b64(&[0xC3])),
@@ -678,7 +743,7 @@ mod tests {
     #[test]
     fn a_window_inside_one_character_advances_over_the_bytes_it_was_given() {
         let obj = text_obj("😀".as_bytes(), None); // F0 9F 98 80
-        let view = plan(&obj, 1, Some(2)).expect("a legal range");
+        let view = plan(&obj, 1, Some(2), Delivery::Rendered).expect("a legal range");
         assert_eq!(view.body, Body::Base64(b64(&[0x9F, 0x98])));
         assert_eq!(
             served_range(&view.meta),
@@ -708,7 +773,8 @@ mod tests {
                     steps <= total + 2,
                     "window {window}: paging did not terminate — stuck at {cursor}"
                 );
-                let view = plan(&obj, cursor, Some(window)).expect("a legal range");
+                let view =
+                    plan(&obj, cursor, Some(window), Delivery::Rendered).expect("a legal range");
                 let (from, to) = served_range(&view.meta)
                     .unwrap_or_else(|| panic!("window {window} at {cursor}: {}", view.meta));
                 assert_eq!(
@@ -744,7 +810,7 @@ mod tests {
             if cursor >= corpus.len() {
                 break;
             }
-            let view = plan(&obj, cursor, Some(3)).unwrap();
+            let view = plan(&obj, cursor, Some(3), Delivery::Rendered).unwrap();
             let (_, to) = served_range(&view.meta).unwrap();
             match &view.body {
                 Body::Text(t) => out.extend_from_slice(t.as_bytes()),
@@ -769,7 +835,7 @@ mod tests {
     /// "this object is binary" wording, which is simply not true of an empty `.txt`.
     #[test]
     fn an_empty_object_says_it_is_empty() {
-        let view = plan(&text_obj(b"", None), 0, None).unwrap();
+        let view = plan(&text_obj(b"", None), 0, None, Delivery::Rendered).unwrap();
         assert_eq!(view.body, Body::None);
         assert!(
             view.meta.contains("empty"),
@@ -792,7 +858,7 @@ mod tests {
         // Each `é` is two bytes, so a 3-byte window from 0 splits the second one.
         let body = "ééé";
         let obj = text_obj(body.as_bytes(), None);
-        let view = plan(&obj, 0, Some(3)).unwrap();
+        let view = plan(&obj, 0, Some(3), Delivery::Rendered).unwrap();
         assert_eq!(
             view.body,
             Body::Text("é".to_string()),
@@ -812,7 +878,7 @@ mod tests {
     fn undecodable_textual_bytes_fall_back_to_base64() {
         let bytes: &[u8] = &[0x66, 0x6f, 0x6f, 0xff, 0xfe, 0x62, 0x61, 0x72];
         let obj = text_obj(bytes, None);
-        let view = plan(&obj, 0, None).unwrap();
+        let view = plan(&obj, 0, None, Delivery::Rendered).unwrap();
         assert_eq!(view.body, Body::Base64(b64(bytes)));
     }
 }

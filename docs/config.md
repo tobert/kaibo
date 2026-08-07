@@ -829,15 +829,12 @@ artifact-producing tool writes into. Three produce today:
 | `save_artifact` | bulk text a consult's model wrote | `[artifacts] enabled` **and** a per-call `save_artifacts` (see below) |
 | `deliberate` | the explorer dossier each deliberation was built on | none — the CAS being on is the only key |
 
-`deliberate` is the one kaibo writes on its own, because the dossier is kaibo's own
-byproduct of a call you already made rather than something a model chose to save. Each
-deliberation's reply names the dossier's `kaibo://cas/<digest>`; pass that digest back as
-the tool's `dossier` argument to run a second synth over the same evidence with no
-explorer sweep. Sizing note: dossiers are the bulkiest thing most installs put in this
-store, so an install that deliberates often accumulates faster than the two
-opt-in producers suggest. A store that refuses the write (a full `max_bytes`, an I/O
-error) costs you the record and never the deliberation — it is logged and the call
-proceeds.
+`deliberate` needs no key of its own — kaibo writes the dossier, not a model. Each
+deliberation names its dossier's `kaibo://cas/<digest>`; pass that digest back as the
+`dossier` argument to run a second synth over the same evidence with no explorer sweep.
+Size the store for dossiers: they are the bulkiest objects most installs hold, and they
+accumulate on every deliberation. A refused write (a full `max_bytes`, an I/O error) is
+logged and the deliberation proceeds — you lose the record, never the answer.
 
 Its lifecycle has three states, reported as `mode` in `kaibo://config`'s `[cas]`
 section:
@@ -881,13 +878,30 @@ an operator, not an audit trail, and a content-addressed store that never rewrit
 be one. For a durable per-call record, kaibo's answers are the tool-call telemetry each
 save emits and the session the answer was recorded into.
 
-**Retrieval is the `read_cas` tool, and it is operator-surface only.** Every producer
-names its artifacts by a `kaibo://cas/<digest>` address; `read_cas` takes the digest out
-of one and hands the content back. The MCP client calls it; the inner model team never can
-— the CAS is not mounted into kaish and no cast-facing tool reads it, because kaibo state
-spans projects and a browsable CAS would let one project's team enumerate another's
-artifacts. There is no `kaibo cas` CLI command; on disk, the path a read reports is how an
-operator reaches an object with their own tools.
+**Retrieval is operator-surface only.** Every producer names its artifacts by a
+`kaibo://cas/<digest>` address, and two commands take the digest out of one and hand the
+content back: the `read_cas` MCP tool, and `kaibo cas read` on the command line. The MCP
+client or the CLI caller runs them; the inner model team never can — the CAS is not
+mounted into kaish and no cast-facing tool reads it, because kaibo state spans projects
+and a browsable CAS would let one project's team enumerate another's artifacts.
+
+`read` is the only verb on either surface. There is no listing, no usage report, and no
+delete — each needs an index this store does not keep. Prune by file mtime over the object
+tree with your own tools.
+
+The two surfaces serve the same object differently, because they write to different
+places:
+
+| | `read_cas` (MCP) | `kaibo cas read` (CLI) |
+|---|---|---|
+| metadata | leads as the first content block | goes to stderr, so stdout stays the payload |
+| text content | returns a bounded window | goes to stdout as text |
+| binary content | returns base64 only for an explicit range; returns a small image as a rendered block | goes to stdout as raw bytes — `kaibo cas read <digest> > arch.png` needs no flag |
+| `--json` | not applicable | puts metadata and body in one stdout envelope, base64 for binary |
+
+`kaibo cas read` runs in disk mode only. It refuses in memory mode and names the mode — a
+memory store is empty in a new process, so every digest would otherwise read as "not
+found".
 
 Reads are **metadata-first and bounded**, and the default depends on what the object is:
 
