@@ -2151,6 +2151,22 @@ async fn batch_cancel_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<
             message: e.to_string(),
             code: EXIT_USAGE,
         })?;
+    // A backend with no batch lane at all is the caller naming the wrong thing, not a
+    // broken setup — say which kinds have one rather than failing later, deeper, and less
+    // clearly on the poller construction (DeepSeek cross-family review, 2026-08-07).
+    if !crate::batch::batch_supported(backend) {
+        return Err(SetupError {
+            kind: "usage",
+            message: format!(
+                "backend {:?} ({:?}) has no batch lane, so it holds no batch to cancel \
+                 (batch-capable: {}).",
+                backend.name,
+                backend.kind,
+                crate::batch::supported_kinds_list()
+            ),
+            code: EXIT_USAGE,
+        });
+    }
     // Poll and cancel need only the connection, never a cast or a model — which is why a
     // handle stays addressable from any front door, after any restart.
     let provider = crate::batch::poller(backend).map_err(|e| SetupError {
@@ -2972,6 +2988,90 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// A cast that can actually deliberate, for the tests that need one — no built-in
+    /// pairs an explorer with an offline synth (see `tests/gating.rs`), so a fixture is
+    /// the only way to reach the road past the lane check. `key_optional` keeps it
+    /// resolvable with no credential in the environment.
+    const DELIBERATE_CAST_TOML: &str = r#"
+        [backends.gem]
+        kind = "gemini"
+        key_optional = true
+
+        [casts.mydeliberate]
+        explorer = "gem/some-lite"
+        synth    = { backend = "gem", id = "some-pro", lane = "batch" }
+    "#;
+
+    /// **The lane must be captured BEFORE the model overrides run.** `apply_model_override`
+    /// replaces a slot with a *laneless* one, so reading `synth_lane()` afterward sees
+    /// `None` and refuses every deliberate-capable cast as "no offline synth" — the
+    /// headline feature broken for everyone by a two-line reordering. The MCP road pins
+    /// this in `deliberation_lane_with_overrides`; the CLI inlines the same order and had
+    /// nothing holding it (DeepSeek cross-family review, 2026-08-07).
+    ///
+    /// Driving it: a deliberate cast WITH a synth override must get past the lane check.
+    /// It fails further along on this keyless fixture, which is fine — any outcome except
+    /// the lane refusal proves the capture survived the override.
+    #[tokio::test]
+    async fn the_deliberate_lane_survives_a_synth_override_on_the_cli() {
+        let config = Config::from_toml_str(DELIBERATE_CAST_TOML).expect("fixture config parses");
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from([
+            "kaibo",
+            "deliberate",
+            "q",
+            "--cast",
+            "mydeliberate",
+            "--synth-model",
+            "some-other-pro",
+        ]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Deliberate(d)) => d,
+            other => panic!("expected deliberate, got {other:?}"),
+        };
+        if let Err(err) = deliberate_inner(&common, &args, &resolver).await {
+            assert!(
+                !err.message.contains("no offline synth"),
+                "the lane must be captured before the synth override runs, but the call \
+                 was refused as laneless: {}",
+                err.message
+            );
+        }
+    }
+
+    /// A cancel naming a backend with no batch lane is refused as a USAGE error naming the
+    /// batch-capable kinds — not left to fail deeper and less clearly when the poller is
+    /// built (DeepSeek cross-family review, 2026-08-07).
+    #[tokio::test]
+    async fn batch_cancel_on_a_backend_without_a_batch_lane_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        // `deepseek` is a real, configured backend whose kind has no batch lane.
+        let cli = Cli::parse_from(["kaibo", "batch", "cancel", "deepseek/abc"]);
+        let args = match cli.command {
+            Some(Command::Batch(b)) => match b.cmd {
+                BatchCmd::Cancel(c) => c,
+                other => panic!("expected cancel, got {other:?}"),
+            },
+            other => panic!("expected batch, got {other:?}"),
+        };
+        let err = batch_cancel_inner(&args, &resolver)
+            .await
+            .expect_err("a backend with no batch lane must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("no batch lane"),
+            "the refusal says why, not just that it failed: {}",
+            err.message
+        );
     }
 
     /// A cancel naming a backend that does not exist is a usage error before any network —
