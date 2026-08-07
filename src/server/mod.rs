@@ -460,6 +460,15 @@ pub struct DeliberateInput {
     /// Max tool-loop turns for the dossier-building explorer sweep (default 100).
     #[serde(default)]
     pub explorer_max_turns: Option<usize>,
+
+    /// Reuse a dossier kaibo already built instead of sweeping for a new one: pass the
+    /// digest (bare, or as its `kaibo://cas/<digest>` URI) that an earlier `deliberate`
+    /// handed back. No explorer runs, so this call costs only the synth — the way to put
+    /// the same evidence in front of a second cast. The explorer arguments (`attach`,
+    /// `explorer_model`, `explorer_backend`, `explorer_max_turns`) have nothing to act on
+    /// here, and are refused rather than ignored.
+    #[serde(default)]
+    pub dossier: Option<String>,
 }
 
 /// The handle addressing one piece of async work — a durable batch or a
@@ -2072,8 +2081,10 @@ impl KaiboHandler {
             provider's batch lane (max thinking, half price) or a big local model taking \
             the time it takes. Returns a durable handle once the dossier is built; keep \
             working, then `job_wait`/`job_get` it. Best for hard questions worth hours — a \
-            design review, a gnarly bug, \"is this abstraction right\". For an answer this \
-            turn, use `consult`."
+            design review, a gnarly bug, \"is this abstraction right\". kaibo keeps the \
+            dossier and hands back its digest: pass it as `dossier` to put the same \
+            evidence in front of a second cast for the price of one synth. For an answer \
+            this turn, use `consult`."
     )]
     async fn deliberate(
         &self,
@@ -2081,6 +2092,11 @@ impl KaiboHandler {
         peer: Peer<RoleServer>,
         meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
+        // A reuse call that also carries explorer arguments is self-contradictory; say so
+        // before resolving anything, so it costs nothing.
+        if let Some(refusal) = dossier::inert_explorer_args(&input) {
+            return Err(McpError::invalid_params(refusal, None));
+        }
         let root = self.resolve_root(input.path)?;
         let mut cast = self.resolve_cast(input.cast)?;
         // deliberate = explore → OFFLINE synth. Require the synth on an offline lane
@@ -2098,106 +2114,132 @@ impl KaiboHandler {
             input.synth_model.as_deref(),
             input.synth_backend.as_deref(),
         )?;
-        let explorer = self.arm(&cast, ModelRole::Explorer)?;
-        let explorer_model = explorer.model.clone();
+        // Stage 2's preamble, resolved before the branch because both roads reach it:
+        // the offline-synth prompt, overridable via `[prompts].batch` OR the synth slot's
+        // own `preamble` (`resolved_prompts` layers both, same as the dossier phase does).
+        let system =
+            crate::consult::batch_system_prompt(self.resolved_prompts(&cast).batch.as_deref());
 
-        // Stage 1 — build the dossier synchronously, on the live progress sink: the
-        // caller waits through this bounded (minutes) explorer sweep, exactly as `explore`
-        // does, so a thin/failed dossier is a clean error *before* any offline tokens are
-        // spent. Only the deliberation (Stage 2) is handed off async. Attachments reach
-        // the dossier-builder as read-WHOLE directives (the sweep semantics), so their
-        // content flows to the offline synth through the dossier it writes.
-        let progress = progress_sink(peer, &meta);
-        let defaults = &self.config.defaults;
-        let attachments = self
-            .resolve_sweep_attachments(&root, &input.attach, "deliberate")
-            .await?;
-        let cfg = ExploreConfig {
-            phase: PhaseContext {
-                progress: progress.clone(),
-                house_rules: self.house_rules(&root)?,
-                prompts: self.resolved_prompts(&cast),
-                orientation: self.orientation(&root).await?,
-                call_deadline: defaults.call_deadline,
-            },
-            explorer_max_turns: input
-                .explorer_max_turns
-                .unwrap_or(defaults.explorer_max_turns),
-            sandbox: self.config.sandbox.clone(),
-            max_attachments: defaults.max_attachments,
-        };
-        // The offline synth's resolved caps, without building a network client — pure
-        // and key-free, so this can run before the (bounded but real) dossier sweep,
-        // and it's valid for both lanes (batch and direct both require the synth
-        // slot). Lets the dossier sweep's `attach` gate on the synth's real vision
-        // cap instead of assuming blind.
-        let (synth_slot, _synth_backend, synth_caps) = self.batch_synth(&cast)?;
-        let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
-            label: Arc::from(format!(
-                "the offline synth (`{}`) on cast `{}`",
-                synth_slot.id, cast.name
-            )),
-            vision: synth_caps.vision,
-        };
-        // Deliberate's dossier sweep does NOT dedupe against the caller's own attach
-        // list (an empty seed): a caller-attached file reaches the offline synth ONLY
-        // through what the explorer writes (it's a read-WHOLE directive here, never
-        // inlined), so deduping would silently strand it — see SweepAttachSink's doc.
-        let sink = (defaults.max_attachments > 0).then(|| {
-            Arc::new(SweepAttachSink::new(
-                defaults.max_attachments,
-                consumer.clone(),
-                std::collections::HashSet::new(),
-            ))
-        });
-
-        let span = tracing::info_span!("deliberate.dossier", cast = %cast.name, explorer_model = %explorer_model);
-        progress.emit(PhaseEvent::PhaseStarted {
-            phase: "deliberate.dossier",
-        });
-        let (mut dossier, dossier_usage) = match explore_with(
-            &input.question,
-            root,
-            &explorer,
-            &cfg,
-            &attachments,
-            sink.as_ref(),
-        )
-        .instrument(span)
-        .await
+        // Stage 1 — build the dossier, or reuse one already built.
+        //
+        // The reuse road exists because a dossier is the expensive half: a sweep can run
+        // hundreds of thousands of tokens, and asking a second cast the same question over
+        // the same evidence should cost only the second synth. It is also the honest way to
+        // compare two synths — same evidence, so the answers differ by the model alone.
+        let (dossier, images, dossier_usage, kept, explorer_model) = if let Some(reference) =
+            input.dossier.as_deref()
         {
-            Ok(out) => out,
-            Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
+            let (text, kept) = dossier::load_dossier(self.media_cas.as_ref(), reference)
+                .map_err(|msg| McpError::invalid_params(msg, None))?;
+            // No sweep, so no routed images and no explorer spend — and no explorer to
+            // name in the provenance footer. The synth is the only model this call ran.
+            (text, Vec::new(), Usage::new(), Some(kept), None)
+        } else {
+            let explorer = self.arm(&cast, ModelRole::Explorer)?;
+            let explorer_model = explorer.model.clone();
+
+            // The dossier is built synchronously, on the live progress sink: the caller
+            // waits through this bounded (minutes) explorer sweep, exactly as `explore`
+            // does, so a thin/failed dossier is a clean error *before* any offline tokens
+            // are spent. Only the deliberation (Stage 2) is handed off async. Attachments
+            // reach the dossier-builder as read-WHOLE directives (the sweep semantics), so
+            // their content flows to the offline synth through the dossier it writes.
+            let progress = progress_sink(peer, &meta);
+            let defaults = &self.config.defaults;
+            let attachments = self
+                .resolve_sweep_attachments(&root, &input.attach, "deliberate")
+                .await?;
+            let cfg = ExploreConfig {
+                phase: PhaseContext {
+                    progress: progress.clone(),
+                    house_rules: self.house_rules(&root)?,
+                    prompts: self.resolved_prompts(&cast),
+                    orientation: self.orientation(&root).await?,
+                    call_deadline: defaults.call_deadline,
+                },
+                explorer_max_turns: input
+                    .explorer_max_turns
+                    .unwrap_or(defaults.explorer_max_turns),
+                sandbox: self.config.sandbox.clone(),
+                max_attachments: defaults.max_attachments,
+            };
+            // The offline synth's resolved caps, without building a network client — pure
+            // and key-free, so this can run before the (bounded but real) dossier sweep,
+            // and it's valid for both lanes (batch and direct both require the synth
+            // slot). Lets the dossier sweep's `attach` gate on the synth's real vision
+            // cap instead of assuming blind.
+            let (synth_slot, _synth_backend, synth_caps) = self.batch_synth(&cast)?;
+            let consumer = SweepConsumer {
+                kind: SweepConsumerKind::OfflineSynth,
+                label: Arc::from(format!(
+                    "the offline synth (`{}`) on cast `{}`",
+                    synth_slot.id, cast.name
+                )),
+                vision: synth_caps.vision,
+            };
+            // Deliberate's dossier sweep does NOT dedupe against the caller's own attach
+            // list (an empty seed): a caller-attached file reaches the offline synth ONLY
+            // through what the explorer writes (it's a read-WHOLE directive here, never
+            // inlined), so deduping would silently strand it — see SweepAttachSink's doc.
+            let sink = (defaults.max_attachments > 0).then(|| {
+                Arc::new(SweepAttachSink::new(
+                    defaults.max_attachments,
+                    consumer.clone(),
+                    std::collections::HashSet::new(),
+                ))
+            });
+
+            let span = tracing::info_span!("deliberate.dossier", cast = %cast.name, explorer_model = %explorer_model);
+            progress.emit(PhaseEvent::PhaseStarted {
+                phase: "deliberate.dossier",
+            });
+            let (mut dossier, dossier_usage) = match explore_with(
+                &input.question,
+                root,
+                &explorer,
+                &cfg,
+                &attachments,
+                sink.as_ref(),
+            )
+            .instrument(span)
+            .await
+            {
+                Ok(out) => out,
+                Err(e) => return Ok(consultation_failed("deliberate", &cast.name, e)),
+            };
+            progress.emit(PhaseEvent::PhaseFinished {
+                phase: "deliberate.dossier",
+            });
+            // Stitch whatever the dossier sweep routed via `attach` into the dossier text
+            // itself (text bodies, notes, demotions); collect any routed images separately
+            // — they ride the synth's single turn as native parts, not as dossier text.
+            let images = stitch_dossier_delivery(&mut dossier, &consumer, sink.as_ref());
+            // Keep the finished dossier before stage 2 spends anything on it, so a
+            // deliberation that fails, times out, or comes back thin still leaves the
+            // evidence it was built from readable. Never fatal — see `server::dossier`.
+            let kept = keep_dossier(
+                self.media_cas.as_ref(),
+                &input.question,
+                &dossier,
+                &cast.name,
+                &explorer_model,
+            );
+            (
+                dossier,
+                images,
+                dossier_usage,
+                kept,
+                Some(explorer_model),
+            )
         };
-        progress.emit(PhaseEvent::PhaseFinished {
-            phase: "deliberate.dossier",
-        });
-        // Stitch whatever the dossier sweep routed via `attach` into the dossier text
-        // itself (text bodies, notes, demotions); collect any routed images separately
-        // — they ride the synth's single turn as native parts, not as dossier text.
-        let images = stitch_dossier_delivery(&mut dossier, &consumer, sink.as_ref());
-        // Keep the finished dossier before stage 2 spends anything on it, so a
-        // deliberation that fails, times out, or comes back thin still leaves the evidence
-        // it was built from readable. Never fatal — see `server::dossier`.
-        let kept = keep_dossier(
-            self.media_cas.as_ref(),
-            &input.question,
-            &dossier,
-            &cast.name,
-            &explorer_model,
-        );
 
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
-        // and the handle; both share the offline-synth preamble (`batch_system_prompt`,
-        // overridable via `[prompts].batch` OR the synth slot's own `preamble` — the
-        // resolved `cfg.phase.prompts` already layered both, same as the dossier phase above).
-        let system = crate::consult::batch_system_prompt(cfg.phase.prompts.batch.as_deref());
+        // and the handle.
         match lane {
             Lane::Batch => {
                 self.deliberate_batch(
                     &cast,
-                    &explorer_model,
+                    explorer_model.as_deref(),
                     &input.question,
                     &dossier,
                     &images,
@@ -2209,7 +2251,7 @@ impl KaiboHandler {
             }
             Lane::Direct => self.deliberate_direct_job(
                 &cast,
-                &explorer_model,
+                explorer_model.as_deref(),
                 &input.question,
                 &dossier,
                 &images,
@@ -2234,7 +2276,10 @@ impl KaiboHandler {
     async fn deliberate_batch(
         &self,
         cast: &Cast,
-        explorer_model: &str,
+        // The explorer that built the dossier, or `None` when this call reused a stored
+        // one — there was no explorer then, and naming one would bill a model that never
+        // ran to this call.
+        explorer_model: Option<&str>,
         question: &str,
         dossier: &str,
         // Images the dossier sweep routed via `attach` — the batch builders already
@@ -2295,15 +2340,22 @@ impl KaiboHandler {
             }
         }
         // Fold the dossier build's real cost into the ack — the synth's own tokens land
-        // later on the provider's batch result, but the build spend is knowable now.
-        let dossier_cost = fmt_usage(&dossier_usage)
-            .map(|t| format!(", {t}"))
-            .unwrap_or_default();
+        // later on the provider's batch result, but the build spend is knowable now. A
+        // reused dossier cost this call nothing, and says so.
+        let stage_one = match explorer_model {
+            Some(m) => {
+                let cost = fmt_usage(&dossier_usage)
+                    .map(|t| format!(", {t}"))
+                    .unwrap_or_default();
+                format!("Dossier built (explorer `{m}`{cost})")
+            }
+            None => "Dossier reused (no explorer ran)".to_string(),
+        };
         let msg = format!(
-            "Dossier built (explorer `{explorer_model}`{dossier_cost}) and handed to the batch \
-             lane as `{handle}` — cast `{}`, synth `{model}` at max thinking. It deliberates \
-             offline; collect it with `job_get {handle}` (durable — survives restart), or stop it \
-             with `job_cancel {handle}`. Nothing to wait on now.{}",
+            "{stage_one} and handed to the batch lane as `{handle}` — cast `{}`, synth \
+             `{model}` at max thinking. It deliberates offline; collect it with `job_get \
+             {handle}` (durable — survives restart), or stop it with `job_cancel \
+             {handle}`. Nothing to wait on now.{}",
             cast.name,
             dossier_ack(kept)
         );
@@ -2319,7 +2371,10 @@ impl KaiboHandler {
     fn deliberate_direct_job(
         &self,
         cast: &Cast,
-        explorer_model: &str,
+        // `None` when the dossier was reused rather than swept for — see the batch lane's
+        // note. The provenance footer then names the synth alone, because the synth is the
+        // only model this call ran.
+        explorer_model: Option<&str>,
         question: &str,
         dossier: &str,
         // Images the dossier sweep routed via `attach` — ride the synth's single
@@ -2356,7 +2411,8 @@ impl KaiboHandler {
         // it emits no beats of its own — the log carries the job's own start/finish.
         let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
         let cast_name = cast.name.clone();
-        let explorer_model = explorer_model.to_string();
+        let swept = explorer_model.is_some();
+        let explorer_model = explorer_model.map(str::to_string);
         let question = question.to_string();
         let dossier = dossier.to_string();
         let images = images.to_vec();
@@ -2370,31 +2426,42 @@ impl KaiboHandler {
             )
             .await
             {
-                Ok((answer, synth_usage)) => Ok(JobResult {
-                    answer: with_provenance(
-                        // The dossier line sits between the answer and the provenance
-                        // footer: it is part of what this deliberation is grounded in,
-                        // not part of who ran it.
-                        with_dossier(answer, kept_for_job.as_ref()),
-                        &cast_name,
-                        &[
-                            ("explorer", explorer_model.as_str()),
-                            ("synth", synth_model.as_str()),
-                        ],
-                        &(dossier_usage + synth_usage),
-                    ),
-                    report: None,
-                }),
+                Ok((answer, synth_usage)) => {
+                    // Name only the models this call actually ran: a reused dossier had no
+                    // explorer, and the token line counts the synth alone because that is
+                    // the whole spend.
+                    let mut roles: Vec<(&str, &str)> = Vec::with_capacity(2);
+                    if let Some(m) = explorer_model.as_deref() {
+                        roles.push(("explorer", m));
+                    }
+                    roles.push(("synth", synth_model.as_str()));
+                    Ok(JobResult {
+                        answer: with_provenance(
+                            // The dossier line sits between the answer and the provenance
+                            // footer: it is part of what this deliberation is grounded in,
+                            // not part of who ran it.
+                            with_dossier(answer, kept_for_job.as_ref()),
+                            &cast_name,
+                            &roles,
+                            &(dossier_usage + synth_usage),
+                        ),
+                        report: None,
+                    })
+                }
                 Err(e) => Err(consultation_failure_text("deliberate", &cast_name, e)),
             }
         });
 
         let msg = format!(
-            "Dossier built; the direct (local) synth is now deliberating offline as \
-             `{job_id}` — cast `{}`. This is one long local completion (it can take a \
-             while): `job_wait {job_id}` parks for it, `job_get {job_id}` collects, \
-             `job_cancel {job_id}` stops it. Session-scoped — the job lives for this \
-             server session only.{}",
+            "{}; the direct (local) synth is now deliberating offline as `{job_id}` — cast \
+             `{}`. This is one long local completion (it can take a while): `job_wait \
+             {job_id}` parks for it, `job_get {job_id}` collects, `job_cancel {job_id}` \
+             stops it. Session-scoped — the job lives for this server session only.{}",
+            if swept {
+                "Dossier built"
+            } else {
+                "Dossier reused (no explorer ran)"
+            },
             cast.name,
             dossier_ack(kept)
         );
@@ -7114,7 +7181,7 @@ enabled = false
         let out = h
             .deliberate_batch(
                 &cast,
-                "gem/some-lite",
+                Some("gem/some-lite"),
                 "Is the retry safe?",
                 "DOSSIER: src/x.rs:1 fn retry",
                 &[],
@@ -7124,6 +7191,7 @@ enabled = false
                     digest: "cd".repeat(32),
                     bytes: 29,
                     path: None,
+                    origin: crate::server::dossier::Origin::Built,
                 }),
             )
             .await
@@ -7197,7 +7265,7 @@ enabled = false
 
         h.deliberate_batch(
             &cast,
-            "gem/some-lite",
+            Some("gem/some-lite"),
             "Is the retry safe?",
             "DOSSIER: src/x.rs:1 fn retry",
             &[],
@@ -7207,6 +7275,7 @@ enabled = false
                 digest: digest.clone(),
                 bytes: 29,
                 path: None,
+                origin: crate::server::dossier::Origin::Built,
             }),
         )
         .await

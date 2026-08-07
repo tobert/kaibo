@@ -45,6 +45,16 @@ const DOSSIER_EXT: Extension = Extension::Md;
 /// short summary rather than a second copy.
 const MAX_LABEL_BYTES: usize = 120;
 
+/// How this call came by its dossier — the one thing the caller-facing lines say
+/// differently, since "kept" and "reused" describe opposite spends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// An explorer sweep built it on this call, and kaibo kept it.
+    Built,
+    /// The caller supplied its digest; no sweep ran.
+    Reused,
+}
+
 /// A dossier kaibo kept: what the caller reads it back with.
 ///
 /// `path` is `Some` only in disk mode — the same "read it with the tool, or find it on
@@ -55,6 +65,7 @@ pub(crate) struct KeptDossier {
     pub digest: String,
     pub bytes: usize,
     pub path: Option<PathBuf>,
+    pub origin: Origin,
 }
 
 /// Put a built dossier in the media CAS and describe where it landed.
@@ -93,6 +104,7 @@ pub(crate) fn keep_dossier(
             path: store.path_for(&digest),
             digest: digest.to_hex(),
             bytes: bytes.len(),
+            origin: Origin::Built,
         }),
         // The bytes are durable; only the sidecar is missing. Still a kept dossier — the
         // digest names readable content, which is the whole point of handing it back.
@@ -109,6 +121,7 @@ pub(crate) fn keep_dossier(
                 path: store.path_for(&parsed),
                 digest,
                 bytes: bytes.len(),
+                origin: Origin::Built,
             })
         }
         Err(e) => {
@@ -120,6 +133,123 @@ pub(crate) fn keep_dossier(
             None
         }
     }
+}
+
+/// The refusal a `deliberate` call earns when it supplies a dossier AND explorer
+/// arguments, or `None` when there is nothing wrong.
+///
+/// With a dossier supplied there is no sweep, so `attach`, the explorer overrides, and
+/// `explorer_max_turns` have nothing to act on. Ignoring them would hand back an answer
+/// that looks like it honored them, which is the quiet kind of wrong: the caller attached
+/// a file, saw a deliberation, and has no way to learn the file never reached it.
+///
+/// A call that builds its own dossier can carry every one of them, so only a reuse call
+/// has anything to answer for here. Checked before the handler resolves anything, so a
+/// self-contradictory request costs nothing.
+pub(crate) fn inert_explorer_args(input: &crate::server::DeliberateInput) -> Option<String> {
+    input.dossier.as_ref()?;
+    let inert: Vec<&str> = [
+        (!input.attach.is_empty()).then_some("attach"),
+        input.explorer_model.is_some().then_some("explorer_model"),
+        input
+            .explorer_backend
+            .is_some()
+            .then_some("explorer_backend"),
+        input
+            .explorer_max_turns
+            .is_some()
+            .then_some("explorer_max_turns"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if inert.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "`dossier` reuses evidence that is already built, so no explorer runs on this call \
+         and {} would do nothing. Drop {} to reuse the stored dossier, or drop `dossier` to \
+         sweep for a fresh one.",
+        inert
+            .iter()
+            .map(|a| format!("`{a}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if inert.len() == 1 { "it" } else { "them" }
+    ))
+}
+
+/// Load a dossier the caller supplied by address, for a second synth to reason over.
+///
+/// This is the reuse half of keeping them: a sweep that cost hundreds of thousands of
+/// tokens is worth asking twice over, and the second ask should cost only the synth. The
+/// text comes back exactly as the store holds it — the same bytes the first synth read.
+///
+/// The caller is the operator's proxy, so any *textual* object in the store is fair
+/// evidence here, not just something `deliberate` wrote: a report, a spec, a pasted
+/// transcript a `save_artifact` call parked. What it will not do is hand an image or any
+/// other binary to a text prompt, or invent a dossier when the address names nothing.
+/// Every refusal says which of those happened.
+///
+/// `Err` is a sentence for the caller — the handler wraps it as invalid params.
+pub(crate) fn load_dossier(
+    store: Option<&Arc<MediaStore>>,
+    reference: &str,
+) -> Result<(String, KeptDossier), String> {
+    let Some(store) = store else {
+        return Err(
+            "`dossier` names a stored dossier, but the media CAS is off ([cas] enabled = \
+             false), so kaibo holds none. Re-enable the CAS and reconnect, or omit \
+             `dossier` to build a fresh one."
+                .to_string(),
+        );
+    };
+    // The ack and the answer footer both render a `kaibo://cas/<digest>` URI, so the
+    // caller most often has the URI in hand rather than the bare digest. Taking either is
+    // not a fallback: the prefix is unambiguous, and refusing the exact string kaibo just
+    // printed would be a puzzle, not a guardrail.
+    let hex = reference
+        .trim()
+        .strip_prefix(crate::cas::CAS_URI_PREFIX)
+        .unwrap_or(reference.trim());
+    let digest = crate::cas::Digest::from_hex(hex).map_err(|e| {
+        format!(
+            "{e} — pass the digest kaibo handed back for a dossier, either bare or as its \
+             full {}<digest> URI.",
+            crate::cas::CAS_URI_PREFIX
+        )
+    })?;
+    let (bytes, ext) = match store.get(&digest) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return Err(format!(
+                "no artifact with digest {hex} — it was never stored here, or (in memory \
+                 mode) it did not survive a restart. Omit `dossier` to build a fresh one."
+            ))
+        }
+        Err(e) => return Err(format!("{e}")),
+    };
+    if !ext.is_textual() {
+        return Err(format!(
+            "the artifact at {hex} is {}, and a dossier is the text an offline synth \
+             reasons over. Pass the digest of a dossier or another text artifact.",
+            ext.mime()
+        ));
+    }
+    // Stored text is UTF-8 by construction on every path that writes it (a dossier is a
+    // Rust `String`; `save_artifact` takes a JSON string). Say so plainly if some other
+    // route ever produced text that is not, rather than deliberating over replacement
+    // characters.
+    let text = String::from_utf8(bytes).map_err(|_| {
+        format!("the artifact at {hex} is not valid UTF-8, so it cannot be read as a dossier.")
+    })?;
+    let kept = KeptDossier {
+        digest: hex.to_string(),
+        bytes: text.len(),
+        path: store.path_for(&digest),
+        origin: Origin::Reused,
+    };
+    Ok((text, kept))
 }
 
 /// One single line of question text for the sidecar label, bounded and control-free.
@@ -160,14 +290,22 @@ fn label_for(question: &str) -> String {
 /// The clause both lane acks carry, naming where the dossier landed. Empty when nothing
 /// was kept, so an ack on a CAS-off server reads exactly as it did before.
 pub(crate) fn dossier_ack(kept: Option<&KeptDossier>) -> String {
-    match kept {
-        Some(k) => format!(
-            " The dossier it built is kept at {}{} ({} bytes) — read it with `read_cas`.",
-            crate::cas::CAS_URI_PREFIX,
-            k.digest,
+    let Some(k) = kept else {
+        return String::new();
+    };
+    let uri = format!("{}{}", crate::cas::CAS_URI_PREFIX, k.digest);
+    match k.origin {
+        Origin::Built => format!(
+            " The dossier it built is kept at {uri} ({} bytes) — read it with `read_cas`, \
+             or pass it back as `dossier` to ask another cast the same question without \
+             re-exploring.",
             k.bytes
         ),
-        None => String::new(),
+        Origin::Reused => format!(
+            " It is reasoning over the dossier you passed, {uri} ({} bytes) — no sweep ran \
+             on this call.",
+            k.bytes
+        ),
     }
 }
 
@@ -178,12 +316,14 @@ pub(crate) fn with_dossier(answer: String, kept: Option<&KeptDossier>) -> String
     let Some(k) = kept else {
         return answer;
     };
+    let how = match k.origin {
+        Origin::Built => "the explorer's report this deliberation reasoned over",
+        Origin::Reused => "the dossier this deliberation reused; no sweep ran on this call",
+    };
     let mut out = format!(
-        "{answer}\n\n---\nDossier: {}{} ({}, {} bytes) — the explorer's report this \
-         deliberation reasoned over; read it with `read_cas`.",
+        "{answer}\n\n---\nDossier: {}{} ({} bytes) — {how}; read it with `read_cas`.",
         crate::cas::CAS_URI_PREFIX,
         k.digest,
-        DOSSIER_EXT.mime(),
         k.bytes
     );
     if let Some(path) = &k.path {
@@ -299,6 +439,149 @@ mod tests {
         );
     }
 
+    /// The round trip that makes reuse worth anything: what `keep_dossier` stored comes
+    /// back byte-for-byte, so a second synth reasons over the same evidence the first one
+    /// did rather than a re-rendering of it.
+    #[test]
+    fn a_kept_dossier_loads_back_verbatim_for_a_second_synth() {
+        let store = store();
+        let dossier = "src/x.rs:1 fn retry\nsrc/x.rs:9 the backoff is unbounded\n";
+        let kept = keep_dossier(Some(&store), "is the retry safe?", dossier, "c", "m").unwrap();
+
+        for reference in [
+            kept.digest.clone(),
+            format!("{}{}", crate::cas::CAS_URI_PREFIX, kept.digest),
+            format!("  {}  ", kept.digest),
+        ] {
+            let (text, reused) = load_dossier(Some(&store), &reference)
+                .unwrap_or_else(|e| panic!("loading {reference:?} must work: {e}"));
+            assert_eq!(text, dossier, "the reused dossier is the stored one");
+            assert_eq!(reused.digest, kept.digest);
+            assert_eq!(
+                reused.origin,
+                Origin::Reused,
+                "a loaded dossier is reused, not built — the two read differently"
+            );
+        }
+    }
+
+    /// Every way a supplied `dossier` can fail says which thing went wrong, and none of
+    /// them invents a dossier or quietly falls back to sweeping.
+    #[test]
+    fn a_dossier_that_cannot_be_reused_says_which_thing_went_wrong() {
+        let store = store();
+        let cas_off = load_dossier(None, &"aa".repeat(32)).expect_err("no store, no reuse");
+        assert!(cas_off.contains("[cas] enabled"), "{cas_off}");
+
+        let bad = load_dossier(Some(&store), "not-a-digest").expect_err("garbage is refused");
+        assert!(
+            bad.contains("kaibo://cas/"),
+            "the refusal shows the shape: {bad}"
+        );
+
+        let missing =
+            load_dossier(Some(&store), &"aa".repeat(32)).expect_err("an absent object is refused");
+        assert!(
+            missing.contains("never stored here"),
+            "an absent dossier is not a corrupt one: {missing}"
+        );
+
+        // A stored PNG is a real address, and emphatically not a dossier.
+        let png = store
+            .put(
+                &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+                Extension::Png,
+                &Provenance {
+                    prompt: "p".into(),
+                    model: "m".into(),
+                    cast: "c".into(),
+                    timestamp: 0,
+                    mime: "image/png".into(),
+                    seed: None,
+                    tool: Some("generate".into()),
+                    slot: None,
+                    label: None,
+                    session: None,
+                },
+            )
+            .unwrap();
+        let binary = load_dossier(Some(&store), &png.to_hex()).expect_err("an image is refused");
+        assert!(
+            binary.contains("image/png"),
+            "the refusal names what it actually is: {binary}"
+        );
+    }
+
+    /// A reuse call that also carries explorer arguments is refused by name, never quietly
+    /// stripped: `attach` is the dangerous one — a caller who attached a file and got an
+    /// answer would have no way to learn the file never reached the synth.
+    #[test]
+    fn explorer_arguments_are_refused_on_a_reuse_call_by_name() {
+        let base = || crate::server::DeliberateInput {
+            question: "q".into(),
+            attach: vec![],
+            path: None,
+            cast: None,
+            explorer_model: None,
+            explorer_backend: None,
+            synth_model: None,
+            synth_backend: None,
+            explorer_max_turns: None,
+            dossier: Some("aa".repeat(32)),
+        };
+        assert_eq!(
+            inert_explorer_args(&base()),
+            None,
+            "a plain reuse call is fine"
+        );
+
+        let with_attach = crate::server::DeliberateInput {
+            attach: vec!["src/x.rs".into()],
+            ..base()
+        };
+        let refusal = inert_explorer_args(&with_attach).expect("attach is inert here");
+        assert!(refusal.contains("`attach`"), "named: {refusal}");
+
+        let many = crate::server::DeliberateInput {
+            explorer_model: Some("m".into()),
+            explorer_max_turns: Some(10),
+            ..base()
+        };
+        let refusal = inert_explorer_args(&many).expect("both are inert");
+        assert!(
+            refusal.contains("`explorer_model`") && refusal.contains("`explorer_max_turns`"),
+            "every inert argument is named, not just the first: {refusal}"
+        );
+
+        // The synth overrides are the ones that still MEAN something on a reuse call —
+        // choosing which model reads the reused evidence is the whole point.
+        let synth_override = crate::server::DeliberateInput {
+            synth_model: Some("other-synth".into()),
+            synth_backend: Some("other-backend".into()),
+            ..base()
+        };
+        assert_eq!(
+            inert_explorer_args(&synth_override),
+            None,
+            "retargeting the synth is exactly what reuse is for"
+        );
+
+        // And a call that builds its own dossier carries every explorer argument happily —
+        // this check must never touch the road it isn't about.
+        let building = crate::server::DeliberateInput {
+            dossier: None,
+            attach: vec!["src/x.rs".into()],
+            explorer_model: Some("m".into()),
+            explorer_max_turns: Some(10),
+            ..base()
+        };
+        assert_eq!(
+            inert_explorer_args(&building),
+            None,
+            "a sweeping call is what the explorer arguments are for"
+        );
+    }
+
     /// Both surfaces name the URI a caller acts on, and the answer footer names the disk
     /// path when there is one — the same pair the artifact footer renders.
     #[test]
@@ -307,6 +590,7 @@ mod tests {
             digest: "ab".repeat(32),
             bytes: 4096,
             path: Some(PathBuf::from("/data/kaibo/cas/ab/abab.md")),
+            origin: Origin::Built,
         };
         let ack = dossier_ack(Some(&kept));
         assert!(
@@ -330,6 +614,24 @@ mod tests {
         assert!(
             answer.contains("path: /data/kaibo/cas/ab/abab.md"),
             "disk mode names the file: {answer}"
+        );
+
+        // A reused dossier reads as reused on both surfaces — the caller must be able to
+        // tell "kaibo swept for this" from "kaibo reasoned over what you handed it",
+        // because only one of those cost an explorer.
+        let reused = KeptDossier {
+            origin: Origin::Reused,
+            ..kept
+        };
+        assert!(
+            dossier_ack(Some(&reused)).contains("no sweep ran"),
+            "{}",
+            dossier_ack(Some(&reused))
+        );
+        assert!(
+            with_dossier("D".into(), Some(&reused)).contains("reused"),
+            "{}",
+            with_dossier("D".into(), Some(&reused))
         );
     }
 }
