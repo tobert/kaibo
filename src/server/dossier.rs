@@ -144,21 +144,18 @@ pub(crate) fn keep_dossier(
 /// a file, saw a deliberation, and has no way to learn the file never reached it.
 ///
 /// A call that builds its own dossier can carry every one of them, so only a reuse call
-/// has anything to answer for here. Checked before the handler resolves anything, so a
-/// self-contradictory request costs nothing.
-pub(crate) fn inert_explorer_args(input: &crate::server::DeliberateInput) -> Option<String> {
-    input.dossier.as_ref()?;
+/// has anything to answer for here. Checked before either front door resolves anything, so
+/// a self-contradictory request costs nothing.
+///
+/// The argument names in the refusal are the MCP spellings; the CLI's own flags carry the
+/// same words behind a `--`, so one sentence serves both readers.
+pub(crate) fn inert_explorer_args(args: ExplorerArgs<'_>) -> Option<String> {
+    args.dossier?;
     let inert: Vec<&str> = [
-        (!input.attach.is_empty()).then_some("attach"),
-        input.explorer_model.is_some().then_some("explorer_model"),
-        input
-            .explorer_backend
-            .is_some()
-            .then_some("explorer_backend"),
-        input
-            .explorer_max_turns
-            .is_some()
-            .then_some("explorer_max_turns"),
+        (!args.attach.is_empty()).then_some("attach"),
+        args.model.is_some().then_some("explorer_model"),
+        args.backend.is_some().then_some("explorer_backend"),
+        args.max_turns.is_some().then_some("explorer_max_turns"),
     ]
     .into_iter()
     .flatten()
@@ -177,6 +174,20 @@ pub(crate) fn inert_explorer_args(input: &crate::server::DeliberateInput) -> Opt
             .join(", "),
         if inert.len() == 1 { "it" } else { "them" }
     ))
+}
+
+/// The explorer-phase arguments of one `deliberate` call, borrowed.
+///
+/// Both front doors take the same arguments under different names — MCP's
+/// `DeliberateInput`, the CLI's flags — so [`inert_explorer_args`] reads them through this
+/// view instead of existing twice and drifting apart. `dossier` rides along because it is
+/// what makes the rest inert.
+pub(crate) struct ExplorerArgs<'a> {
+    pub dossier: Option<&'a str>,
+    pub attach: &'a [String],
+    pub model: Option<&'a str>,
+    pub backend: Option<&'a str>,
+    pub max_turns: Option<usize>,
 }
 
 /// Load a dossier the caller supplied by address, for a second synth to reason over.
@@ -517,66 +528,49 @@ mod tests {
     /// answer would have no way to learn the file never reached the synth.
     #[test]
     fn explorer_arguments_are_refused_on_a_reuse_call_by_name() {
-        let base = || crate::server::DeliberateInput {
-            question: "q".into(),
-            attach: vec![],
-            path: None,
-            cast: None,
-            explorer_model: None,
-            explorer_backend: None,
-            synth_model: None,
-            synth_backend: None,
-            explorer_max_turns: None,
-            dossier: Some("aa".repeat(32)),
+        let digest = "aa".repeat(32);
+        let none: Vec<String> = vec![];
+        let one = vec!["src/x.rs".to_string()];
+        let reuse = |attach: &'static [&'static str]| ExplorerArgs {
+            dossier: Some(&digest),
+            attach: if attach.is_empty() { &none } else { &one },
+            model: None,
+            backend: None,
+            max_turns: None,
         };
+
         assert_eq!(
-            inert_explorer_args(&base()),
+            inert_explorer_args(reuse(&[])),
             None,
             "a plain reuse call is fine"
         );
 
-        let with_attach = crate::server::DeliberateInput {
-            attach: vec!["src/x.rs".into()],
-            ..base()
-        };
-        let refusal = inert_explorer_args(&with_attach).expect("attach is inert here");
+        let refusal = inert_explorer_args(reuse(&["src/x.rs"])).expect("attach is inert here");
         assert!(refusal.contains("`attach`"), "named: {refusal}");
 
-        let many = crate::server::DeliberateInput {
-            explorer_model: Some("m".into()),
-            explorer_max_turns: Some(10),
-            ..base()
-        };
-        let refusal = inert_explorer_args(&many).expect("both are inert");
+        let refusal = inert_explorer_args(ExplorerArgs {
+            model: Some("m"),
+            max_turns: Some(10),
+            ..reuse(&[])
+        })
+        .expect("both are inert");
         assert!(
             refusal.contains("`explorer_model`") && refusal.contains("`explorer_max_turns`"),
             "every inert argument is named, not just the first: {refusal}"
         );
 
-        // The synth overrides are the ones that still MEAN something on a reuse call —
-        // choosing which model reads the reused evidence is the whole point.
-        let synth_override = crate::server::DeliberateInput {
-            synth_model: Some("other-synth".into()),
-            synth_backend: Some("other-backend".into()),
-            ..base()
-        };
+        // A call that builds its own dossier carries every explorer argument happily — this
+        // check must never touch the road it isn't about. (The synth overrides aren't here
+        // at all: retargeting which model reads the evidence is what reuse is FOR, so they
+        // are not part of this view.)
         assert_eq!(
-            inert_explorer_args(&synth_override),
-            None,
-            "retargeting the synth is exactly what reuse is for"
-        );
-
-        // And a call that builds its own dossier carries every explorer argument happily —
-        // this check must never touch the road it isn't about.
-        let building = crate::server::DeliberateInput {
-            dossier: None,
-            attach: vec!["src/x.rs".into()],
-            explorer_model: Some("m".into()),
-            explorer_max_turns: Some(10),
-            ..base()
-        };
-        assert_eq!(
-            inert_explorer_args(&building),
+            inert_explorer_args(ExplorerArgs {
+                dossier: None,
+                attach: &one,
+                model: Some("m"),
+                backend: Some("b"),
+                max_turns: Some(10),
+            }),
             None,
             "a sweeping call is what the explorer arguments are for"
         );
