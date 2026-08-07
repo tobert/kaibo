@@ -354,16 +354,31 @@ lowered by #114's role-identity preambles; n=3 can't tell). Open work, in order:
   If that shape shows up in practice it's a different problem (answer-quality, not
   emptiness) and wants its own thinking, not a heuristic bolted onto this gate.
 
-### Dossier checkpointing via the persistence store
-`deliberate`'s dossier (the synchronous explorer sweep) is the expensive artifact — minutes
-of live exploration — yet it lives only in memory until the offline synth consumes it.
-Persist it to the state store (`src/store.rs`) on completion so a **failed synth hand-off
-can resubmit without re-exploring**, and a mid-explore failure can resume from the last
-checkpoint. Natural follow-on to the persistent session/batch store: a lean text artifact
-keyed by a deliberation/job id, and kept like the rest of the store — expensive model
-output we hold onto, not a scratch cache. Dovetails the "deliberate dossier vs. caller timeout" entry above — a
-persisted dossier also survives the caller dropping the connection. Surfaced by the
+### Dossier durability — what's left after keep + reuse (2026-08-07)
+A finished dossier now lands in the media CAS and can be handed back as `deliberate`'s
+`dossier` argument, so a failed synth hand-off is re-runnable by hand and a caller who
+dropped the connection still holds the evidence. Two pieces remain:
+
+- **A mid-sweep failure still loses everything.** The dossier is kept only after a
+  *successful* sweep, so an explorer that dies at turn 90 of 100 leaves nothing behind.
+  Checkpointing a partial sweep is a different mechanism — incremental writes do not fit a
+  store whose address is the hash of the whole content, so that one belongs in the state
+  store, not the CAS.
+- **Nothing resubmits automatically.** A failed hand-off leaves the caller to re-run with
+  the digest. Deliberate for now (they may want a different cast anyway), but worth
+  revisiting if that failure turns out to be common.
+
+Dovetails the "deliberate dossier vs. caller timeout" entry above. Surfaced by the
 DeepSeek CLI-subcommands review (2026-07-17).
+
+### Should a reuse-only install advertise `deliberate`?
+Reusing a stored dossier needs no explorer, so a synth-only offline cast (`fable`,
+`anthropic-batch`) serves that call fine — but the route is advertised only when some cast
+can staff the *full* job (`cast_can_deliberate` wants explorer + offline synth, pinned in
+`tests/gating.rs`). An install holding only synth-only offline casts therefore cannot reuse
+a dossier it already has, though the machinery works. Widening the gate would advertise
+`deliberate` where its headline behavior — sweep, then deliberate — cannot run, which is
+worse than the gap. Left as-is on purpose; revisit if someone hits it.
 
 ## P3 — Infra, perf, polish
 

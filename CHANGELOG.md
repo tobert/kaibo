@@ -17,6 +17,23 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`deliberate` keeps its dossier, and can reuse one.** The explorer sweep a
+  deliberation is built on is the expensive half — it can run hundreds of thousands
+  of tokens — and it used to be consumed invisibly: no way to see what the offline
+  synth actually reasoned over, and no way to ask a second model the same question
+  without paying for the sweep again. kaibo now stores the finished dossier in its
+  media CAS and names it in the reply (and in the answer when the deliberation
+  lands), so you can `read_cas` it. Pass that digest back as `dossier` and no
+  explorer runs at all: the same evidence goes to whichever cast you point at, for
+  the price of one synth — which is also the fair way to compare two synths, since
+  only the model differs. Any stored text artifact can serve as a dossier, not only
+  one `deliberate` wrote. It rides the CAS's own switch (`[cas] enabled`) with no
+  new key to turn on, a store that refuses the write costs you the record and never
+  the deliberation, and the explorer arguments (`attach`, the explorer overrides,
+  `explorer_max_turns`) are refused on a reuse call rather than silently ignored.
+  Batch deliberations now persist their handle too, with the dossier's address on
+  it, so `job_list` still leads back to the evidence after a restart.
+
 - **kaibo warns when the media CAS is on a disk that will not survive the
   container.** A container with no volume mounted looks exactly like durable disk
   mode: persistence comes up, the store opens, artifacts write and read back — and
