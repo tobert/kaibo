@@ -14,7 +14,22 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
-## 2026-08-09 — the turn kaibo could not retry, and where the transcript actually goes
+## 2026-08-09 — the stack that reviewed itself in
+
+GitHub's stacked PRs left preview waitlists on 2026-07-30, and this PR is the trial
+run: it ships as layer 3 of kaibo's first stack (#137), on top of the two feature PRs
+below it — the primer merged by the workflow it documents. The trial was real, not
+staged: `gh stack link 135 136` retargeted a sibling PR onto its neighbor and
+surfaced their CHANGELOG/devlog overlap as a conflict *before* any merge, which is
+the #129 failure (two clean-looking siblings, broken union on main) caught at the
+right time instead of after. The union rebase, the gates, and one force-with-lease
+later, the stack merges bottom-up atomically.
+
+Amy's framing decided the shape of the guidance: temporary by declaration. It
+recommends stacks while they're new, and names its own deletion condition — when the
+harnesses inject stack awareness or the models carry the feature natively, the
+paragraph goes. Guidance that knows when to die is cheaper than guidance that
+accretes.
 
 The bug read like a policy problem and turned out to be a plumbing problem. A Gemini Flash
 explorer, deep into a `deliberate`, emitted one empty function call. Gemini answered

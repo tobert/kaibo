@@ -395,6 +395,20 @@ even for a one-line doc fix.
   wrote it (`/code-review`, or kaibo's own `consult`/`oneshot` aimed at the change) —
   before merge. Scale the review to the change (a doc fix is a glance; a sandbox or
   TLS change is a hard look), but don't skip the PR.
+- **Stacked PRs — temporary guidance (GitHub public preview, 2026-07).** When one
+  change builds on another unmerged change, prefer a native GitHub stack over sibling
+  PRs racing to `main` — the stack resolves their overlap once, before any merge.
+  Primer: the CLI is the `github/gh-stack` extension (installed here).
+  `gh stack link <bottom> <top>…` retrofits open PRs or branches into a stack,
+  retargeting each PR's base onto the one below; `gh stack init`/`add`/`submit` is the
+  local-first path. `gh stack merge` lands a layer plus every unmerged layer below it
+  in one all-or-nothing operation, and layers above a merged one rebase and retarget
+  automatically — a linked stack cannot strand a PR on an already-landed base branch.
+  Layers touching the same files still need a real rebase on the branch: resolve as
+  the union in stack order, re-run the gates, push `--force-with-lease`. An
+  *unstacked* PR keeps the manual base check before merge:
+  `gh pr view <N> --json baseRefName`. Delete this guidance when the harness injects
+  stack awareness or the models carry the feature natively.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
   Write what a *user* notices, not the file diff. Internal-only refactors need no entry —
