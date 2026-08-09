@@ -281,7 +281,9 @@ kaish-vfs read API.
 
 ### Upstream a retry/backoff for rig's non-streaming completion path
 The provider failure *policy* is now stated, audited, and documented (README FAQ +
-`docs/config.md`, shipped): kaibo does **no** retry; one completion is bounded by the
+`docs/config.md`, shipped): kaibo does **no** transport retry — the one repeated call is
+the re-draw of a malformed generation (`src/completion_retry.rs`), a model fumble rather
+than an overload. One completion is bounded by the
 backend `request_timeout`/`connect_timeout`, and a provider failure surfaces as a clean
 **tool-result error** (`is_error`, `server.rs::consultation_failed`) the host can proceed
 past rather than an opaque `internal_error`. What's left is the *mechanism* we chose not
@@ -306,20 +308,6 @@ longer *mislabelled* — but the cleaner fix is to spawn the driver's kernel in 
 *before* the `consult()` call (the way `orientation` already does) and map a spawn failure
 to `McpError::internal_error`, matching `run_kaish`. Low priority (kernel build is
 in-process and reliable); the classification covers the user-facing symptom today.
-
-### Turn-level retry on a malformed tool call (transient generation glitch)
-A single `MalformedFunctionCall` from a provider fails the whole phase, discarding an
-in-flight dossier/investigation — observed live: a Gemini Flash explorer died mid-
-`deliberate` emitting an *empty* function call. That's a generation glitch (the model
-fumbled one tool call), not a schema/content rejection, so the current
-`consultation_failed` advice — "retrying is unlikely to help" — is wrong for this class.
-Fix: a **bounded turn-level re-prompt (1–2 attempts)** before failing the phase, plus
-split the failure classification so a malformed-tool-call/generation glitch steers toward
-retry while a genuine schema/content rejection keeps the don't-bother advice. Seams:
-`run_phase` (`consult/engine.rs`) for the re-prompt, `render.rs::classify_failure` for the
-advice split. Distinct from the upstream rig retry/backoff entry above — that's transport-
-level 429/503 backoff; this is a mid-loop model fumble kaibo can re-prompt around itself.
-Surfaced by the DeepSeek CLI-subcommands review (2026-07-17).
 
 ### Empty answers keep happening — the guard is a backstop, not a cure
 The empty-answer guard shipped 2026-08-02 (#115, meeting #116's finish_reason plumbing and

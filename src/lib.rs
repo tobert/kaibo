@@ -22,6 +22,7 @@ pub mod attach;
 pub mod batch;
 pub mod cas;
 pub mod cli;
+pub mod completion_retry;
 pub mod completion_watch;
 pub mod config;
 pub mod consult;

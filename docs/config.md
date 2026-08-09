@@ -172,13 +172,19 @@ because a slow local model legitimately wants a longer leash than a hosted API.
 A non-streaming call cannot distinguish *wedged* from *slow but working*, so keep the
 value above your slowest legitimate single completion.
 
-#### Failure policy: no retry
+#### Failure policy: one re-draw, no backoff
 
-kaibo does not retry a failed provider call. There is no backoff and no `max_retries`
+kaibo repeats a provider call for exactly one reason: the provider could not parse the
+tool call the model generated. Gemini reports it as `MALFORMED_FUNCTION_CALL`, and it is
+a fumbled turn rather than a rejected request, so kaibo asks the model for that turn
+again — 2 more draws, no delay between them, on the same request. A single fumble then
+costs one extra call instead of the whole investigation. There is no knob; the bound is a
+constant (`MALFORMED_REDRAWS`).
+
+Every other failure fails the single completion. There is no backoff and no `max_retries`
 knob. A 429/503/529 overload, a connection reset, a partial stream, or a backend that
-hits `request_timeout` all fail the single completion, and `consult`/`oneshot` surface
-that as a clean tool-result error (`is_error`) naming the cast and the underlying
-detail.
+hits `request_timeout` all fail the call, and `consult`/`oneshot` surface that as a clean
+tool-result error (`is_error`) naming the cast and the underlying detail.
 
 The reasoning: a consult is an *optional* augmentation. The calling agent should read
 the failure and proceed without the second opinion, or call again, rather than have its
@@ -189,6 +195,8 @@ Failures are classified so the caller can pick a next step:
 | class | examples | retry advice |
 |---|---|---|
 | transient | overload, rate limit, timeout, connection reset | a manual retry may succeed |
+| malformed generation | the provider could not parse the model's tool call | the re-draws are spent; retry, or use a cast from another family |
+| empty answer | the model ran and returned no answer text | retry; a different cast often helps |
 | non-transient | auth failure, bad request | fix the config or the call |
 | kaibo-side | named as such | not a provider problem |
 
@@ -197,7 +205,8 @@ status, because rig surfaces the response body rather than the code. For a relia
 backend, raise its `request_timeout_secs`. Automatic retry and backoff belong in the
 shared HTTP layer — rig ships an `ExponentialBackoff` wired only into its streaming path
 today — and landing it for the non-streaming completion path is tracked as an upstream
-contribution in `docs/issues.md`.
+contribution in `docs/issues.md`. That is a transport concern and stays separate from the
+re-draw above, which answers a model fumble.
 
 ### Casts: `[casts.<name>]`
 

@@ -14,6 +14,46 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-09 — the turn kaibo could not retry, and where the transcript actually goes
+
+The bug read like a policy problem and turned out to be a plumbing problem. A Gemini Flash
+explorer, deep into a `deliberate`, emitted one empty function call. Gemini answered
+`MALFORMED_FUNCTION_CALL`, the phase died, and kaibo told the caller "retrying is unlikely
+to help" — which was both wrong and expensive, because everything the explorer had read up
+to that point went with it.
+
+I went in expecting to add a retry to `run_phase` and came out having learned why that
+would not have worked. rig's agent loop hands the transcript back on the two failures kaibo
+already recovers from — `MaxTurnsError` and `PromptCancelled` both carry a `chat_history`,
+which is exactly why the turn-cap finalize and the `view_image` break can resume. A
+completion *error* carries nothing. `AgentRunner::run_model_turn` yields it straight out of
+the driver stream, `PromptError::CompletionError` has no history field, and by the time
+kaibo sees it the turns are gone. So "retry the phase" could only ever mean "pay for the
+whole investigation again to get back to where we just were" — the thing the issue was
+complaining about, spelled differently.
+
+The fix had to sit *below* the loop, and kaibo already had the shape for it. `Watched`
+wraps the model to observe each completion; `Retried` wraps it to repeat one. At that
+level the request still holds the entire transcript, so a re-draw loses nothing, and rig
+never learns the first draw happened — which also means the re-draw spends none of its turn
+budget. Two extra draws, no delay between them. The no-delay part is deliberate and is the
+whole boundary against the retry/backoff work we keep declining to hand-roll: a fumbled
+tool call and a 429 want opposite treatments, and the moment this grew a sleep it would
+have become the transport retry by accident.
+
+The part I spent longest on was what *not* to match. The OpenAI family has a near neighbor
+("Response did not contain a valid message or tool call") that plausibly belongs, and
+Gemini has a worse one — `MissingThoughtSignature`, which if it fires because a replayed
+history dropped a signature, fires on every draw, so retrying it would burn three calls on
+every single call rather than rescuing anything. Both stayed out, named in the module doc,
+waiting on a live probe. Guessing here costs real money on a failure path.
+
+Then the advice string, which is the half a caller actually reads. It now says kaibo
+already asked the model for that turn two more times — because a caller who doesn't know
+that will keep retrying by hand, and a caller who does knows to switch families instead.
+The number comes from the const rather than the prose, so the sentence cannot quietly
+become a lie.
+
 ## 2026-08-07 — finishing the CLI, and what a front door is allowed to be
 
 Amy, looking at the morning's work: *"hm did we ever say why deliberate isn't on the cli?
