@@ -77,15 +77,15 @@ pub(crate) use dossier::{
     dossier_ack, inert_explorer_args, keep_dossier, load_dossier, with_dossier, ExplorerArgs,
     KeptDossier,
 };
-pub(crate) use render::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
-    BATCH_RECENCY_WINDOW_SECS,
-};
 use render::{
     batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
     consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
     is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
     wait_level_floor, wait_level_label,
+};
+pub(crate) use render::{
+    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
+    BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -2066,7 +2066,8 @@ impl KaiboHandler {
         peer: Peer<RoleServer>,
         meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
-        self.deliberate_call(input, progress_sink(peer, &meta)).await
+        self.deliberate_call(input, progress_sink(peer, &meta))
+            .await
     }
 
     /// The `deliberate` handler, with the live peer already reduced to a progress sink.
@@ -2218,13 +2219,7 @@ impl KaiboHandler {
                 &cast.name,
                 &explorer_model,
             );
-            (
-                dossier,
-                images,
-                dossier_usage,
-                kept,
-                Some(explorer_model),
-            )
+            (dossier, images, dossier_usage, kept, Some(explorer_model))
         };
 
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
@@ -2327,7 +2322,12 @@ impl KaiboHandler {
                 None => format!("deliberate · synth `{model}`"),
             };
             if let Err(e) = store
-                .put_batch(&backend_name, &provider_id, Some(&label))
+                .put_batch(
+                    &backend_name,
+                    &provider_id,
+                    Some(&label),
+                    Some(items.len() as i64),
+                )
                 .await
             {
                 tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
@@ -2772,7 +2772,12 @@ impl KaiboHandler {
         // `job_list`'s provider query still recovers it). Only when persistence is enabled.
         if let Some(store) = self.sessions.store() {
             if let Err(e) = store
-                .put_batch(&backend_name, &provider_id, Some(&model))
+                .put_batch(
+                    &backend_name,
+                    &provider_id,
+                    Some(&model),
+                    Some(items.len() as i64),
+                )
                 .await
             {
                 tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
@@ -3073,9 +3078,24 @@ impl KaiboHandler {
             self.ensure_batch_enabled(&input.handle)?;
             let (backend_name, provider_id) = parse_batch_handle(&input.handle)?;
             let provider = self.batch_poller(backend_name)?;
+            // The submitted count this handle was recorded with, when persistence is on
+            // and the record has one — a store miss (persistence off, an unknown handle,
+            // or a lookup error) is `None`, the same "no cross-check to run" gap a legacy
+            // handle already renders as. A lookup failure is logged, never fatal: the
+            // provider is still the source of truth for the poll itself.
+            let submitted = match self.sessions.store() {
+                Some(store) => match store.get_batch(backend_name, provider_id).await {
+                    Ok(handle) => handle.and_then(|h| h.submitted_count).map(|n| n as u64),
+                    Err(e) => {
+                        tracing::warn!(handle = %input.handle, error = %e, "could not read the batch handle's submitted count");
+                        None
+                    }
+                },
+                None => None,
+            };
             let span = tracing::info_span!("job_get", handle = %input.handle);
             let poll = provider
-                .poll(provider_id)
+                .poll(provider_id, submitted)
                 .instrument(span)
                 .await
                 .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
@@ -3393,10 +3413,24 @@ impl KaiboHandler {
             }
             let line = match parse_batch_handle(h) {
                 Ok((backend, id)) => match self.batch_poller(backend) {
-                    Ok(provider) => match provider.poll(id).await {
-                        Ok(poll) => format!("{h} — {}", batch_poll_brief(&poll)),
-                        Err(e) => format!("{h} — poll failed: {e:#}"),
-                    },
+                    Ok(provider) => {
+                        // Same submitted-count lookup `job_get` does — best-effort, so the
+                        // gentle poll here never blocks on a store hiccup.
+                        let submitted = match self.sessions.store() {
+                            Some(store) => store
+                                .get_batch(backend, id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|handle| handle.submitted_count)
+                                .map(|n| n as u64),
+                            None => None,
+                        };
+                        match provider.poll(id, submitted).await {
+                            Ok(poll) => format!("{h} — {}", batch_poll_brief(&poll)),
+                            Err(e) => format!("{h} — poll failed: {e:#}"),
+                        }
+                    }
                     Err(e) => format!("{h} — {}", e.message),
                 },
                 Err(e) => format!("{h} — {}", e.message),
@@ -7358,7 +7392,10 @@ enabled = false
         };
 
         let err = h
-            .deliberate_call(reuse(vec!["src/x.rs".into()], &"aa".repeat(32)), Arc::new(NullSink))
+            .deliberate_call(
+                reuse(vec!["src/x.rs".into()], &"aa".repeat(32)),
+                Arc::new(NullSink),
+            )
             .await
             .expect_err("`attach` on a reuse call is refused");
         assert!(

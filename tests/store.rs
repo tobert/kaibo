@@ -121,7 +121,7 @@ async fn survives_reopen() {
         store.record_turn("keep", "q1", "a1").await.unwrap();
         store.record_turn("keep", "q2", "a2").await.unwrap();
         store
-            .put_batch("anthropic", "msgbatch_123", Some("nightly"))
+            .put_batch("anthropic", "msgbatch_123", Some("nightly"), Some(10))
             .await
             .unwrap();
     }
@@ -138,6 +138,11 @@ async fn survives_reopen() {
         .unwrap()
         .expect("batch handle survives reopen");
     assert_eq!(handle.label.as_deref(), Some("nightly"));
+    assert_eq!(
+        handle.submitted_count,
+        Some(10),
+        "the submitted count must survive a reopen too"
+    );
 }
 
 #[tokio::test]
@@ -163,16 +168,16 @@ async fn list_sessions_is_mru_first() {
 async fn batch_put_get_list_and_upsert() {
     let (store, _d) = open(8).await;
     store
-        .put_batch("gemini", "batches/abc", None)
+        .put_batch("gemini", "batches/abc", None, Some(1))
         .await
         .unwrap();
     store
-        .put_batch("anthropic", "msgbatch_1", Some("hard-q"))
+        .put_batch("anthropic", "msgbatch_1", Some("hard-q"), Some(3))
         .await
         .unwrap();
-    // Upsert: same key, new label — one row, updated.
+    // Upsert: same key, new label and count — one row, updated.
     store
-        .put_batch("anthropic", "msgbatch_1", Some("hard-q-v2"))
+        .put_batch("anthropic", "msgbatch_1", Some("hard-q-v2"), Some(5))
         .await
         .unwrap();
 
@@ -182,6 +187,7 @@ async fn batch_put_get_list_and_upsert() {
         .unwrap()
         .unwrap();
     assert_eq!(g.label, None);
+    assert_eq!(g.submitted_count, Some(1));
     let a = store
         .get_batch("anthropic", "msgbatch_1")
         .await
@@ -191,6 +197,11 @@ async fn batch_put_get_list_and_upsert() {
         a.label.as_deref(),
         Some("hard-q-v2"),
         "upsert updated label"
+    );
+    assert_eq!(
+        a.submitted_count,
+        Some(5),
+        "upsert updated the submitted count too"
     );
 
     let all = store.list_batches().await.unwrap();
@@ -212,11 +223,11 @@ async fn stale_batch_handles_are_pruned_by_ttl() {
 
     // A handle 40 days old (past the 30-day TTL) and a 1-day-old one.
     store
-        .put_batch_at("anthropic", "old", Some("stale"), now - 40 * day)
+        .put_batch_at("anthropic", "old", Some("stale"), Some(1), now - 40 * day)
         .await
         .unwrap();
     store
-        .put_batch_at("anthropic", "new", Some("fresh"), now - day)
+        .put_batch_at("anthropic", "new", Some("fresh"), Some(1), now - day)
         .await
         .unwrap();
 
@@ -499,7 +510,7 @@ async fn store_futures_are_send() {
     assert_send(store.replay("s"));
     assert_send(store.list_sessions());
     assert_send(store.session_count());
-    assert_send(store.put_batch("b", "p", None));
+    assert_send(store.put_batch("b", "p", None, None));
     assert_send(store.get_batch("b", "p"));
     assert_send(store.list_batches());
     // And the open future itself, plus the store handle as a shared handler cache.

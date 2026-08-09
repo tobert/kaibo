@@ -1714,7 +1714,12 @@ async fn deliberate_batch_cli(
             None => format!("deliberate · synth `{model}`"),
         };
         if let Err(e) = store
-            .put_batch(&backend_name, &provider_id, Some(&label))
+            .put_batch(
+                &backend_name,
+                &provider_id,
+                Some(&label),
+                Some(items.len() as i64),
+            )
             .await
         {
             tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
@@ -2486,7 +2491,12 @@ async fn batch_submit_inner(
     // live at the provider).
     if let Some(store) = open_batch_store(resolver).await {
         if let Err(e) = store
-            .put_batch(&backend_name, &provider_id, Some(&model))
+            .put_batch(
+                &backend_name,
+                &provider_id,
+                Some(&model),
+                Some(items.len() as i64),
+            )
             .await
         {
             tracing::warn!(handle = %handle, error = %e, "could not persist batch handle");
@@ -2550,7 +2560,21 @@ async fn batch_get_inner(args: &BatchGetArgs, resolver: &Resolver) -> Result<i32
         message: format!("{e:#}"),
         code: EXIT_SETUP,
     })?;
-    match provider.poll(provider_id).await {
+    // The submitted count this handle was recorded with, when persistence is on and the
+    // record has one — `None` (no cross-check to run) for persistence off, an unrecorded
+    // handle, or a lookup error; the provider stays the source of truth for the poll
+    // itself regardless.
+    let submitted = match open_batch_store(resolver).await {
+        Some(store) => match store.get_batch(backend_name, provider_id).await {
+            Ok(handle) => handle.and_then(|h| h.submitted_count).map(|n| n as u64),
+            Err(e) => {
+                tracing::warn!(handle = %args.handle, error = %e, "could not read the batch handle's submitted count");
+                None
+            }
+        },
+        None => None,
+    };
+    match provider.poll(provider_id, submitted).await {
         Ok(poll) => {
             if args.json {
                 println!("{}", batch_poll_envelope(&poll));

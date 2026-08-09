@@ -197,8 +197,13 @@ pub trait BatchProvider: Send + Sync {
         attachments: &[Attachment],
         items: &[BatchItem],
     ) -> Result<String>;
-    /// Poll a batch by its provider id.
-    async fn poll(&self, batch_id: &str) -> Result<BatchPoll>;
+    /// Poll a batch by its provider id. `submitted` is how many items kaibo submitted
+    /// this batch with — `None` when the caller has no durable record of it (persistence
+    /// off, or a handle from before kaibo started recording the count). A finished poll
+    /// cross-checks its result set against `submitted` and reports any `custom_id` the
+    /// provider never returned as a per-item failure, so a silently dropped item is loud
+    /// instead of just missing from the count.
+    async fn poll(&self, batch_id: &str, submitted: Option<u64>) -> Result<BatchPoll>;
     /// Ask the provider to cancel a batch by its id.
     async fn cancel(&self, batch_id: &str) -> Result<()>;
     /// List the most recent batches the provider still knows about (newest first),
@@ -518,10 +523,63 @@ fn anthropic_finish_gate(stop_reason: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// The message kaibo attaches to a `custom_id` it submitted but a finished batch never
+/// returned — kaibo's own cross-check against the count it sent, not a provider-reported
+/// per-item error, so the wording says that explicitly rather than reading like one more
+/// `provider error: …` line. Names the id, states what is and is not known (present in the
+/// finished result set: no; why the provider left it out: unknown — nothing here invents a
+/// reason), and gives the two real next steps: poll again, or check the provider's own
+/// batch dashboard for that id.
+fn absentee_answer(custom_id: String) -> BatchAnswer {
+    let text = format!(
+        "kaibo: item `{custom_id}` is missing — this batch is finished, but the provider \
+         returned no answer and no error for a custom_id kaibo submitted. This is kaibo's \
+         own count check against what it sent, not a failure the provider reported. Re-run \
+         `job_get` in case the result is still landing, or look up `{custom_id}` on the \
+         provider's own batch dashboard."
+    );
+    BatchAnswer {
+        custom_id,
+        text: Err(text),
+    }
+}
+
+/// Append a synthetic [`absentee_answer`] for every `custom_id` in `0..submitted` that
+/// `answers` doesn't already carry. `submitted` is `None` when there is nothing honest to
+/// check against — a handle persisted before kaibo recorded a submitted count, or a result
+/// set that is a *known* partial (a cancelled/expired batch's before-the-cutoff items) —
+/// and in that case `answers` returns untouched rather than false-flagging a documented gap.
+///
+/// kaibo assigns every `custom_id` itself, as the contiguous decimal indices
+/// `0..submitted` (`batch_submit`'s and `deliberate`'s `items` construction never take an
+/// id from the caller), so a bare count fully determines the expected set — no id list
+/// needs to ride along on the handle.
+fn cross_check_absentees(
+    mut answers: Vec<BatchAnswer>,
+    submitted: Option<u64>,
+) -> Vec<BatchAnswer> {
+    let Some(submitted) = submitted else {
+        return answers;
+    };
+    let seen: std::collections::HashSet<String> =
+        answers.iter().map(|a| a.custom_id.clone()).collect();
+    let absentees = (0..submitted)
+        .map(|i| i.to_string())
+        .filter(|id| !seen.contains(id))
+        .map(absentee_answer);
+    answers.extend(absentees);
+    answers
+}
+
 /// Parse the JSONL results body: one `{custom_id, result}` per line. A `succeeded`
 /// result yields the message text; `errored`/`canceled`/`expired` yield a per-item
-/// `Err(reason)` so a single bad item is reported, never silently dropped.
-fn parse_results_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
+/// `Err(reason)` so a single bad item is reported, never silently dropped. `submitted` is
+/// the count kaibo sent this batch with (`None` for a pre-cross-check handle) — every
+/// Anthropic terminal batch carries one line per submitted item regardless of how it ended
+/// (errored/canceled/expired items are still lines, not omissions), so the cross-check
+/// applies unconditionally here, unlike the providers whose terminal states can carry a
+/// genuinely partial result set.
+fn parse_results_jsonl(body: &str, submitted: Option<u64>) -> Result<Vec<BatchAnswer>> {
     let mut out = Vec::new();
     for line in body.lines() {
         let line = line.trim();
@@ -570,7 +628,7 @@ fn parse_results_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
         };
         out.push(BatchAnswer { custom_id, text });
     }
-    Ok(out)
+    Ok(cross_check_absentees(out, submitted))
 }
 
 // --- Rendering -------------------------------------------------------------
@@ -725,8 +783,13 @@ impl AnthropicBatch {
     }
 
     /// GET a results JSONL body. The `results_url` is absolute (from the status), so it
-    /// addresses the service directly.
-    async fn fetch_results(&self, results_url: &str) -> Result<Vec<BatchAnswer>> {
+    /// addresses the service directly. `submitted` rides through to
+    /// [`parse_results_jsonl`]'s cross-check.
+    async fn fetch_results(
+        &self,
+        results_url: &str,
+        submitted: Option<u64>,
+    ) -> Result<Vec<BatchAnswer>> {
         let resp = self
             .auth(self.http.get(results_url))
             .send()
@@ -740,7 +803,7 @@ impl AnthropicBatch {
         if !status.is_success() {
             return Err(anyhow!("batch results GET {status}: {body}"));
         }
-        parse_results_jsonl(&body)
+        parse_results_jsonl(&body, submitted)
     }
 }
 
@@ -792,7 +855,7 @@ impl BatchProvider for AnthropicBatch {
         parse_batch_id(&v)
     }
 
-    async fn poll(&self, batch_id: &str) -> Result<BatchPoll> {
+    async fn poll(&self, batch_id: &str, submitted: Option<u64>) -> Result<BatchPoll> {
         let url = format!("{}/v1/messages/batches/{batch_id}", self.base_url);
         let resp = self
             .auth(self.http.get(&url))
@@ -812,9 +875,9 @@ impl BatchProvider for AnthropicBatch {
         match parse_status(&v)? {
             StatusKind::Pending { completed, total } => Ok(BatchPoll::Pending { completed, total }),
             StatusKind::Cancelling => Ok(BatchPoll::Cancelling),
-            StatusKind::Ended { results_url } => {
-                Ok(BatchPoll::Done(self.fetch_results(&results_url).await?))
-            }
+            StatusKind::Ended { results_url } => Ok(BatchPoll::Done(
+                self.fetch_results(&results_url, submitted).await?,
+            )),
         }
     }
 
@@ -971,9 +1034,13 @@ fn gemini_inlined_array(v: &Value) -> Option<&Vec<Value>> {
 
 /// Parse the inlined-responses array into per-item [`BatchAnswer`]s. Each element carries
 /// its `metadata.key` plus either a `response` (the model's content) or an `error`
-/// (surfaced per item, never silently dropped — the Anthropic per-item ethos).
-fn parse_gemini_inlined(arr: &[Value]) -> Vec<BatchAnswer> {
-    arr.iter()
+/// (surfaced per item, never silently dropped — the Anthropic per-item ethos). `submitted`
+/// rides into the cross-check ([`cross_check_absentees`]) — the caller passes `None` when
+/// `arr` is a known-partial result set (a cancelled/expired batch's before-the-cutoff
+/// items), so a legitimate partial is never misreported as a silently missing item.
+fn parse_gemini_inlined(arr: &[Value], submitted: Option<u64>) -> Vec<BatchAnswer> {
+    let answers = arr
+        .iter()
         .map(|el| {
             let custom_id = el
                 .get("metadata")
@@ -996,7 +1063,8 @@ fn parse_gemini_inlined(arr: &[Value]) -> Vec<BatchAnswer> {
             };
             BatchAnswer { custom_id, text }
         })
-        .collect()
+        .collect();
+    cross_check_absentees(answers, submitted)
 }
 
 /// Pull the batch's operation `name` (`batches/<id>`) out of a submit/status response.
@@ -1012,8 +1080,15 @@ fn parse_gemini_name(v: &Value) -> Result<String> {
 /// partial results that *did* land before the terminal event, or (none) a [`Failed`] that
 /// names the state honestly rather than a misleading empty `Done`.
 ///
+/// `submitted` (the count kaibo sent this batch with) reaches the cross-check ONLY on the
+/// succeeded arm — that state is the one Gemini promises is the *whole* result set. The
+/// cancelled/expired/failed arm below hands back whatever finished before the terminal
+/// event, an outcome that is *expected* to be partial, so it always cross-checks against
+/// `None`: a genuinely partial batch must never render its known-incomplete items as
+/// kaibo's own "missing" absentees.
+///
 /// [`Failed`]: BatchPoll::Failed
-fn parse_gemini_poll(v: &Value) -> Result<BatchPoll> {
+fn parse_gemini_poll(v: &Value, submitted: Option<u64>) -> Result<BatchPoll> {
     let meta = v.get("metadata");
     let state = meta
         .and_then(|m| m.get("state"))
@@ -1031,14 +1106,14 @@ fn parse_gemini_poll(v: &Value) -> Result<BatchPoll> {
                      (responsesFile) isn't supported; kaibo only submits inline batches: {v}"
                 )
             })?;
-            Ok(BatchPoll::Done(parse_gemini_inlined(arr)))
+            Ok(BatchPoll::Done(parse_gemini_inlined(arr, submitted)))
         }
         "BATCH_STATE_CANCELLED" | "BATCH_STATE_FAILED" | "BATCH_STATE_EXPIRED" => {
             // Items that finished before the terminal event still carry results — hand
-            // those back rather than throwing them away.
+            // those back rather than throwing them away. A known partial, so no cross-check.
             if let Some(arr) = gemini_inlined_array(v) {
                 if !arr.is_empty() {
-                    return Ok(BatchPoll::Done(parse_gemini_inlined(arr)));
+                    return Ok(BatchPoll::Done(parse_gemini_inlined(arr, None)));
                 }
             }
             let message = v
@@ -1305,10 +1380,10 @@ impl BatchProvider for GeminiBatch {
         parse_gemini_name(&v)
     }
 
-    async fn poll(&self, batch_id: &str) -> Result<BatchPoll> {
+    async fn poll(&self, batch_id: &str, submitted: Option<u64>) -> Result<BatchPoll> {
         let url = format!("{}/{}", self.base_url, batch_id);
         let v = self.send_json(self.http.get(&url), "status").await?;
-        parse_gemini_poll(&v)
+        parse_gemini_poll(&v, submitted)
     }
 
     async fn cancel(&self, batch_id: &str) -> Result<()> {
@@ -1459,7 +1534,11 @@ enum OpenaiStatus {
 /// missing block reads as 0/0 rather than erroring — a just-created batch has no counts.
 fn openai_counts(v: &Value) -> (u64, u64) {
     let c = v.get("request_counts");
-    let get = |k: &str| c.and_then(|c| c.get(k)).and_then(Value::as_u64).unwrap_or(0);
+    let get = |k: &str| {
+        c.and_then(|c| c.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
     (get("completed") + get("failed"), get("total"))
 }
 
@@ -1620,8 +1699,9 @@ fn parse_openai_output_jsonl(body: &str) -> Result<Vec<BatchAnswer>> {
                         .unwrap_or_else(|| "no detail given".into());
                     Err(format!("provider error (HTTP {code}): {detail}"))
                 } else {
-                    let body = body
-                        .ok_or_else(|| anyhow!("succeeded result has no `response.body`: {line}"))?;
+                    let body = body.ok_or_else(|| {
+                        anyhow!("succeeded result has no `response.body`: {line}")
+                    })?;
                     finish_gated_answer(openai_response_text(body), openai_finish_gate(body))
                 }
             }
@@ -1644,6 +1724,22 @@ fn order_by_index(mut answers: Vec<BatchAnswer>) -> Vec<BatchAnswer> {
         answers.sort_by_key(|a| a.custom_id.parse::<u64>().unwrap_or(0));
     }
     answers
+}
+
+/// Cross-check + reorder an OpenAI batch's merged output+error answers — the one place
+/// the check can run, since a per-file parse alone can't tell a genuinely missing item
+/// from one sitting in the *other* file. Only a `completed` batch promises the two files
+/// together cover every submitted item; `expired`/`cancelled` legitimately hand back a
+/// partial set (whatever beat the clock/cancel), so `submitted` is honored only for
+/// `state == "completed"` — any other terminal state cross-checks against `None`, so a
+/// known partial is never misreported as kaibo's own "missing" absentee.
+fn finalize_openai_answers(
+    answers: Vec<BatchAnswer>,
+    state: &str,
+    submitted: Option<u64>,
+) -> Vec<BatchAnswer> {
+    let expected = (state == "completed").then_some(submitted).flatten();
+    order_by_index(cross_check_absentees(answers, expected))
 }
 
 /// Parse one batch object from the list endpoint. A missing `id`/`status` is a broken
@@ -1882,7 +1978,7 @@ impl BatchProvider for OpenaiBatch {
         parse_batch_id(&v)
     }
 
-    async fn poll(&self, batch_id: &str) -> Result<BatchPoll> {
+    async fn poll(&self, batch_id: &str, submitted: Option<u64>) -> Result<BatchPoll> {
         let url = format!("{}/batches/{batch_id}", self.base_url);
         let v = self.send_json(self.http.get(&url), "status").await?;
         match parse_openai_status(&v)? {
@@ -1918,7 +2014,9 @@ impl BatchProvider for OpenaiBatch {
                         }),
                     });
                 }
-                Ok(BatchPoll::Done(order_by_index(answers)))
+                Ok(BatchPoll::Done(finalize_openai_answers(
+                    answers, &state, submitted,
+                )))
             }
         }
     }
@@ -2117,7 +2215,7 @@ mod test_double {
             Ok(self.submit_id.clone())
         }
 
-        async fn poll(&self, _batch_id: &str) -> Result<BatchPoll> {
+        async fn poll(&self, _batch_id: &str, _submitted: Option<u64>) -> Result<BatchPoll> {
             let mut q = self.polls.lock().expect("polls lock");
             // Drain in order; repeat the last so an extra poll of a Done batch is Done.
             if q.len() > 1 {
@@ -2585,7 +2683,7 @@ mod tests {
             r#"{"custom_id":"2","result":{"type":"expired"}}"#,
             "\n",
         );
-        let answers = parse_results_jsonl(body).unwrap();
+        let answers = parse_results_jsonl(body, None).unwrap();
         assert_eq!(answers.len(), 3);
         assert_eq!(
             answers[0],
@@ -2599,6 +2697,51 @@ mod tests {
         assert!(matches!(&answers[2].text, Err(m) if m.contains("expired")));
     }
 
+    /// `docs/issues.md`'s P3 batch cross-check, Anthropic side: a provider that silently
+    /// drops an item yields fewer lines than kaibo submitted, with no error naming the
+    /// gap. Submitting 3 but reading back 2 must synthesize the third as a loud per-item
+    /// failure — never a quiet "2 results" that reads like the batch only ever had two.
+    #[test]
+    fn results_jsonl_cross_checks_submitted_ids() {
+        let body = concat!(
+            r#"{"custom_id":"0","result":{"type":"succeeded","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}}"#,
+            "\n",
+            r#"{"custom_id":"1","result":{"type":"errored","error":{"type":"overloaded"}}}"#,
+            "\n",
+            // custom_id "2" never came back.
+        );
+        let answers = parse_results_jsonl(body, Some(3)).unwrap();
+        assert_eq!(
+            answers.len(),
+            3,
+            "the gap is filled, not left short: {answers:?}"
+        );
+        let absentee = &answers[2];
+        assert_eq!(absentee.custom_id, "2");
+        let msg = absentee
+            .text
+            .as_ref()
+            .expect_err("missing item is a failure");
+        assert!(
+            msg.contains("kaibo"),
+            "names itself, not the provider: {msg}"
+        );
+        assert!(
+            !msg.contains("provider error:"),
+            "must not read like a provider-reported failure: {msg}"
+        );
+        assert!(msg.contains("job_get"), "names what to do: {msg}");
+
+        // No submitted count on the handle (a legacy record, or persistence off) — the
+        // gap stays silent rather than inventing a count to check against.
+        let answers = parse_results_jsonl(body, None).unwrap();
+        assert_eq!(
+            answers.len(),
+            2,
+            "with no submitted count, the result set renders exactly as it always did"
+        );
+    }
+
     /// An Anthropic item that hit `stop_reason: max_tokens` is *not* a clean completion:
     /// its partial text is kept but announces itself under an INCOMPLETE banner naming the
     /// stop reason, so a caller can't mistake a clipped answer for a finished one (GH #75).
@@ -2608,7 +2751,7 @@ mod tests {
             r#"{"custom_id":"0","result":{"type":"succeeded","message":{"stop_reason":"max_tokens","content":[{"type":"text","text":"partial finding, cut off mid-"}]}}}"#,
             "\n",
         );
-        let answers = parse_results_jsonl(body).unwrap();
+        let answers = parse_results_jsonl(body, None).unwrap();
         let text = answers[0]
             .text
             .as_ref()
@@ -2626,7 +2769,7 @@ mod tests {
     #[test]
     fn results_jsonl_max_tokens_empty_is_failure() {
         let body = r#"{"custom_id":"0","result":{"type":"succeeded","message":{"stop_reason":"max_tokens","content":[]}}}"#;
-        let answers = parse_results_jsonl(body).unwrap();
+        let answers = parse_results_jsonl(body, None).unwrap();
         assert!(
             matches!(&answers[0].text, Err(m) if m.contains("no answer") && m.contains("max_tokens")),
             "empty + truncated is a failure naming the reason: {:?}",
@@ -3006,11 +3149,7 @@ mod tests {
                 "gemini-pro-latest",
                 &tunables("low", 100),
             );
-            drop(batch_request_span(
-                "gemini-pro-latest",
-                params.as_ref(),
-                3,
-            ));
+            drop(batch_request_span("gemini-pro-latest", params.as_ref(), 3));
             // Negative: no thinking block → the field stays absent.
             drop(batch_request_span("poll-only", None, 1));
         });
@@ -3167,7 +3306,7 @@ mod tests {
         let pend = json!({ "metadata": { "state": "BATCH_STATE_PENDING",
             "batchStats": { "requestCount": "2", "pendingRequestCount": "2" } } });
         assert_eq!(
-            parse_gemini_poll(&pend).unwrap(),
+            parse_gemini_poll(&pend, None).unwrap(),
             BatchPoll::Pending {
                 completed: 0,
                 total: 2
@@ -3176,15 +3315,15 @@ mod tests {
         let run = json!({ "metadata": { "state": "BATCH_STATE_RUNNING",
             "batchStats": { "requestCount": "2", "successfulRequestCount": "1" } } });
         assert_eq!(
-            parse_gemini_poll(&run).unwrap(),
+            parse_gemini_poll(&run, None).unwrap(),
             BatchPoll::Pending {
                 completed: 1,
                 total: 2
             }
         );
         // No state, or an unknown one, is a broken contract surfaced loudly.
-        assert!(parse_gemini_poll(&json!({ "metadata": {} })).is_err());
-        assert!(parse_gemini_poll(&json!({ "metadata": { "state": "WAT" } })).is_err());
+        assert!(parse_gemini_poll(&json!({ "metadata": {} }), None).is_err());
+        assert!(parse_gemini_poll(&json!({ "metadata": { "state": "WAT" } }), None).is_err());
     }
 
     /// A succeeded batch yields per-item answers; thought parts are filtered out of the
@@ -3205,7 +3344,7 @@ mod tests {
                 { "metadata": { "key": "1" }, "error": { "code": 7, "message": "permission denied" } }
             ] } }
         });
-        let poll = parse_gemini_poll(&v).unwrap();
+        let poll = parse_gemini_poll(&v, None).unwrap();
         let answers = match poll {
             BatchPoll::Done(a) => a,
             other => panic!("expected Done, got {other:?}"),
@@ -3217,6 +3356,67 @@ mod tests {
         // STOP). No banner.
         assert_eq!(answers[0].text, Ok("the answer".to_string()));
         assert!(matches!(&answers[1].text, Err(m) if m.contains("permission denied")));
+    }
+
+    /// `docs/issues.md`'s P3 batch cross-check, Gemini side: a `SUCCEEDED` batch promises
+    /// every submitted item is in the inlined array, so a provider that silently drops one
+    /// must be caught here — submitting 3 but reading back 2 synthesizes the third as a
+    /// loud per-item failure.
+    #[test]
+    fn gemini_poll_succeeded_cross_checks_submitted_ids() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_SUCCEEDED" },
+            "response": { "inlinedResponses": { "inlinedResponses": [
+                { "metadata": { "key": "0" }, "response": { "candidates": [ {
+                    "finishReason": "STOP",
+                    "content": { "parts": [ { "text": "answer" } ] } } ] } }
+                // custom_id "1" never came back.
+            ] } }
+        });
+        let answers = match parse_gemini_poll(&v, Some(2)).unwrap() {
+            BatchPoll::Done(a) => a,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        assert_eq!(answers.len(), 2, "the gap is filled: {answers:?}");
+        let absentee = &answers[1];
+        assert_eq!(absentee.custom_id, "1");
+        let msg = absentee
+            .text
+            .as_ref()
+            .expect_err("missing item is a failure");
+        assert!(
+            msg.contains("kaibo"),
+            "names itself, not the provider: {msg}"
+        );
+        assert!(
+            !msg.contains("provider error:"),
+            "must not read like a provider-reported failure: {msg}"
+        );
+    }
+
+    /// A cancelled/expired partial result set is a KNOWN partial, not a silent drop — even
+    /// with a submitted count on hand, the cancelled/partials branch must never synthesize
+    /// absentees for items that legitimately never ran (`gemini_poll_cancelled_with_partials_is_done`
+    /// covers the same batch with no count at all; this proves a count present doesn't change
+    /// the outcome either).
+    #[test]
+    fn gemini_poll_cancelled_partials_are_not_cross_checked() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_CANCELLED",
+                "output": { "inlinedResponses": { "inlinedResponses": [
+                    { "metadata": { "key": "0" }, "response": { "candidates": [ { "content": { "parts": [ { "text": "done in time" } ] } } ] } }
+                ] } } }
+        });
+        // 3 were submitted; only 1 beat the cancel. A submitted count must not turn the
+        // other 2 into synthetic "missing" failures — the cancel already explains the gap.
+        match parse_gemini_poll(&v, Some(3)).unwrap() {
+            BatchPoll::Done(a) => assert_eq!(
+                a.len(),
+                1,
+                "a known partial stays exactly as short as the provider left it: {a:?}"
+            ),
+            other => panic!("expected Done with partials, got {other:?}"),
+        }
     }
 
     /// GH #75, ground-truthed against the real durable payload
@@ -3239,7 +3439,7 @@ mod tests {
                     ] } } ] } }
             ] } }
         });
-        let answers = match parse_gemini_poll(&v).unwrap() {
+        let answers = match parse_gemini_poll(&v, None).unwrap() {
             BatchPoll::Done(a) => a,
             other => panic!("expected Done, got {other:?}"),
         };
@@ -3278,7 +3478,7 @@ mod tests {
                     ] } } ] } }
             ] } }
         });
-        let answers = match parse_gemini_poll(&v).unwrap() {
+        let answers = match parse_gemini_poll(&v, None).unwrap() {
             BatchPoll::Done(a) => a,
             other => panic!("expected Done, got {other:?}"),
         };
@@ -3333,7 +3533,7 @@ mod tests {
             "error": { "code": 13, "message": "Batch x failed without error." }
         });
         assert_eq!(
-            parse_gemini_poll(&v).unwrap(),
+            parse_gemini_poll(&v, None).unwrap(),
             BatchPoll::Failed {
                 state: "BATCH_STATE_CANCELLED".into(),
                 message: "Batch x failed without error.".into()
@@ -3351,7 +3551,7 @@ mod tests {
                     { "metadata": { "key": "0" }, "response": { "candidates": [ { "content": { "parts": [ { "text": "done in time" } ] } } ] } }
                 ] } } }
         });
-        match parse_gemini_poll(&v).unwrap() {
+        match parse_gemini_poll(&v, None).unwrap() {
             BatchPoll::Done(a) => {
                 assert_eq!(a.len(), 1);
                 assert_eq!(a[0].text, Ok("done in time".to_string()));
@@ -3366,7 +3566,7 @@ mod tests {
     fn gemini_poll_succeeded_without_inline_errors() {
         let v = json!({ "metadata": { "state": "BATCH_STATE_SUCCEEDED",
             "output": { "responsesFile": "files/abc" } } });
-        assert!(parse_gemini_poll(&v).is_err());
+        assert!(parse_gemini_poll(&v, None).is_err());
     }
 
     /// The list endpoint reads `operations` (not `data`) and treats `nextPageToken` as the
@@ -3601,8 +3801,8 @@ mod tests {
                 prompt: "second".into(),
             },
         ];
-        let jsonl =
-            openai_batch_jsonl("gpt-5.6-sol", max_tokens, "be terse", &params, &[], &items).unwrap();
+        let jsonl = openai_batch_jsonl("gpt-5.6-sol", max_tokens, "be terse", &params, &[], &items)
+            .unwrap();
         let lines: Vec<Value> = jsonl
             .lines()
             .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
@@ -3805,7 +4005,10 @@ mod tests {
         let text = answers[0].text.as_ref().expect("partial text is kept");
         assert!(text.contains("INCOMPLETE"), "{text}");
         assert!(text.contains("max_output_tokens"), "{text}");
-        assert!(text.contains("half an ans"), "the fragment survives: {text}");
+        assert!(
+            text.contains("half an ans"),
+            "the fragment survives: {text}"
+        );
 
         // …and with no text at all it's an honest per-item failure, not an empty success.
         let empty = json!({
@@ -3907,6 +4110,59 @@ mod tests {
         assert_eq!(ids, ["zeta", "alpha"]);
     }
 
+    /// `docs/issues.md`'s P3 batch cross-check, OpenAI side: a per-file parse can't judge
+    /// completeness on its own (a missing id might just be sitting in the *other* file),
+    /// so the check runs once, on the merged set, in [`finalize_openai_answers`] — and
+    /// only for `completed`, the one state that promises the two files together cover
+    /// every submitted item. Submitting 3 but merging 2 (both from the output file here)
+    /// must synthesize the third as a loud per-item failure.
+    #[test]
+    fn finalize_openai_answers_cross_checks_a_completed_batch() {
+        let answers = vec![
+            BatchAnswer {
+                custom_id: "0".into(),
+                text: Ok("first".into()),
+            },
+            BatchAnswer {
+                custom_id: "1".into(),
+                text: Ok("second".into()),
+            },
+            // custom_id "2" never came back, in either file.
+        ];
+        let out = finalize_openai_answers(answers, "completed", Some(3));
+        assert_eq!(out.len(), 3, "the gap is filled: {out:?}");
+        assert_eq!(out[2].custom_id, "2");
+        let msg = out[2].text.as_ref().expect_err("missing item is a failure");
+        assert!(
+            msg.contains("kaibo"),
+            "names itself, not the provider: {msg}"
+        );
+        assert!(
+            !msg.contains("provider error:"),
+            "must not read like a provider-reported failure: {msg}"
+        );
+    }
+
+    /// `expired`/`cancelled` legitimately hand back a partial result set (whatever beat the
+    /// clock/cancel) — cross-checking those against the full submitted count would
+    /// misreport a known partial as kaibo's own "missing" absentee, so those states must
+    /// stay exactly as short as the provider left them even with a submitted count on hand.
+    #[test]
+    fn finalize_openai_answers_skips_the_check_on_a_known_partial() {
+        let answers = vec![BatchAnswer {
+            custom_id: "0".into(),
+            text: Ok("done in time".into()),
+        }];
+        for state in ["expired", "cancelled"] {
+            let out = finalize_openai_answers(answers.clone(), state, Some(3));
+            assert_eq!(
+                out.len(),
+                1,
+                "a known partial ({state}) stays exactly as short as the provider left it: {out:?}"
+            );
+        }
+    }
+
     /// A batch that fails input validation has no result files at all — the reason lives
     /// on the batch object, with the offending JSONL line.
     #[test]
@@ -3992,16 +4248,16 @@ mod tests {
             "no attachments in this flow"
         );
         assert!(matches!(
-            provider.poll(&id).await.unwrap(),
+            provider.poll(&id, None).await.unwrap(),
             BatchPoll::Pending { .. }
         ));
         assert!(matches!(
-            provider.poll(&id).await.unwrap(),
+            provider.poll(&id, None).await.unwrap(),
             BatchPoll::Done(_)
         ));
         // Over-polling a Done batch stays Done.
         assert!(matches!(
-            provider.poll(&id).await.unwrap(),
+            provider.poll(&id, None).await.unwrap(),
             BatchPoll::Done(_)
         ));
         provider.cancel(&id).await.unwrap();

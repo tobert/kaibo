@@ -54,6 +54,56 @@ that will keep retrying by hand, and a caller who does knows to switch families 
 The number comes from the const rather than the prose, so the sentence cannot quietly
 become a lie.
 
+## 2026-08-09 — a count kaibo never checked against itself
+
+The 2026-08-02 batch audit's one real finding, closed: none of the three result parsers
+(`parse_results_jsonl`, `parse_gemini_inlined`, `parse_openai_output_jsonl`) ever asked
+whether the provider sent back everything kaibo submitted. A provider that quietly dropped
+one item still rendered "Batch complete — 9 result(s)" after a submit of 10 — no error, no
+gap named, just a count one short of the truth. The per-item propagation the audit checked
+was sound; this was the one thing nothing checked *against*.
+
+**Count, not a set.** kaibo assigns every `custom_id` itself, as the contiguous decimal
+indices `0..submitted` — `batch_submit` and `deliberate` both build `items` that way, never
+taking an id from the caller. So the expected set is fully determined by one number. Storing
+the ids anyway would be redundant state that could itself drift from the count; a bare `i64`
+column on the batch handle is the whole fix on the persistence side.
+
+**Legacy handles stay honest by construction, not by a special case.** `ALTER TABLE
+batch_handles ADD COLUMN submitted_count INTEGER` leaves every existing row `NULL` — SQLite
+does this for free, no backfill migration to get wrong. `cross_check_absentees` treats
+`None` as "nothing to check", so a handle from before this shipped renders exactly as it
+always did. No guessed count, no false "complete" stamped on a gap kaibo can't actually see.
+
+**The interesting bug I avoided, not the one I was asked to fix.** Gemini's cancelled/expired
+poll branch and OpenAI's `expired`/`cancelled` states both return a *deliberately* partial
+result set — whatever finished before the clock or the cancel caught up. First draft of this
+threaded the submitted count into every terminal branch uniformly, which would have turned
+every legitimately-unfinished item into a synthetic "kaibo can't find this" failure indistinguishable
+from a real silent drop — worse than the bug I came to fix, because it would have been
+*wrong* on every batch a caller ever cancelled early. The cross-check only runs where the
+provider's own state promises completeness: Anthropic's `ended` (every terminal reason still
+gets a results line, cancelled/expired items included), Gemini's `BATCH_STATE_SUCCEEDED`
+specifically, and OpenAI's `completed` specifically. Everything else passes `None` through
+on purpose, and there's a test pinning each of those "don't check" branches now, not just
+the "do check" ones.
+
+**OpenAI needed a merge point, not a parser change.** `parse_openai_output_jsonl` reads one
+file at a time — output and errors arrive as two separate files, and an id absent from one
+might just be sitting in the other. Cross-checking inside that function would have flagged
+real answers as missing half the time. The check lives in a new `finalize_openai_answers`,
+called once after both files are merged, gated on `state == "completed"` the same way the
+Gemini branch is gated on `BATCH_STATE_SUCCEEDED`. Same shape, applied where the shape
+actually forced it, not where the tracker entry's line numbers pointed.
+
+The absentee message itself gets its own paragraph because it earns one: it says `kaibo:`
+up front so it can never be mistaken for a `provider error: …` line, names the missing
+`custom_id`, and gives the two real next moves — re-run `job_get` in case it's still
+landing, or check the id on the provider's own dashboard. Read `~/src/kaish/docs/style.md`
+before writing it and rewrote it three times; a reader stuck on a batch result at 2am
+deserves a sentence that tells them what to do next, not a stack trace with a raised
+eyebrow.
+
 ## 2026-08-07 — finishing the CLI, and what a front door is allowed to be
 
 Amy, looking at the morning's work: *"hm did we ever say why deliberate isn't on the cli?
