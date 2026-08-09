@@ -253,31 +253,24 @@ otherwise sound. The attacker model stays narrow (a self-attack: a concurrent wr
 caller's own workspace, sub-millisecond window). Worth closing for symmetry when the model
 justifies it, but lower priority than the attachment read that one-shot-followed a symlink.
 
-### Attachment per-file streaming cap + FIFO-hang (DoS, self-attack) — count/total caps shipped
+### Attachment FIFO-hang (DoS, self-attack) — count/total/per-file caps shipped
 Surfaced by the Gemini Pro batch review of the VFS-read change (2026-06-23). These are
 **pre-existing** and all in the self-attack model (the caller owns the request and the
 workspace), so they're DoS, not confidentiality. The cheap batch-level bounds **shipped**
 (`attach::check_attachment_bounds`, wired into `resolve_attachments`): a hard cap on
 attachment *count* (`DEFAULT_MAX_ATTACHMENTS` = 64, checked before canonicalizing the list)
 and a *cumulative* byte budget (`DEFAULT_MAX_TOTAL_BYTES` = 32 MiB, the running total
-checked before each read so a batch of individually-legal files can't sum to an OOM). Two
-remain, both needing more than a pre-check:
-- **Per-file size cap is check-then-read, not streaming.** `resolve_attachments` checks
-  `std::fs::metadata` length against `read_ceiling`, then `worker.read_file` slurps the whole
-  file with **no byte cap** (`Job::Read` deliberately skips the script-output cap). A file
-  swapped for a huge one *after* the metadata check is read whole into a `Vec<u8>` → OOM,
-  bounded now only by the 32 MiB cumulative cap (so the blast radius shrank, but a single
-  swapped file up to that budget still slurps). The real fix is a *streaming* cap in the read
-  path (a `read_file` that takes a limit and aborts past `limit+1`), which needs a
-  `KaishWorker`/kaish-vfs API that bounds the read. (`classify` enforces the per-encoding cap
-  only *after* the full read, too late for memory.)
+checked before each read so a batch of individually-legal files can't sum to an OOM). The
+per-file streaming cap **shipped too**: `KaishWorker::read_file_capped(max)`
+(`sandbox.rs`) bounds the read itself via `read_range`/`File::take`, and both attachment
+resolvers (`server/resolver.rs`, `server/containment.rs`) pass their real per-file ceiling
+— a stat-then-read swap now stops at the cap instead of slurping to OOM. One remains:
 - **A special file (FIFO/device) swapped in can hang the read.** `is_file()` rejects a FIFO
   at check time, but a regular file swapped for a FIFO before the read blocks
-  `worker.read_file` indefinitely (single worker thread; `request_timeout` covers only the
-  model call, not attachment resolution). Wants an `O_NONBLOCK`/`tokio::time::timeout` bound
-  on the read. Judged rare (decided 2026-06-23) — parked unless it bites.
-Low priority (self-attack DoS). The streaming cap is the one with real teeth and needs the
-kaish-vfs read API.
+  `worker.read_file_capped` indefinitely (single worker thread; `request_timeout` covers only
+  the model call, not attachment resolution). Wants an `O_NONBLOCK`/`tokio::time::timeout`
+  bound on the read. Judged rare (decided 2026-06-23) — parked unless it bites.
+Low priority (self-attack DoS).
 
 ### Upstream a retry/backoff for rig's non-streaming completion path
 The provider failure *policy* is now stated, audited, and documented (README FAQ +
@@ -368,6 +361,25 @@ a dossier it already has, though the machinery works. Widening the gate would ad
 `deliberate` where its headline behavior — sweep, then deliberate — cannot run, which is
 worse than the gap. Left as-is on purpose; revisit if someone hits it.
 
+### Hybrid-provider casts as shipped defaults, and a 429-aware explorer story
+Field report (2026-08-09): `gpt-deliberate` failed three times at the explorer phase on
+OpenAI TPM 429s (`gpt-5.6-luna` explorer, a 200k tokens/min org ceiling) — a failed
+attempt still consumes the window, so a same-cast retry self-starves. Working fix,
+live-verified: a per-call `explorer_backend`/`explorer_model` override to a Gemini
+explorer, synth left on `gpt-5.6-sol` (batch lane). Matches a 2026-08-05 datapoint: a
+`gpt-luna` explorer TPM'd out instantly on a 16-file attach set while `gemini-flash-lite`
+built the identical dossier clean. Two threads:
+- **The mechanism is already cross-backend; the shipped defaults aren't.** A cast is
+  free to pair any backend per role (`AGENTS.md`), but `gpt-deliberate`'s built-in
+  (`docs/config.example.toml`) pins `explorer = { backend = "gpt", … }` — same family as
+  the synth. The explorer's job is cheap bulk reading, where family-match buys nothing
+  the synth's answer needs; consider giving the built-in `gpt` offline/deliberate casts
+  a cross-provider explorer (Gemini Flash, say) instead of a same-family one.
+- **A possible 429-aware explorer fallback** (auto-retarget the explorer after repeated
+  TPM 429s) cuts against the house doctrine — silent fallbacks are often a mistake, no
+  hidden retry. If built, it must be loud (named in the answer's provenance footer) and
+  probably opt-in. Decide the shape before building.
+
 ## P3 — Infra, perf, polish
 
 Two accepted-as-designed observations from the 2026-08-02 batch error-propagation audit,
@@ -419,16 +431,6 @@ rode along honestly. Deliberately deferred from the signing PR (2026-07-13, w/ A
 it changes the build invocation on all five legs (including through `cargo zigbuild`
 — compatibility unverified) and deserves its own validation dispatches. Do it when
 the audit story matters more than the extra moving part.
-
-### `KaishWorker::read_file` is unbounded — stat-then-read growth race
-`sandbox.rs` `Job::Read` slurps the whole file through the VFS with no size cap.
-Both attachment resolvers check `metadata().len()` against their cap/budget *before*
-reading, so a file that grows huge in the stat→read window gets slurped into memory
-before the post-read length check demotes/refuses it (Gemini cross-family review,
-2026-07-03). kaibo's stated adversary (the model) can't drive filesystem timing, so
-this is robustness, not an escape — but a fast-growing log file could spike memory.
-Fix shape: a capped read op on the worker (`read_file_capped(max)`) that refuses past
-the cap at the VFS layer; both resolvers pass their real ceiling.
 
 ### Attach-inline follow-ons: per-call budget, observed cost
 `inline_attach_budget` (2026-07-03, `[defaults]`/env) is server-wide only. Two
@@ -688,11 +690,6 @@ global, per the `large-token-headroom` memory. Remaining knobs on the same seam:
   warning plus an `inert_tunables` entry (`Config::effort_diagnostics`), and
   `tests/effort_wire.rs` pins the drop against a real serialized request body. Audible
   is not fixed — reasoning is still off on that wire.
-- **`thinking_style` is missing from the `inert_tunables` render** (GLM review,
-  2026-07-03): `kaibo://config` flags an inert `thinking_budget`/`effort`/
-  `temperature` per slot (`config_resource.rs`), but a `thinking_style` set on a
-  slot whose kind ignores the override (anything non-Anthropic) renders as if
-  effective. Display accuracy only; add it to the inert check alongside the others.
 
 All four provider paths have opt-in live tests (`tests/consult.rs`, `#[ignore]`d,
 gated on a key/endpoint) and passed with thinking on — the probes above extend these.
