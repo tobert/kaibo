@@ -684,11 +684,9 @@ named as such rather than blamed on the provider. If a provider is reliably slow
 that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
 — tracked as an upstream `rig` contribution in [`docs/issues.md`](docs/issues.md).)
 
-One failure *is* repeated, because it isn't a transport failure at all: when the provider
-could not parse the tool call the model generated (Gemini's `MALFORMED_FUNCTION_CALL`),
-kaibo asks the model for that turn again, 2 more draws on the same request. A fumbled
-tool call then costs one extra call rather than the whole investigation. See
-[`docs/config.md`](docs/config.md), "Failure policy".
+One exception: when a provider cannot parse the tool call a model generated, kaibo asks
+that model for the turn twice more — otherwise a single fumbled tool call discards the
+whole investigation.
 
 **What's the cost?** `consult` spends tokens on the provider behind the chosen cast,
 so the cast is what decides. A DeepSeek-class team is inexpensive enough to reach for
