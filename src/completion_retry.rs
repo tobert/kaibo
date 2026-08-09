@@ -1,4 +1,4 @@
-//! One re-draw when the provider could not parse what the model generated.
+//! One retry when the provider could not parse what the model generated.
 //!
 //! There is a failure class that looks like a hard error and is really a coin that
 //! landed wrong: the model fumbled a single tool call, the provider refused to shape
@@ -16,22 +16,23 @@
 //! becomes carries **no `chat_history`** — unlike `MaxTurnsError` and
 //! `PromptCancelled`, which hand the transcript back and are exactly why kaibo can
 //! recover from a turn cap or a `view_image` break. So by the time this failure
-//! reaches [`crate::consult::run_phase`], the turns are already gone and a "retry"
+//! reaches [`crate::consult::run_phase`], the turns are already gone and a retry
 //! there could only mean re-running the phase from the first prompt: paying for the
 //! whole investigation again to reach the state we just lost. `CompletionModel` is a
-//! trait, so wrapping the model puts the re-draw *underneath* the loop, where the
+//! trait, so wrapping the model puts the retry *underneath* the loop, where the
 //! request still holds the entire transcript and rig never learns anything went
 //! wrong. [`crate::completion_watch::Watched`] is the same seam used for observation;
-//! this is its acting sibling, and it is the only thing in kaibo that repeats a
-//! provider call.
+//! this is its acting sibling, and it is the only thing in kaibo that sends a provider
+//! request twice.
 //!
-//! **Bounded, immediate, and not backoff.** [`MALFORMED_REDRAWS`] extra draws, then
-//! the error goes up as before. There is no delay between them and there must not be:
-//! a re-draw answers "the model fumbled", where a 429/503 answers "the provider is
-//! busy", and the two want opposite treatments. kaibo still does not retry a
-//! rate-limited or overloaded call — that is a transport concern tracked as an
-//! upstream rig contribution in `docs/issues.md`. The re-draw also spends none of
-//! rig's turn budget, since rig never sees the failed attempt.
+//! **What is retried, and why that is not backoff.** This retries *the model's turn*:
+//! [`MALFORMED_RETRIES`] further attempts, each sending the identical request with no
+//! wait between them, and then the error goes up as before. Sending at once is the
+//! point — the provider is not busy, one generation came out wrong, and the next
+//! sampling of the same request is a fresh chance at it. Waiting is what a *transport*
+//! failure wants, and kaibo still does not retry a rate-limited or overloaded call at
+//! all; that is tracked as an upstream rig contribution in `docs/issues.md`. The retry
+//! also spends none of rig's turn budget, since rig never sees the failed attempt.
 //!
 //! **Detection is a heuristic on the error text**, by the same necessity as
 //! `server/render.rs::classify_failure`: the reason arrives inside a formatted
@@ -42,18 +43,18 @@
 //! also means "unparseable generation", but nothing yet says whether it is a fumble
 //! or a refusal, and a wrong guess spends three calls on every refusal. Gemini's
 //! `MissingThoughtSignature` is worse: if it fires because a replayed history dropped
-//! a signature, it fires on every draw, so retrying it burns the budget on every call
-//! rather than rescuing anything. Add either one on evidence from a live probe.
+//! a signature, it fires on every attempt, so retrying it burns the budget on every
+//! call rather than rescuing anything. Add either one on evidence from a live probe.
 
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
 };
 
-/// Extra draws one turn gets when the provider could not parse the generation, on top
-/// of the first. Two, so a turn sees three draws in the worst case: one glitch is the
-/// observed shape, a second in a row is unlucky, and a third says the request itself
-/// is the problem and the phase should fail with it.
-pub const MALFORMED_REDRAWS: usize = 2;
+/// Attempts a turn gets *after* the first, when the provider could not parse the
+/// generation. Two, so a turn costs at most three requests: one glitch is the observed
+/// shape, a second in a row is unlucky, and a third says the request itself is the
+/// problem and the phase should fail with it.
+pub const MALFORMED_RETRIES: usize = 2;
 
 /// The spellings a provider uses when it could not parse the model's tool call or the
 /// response around it, lowercased. Confirmed against the vendored rig-core 0.41
@@ -77,8 +78,8 @@ const MALFORMED_MARKERS: &[&str] = &[
 
 /// True when an error text says the provider could not parse what the model
 /// generated. Shared with `server/render.rs::classify_failure` so one vocabulary
-/// decides both the re-draw and the advice a caller finally reads — a marker added
-/// here reaches both.
+/// decides both the retry and the advice a caller finally reads — a marker added here
+/// reaches both.
 pub fn is_malformed_generation(error_text: &str) -> bool {
     let text = error_text.to_lowercase();
     MALFORMED_MARKERS.iter().any(|marker| text.contains(marker))
@@ -93,27 +94,27 @@ pub fn is_malformed_generation(error_text: &str) -> bool {
 pub struct Retried<M> {
     inner: M,
     /// The model id, for the warn event — a count of these per model is the whole
-    /// point of making the re-draw observable.
+    /// point of making the retry observable.
     model: String,
-    redraws: usize,
+    retries: usize,
 }
 
 impl<M> Retried<M> {
-    /// Wrap `model` so a malformed generation gets `redraws` further attempts.
-    pub fn new(model: M, name: impl Into<String>, redraws: usize) -> Self {
+    /// Wrap `model` so a malformed generation gets `retries` further attempts.
+    pub fn new(model: M, name: impl Into<String>, retries: usize) -> Self {
         Self {
             inner: model,
             model: name.into(),
-            redraws,
+            retries,
         }
     }
 }
 
-/// Wrap a completion model so a malformed generation is re-drawn [`MALFORMED_REDRAWS`]
-/// times — the drop-in at a phase's model call site, mirroring
+/// Wrap a completion model so a malformed generation is sent again
+/// [`MALFORMED_RETRIES`] times — the drop-in at a phase's model call site, mirroring
 /// [`watched`](crate::completion_watch::watched).
 pub fn retried<M: CompletionModel>(model: M, name: &str) -> Retried<M> {
-    Retried::new(model, name, MALFORMED_REDRAWS)
+    Retried::new(model, name, MALFORMED_RETRIES)
 }
 
 impl<M: CompletionModel> CompletionModel for Retried<M> {
@@ -135,22 +136,22 @@ impl<M: CompletionModel> CompletionModel for Retried<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        for attempt in 1..=self.redraws {
+        for attempt in 1..=self.retries {
             match self.inner.completion(request.clone()).await {
                 Err(error) if is_malformed_generation(&error.to_string()) => {
                     tracing::warn!(
                         model = %self.model,
                         attempt,
-                        redraws = self.redraws,
+                        retries = self.retries,
                         %error,
-                        "the provider could not parse this turn's tool call — asking \
-                         the model to generate the turn again"
+                        "the provider could not parse this turn's tool call — sending \
+                         the same request again"
                     );
                 }
                 outcome => return outcome,
             }
         }
-        // The last draw, un-cloned: a further malformed generation is the phase's
+        // The last attempt, un-cloned: a further malformed generation is the phase's
         // failure now, and it goes up carrying the provider's own words.
         self.inner.completion(request).await
     }
@@ -213,11 +214,11 @@ mod tests {
         )
     }
 
-    /// A scripted model that fails its first `fail_first` draws with `error`, then
+    /// A scripted model that fails its first `fail_first` attempts with `error`, then
     /// answers. The counter is the one thing a content-driven responder cannot
-    /// express: a re-draw sends a **byte-identical** request, so attempt 1 and
-    /// attempt 2 differ in nothing but their order. Counting is therefore the
-    /// behavior under test, not a shortcut around the harness's design.
+    /// express: a retry sends a **byte-identical** request, so attempt 1 and attempt 2
+    /// differ in nothing but their order. Counting is therefore the behavior under
+    /// test, not a shortcut around the harness's design.
     fn flaky_model(
         fail_first: usize,
         error: impl Fn() -> CompletionError + Send + Sync + 'static,
@@ -225,8 +226,8 @@ mod tests {
         super::Retried<crate::test_support::ScriptedModel>,
         Arc<AtomicUsize>,
     ) {
-        let draws = Arc::new(AtomicUsize::new(0));
-        let seen = draws.clone();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen = sent.clone();
         let client = ScriptedClient::builder()
             .on_model("m", move |_req| {
                 if seen.fetch_add(1, Ordering::SeqCst) < fail_first {
@@ -236,41 +237,41 @@ mod tests {
                 }
             })
             .build();
-        (retried(client.completion_model("m"), "m"), draws)
+        (retried(client.completion_model("m"), "m"), sent)
     }
 
-    /// The whole point: one malformed generation costs a second draw, not the turn.
+    /// The whole point: one malformed generation costs a second request, not the turn.
     #[tokio::test]
-    async fn a_malformed_generation_is_drawn_again_and_the_second_draw_answers() {
-        let (model, draws) = flaky_model(1, gemini_malformed);
-        let response = model.completion(req()).await.expect("the re-draw answers");
+    async fn a_malformed_generation_is_sent_again_and_the_second_attempt_answers() {
+        let (model, sent) = flaky_model(1, gemini_malformed);
+        let response = model.completion(req()).await.expect("the retry answers");
         assert_eq!(
-            draws.load(Ordering::SeqCst),
+            sent.load(Ordering::SeqCst),
             2,
-            "one glitch costs exactly one extra draw"
+            "one glitch costs exactly one extra request"
         );
         assert!(
             matches!(
                 response.choice.first(),
                 rig_core::completion::message::AssistantContent::Text(_)
             ),
-            "the caller gets the second draw's answer"
+            "the caller gets the second attempt's answer"
         );
     }
 
-    /// Bounded. A provider that fumbles every draw fails the turn after
-    /// [`MALFORMED_REDRAWS`] extra attempts, carrying its own words up.
+    /// Bounded. A provider that fumbles every attempt fails the turn after
+    /// [`MALFORMED_RETRIES`] further requests, carrying its own words up.
     #[tokio::test]
-    async fn re_drawing_stops_at_the_bound_and_the_provider_error_survives() {
-        let (model, draws) = flaky_model(usize::MAX, gemini_malformed);
+    async fn retrying_stops_at_the_bound_and_the_provider_error_survives() {
+        let (model, sent) = flaky_model(usize::MAX, gemini_malformed);
         let error = model
             .completion(req())
             .await
             .expect_err("a provider that always fumbles must still fail");
         assert_eq!(
-            draws.load(Ordering::SeqCst),
-            MALFORMED_REDRAWS + 1,
-            "the first draw plus MALFORMED_REDRAWS, and no more"
+            sent.load(Ordering::SeqCst),
+            MALFORMED_RETRIES + 1,
+            "the first request plus MALFORMED_RETRIES, and no more"
         );
         assert!(
             error.to_string().contains("MalformedFunctionCall"),
@@ -278,17 +279,17 @@ mod tests {
         );
     }
 
-    /// Every other failure passes straight through on the first draw. A rejected
-    /// request is not a coin that landed wrong, and asking again would spend a
+    /// Every other failure passes straight through on the first attempt. A rejected
+    /// request is not a coin that landed wrong, and sending it again would spend a
     /// caller's money to be refused twice more.
     #[tokio::test]
-    async fn a_rejected_request_is_never_drawn_again() {
-        let (model, draws) = flaky_model(usize::MAX, || provider_error("invalid_request_error"));
+    async fn a_rejected_request_is_never_sent_again() {
+        let (model, sent) = flaky_model(usize::MAX, || provider_error("invalid_request_error"));
         let error = model.completion(req()).await.expect_err("rejected");
         assert_eq!(
-            draws.load(Ordering::SeqCst),
+            sent.load(Ordering::SeqCst),
             1,
-            "a rejection costs one draw, not three"
+            "a rejection costs one request, not three"
         );
         assert!(error.to_string().contains("invalid_request_error"));
     }
@@ -319,17 +320,17 @@ mod tests {
         ] {
             assert!(
                 !is_malformed_generation(text),
-                "only a malformed generation is re-drawn: {text}"
+                "only a malformed generation is sent again: {text}"
             );
         }
     }
 
-    /// A re-draw sends the same request the failed draw sent — the transcript is what
+    /// A retry sends the same request the failed attempt sent — the transcript is what
     /// makes this recovery worth having, so losing it would defeat the module.
     #[tokio::test]
-    async fn a_re_draw_carries_the_same_request() {
-        let draws = Arc::new(AtomicUsize::new(0));
-        let seen = draws.clone();
+    async fn a_retry_sends_the_identical_request() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen = sent.clone();
         let client = ScriptedClient::builder()
             .on_model("m", move |_req| {
                 if seen.fetch_add(1, Ordering::SeqCst) < 1 {
@@ -348,17 +349,14 @@ mod tests {
             Message::assistant("a partial investigation"),
         ])
         .expect("two messages");
-        model
-            .completion(request)
-            .await
-            .expect("the re-draw answers");
+        model.completion(request).await.expect("the retry answers");
 
         let asked = client.requests_for("m");
-        assert_eq!(asked.len(), 2, "two draws were recorded");
+        assert_eq!(asked.len(), 2, "two requests were recorded");
         assert_eq!(
             serde_json::to_value(&asked[0].raw).unwrap_or(Value::Null),
             serde_json::to_value(&asked[1].raw).unwrap_or(Value::Null),
-            "the re-draw is the same request, transcript and all"
+            "the retry is the same request, transcript and all"
         );
     }
 }

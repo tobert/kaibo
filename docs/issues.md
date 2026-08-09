@@ -282,7 +282,7 @@ kaish-vfs read API.
 ### Upstream a retry/backoff for rig's non-streaming completion path
 The provider failure *policy* is now stated, audited, and documented (README FAQ +
 `docs/config.md`, shipped): kaibo does **no** transport retry — the one repeated call is
-the re-draw of a malformed generation (`src/completion_retry.rs`), a model fumble rather
+the retry of a malformed generation (`src/completion_retry.rs`), a model fumble rather
 than an overload. One completion is bounded by the
 backend `request_timeout`/`connect_timeout`, and a provider failure surfaces as a clean
 **tool-result error** (`is_error`, `server.rs::consultation_failed`) the host can proceed
