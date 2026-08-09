@@ -14,6 +14,59 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-09 — the test that had to speak MCP, and the flag that had stopped working
+
+The plan was a Python script. `mcp_drive.py` would spawn kaibo, speak JSON-RPC at it, and
+finally cover the one surface every test in this tree reaches around: the wire. Amy killed
+it in a sentence — "I don't want to check in python. Let's consider how to drive a test with
+rust tests. rmcp can be a server." kaibo already depends on rmcp for the server half. The
+client half is a dev-dependency and a feature flag away.
+
+So `tests/mcp_stdio.rs` spawns `env!("CARGO_BIN_EXE_kaibo")` over `TokioChildProcess`,
+completes a real handshake, and drives the shipped binary the way a client does. Two
+choices carry it. The child's environment is *cleared* before anything is set — HOME and
+the three XDG roots point at temp dirs, and nothing from the developer's shell (a provider
+key, a `KAIBO_*`, a `RUST_LOG`) can decide what the server advertises. And each test gets
+its own process and its own dirs, so nothing is shared and nothing is ordered. A missing
+`config.toml` being a non-error by design is what makes an empty temp config dir mean
+"built-ins" rather than "broken".
+
+The first run of the tool-list assertion failed, and it failed the interesting way. I had
+written down the eleven tools a keyless kaibo advertises — read off `kaibo config`, which
+reports `live_tools`. The wire answered fourteen. `batch_submit`, `deliberate`, and
+`generate` were all there, on a server whose own startup log had just said, three times, in
+full sentences, that nothing could staff them.
+
+The cause is one attribute with a default that changed under us. `#[tool_handler]` takes a
+`router` expression; rmcp 0.16 defaulted it to `self.tool_router` — the handler's own,
+runtime-gated router — and rmcp 1.x onward defaults it to `Self::tool_router()`, a fresh one
+rebuilt from the compile-time `#[tool]` set. kaibo wrote the bare attribute, so the 0.16 →
+3.0.0-beta.5 bump on 2026-07-28 silently swapped the gated router for an ungated one. The
+bump's own commit message says "No tool behavior or wire shape changed", and every test in
+the tree agreed, because every test asked the handler.
+
+`tools/list` was the visible half. The expensive half is that `tools/call` reads the same
+router: a server started with `--no-run-kaish` dropped the tool from its list and then ran
+the script anyway. I confirmed that by hand before believing it. The `--no-<tool>` flags are
+the operator's capability surface — the thing you set when you want a kaibo that *cannot* do
+something — and for twelve days they were advisory. The `cast` enums and the `alwaysLoad`
+pin on `consult` were quietly gone too; they are stamped onto the instance's routes, and the
+instance's routes were not what shipped.
+
+The fix is `#[tool_handler(router = self.tool_router)]` with a comment explaining why it is
+not decoration. What I want on the record is the shape of the miss, because it will happen
+again in some other form: the assertion that could have caught this had to be *outside* the
+process. `advertised_tools()` reads the gated router and answers correctly no matter which
+router the wire is using, so the in-process tests were honest and useless here at the same
+time. That is the argument for this file existing. It is also why the harness pins the whole
+tool set rather than checking that `run_kaish` is present — the failure was a set that got
+bigger, and only an equality assertion notices that.
+
+The teeth were easy to show, which is its own comfort. Reverting the attribute fails the two
+gating tests; mounting the project with `LocalFs::new` instead of `read_only` fails the write
+battery. The read-only invariant now has a proof that goes through the shipped MCP surface
+and not around it.
+
 ## 2026-08-09 — the stack that reviewed itself in
 
 GitHub's stacked PRs left preview waitlists on 2026-07-30, and this PR is the trial
