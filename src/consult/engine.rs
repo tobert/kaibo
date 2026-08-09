@@ -1048,11 +1048,11 @@ where
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
     let result = run_phase_loop(
-        // Two wrappers, innermost first: [`retried`] re-draws a turn the provider could
-        // not parse, then [`watched`] records the response that finally came back. A
-        // failed draw produces no response, so the log holds one record per turn either
-        // way — the order is about who resolves the failure, and the re-draw must resolve
-        // it below the loop, which loses the transcript on a completion error
+        // Two wrappers, innermost first: [`retried`] sends a turn the provider could not
+        // parse again, then [`watched`] records the response that finally came back. A
+        // failed attempt produces no response, so the log holds one record per turn either
+        // way — the order is about who resolves the failure, and the retry must resolve it
+        // below the loop, which loses the transcript on a completion error
         // (`crate::completion_retry`).
         &watched(retried(model.clone(), model_name), log.clone()),
         log,
@@ -1445,7 +1445,7 @@ where
     }
     // Same two wrappers the loop uses: a single-shot lane declares no tools, so it
     // cannot fumble a tool call, but a provider that could not shape the response
-    // (`MalformedResponse`) reaches here too and is worth the same re-draw.
+    // (`MalformedResponse`) reaches here too and is worth the same retry.
     let mut builder = watched(retried(model.clone(), model_name), log.clone())
         .completion_request(prompt)
         .preamble(preamble.to_string())
@@ -2927,21 +2927,21 @@ mod tests {
         );
     }
 
-    /// A malformed tool call mid-loop costs one extra draw, not the investigation.
+    /// A malformed tool call mid-loop costs one extra request, not the investigation.
     ///
     /// The live shape (a Gemini Flash explorer inside a `deliberate`): the model
     /// fumbles one function call, the provider refuses to shape the response, and rig
     /// hands back a `PromptError::CompletionError` carrying **no transcript** — so a
-    /// phase-level retry could only start over from the first prompt. The re-draw
-    /// lives under the loop ([`crate::completion_retry`]), where the request still
-    /// holds every turn. The proof that the investigation survived is in the third
-    /// request: it still carries the tool result the first two draws were built on,
-    /// and the answer is written from it.
+    /// phase-level retry could only start over from the first prompt. The retry lives
+    /// under the loop ([`crate::completion_retry`]), where the request still holds every
+    /// turn. The proof that the investigation survived is in the third request: it still
+    /// carries the tool result the first two attempts were built on, and the answer is
+    /// written from it.
     #[tokio::test]
-    async fn a_malformed_tool_call_mid_loop_is_re_drawn_and_the_investigation_survives() {
+    async fn a_malformed_tool_call_mid_loop_is_retried_and_the_investigation_survives() {
         use std::sync::atomic::AtomicBool;
         const MODEL: &str = "driver";
-        // A re-draw sends a byte-identical request, so "first draw of this turn" is
+        // A retry sends a byte-identical request, so "first attempt at this turn" is
         // not something a content-driven responder can read off the request — the
         // ordering IS the behavior under test. The flag is scoped to the one turn the
         // content predicate already selected.
@@ -2994,7 +2994,7 @@ mod tests {
         assert_eq!(
             asked.len(),
             3,
-            "the tool turn, the fumbled draw, and the re-draw: {:?}",
+            "the tool turn, the fumbled attempt, and the retry: {:?}",
             asked
                 .iter()
                 .map(|r| r.transcript.clone())
@@ -3002,7 +3002,7 @@ mod tests {
         );
         assert!(
             asked[2].transcript.contains("EVIDENCE"),
-            "the re-draw carries the gathered evidence, not a fresh start: {:?}",
+            "the retry carries the gathered evidence, not a fresh start: {:?}",
             asked[2].transcript
         );
     }

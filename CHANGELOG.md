@@ -263,8 +263,8 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
-- **One malformed tool call no longer discards the investigation** — kaibo asks the model
-  for that turn again, twice, before failing the call.
+- **One malformed tool call no longer discards the investigation** — kaibo sends that
+  request twice more before failing the call.
 - **A batch result no longer under-reports silently** — `job_get`/`job_wait` now flag any
   submitted `custom_id` a provider never returned as a loud per-item failure.
 

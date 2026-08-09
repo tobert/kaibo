@@ -33,10 +33,10 @@ whole investigation again to get back to where we just were" — the thing the i
 complaining about, spelled differently.
 
 The fix had to sit *below* the loop, and kaibo already had the shape for it. `Watched`
-wraps the model to observe each completion; `Retried` wraps it to repeat one. At that
-level the request still holds the entire transcript, so a re-draw loses nothing, and rig
-never learns the first draw happened — which also means the re-draw spends none of its turn
-budget. Two extra draws, no delay between them. The no-delay part is deliberate and is the
+wraps the model to observe each completion; `Retried` wraps it to send one again. At that
+level the request still holds the entire transcript, so a retry loses nothing, and rig
+never learns the first attempt happened — which also means the retry spends none of its
+turn budget. Two further attempts, sent at once. Sending at once is deliberate and is the
 whole boundary against the retry/backoff work we keep declining to hand-roll: a fumbled
 tool call and a 429 want opposite treatments, and the moment this grew a sleep it would
 have become the transport retry by accident.
@@ -44,15 +44,31 @@ have become the transport retry by accident.
 The part I spent longest on was what *not* to match. The OpenAI family has a near neighbor
 ("Response did not contain a valid message or tool call") that plausibly belongs, and
 Gemini has a worse one — `MissingThoughtSignature`, which if it fires because a replayed
-history dropped a signature, fires on every draw, so retrying it would burn three calls on
-every single call rather than rescuing anything. Both stayed out, named in the module doc,
+history dropped a signature, fires on every attempt, so retrying it would burn three
+requests on every single call rather than rescuing anything. Both stayed out, named in the module doc,
 waiting on a live probe. Guessing here costs real money on a failure path.
 
 Then the advice string, which is the half a caller actually reads. It now says kaibo
-already asked the model for that turn two more times — because a caller who doesn't know
-that will keep retrying by hand, and a caller who does knows to switch families instead.
-The number comes from the const rather than the prose, so the sentence cannot quietly
-become a lie.
+already sent that request two more times and the model repeated the mistake — because a
+caller who doesn't know that will keep retrying by hand, and a caller who does knows to
+switch families instead. The number comes from the const rather than the prose, so the
+sentence cannot quietly become a lie.
+
+Two things came back from review and both were about words, not code. Amy on the config
+guide: *"config.md help needs to be clearer / easier to read. Do configurers need to know
+all that?"* — no, they did not. The section leads with "there is nothing to set here" now,
+and the failure-class table is gone: every row restated what the error string already says
+at the moment of failure, and it had already drifted out of date once. The page cannot beat
+the message kaibo speaks live, so it points at it.
+
+And on the word I had used everywhere — *"we say 'redraw', it's not clear what that
+means. I think you mean we make another request. is it specific to image models?"* Right on
+both counts. It was sampling jargon, and in a repo that generates images it collides with
+the thing `generate` actually does. It also broke our own "subset, not slang" rule at the
+place that rule bites hardest, since most of our synths are not English-first. So the whole
+vocabulary is plain now: kaibo *sends the same request again*, the noun is a *retry*, and
+the constant is `MALFORMED_RETRIES` — which also settles what the number counts, because
+"retries" says "after the first" and "redraws" never did.
 
 ## 2026-08-09 — a count kaibo never checked against itself
 

@@ -50,8 +50,8 @@ enum FailureKind {
     /// The provider could not parse what the model generated — a malformed tool call,
     /// or a response it could not shape. A fumble rather than a rejection, so it must
     /// not inherit [`Provider`]'s "retrying is unlikely to help": kaibo has already
-    /// re-drawn the turn (`completion_retry::MALFORMED_REDRAWS`) and a fresh call gets
-    /// a fresh draw.
+    /// sent that request again (`completion_retry::MALFORMED_RETRIES`) and a fresh call
+    /// gets a fresh generation.
     MalformedGeneration,
     /// A model ran and delivered no answer text (`consult/engine.rs::empty_answer_error`,
     /// or the forced write-up turn's own failure wrapper). A model-side outcome that the
@@ -103,7 +103,7 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     // transient list because it is the more specific diagnosis and both point the
     // caller at another call — a finish message carrying "try again" would otherwise
     // flatten a fumble into a generic overload. The vocabulary lives in
-    // `completion_retry`, beside the re-draw that already spent its attempts on this
+    // `completion_retry`, beside the retry that already spent its attempts on this
     // error, so one list decides both.
     if crate::completion_retry::is_malformed_generation(&s) {
         return FailureKind::MalformedGeneration;
@@ -144,7 +144,7 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 /// transient overload/timeout invites a manual retry (kaibo does **not** back off and
 /// retry — one completion is bounded by the backend's `request_timeout`/`connect_timeout`;
 /// see the failure-policy FAQ and `docs/config.md`), a non-transient provider error
-/// doesn't, a malformed generation says the re-draws ([`crate::completion_retry`]) are
+/// doesn't, a malformed generation says the retries ([`crate::completion_retry`]) are
 /// already spent, and a kaibo-side failure is named honestly rather than blamed on the
 /// provider. Setup errors *before* the model call — unknown cast, an attachment outside
 /// the boundary, a missing key — stay `McpError`, since those are the caller's to fix.
@@ -216,14 +216,14 @@ pub(crate) fn consult_answer_text(
 pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> String {
     let detail = format!("{err:#}");
     // Built before the match, not inside it, so the other four arms stay `&'static str`:
-    // this one states the exact number of re-draws kaibo already spent, and that number is
+    // this one states the exact number of retries kaibo already spent, and that number is
     // a const one edit away from making a fixed string a lie.
     let malformed = format!(
         "The provider could not parse a tool call this model generated — the model \
-         fumbled one turn, and the request itself is fine. kaibo already asked the model \
-         for that turn {} more times and got the same result, so retry this call, or run \
-         it on a cast from a different family.",
-        crate::completion_retry::MALFORMED_REDRAWS
+         fumbled one turn, and the request itself is fine. kaibo already sent that \
+         request {} more times and the model repeated the mistake, so retry this call, \
+         or run it on a cast from a different family.",
+        crate::completion_retry::MALFORMED_RETRIES
     );
     let guidance = match classify_failure(&err) {
         FailureKind::TransientProvider => {
@@ -883,9 +883,9 @@ mod tests {
     }
 
     /// A malformed generation is a fumble, not a rejection, so it must not inherit the
-    /// non-transient "retrying is unlikely to help" advice. kaibo has already re-drawn
-    /// the turn twice by the time this text is written
-    /// (`completion_retry::MALFORMED_REDRAWS`), so what remains for the caller is a
+    /// non-transient "retrying is unlikely to help" advice. kaibo has already sent that
+    /// request twice more by the time this text is written
+    /// (`completion_retry::MALFORMED_RETRIES`), so what remains for the caller is a
     /// fresh call or another cast — and the advice must say which. (Live repro: a
     /// Gemini Flash explorer emitted one empty function call mid-`deliberate` and the
     /// whole investigation was discarded with "retrying is unlikely to help".)
