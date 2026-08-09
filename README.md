@@ -670,7 +670,7 @@ Telemetry is off by default and, when on, only opens an *outbound* OTLP connecti
 you configure.
 
 **What happens if a provider is overloaded or down (a 429/529, a reset, a wedged
-backend)?** kaibo does **not** retry — a single completion is bounded by the backend's
+backend)?** kaibo does **not** back off and retry — a single completion is bounded by the backend's
 `request_timeout` (default 15 min, the wall-clock for one model call) and a ≤10s
 `connect_timeout` that fails a dead endpoint fast. When a provider fails, the consult
 returns a **clean tool-result error** (`is_error`) naming the cast and the underlying
@@ -683,6 +683,10 @@ error (auth, bad request) doesn't, since a retry won't help; and a kaibo-side fa
 named as such rather than blamed on the provider. If a provider is reliably slow, raise
 that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
 — tracked as an upstream `rig` contribution in [`docs/issues.md`](docs/issues.md).)
+
+One exception: when a provider cannot parse the tool call a model generated, kaibo asks
+that model for the turn twice more — otherwise a single fumbled tool call discards the
+whole investigation.
 
 **What's the cost?** `consult` spends tokens on the provider behind the chosen cast,
 so the cast is what decides. A DeepSeek-class team is inexpensive enough to reach for

@@ -273,6 +273,11 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **One malformed tool call no longer discards the investigation** — kaibo sends that
+  request twice more before failing the call.
+- **A batch result no longer under-reports silently** — `job_get`/`job_wait` now flag any
+  submitted `custom_id` a provider never returned as a loud per-item failure.
+
 - **A consultation that produced no answer no longer comes back as a successful empty
   one.** A reasoning model's final turn can carry reasoning but no answer text, and
   kaibo would dress that empty string in a provenance footer and return it as success —

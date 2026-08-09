@@ -424,6 +424,16 @@ pub fn provider_error(msg: impl Into<String>) -> CompletionError {
     CompletionError::ProviderError(msg.into())
 }
 
+/// A **response-parse** error — what rig returns when the provider answered but rig
+/// could not turn the answer into a turn. Gemini's malformed function call arrives
+/// this way (`providers/gemini/completion.rs::function_call_finish_reason_error`), so
+/// this is how a test drives [`Retried`](crate::completion_retry::Retried) and the
+/// malformed-generation classification. Distinct from [`provider_error`], which is the
+/// provider's own error body.
+pub fn response_error(msg: impl Into<String>) -> CompletionError {
+    CompletionError::ResponseError(msg.into())
+}
+
 // ---- request accessors -----------------------------------------------------
 
 /// Concatenated text of every `User` message in the request history, oldest→newest,

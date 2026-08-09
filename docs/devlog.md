@@ -14,6 +14,127 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-09 — the stack that reviewed itself in
+
+GitHub's stacked PRs left preview waitlists on 2026-07-30, and this PR is the trial
+run: it ships as layer 3 of kaibo's first stack (#137), on top of the two feature PRs
+below it — the primer merged by the workflow it documents. The trial was real, not
+staged: `gh stack link 135 136` retargeted a sibling PR onto its neighbor and
+surfaced their CHANGELOG/devlog overlap as a conflict *before* any merge, which is
+the #129 failure (two clean-looking siblings, broken union on main) caught at the
+right time instead of after. The union rebase, the gates, and one force-with-lease
+later, the stack merges bottom-up atomically.
+
+Amy's framing decided the shape of the guidance: temporary by declaration. It
+recommends stacks while they're new, and names its own deletion condition — when the
+harnesses inject stack awareness or the models carry the feature natively, the
+paragraph goes. Guidance that knows when to die is cheaper than guidance that
+accretes.
+
+The bug read like a policy problem and turned out to be a plumbing problem. A Gemini Flash
+explorer, deep into a `deliberate`, emitted one empty function call. Gemini answered
+`MALFORMED_FUNCTION_CALL`, the phase died, and kaibo told the caller "retrying is unlikely
+to help" — which was both wrong and expensive, because everything the explorer had read up
+to that point went with it.
+
+I went in expecting to add a retry to `run_phase` and came out having learned why that
+would not have worked. rig's agent loop hands the transcript back on the two failures kaibo
+already recovers from — `MaxTurnsError` and `PromptCancelled` both carry a `chat_history`,
+which is exactly why the turn-cap finalize and the `view_image` break can resume. A
+completion *error* carries nothing. `AgentRunner::run_model_turn` yields it straight out of
+the driver stream, `PromptError::CompletionError` has no history field, and by the time
+kaibo sees it the turns are gone. So "retry the phase" could only ever mean "pay for the
+whole investigation again to get back to where we just were" — the thing the issue was
+complaining about, spelled differently.
+
+The fix had to sit *below* the loop, and kaibo already had the shape for it. `Watched`
+wraps the model to observe each completion; `Retried` wraps it to send one again. At that
+level the request still holds the entire transcript, so a retry loses nothing, and rig
+never learns the first attempt happened — which also means the retry spends none of its
+turn budget. Two further attempts, sent at once. Sending at once is deliberate and is the
+whole boundary against the retry/backoff work we keep declining to hand-roll: a fumbled
+tool call and a 429 want opposite treatments, and the moment this grew a sleep it would
+have become the transport retry by accident.
+
+The part I spent longest on was what *not* to match. The OpenAI family has a near neighbor
+("Response did not contain a valid message or tool call") that plausibly belongs, and
+Gemini has a worse one — `MissingThoughtSignature`, which if it fires because a replayed
+history dropped a signature, fires on every attempt, so retrying it would burn three
+requests on every single call rather than rescuing anything. Both stayed out, named in the module doc,
+waiting on a live probe. Guessing here costs real money on a failure path.
+
+Then the advice string, which is the half a caller actually reads. It now says kaibo
+already sent that request two more times and the model repeated the mistake — because a
+caller who doesn't know that will keep retrying by hand, and a caller who does knows to
+switch families instead. The number comes from the const rather than the prose, so the
+sentence cannot quietly become a lie.
+
+Two things came back from review and both were about words, not code. Amy on the config
+guide: *"config.md help needs to be clearer / easier to read. Do configurers need to know
+all that?"* — no, they did not. The section leads with "there is nothing to set here" now,
+and the failure-class table is gone: every row restated what the error string already says
+at the moment of failure, and it had already drifted out of date once. The page cannot beat
+the message kaibo speaks live, so it points at it.
+
+And on the word I had used everywhere — *"we say 'redraw', it's not clear what that
+means. I think you mean we make another request. is it specific to image models?"* Right on
+both counts. It was sampling jargon, and in a repo that generates images it collides with
+the thing `generate` actually does. It also broke our own "subset, not slang" rule at the
+place that rule bites hardest, since most of our synths are not English-first. So the whole
+vocabulary is plain now: kaibo *sends the same request again*, the noun is a *retry*, and
+the constant is `MALFORMED_RETRIES` — which also settles what the number counts, because
+"retries" says "after the first" and "redraws" never did.
+
+## 2026-08-09 — a count kaibo never checked against itself
+
+The 2026-08-02 batch audit's one real finding, closed: none of the three result parsers
+(`parse_results_jsonl`, `parse_gemini_inlined`, `parse_openai_output_jsonl`) ever asked
+whether the provider sent back everything kaibo submitted. A provider that quietly dropped
+one item still rendered "Batch complete — 9 result(s)" after a submit of 10 — no error, no
+gap named, just a count one short of the truth. The per-item propagation the audit checked
+was sound; this was the one thing nothing checked *against*.
+
+**Count, not a set.** kaibo assigns every `custom_id` itself, as the contiguous decimal
+indices `0..submitted` — `batch_submit` and `deliberate` both build `items` that way, never
+taking an id from the caller. So the expected set is fully determined by one number. Storing
+the ids anyway would be redundant state that could itself drift from the count; a bare `i64`
+column on the batch handle is the whole fix on the persistence side.
+
+**Legacy handles stay honest by construction, not by a special case.** `ALTER TABLE
+batch_handles ADD COLUMN submitted_count INTEGER` leaves every existing row `NULL` — SQLite
+does this for free, no backfill migration to get wrong. `cross_check_absentees` treats
+`None` as "nothing to check", so a handle from before this shipped renders exactly as it
+always did. No guessed count, no false "complete" stamped on a gap kaibo can't actually see.
+
+**The interesting bug I avoided, not the one I was asked to fix.** Gemini's cancelled/expired
+poll branch and OpenAI's `expired`/`cancelled` states both return a *deliberately* partial
+result set — whatever finished before the clock or the cancel caught up. First draft of this
+threaded the submitted count into every terminal branch uniformly, which would have turned
+every legitimately-unfinished item into a synthetic "kaibo can't find this" failure indistinguishable
+from a real silent drop — worse than the bug I came to fix, because it would have been
+*wrong* on every batch a caller ever cancelled early. The cross-check only runs where the
+provider's own state promises completeness: Anthropic's `ended` (every terminal reason still
+gets a results line, cancelled/expired items included), Gemini's `BATCH_STATE_SUCCEEDED`
+specifically, and OpenAI's `completed` specifically. Everything else passes `None` through
+on purpose, and there's a test pinning each of those "don't check" branches now, not just
+the "do check" ones.
+
+**OpenAI needed a merge point, not a parser change.** `parse_openai_output_jsonl` reads one
+file at a time — output and errors arrive as two separate files, and an id absent from one
+might just be sitting in the other. Cross-checking inside that function would have flagged
+real answers as missing half the time. The check lives in a new `finalize_openai_answers`,
+called once after both files are merged, gated on `state == "completed"` the same way the
+Gemini branch is gated on `BATCH_STATE_SUCCEEDED`. Same shape, applied where the shape
+actually forced it, not where the tracker entry's line numbers pointed.
+
+The absentee message itself gets its own paragraph because it earns one: it says `kaibo:`
+up front so it can never be mistaken for a `provider error: …` line, names the missing
+`custom_id`, and gives the two real next moves — re-run `job_get` in case it's still
+landing, or check the id on the provider's own dashboard. Read `~/src/kaish/docs/style.md`
+before writing it and rewrote it three times; a reader stuck on a batch result at 2am
+deserves a sentence that tells them what to do next, not a stack trace with a raised
+eyebrow.
+
 ## 2026-08-07 — finishing the CLI, and what a front door is allowed to be
 
 Amy, looking at the morning's work: *"hm did we ever say why deliberate isn't on the cli?

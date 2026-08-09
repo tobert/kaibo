@@ -78,7 +78,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current on-disk schema version. Bump + add a migration arm when the shape changes;
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long a batch handle is kept before it's pruned. Provider batches expire around 30
 /// days (Anthropic/Gemini both), so a handle older than that names a batch the provider has
@@ -108,12 +108,19 @@ pub struct SessionInfo {
 /// `backend/provider_id` handle that [`crate::batch::poller`] re-addresses after a
 /// restart — the fix for today's orphaned-batch problem (provider-side batches outlive
 /// the process that submitted them, and kaibo held nothing on disk to find them again).
+///
+/// `submitted_count` is how many items kaibo submitted under this handle — `None` on a
+/// handle persisted before schema v2 added the column (an `ALTER TABLE ADD COLUMN` leaves
+/// every existing row `NULL`, not backfilled). A batch parser cross-checks its result set
+/// against this count only when it is `Some`, so a legacy handle's poll renders exactly as
+/// it always did — no invented count, no false "complete."
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchHandle {
     pub backend: String,
     pub provider_id: String,
     pub label: Option<String>,
     pub created_at: i64,
+    pub submitted_count: Option<i64>,
 }
 
 /// The store's error surface. A persistence-library boundary wants a typed error callers
@@ -322,6 +329,7 @@ impl SessionStore {
         while version < SCHEMA_VERSION {
             match version {
                 0 => Self::apply_v1(&conn).await?,
+                1 => Self::apply_v2(&conn).await?,
                 other => {
                     return Err(StoreError::Corrupt(format!(
                         "no migration from schema version {other} (this binary knows up to \
@@ -368,6 +376,18 @@ impl SessionStore {
             "#,
         )
         .await?;
+        Ok(())
+    }
+
+    /// v1 → v2: add `submitted_count` to `batch_handles`, so a poll can cross-check the
+    /// provider's returned `custom_id`s against how many kaibo actually sent — the fix for
+    /// a provider silently dropping an item (`docs/issues.md`, P3). `ALTER TABLE ADD
+    /// COLUMN` with no `NOT NULL` leaves every pre-existing row `NULL`, which is exactly
+    /// the "unknown, don't guess" value [`BatchHandle::submitted_count`] wants for a handle
+    /// that predates this column.
+    async fn apply_v2(conn: &Connection) -> Result<()> {
+        conn.execute_batch("ALTER TABLE batch_handles ADD COLUMN submitted_count INTEGER;")
+            .await?;
         Ok(())
     }
 
@@ -477,13 +497,22 @@ impl SessionStore {
     /// the `(backend, provider_id)` key — a repeat submit updates the label rather than
     /// duplicating the row — and prunes any handles older than the TTL on the way, so the
     /// table (and `job_list`'s payload) stays bounded by the data itself.
+    ///
+    /// `submitted_count` is how many items this batch was submitted with — kaibo's own
+    /// `custom_id`s are the contiguous decimal indices `0..submitted_count`, so this one
+    /// number is what a later poll needs to notice a provider that silently dropped an
+    /// item. Always `Some` from a live submit; pass `None` only from a caller reconstructing
+    /// a handle without that count (there is none in production code today — every submit
+    /// site knows its own item count).
     pub async fn put_batch(
         &self,
         backend: &str,
         provider_id: &str,
         label: Option<&str>,
+        submitted_count: Option<i64>,
     ) -> Result<()> {
-        self.put_batch_at(backend, provider_id, label, now()).await
+        self.put_batch_at(backend, provider_id, label, submitted_count, now())
+            .await
     }
 
     /// [`put_batch`](Self::put_batch) with an explicit `created_at` (epoch seconds) — the
@@ -494,6 +523,7 @@ impl SessionStore {
         backend: &str,
         provider_id: &str,
         label: Option<&str>,
+        submitted_count: Option<i64>,
         created_at: i64,
     ) -> Result<()> {
         let conn = self.conn().await?;
@@ -501,15 +531,20 @@ impl SessionStore {
             Some(s) => Value::Text(s.to_string()),
             None => Value::Null,
         };
+        let submitted_val = match submitted_count {
+            Some(n) => Value::Integer(n),
+            None => Value::Null,
+        };
         conn.execute(
-            "INSERT INTO batch_handles (backend, provider_id, label, created_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(backend, provider_id) DO UPDATE SET label = ?3",
+            "INSERT INTO batch_handles (backend, provider_id, label, created_at, submitted_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(backend, provider_id) DO UPDATE SET label = ?3, submitted_count = ?5",
             (
                 backend.to_string(),
                 provider_id.to_string(),
                 label_val,
                 created_at,
+                submitted_val,
             ),
         )
         .await?;
@@ -522,7 +557,8 @@ impl SessionStore {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT backend, provider_id, label, created_at FROM batch_handles
+                "SELECT backend, provider_id, label, created_at, submitted_count
+                 FROM batch_handles
                  WHERE backend = ?1 AND provider_id = ?2",
                 (backend.to_string(), provider_id.to_string()),
             )
@@ -539,7 +575,8 @@ impl SessionStore {
         let mut out = Vec::new();
         let mut rows = conn
             .query(
-                "SELECT backend, provider_id, label, created_at FROM batch_handles
+                "SELECT backend, provider_id, label, created_at, submitted_count
+                 FROM batch_handles
                  ORDER BY created_at DESC",
                 (),
             )
@@ -764,11 +801,21 @@ fn row_to_handle(row: &turso::Row) -> Result<BatchHandle> {
         Value::Text(s) => Some(s),
         other => Some(format!("{other:?}")),
     };
+    let submitted_count = match row.get_value(4)? {
+        Value::Null => None,
+        Value::Integer(n) => Some(n),
+        other => {
+            return Err(StoreError::Corrupt(format!(
+                "batch_handles.submitted_count is {other:?}, not an INTEGER or NULL"
+            )))
+        }
+    };
     Ok(BatchHandle {
         backend: row.get::<String>(0)?,
         provider_id: row.get::<String>(1)?,
         label,
         created_at: row.get::<i64>(3)?,
+        submitted_count,
     })
 }
 
@@ -903,6 +950,43 @@ mod tests {
         assert!(
             hint.contains("--no-persistence"),
             "hint should still name --no-persistence as a fix (skip persistence): {hint}"
+        );
+    }
+
+    /// A handle persisted before schema v2 added `submitted_count` reads back `None`, not
+    /// a guessed number — the honest-gap contract [`BatchHandle::submitted_count`] and
+    /// `docs/issues.md`'s batch cross-check promise. Simulated by inserting a row through
+    /// the store's own connection factory (never a second raw open of the file — see the
+    /// module doc's MP-WAL warning) with `submitted_count` left unset, exactly what an
+    /// `ALTER TABLE ADD COLUMN` leaves on every pre-existing row.
+    #[tokio::test]
+    async fn a_handle_without_a_submitted_count_reads_back_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        let store = SessionStore::open(&path, NonZeroUsize::new(4).unwrap(), &[])
+            .await
+            .unwrap();
+        let conn = store.conn().await.unwrap();
+        conn.execute(
+            "INSERT INTO batch_handles (backend, provider_id, label, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            (
+                "anthropic".to_string(),
+                "msgbatch_legacy".to_string(),
+                Value::Null,
+                now(),
+            ),
+        )
+        .await
+        .unwrap();
+        let handle = store
+            .get_batch("anthropic", "msgbatch_legacy")
+            .await
+            .unwrap()
+            .expect("row was inserted");
+        assert_eq!(
+            handle.submitted_count, None,
+            "a pre-v2 row must read back an honest gap, not a guessed count"
         );
     }
 }

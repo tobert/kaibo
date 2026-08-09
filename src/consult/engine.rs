@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 use crate::artifact::SaveArtifact;
 use crate::attach::Attachment;
+use crate::completion_retry::retried;
 use crate::completion_watch::{watched, CompletionLog, Watched};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::WireKind;
@@ -1047,7 +1048,13 @@ where
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
     let result = run_phase_loop(
-        &watched(model.clone(), log.clone()),
+        // Two wrappers, innermost first: [`retried`] sends a turn the provider could not
+        // parse again, then [`watched`] records the response that finally came back. A
+        // failed attempt produces no response, so the log holds one record per turn either
+        // way — the order is about who resolves the failure, and the retry must resolve it
+        // below the loop, which loses the transcript on a completion error
+        // (`crate::completion_retry`).
+        &watched(retried(model.clone(), model_name), log.clone()),
         log,
         model_name,
         preamble,
@@ -1436,7 +1443,10 @@ where
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
-    let mut builder = watched(model.clone(), log.clone())
+    // Same two wrappers the loop uses: a single-shot lane declares no tools, so it
+    // cannot fumble a tool call, but a provider that could not shape the response
+    // (`MalformedResponse`) reaches here too and is worth the same retry.
+    let mut builder = watched(retried(model.clone(), model_name), log.clone())
         .completion_request(prompt)
         .preamble(preamble.to_string())
         .max_tokens(max_tokens);
@@ -2914,6 +2924,86 @@ mod tests {
             log.last_finish_reason().as_deref(),
             Some("end_turn"),
             "the phase's ending is one call away"
+        );
+    }
+
+    /// A malformed tool call mid-loop costs one extra request, not the investigation.
+    ///
+    /// The live shape (a Gemini Flash explorer inside a `deliberate`): the model
+    /// fumbles one function call, the provider refuses to shape the response, and rig
+    /// hands back a `PromptError::CompletionError` carrying **no transcript** — so a
+    /// phase-level retry could only start over from the first prompt. The retry lives
+    /// under the loop ([`crate::completion_retry`]), where the request still holds every
+    /// turn. The proof that the investigation survived is in the third request: it still
+    /// carries the tool result the first two attempts were built on, and the answer is
+    /// written from it.
+    #[tokio::test]
+    async fn a_malformed_tool_call_mid_loop_is_retried_and_the_investigation_survives() {
+        use std::sync::atomic::AtomicBool;
+        const MODEL: &str = "driver";
+        // A retry sends a byte-identical request, so "first attempt at this turn" is
+        // not something a content-driven responder can read off the request — the
+        // ordering IS the behavior under test. The flag is scoped to the one turn the
+        // content predicate already selected.
+        let fumbled = Arc::new(AtomicBool::new(false));
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |req| {
+                if !transcript_text(req).contains("EVIDENCE") {
+                    return Ok(tool_call_response(
+                        "c1",
+                        "run_kaish",
+                        json!({"script": "echo EVIDENCE"}),
+                    ));
+                }
+                if !fumbled.swap(true, Ordering::SeqCst) {
+                    return Err(crate::test_support::response_error(
+                        "Gemini stopped with finish_reason=MalformedFunctionCall: \
+                         malformed function call: default_api",
+                    ));
+                }
+                Ok(text_response("ANSWER: built on EVIDENCE"))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase(
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            4,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        )
+        .await
+        .expect("one malformed tool call must not fail the phase");
+
+        assert_eq!(answer, "ANSWER: built on EVIDENCE");
+        let asked = client.requests_for(MODEL);
+        assert_eq!(
+            asked.len(),
+            3,
+            "the tool turn, the fumbled attempt, and the retry: {:?}",
+            asked
+                .iter()
+                .map(|r| r.transcript.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            asked[2].transcript.contains("EVIDENCE"),
+            "the retry carries the gathered evidence, not a fresh start: {:?}",
+            asked[2].transcript
         );
     }
 

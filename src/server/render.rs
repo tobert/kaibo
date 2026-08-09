@@ -47,6 +47,12 @@ enum FailureKind {
     TransientProvider,
     /// A non-transient model/provider error (auth, bad request). Retrying won't help.
     Provider,
+    /// The provider could not parse what the model generated — a malformed tool call,
+    /// or a response it could not shape. A fumble rather than a rejection, so it must
+    /// not inherit [`Provider`]'s "retrying is unlikely to help": kaibo has already
+    /// sent that request again (`completion_retry::MALFORMED_RETRIES`) and a fresh call
+    /// gets a fresh generation.
+    MalformedGeneration,
     /// A model ran and delivered no answer text (`consult/engine.rs::empty_answer_error`,
     /// or the forced write-up turn's own failure wrapper). A model-side outcome that the
     /// guard's diagnostics already frame as retryable — distinct from [`Provider`], whose
@@ -82,8 +88,9 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     // The empty-answer guard's marker (`empty_answer_error` and the forced-turn failure
     // wrapper, `consult/engine.rs`). An empty answer definitionally means a model ran, so
     // it counts toward `reached_a_model`; its own classification is decided *after* the
-    // transient vocabulary below, so a forced write-up turn that died on an overload is
-    // framed transient (the more specific retry guidance) rather than generically empty.
+    // malformed and transient vocabularies below, so a forced write-up turn that died on a
+    // fumbled tool call or an overload is framed by the more specific diagnosis rather than
+    // generically empty.
     let empty_answer = s.contains("returned an empty answer");
     let reached_a_model = s.contains("model loop failed")
         || s.contains("model call failed")
@@ -91,6 +98,15 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
         || empty_answer;
     if !reached_a_model {
         return FailureKind::Internal;
+    }
+    // The provider could not parse the model's own output. Decided before the
+    // transient list because it is the more specific diagnosis and both point the
+    // caller at another call — a finish message carrying "try again" would otherwise
+    // flatten a fumble into a generic overload. The vocabulary lives in
+    // `completion_retry`, beside the retry that already spent its attempts on this
+    // error, so one list decides both.
+    if crate::completion_retry::is_malformed_generation(&s) {
+        return FailureKind::MalformedGeneration;
     }
     // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
     // transport layer (reqwest timeouts/resets from our own `request_timeout`).
@@ -125,12 +141,13 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 /// augmentation: the calling agent should read a clear message and proceed *without* the
 /// second opinion — not have its own tool call fail at the JSON-RPC layer. The framing is
 /// tailored by [`classify_failure`] so the agent can drive the right next step: a
-/// transient overload/timeout invites a manual retry (kaibo does **not** retry on its own
-/// — one completion is bounded by the backend's `request_timeout`/`connect_timeout`; see
-/// the failure-policy FAQ and `docs/config.md`), a non-transient provider error doesn't,
-/// and a kaibo-side failure is named honestly rather than blamed on the provider. Setup
-/// errors *before* the model call — unknown cast, an attachment outside the boundary, a
-/// missing key — stay `McpError`, since those are the caller's to fix.
+/// transient overload/timeout invites a manual retry (kaibo does **not** back off and
+/// retry — one completion is bounded by the backend's `request_timeout`/`connect_timeout`;
+/// see the failure-policy FAQ and `docs/config.md`), a non-transient provider error
+/// doesn't, a malformed generation says the retries ([`crate::completion_retry`]) are
+/// already spent, and a kaibo-side failure is named honestly rather than blamed on the
+/// provider. Setup errors *before* the model call — unknown cast, an attachment outside
+/// the boundary, a missing key — stay `McpError`, since those are the caller's to fix.
 pub(super) fn consultation_failed(tool: &str, cast: &str, err: anyhow::Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(consultation_failure_text(
         tool, cast, err,
@@ -198,16 +215,27 @@ pub(crate) fn consult_answer_text(
 /// unified `job_get` wrap it without re-classifying.
 pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Error) -> String {
     let detail = format!("{err:#}");
+    // Built before the match, not inside it, so the other four arms stay `&'static str`:
+    // this one states the exact number of retries kaibo already spent, and that number is
+    // a const one edit away from making a fixed string a lie.
+    let malformed = format!(
+        "The provider could not parse a tool call this model generated — the model \
+         fumbled one turn, and the request itself is fine. kaibo already sent that \
+         request {} more times and the model repeated the mistake, so retry this call, \
+         or run it on a cast from a different family.",
+        crate::completion_retry::MALFORMED_RETRIES
+    );
     let guidance = match classify_failure(&err) {
         FailureKind::TransientProvider => {
             "This looks like a transient provider condition (overload, rate limit, or \
-             timeout). kaibo does not retry automatically — you may retry this call, or \
+             timeout). kaibo does not back off and retry — you may retry this call, or \
              proceed without the consultation."
         }
         FailureKind::Provider => {
             "The model or its provider rejected the request; retrying is unlikely to help \
              — proceed without the consultation, or check the cast and config."
         }
+        FailureKind::MalformedGeneration => &malformed,
         FailureKind::EmptyAnswer => {
             "The model ran but delivered no answer text — a model-side outcome, not a \
              kaibo bug. You may retry, and a different cast often helps; if the \
@@ -852,6 +880,46 @@ mod tests {
                 && !text.to_lowercase().contains("retry this call"),
             "a non-transient error must not invite a retry: {text}"
         );
+    }
+
+    /// A malformed generation is a fumble, not a rejection, so it must not inherit the
+    /// non-transient "retrying is unlikely to help" advice. kaibo has already sent that
+    /// request twice more by the time this text is written
+    /// (`completion_retry::MALFORMED_RETRIES`), so what remains for the caller is a
+    /// fresh call or another cast — and the advice must say which. (Live repro: a
+    /// Gemini Flash explorer emitted one empty function call mid-`deliberate` and the
+    /// whole investigation was discarded with "retrying is unlikely to help".)
+    #[test]
+    fn a_malformed_generation_steers_toward_a_retry_not_away_from_one() {
+        for body in [
+            // The tool loop, which is where it was seen.
+            "model loop failed: CompletionError: ResponseError: Gemini stopped with \
+             finish_reason=MalformedFunctionCall: malformed function call: default_api",
+            // A gateway forwarding the wire spelling instead of rig's Debug one.
+            "model loop failed: ProviderError: {\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}",
+            // The single-shot direct lane wears its own marker.
+            "model call failed: ResponseError: Gemini stopped with \
+             finish_reason=MalformedResponse: malformed response from provider",
+        ] {
+            let text = answer_text(&consultation_failed(
+                "consult",
+                "gemini",
+                anyhow::anyhow!(body),
+            ));
+            let lower = text.to_lowercase();
+            assert!(
+                !lower.contains("retrying is unlikely to help"),
+                "a fumbled tool call is worth another call: {body} -> {text}"
+            );
+            assert!(
+                lower.contains("retry"),
+                "the advice must name the next step: {body} -> {text}"
+            );
+            assert!(
+                !lower.contains("kaibo-side error") && !lower.contains("please report"),
+                "a model fumble is not a kaibo bug: {body} -> {text}"
+            );
+        }
     }
 
     /// An empty-answer failure (`consult/engine.rs::empty_answer_error`) means a model
