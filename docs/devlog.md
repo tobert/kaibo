@@ -46,12 +46,12 @@ bump's own commit message says "No tool behavior or wire shape changed", and eve
 the tree agreed, because every test asked the handler.
 
 `tools/list` was the visible half. The expensive half is that `tools/call` reads the same
-router: a server started with `--no-run-kaish` dropped the tool from its list and then ran
-the script anyway. I confirmed that by hand before believing it. The `--no-<tool>` flags are
-the operator's capability surface — the thing you set when you want a kaibo that *cannot* do
-something — and for twelve days they were advisory. The `cast` enums and the `alwaysLoad`
-pin on `consult` were quietly gone too; they are stamped onto the instance's routes, and the
-instance's routes were not what shipped.
+router, so the gate failed on both sides at once: an operator who asked for a kaibo that
+*cannot* run a shell — `--no-run-kaish` — got one that listed `run_kaish` anyway and then
+ran the script when asked. I confirmed that by hand before believing it. Those flags are the
+operator's capability surface, and for twelve days they were advisory. The `cast` enums and
+the `alwaysLoad` pin on `consult` went the same way; they are stamped onto the instance's
+routes, and the instance's routes were not what shipped.
 
 The fix is `#[tool_handler(router = self.tool_router)]` with a comment explaining why it is
 not decoration. What I want on the record is the shape of the miss, because it will happen
@@ -66,6 +66,13 @@ The teeth were easy to show, which is its own comfort. Reverting the attribute f
 gating tests; mounting the project with `LocalFs::new` instead of `read_only` fails the write
 battery. The read-only invariant now has a proof that goes through the shipped MCP surface
 and not around it.
+
+The DeepSeek review found the gap I had left in my own lesson. Routing and meta injection are
+separate steps on the same router, so a change that keeps the routes and drops the `_meta`
+stamp would have passed everything I wrote — the front door would quietly stop being resident
+under a schema-deferring host, with no test to say so. That has its own assertion now, and it
+pins the *narrowness* too: only `consult` is pinned, because the whole point is that an unused
+tool bills nothing until someone reaches for it.
 
 ## 2026-08-09 — the stack that reviewed itself in
 

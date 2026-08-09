@@ -34,7 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ServerPeerInfo,
+    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ServerPeerInfo, Tool,
 };
 use rmcp::service::{RoleClient, RunningService, ServiceError, ServiceExt};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -166,16 +166,23 @@ impl Server {
         (*info).clone()
     }
 
+    /// Every advertised tool as the wire carries it — schema, `_meta`, and all — sorted
+    /// by name.
+    async fn tools(&self) -> Vec<Tool> {
+        let mut tools = bounded("tools/list", self.client.list_all_tools())
+            .await
+            .expect("tools/list should succeed");
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
     /// Every advertised tool name, sorted.
     async fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = bounded("tools/list", self.client.list_all_tools())
+        self.tools()
             .await
-            .expect("tools/list should succeed")
             .into_iter()
             .map(|t| t.name.to_string())
-            .collect();
-        names.sort();
-        names
+            .collect()
     }
 
     /// Ask the server to run a kaish script against the served root, returning whatever
@@ -411,6 +418,52 @@ async fn a_gated_tool_is_neither_advertised_nor_callable() {
     assert!(
         refusal.contains("not found"),
         "a gated tool must be refused as absent; got: {refusal}"
+    );
+
+    server.shutdown().await;
+}
+
+/// The `alwaysLoad` pin reaches the wire on `consult`, and on nothing else.
+///
+/// Routing and meta injection are separate steps on the same router
+/// (`server.rs`, `new_with_env`): the routes survive a change that drops the `_meta`
+/// stamp, so every other assertion here would still pass while the front door quietly
+/// stopped being resident under a schema-deferring host. This is the assertion that
+/// notices. It also pins the pin's *narrowness* — the whole point is that an unused
+/// tool bills nothing until the caller reaches for it.
+#[tokio::test]
+async fn consult_carries_the_always_load_pin_and_no_other_tool_does() {
+    let server = Server::start().await;
+    let tools = server.tools().await;
+
+    let consult = tools
+        .iter()
+        .find(|t| t.name == "consult")
+        .expect("`consult` is advertised on a keyless server");
+    let meta = consult
+        .meta
+        .as_ref()
+        .expect("`consult` carries `_meta` as served over MCP");
+    assert_eq!(
+        meta.get("anthropic/alwaysLoad"),
+        Some(&serde_json::Value::Bool(true)),
+        "`consult` must stay resident under a schema-deferring host; its _meta was {meta:?}"
+    );
+
+    let also_pinned: Vec<&str> = tools
+        .iter()
+        .filter(|t| t.name != "consult")
+        .filter(|t| {
+            t.meta
+                .as_ref()
+                .is_some_and(|m| m.contains_key("anthropic/alwaysLoad"))
+        })
+        .map(|t| t.name.as_ref())
+        .collect();
+    assert!(
+        also_pinned.is_empty(),
+        "only `consult` is pinned resident, so an unused tool bills nothing until it is \
+         reached for; also pinned: {also_pinned:?}"
     );
 
     server.shutdown().await;
