@@ -398,14 +398,16 @@ even for a one-line doc fix.
 - **Stacked PRs — temporary guidance (GitHub public preview, 2026-07).** When one
   change builds on another unmerged change, prefer a native GitHub stack over sibling
   PRs racing to `main` — the stack resolves their overlap once, before any merge.
-  Primer: the CLI is the `github/gh-stack` extension (installed here).
+  Primer: the CLI is `gh stack` (`gh extension install github/gh-stack`).
   `gh stack link <bottom> <top>…` retrofits open PRs or branches into a stack,
   retargeting each PR's base onto the one below; `gh stack init`/`add`/`submit` is the
   local-first path. `gh stack merge` lands a layer plus every unmerged layer below it
   in one all-or-nothing operation, and layers above a merged one rebase and retarget
   automatically — a linked stack cannot strand a PR on an already-landed base branch.
-  Layers touching the same files still need a real rebase on the branch: resolve as
-  the union in stack order, re-run the gates, push `--force-with-lease`. An
+  Layers touching the same files still need a real rebase on the branch: additive
+  docs files (changelog, tracker, devlog) resolve as the union in stack order, code
+  conflicts resolve on their logic, then re-run the gates and push
+  `--force-with-lease` (`gh stack submit` when using local tracking). An
   *unstacked* PR keeps the manual base check before merge:
   `gh pr view <N> --json baseRefName`. Delete this guidance when the harness injects
   stack awareness or the models carry the feature natively.
