@@ -528,15 +528,15 @@ fn anthropic_finish_gate(stop_reason: Option<&str>) -> Result<(), String> {
 /// per-item error, so the wording says that explicitly rather than reading like one more
 /// `provider error: …` line. Names the id, states what is and is not known (present in the
 /// finished result set: no; why the provider left it out: unknown — nothing here invents a
-/// reason), and gives the two real next steps: poll again, or check the provider's own
-/// batch dashboard for that id.
+/// reason, and nothing suggests re-polling: the provider already declared this batch
+/// finished, so there is no later result still in flight to catch), and gives the one real
+/// next step — the provider's own batch dashboard for that id.
 fn absentee_answer(custom_id: String) -> BatchAnswer {
     let text = format!(
         "kaibo: item `{custom_id}` is missing — this batch is finished, but the provider \
          returned no answer and no error for a custom_id kaibo submitted. This is kaibo's \
-         own count check against what it sent, not a failure the provider reported. Re-run \
-         `job_get` in case the result is still landing, or look up `{custom_id}` on the \
-         provider's own batch dashboard."
+         own count check against what it sent, not a failure the provider reported. Look up \
+         `{custom_id}` on the provider's own batch dashboard."
     );
     BatchAnswer {
         custom_id,
@@ -2730,7 +2730,7 @@ mod tests {
             !msg.contains("provider error:"),
             "must not read like a provider-reported failure: {msg}"
         );
-        assert!(msg.contains("job_get"), "names what to do: {msg}");
+        assert!(msg.contains("dashboard"), "names what to do: {msg}");
 
         // No submitted count on the handle (a legacy record, or persistence off) — the
         // gap stays silent rather than inventing a count to check against.
