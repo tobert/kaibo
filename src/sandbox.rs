@@ -391,7 +391,8 @@ enum Job {
     /// stdout would truncate it) but never unbounded: `limit` is a hard ceiling on the
     /// bytes pulled into memory, so a file swapped between the caller's `stat` and this
     /// read cannot slurp a giant file and OOM the process — the read stops at `limit`
-    /// and the caller detects the overflow by length (see [`KaishWorker::read_file`]).
+    /// and the caller detects the overflow by length (see
+    /// [`KaishWorker::read_file_capped`]).
     /// It rides through `read_range`, which `LocalFs` honours with `File::take(limit)`
     /// (no whole-file slurp-then-slice), so the ceiling is real, not cosmetic. Same VFS
     /// as every read, so containment and read-only stay structural — an out-of-mount
