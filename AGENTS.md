@@ -443,8 +443,31 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.13.0"`. The `0.12.0 → 0.13.0` bump was
-  again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
+- **kaish pin.** Currently `kaish-kernel = "0.14.0"`. The `0.13.0 → 0.14.0` bump moved
+  **one** call site, and it was a deletion: `kaish_syntax.rs`'s
+  `strip_write_side_paragraphs`, which stripped the shared contract's "Overlay mode"
+  paragraph before it fronted kaibo's read-only shell. kaish-help #297 made that guidance
+  opt-in (`Concept::Overlay`, reached only via `Selector::with_overlay`), so the paragraph
+  stopped arriving and the filter had nothing to remove — its own guard assertion is what
+  failed and told us. The *property* kept its test (`core_carries_no_write_side_teaching`):
+  it now rests on upstream's default plus kaibo never opting in, and it still fails if
+  either changes (proven by sabotage — composing `.with_overlay()` turns it red).
+  Everything else on the checklist was inert here: `jobs --json` gaining a `path` field and
+  lowercase `JobStatus` wire spellings (including the new `Killed`) reach no parse site,
+  because model-facing kaish never grows `jobs`; `KernelConfig::agent()` defaulting
+  `kill_on_parent_death = true` has no children to signal with `subprocess` off;
+  `Kernel::shutdown` taking `&self` matters only to a caller, and kaibo never calls it;
+  `ExecResult.approval` carrying `PendingApproval` is unreachable from a read-only
+  embedder. `ExecuteOptions`, `OutputLimitConfig`, and `ToolArgs` were untouched.
+  **The one thing this bump changes about the boundary:** kaish mounts an approvals ledger
+  at `/v/approvals` in every kernel, unconditionally — a model-readable path kaibo did not
+  have before. It is inert here (a fresh kernel per call means its observation log holds
+  only that call's own commands, and every mutation is refused), but its read-only-ness
+  comes from kaish's `vfs/approvalsfs.rs` chokepoint, **not** from any of kaibo's four
+  levers, because `/v/*` is kernel space our backend never sees. Battery F in
+  `docs/sandbox-probes.md` is how we keep checking the part of the boundary we don't own.
+- **The previous pin, kept because the reasoning pattern is the point.** The
+  `0.12.0 → 0.13.0` bump was again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
   full `cargo test` (598 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc`
   both empty. A large release (six crates bumped, ~270 changelog lines: lexer/parser
   fixes, stricter binary-input handling across several builtins, a browser/wasm target)

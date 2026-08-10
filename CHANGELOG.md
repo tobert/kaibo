@@ -66,6 +66,8 @@ record. Each later release appends a new section at the top.
 
 - **kaibo speaks MCP through the released rmcp 3.1.2**, off the 3.0 beta it shipped on,
   for that line's protocol conformance fixes.
+- **kaibo runs on kaish 0.14.** Its kernels now carry a read-only approvals ledger at
+  `/v/approvals` — readable by the model team, refusing every write, and inert in kaibo.
 - **The built-in deepseek and anthropic synths pin `max_tokens = 32768`** — a measured
   consult showed reasoning consuming half the completion budget before the answer
   started.

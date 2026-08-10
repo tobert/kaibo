@@ -54,36 +54,22 @@ pub fn kaish_operating_contract() -> &'static str {
     CONTRACT.get_or_init(|| compose(&Recipe::tool_description(), &SchemaContent::new(&[])))
 }
 
-/// Strip the canonical contract's write-side paragraphs before it fronts kaibo's
-/// read-only sandbox. The contract is shared upstream text (`kaish-help`) written
-/// for kaish embedders in general; its "Overlay mode" paragraph teaches a virtual
-/// *write* layer and `kaish-vfs commit` — dead weight in every kaibo preamble, and
-/// an active mixed signal one paragraph before "writes are refused". Paragraph-
-/// boundary surgery keyed on the bold heading: if upstream renames it, the
-/// `core_carries_no_write_side_modes` test fails loudly rather than the paragraph
-/// sliding back in silently.
-fn strip_write_side_paragraphs(contract: &str) -> String {
-    contract
-        .split("\n\n")
-        .filter(|p| !p.trim_start().starts_with("**Overlay mode**"))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// The compact, model-facing cheatsheet: the canonical kaish contract (minus its
-/// write-side paragraphs — see [`strip_write_side_paragraphs`]) plus kaibo's
+/// The compact, model-facing cheatsheet: the canonical kaish contract plus kaibo's
 /// sandbox addendum. Every internal preamble and the internal `run_kaish` tool
 /// definition embed this, so there is exactly one place the model-facing framing
 /// lives. Composed once.
+///
+/// kaibo carried a `strip_write_side_paragraphs` filter here until kaish 0.14: the
+/// shared contract used to teach "Overlay mode" (a virtual *write* layer and
+/// `kaish-vfs commit`) to embedders in general, which is dead weight in a kaibo
+/// preamble and a mixed signal one paragraph before "writes are refused". kaish-help
+/// #297 made that guidance opt-in (`Concept::Overlay`, reached only through
+/// `Selector::with_overlay`), so the paragraph no longer arrives and the filter had
+/// nothing left to remove. kaibo never opts in; `core_carries_no_write_side_teaching`
+/// is what keeps that true.
 pub fn kaish_syntax_core() -> &'static str {
     static CORE: OnceLock<String> = OnceLock::new();
-    CORE.get_or_init(|| {
-        format!(
-            "{}\n\n{}",
-            strip_write_side_paragraphs(kaish_operating_contract()),
-            KAISH_SANDBOX_ADDENDUM
-        )
-    })
+    CORE.get_or_init(|| format!("{}\n\n{}", kaish_operating_contract(), KAISH_SANDBOX_ADDENDUM))
 }
 
 /// The internal `run_kaish` (rig) tool description shown to kaibo's own models. It
@@ -411,20 +397,20 @@ mod tests {
         );
     }
 
-    /// kaibo's core is a READ-ONLY surface, so the canonical contract's write-side
-    /// paragraphs must not reach it: upstream `kaish-help` teaches "Overlay mode"
-    /// (a virtual write layer, `kaish-vfs commit`) to embedders in general, and in
-    /// a kaibo preamble that's dead weight contradicting "writes are refused" one
-    /// paragraph later. The filter keys on the bold heading — if upstream renames
-    /// it, this fails loudly instead of the paragraph sliding back in silently.
+    /// kaibo's core is a READ-ONLY surface, so write-side teaching must not reach
+    /// it: "Overlay mode" is a virtual write layer (`kaish-vfs commit`), dead weight
+    /// in a kaibo preamble and a mixed signal one paragraph before "writes are
+    /// refused".
+    ///
+    /// The property is unchanged from the version of this test that guarded kaibo's
+    /// own `strip_write_side_paragraphs` filter; only the mechanism moved. Since
+    /// kaish-help #297 the guidance is opt-in (`Selector::with_overlay`) and kaibo
+    /// never opts in, so upstream's default keeps the paragraph out and the filter
+    /// was retired in the 0.14 bump. This still fails if a future kaish makes
+    /// overlay guidance default-on, or if a kaibo recipe ever opts in — which is
+    /// exactly why it outlived the filter it was written for.
     #[test]
-    fn core_carries_no_write_side_modes() {
-        // The raw upstream contract DOES carry it (otherwise the filter tests
-        // nothing and should be retired along with this assertion).
-        assert!(
-            kaish_operating_contract().contains("Overlay mode"),
-            "upstream contract no longer mentions Overlay mode — retire the filter?"
-        );
+    fn core_carries_no_write_side_teaching() {
         let core = kaish_syntax_core();
         for needle in ["Overlay mode", "kaish-vfs commit"] {
             assert!(
