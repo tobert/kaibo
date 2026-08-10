@@ -196,6 +196,15 @@ pub fn build_readonly_kernel_with_timeout(
     )
 }
 
+/// The output-limit shape every kaibo kernel runs: the agent profile, forced to
+/// in-memory truncation so oversize output never reaches the host disk. Named so a
+/// test can assert the spill mode without building a kernel — see
+/// `output_limit_is_memory_only` in `tests/sandbox.rs`. The byte cap is applied by
+/// the caller; it is the only part of this an operator configures.
+pub fn sandbox_output_limit() -> OutputLimitConfig {
+    OutputLimitConfig::agent().in_memory()
+}
+
 /// Build the read-only kernel with explicit [`SandboxConfig`] limits.
 pub fn build_readonly_kernel_with(
     root: impl Into<PathBuf>,
@@ -243,12 +252,26 @@ fn build_readonly_kernel_and_vfs(
     let project_vfs = Arc::new(vfs);
     let backend: Arc<dyn KernelBackend> = Arc::new(LocalBackend::new(project_vfs.clone()));
 
-    // Start from the agent output limit (head+tail truncation) and set the configured
-    // cap so a runaway `cat` can't flood the caller's context; the timeout bounds
-    // wall clock. Both guards matter for a caller-facing `run_kaish` with no turn cap.
-    let mut output_limit = OutputLimitConfig::agent();
+    // Start from the agent output limit and set the configured cap so a runaway `cat`
+    // can't flood the caller's context; the timeout bounds wall clock. Both guards
+    // matter for a caller-facing `run_kaish` with no turn cap.
+    //
+    // `.in_memory()` is the boundary half, and it is deliberate. `agent()` defaults to
+    // `SpillMode::Disk`: overflow is written whole to a spill file under kaish's runtime
+    // dir and the model is handed the path to range-read. That is the better *reading*
+    // experience — nothing is lost to head+tail — and kaibo declines it, because the
+    // trigger is a model's `cat` and the effect is a file on the host. kaibo's claim is
+    // that a model driving this shell writes nothing anywhere, and "nothing except spill
+    // files under $XDG_RUNTIME_DIR" is a worse sentence than the read it buys.
+    //
+    // We observed in-memory truncation before setting this, so our mount shape was
+    // already producing it; the call makes it a *choice* rather than a side effect that
+    // a future kaish change to spill-path resolution could quietly reverse. kaish names
+    // this mode for exactly this case ("For runtime read-only kernels (e.g. kaibo)").
+    // `sandbox_output_limit` is the seam a test can read.
+    let mut output_limit = sandbox_output_limit();
     output_limit.set_limit(Some(sandbox.output_limit_bytes));
-    // `agent()` already seeds an `.gitignore`-aware filter; override with the resolved
+    // `agent()` already seeds a `.gitignore`-aware filter; override with the resolved
     // `[kaish.ignore]` policy so configured extra ignore files (`.claudeignore`, …)
     // and scope/default toggles reach every file-walking builtin — and the
     // orientation repo-map, which enumerates through this same kernel.
