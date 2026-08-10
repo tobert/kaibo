@@ -203,7 +203,9 @@ pub fn report_preamble() -> String {
          complete, accurate picture of the code a question touches, and you give that \
          picture to the synthesis agent. The synthesis agent writes the final answer \
          from what you found. So your work is to gather grounded evidence and cite it \
-         exactly. \
+         exactly. The tools named in this request are your complete set. Every shell \
+         command is one `run_kaish` call: the tool name is always `run_kaish`, and the \
+         command you want to run goes inside its `script` argument. \
          {core}\n\n\
          HOW TO READ. Read files WHOLE. `cat -n FILE` is your default command for any \
          file the question touches. One read gives you the imports, the types with \
@@ -809,6 +811,30 @@ mod tests {
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
             assert!(p.contains(section), "missing report section {section}: {p}");
         }
+    }
+
+    /// The toolset anchor: the preamble states that the request's tool list is
+    /// complete and that `run_kaish` is the one tool name every shell command rides.
+    /// Installed after a flash-tier explorer under `deliberate`'s two-tool set called
+    /// tools that do not exist (`run_sha`, `run_grail` — morphs of `run_kaish`, the
+    /// model blending "run this command" into a tool *name*). Structural wording on
+    /// purpose: the same preamble serves three toolset variants, so it asserts the
+    /// roster is complete without enumerating it.
+    #[test]
+    fn report_preamble_anchors_the_toolset() {
+        let p = report_preamble();
+        assert!(
+            p.contains("The tools named in this request are your complete set"),
+            "roster completeness is stated: {p}"
+        );
+        assert!(
+            p.contains("the tool name is always `run_kaish`"),
+            "the constant tool name is stated: {p}"
+        );
+        assert!(
+            p.contains("goes inside its `script` argument"),
+            "the name/argument split is stated: {p}"
+        );
     }
 
     /// Every synth-side phase opens on the *same role*, in the vocabulary the code

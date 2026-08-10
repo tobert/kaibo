@@ -69,6 +69,9 @@ record. Each later release appends a new section at the top.
   started.
 - **kaibo's models work from a role, not a job description** — every preamble opens on
   who the model is on kaibo's team, and the obligation to finish rides that identity.
+- **The explorer preamble anchors its toolset** — the request's tool list is stated as
+  complete and `run_kaish` named as the one tool name every shell command rides, aimed
+  at flash-tier explorers inventing `run_*` tool names under a restricted toolset.
 - **kaibo's prompts are written in plain, literal English** — most of the models kaibo
   drives are not English-first, and figurative phrasing costs them attention.
 - **`oneshot` and `deliberate`'s direct lane are one literal request** instead of a
