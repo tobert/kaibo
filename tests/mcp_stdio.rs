@@ -585,15 +585,18 @@ async fn raw_initialize_then_list_tools(
 /// A session at the newest negotiable protocol version receives every field that
 /// version's schema REQUIRES on a list result.
 ///
-/// The failure this pins (live, 2026-08-10): rmcp 3.0.0-beta.5 negotiates
-/// `2026-07-28` — it is in the SDK's known-version list, and its serve loop
-/// overrides any handler attempt to answer lower — but it leaves `ttlMs` and
-/// `cacheScope` unset, which SEP-2549 makes REQUIRED on every list/read result at
-/// that version. A strictly-validating client (Claude Code) rejected the whole
-/// `tools/list` over the two missing fields: zero tools, kaibo unusable until
-/// restart. kaibo now fills them itself (`sep_2549_cache_fields`, `server/mod.rs`)
-/// with the no-caching floor: `ttlMs: 0`, `cacheScope: "private"`. Delete that
-/// helper and let this test fail when a bumped rmcp fills the fields itself.
+/// The failure this pins (live, 2026-08-10): rmcp negotiates `2026-07-28` whenever a
+/// client asks for it, but left `ttlMs` and `cacheScope` unset, which SEP-2549 makes
+/// REQUIRED on every list/read result at that version. A strictly-validating client
+/// (Claude Code) rejected the whole `tools/list` over the two missing fields: zero
+/// tools, kaibo unusable until restart. kaibo fills them itself
+/// (`sep_2549_cache_fields`, `server/mod.rs`) with the no-caching floor: `ttlMs: 0`,
+/// `cacheScope: "private"`.
+///
+/// A newer rmcp filling the fields is not the signal to delete that helper: 3.1.1
+/// fills only the two results its handler macros generate and answers
+/// `cacheScope: public`, which is the wrong answer for a per-user surface. This test
+/// asserts kaibo's values, so it fails if the SDK's ever start winning.
 #[tokio::test]
 async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
     let (init, tools, resources) = raw_initialize_then_list_tools("2026-07-28").await;

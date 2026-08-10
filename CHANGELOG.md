@@ -64,6 +64,8 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **kaibo speaks MCP through the released rmcp 3.1.2**, off the 3.0 beta it shipped on,
+  for that line's protocol conformance fixes.
 - **The built-in deepseek and anthropic synths pin `max_tokens = 32768`** — a measured
   consult showed reasoning consuming half the completion budget before the answer
   started.

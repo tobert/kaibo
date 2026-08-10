@@ -103,7 +103,7 @@ toml = "0.8"
 regex = "1"
 
 # MCP server (stdio only — never bind a socket; the FS is the boundary).
-rmcp = { version = "3.0.0-beta.5", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.1.2", features = ["server", "transport-io", "macros"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -190,7 +190,7 @@ bytes = "1"
 # Dev-only under resolver v2, so the shipped binary's dependency graph is unchanged;
 # `cargo tree -i aws-lc-rs` and `-i mimalloc` stay empty either way (both features are
 # crypto-free — no reqwest, no TLS).
-rmcp = { version = "3.0.0-beta.5", default-features = false, features = [
+rmcp = { version = "3.1.2", default-features = false, features = [
     "client",
     "transport-child-process",
 ] }
