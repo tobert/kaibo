@@ -17,6 +17,8 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or
+  unstaffable tool was still listed and still callable; it is now neither.
 - **`--include-report`'s help described the wrong stream.** It said the report is appended
   below the answer; it goes to stderr, so a script that piped stdout lost it silently.
 - **`--cas-max-bytes` was documented as a "soft cap".** A write past it is refused and

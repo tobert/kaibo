@@ -3492,7 +3492,17 @@ impl KaiboHandler {
     }
 }
 
-#[tool_handler]
+// `router = self.tool_router` is load-bearing, not decoration. The attribute's DEFAULT
+// is `Self::tool_router()` — a fresh router rebuilt from the compile-time `#[tool]` set,
+// which knows nothing about the per-instance gating `new_with_env` applied: dropped
+// routes, the injected `cast` enums, the `alwaysLoad` pin. Naming the field routes
+// `tools/list`, `tools/call`, and `get_tool` through the handler's OWN router, so what
+// the wire advertises and accepts is what `advertised_tools` reports. rmcp 0.16
+// defaulted to the field and 1.x+ defaults to the constructor, so the 0.16 → 3.0 bump
+// silently bypassed every `--no-<tool>` flag and every staffing drop. Only a test that
+// speaks MCP can catch that — a handler-side assertion reads the gated router either
+// way; see `tests/mcp_stdio.rs`.
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for KaiboHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
