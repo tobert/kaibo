@@ -349,7 +349,12 @@ re-prompt that feeds the error back into the conversation as a tool-result/user 
 ("`run_sha` is not a tool; available: `attach`, `run_kaish`") so the model can correct
 itself, with the same loud-warn-per-attempt discipline the malformed retry has.
 Workaround meanwhile: `explorer_model = "deepseek-v4-pro"` (verified working);
-`docs/casts.md` carries the operator-facing note.
+`docs/casts.md` carries the operator-facing guidance, framed clinically (Amy,
+2026-08-10: no specific failures in model-readable docs). Shaping datapoint for
+the fix: the repro ran with the DeepSeek wire's defaults — `thinking` enabled
+plus `reasoning_effort: "high"` are emitted regardless of model id
+(`src/consult/shaping.rs:306`, `:457`) — so deeper thinking is not the missing
+lever; corrective feedback is.
 
 ### Dossier durability — what's left after keep + reuse (2026-08-07)
 A finished dossier now lands in the media CAS and can be handed back as `deliberate`'s

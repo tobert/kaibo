@@ -123,26 +123,27 @@ own request shape — `ModelShape::resolve(backend.kind, slot.id, …)` with its
 slot's overrides — so a cast whose explorer and synth straddle any capability
 line (different kinds, even) is fit per-arm by construction.
 
-## Choosing an explorer (field notes)
+## Choosing an explorer
 
 The explorer's job is cheap bulk reading, so it is the slot where the cheapest
-tier looks tempting — two measured cautions before pinning one:
+tier looks tempting — two considerations before pinning one:
 
-- **Flash-tier explorers can hallucinate tool names on long prompts under a
-  restricted toolset.** `deepseek-v4-flash` twice failed a `deliberate` dossier
-  sweep by calling a tool that does not exist (`run_sha`, `run_grail`) while the
-  same model runs long `consult` sweeps clean; a resend repeats the hallucination
-  (tracked in `docs/issues.md`). A pro-tier explorer on the same backend cleared
-  the identical build. `gemini-flash-lite` has been the reliable flash-tier
-  choice for big dossier builds.
-- **Match the explorer's provider to its token budget, not its synth.** A sweep
-  with whole-file attachments can request 90–130k tokens per minute; on a
-  provider with a tight org TPM ceiling (hosted GPT, measured 2026-08-09) the
-  sweep 429s and a retry self-starves, while the per-call
-  `explorer_backend`/`explorer_model` override to a Gemini explorer built the
-  same dossier first try. Family-match buys the synth's answer nothing — pair an
-  expensive synth with a cross-provider explorer freely; that freedom is the
-  point of the split.
+- **Confabulation risk is why we usually want smarter models.** Under a
+  restricted toolset a small or flash-tier model may confabulate — calling a
+  tool that is not in its set, for example — and a sweep re-run without
+  corrective feedback tends to repeat the confabulation. Thinking depth is not
+  the lever here: kaibo already enables thinking at high effort by default on
+  every wire that supports it, so the reliable lever is model capability.
+  Prefer a pro-tier explorer for a long sweep that must complete (a
+  `deliberate` dossier build); a flash tier fits interactive sweeps, where the
+  consult driver absorbs a failed delegation and answers from its own reads.
+- **Match the explorer to its provider's rate ceiling, not its synth's
+  family.** A sweep with whole-file attachments can request 100k+ tokens per
+  minute; against a tight org TPM ceiling the sweep rate-limits, and a retry
+  self-starves the next window. The per-call `explorer_backend` /
+  `explorer_model` overrides pair any synth with an explorer on a roomier
+  provider — family-match buys the synth's answer nothing, and that freedom is
+  the point of the split.
 
 ## How a call maps
 
