@@ -100,6 +100,10 @@ record. Each later release appends a new section at the top.
 
 - **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or
   unstaffable tool was still listed and still callable; it is now neither.
+- **A new Claude Code sees kaibo's tools again.** The client negotiates protocol
+  `2026-07-28` and requires the `ttlMs`/`cacheScope` fields on every list result; rmcp
+  negotiates that version but leaves them unset, so the client rejected the whole
+  `tools/list` — kaibo now fills them itself (`ttlMs: 0`, `cacheScope: "private"`).
 - **`--include-report`'s help described the wrong stream** — the report goes to stderr,
   so a script that piped stdout lost it silently.
 - **`--cas-max-bytes` was documented as a "soft cap"** — a write past it is refused and

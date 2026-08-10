@@ -21,13 +21,13 @@ use rig_core::completion::Usage;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
-    Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, LoggingLevel, MetaObject, PaginatedRequestParams,
+    CacheScope, CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse,
+    GetPromptResult, Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, LoggingLevel, MetaObject, PaginatedRequestParams,
     ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-    RequestMetaObject, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
-    ServerInfo, SetLevelRequestParams,
+    RequestMetaObject, Resource, ResourceContents, ResourceTemplate, ResultType, Role,
+    ServerCapabilities, ServerInfo, SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -3502,8 +3502,56 @@ impl KaiboHandler {
 // silently bypassed every `--no-<tool>` flag and every staffing drop. Only a test that
 // speaks MCP can catch that — a handler-side assertion reads the gated router either
 // way; see `tests/mcp_stdio.rs`.
+/// The SEP-2549 response-caching fields, filled when this session's negotiated
+/// protocol version requires them (`2026-07-28` and newer), absent otherwise.
+///
+/// rmcp 3.0.0-beta.5 negotiates `2026-07-28` — it is in the SDK's known-version
+/// list, and its serve loop overrides any handler attempt to answer lower — but it
+/// leaves these fields `None` on every result, and that spec version makes them
+/// REQUIRED on every list/read result. A strictly-validating client (Claude Code,
+/// observed 2026-08-10) accepts the negotiated version and then rejects the whole
+/// `tools/list` over the missing fields: zero tools, kaibo unusable until restart.
+/// So kaibo fills them itself, with the no-caching floor stated honestly:
+/// `ttlMs: 0` (immediately stale — the advertised surface is resolved per
+/// connection from env, config, and staffing, so a cached copy goes wrong exactly
+/// when it matters) and `cacheScope: private` (the surface is this user's own
+/// configuration; an intermediary must not serve it to another user). Older
+/// sessions stay on their legacy wire shape with the fields absent. Delete this
+/// when a bumped rmcp fills the fields itself; the raw-wire tests in
+/// `tests/mcp_stdio.rs` pin both sides.
+fn sep_2549_cache_fields(context: &RequestContext<RoleServer>) -> (Option<u64>, Option<CacheScope>) {
+    // ISO `YYYY-MM-DD` versions compare lexically the same as chronologically.
+    let required = context
+        .protocol_version()
+        .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+    if required {
+        (Some(0), Some(CacheScope::Private))
+    } else {
+        (None, None)
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for KaiboHandler {
+    /// What the `#[tool_handler]` macro would generate, plus the SEP-2549 fields a
+    /// `2026-07-28` session requires — writing the method here is what suppresses
+    /// the macro's version (it skips any method the impl already has).
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let (ttl_ms, cache_scope) = sep_2549_cache_fields(&context);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms,
+            cache_scope,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -3555,10 +3603,13 @@ impl rmcp::ServerHandler for KaiboHandler {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
+        let (ttl_ms, cache_scope) = sep_2549_cache_fields(&context);
         Ok(ListResourcesResult {
             resources: kaibo_resources(),
+            ttl_ms,
+            cache_scope,
             ..Default::default()
         })
     }
@@ -3566,10 +3617,13 @@ impl rmcp::ServerHandler for KaiboHandler {
     async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
+        let (ttl_ms, cache_scope) = sep_2549_cache_fields(&context);
         Ok(ListResourceTemplatesResult {
             resource_templates: kaibo_resource_templates(),
+            ttl_ms,
+            cache_scope,
             ..Default::default()
         })
     }
@@ -3577,8 +3631,9 @@ impl rmcp::ServerHandler for KaiboHandler {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
+        let (ttl_ms, cache_scope) = sep_2549_cache_fields(&context);
         // Compute the runtime-derived worktree set here (it needs the handler's
         // allowed_set and reflects worktrees that exist *now*); the renderer is a
         // pure function of its inputs, so it can't reach back for this itself.
@@ -3594,15 +3649,27 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.live_cas_mode(),
             self.cas_ephemeral_fs,
         )
+        .map(|response| match response {
+            // SEP-2549 covers read results too; fill the same session-gated fields.
+            ReadResourceResponse::Complete(mut result) => {
+                result.ttl_ms = ttl_ms;
+                result.cache_scope = cache_scope;
+                ReadResourceResponse::Complete(result)
+            }
+            other => other,
+        })
     }
 
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
+        let (ttl_ms, cache_scope) = sep_2549_cache_fields(&context);
         Ok(ListPromptsResult {
             prompts: kaibo_prompts(),
+            ttl_ms,
+            cache_scope,
             ..Default::default()
         })
     }

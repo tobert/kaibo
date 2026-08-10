@@ -468,3 +468,181 @@ async fn consult_carries_the_always_load_pin_and_no_other_tool_does() {
 
     server.shutdown().await;
 }
+
+/// A raw JSON-RPC exchange over the binary's stdio, bypassing rmcp's client so the
+/// test controls the exact `protocolVersion` on the wire. rmcp's client always asks
+/// for its own latest, so the version-skew cases below are unreachable through it.
+///
+/// Same blank-environment rule as [`Server`]: `env_clear()`, then temp `HOME`/XDG
+/// roots, so nothing from the developer's shell shapes the server under test.
+async fn raw_initialize_then_list_tools(
+    client_version: &str,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let xdg = TempDir::new().expect("tempdir for the child's HOME/XDG roots");
+    let project = TempDir::new().expect("tempdir for the served project");
+    std::fs::write(project.path().join("Cargo.toml"), "[package]\n")
+        .expect("seed the temp project");
+    let home = xdg.path().join("home");
+    let config_home = xdg.path().join("config");
+    let state_home = xdg.path().join("state");
+    let data_home = xdg.path().join("data");
+    for dir in [&home, &config_home, &state_home, &data_home] {
+        std::fs::create_dir_all(dir).expect("create an XDG root");
+    }
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_kaibo"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("RUST_LOG", "error")
+        .arg("--root")
+        .arg(project.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the kaibo binary");
+
+    let mut stdin = child.stdin.take().expect("child stdin is piped");
+    let stdout = child.stdout.take().expect("child stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+
+    async fn call(
+        stdin: &mut tokio::process::ChildStdin,
+        lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        what: &str,
+        msg: serde_json::Value,
+        id: u64,
+    ) -> serde_json::Value {
+        stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .expect("write a request line");
+        loop {
+            let line = bounded(what, lines.next_line())
+                .await
+                .expect("read a response line")
+                .unwrap_or_else(|| panic!("{what}: the server closed stdout"));
+            let value: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("{what}: bad JSON: {e}"));
+            if value.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                return value;
+            }
+        }
+    }
+
+    let init = call(
+        &mut stdin,
+        &mut lines,
+        "raw initialize",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": client_version,
+                "capabilities": {},
+                "clientInfo": { "name": "raw-probe", "version": "0" }
+            }
+        }),
+        1,
+    )
+    .await;
+
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("write the initialized notification");
+
+    let tools = call(
+        &mut stdin,
+        &mut lines,
+        "raw tools/list",
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+        2,
+    )
+    .await;
+
+    let resources = call(
+        &mut stdin,
+        &mut lines,
+        "raw resources/list",
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {} }),
+        3,
+    )
+    .await;
+
+    child.kill().await.ok();
+    (
+        init["result"].clone(),
+        tools["result"].clone(),
+        resources["result"].clone(),
+    )
+}
+
+/// A session at the newest negotiable protocol version receives every field that
+/// version's schema REQUIRES on a list result.
+///
+/// The failure this pins (live, 2026-08-10): rmcp 3.0.0-beta.5 negotiates
+/// `2026-07-28` — it is in the SDK's known-version list, and its serve loop
+/// overrides any handler attempt to answer lower — but it leaves `ttlMs` and
+/// `cacheScope` unset, which SEP-2549 makes REQUIRED on every list/read result at
+/// that version. A strictly-validating client (Claude Code) rejected the whole
+/// `tools/list` over the two missing fields: zero tools, kaibo unusable until
+/// restart. kaibo now fills them itself (`sep_2549_cache_fields`, `server/mod.rs`)
+/// with the no-caching floor: `ttlMs: 0`, `cacheScope: "private"`. Delete that
+/// helper and let this test fail when a bumped rmcp fills the fields itself.
+#[tokio::test]
+async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
+    let (init, tools, resources) = raw_initialize_then_list_tools("2026-07-28").await;
+
+    assert_eq!(
+        init["protocolVersion"], "2026-07-28",
+        "rmcp echoes a known client version; the fix serves that contract rather \
+         than fighting the echo; got: {init}"
+    );
+
+    for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+        assert_eq!(
+            result["ttlMs"], 0,
+            "{what} must carry the REQUIRED `ttlMs`, as the no-caching floor; got: {result}"
+        );
+        assert_eq!(
+            result["cacheScope"], "private",
+            "{what} must carry the REQUIRED `cacheScope`; the surface is this \
+             user's own configuration; got: {result}"
+        );
+        assert_eq!(
+            result["resultType"], "complete",
+            "{what} carries the SEP-2322 discriminator at this version; got: {result}"
+        );
+    }
+    let served = tools["tools"].as_array().expect("tools/list carries a tools array");
+    assert!(
+        !served.is_empty(),
+        "the session serves the real tool surface alongside the cache fields"
+    );
+}
+
+/// A client on an older protocol version keeps the legacy wire shape — none of the
+/// newer contract's fields leak into a session whose schema does not know them.
+#[tokio::test]
+async fn an_older_protocol_session_keeps_the_legacy_wire_shape() {
+    let (init, tools, resources) = raw_initialize_then_list_tools("2025-06-18").await;
+
+    assert_eq!(
+        init["protocolVersion"], "2025-06-18",
+        "an in-range client version is echoed, not lifted or lowered; got: {init}"
+    );
+    for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+        for field in ["ttlMs", "cacheScope", "resultType"] {
+            assert!(
+                result.get(field).is_none(),
+                "{what}: no newer-contract `{field}` leaks into an older session; \
+                 got: {result}"
+            );
+        }
+    }
+}
