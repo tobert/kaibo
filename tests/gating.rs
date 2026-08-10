@@ -401,15 +401,17 @@ fn a_server_left_with_no_staffable_tools_refuses_to_start() {
     )
     .expect("write config");
 
+    // Blank environment, then rebuild only what the test means: a spawned kaibo starts
+    // from `env_clear()` so nothing from the developer's shell — a provider key, a
+    // `KAIBO_*` override — can re-staff a cast or reconfigure the server under test. An
+    // enumerated `env_remove` list rots the day a new variable ships; clearing cannot.
+    // `HOME` points at an empty temp dir so the default key-file paths resolve to
+    // nothing instead of the developer's real keyring.
+    let home = tempfile::tempdir().expect("tempdir for the child's HOME");
     let out = Command::new(env!("CARGO_BIN_EXE_kaibo"))
+        .env_clear()
+        .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", dir.path())
-        // Clear every provider key so the fixture's unreachable key files are the whole
-        // story — otherwise a developer's own environment re-staffs the casts.
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("DEEPSEEK_API_KEY")
-        .env_remove("GEMINI_API_KEY")
-        .env_remove("OPENROUTER_API_KEY")
-        .env_remove("OPENAI_API_KEY")
         // The two tools no cast can affect — off, so staffing decides everything.
         .args(["--no-run-kaish", "--no-list-models"])
         .output()
@@ -443,11 +445,14 @@ fn a_server_left_with_no_staffable_tools_refuses_to_start() {
 /// has to be able to catch a zero-tool misconfiguration.
 #[test]
 fn all_tools_disabled_refuses_to_start() {
-    // Isolate from the developer's real ~/.config/kaibo/config.toml: point
-    // XDG_CONFIG_HOME at an empty dir so the binary runs on built-ins and the
-    // failure under test (zero tools) is the only one in play.
+    // Blank environment, then rebuild only what the test means (see the sibling test
+    // above): built-ins only, an empty `HOME`, and no `KAIBO_*` from the developer's
+    // shell, so the failure under test (zero tools) is the only one in play.
     let empty_config = tempfile::tempdir().expect("tempdir for an isolated XDG_CONFIG_HOME");
+    let home = tempfile::tempdir().expect("tempdir for the child's HOME");
     let out = Command::new(env!("CARGO_BIN_EXE_kaibo"))
+        .env_clear()
+        .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", empty_config.path())
         .args([
             "--no-consult",

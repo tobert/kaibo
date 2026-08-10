@@ -136,6 +136,12 @@ project and cannot run external commands.
 - **TDD.** Tests that can and will fail. The sandbox boundary gets failing-first
   tests — and we prove they actually work (e.g. mount the project writable with
   `LocalFs::new` instead of `read_only`, watch the write-denial tests fail).
+- **Tests start from a blank environment.** A test that spawns the kaibo binary
+  clears the child's env (`env_clear()`) and rebuilds only what it means — temp
+  `HOME` and XDG roots — never an enumerated `env_remove` list, which rots the day
+  a new variable ships. In-process tests inject env through `load_with`'s map, not
+  the process environment. So a developer's keys and `KAIBO_*` overrides can never
+  change what a test observes (`tests/mcp_stdio.rs` is the model).
 - **`docs/sandbox-probes.md` is the read-only/containment audit runbook.** The
   `cargo test` suites are the continuous guard; that doc is how we *live-test* the
   shipped boundary now and then (write/external/read-escape/env/path batteries via
