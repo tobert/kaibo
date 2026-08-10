@@ -76,6 +76,8 @@ record. Each later release appends a new section at the top.
   at flash-tier explorers inventing `run_*` tool names under a restricted toolset.
 - **kaibo's prompts are written in plain, literal English** — most of the models kaibo
   drives are not English-first, and figurative phrasing costs them attention.
+- **kaibo's models read a wide span around a grep hit in a large file, and run `file`
+  on an unfamiliar one** — whole-file reading stays the default everywhere else.
 - **`oneshot` and `deliberate`'s direct lane are one literal request** instead of a
   toolless pass through the managed loop — proven request-for-request identical.
 - **Batch treats `effort` as a floor, not an override** — a slot asking deeper than the
