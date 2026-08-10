@@ -15,393 +15,132 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+
+- **`deliberate` keeps its dossier in the media CAS, and `dossier` reuses one** — hand
+  the digest to a second cast to reason over the same evidence for one synth's price.
+- **A refused dossier write never fails the deliberation** — you lose the record, not
+  the answer.
+- **Batch deliberations persist their handle**, labelled with the dossier's address, so
+  `job_list` leads back to the evidence after a restart.
+- **`kaibo deliberate`** — a batch cast prints the durable handle and exits; a direct
+  cast runs in the foreground and prints the answer
+  ([#82](https://github.com/tobert/kaibo/issues/82)).
+- **`kaibo batch cancel <handle>`** — the wording says "requested", because a provider
+  finishes what is already in flight.
+- **`kaibo generate`** renders into the artifact store; a deferred render polls in the
+  foreground rather than returning a handle nothing could collect.
+- **`kaibo cas read <digest>`** — metadata to stderr, content to stdout, binary as raw
+  bytes; `read` is the only verb, and the store keeps no index.
+- **kaibo warns when the media CAS sits on a filesystem that will not survive the
+  container** (overlayfs/tmpfs/ramfs, Linux) — it proceeds, and `[cas] backing` in
+  `kaibo://config` reports the finding.
+- **`read_cas` — read a stored artifact back by digest.** Metadata always leads; reads
+  are bounded, ranges always advance, and an image up to 5 MiB arrives whole and
+  viewable.
+- **A consult can hand you bulk output as an artifact instead of spending your context
+  on it** (`save_artifacts: true`) — opt-in via `[artifacts] enabled`, fixed limits, a
+  save past one refused rather than truncated.
+- **A second media kind: `openai-images`** — hosted OpenAI image generation and a local
+  `sd-server` through one backend kind, several images per `generate` call (`n`).
+- **kaibo can generate images**: the `generate` tool renders a prompt through a cast's
+  `image` slot (Stability first) into a content-addressed media store — digests and
+  provenance sidecars, never inline bytes.
+- **The media CAS has a lifecycle, and it follows persistence** — durable on disk while
+  persistence is active, in-memory without it, `[cas] enabled = false` off entirely.
+- **Artifact retrieval is operator-surface only** — the inner model team never sees the
+  CAS, so one project's team cannot enumerate another's artifacts.
+- **Model listings show each model's output ceiling** beside the context window — size a
+  synth slot's `max_tokens` from it.
+- **The explorer can hand whole files to whoever reads its report** — an `attach` tool
+  routes real bytes (images too) into the driver's context or the `deliberate` dossier,
+  governed by `[defaults] max_attachments`.
+- **Traces say how each model turn ended** — `run_phase` spans carry
+  `gen_ai.response.finish_reason`, tool-loop turns included, with no per-provider code.
+- **`effort = "max"` reaches hosted GPT-5.6** — the wall was rig's, removed by rig 0.41;
+  kaibo reads the accepted rungs back out of the client on every call.
+- **New MCP resource `kaibo://config/guide`** — the configuration manual embedded in the
+  binary; example / live state / guide now split by job.
+
+### Changed
+
+- **The built-in deepseek and anthropic synths pin `max_tokens = 32768`** — a measured
+  consult showed reasoning consuming half the completion budget before the answer
+  started.
+- **kaibo's models work from a role, not a job description** — every preamble opens on
+  who the model is on kaibo's team, and the obligation to finish rides that identity.
+- **kaibo's prompts are written in plain, literal English** — most of the models kaibo
+  drives are not English-first, and figurative phrasing costs them attention.
+- **`oneshot` and `deliberate`'s direct lane are one literal request** instead of a
+  toolless pass through the managed loop — proven request-for-request identical.
+- **Batch treats `effort` as a floor, not an override** — a slot asking deeper than the
+  batch floor keeps its rung; a shallower one is still lifted.
+- **`effort = "none"` survives the batch lane** — "off" is not a depth, so a fan-out
+  with reasoning off stays off instead of billing thinking on every item.
+- **kaibo no longer advertises a tool no configured cast can staff** — a startup warning
+  names the cast shape that would bring each tool back, and `[runtime]` in
+  `kaibo://config` reports `advertised_tools` and `unstaffable_tools`.
+- **kaibo refuses to start when nothing is left to advertise** — the staffing road to an
+  empty surface now exits non-zero like the all-flags-off road always has.
+- **`docs/config.example.toml` is leaner, and `docs/config.md` reads as a reference
+  manual** — explanation moved from the template to the guide, which was rewritten in
+  technical-reference style.
+- **The example config documents four knobs it had been missing** — `[persistence]`,
+  `[orientation]`, `job_capacity`, and `inline_attach_budget`.
+- **The tool is plain "kaibo" now** — the 解剖 kanji appears only in the README's
+  `## Name` section; that reading is a coincidence of how the name was built, not the
+  name itself.
+
+### Removed
+
+- **The `kaibo://cas/<digest>` MCP resource** — never in a release, replaced by the
+  `read_cas` tool; a stale request for the URI answers with the migration.
+
 ### Fixed
 
 - **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or
   unstaffable tool was still listed and still callable; it is now neither.
-- **`--include-report`'s help described the wrong stream.** It said the report is appended
-  below the answer; it goes to stderr, so a script that piped stdout lost it silently.
-- **`--cas-max-bytes` was documented as a "soft cap".** A write past it is refused and
-  nothing is evicted — an operator would have found that out by losing a generation.
-- **`kaibo batch` advertised "half price"** as a fact kaibo does not control. It now says
-  "typically", and the refusals that name a provider kind print the config spelling
-  (`deepseek`) instead of the Rust one (`DeepSeek`).
-
-### Added
-
-- **`deliberate` keeps its dossier, and `--dossier` reuses one.** The explorer sweep is
-  the expensive half of a deliberation, so it is now stored and addressable — read it back
-  with `read_cas`, or hand the digest to a second cast to reason over the same evidence for
-  the price of one synth. Rides `[cas] enabled`; no new key.
-- **A refused dossier write never fails the deliberation** — you lose the record, not the
-  answer.
-- **Batch deliberations persist their handle**, labelled with the dossier's address, so
-  `job_list` leads back to the evidence after a restart.
-- **`kaibo deliberate` on the command line.** A batch cast prints the durable handle and
-  exits (`HANDLE=$(kaibo deliberate …)`, then `kaibo batch get "$HANDLE"`); a direct cast
-  runs the long local completion in the foreground and prints the answer, because a
-  one-shot process has no server to hold a job open ([#82](https://github.com/tobert/kaibo/issues/82)).
-- **`kaibo batch cancel <handle>`** — the CLI could submit and list but never stop. The
-  wording says "requested", because a provider finishes what is already in flight.
-- **`kaibo generate`** renders into the artifact store; a deferred render polls in the
-  foreground rather than returning a handle nothing could collect.
-- **`kaibo cas read <digest>`** reads an artifact back: metadata to stderr, content to
-  stdout — text as text, binary as raw bytes, so `> arch.png` needs no flag. `read` is the
-  only verb; the store keeps no index, so there is no listing, usage report, or delete.
-
-- **kaibo warns when the media CAS is on a disk that will not survive the
-  container.** A container with no volume mounted looks exactly like durable disk
-  mode: persistence comes up, the store opens, artifacts write and read back — and
-  the whole filesystem evaporates on exit, after you have paid provider credits for
-  what was in it. On Linux, startup now checks the CAS directory's backing
-  filesystem and warns severely on overlayfs, tmpfs, or ramfs, naming the filesystem
-  and the directory. It **proceeds** — a throwaway store is a legitimate thing to
-  run on purpose — and `kaibo://config` reports the finding under `[cas] backing`
-  (as does `kaibo config`), so it is checkable before you spend anything instead of
-  only in startup log. A durable filesystem, or a check that cannot answer, says
-  nothing at all.
-
-- **`read_cas` — read a stored artifact back by digest.** Metadata comes first on
-  every response: mime, total size, binary or not, the artifact's label when its
-  record carries one, the range served, and the real file path when the store is on
-  disk (open that directly for anything large). Reads are bounded, and the default
-  fits the object: text gives up to 64 KiB from `offset` and tells you the total so
-  you can page; an image up to 5 MiB arrives whole and viewable, a larger one as
-  metadata alone; any other binary gives metadata until you ask for a range. `length`
-  is capped at 1 MiB and a larger ask is refused rather than trimmed, and paging always
-  advances — a window landing inside a multi-byte character returns those exact bytes
-  as base64 with a note, so a caller resuming at the range it was handed never stalls.
-  Advertised whenever the media CAS is on.
-
-- **A consult can hand you bulk output as an artifact instead of spending your
-  context on it.** Ask with `save_artifacts: true` and the investigating model can
-  write a generated corpus, a long inventory, or a fixture into kaibo's media store;
-  the answer names each `kaibo://cas/<digest>` and you choose what to read. Off
-  unless an operator turns it on — `[artifacts] enabled = true`,
-  `KAIBO_ARTIFACTS_ENABLED`, or `--allow-save-artifact` (serve only) — which makes it
-  kaibo's first opt-in capability rather than a `--no-<tool>` gate. Limits are fixed
-  (1 MiB per artifact, 8 artifacts and 8 MiB per call) and a save past one is refused
-  rather than truncated, naming the limit it hit. A consult that saved and then failed
-  still reports the digests, and a call with a `session_id` keeps them beside the
-  conversation.
-
-- **A second media kind: `openai-images`.** One backend kind covers hosted OpenAI
-  image generation (gpt-image-1) *and* a local stable-diffusion.cpp `sd-server`,
-  which speaks the same `/v1/images/generations` shape — `base_url` picks the
-  target (unset dials hosted OpenAI, so the key is required by default), keys ride
-  the same `OPENAI_API_KEY` / `~/.openai-key` sources as the `openai` kind, and a
-  keyless local server opts in with `key_optional = true`. A single `generate`
-  call can now return several images (the `n` field), each stored under its own
-  digest — and `fields` values keep their JSON types (`n` as a number, `user` as
-  a string) all the way to the provider, on every media kind.
-
-- **kaibo can now generate images.** A new `generate` tool turns a text prompt into
-  artifacts through the cast's new `image` slot — a media backend (Stability's v2beta
-  `core`/`ultra`/SD3.5 family) riding beside the reasoning slots, e.g.
-  `[casts.artist] image = "sd/core"`. The tool never inlines bytes: every artifact
-  lands in kaibo's content-addressed media store under its own SHA-256 digest with a
-  provenance sidecar (prompt, model, cast, timestamp, mime, seed), and the result
-  lists per-artifact `kaibo://cas/<digest>` addresses — plus the real file path
-  when the store is on disk. Provider-native options (`aspect_ratio`,
-  `output_format`, `seed`, `negative_prompt`, ...) pass through a `fields` object
-  verbatim. Operations the provider declares deferred return a `job-N` handle on the
-  existing `job_wait`/`job_get`/`job_list`/`job_cancel` verbs (the lane ships
-  offline-tested; every Stability operation wired today is synchronous). The tool
-  follows the
-  staffing discipline: no configured cast with an `image` slot (a stock install)
-  means it is not advertised and costs nothing; `--no-generate` /
-  `KAIBO_NO_GENERATE` / `[server.tools] generate = false` switch it off explicitly.
-
-- **The media CAS has a lifecycle, and it follows persistence.** While persistence is
-  active, generated artifacts are durable on disk at `[cas] dir` (default
-  `$XDG_DATA_HOME/kaibo/cas`). Without persistence (off, or degraded) the CAS runs
-  in memory: artifacts stay fetchable by digest for that run only, and startup warns
-  loudly that they will not survive a restart. `[cas] enabled = false` turns the
-  store off entirely and un-advertises every tool that needs it. `kaibo://config`
-  gains a `[cas]` section reporting the knob and the live mode
-  (`disk` / `memory` / `off`).
-
-- **Artifact retrieval is operator-surface only.** The `read_cas` tool serves an
-  artifact's content to the calling client — the inner model team never sees the CAS:
-  it is not mounted into kaish and no cast-facing tool reads it, so one project's team
-  can never enumerate another project's artifacts.
-
-- **Model listings show each model's output ceiling.** `kaibo models` and `list_models`
-  render the provider's advertised max completion tokens beside the context window
-  (`output_ceiling` in the JSON face); the configure prompt and config guide now say to
-  size a synth slot's `max_tokens` from it.
-
-- **The explorer can now hand whole files to whoever reads its report.** Inside
-  `consult` and `deliberate`, the delegated investigator gets an `attach` tool: when a
-  whole file is the evidence, it routes the file's real bytes (numbered, `cat -n`
-  style) alongside its report — into the consult driver's context, or into the
-  `deliberate` dossier the offline model reasons over — instead of transcribing spans
-  through its own small budget. Images ride too: an explorer that can't see a PNG can
-  still staple it to a vision-capable answering model, and is told plainly when the
-  reader is text-only. Governed by `[defaults] max_attachments` (files per sweep;
-  default 32, `0` disables the tool), also settable via `KAIBO_MAX_ATTACHMENTS` and
-  `--max-attachments`; every routed file surfaces as a progress beat so you can watch
-  what the explorer chose.
-
-- **Traces now say how each model turn *ended*.** A `run_phase` span carries
-  `gen_ai.response.finish_reason` — the provider's own word for why generation stopped
-  (`end_turn`, `max_tokens`, `content_filter`, Gemini's `MAX_TOKENS`, OpenAI Responses'
-  `max_output_tokens`). Providers have always reported it; rig's agent layer discarded it
-  before kaibo could look, which is why a consult that came back empty was
-  indistinguishable from one that was truncated or refused by a classifier. kaibo now
-  observes every completion on its way past — the turns *inside* the tool loop included —
-  with no per-provider code, and an unfamiliar response shape simply reports nothing
-  rather than breaking the call.
-
-- **`effort = "max"` now reaches hosted GPT-5.6.** kaibo has always accepted `max` as a
-  rung and always sent it faithfully; the wall was rig's, whose typed OpenAI Responses
-  request stopped one rung short of OpenAI's own API and refused `max` before the
-  request was even built. Upgrading to rig 0.41 removes that wall. Nothing in kaibo
-  changed to make it work — the accepted-rung list is read back out of rig on every
-  call rather than restated — so if you had `synth_effort = "max"` on a hosted GPT slot
-  and were getting a refusal naming the cast and the rungs, you simply stop getting one.
-  Gemini's ceiling (`high`) is unchanged and still correct: that one is Google's limit,
-  not rig's.
-
-- **New MCP resource: `kaibo://config/guide`** — the full configuration manual
-  (`docs/config.md`), embedded in the binary the way the annotated template already is.
-  An agent configuring kaibo over MCP has no access to kaibo's own `docs/`, so until now
-  every explanation had to be smuggled into `config.toml`'s comments, where it cost bytes
-  on every read. The three config resources now split by job: `kaibo://config/example` is
-  the template you copy, `kaibo://config` is the resolved live state, and
-  `kaibo://config/guide` explains what any of it means. The `configure` prompt points at
-  all three.
-
-### Removed
-
-- **The `kaibo://cas/<digest>` MCP resource** — briefly on `main`, never in a release,
-  replaced before shipping by the `read_cas` tool above. A stale request for that URI
-  answers with the migration rather than a bare unknown-resource error.
-
-### Changed
-
-- **The built-in deepseek and anthropic synths pin `max_tokens = 32768`** (the 16384
-  `[defaults]` floor is unchanged): a measured consult showed reasoning consuming half
-  the completion budget before the answer started.
-
-- **kaibo's models now work from a role, not a job description.** Every preamble opens
-  on who the model is on kaibo's team — "You are the synthesis agent", "You are the
-  explorer" — where it used to say "a capable model", and the obligation to finish rides
-  that identity: the synthesis agent's final turn *is* the answer, the explorer's last
-  turn *is* the report. This is the prompt-side half of a real failure — a consult that
-  stopped mid-investigation and handed back an empty answer as a success. The `consult`
-  driver is also told plainly why delegating a sweep pays (a trace caught one taking all
-  203 turns itself and never delegating), and the sweep that builds a `deliberate`
-  dossier is now told to read *holistically*: its offline synth never sees the code, so
-  whatever the dossier leaves out is missing for good.
-
-- **kaibo's prompts are now written in plain, literal English.** Every preamble, the
-  kaish cheatsheet, and the attachment directives were rewritten as declarative
-  sentences: no idiom, no metaphor, no em-dash clause chains. Most of the models kaibo
-  drives are not English-first, and the small local models already fixate on odd
-  phrasing, so a figurative instruction costs them attention that should go to the code.
-  Expect this to show up most on the DeepSeek, GLM, Qwen, Kimi, and local casts.
-
-- **`oneshot` and `deliberate`'s direct lane are now one literal request.** Both are
-  toolless by definition — the caller owns the context — but both reached the provider
-  through the managed tool loop carrying an empty toolset, arriving at the same place by
-  a longer road. They now ask the model directly. Same preamble, same params, same
-  answer, same token accounting; the request that goes out is proven request-for-request
-  identical to the one the loop built.
-
-- **Batch treats `effort` as a floor, not an override.** Every other batch knob
-  already worked this way: `max_tokens` and the thinking budget rise to a batch
-  minimum but never undercut a slot that asked for more. `effort` alone was
-  clobbered in both directions, so a cast deliberately tuned to `xhigh`/`max` for the
-  offline lane was quietly demoted to `high`. Now a slot asking deeper than the batch
-  floor keeps its rung, a shallower one is still lifted (batch is the lane that
-  spends), and a rung kaibo doesn't recognize passes through untouched rather than
-  being replaced.
-
-- **`effort = "none"` survives the batch lane.** The floor raises reasoning *depth*,
-  and "off" isn't a depth — so a `batch_submit` fan-out you turned reasoning off for
-  stays off, instead of being lifted to `high` and billing thinking on every item. That
-  matters most exactly where batch is cheapest: bulk extraction and classification over
-  many prompts.
-
-
-- **kaibo no longer advertises a tool no configured cast can run.** A tool now has to
-  clear two gates to appear: its `--no-<tool>` flag, and a cast that can actually staff
-  it. The visible effect on a stock install is `deliberate`, which was advertised but
-  dead on arrival — it needs an explorer paired with an offline synth, and no built-in
-  cast has that shape, so every call failed `cast "…" has no explorer slot` while the
-  tool still cost resident tokens in every session. It now stays hidden until you
-  configure a cast that can run it (`docs/config.example.toml`'s DELIBERATE section,
-  where any of the three hosted batch providers or a big local model on the `direct`
-  lane will do). The same rule covers `explore`, `batch_submit`, `consult`/`oneshot`,
-  and the job-collect verbs, which follow whichever handle producers are live.
-
-  Because vanishing is right for the calling agent and wrong for the operator, kaibo
-  says so twice: a startup warning naming the cast *shape* that would bring each tool
-  back, and a `[runtime]` entry in `kaibo://config` — `advertised_tools` for what the
-  server really serves, `unstaffable_tools` for each tool held back plus what it wants.
-  A tool you turned off yourself is reported in `[tools]` as before and never appears
-  as unstaffable — "you disabled it" and "nothing can run it" are different answers and
-  are kept apart.
-
-- **kaibo refuses to start when nothing is left to advertise.** It already refused a
-  server with every tool switched off; staffing opened a second road to the same useless
-  state (every cast-taking tool enabled but unstaffable, with `run_kaish` and
-  `list_models` disabled), which would previously have started and served an empty tool
-  list in silence. That now exits non-zero naming the cause, alongside the per-tool
-  warnings that say what each tool wanted.
-
-
-- **`docs/config.example.toml` is leaner, and `docs/config.md` reads as a reference
-  manual.** The template had been accumulating explanation that belongs in the manual —
-  a whole hand-copied table of the staffing rules above, for instance, which the running
-  server already reports for your actual config. That detail moved to the guide's new
-  "Tool gating" section and the template points at it, so the file you read while editing
-  your config is mostly the knobs you're editing. The guide itself was rewritten in
-  technical-reference style throughout: settings in tables with their defaults and
-  constraints, rules stated plainly, and the design-history essay dropped in favour of
-  `docs/casts.md`, which is the design record. No behavior changed and no rule was
-  dropped.
-
-- **`docs/config.example.toml` documents four knobs it had been missing** —
-  `[persistence]`, `[orientation]`, `job_capacity`, and `inline_attach_budget`. The
-  resource description promised "every option with its default"; now that is true.
-- **The tool is plain "kaibo" now.** The 解剖 kanji no longer rides along with the
-  name in the MCP handshake, the CLI `--help` banner, the example config, or the
-  docs — that reading is a coincidence of how the name was built (kai + aibo), not
-  the name itself, and repeating it everywhere implied otherwise. The README's
-  `## Name` section keeps the story and is now the one place it appears. No
-  behavior, flags, or tool names changed.
-
-### Fixed
-
+- **`--include-report`'s help described the wrong stream** — the report goes to stderr,
+  so a script that piped stdout lost it silently.
+- **`--cas-max-bytes` was documented as a "soft cap"** — a write past it is refused and
+  nothing is evicted.
+- **`kaibo batch` advertised "half price"** as a fact kaibo does not control — it says
+  "typically" now, and refusals print config spellings (`deepseek`, not `DeepSeek`).
 - **One malformed tool call no longer discards the investigation** — kaibo sends that
   request twice more before failing the call.
-- **A batch result no longer under-reports silently** — `job_get`/`job_wait` now flag any
+- **A batch result no longer under-reports silently** — `job_get`/`job_wait` flag any
   submitted `custom_id` a provider never returned as a loud per-item failure.
-
 - **A consultation that produced no answer no longer comes back as a successful empty
-  one.** A reasoning model's final turn can carry reasoning but no answer text, and
-  kaibo would dress that empty string in a provenance footer and return it as success —
-  no error, no signal that the review had not happened. Every phase (`consult`,
-  `explore`, `oneshot`, `deliberate`) now checks its answer: if the model had already
-  gathered evidence, kaibo asks it once to write up what it found, which usually
-  recovers the answer (both attempts' tokens counted in the footer); if it had gathered
-  nothing, the call fails with its diagnostics attached (turns used, token counts, and
-  the provider's own finish reason when it reported one) rather than pressing an
-  evidence-free model into an ungrounded answer.
-
-- **An empty-answer failure now reads as what it is — a retryable model outcome, not a
-  kaibo bug.** The failure classifier predates the empty-answer guard above and did not
-  know its vocabulary, so every empty-answer error was wrapped in "This is a kaibo-side
-  error (not the provider) — please report it" around inner text that said "Retry" —
-  contradictory guidance blaming kaibo for the model's silence. The guidance now says the
-  model delivered no answer text, invites a retry or a different cast, and points at the
-  slot's `max_tokens` when the provider reported the answer was cut off by length.
-
-- **A vision model still sees the image after the `rig` 0.41 upgrade.** rig 0.41 stopped
-  inspecting a tool's text output to discover rich content in it, which would have
-  silently turned every `view_image` result into base64 text labelled JSON — the model
-  would have received a wall of characters instead of a picture, with no error anywhere.
-  `view_image` now hands rig a declared image block instead of a JSON envelope for rig to
-  recognize, which is both the supported path and a sturdier one.
-
-- **A tool failure is readable by the model again.** rig 0.41 began replacing an
-  arbitrary tool error with a generic "the tool failed" before showing it to the model.
-  kaibo's tool errors are written *for* the model — `view_image` names the file, the
-  workspace, and the fix (copy it in, crop it, use `run_kaish` instead); a dead
-  `explore` sweep is what tells the driver to answer from its own reads rather than
-  retry blind. All three tools now keep their message model-visible, so a recoverable
-  failure stays recoverable. The full text remains available to operators either way.
-
-- **A reasoning `effort` your provider client can't accept now fails with a message
-  you can act on.** Two request shapes — Gemini and OpenAI's Responses API — go
-  through a typed builder in the underlying `rig` client whose reasoning levels are a
-  closed set: Gemini takes only `minimal`/`low`/`medium`/`high`, and Responses stopped
-  at `xhigh` even though OpenAI's own API accepts `max` (rig 0.41 has since added
-  `max`; Gemini's ceiling stands). A rung outside those used to
-  die mid-call with a bare ``unknown variant `max` `` naming neither the cast nor the
-  slot that asked for it. kaibo now checks the same builder up front and refuses with
-  the cast, the role, the backend, the model, whose ceiling it is, and the rungs that
-  path *does* take. kaibo still keeps **no allowlist of its own** — that list is read
-  back out of the client, so a rung a provider (or a client upgrade) makes available
-  works immediately, with no kaibo release.
-
-- **`[defaults] synth_effort = "xhigh"` no longer quietly breaks every Gemini cast.**
-  The shipped example config invited exactly that value; on Gemini it produced a
-  failed call with an opaque message. The docs now carry the real per-provider
-  ladders — including that OpenAI's rungs differ **per model** (`gpt-5.6` reaches
-  `max`, `gpt-5.2` stops at `xhigh`, `gpt-5.1` at `high`) — instead of implying one
-  universal ladder.
-
-- **`effort = "none"` on a DeepSeek slot now actually turns reasoning off.** kaibo
-  was sending "reasoning enabled" alongside "zero effort"; the enable won, so the
-  opt-out did nothing and still billed reasoning tokens (160–253 on a probe). It now
-  sends DeepSeek's structural disable, matching how the same setting already worked
-  on OpenRouter.
-
-- **An `effort` that lands nowhere is now said out loud.** Anthropic's budget-tier
-  models and any OpenAI-compatible chat endpoint (local llama.cpp/Ollama, most
-  gateways) have no reasoning parameter at all, so the setting was dropped in
-  silence. If you *wrote* one — on a slot, in `[defaults]`, or via `KAIBO_*_EFFORT` —
-  kaibo now warns at startup naming the cast and slot, and `kaibo://config` lists it
-  under that slot's `inert_tunables`. The inherited built-in default stays quiet, so
-  an ordinary local cast doesn't nag.
-
-- **`kaibo://config` reports inert tunables the way the request is actually built.**
-  It previously ignored a `[defaults].thinking_style` (mislabelling whether a
-  `thinking_budget` was live), ignored `[defaults]`-sourced effort entirely, and was
-  blind to `lane = "batch"` — rendering a batch slot's `effort` and `temperature` as
-  effective when batch sends no sampling at all and floors the effort.
-
-- **`kaibo://config` now flags `thinking_style` as inert on a non-Anthropic slot.**
-  The override only moves anything on the Anthropic wire (it picks the adaptive vs.
-  budget tier there); every other wire classifies its thinking style from the model
-  id alone and never reads it, so a `thinking_style` forced on a DeepSeek/Gemini/
-  OpenRouter/generic-OpenAI slot — on the slot itself or inherited from
-  `[defaults]` — used to render as if it were shaping the request when it was a
-  pure no-op.
-
-- **The startup warning and `kaibo://config` can no longer disagree about an effort.**
-  They answer from one shared rule now, so a value the batch lane lifts is reported by
-  both (it used to be flagged in the resource and stay silent at startup), and the
-  warning says *which* thing happened — dropped by a wire with no reasoning parameter,
-  or raised to the batch floor — since those want different fixes.
-
-
-- **Corrected several configuration-manual claims that did not match the code.** Found by
-  pointing kaibo's own `consult` at the rewrite (cast `or-gpt`, GPT-5.6 luna in both
-  roles) and verifying each finding against the source. The ones that would have misled
-  someone configuring kaibo:
-
-  - A synth slot's `preamble` **does** reach the offline `batch` and `deliberate` phases.
-    The manual said it did not. It is load-bearing that it does: on a batch or deliberate
-    cast the synth slot *is* the offline synth, so the opposite rule would make a slot
-    preamble do nothing on exactly the casts built for that lane.
-  - `explore` accepts a cast whose synth is on an offline lane — it runs only the
-    explorer arm. The lane rules had been generalized to "the interactive tools".
-  - A missing or broken key file, and a missing `[context] user_files` entry, are
-    **call-time** errors, not startup errors. Keys and context files both resolve lazily.
-  - Hosted OpenAI `gpt-5*` models **do** consume `effort` (as `reasoning.effort` on the
-    Responses shape). Only generic/local Chat Completions endpoints ignore it.
-  - `[context]` house rules and the `[orientation]` map reach standalone `explore` and
-    `deliberate`'s dossier explorer too, not only the `consult` driver and its sweep.
-  - The state db stores the caller's **questions** alongside the models' answers.
-  - In `kaibo://config`, `tools` is the configured flags; `runtime.advertised_tools` is
-    what the server actually serves. The distinction is new in this release, so the
-    manual now points at the right one.
-
-- **State-db-collides-with-project-tree error now names `--root`/`--allow-path`.**
-  The state db's default path (`~/.local/state/kaibo/state.db`) can land inside
-  kaibo's default allowed tree when kaibo runs with no `--root`/`--allow-path`
-  and the launch directory is the home directory (or another ancestor of the
-  state dir) — startup then refuses to open the db, correctly, since a model
-  must never be able to reach kaibo's cross-project session store through a
-  read-only project mount. The refusal itself is unchanged and stays as strict
-  as ever; only the error message improves; it previously suggested only
-  `--state-db`/`--no-persistence`, leaving out the fix that's usually the right
-  one here — narrowing the allowed tree with `--root <project-dir>` or
-  `--allow-path <dir>` so it no longer contains the state db.
+  one** — with evidence gathered, kaibo asks once for the write-up; with none, it fails
+  loudly with turns, tokens, and the provider's own finish reason.
+- **An empty-answer failure reads as a retryable model outcome, not a kaibo bug** — the
+  guidance invites a retry or a different cast, and points at the slot's `max_tokens`
+  when the answer was cut off by length.
+- **A vision model still sees the image after the rig 0.41 upgrade** — `view_image`
+  hands rig a declared image block instead of a JSON envelope for it to sniff.
+- **A tool failure is readable by the model again** — rig 0.41 began masking tool errors
+  with a generic "the tool failed"; kaibo's model-facing errors stay model-visible.
+- **A reasoning `effort` the provider client cannot accept is refused up front**, naming
+  the cast, role, backend, model, and the rungs that path does take — kaibo keeps no
+  allowlist of its own.
+- **`[defaults] synth_effort = "xhigh"` no longer quietly breaks every Gemini cast** —
+  the docs carry the real per-provider ladders, which on OpenAI differ per model.
+- **`effort = "none"` on a DeepSeek slot actually turns reasoning off** — kaibo now
+  sends the structural disable instead of "enabled, zero effort".
+- **An `effort` that lands nowhere is said out loud** — a startup warning names the cast
+  and slot, and `kaibo://config` lists it under `inert_tunables`; the inherited built-in
+  default stays quiet.
+- **`kaibo://config` reports inert tunables the way the request is actually built** —
+  `thinking_style`, `[defaults]`-sourced effort, and batch-lane slots included; a
+  `thinking_style` on a non-Anthropic slot now shows as the no-op it is.
+- **The startup warning and `kaibo://config` can no longer disagree about an effort** —
+  one shared rule, and the warning says which thing happened.
+- **Corrected configuration-manual claims that did not match the code** — the
+  load-bearing one: a synth slot's `preamble` does reach the offline `batch` and
+  `deliberate` phases, where the opposite rule would gut exactly the casts built for
+  those lanes.
+- **The state-db-collides-with-project-tree refusal now also names
+  `--root`/`--allow-path`** — usually the right fix; the refusal itself is unchanged.
 
 ## [0.2.0] — 2026-07-29
 
