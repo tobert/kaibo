@@ -529,7 +529,11 @@ mod tests {
              identified rather than discovered by reading it:\n{a}"
         );
         // Structural, so it survives someone changing the example line numbers: every
-        // `sed -n` kaibo writes here is followed by a quote.
+        // `sed -n` kaibo writes here is followed by a quote. The count is asserted too —
+        // a loop over zero matches passes green, so without this the whole scan would go
+        // quiet the day someone removed the last span example (caught in review, and the
+        // sibling scan in `prompts.rs` already had it).
+        let mut seen = 0;
         for (i, _) in a.match_indices("sed -n ") {
             let rest = &a[i + "sed -n ".len()..];
             assert!(
@@ -537,7 +541,13 @@ mod tests {
                 "every `sed -n` range must be quoted — unquoted, kaish 0.13 refuses the \
                  comma with a parse error:\n{a}"
             );
+            seen += 1;
         }
+        assert!(
+            seen > 0,
+            "the addendum must carry at least one `sed -n` span for the scan above to \
+             mean anything:\n{a}"
+        );
     }
 
     #[test]
