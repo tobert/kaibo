@@ -123,6 +123,27 @@ own request shape — `ModelShape::resolve(backend.kind, slot.id, …)` with its
 slot's overrides — so a cast whose explorer and synth straddle any capability
 line (different kinds, even) is fit per-arm by construction.
 
+## Choosing an explorer (field notes)
+
+The explorer's job is cheap bulk reading, so it is the slot where the cheapest
+tier looks tempting — two measured cautions before pinning one:
+
+- **Flash-tier explorers can hallucinate tool names on long prompts under a
+  restricted toolset.** `deepseek-v4-flash` twice failed a `deliberate` dossier
+  sweep by calling a tool that does not exist (`run_sha`, `run_grail`) while the
+  same model runs long `consult` sweeps clean; a resend repeats the hallucination
+  (tracked in `docs/issues.md`). A pro-tier explorer on the same backend cleared
+  the identical build. `gemini-flash-lite` has been the reliable flash-tier
+  choice for big dossier builds.
+- **Match the explorer's provider to its token budget, not its synth.** A sweep
+  with whole-file attachments can request 90–130k tokens per minute; on a
+  provider with a tight org TPM ceiling (hosted GPT, measured 2026-08-09) the
+  sweep 429s and a retry self-starves, while the per-call
+  `explorer_backend`/`explorer_model` override to a Gemini explorer built the
+  same dossier first try. Family-match buys the synth's answer nothing — pair an
+  expensive synth with a cross-provider explorer freely; that freedom is the
+  point of the split.
+
 ## How a call maps
 
 All the chimera-ness happens in one resolution step at the server boundary.

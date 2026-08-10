@@ -335,6 +335,22 @@ lowered by #114's role-identity preambles; n=3 can't tell). Open work, in order:
   If that shape shows up in practice it's a different problem (answer-quality, not
   emptiness) and wants its own thinking, not a heuristic bolted onto this gate.
 
+### A hallucinated tool call fails the phase with no corrective feedback (2026-08-09)
+Repro, twice: a `deliberate` dossier sweep on explorer `deepseek-v4-flash` failed 2×
+*identically* with `UnknownToolCall: 'run_sha'` (available: `attach`, `run_kaish`),
+killing the phase before the synth spent anything; a 2026-08-05 build died the same way
+on `run_grail`. The same model runs 80+-step `consult` sweeps clean, so this is
+flash-tier-under-a-restricted-toolset behavior on long prompts, not a broken model.
+Distinct from the shipped malformed-generation retry (`src/completion_retry.rs`): that
+resends the *same* request when the provider's output failed to parse; here the request
+parsed fine — the model named a tool that does not exist — and an identical resend
+re-hallucinates (the 2× identical failure proves it). Fix shape: a bounded corrective
+re-prompt that feeds the error back into the conversation as a tool-result/user turn
+("`run_sha` is not a tool; available: `attach`, `run_kaish`") so the model can correct
+itself, with the same loud-warn-per-attempt discipline the malformed retry has.
+Workaround meanwhile: `explorer_model = "deepseek-v4-pro"` (verified working);
+`docs/casts.md` carries the operator-facing note.
+
 ### Dossier durability — what's left after keep + reuse (2026-08-07)
 A finished dossier now lands in the media CAS and can be handed back as `deliberate`'s
 `dossier` argument, so a failed synth hand-off is re-runnable by hand and a caller who
@@ -411,6 +427,17 @@ leg). Sequenced PRs (1 plan doc, 2 harden matrix — realized 2026-07-05; 3 sign
 provenance/SBOM and 4 ghcr image — realized 2026-07-13 → **next: 5 channels, gated on
 demand**; the `/reconfigure` container-UX workstream rides alongside) in the doc;
 delete this entry when the pipeline ships.
+
+### A gated tool refuses with rmcp's words, not kaibo's (from #140's report)
+A tool dropped by a `--no-<tool>` flag or by staffing is absent from the router, so a
+call to it answers with rmcp's generic `-32602 tool not found` — correct on the wire,
+but it reads the same as a typo'd tool name. Error strings are kaibo's most valuable
+prose (AGENTS.md): the refusal should say what was refused, why (disabled by flag vs.
+no cast can staff it — the same distinction `kaibo://config` already draws), and what
+to do instead. Needs a `call_tool` override on the handler so kaibo can author the
+message for known-but-ungated names while unknown names keep the generic error.
+`tests/mcp_stdio.rs::a_gated_tool_is_neither_advertised_nor_callable` pins today's
+behavior and is the test to evolve with it.
 
 ### Graceful no-stdin error for the container case
 `docker run` without `-i` hands kaibo a closed stdin: the MCP server sees immediate
