@@ -191,17 +191,78 @@ cat $XDG_STATE_HOME/kaibo/state.db      ; echo "store-read=$?"   # or ~/.local/s
 real disk (verified live 2026-07-17: a 4 KiB store on disk read back `not found` through
 `run_kaish`). The model driving the shell can never exfiltrate another session's data.
 
-**E3 — the source-level write guard (compile-time leg).** kaibo makes exactly one
-`std::fs` mutation in production — the blessed `create_dir_all` that creates the state
-dir — and a source scan proves it is the only one:
+**E3 — the source-level write guard (compile-time leg).** kaibo's production code carries
+a small, fixed set of blessed write lines and nothing else, and a source scan proves it:
 
 ```sh
 cargo test --test no_write_path
 ```
 
-**Pass:** green. The guard fails if any other `std::fs` write appears in `src/`, if the
-blessed `create_dir_all` loses its marker or moves out of `store.rs`, or if a second
-blessed site is added (teeth pinned by the `teeth_*` cases in that file).
+**Pass:** green. Read the blessed set from the test, not from here — `BLESSED` names each
+file, its marker, and which calls that marker excuses, and `EXPECTED_BLESSED_LINES` pins
+the tree-wide total exactly. As of 2026-08-10 that is **5 lines across 3 files**: the state
+dir's `create_dir_all` (`store.rs`), the media CAS's three seams (`cas.rs` — shard dir,
+`create_new` open, byte write), and `kaibo cas read` handing bytes to stdout (`cli.rs`).
+The guard fails if any other `std::fs` write appears in `src/`, if a blessed line loses its
+marker or moves out of its file, if a marker is pasted onto a call it does not excuse, or
+if the count moves in either direction — teeth pinned by the `teeth_*` cases in that file.
+
+---
+
+## 5a. Battery F — `/v/approvals` is readable and inert (kaish 0.14+)
+
+kaish 0.14 mounts an approvals ledger at `/v/approvals` in **every** kernel — the mount is
+unconditional in `Kernel::assemble`, shared by `Kernel::build` and `with_backend` alike, so
+kaibo's kernel gets it; `with_approvals(false)` sets the gating posture, not whether the
+ledger exists. kaibo never uses approvals, so the path is present and empty.
+
+This battery exists because that is a **read surface kaibo does not own**. `/v/*` is kernel
+space our backend never sees, so none of kaibo's four levers apply to it: its read-only-ness
+comes from a single `read_only()` chokepoint in kaish's `vfs/approvalsfs.rs`. kaish's reason
+for putting it there is worth quoting rather than paraphrasing — granting by file write
+would make "the agent can write files" equivalent to "the agent can approve its own
+operations". We depend on that, so we check it.
+
+```sh
+ls /v/approvals                          ; echo "ls=$?"
+cat /v/approvals/pending                 ; echo "pending=$?"
+cat /v/approvals/log                     ; echo "log=$?"
+cat /v/approvals/standing                ; echo "standing=$?"
+echo x > /v/approvals/pending            ; echo "write=$?"
+mkdir /v/approvals/mine                  ; echo "mkdir=$?"
+rm /v/approvals/pending                  ; echo "rm=$?"
+```
+
+**Pass** (run live 2026-08-10 against kaish `809e39f`, so these are observed, not expected):
+
+- `ls` enumerates exactly `log`, `pending`, `standing`, exit `0`.
+- `pending` and `standing` read back `[]`, exit `0`. kaibo never records an approval, so a
+  non-empty read here means state is reaching a model that should not see it.
+- **`log` is NOT empty, and that is correct.** It is an append-only *observation* ledger:
+  with approvals off, kaish still records every command the script executes, as JSON lines
+  carrying the rendered command text. What to check is its **scope**, not its emptiness —
+  every entry must be from this call's own script, under one `kernel_id`. kaibo spawns a
+  fresh worker and kernel per call (`src/server/mod.rs:2540`, `src/consult/engine.rs:1903`),
+  so the ledger cannot span calls, sessions, or projects. An entry naming a command this
+  script did not run is the finding this probe exists to catch.
+- Every mutation is refused with exit `1` and kaish's `ErrorKind::Unsupported` class:
+  redirect, `mkdir`, and `rm` each answer with their own verb ("write is not supported",
+  "mkdir is not supported", "remove is not supported").
+
+The log is **ring-buffered**, so a long phase cannot grow it without bound:
+`LedgerConfig::retained_entries` defaults to 4096 and eviction runs on every append
+(confirmed by the kaish session, 2026-08-10). Observation entries are chainless — they
+name no live request — so they always evict freely and can never hit the one refusal case
+(an eviction that would drop a still-live request's entry, which kaish fails loudly rather
+than dropping). A late read therefore costs at most the retained window, which kaibo's
+output cap then truncates as usual. Entries carry the fully rendered command text; in a
+per-call kernel that is only ever the model reading back commands it just issued itself.
+
+**Assert the class and the exit code; treat kaish's exact refusal text as informational.**
+The message is per-operation and reads, today,
+`io error: /v/approvals is read-only: <verb> is not supported — decide with the
+`approvals` builtin`. kaish rewrites its error prose for the same reasons we rewrite ours,
+and a wording improvement upstream must not fail this battery for the wrong reason.
 
 ---
 
