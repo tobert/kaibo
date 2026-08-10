@@ -3505,20 +3505,31 @@ impl KaiboHandler {
 /// The SEP-2549 response-caching fields, filled when this session's negotiated
 /// protocol version requires them (`2026-07-28` and newer), absent otherwise.
 ///
-/// rmcp 3.0.0-beta.5 negotiates `2026-07-28` — it is in the SDK's known-version
-/// list, and its serve loop overrides any handler attempt to answer lower — but it
-/// leaves these fields `None` on every result, and that spec version makes them
-/// REQUIRED on every list/read result. A strictly-validating client (Claude Code,
-/// observed 2026-08-10) accepts the negotiated version and then rejects the whole
-/// `tools/list` over the missing fields: zero tools, kaibo unusable until restart.
-/// So kaibo fills them itself, with the no-caching floor stated honestly:
-/// `ttlMs: 0` (immediately stale — the advertised surface is resolved per
-/// connection from env, config, and staffing, so a cached copy goes wrong exactly
-/// when it matters) and `cacheScope: private` (the surface is this user's own
-/// configuration; an intermediary must not serve it to another user). Older
-/// sessions stay on their legacy wire shape with the fields absent. Delete this
-/// when a bumped rmcp fills the fields itself; the raw-wire tests in
-/// `tests/mcp_stdio.rs` pin both sides.
+/// rmcp negotiates `2026-07-28` whenever a client asks for it (the version is in the
+/// SDK's known list), and that spec version makes both fields REQUIRED on every list
+/// and read result. A strictly-validating client (Claude Code, observed 2026-08-10
+/// against rmcp 3.0.0-beta.5) accepts the negotiated version and then rejects the
+/// whole `tools/list` over the missing fields: zero tools, kaibo unusable until
+/// restart.
+///
+/// rmcp 3.1.1 fills the fields for the two results its handler macros generate
+/// (`tools/list`, `prompts/list`) and answers `cacheScope: public`. That is not
+/// kaibo's answer, and it does not reach kaibo's other results: the resource methods
+/// have no fill at all (the default `ServerHandler` bodies return `::default()`), and
+/// kaibo writes all of these methods by hand regardless. So kaibo answers for itself,
+/// with the no-caching floor stated honestly: `ttlMs: 0` (immediately stale — the
+/// advertised surface is resolved per connection from env, config, and staffing, so a
+/// cached copy goes wrong exactly when it matters) and `cacheScope: private` (the
+/// surface is this user's own configuration; an intermediary must not serve it to
+/// another user). Older sessions stay on their legacy wire shape with the fields
+/// absent, and the raw-wire tests in `tests/mcp_stdio.rs` pin both sides.
+///
+/// The alternative — refusing the version instead of fulfilling it — is available
+/// since rmcp 3.1.0 (`ServerHandler::supported_protocol_versions`, upstream #1093;
+/// on the 3.0.0-beta.5 this was written against, the serve loop overrode any handler
+/// answer). Fulfilling stays the right call: a client that asks for the newest
+/// version wants what that version's other features buy it, and the two fields cost
+/// kaibo nothing to answer truthfully.
 fn sep_2549_cache_fields(context: &RequestContext<RoleServer>) -> (Option<u64>, Option<CacheScope>) {
     // ISO `YYYY-MM-DD` versions compare lexically the same as chronologically.
     let required = context
@@ -3533,9 +3544,11 @@ fn sep_2549_cache_fields(context: &RequestContext<RoleServer>) -> (Option<u64>, 
 
 #[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for KaiboHandler {
-    /// What the `#[tool_handler]` macro would generate, plus the SEP-2549 fields a
-    /// `2026-07-28` session requires — writing the method here is what suppresses
-    /// the macro's version (it skips any method the impl already has).
+    /// The `#[tool_handler]` macro's own `list_tools`, with one difference: the
+    /// SEP-2549 fields answer `cacheScope: private`, where the macro answers
+    /// `public`. Writing the method here is what suppresses the macro's version (it
+    /// skips any method the impl already has), and it must keep serving
+    /// `self.tool_router` for the reason the comment above states.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
