@@ -212,8 +212,10 @@ pub fn report_preamble() -> String {
          their impls, the call sites, and exact line numbers together, and most source \
          files are small enough to read in a single command. Use `grep -rn PATTERN .` \
          to find WHICH files matter (`-B4 -A8` shows a preview around each match). \
-         Once grep names a file, open that file whole instead of reading only the \
-         lines around the match. A whole-file read of a very large file comes back \
+         Once grep names a file, open that file whole. When the file is large, read a \
+         wide span around each match instead, with `cat -n FILE | sed -n '120,400p'`. \
+         That returns the range and keeps the real line numbers, so your citation \
+         stays exact. A whole-file read of a very large file comes back \
          truncated (exit 3), and the truncated result still contains the start and the \
          end of the file. Read the rest in targeted spans: run `grep -n SYMBOL FILE` \
          to get the line numbers the question needs, then read a wide span around each \
@@ -810,6 +812,78 @@ mod tests {
         // against — keep the three section names in lockstep with those.
         for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
             assert!(p.contains(section), "missing report section {section}: {p}");
+        }
+    }
+
+    /// The follow-up to a grep hit, when the file is large: a wide span around the
+    /// match, numbered, instead of the whole file. The whole-file default is
+    /// deliberate and pinned above; this is the branch off it, so both sentences must
+    /// survive together — the preamble says "open that file whole" first and reaches
+    /// for a span second.
+    #[test]
+    fn explorer_reads_a_wide_span_around_a_grep_hit_in_a_large_file() {
+        let p = report_preamble();
+        assert!(
+            p.contains("Once grep names a file, open that file whole."),
+            "whole-file stays the default follow-up to a grep hit: {p}"
+        );
+        assert!(
+            p.contains("When the file is large, read a wide span around each match instead"),
+            "a large file gets a span around the match rather than a whole read: {p}"
+        );
+        assert!(
+            p.contains("instead, with `cat -n FILE | sed -n '120,400p'`."),
+            "the span example must be written with the range QUOTED — unquoted, kaish \
+             0.13 refuses the comma with a parse error: {p}"
+        );
+        assert!(
+            p.contains("keeps the real line numbers"),
+            "the span idiom must say why it is piped through `cat -n`, which is the \
+             exact citation: {p}"
+        );
+        let whole_at = p
+            .find("open that file whole")
+            .expect("whole-file directive");
+        let span_at = p.find("When the file is large").expect("span directive");
+        assert!(
+            whole_at < span_at,
+            "whole reads first, the span is the branch off it: {p}"
+        );
+    }
+
+    /// kaish reserves a bare comma, so `sed -n 120,400p` is a parse error on kaish
+    /// 0.13 — the version the released binary runs — while `sed -n '120,400p'` parses
+    /// on 0.13 and later alike (both forms verified live against both). Every range
+    /// kaibo puts in front of a model is therefore quoted. This sweeps every built-in
+    /// preamble and every attachment directive rather than naming one string, so a
+    /// new unquoted example anywhere in this module fails here.
+    #[test]
+    fn every_sed_range_kaibo_writes_is_quoted() {
+        for (label, text) in [
+            ("explorer", report_preamble()),
+            ("consult", consult_preamble()),
+            (
+                "oversize attachment",
+                consult_user_prompt("q", None, &[], &[oversize_attach("src/big.rs", 900_000)]),
+            ),
+            (
+                "explorer attachment directive",
+                explorer_attachment_directive(&[oversize_attach("src/big.rs", 900_000)])
+                    .expect("a text attachment produces a directive"),
+            ),
+        ] {
+            let mut seen = 0;
+            for (i, _) in text.match_indices("sed -n ") {
+                seen += 1;
+                let rest = &text[i + "sed -n ".len()..];
+                assert!(
+                    rest.starts_with('\''),
+                    "{label}: every `sed -n` range must be quoted — unquoted, kaish 0.13 \
+                     refuses the comma with a parse error and the model loses the \
+                     turn:\n{text}"
+                );
+            }
+            assert!(seen > 0, "{label} must still teach a span read:\n{text}");
         }
     }
 
