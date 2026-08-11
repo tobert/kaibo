@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rig_agent::agent::hook::{
-    AgentHook, CompletionCall, CompletionCallAction, HookContext, ToolResultAction, ToolResultEvent,
+    AgentHook, CompletionCall, CompletionCallAction, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::agent::AgentBuilder;
 use rig_agent::completion::PromptError;
@@ -712,6 +713,137 @@ fn empty_answer_error(
     )
 }
 
+// --- a tool call naming a tool that does not exist -------------------------------
+
+/// Answers a tool call the run cannot dispatch, so the phase keeps its evidence.
+///
+/// A model sometimes emits a tool that was never advertised — `run_sha` and `run_grail`
+/// were both observed on a flash-tier explorer under a restricted toolset, each killing
+/// the phase before the synth spent anything. rig's default is fail-fast, which throws
+/// away every turn of reading already done. This hook answers the call instead: the
+/// model gets a tool result naming what it asked for and what it can actually call, and
+/// it corrects itself on the next turn inside the budget it already had.
+///
+/// **Feedback, never repair.** [`InvalidToolCallAction::Repair`] would let kaibo rename
+/// `run_sha` to `run_kaish` and dispatch it. That is a guess at intent, and a wrong guess
+/// runs a command the model did not ask for — a silent fallback, which the project
+/// refuses. Naming the real tools is strictly more information than a rename and leaves
+/// the choice with the model.
+///
+/// **The turn's other tool calls are reported, not hidden.** rig executes no tool call
+/// from a turn that had an invalid one; the peers each come back as "not executed"
+/// (`run/mod.rs` — `TOOL_NOT_EXECUTED_DUE_TO_INVALID_PEER`). So the message says the work
+/// did not run and asks for it again, because a model told only that one name was wrong
+/// would reasonably assume its other calls landed.
+///
+/// **Under [`ToolChoice::None`] it declines, and today nothing reaches that branch.** The
+/// one phase that sets that tool choice is the forced write-up turn
+/// ([`forced_finish_turn`]), which builds its own agent and installs no hooks — so the
+/// branch is guarding a state this tree cannot produce. It is kept because it is the
+/// answer we would want if the write-up path ever did install hooks: that tool choice is
+/// kaibo asking for prose, so a tool call there is a model ignoring the ask rather than
+/// misnaming a tool, and the write-up path's own diagnostics are the better error. rig
+/// rejects a `Skip` under that tool choice regardless, so the branch only ever changes
+/// which of two correct errors is raised. Do not read it as a live guard.
+#[derive(Clone)]
+struct UnknownToolFeedbackHook {
+    /// The phase's model id. Carried for the `warn` event only, so telemetry can say
+    /// *which* models do this and how often — the open question this class was tracked
+    /// under.
+    model_name: Arc<str>,
+}
+
+impl UnknownToolFeedbackHook {
+    fn new(model_name: &str) -> Self {
+        Self {
+            model_name: Arc::from(model_name),
+        }
+    }
+}
+
+impl AgentHook for UnknownToolFeedbackHook {
+    async fn on_invalid_tool_call(
+        &self,
+        _ctx: &HookContext,
+        event: &InvalidToolCallContext,
+    ) -> Option<InvalidToolCallAction> {
+        let reason = unknown_tool_feedback(
+            event.tool_choice.as_ref(),
+            &event.tool_name,
+            &event.available_tools,
+            &event.allowed_tools,
+        )?;
+        tracing::warn!(
+            model = %self.model_name,
+            tool = %event.tool_name,
+            available_tools = %event.available_tools.join(", "),
+            "model called a tool that does not exist — answering it with the real toolset \
+             so the phase keeps its evidence"
+        );
+        Some(InvalidToolCallAction::Skip { reason })
+    }
+}
+
+/// The tool result an unknown tool call gets back, or `None` to leave rig's fail-fast in
+/// place.
+///
+/// Names what was refused, why, and what to do instead — the three things a refusal owes
+/// its reader, and this one is read by a model at the moment it is blocked.
+///
+/// Two cases get different corrections, because they call for different fixes. A name
+/// that is in the toolset but not permitted this turn is a *timing* problem: the tool is
+/// real and the model should wait for it. Any other name is not a tool at all.
+///
+/// The whole decision lives here rather than in [`UnknownToolFeedbackHook`] so it is
+/// testable without standing up a rig run — the hook is the one-line shell that maps this
+/// to an action.
+fn unknown_tool_feedback(
+    tool_choice: Option<&ToolChoice>,
+    tool_name: &str,
+    available: &[String],
+    allowed: &[String],
+) -> Option<String> {
+    // Under `ToolChoice::None` kaibo asked for prose, so a tool call is not a misnamed
+    // tool. See the hook's doc comment.
+    if matches!(tool_choice, Some(ToolChoice::None)) {
+        return None;
+    }
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let opening =
+        if available.iter().any(|n| n == tool_name) && !allowed.iter().any(|n| n == tool_name) {
+            format!(
+                "`{tool_name}` is a real tool, and it is not one you can call on this turn. \
+             The tools you can call now are: {}.",
+                list(allowed)
+            )
+        } else {
+            format!(
+                "`{tool_name}` is not a tool. The tools you can call are: {}.",
+                list(if allowed.is_empty() {
+                    available
+                } else {
+                    allowed
+                })
+            )
+        };
+    Some(format!(
+        "{opening} Nothing ran this turn: a tool call the run cannot dispatch stops the \
+         whole turn, so any other tool you called alongside this one did not run either. \
+         Call the tools above to do the work you intended, including the work you asked \
+         for in this turn."
+    ))
+}
+
 // --- an image-bearing tool result on the user-turn channel (the openai VLM path) --
 
 /// The cancellation reason [`ToolImageBreakHook`] terminates with, so [`run_phase`]
@@ -1161,6 +1293,12 @@ where
             .runner(prompt.clone())
             .history(history.clone())
             .add_hook(ToolImageBreakHook::new(break_on_tool_images))
+            // Every tool-driven phase runs through this loop, so installing the hook here
+            // is what gives the consult driver, each delegated `explore′` sweep, and the
+            // `deliberate` dossier sweep the same recovery. The toolless lanes
+            // (`oneshot`, `deliberate`'s direct synth) bypass the agent entirely via
+            // `Arm::complete` and can raise no tool call at all.
+            .add_hook(UnknownToolFeedbackHook::new(model_name))
             .max_turns(remaining)
             .run()
             .await;
@@ -3023,6 +3161,193 @@ mod tests {
         assert_eq!(answer, "done");
         assert_eq!(reported.input_tokens, 321);
         assert_eq!(reported.output_tokens, 21);
+    }
+
+    /// The recovery this whole hook exists for: a model names a tool that was never
+    /// advertised, and the phase keeps the evidence it had already gathered instead of
+    /// dying. Without [`UnknownToolFeedbackHook`] rig fails the run at the second turn
+    /// with `UnknownToolCall`, `run_phase` returns `Err`, and this `expect` fires — the
+    /// sabotage check is deleting the `add_hook` line.
+    ///
+    /// Modeled on the observed failure: `run_sha` on a flash-tier explorer, mid-sweep,
+    /// after real reading had already happened.
+    #[tokio::test]
+    async fn an_unknown_tool_call_is_answered_and_the_investigation_survives() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                let seen = transcript_text(req);
+                // Turn 1: real work, so there is evidence worth saving.
+                if !seen.contains("EVIDENCE") {
+                    return Ok(tool_call_response(
+                        "c1",
+                        "run_kaish",
+                        json!({"script": "echo EVIDENCE"}),
+                    ));
+                }
+                // Turn 2: the hallucination. Keyed on the feedback's own words so this
+                // fires exactly once — the responder is content-driven, not counted.
+                if !seen.contains("is not a tool") {
+                    return Ok(tool_call_response("c2", "run_sha", json!({"path": "x"})));
+                }
+                // Turn 3: the model corrects itself and answers.
+                Ok(text_response("ANSWER: built on EVIDENCE"))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase(
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            6,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        )
+        .await
+        .expect("a tool call naming a tool that does not exist must not fail the phase");
+
+        assert_eq!(answer, "ANSWER: built on EVIDENCE");
+
+        let asked = client.requests_for(MODEL);
+        let last = &asked[asked.len() - 1];
+        assert!(
+            last.transcript.contains("`run_sha` is not a tool"),
+            "the model must be told which name failed: {:?}",
+            last.transcript
+        );
+        assert!(
+            last.transcript.contains("`run_kaish`"),
+            "the model must be told what it CAN call: {:?}",
+            last.transcript
+        );
+        assert!(
+            last.transcript.contains("EVIDENCE"),
+            "the recovered turn keeps the evidence already gathered: {:?}",
+            last.transcript
+        );
+    }
+
+    /// The refusal names the failed name and the real toolset. Both halves matter: a
+    /// model that learns only "wrong" guesses again.
+    #[test]
+    fn the_unknown_tool_refusal_names_the_tool_and_the_toolset() {
+        let available = vec!["attach".to_string(), "run_kaish".to_string()];
+        let msg = unknown_tool_feedback(None, "run_sha", &available, &available)
+            .expect("no tool choice means kaibo answers the call");
+        assert!(msg.contains("`run_sha` is not a tool"), "{msg}");
+        assert!(msg.contains("`attach`, `run_kaish`"), "{msg}");
+        assert!(
+            msg.contains("did not run either"),
+            "the model must learn its other calls were dropped, or it will not reissue \
+             them: {msg}"
+        );
+    }
+
+    /// A real tool the turn's tool choice forbids reads differently from a name that is
+    /// not a tool at all — telling a model `attach` "is not a tool" would be a lie, and
+    /// it would go looking for a different name instead of waiting.
+    #[test]
+    fn a_real_tool_barred_this_turn_is_not_called_nonexistent() {
+        let available = vec!["attach".to_string(), "run_kaish".to_string()];
+        let allowed = vec!["run_kaish".to_string()];
+        let msg = unknown_tool_feedback(None, "attach", &available, &allowed)
+            .expect("a barred tool still gets an answer");
+        assert!(msg.contains("`attach` is a real tool"), "{msg}");
+        assert!(!msg.contains("is not a tool"), "{msg}");
+        assert!(
+            msg.contains("`run_kaish`") && !msg.contains("`attach`, `run_kaish`"),
+            "it names what is callable NOW, not the whole toolset: {msg}"
+        );
+    }
+
+    /// Under `ToolChoice::None` kaibo asked for prose, so a tool call is the model
+    /// ignoring the ask rather than fumbling a name. No phase reaches this branch today —
+    /// `forced_finish_turn` is the only caller that sets the tool choice and it installs
+    /// no hooks — so this pins the decision, not a live path. Named for what it asserts
+    /// rather than for a caller, because there is no caller.
+    #[test]
+    fn a_prose_only_tool_choice_is_declined_rather_than_answered() {
+        let available = vec!["run_kaish".to_string()];
+        assert!(
+            unknown_tool_feedback(Some(&ToolChoice::None), "run_sha", &available, &[]).is_none(),
+            "a phase that asked for prose must not offer the model another tool call"
+        );
+    }
+
+    /// A model that names a phantom tool on *every* turn spends the budget and stops. The
+    /// recovery costs one turn each time and nothing counts the recoveries, so the only
+    /// thing standing between a pathological model and an unbounded loop is that the
+    /// skipped turn is still a turn. This test is what proves it: with a budget of two,
+    /// two hallucinations exhaust it, and the run lands in the turn-cap finalize rather
+    /// than looping. If the skipped turn ever stopped counting, this would hang instead of
+    /// failing — so it is written with a timeout.
+    ///
+    /// Raised by the cross-family review of this change (DeepSeek, 2026-08-11), which
+    /// judged the path structurally safe but untested.
+    #[tokio::test]
+    async fn a_model_that_only_ever_names_phantom_tools_still_terminates() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                // The finalize turn is the way out: it carries `ToolChoice::None`, so the
+                // model is being asked for prose and answers.
+                if is_finalize_turn(req) {
+                    return Ok(text_response("FORCED FINAL ANSWER"));
+                }
+                Ok(tool_call_response("c", "run_sha", json!({"path": "x"})))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let model = client.completion_model(MODEL);
+        let run = run_phase(
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            2,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        );
+        let (answer, _usage) = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("a phantom tool call every turn must exhaust the budget, not loop")
+            .expect("the turn cap must still produce an answer");
+
+        assert_eq!(answer, "FORCED FINAL ANSWER");
+        let asked = client.requests_for(MODEL);
+        assert!(
+            asked.len() <= 4,
+            "the budget of 2 must bound the recoveries, not be refreshed by them: {} turns",
+            asked.len()
+        );
+        assert!(
+            asked.iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
+            "exhausting the budget must reach the forced write-up turn"
+        );
     }
 
     /// The load-bearing e2e: a scripted consult that delegates a sweep to `explore′`,

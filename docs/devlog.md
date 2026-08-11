@@ -14,6 +14,65 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-11 — method_missing, for models
+
+We had this tracked as "a bounded corrective re-prompt": catch `UnknownToolCall`, feed the
+error back, ask again. That's how it reads in `issues.md`, written the day the second repro
+landed. Amy reframed it in one line before I'd written any code — *"can we catch incorrect
+tool calls and return an informational error? sorta hooking method_missing"* — and the
+reframe is the whole entry, because it changes what the fix *is*. A re-prompt is kaibo
+noticing a failure and spending a model call to work around it. `method_missing` is the
+call **succeeding**, with an answer that happens to say "that's not a thing, here's what
+is". The model was already going to take another turn. It doesn't need to be asked again;
+it needs to be told something useful.
+
+Then rig had already built it. `rig-agent 0.41` ships `AgentHook::on_invalid_tool_call`
+returning an `InvalidToolCallAction`, and kaibo has implemented `AgentHook` since the
+`view_image` break work — so the fix is a second hook on a stack we already own, not new
+plumbing. This keeps happening and it keeps being worth checking first: the same lesson as
+the retry policy we decided to upstream rather than hand-roll.
+
+Four resolutions were on offer, and the interesting one to reject was `Repair` — hand rig a
+replacement name and let the call through. It is *right there*, `run_sha` → `run_kaish`
+would have worked on both observed failures, and it is a silent fallback: kaibo guessing
+what the model meant and running a command nobody asked for. A wrong guess doesn't announce
+itself. `Skip` with a reason string is strictly more information and leaves the choice where
+it belongs. Amy picked it.
+
+Reading rig's source changed the message. When a call is skipped, *none* of the turn's tool
+calls execute — the peers come back as "not executed". That's a fact the model needs,
+because one told only that a single name was wrong will assume its other calls landed. So
+the message says the turn ran nothing and asks for the work again. A refusal owes the reader
+what was refused, why, and what to do instead; here "what to do instead" had a second half
+we would have missed by not reading the code we were calling.
+
+The test is the old repro. A scripted model reads a file, then calls `run_sha`, then
+answers — and deleting the `add_hook` line makes it fail with the production error
+verbatim: ``UnknownToolCall: model attempted to call unknown or disallowed tool `run_sha` ``.
+A satisfying shape for a regression test — the sabotage doesn't approximate the bug, it *is*
+the bug.
+
+The cross-family review (DeepSeek, dogfooding `consult`) came back sound and caught the one
+thing I'd written down wrong. I had the `ToolChoice::None` branch described as a live guard
+protecting the forced write-up turn. It isn't: `forced_finish_turn` builds its own agent and
+installs no hooks, so the hook never sees that tool choice at all. The branch is right and I
+kept it — it's the answer we'd want if that ever changed — but it is guarding a state this
+tree cannot produce, and a comment that oversells its own reach is the kind of thing that
+gets believed later. The correction is in the doc comment now, stated as plainly as the
+claim was.
+
+Its other finding was a real test gap: nothing exercised a model that names a phantom tool
+on *every* turn. The recovery costs a turn and nothing counts recoveries, so the only thing
+between a pathological model and an unbounded loop is that a skipped turn is still a turn.
+The review reasoned that through and concluded it was structurally safe. It was right, and
+now there's a test that would hang if it ever stopped being true — which is the version of
+that argument I trust.
+
+What this doesn't do is lower the rate. The hook is recovery, and the `warn` it emits per
+occurrence is the first time this class is measurable at all — which is now the open half in
+`issues.md`, alongside the question of whether a model that gets the feedback actually reads
+it.
+
 ## 2026-08-09 — the test that had to speak MCP, and the flag that had stopped working
 
 The plan was a Python script. `mcp_drive.py` would spawn kaibo, speak JSON-RPC at it, and

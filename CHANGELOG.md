@@ -105,6 +105,8 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A model calling a tool that does not exist no longer throws away the investigation**
+  — it gets a tool result naming the real toolset, and corrects itself on the next turn.
 - **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or
   unstaffable tool was still listed and still callable; it is now neither.
 - **A new Claude Code sees kaibo's tools again.** The client negotiates protocol
