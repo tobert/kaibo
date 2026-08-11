@@ -736,11 +736,15 @@ fn empty_answer_error(
 /// did not run and asks for it again, because a model told only that one name was wrong
 /// would reasonably assume its other calls landed.
 ///
-/// **Under [`ToolChoice::None`] it declines.** That tool choice is kaibo asking for prose
-/// — the forced write-up turn ([`forced_finish_turn`]) — so a tool call there is not a
-/// misnamed tool but a model ignoring the ask, and the write-up path's own diagnostics
-/// are the better error. rig rejects a `Skip` under that tool choice anyway; declining
-/// says so on purpose instead of leaning on a rejection.
+/// **Under [`ToolChoice::None`] it declines, and today nothing reaches that branch.** The
+/// one phase that sets that tool choice is the forced write-up turn
+/// ([`forced_finish_turn`]), which builds its own agent and installs no hooks — so the
+/// branch is guarding a state this tree cannot produce. It is kept because it is the
+/// answer we would want if the write-up path ever did install hooks: that tool choice is
+/// kaibo asking for prose, so a tool call there is a model ignoring the ask rather than
+/// misnaming a tool, and the write-up path's own diagnostics are the better error. rig
+/// rejects a `Skip` under that tool choice regardless, so the branch only ever changes
+/// which of two correct errors is raised. Do not read it as a live guard.
 #[derive(Clone)]
 struct UnknownToolFeedbackHook {
     /// The phase's model id. Carried for the `warn` event only, so telemetry can say
@@ -3270,15 +3274,79 @@ mod tests {
     }
 
     /// Under `ToolChoice::None` kaibo asked for prose, so a tool call is the model
-    /// ignoring the ask rather than fumbling a name. Declining here keeps the forced
-    /// write-up turn's own diagnostics as the error — and rig rejects a `Skip` under this
-    /// tool choice regardless, so acting would buy nothing.
+    /// ignoring the ask rather than fumbling a name. No phase reaches this branch today —
+    /// `forced_finish_turn` is the only caller that sets the tool choice and it installs
+    /// no hooks — so this pins the decision, not a live path. Named for what it asserts
+    /// rather than for a caller, because there is no caller.
     #[test]
-    fn the_forced_write_up_turn_declines_to_answer_a_tool_call() {
+    fn a_prose_only_tool_choice_is_declined_rather_than_answered() {
         let available = vec!["run_kaish".to_string()];
         assert!(
             unknown_tool_feedback(Some(&ToolChoice::None), "run_sha", &available, &[]).is_none(),
             "a phase that asked for prose must not offer the model another tool call"
+        );
+    }
+
+    /// A model that names a phantom tool on *every* turn spends the budget and stops. The
+    /// recovery costs one turn each time and nothing counts the recoveries, so the only
+    /// thing standing between a pathological model and an unbounded loop is that the
+    /// skipped turn is still a turn. This test is what proves it: with a budget of two,
+    /// two hallucinations exhaust it, and the run lands in the turn-cap finalize rather
+    /// than looping. If the skipped turn ever stopped counting, this would hang instead of
+    /// failing — so it is written with a timeout.
+    ///
+    /// Raised by the cross-family review of this change (DeepSeek, 2026-08-11), which
+    /// judged the path structurally safe but untested.
+    #[tokio::test]
+    async fn a_model_that_only_ever_names_phantom_tools_still_terminates() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                // The finalize turn is the way out: it carries `ToolChoice::None`, so the
+                // model is being asked for prose and answers.
+                if is_finalize_turn(req) {
+                    return Ok(text_response("FORCED FINAL ANSWER"));
+                }
+                Ok(tool_call_response("c", "run_sha", json!({"path": "x"})))
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let model = client.completion_model(MODEL);
+        let run = run_phase(
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            2,
+            None,
+            &crate::progress::NullSink,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+        );
+        let (answer, _usage) = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("a phantom tool call every turn must exhaust the budget, not loop")
+            .expect("the turn cap must still produce an answer");
+
+        assert_eq!(answer, "FORCED FINAL ANSWER");
+        let asked = client.requests_for(MODEL);
+        assert!(
+            asked.len() <= 4,
+            "the budget of 2 must bound the recoveries, not be refreshed by them: {} turns",
+            asked.len()
+        );
+        assert!(
+            asked.iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
+            "exhausting the budget must reach the forced write-up turn"
         );
     }
 

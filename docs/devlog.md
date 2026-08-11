@@ -39,23 +39,34 @@ what the model meant and running a command nobody asked for. A wrong guess doesn
 itself. `Skip` with a reason string is strictly more information and leaves the choice where
 it belongs. Amy picked it.
 
-Two things in rig's source changed the design. Under `ToolChoice::None` rig *rejects* a
-`Skip` outright — and that is exactly the tool choice kaibo's forced write-up turn uses. So
-the hook declines there, and it declines on purpose rather than leaning on the rejection: a
-tool call during a turn that asked for prose is not a fumbled name, it's a model ignoring
-the ask, and the write-up path's own diagnostics are the better error. And when a call is
-skipped, *none* of the turn's tool calls execute — the peers come back as "not executed".
-That's a fact the model needs, because one told only that a single name was wrong will
-assume its other calls landed. So the message says the turn ran nothing and asks for the
-work again. A refusal owes the reader what was refused, why, and what to do instead; here
-"what to do instead" had a second half we would have missed by not reading the code we were
-calling.
+Reading rig's source changed the message. When a call is skipped, *none* of the turn's tool
+calls execute — the peers come back as "not executed". That's a fact the model needs,
+because one told only that a single name was wrong will assume its other calls landed. So
+the message says the turn ran nothing and asks for the work again. A refusal owes the reader
+what was refused, why, and what to do instead; here "what to do instead" had a second half
+we would have missed by not reading the code we were calling.
 
 The test is the old repro. A scripted model reads a file, then calls `run_sha`, then
 answers — and deleting the `add_hook` line makes it fail with the production error
 verbatim: ``UnknownToolCall: model attempted to call unknown or disallowed tool `run_sha` ``.
 A satisfying shape for a regression test — the sabotage doesn't approximate the bug, it *is*
 the bug.
+
+The cross-family review (DeepSeek, dogfooding `consult`) came back sound and caught the one
+thing I'd written down wrong. I had the `ToolChoice::None` branch described as a live guard
+protecting the forced write-up turn. It isn't: `forced_finish_turn` builds its own agent and
+installs no hooks, so the hook never sees that tool choice at all. The branch is right and I
+kept it — it's the answer we'd want if that ever changed — but it is guarding a state this
+tree cannot produce, and a comment that oversells its own reach is the kind of thing that
+gets believed later. The correction is in the doc comment now, stated as plainly as the
+claim was.
+
+Its other finding was a real test gap: nothing exercised a model that names a phantom tool
+on *every* turn. The recovery costs a turn and nothing counts recoveries, so the only thing
+between a pathological model and an unbounded loop is that a skipped turn is still a turn.
+The review reasoned that through and concluded it was structurally safe. It was right, and
+now there's a test that would hang if it ever stopped being true — which is the version of
+that argument I trust.
 
 What this doesn't do is lower the rate. The hook is recovery, and the `warn` it emits per
 occurrence is the first time this class is measurable at all — which is now the open half in
