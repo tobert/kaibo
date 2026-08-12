@@ -209,19 +209,20 @@ pub fn report_preamble() -> String {
          {core}\n\n\
          HOW TO READ. Read files WHOLE. `cat -n FILE` is your default command for any \
          file the question touches. One read gives you the imports, the types with \
-         their impls, the call sites, and exact line numbers together, and most source \
-         files are small enough to read in a single command. Use `grep -rn PATTERN .` \
+         their impls, the call sites, and exact line numbers together, and nearly \
+         every source file comes back whole in a single command. The project file \
+         list gives you each file's size, so you know before you read: read whole \
+         every file it does not mark. When you have no size, read whole anyway and \
+         let the result tell you otherwise. Reading too much costs you one read. \
+         Reading too little costs you every read after it. Use `grep -rn PATTERN .` \
          to find WHICH files matter (`-B4 -A8` shows a preview around each match). \
          Once grep names a file, open that file whole. When the file is large, read a \
          wide span around each match instead, with `cat -n FILE | sed -n '120,400p'`. \
-         That returns the range and keeps the real line numbers, so your citation \
-         stays exact. A whole-file read of a very large file comes back \
-         truncated (exit 3), and the truncated result still contains the start and the \
-         end of the file. Read the rest in targeted spans: run `grep -n SYMBOL FILE` \
-         to get the line numbers the question needs, then read a wide span around each \
-         one with `cat -n FILE | sed -n '1200,2400p'`. A span of about 1,200 lines \
-         fits in a single read. Read a very large file from start to end only when the \
-         question needs all of it.\n\n\
+         That keeps the real line numbers, so your citation stays exact. A file so \
+         large that a whole read comes back truncated (exit 3) returns its start and \
+         its end; read the rest the same way, with `grep -n SYMBOL FILE` for the line \
+         numbers and `cat -n FILE | sed -n '1200,2400p'` for each span. About 1,200 \
+         lines fits in a single read.\n\n\
          HOW TO INVESTIGATE. Read holistically. The question tells you where to start \
          reading, not where to stop. Read the code around each relevant location as \
          well, not only the lines the question names directly. Your report is the only \
@@ -679,12 +680,14 @@ pub fn consult_preamble() -> String {
          repository than you could read in one turn, which leaves you more turns for \
          reading the most important code closely and for reasoning. Use `run_kaish` \
          to read the code yourself when you need a specific span. When you read \
-         directly, read files WHOLE with `cat -n FILE`, because most files are small \
-         enough to read in a single command. A whole-file read of a very large file \
-         comes back truncated (exit 3), and the truncated result still contains the \
-         start and the end of the file. Read the rest in targeted spans: run \
-         `grep -n SYMBOL FILE` to get the line numbers you need, then read a wide \
-         span around each one with `cat -n FILE | sed -n '1200,2400p'`.\n\n\
+         directly, read files WHOLE with `cat -n FILE`, because nearly every source \
+         file comes back whole in a single command. The project file list gives you \
+         each file's size, so read whole every file it does not mark, and when you \
+         have no size read whole anyway and let the result tell you otherwise. \
+         Reading too much costs you one read. Reading too little costs you every read \
+         after it. For a file too large to come back whole, run `grep -n SYMBOL FILE` \
+         to get the line numbers you need, then read a wide span around each one with \
+         `cat -n FILE | sed -n '1200,2400p'`.\n\n\
          Your tools exist to support the answer. Writing the answer is your work, and \
          no tool writes it for you. Every read you make is evidence for that answer, \
          and the work is not finished until the answer is written. Write it in this \

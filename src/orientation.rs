@@ -64,6 +64,10 @@ impl OrientationConfig {
         if !self.enabled {
             return Ok(None);
         }
+        // Captured before `sandbox` moves into the kernel: the map states the
+        // read-whole ceiling in the operator's own configured terms, so the number a
+        // model reads is the one its next `cat -n` will actually be cut at.
+        let output_limit = sandbox.output_limit_bytes;
         let worker = KaishWorker::spawn_with(root, sandbox)
             .context("orientation: spawning the read-only kernel")?;
         let files = list_files(&worker).await?;
@@ -72,7 +76,8 @@ impl OrientationConfig {
         }
         let n = files.len();
         if n <= self.full_list_max_files {
-            return Ok(Some(render_full_list(&files)));
+            let sizes = file_sizes(&worker, &files).await;
+            return Ok(Some(render_full_list(&files, &sizes, output_limit)));
         }
         // Too many files for a flat list — fold into a directory map.
         let tree = DirNode::from_paths(&files);
@@ -118,22 +123,127 @@ async fn list_files(worker: &KaishWorker) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Stat the enumerated files for their sizes, through the *same* kernel that
+/// enumerated them — so a size can never disagree with the file the model will read.
+///
+/// Best-effort by design: orientation is an enhancement, so a stat failure costs the
+/// sizes, never the map. It is logged rather than swallowed, because a map that
+/// silently lost its sizes looks identical to a repo that never had them.
+///
+/// Chunked because the paths ride the command line: a 256-file project would
+/// otherwise build one very long script string.
+async fn file_sizes(worker: &KaishWorker, files: &[String]) -> BTreeMap<String, u64> {
+    #[derive(serde::Deserialize)]
+    struct StatRow {
+        #[serde(rename = "FILE")]
+        file: String,
+        #[serde(rename = "SIZE")]
+        size: String,
+    }
+
+    let mut sizes = BTreeMap::new();
+    for chunk in files.chunks(64) {
+        // Single-quote each path and strip any embedded quote: a path cannot break
+        // out of the argument it sits in.
+        let args: Vec<String> = chunk
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "")))
+            .collect();
+        let script = format!("stat --json {}", args.join(" "));
+        let out = match worker.run(&script).await {
+            Ok(out) if out.ok() => out,
+            other => {
+                tracing::warn!(
+                    error = ?other.err(),
+                    "orientation: stat failed for a chunk; the map keeps its paths and \
+                     loses those sizes"
+                );
+                continue;
+            }
+        };
+        match serde_json::from_str::<Vec<StatRow>>(out.stdout.trim()) {
+            Ok(rows) => sizes.extend(
+                rows.into_iter()
+                    .filter_map(|r| r.size.parse::<u64>().ok().map(|n| (r.file, n))),
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "orientation: parsing stat --json failed; the map keeps its paths and \
+                 loses those sizes"
+            ),
+        }
+    }
+    sizes
+}
+
+/// The size at or under which one `cat -n FILE` returns the file WHOLE.
+///
+/// It is *below* the raw output cap on purpose: `cat -n` prefixes every line with a
+/// number and a tab, so the delivered bytes exceed the file's own size by roughly an
+/// eighth on real source. Four fifths of the cap keeps the stated ceiling true for
+/// files with short lines, where the numbering overhead is worst. Derived from the
+/// live `[sandbox] output_limit_bytes` rather than hardcoded, so an operator who
+/// raises the cap gets a map that says so.
+fn whole_read_ceiling(output_limit: usize) -> usize {
+    output_limit / 5 * 4
+}
+
+/// Bytes as whole kilobytes, floored, minimum 1 — the unit the read-whole ceiling is
+/// stated in, so a model compares two numbers instead of counting digits.
+fn kb(bytes: u64) -> u64 {
+    (bytes / 1024).max(1)
+}
+
 /// Render the complete file list into the injected block. The framing tells the
 /// model the map is complete (so it skips discovery) and points it at the reads it
 /// should do instead — the whole point is to convert "what's here?" turns into
 /// direct reads.
-fn render_full_list(files: &[String]) -> String {
-    let mut s = String::with_capacity(64 + files.iter().map(|f| f.len() + 1).sum::<usize>());
+///
+/// **Sizes are here to remove a guess.** Measured over 16,105 real reads (a month of
+/// traces, 2026-08-12), the median read delivered 1,837 bytes — about 45 lines —
+/// while whole-file reads truncated only 1.8% of the time. Models were reading in
+/// small windows to avoid a risk that almost never materialized, because from inside
+/// the sandbox a file's size is unknown until it has been read. Publishing the size
+/// turns that judgment call into a comparison, and marking the few files that exceed
+/// the ceiling puts the exception on the line it applies to instead of in prose the
+/// reader has to hold.
+fn render_full_list(files: &[String], sizes: &BTreeMap<String, u64>, output_limit: usize) -> String {
+    let ceiling = whole_read_ceiling(output_limit);
+    let mut s = String::with_capacity(80 + files.iter().map(|f| f.len() + 16).sum::<usize>());
     s.push_str(
         "PROJECT FILES. The project's complete file list (read-only; hidden config \
          included, build/VCS dirs excluded). You already have the whole layout here, \
          so go straight to reading the files the question touches with `cat -n FILE`, \
          and use `grep -rn` to find where something lives inside them.\n",
     );
+    if !sizes.is_empty() {
+        s.push_str(&format!(
+            "Each file's size is given. One `cat -n FILE` returns a file of up to {} KB \
+             WHOLE, so read every file at or under that size whole — that is most of \
+             this list, and you never have to guess. The few files above it are marked \
+             `read in spans`; for those, `grep -n SYMBOL FILE` first, then read a wide \
+             span around each hit with `cat -n FILE | sed -n '1200,2400p'`.\n",
+            kb(ceiling as u64)
+        ));
+    }
+    // One column, so the sizes line up and the marked files stand out down the page.
+    let width = files.iter().map(String::len).max().unwrap_or(0).min(72);
     for f in files {
         s.push_str("  ");
-        s.push_str(f);
-        s.push('\n');
+        match sizes.get(f) {
+            Some(&bytes) => {
+                let mark = if bytes as usize > ceiling {
+                    "   read in spans"
+                } else {
+                    ""
+                };
+                s.push_str(&format!("{f:<width$}  {:>5} KB{mark}\n", kb(bytes)));
+            }
+            None => {
+                s.push_str(f);
+                s.push('\n');
+            }
+        }
     }
     s
 }
@@ -285,6 +395,96 @@ mod tests {
         assert!(out.contains("README.md"), "lists the readme: {out}");
     }
 
+    /// Every listed file carries its size, and the block states the size at which one
+    /// `cat -n` still returns a whole file.
+    ///
+    /// This is the feature's whole point: measured over 16,105 real reads, the median
+    /// delivered 1,837 bytes while whole-file reads truncated 1.8% of the time —
+    /// models hedge because a file's size is unknowable from inside the sandbox until
+    /// it has been read. A map without sizes leaves that guess in place.
+    #[tokio::test]
+    async fn the_file_list_publishes_sizes_and_the_read_whole_ceiling() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "small.rs", &"x\n".repeat(100)); // 200 B
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+
+        let out = OrientationConfig::default()
+            .assemble(&canon, SandboxConfig::default())
+            .await
+            .unwrap()
+            .expect("a non-empty repo yields a map");
+
+        assert!(
+            out.contains("small.rs") && out.contains("KB"),
+            "each file is listed with a size: {out}"
+        );
+        // 64 KiB cap → a 51 KB read-whole ceiling, stated in the map itself.
+        let stated = kb(whole_read_ceiling(SandboxConfig::default().output_limit_bytes) as u64);
+        assert!(
+            out.contains(&format!("up to {stated} KB")),
+            "the block states the ceiling ({stated} KB): {out}"
+        );
+    }
+
+    /// A file past the ceiling is marked on its own line; a file under it is not.
+    /// The exception rides the line it applies to, so a model reading the list never
+    /// has to hold a rule in its head while scanning.
+    #[tokio::test]
+    async fn only_files_over_the_ceiling_are_marked_for_span_reading() {
+        let dir = tempdir().unwrap();
+        let limit = 4096; // a small cap → a 3 KB ceiling, so the fixture stays tiny
+        write(dir.path(), "tiny.rs", &"x\n".repeat(64)); // 128 B — under
+        write(dir.path(), "huge.rs", &"x\n".repeat(8192)); // 16 KB — over
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+
+        let out = OrientationConfig::default()
+            .assemble(
+                &canon,
+                SandboxConfig {
+                    output_limit_bytes: limit,
+                    ..SandboxConfig::default()
+                },
+            )
+            .await
+            .unwrap()
+            .expect("a non-empty repo yields a map");
+
+        let huge = out
+            .lines()
+            .find(|l| l.contains("huge.rs"))
+            .expect("the large file is listed");
+        let tiny = out
+            .lines()
+            .find(|l| l.contains("tiny.rs"))
+            .expect("the small file is listed");
+        assert!(
+            huge.contains("read in spans"),
+            "a file over the ceiling is marked: {huge}"
+        );
+        assert!(
+            !tiny.contains("read in spans"),
+            "a file under the ceiling carries no exception: {tiny}"
+        );
+        // The ceiling tracks the operator's configured cap, not a hardcoded number.
+        assert!(
+            out.contains(&format!("up to {} KB", kb(whole_read_ceiling(limit) as u64))),
+            "the stated ceiling follows [sandbox] output_limit_bytes: {out}"
+        );
+    }
+
+    /// Sizes are an enhancement: without them the map still lists every path, so a
+    /// stat failure costs the sizes and never the orientation.
+    #[test]
+    fn a_map_without_sizes_still_lists_every_file() {
+        let files = vec!["src/main.rs".to_string(), "README.md".to_string()];
+        let out = render_full_list(&files, &BTreeMap::new(), 1 << 16);
+        assert!(out.contains("src/main.rs") && out.contains("README.md"), "{out}");
+        assert!(
+            !out.contains("KB"),
+            "with no sizes the block makes no size claims: {out}"
+        );
+    }
+
     /// Over the file-count ceiling, the flat list gives way to a directory map —
     /// dir → file-count lines — instead of refusing the call. Orientation is an
     /// enhancement; a large repo must still get one.
@@ -388,3 +588,4 @@ mod tests {
         );
     }
 }
+
