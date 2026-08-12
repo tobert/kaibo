@@ -17,6 +17,8 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **The repo map gives each file's size and the size that still reads whole**, so a model
+  compares two numbers instead of guessing how much of a file one read returns.
 - **`[telemetry]` exports the logs signal too** — kaibo's own `tracing` events, which the
   span tree never carried, so a warning like a model calling a tool that does not exist
   becomes countable.
