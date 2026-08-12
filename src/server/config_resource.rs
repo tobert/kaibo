@@ -210,6 +210,14 @@ pub(crate) fn render_config_resource(
     struct TelemetryDoc {
         enabled: bool,
         endpoint: String,
+        /// Whether kaibo's own `tracing` events export alongside the span tree.
+        logs: bool,
+        /// Where those records go, **as resolved** — the explicit `logs_endpoint` or
+        /// the one derived from `endpoint`. Absent when `logs` is off. Resolved
+        /// rather than echoed because the derivation is the part a reader can't do
+        /// in their head from the file.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        logs_endpoint: Option<String>,
         timeout_secs: u64,
         service_name: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -570,6 +578,10 @@ pub(crate) fn render_config_resource(
     let crate::config::TelemetryConfig {
         enabled: telemetry_enabled,
         endpoint: telemetry_endpoint,
+        logs: telemetry_logs,
+        // Read through `resolve_logs_endpoint` below, which is where the derivation
+        // lives; the raw override alone would under-report where records go.
+        logs_endpoint: _,
         headers: telemetry_headers,
         timeout: telemetry_timeout,
         service_name: telemetry_service_name,
@@ -643,6 +655,13 @@ pub(crate) fn render_config_resource(
         telemetry: TelemetryDoc {
             enabled: *telemetry_enabled,
             endpoint: telemetry_endpoint.clone(),
+            logs: *telemetry_logs,
+            // A non-derivable endpoint is a fatal startup error, so a *running*
+            // server always resolves here. Reported absent rather than guessed if
+            // that ever stops being true.
+            logs_endpoint: (*telemetry_logs)
+                .then(|| crate::telemetry::resolve_logs_endpoint(&config.telemetry).ok())
+                .flatten(),
             timeout_secs: telemetry_timeout.as_secs(),
             service_name: telemetry_service_name.clone(),
             header_names: telemetry_headers.keys().cloned().collect(),

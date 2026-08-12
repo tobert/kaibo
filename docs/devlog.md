@@ -14,6 +14,56 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-12 — the instrument had nowhere to report
+
+This one sat at P4 for weeks with an honest question attached: *is a logs signal worth
+the content and cost, given traces already carry the prompts and completions?* Framed
+that way the answer kept coming back "not yet", and that was right every time it was
+asked.
+
+What changed is that two parties wanted the same number. Genba — Amy's work fleet —
+asked for the unknown-tool recovery rate by name, to cite when they teach cross-model
+review. Our own tracker had been asking for the empty-answer incidence since the guard
+shipped. Both are `warn` events. Neither is a span. So the honest status of both entries
+was not "unmeasured" but *unmeasurable*: `[telemetry]` exported traces, while kaibo's
+events rode stderr and the MCP notification bridge, which the `mcp-notification-channels`
+finding already established do not reach a calling agent. We had built the instrument
+twice and never built the gauge.
+
+The day before, a provocation attempt closed the other road. Told to call a nonexistent
+tool, the local Gemma treated the name as a shell command, got kaish's `exit: 127`, found
+`checksum` in `help builtins`, and finished the task correctly. DeepSeek — the family
+that produced the phantom tool in the wild — simply declined to. **A capable model asked
+to fail on demand does not.** So there is no benchmark for this class, only passive
+collection, and passive collection needed a sink.
+
+That reframes the old question rather than answering it. The cost worry was about
+*content*: rig's spans carry prompts, completions, source snippets. But kaibo's own
+events are diagnostics kaibo writes about itself, strictly less sensitive than what an
+operator already accepted when they turned traces on. So logs ride the same opt-in — one
+`enabled`, both signals — and the layer's filter is `kaibo=info` rather than the traces
+layer's `info`. That asymmetry is the design, not an oversight: rig also emits
+event-level chatter repeating the prompt text, and exporting it again as loose log lines
+would pay twice for the most sensitive bytes we handle.
+
+The one real decision was the endpoint. Traces sit at `/v1/traces`, logs at `/v1/logs`,
+and it is tempting to just swap the suffix. But an operator whose collector lives at
+`/otlp/ingest` would then get their diagnostics posted to a URL they never chose, and
+they would discover it by the records never arriving — the exact silent failure this
+house refuses. So the derivation is scoped to the standard shape and anything else is a
+startup error naming `logs_endpoint`. Amy's ruling that same morning about `attach.rs`
+sharpened how that error reads: state the action, don't point at a tracker.
+
+Proved rather than assumed, twice over. Breaking the filter to `info` made the filter
+test fail with rig's chatter in the diff; making the derivation fall back silently made
+the refusal test fail. Then a local HTTP sink caught the real exports: two POSTs, one to
+`/v1/traces` and one to the **derived** `/v1/logs`, both carrying the probe marker. The
+offline test proves the filter; only the wire proves the record leaves the process.
+
+`docs/issues.md` keeps the metrics signal and gains a new entry — *now go collect the two
+rates*. The plumbing is no longer the blocker, which means the next honest status for
+those entries is a number or nothing.
+
 ## 2026-08-11 — method_missing, for models
 
 We had this tracked as "a bounded corrective re-prompt": catch `UnknownToolCall`, feed the

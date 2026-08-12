@@ -125,17 +125,18 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     // over config.log (unchanged), rebuilt fresh per layer.
     let kaibo_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.log.clone()));
-    // Stand up the OTLP exporter first, so the boxed layer's subscriber type is the
+    // Stand up the OTLP exporters first, so the boxed layers' subscriber type is the
     // bare `Registry`. `None` (zero overhead) unless [telemetry] opted in; the guard
-    // flushes the batch on exit. A build error here is fatal — a misconfigured
-    // exporter is an operator mistake, surfaced loudly, not silently swallowed.
-    let (otel_layer, otel_guard) =
+    // flushes both signals' batches on exit. A build error here is fatal — a
+    // misconfigured exporter (including a logs endpoint kaibo cannot derive) is an
+    // operator mistake, surfaced loudly, not silently swallowed.
+    let (otel_layers, otel_guard) =
         match kaibo::telemetry::init::<tracing_subscriber::Registry>(&config.telemetry)? {
-            Some((layer, guard)) => (Some(layer), Some(guard)),
+            Some((layers, guard)) => (Some(layers), Some(guard)),
             None => (None, None),
         };
     tracing_subscriber::registry()
-        .with(otel_layer)
+        .with(otel_layers)
         .with(
             fmt::layer()
                 .with_writer(std::io::stderr)

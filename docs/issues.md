@@ -856,19 +856,21 @@ defaults (`credentials.rs`, `docs/config.md`). A secrets *manager* is still out 
 scope: by design the TOML references keys, never inlines them, so "point at
 `$SECRET_TOOL` output" would be a future key-source variant alongside env/file.
 
-### OTLP logs + metrics signals (deferred — traces shipped)
-The **traces** signal is in: `[telemetry]` (off by default) stands up an OTLP/HTTP
-exporter and a `tracing-opentelemetry` layer in `main.rs`, exporting the GenAI span
-tree rig already emits (`src/telemetry.rs`, `docs/config.md`). Two signals remain:
-- **Logs** — kaibo's `tracing` events (the `kaibo`-target log lines) as an OTLP
-  *logs* signal via `opentelemetry-appender-tracing`, a third layer in the same
-  registry stack. Today they still ride stderr + the MCP `notifications/message`
-  bridge only; nothing exports them.
-- **Metrics** — rig records token usage as span *fields*, not as metric
-  instruments. Real counters/histograms (tokens, per-phase latency, sweep fan-out)
-  are hand-rolled, or derived from spans at the collector. Decide which before
-  adding an `opentelemetry` metrics provider.
-Both reuse the same off-by-default `[telemetry]` gate and endpoint; the open
-question is whether the content/cost of a logs signal is worth it given traces
-already carry the prompts/completions. The session's `otlp-mcp` collector is the
-sink for a probe.
+### OTLP metrics signal (deferred — traces and logs shipped)
+**Metrics** — rig records token usage as span *fields*, not as metric instruments.
+Real counters/histograms (tokens, per-phase latency, sweep fan-out) are hand-rolled,
+or derived from spans at the collector. Decide which before adding an
+`opentelemetry` metrics provider; it reuses the same off-by-default `[telemetry]`
+gate and endpoint the other two signals do.
+
+### Now collect the two rates the logs signal was built for
+The sink shipped, so the counting can start — and until someone runs it, the two
+"incidence is unmeasured" entries above stay open on data, not on plumbing:
+- **Unknown-tool recovery rate.** Genba asked for it by name to cite when teaching
+  cross-model review. The `warn` carries the model id and the advertised toolset;
+  the split that matters is rescued-by-feedback vs. named-a-second-phantom-tool.
+  It cannot be benchmarked — a capable model asked to call a nonexistent tool
+  simply declines (measured 2026-08-11 against `openai-local` and `deepseek`), so
+  this comes from real sessions or not at all.
+- **Empty-answer incidence**, split by `finish_reason` and by
+  rescued-by-forced-turn, per that entry's first bullet.
