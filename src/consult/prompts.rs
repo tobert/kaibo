@@ -212,9 +212,9 @@ pub fn report_preamble() -> String {
          their impls, the call sites, and exact line numbers together, and nearly \
          every source file comes back whole in a single command.\n\n\
          You do not have to guess how big a file is. The project file list gives you \
-         each file's size, and the size at which one read still returns a whole file. \
-         Read whole every file it does not mark. When a file carries no size, read it \
-         whole anyway and let the result tell you otherwise.\n\n\
+         each file's size and marks the few files that will not come back whole. Read \
+         whole every file it does not mark. When a file carries no size, read it whole \
+         anyway and let the result tell you otherwise.\n\n\
          Prefer the bigger read. Reading too much costs you one read. Reading too \
          little costs you every read after it.\n\n\
          Use `grep -rn PATTERN .` to find WHICH files matter (`-B4 -A8` shows a \
@@ -856,9 +856,15 @@ mod tests {
         // it *after* the exceptions, where a reader would otherwise stop.
         for (register, phrase) in [
             ("imperative", "Read files WHOLE."),
-            ("data-anchored", "You do not have to guess how big a file is."),
+            (
+                "data-anchored",
+                "You do not have to guess how big a file is.",
+            ),
             ("cost", "Prefer the bigger read."),
-            ("re-anchor after the exceptions", "The default is the whole file."),
+            (
+                "re-anchor after the exceptions",
+                "The default is the whole file.",
+            ),
         ] {
             assert!(
                 p.contains(phrase),
@@ -1499,7 +1505,8 @@ mod tests {
     /// all — the report/dossier stays byte-for-byte what it was before this feature.
     #[test]
     fn an_empty_delivery_renders_no_block() {
-        assert!(sweep_evidence_block(&consult_driver_consumer(), &SweepDelivery::default())
-            .is_none());
+        assert!(
+            sweep_evidence_block(&consult_driver_consumer(), &SweepDelivery::default()).is_none()
+        );
     }
 }
