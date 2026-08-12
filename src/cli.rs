@@ -725,6 +725,72 @@ fn init_cli_logging() {
         .try_init();
 }
 
+/// [`init_cli_logging`], plus the OTLP layers `[telemetry]` asked for — the CLI's
+/// counterpart to `serve()`'s subscriber build in `main.rs`. Installing both layers
+/// in one `try_init()` call here means a subcommand's own later `init_cli_logging()`
+/// call (every `run_*` fn makes one, for callers that reach it without going through
+/// `main`) simply no-ops — `try_init` is idempotent, and the global default this
+/// function installed already carries both the stderr sink and the exporter.
+fn init_cli_logging_with_otel(
+    otel_layers: Vec<
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+    >,
+) {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::registry()
+        .with(otel_layers)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        )
+        .try_init();
+}
+
+/// Stand up OTLP for a CLI subcommand when `[telemetry]` is configured — Amy's ask:
+/// "CLI should try to do otel if it has connection info." Mirrors `serve()` in
+/// `main.rs`: build the exporter layers, install them alongside the CLI's normal
+/// stderr logging, and hand the guard back so `main` can flush and shut it down.
+///
+/// **`main` must hold the returned guard and call
+/// [`shutdown`](crate::telemetry::OtelGuard::shutdown) AFTER the subcommand returns
+/// and BEFORE `std::process::exit`.** Every CLI arm exits through
+/// `std::process::exit`, which skips destructors — a guard merely dropped here would
+/// discard whatever the batch processor hadn't exported yet, silently losing every
+/// span from a short CLI run. This is called once, before dispatch, so it does not
+/// know which subcommand is about to run; the OTel layers export whatever spans that
+/// subcommand's own instrumentation produces (rig's GenAI tree for a model phase,
+/// kaish-kernel's command spans for `kaish`, ...).
+///
+/// A config-load failure here returns `Ok(None)` rather than propagating: telemetry
+/// is off in that case the same as if it were never configured, and the *real* error
+/// surfaces a moment later when the subcommand makes its own `load_config` call and
+/// reports it through the normal `--json`/stderr preflight path — swallowing it here
+/// only defers where it's told, it never hides it. A telemetry-specific failure
+/// (config loads fine but the exporter itself won't build — e.g. a logs endpoint
+/// that can't be derived) is different: nothing else re-checks that, so it propagates
+/// loudly, same as the fatal build error on the `serve` path.
+pub async fn init_cli_telemetry(
+    common: &CommonArgs,
+) -> anyhow::Result<Option<crate::telemetry::OtelGuard>> {
+    let Ok(config) = load_config(common) else {
+        return Ok(None);
+    };
+    if !config.telemetry.enabled {
+        return Ok(None);
+    }
+    match crate::telemetry::init::<tracing_subscriber::Registry>(&config.telemetry)? {
+        Some((layers, guard)) => {
+            init_cli_logging_with_otel(layers);
+            Ok(Some(guard))
+        }
+        // `enabled` is checked above, so `init` cannot return `None` here — kept as a
+        // match arm rather than `.expect()` because the type is still `Option`.
+        None => Ok(None),
+    }
+}
+
 /// Print `err` to stderr and return `code` — the shared shape for a **pre-flight**
 /// rejection (usage *or* setup/containment), i.e. anything refused before the model
 /// runs. Carries the `kind`/`code` its caller classified (it renders both, so the name
