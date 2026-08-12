@@ -14,6 +14,69 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-12 — three nudges, three nulls, and the lever that actually moves
+
+Amy noticed something we had all half-noticed: kaibo's agents read code in small,
+conservative slices. *"We've done rounds of tuning them to do bigger strides, but I
+wonder if we should do more thinking about how we prompt them."* The thinking turned
+into a measurement, and the measurement turned into a result none of us expected to
+like.
+
+The logs signal had just shipped, so for the first time there was a month of traces to
+ask. 16,105 real `run_kaish` reads, 18 models, each attributed to its phase's model
+through the `run_phase` parent span. The median delivered **1,837 bytes** — about 45
+lines — against a preamble whose first sentence already said "Read files WHOLE."
+Whole-file reads truncated **1.8%** of the time. So models were hedging against a risk
+that essentially never fired, and the obvious reason was that a file's size is
+unknowable from inside the sandbox until the file has been read.
+
+That gave a clean hypothesis and three ways at it. Publish the sizes in the repo map so
+the guess becomes a comparison. Say the rule several ways instead of once, because Amy's
+instinct was that repetition might carry where one clear sentence had not. Then put the
+budget in the tool result itself, so the number arrives at the moment the next read is
+chosen rather than in a preamble read once at the start.
+
+**All three moved nothing.** Not "a little" — nothing coherent. The third is the one
+worth recording, because it failed in an instructive shape: median up 17%, mean down,
+p90 down, small-read share up. A real effect moves those together. That is what noise
+looks like when you stare at it hopefully. Across every run, control and treatment
+medians sat in a ±10% band around 3,400 bytes.
+
+The honest conclusion was Amy's opening position, now with numbers behind it: *"the
+weights are the weights, we can only nudge them."*
+
+What the data does say, loudly, is in the column nobody was looking at. Under the
+**same** preamble and the same tools, `gpt-5.6-terra` reads at a median of 14,939 bytes
+and `z-ai/glm-4.7-flash` at 227. A **65× spread**, decided entirely by which model sits
+in the slot. Nothing written moved the number past noise; changing the model moves it by
+nearly two orders of magnitude. Read stride is a **casting** decision, not a prompting
+one, and that belongs in `docs/casts.md` rather than in another round of preamble edits.
+
+Two corrections the record is owed. First, an early framing here was too broad: "models
+read at 4% of the stride we ask for" came from the aggregate, but the explorer *alone*,
+post-#143 and #146, reads at a median near 5 KB. The 1,837-byte figure is dragged down
+by the consult driver, which reads smaller than the explorer it delegates to. Second,
+and more interesting: for a sweep that has `attach`, a small read followed by an attach
+is **correct**. `attach` routes a file's whole bytes past the explorer to whoever reads
+its report, never through the explorer's own context, which is strictly cheaper than
+reading it. Stride is the wrong metric there entirely. The A/B ran against the top-level
+`explore` tool, which deliberately withholds `attach` (`server/mod.rs:2030`), so it
+measured the one configuration where a bigger read is worth the most — a fair test, and
+still null.
+
+What ships is the half that stands on its own argument rather than on a moved metric:
+the map publishes each file's size and the size that still reads whole. That closes a
+real information gap whether or not any model acts on it differently today. The
+tool-result budget line was built, tested, measured, and **dropped** — Amy's call, and
+the right one: recurring cost on every tool result, three nulls of evidence, and nothing
+a model could act on that the map does not already say.
+
+The meta-lesson is the one worth keeping. Two rounds of prompt tuning had happened here
+before, on impression rather than measurement, and a third was queued. What stopped it
+was a month of traces and three A/Bs — a couple of hours, most of it spent fighting a
+decoder rather than a model. **Measure before writing prose at a model.** The prose is
+the expensive part, and it is the part that feels like progress.
+
 ## 2026-08-12 — the CLI never had an exporter, and a byte count wore the wrong clothes
 
 Two findings, both surfaced by measuring a real trace instead of trusting the wiring.
