@@ -1,4 +1,4 @@
-//! Live OTLP export probe — `#[ignore]`d, needs a real OTLP/HTTP collector.
+//! Live OTLP export probe (traces + logs) — `#[ignore]`d, needs a real OTLP/HTTP collector.
 //!
 //! The offline tests (`src/telemetry.rs`) prove the exporter *builds* and the gate
 //! is off-by-default, but they never push a span over a socket — so they can't catch
@@ -35,15 +35,15 @@ async fn live_export_reaches_an_otlp_collector() {
         ..TelemetryConfig::default()
     };
 
-    // Same path the binary takes: build the layer + guard, install the layer, emit a
+    // Same path the binary takes: build the layers + guard, install them, emit a
     // span (rig's spans are `info_span!`s just like this), then force-flush on
     // shutdown. If export is wired wrong this silently no-ops — so the assertion
     // lives downstream (grep the collector), the way the docstring describes.
-    let (layer, guard) = kaibo::telemetry::init::<tracing_subscriber::Registry>(&cfg)
+    let (layers, guard) = kaibo::telemetry::init::<tracing_subscriber::Registry>(&cfg)
         .expect("telemetry init must not error")
-        .expect("an enabled config must yield a layer");
+        .expect("an enabled config must yield layers");
 
-    let sub = tracing_subscriber::registry().with(layer);
+    let sub = tracing_subscriber::registry().with(layers);
     subscriber::with_default(sub, || {
         let span = tracing::info_span!(
             "kaibo_selftest_span",
@@ -52,6 +52,14 @@ async fn live_export_reaches_an_otlp_collector() {
         );
         let _enter = span.enter();
         tracing::info!(marker = MARKER, "selftest span body");
+        // The logs signal rides the same guard and the same offline gap: the unit
+        // test proves the filter, only a live run proves the record leaves the
+        // process. Emitted on the `kaibo` target, which is what that filter admits.
+        tracing::warn!(
+            target: "kaibo::telemetry",
+            marker = MARKER,
+            "selftest log record — the logs signal's half of this probe"
+        );
     });
 
     // Force-flush + stop. Without the blocking-client fix this is where the dropped

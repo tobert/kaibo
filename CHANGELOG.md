@@ -17,6 +17,11 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`[telemetry]` exports the logs signal too** — kaibo's own `tracing` events, which the
+  span tree never carried, so a warning like a model calling a tool that does not exist
+  becomes countable.
+- **`[telemetry] logs_endpoint`** — omit it and kaibo derives the sibling of `endpoint`;
+  a non-standard endpoint is a startup error naming the key, never a guessed destination.
 - **`deliberate` keeps its dossier in the media CAS, and `dossier` reuses one** — hand
   the digest to a second cast to reason over the same evidence for one synth's price.
 - **A refused dossier write never fails the deliberation** — you lose the record, not

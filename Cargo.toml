@@ -147,14 +147,24 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 # there. The outbound OTLP socket is allowed under stdio-only (kaibo never *binds*);
 # it stays off unless [telemetry] enables it.
 opentelemetry = "0.32"
-opentelemetry_sdk = "0.32"
+# `logs` is a default feature today and the logs signal would stop compiling without
+# it; named explicitly so a minor bump that re-sorts the defaults fails at resolve
+# time rather than by dropping a signal we ship.
+opentelemetry_sdk = { version = "0.32", features = ["logs"] }
 # No `reqwest-rustls` here: that feature pulls `reqwest/default-tls` → `reqwest/rustls`
 # → aws-lc-rs, re-introducing the C provider we just dropped. The blocking exporter
 # builds a plain reqwest client and uses whatever TLS the (feature-unified) reqwest
 # was compiled with — i.e. our rustls-no-provider + ring. So we keep only the
 # transport features and let TLS come from the shared reqwest above.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
+# The LOGS signal's half of the bridge: `tracing` events → OTel log records. Traces
+# carry rig's spans (prompts, completions, token counts); this carries kaibo's own
+# `tracing` events, which nothing exported before — the `warn` a phase emits when a
+# model calls a tool that does not exist, and the empty-answer warn, are both only
+# events. Pure `tracing` → `opentelemetry` glue, no transport of its own: it feeds the
+# same OTLP/HTTP exporter and inherits the reqwest/TLS reasoning above.
+opentelemetry-appender-tracing = "0.32"
 
 # sha256 for the media CAS (src/cas.rs): the address IS the digest, so hashing is the
 # one operation the whole design leans on. Pure Rust, no C/asm, already in the lock
@@ -173,6 +183,10 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `InMemoryLogExporter`, so the logs-signal filter is proved against real exported
+# records instead of by reading the filter string back. Dev-only: `cargo build` never
+# compiles dev-dependencies, so the `testing` feature cannot reach a shipped binary.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 # `start_paused` tests (the deferred-generate poll loop) auto-advance tokio's clock
 # instead of really sleeping the poll interval.
 tokio = { version = "1", features = ["test-util"] }
