@@ -32,40 +32,51 @@ async fn main() -> Result<()> {
     // subcommand); each arm consumes them alongside its own payload.
     match cli.command {
         // Bare `kaibo` and explicit `kaibo serve` both run the MCP server on the same
-        // flags — the compatibility contract for existing client configs.
+        // flags — the compatibility contract for existing client configs. `serve()`
+        // stands up its own OTLP guard and flushes it before returning (no
+        // `process::exit` on this path, so a plain `Drop` would already be safe here —
+        // it does the flush explicitly anyway, to keep both paths' shutdown visible
+        // and symmetric).
         None => serve(cli.common, cli.gates).await,
         Some(Command::Serve(gates)) => serve(cli.common, gates).await,
-        // The CLI front doors own their exit codes (0 answer / 2 usage / 3 setup /
-        // 4 consultation failure; kaish passes through its own code), so they return a
-        // code and we exit on it.
-        Some(Command::Consult(args)) => {
-            std::process::exit(kaibo::cli::run_consult(cli.common, args).await)
+        // Every other subcommand is a CLI front door: it owns its exit code (0 answer
+        // / 2 usage / 3 setup / 4 consultation failure; kaish passes through its own
+        // code) and always leaves through `std::process::exit`, which runs no
+        // destructors. So telemetry is stood up here, BEFORE the subcommand runs, and
+        // flushed here, AFTER it returns but BEFORE `exit` — a guard merely dropped
+        // at the end of this block would never run (`exit` skips it) and every
+        // buffered span from the run would be lost silently. `init_cli_telemetry`
+        // returns `None` (the common case: telemetry unconfigured) without installing
+        // anything, so a default CLI run is unchanged.
+        Some(command) => {
+            let otel_guard = kaibo::cli::init_cli_telemetry(&cli.common).await?;
+            let code = run_command(cli.common, command).await;
+            if let Some(guard) = otel_guard {
+                guard.shutdown();
+            }
+            std::process::exit(code);
         }
-        Some(Command::Oneshot(args)) => {
-            std::process::exit(kaibo::cli::run_oneshot(cli.common, args).await)
-        }
-        Some(Command::Explore(args)) => {
-            std::process::exit(kaibo::cli::run_explore(cli.common, args).await)
-        }
-        Some(Command::Deliberate(args)) => {
-            std::process::exit(kaibo::cli::run_deliberate(cli.common, args).await)
-        }
-        Some(Command::Kaish(args)) => {
-            std::process::exit(kaibo::cli::run_kaish(cli.common, args).await)
-        }
-        Some(Command::Batch(args)) => {
-            std::process::exit(kaibo::cli::run_batch(cli.common, args).await)
-        }
-        Some(Command::Generate(args)) => {
-            std::process::exit(kaibo::cli::run_generate(cli.common, args).await)
-        }
-        Some(Command::Cas(args)) => std::process::exit(kaibo::cli::run_cas(cli.common, args).await),
-        Some(Command::Models(args)) => {
-            std::process::exit(kaibo::cli::run_models(cli.common, args).await)
-        }
-        Some(Command::Config) => std::process::exit(kaibo::cli::run_config(cli.common)),
-        Some(Command::Configure(args)) => std::process::exit(kaibo::cli::run_configure(args.goal)),
-        Some(Command::ExampleConfig) => std::process::exit(kaibo::cli::run_example_config()),
+    }
+}
+
+/// Dispatch a non-`serve` subcommand to its CLI front door and return its exit code.
+/// Split out of `main` so telemetry setup/flush (see [`main`]) wraps every arm in one
+/// place instead of being repeated per-arm.
+async fn run_command(common: CommonArgs, command: Command) -> i32 {
+    match command {
+        Command::Serve(_) => unreachable!("serve is dispatched directly in main, before this fn"),
+        Command::Consult(args) => kaibo::cli::run_consult(common, args).await,
+        Command::Oneshot(args) => kaibo::cli::run_oneshot(common, args).await,
+        Command::Explore(args) => kaibo::cli::run_explore(common, args).await,
+        Command::Deliberate(args) => kaibo::cli::run_deliberate(common, args).await,
+        Command::Kaish(args) => kaibo::cli::run_kaish(common, args).await,
+        Command::Batch(args) => kaibo::cli::run_batch(common, args).await,
+        Command::Generate(args) => kaibo::cli::run_generate(common, args).await,
+        Command::Cas(args) => kaibo::cli::run_cas(common, args).await,
+        Command::Models(args) => kaibo::cli::run_models(common, args).await,
+        Command::Config => kaibo::cli::run_config(common),
+        Command::Configure(args) => kaibo::cli::run_configure(args.goal),
+        Command::ExampleConfig => kaibo::cli::run_example_config(),
     }
 }
 

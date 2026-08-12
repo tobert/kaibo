@@ -17,8 +17,8 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
-- **The repo map gives each file's size and the size that still reads whole**, so a model
-  compares two numbers instead of guessing how much of a file one read returns.
+- **The repo map gives each file's size and marks the files one read cannot return
+  whole**, so a model stops guessing how much of a file it will get.
 - **`[telemetry]` exports the logs signal too** — kaibo's own `tracing` events, which the
   span tree never carried, so a warning like a model calling a tool that does not exist
   becomes countable.
@@ -68,6 +68,9 @@ record. Each later release appends a new section at the top.
   kaibo reads the accepted rungs back out of the client on every call.
 - **New MCP resource `kaibo://config/guide`** — the configuration manual embedded in the
   binary; example / live state / guide now split by job.
+- **CLI subcommands export telemetry too**, when `[telemetry]` is configured — every
+  export flushes before the process exits, so a short-lived `kaibo consult`/`kaish`/...
+  run no longer loses its spans to `process::exit`.
 
 ### Changed
 
@@ -161,6 +164,8 @@ record. Each later release appends a new section at the top.
   those lanes.
 - **The state-db-collides-with-project-tree refusal now also names
   `--root`/`--allow-path`** — usually the right fix; the refusal itself is unchanged.
+- **`kaish.output_bytes` lands as an OTel int, not a string** — it now rides the same
+  `record_i64` path as `kaish.exit_code` instead of the untyped `record_u64` fallback.
 
 ## [0.2.0] — 2026-07-29
 
