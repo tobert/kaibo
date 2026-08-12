@@ -66,6 +66,9 @@ record. Each later release appends a new section at the top.
   kaibo reads the accepted rungs back out of the client on every call.
 - **New MCP resource `kaibo://config/guide`** — the configuration manual embedded in the
   binary; example / live state / guide now split by job.
+- **CLI subcommands export telemetry too**, when `[telemetry]` is configured — every
+  export flushes before the process exits, so a short-lived `kaibo consult`/`kaish`/...
+  run no longer loses its spans to `process::exit`.
 
 ### Changed
 
@@ -159,6 +162,8 @@ record. Each later release appends a new section at the top.
   those lanes.
 - **The state-db-collides-with-project-tree refusal now also names
   `--root`/`--allow-path`** — usually the right fix; the refusal itself is unchanged.
+- **`kaish.output_bytes` lands as an OTel int, not a string** — it now rides the same
+  `record_i64` path as `kaish.exit_code` instead of the untyped `record_u64` fallback.
 
 ## [0.2.0] — 2026-07-29
 

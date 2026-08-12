@@ -14,6 +14,45 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-12 — the CLI never had an exporter, and a byte count wore the wrong clothes
+
+Two findings, both surfaced by measuring a real trace instead of trusting the wiring.
+Trying to watch a `kaibo consult` run from a terminal for the unknown-tool span turned
+up nothing at all — `telemetry::init` was called exactly once, inside `serve()`'s
+dispatch arm in `main.rs`. Every CLI subcommand ran with zero exporter, `[telemetry]
+enabled = true` in `config.toml` notwithstanding. Amy's ask was blunt: the CLI should
+try to do otel if it has connection info.
+
+The fix isn't "call `init` everywhere" — every CLI arm leaves through
+`std::process::exit`, which runs no destructors, so a guard merely constructed and
+dropped loses whatever the batch processor hasn't exported yet. A short `kaish -c
+"..."` finishes before the processor's own export interval would ever fire, so a naive
+fix would have shipped the same invisible loss a second time. The guard is threaded
+through explicitly instead: `main.rs` stands up telemetry once, before dispatching to
+whichever subcommand ran, and calls `.shutdown()` on it after the subcommand returns
+and before `exit`. Proved with a real subprocess against a raw TCP collector
+(`tests/telemetry_cli.rs`) rather than trusted by inspection — breaking the flush (drop
+instead of shutdown) turns the test into a clean 10-second timeout with zero
+connections ever accepted, which is exactly the failure this fix has to rule out.
+Telemetry stays off by default either way: `init_cli_telemetry` returns `None` the
+moment `[telemetry]` isn't configured, before touching the subscriber at all.
+
+The second finding came off the same trace. `kaish.exit_code` landed as an OTel int;
+`kaish.output_bytes`, same span, same shape of field, landed as a *string*. Both are
+recorded with `Span::record` — `exit_code` as `i64`, `output_bytes` as `output_bytes as
+u64` — and that cast is the whole bug. tracing-opentelemetry's span visitor implements
+`record_i64` but never got a `record_u64` override; `tracing_core::field::Visit`'s
+default for an unoverridden method falls back to `record_debug`, which stringifies. The
+fix is one word, `u64` to `i64` — a kaish output byte count is nowhere near
+`i64::MAX`. Proving it needed a different kind of test than the obvious one: a
+value-only assertion (`kaish_bytes == Some(4321)`) can't see this bug, because a test
+visitor that implements both `record_i64` and `record_u64` reads back the same value
+either way — which is exactly how the wire bug shipped unnoticed. The test that can
+fail watches *which* `Visit` method actually fires, not what it reports back.
+
+Both are wire-visible changes for anyone already consuming these traces — CHANGELOG
+entries under Added (CLI export) and Fixed (the int/string field).
+
 ## 2026-08-12 — the instrument had nowhere to report
 
 This one sat at P4 for weeks with an honest question attached: *is a logs signal worth
