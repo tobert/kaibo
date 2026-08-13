@@ -148,7 +148,7 @@ fn run_kaish_with_telemetry(port: u16, logs: bool) -> std::process::Output {
 /// export to the collector before the process exits, not merely construct an
 /// exporter it never flushes. Proven by breaking the fix (dropping the guard
 /// instead of calling `.shutdown()`) and watching this test time out with no
-/// connection ever accepted — see the devlog/PR for that run.
+/// connection ever accepted — see the pull request for that run.
 #[test]
 fn cli_kaish_flushes_a_trace_export_before_the_process_exits() {
     let (port, rx) = one_shot_collector();
