@@ -34,19 +34,20 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// Plain and literal per the agent-facing clarity rule in AGENTS.md — this block is
 /// embedded in every preamble, so an idiom here is charged to every model we drive.
 ///
-/// Every `sed` range here is written **quoted**, and the rule is stated to the model
-/// rather than only demonstrated: kaish reserves a bare comma (brace expansion, lists),
-/// so `sed -n 120,400p` is a parse error on kaish 0.13 — the version the released binary
-/// runs — while the quoted form parses on 0.13 and later alike. Verified live against
-/// both. `addendum_teaches_quoted_spans_and_identifying_a_file` holds the quoting.
+/// Every `sed` range here is written **quoted**, but the addendum no longer explains
+/// why, because the reason stopped being true. kaish reserved a bare comma through
+/// 0.13, making `sed -n 120,400p` a parse error; kaish 0.14 made a comma an ordinary
+/// bareword character outside `[...]`/`{...}`, so both forms parse now. The quoted
+/// examples stay — they are correct on every version kaibo has ever run — and the
+/// stated rule went, since a model reads this block every turn and a false reason is
+/// worse than a missing one.
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so your work here is reading. Read \
 files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN .` finds matches whether \
 the target is a file or a directory. When a grep hit lands in a large file, read a \
 wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that range \
-with its real line numbers. Quote the range, because an unquoted comma splits the \
-argument into separate words. Run `file FILE` on an unfamiliar file first; it names \
+with its real line numbers. Run `file FILE` on an unfamiliar file first; it names \
 the content as text or binary, so you know what you are about to read. \
 Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
@@ -65,36 +66,22 @@ pub fn kaish_operating_contract() -> &'static str {
     CONTRACT.get_or_init(|| compose(&Recipe::tool_description(), &SchemaContent::new(&[])))
 }
 
-/// Strip the canonical contract's write-side paragraphs before it fronts kaibo's
-/// read-only sandbox. The contract is shared upstream text (`kaish-help`) written
-/// for kaish embedders in general; its "Overlay mode" paragraph teaches a virtual
-/// *write* layer and `kaish-vfs commit` — dead weight in every kaibo preamble, and
-/// an active mixed signal one paragraph before "writes are refused". Paragraph-
-/// boundary surgery keyed on the bold heading: if upstream renames it, the
-/// `core_carries_no_write_side_modes` test fails loudly rather than the paragraph
-/// sliding back in silently.
-fn strip_write_side_paragraphs(contract: &str) -> String {
-    contract
-        .split("\n\n")
-        .filter(|p| !p.trim_start().starts_with("**Overlay mode**"))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// The compact, model-facing cheatsheet: the canonical kaish contract (minus its
-/// write-side paragraphs — see [`strip_write_side_paragraphs`]) plus kaibo's
+/// The compact, model-facing cheatsheet: the canonical kaish contract plus kaibo's
 /// sandbox addendum. Every internal preamble and the internal `run_kaish` tool
 /// definition embed this, so there is exactly one place the model-facing framing
 /// lives. Composed once.
+///
+/// kaibo carried a `strip_write_side_paragraphs` filter here until kaish 0.14: the
+/// shared contract used to teach "Overlay mode" (a virtual *write* layer and
+/// `kaish-vfs commit`) to embedders in general, which is dead weight in a kaibo
+/// preamble and a mixed signal one paragraph before "writes are refused". kaish-help
+/// #297 made that guidance opt-in (`Concept::Overlay`, reached only through
+/// `Selector::with_overlay`), so the paragraph no longer arrives and the filter had
+/// nothing left to remove. kaibo never opts in; `core_carries_no_write_side_teaching`
+/// is what keeps that true.
 pub fn kaish_syntax_core() -> &'static str {
     static CORE: OnceLock<String> = OnceLock::new();
-    CORE.get_or_init(|| {
-        format!(
-            "{}\n\n{}",
-            strip_write_side_paragraphs(kaish_operating_contract()),
-            KAISH_SANDBOX_ADDENDUM
-        )
-    })
+    CORE.get_or_init(|| format!("{}\n\n{}", kaish_operating_contract(), KAISH_SANDBOX_ADDENDUM))
 }
 
 /// The internal `run_kaish` (rig) tool description shown to kaibo's own models. It
@@ -367,7 +354,7 @@ pub fn kaibo_sandbox_doc() -> String {
          - `grep -rn PATTERN [PATH]` — find which files matter, then open them whole\n\
          - `grep -rn -B3 -A6 PATTERN .` — preview matches in context across files\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
-         - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file; quote the range, because an unquoted comma splits the argument into separate words\n\
+         - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file\n\
          - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
          ## Read-only boundary\n\
          The project is mounted read-only and external commands are off, by \
@@ -423,20 +410,20 @@ mod tests {
         );
     }
 
-    /// kaibo's core is a READ-ONLY surface, so the canonical contract's write-side
-    /// paragraphs must not reach it: upstream `kaish-help` teaches "Overlay mode"
-    /// (a virtual write layer, `kaish-vfs commit`) to embedders in general, and in
-    /// a kaibo preamble that's dead weight contradicting "writes are refused" one
-    /// paragraph later. The filter keys on the bold heading — if upstream renames
-    /// it, this fails loudly instead of the paragraph sliding back in silently.
+    /// kaibo's core is a READ-ONLY surface, so write-side teaching must not reach
+    /// it: "Overlay mode" is a virtual write layer (`kaish-vfs commit`), dead weight
+    /// in a kaibo preamble and a mixed signal one paragraph before "writes are
+    /// refused".
+    ///
+    /// The property is unchanged from the version of this test that guarded kaibo's
+    /// own `strip_write_side_paragraphs` filter; only the mechanism moved. Since
+    /// kaish-help #297 the guidance is opt-in (`Selector::with_overlay`) and kaibo
+    /// never opts in, so upstream's default keeps the paragraph out and the filter
+    /// was retired in the 0.14 bump. This still fails if a future kaish makes
+    /// overlay guidance default-on, or if a kaibo recipe ever opts in — which is
+    /// exactly why it outlived the filter it was written for.
     #[test]
-    fn core_carries_no_write_side_modes() {
-        // The raw upstream contract DOES carry it (otherwise the filter tests
-        // nothing and should be retired along with this assertion).
-        assert!(
-            kaish_operating_contract().contains("Overlay mode"),
-            "upstream contract no longer mentions Overlay mode — retire the filter?"
-        );
+    fn core_carries_no_write_side_teaching() {
         let core = kaish_syntax_core();
         for needle in ["Overlay mode", "kaish-vfs commit"] {
             assert!(
@@ -500,17 +487,15 @@ mod tests {
         }
     }
 
-    /// The two reading idioms that follow a grep hit, both verified live against the
-    /// kaish the released binary runs (0.13): a wide span around a match in a large
-    /// file, and `file` to learn what a file is before reading it. Whole-file reading
-    /// stays the default and is asserted next door; these are the follow-ups.
+    /// The two reading idioms that follow a grep hit: a wide span around a match in a
+    /// large file, and `file` to learn what a file is before reading it. Whole-file
+    /// reading stays the default and is asserted next door; these are the follow-ups.
     ///
-    /// The range is pinned **quoted**, by name. kaish reserves a bare comma, so
-    /// `sed -n 120,400p` is a parse error on 0.13 ("an unquoted comma splits this into
-    /// separate words") while the quoted form parses on 0.13 and later alike. A future
-    /// edit that "simplifies" the quotes away would break every model running today's
-    /// kaibo, and this is the test that catches it. The rule is also stated in prose,
-    /// not only demonstrated, so a model composing its own range gets it right.
+    /// The span is pinned quoted because that form is correct on every kaish kaibo has
+    /// run. What this test deliberately no longer asserts is the *rule* — kaish 0.14
+    /// made a bare comma an ordinary bareword, so an unquoted range parses too, and an
+    /// assertion demanding kaibo teach otherwise would pin a false sentence into every
+    /// preamble. Quoting is now a house convention, not a requirement.
     #[test]
     fn addendum_teaches_quoted_spans_and_identifying_a_file() {
         let a = KAISH_SANDBOX_ADDENDUM;
@@ -519,9 +504,10 @@ mod tests {
             "the addendum must teach a wide span around a grep hit in a large file:\n{a}"
         );
         assert!(
-            a.contains("Quote the range"),
-            "the addendum must state the quoting rule, not only demonstrate it — a model \
-             composing its own range needs the rule:\n{a}"
+            !a.contains("unquoted comma"),
+            "the addendum must not explain quoting by a kaish 0.13 parse rule — kaish 0.14 \
+             made a bare comma ordinary, so that reason is false and a model reads it every \
+             turn:\n{a}"
         );
         assert!(
             a.contains("`file FILE`"),

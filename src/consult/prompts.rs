@@ -881,12 +881,16 @@ mod tests {
         );
     }
 
-    /// kaish reserves a bare comma, so `sed -n 120,400p` is a parse error on kaish
-    /// 0.13 — the version the released binary runs — while `sed -n '120,400p'` parses
-    /// on 0.13 and later alike (both forms verified live against both). Every range
-    /// kaibo puts in front of a model is therefore quoted. This sweeps every built-in
-    /// preamble and every attachment directive rather than naming one string, so a
-    /// new unquoted example anywhere in this module fails here.
+    /// Every `sed` range kaibo puts in front of a model is quoted, and this sweeps every
+    /// built-in preamble and attachment directive rather than naming one string.
+    ///
+    /// **This guards style, not behavior — read that before you act on a failure.** kaish
+    /// reserved a bare comma through 0.13, which made the quoted form load-bearing; kaish
+    /// 0.14 made a comma an ordinary bareword, so an unquoted range parses fine and
+    /// nothing breaks if one appears. What this keeps is uniformity: a model copies the
+    /// shape it is shown, and two spellings in one preamble read as a distinction kaibo
+    /// is not drawing. So a failure here means "make it match", never "you broke a
+    /// model" — and deleting this test is a legitimate choice, not a regression.
     #[test]
     fn every_sed_range_kaibo_writes_is_quoted() {
         for (label, text) in [

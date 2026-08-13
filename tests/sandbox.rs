@@ -393,3 +393,52 @@ fn builtin_schemas_enumerate_the_read_toolbox() {
     }
 }
 
+
+/// Oversize output is truncated in memory and never lands on the host disk.
+///
+/// kaish's agent profile defaults to `SpillMode::Disk`: overflow is written whole to a
+/// spill file under its runtime dir and the model gets the path to range-read. That is
+/// the better *reading* experience, and kaibo declines it — the trigger is a model's
+/// `cat` and the effect is a file on the host, which is not a sentence kaibo's read-only
+/// claim survives. `sandbox_output_limit` makes the choice explicit; this proves it end
+/// to end, through a real kernel, on output big enough to overflow.
+///
+/// Which assertion does the work, stated plainly because it is not the one you would
+/// guess: sabotaged (drop `.in_memory()`), this fails on the **spill-mode** assertion,
+/// not the output one — our mount shape declines to spill even under `SpillMode::Disk`,
+/// so the behavioral check cannot discriminate today. It stays because it encodes the
+/// property we actually care about (no host path is ever handed back) and it is what
+/// would catch a future kaish that resolves spill paths through a writable host dir.
+/// The config assertion is today's guard; the output assertion is the alarm for the day
+/// that guard stops being sufficient.
+#[tokio::test(flavor = "current_thread")]
+async fn oversize_output_never_spills_to_the_host() {
+    let dir = tempdir().unwrap();
+    // Comfortably past the configured cap below, so the limiter has to act.
+    let big = "kai the crab is a very fine crab indeed\n".repeat(4096);
+    fs::write(dir.path().join("big.txt"), &big).unwrap();
+
+    let sandbox = SandboxConfig {
+        output_limit_bytes: 1 << 12,
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
+    let r = run(&kernel, "cat big.txt").await.unwrap();
+
+    let out = r.text_out();
+    assert!(
+        out.len() < big.len(),
+        "the limiter must act on output past the cap; got {} bytes for a {} byte file",
+        out.len(),
+        big.len()
+    );
+    assert!(
+        !out.contains("/spill/"),
+        "oversize output must not hand back a host spill path; got: {out:?}"
+    );
+    assert_eq!(
+        kaibo::sandbox::sandbox_output_limit().spill_mode(),
+        kaish_kernel::output_limit::SpillMode::Memory,
+        "kaibo's kernels run in-memory truncation, never disk spill"
+    );
+}

@@ -1,10 +1,10 @@
-//! The read-only invariant, guarded at the source — now with two blessed exceptions.
+//! The read-only invariant, guarded at the source — now with three blessed exceptions.
 //!
 //! kaibo writes essentially nothing: no write path through kaish (enforced structurally —
 //! see `tests/sandbox.rs`/`tests/worker.rs`, where a kaish write is refused), and no
 //! handler-side `std::fs` write either. That has no runtime surface to probe — a handler
 //! that called `std::fs::write` would just succeed — so we guard it at the source:
-//! production code in `src/` must contain no filesystem-mutating call, save the **two
+//! production code in `src/` must contain no filesystem-mutating call, save the **three
 //! blessed sites** below.
 //!
 //! **Blessed site 1** (the sanctioned first half of the read-only invariant amendment; see
@@ -25,7 +25,9 @@
 //! the safety property was never "exactly one needle is blessed," it was always "every
 //! blessed line is deliberate, visible, and can't silently multiply." The per-line,
 //! per-file pinning below keeps exactly that property; only the *count* it must satisfy
-//! grows from one to four (1 in `store.rs` + 3 in `cas.rs`).
+//! grows. It went from one to four when `cas.rs` arrived (1 in `store.rs` + 3 there), and
+//! to five with blessed site 3 below — `EXPECTED_BLESSED_LINES` is the current number and
+//! this sentence is the history, so read the constant, not this paragraph.
 //!
 //! **Blessed site 3** (2026-08-07): `kaibo cas read` writing an artifact's bytes to
 //! **stdout**. Different in kind from the other two, and worth saying why it is here at
@@ -40,15 +42,16 @@
 //! we might output binary and the caller likely knows they're gonna get binary").
 //!
 //! The carve-out is deliberately narrow, and this test keeps its teeth:
-//! - a blessed line is exempted **only** when its file is one of the two blessed files
-//!   *and* the line's own raw text carries that file's marker — nothing else qualifies
-//!   (see the `teeth_*` unit tests, including the new ones proving both directions for
-//!   `cas.rs` and that the two files' markers don't cross-pollinate);
+//! - a blessed line is exempted **only** when its file is one of the blessed files
+//!   *and* the line's own raw text carries that file's marker *and* the call is one that
+//!   file's marker excuses — nothing else qualifies (see the `teeth_*` unit tests,
+//!   including the ones proving both directions for `cas.rs` and that the files' markers
+//!   don't cross-pollinate);
 //! - any OTHER forbidden call (`fs::write`, `File::create`, `remove_*`, `.write(`, …) still
-//!   fails everywhere, including inside the two blessed files, on any line lacking that
+//!   fails everywhere, including inside the blessed files, on any line lacking that
 //!   file's own marker;
 //! - the total number of blessed marker lines tree-wide is pinned to an **exact count**
-//!   (`EXPECTED_BLESSED_LINES`, currently 4), so a new write site — in an existing blessed
+//!   (`EXPECTED_BLESSED_LINES`, currently 5), so a new write site — in an existing blessed
 //!   file or a new one — can't quietly ride in behind an existing marker without this test
 //!   failing (`blessed_marker_count_matches_exactly`).
 //!

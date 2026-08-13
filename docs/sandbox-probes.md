@@ -191,17 +191,21 @@ cat $XDG_STATE_HOME/kaibo/state.db      ; echo "store-read=$?"   # or ~/.local/s
 real disk (verified live 2026-07-17: a 4 KiB store on disk read back `not found` through
 `run_kaish`). The model driving the shell can never exfiltrate another session's data.
 
-**E3 — the source-level write guard (compile-time leg).** kaibo makes exactly one
-`std::fs` mutation in production — the blessed `create_dir_all` that creates the state
-dir — and a source scan proves it is the only one:
+**E3 — the source-level write guard (compile-time leg).** kaibo's production code carries
+a small, fixed set of blessed write lines and nothing else, and a source scan proves it:
 
 ```sh
 cargo test --test no_write_path
 ```
 
-**Pass:** green. The guard fails if any other `std::fs` write appears in `src/`, if the
-blessed `create_dir_all` loses its marker or moves out of `store.rs`, or if a second
-blessed site is added (teeth pinned by the `teeth_*` cases in that file).
+**Pass:** green. Read the blessed set from the test, not from here — `BLESSED` names each
+file, its marker, and which calls that marker excuses, and `EXPECTED_BLESSED_LINES` pins
+the tree-wide total exactly. As of 2026-08-10 that is **5 lines across 3 files**: the state
+dir's `create_dir_all` (`store.rs`), the media CAS's three seams (`cas.rs` — shard dir,
+`create_new` open, byte write), and `kaibo cas read` handing bytes to stdout (`cli.rs`).
+The guard fails if any other `std::fs` write appears in `src/`, if a blessed line loses its
+marker or moves out of its file, if a marker is pasted onto a call it does not excuse, or
+if the count moves in either direction — teeth pinned by the `teeth_*` cases in that file.
 
 ---
 

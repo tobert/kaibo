@@ -443,8 +443,42 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.13.0"`. The `0.12.0 → 0.13.0` bump was
-  again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
+- **kaish pin.** Currently `kaish-kernel = "0.14.0"`. The `0.13.0 → 0.14.0` bump moved
+  **one** call site, and it was a deletion: `kaish_syntax.rs`'s
+  `strip_write_side_paragraphs`, which stripped the shared contract's "Overlay mode"
+  paragraph before it fronted kaibo's read-only shell. kaish-help #297 made that guidance
+  opt-in (`Concept::Overlay`, reached only via `Selector::with_overlay`), so the paragraph
+  stopped arriving and the filter had nothing to remove — its own guard assertion is what
+  failed and told us. The *property* kept its test (`core_carries_no_write_side_teaching`):
+  it now rests on upstream's default plus kaibo never opting in, and it still fails if
+  either changes (proven by sabotage — composing `.with_overlay()` turns it red).
+  A second kaibo edit was forced by a *grammar* change rather than an API one: kaish 0.14
+  made a bare comma an ordinary bareword outside `[...]`/`{...}`, so the preamble sentence
+  teaching "quote the range, because an unquoted comma splits the argument" became false.
+  The quoted `sed` examples stayed (correct on every version) and the stated reason went —
+  a model reads that block every turn, and a false rule is worse than a missing one. The
+  test that pinned the rule now asserts its **absence**, which is what catches a merge
+  re-introducing it.
+  Everything else on the checklist was inert here: `jobs --json` gaining a `path` field and
+  lowercase `JobStatus` wire spellings (including the new `Killed`) reach no parse site,
+  because model-facing kaish never grows `jobs`; `KernelConfig::agent()` defaulting
+  `kill_on_parent_death = true` has no children to signal with `subprocess` off;
+  `Kernel::shutdown` taking `&self` matters only to a caller, and kaibo never calls it.
+  `ExecuteOptions`, `OutputLimitConfig`, and `ToolArgs` were untouched.
+  **This bump NARROWS the model-facing read surface, and that reverses what we planned
+  for.** Through the 0.14 release cycle kaish carried an approvals ledger mounted at
+  `/v/approvals` in every kernel, and this section was drafted to say the bump handed the
+  model a readable path it did not have before — with a probe battery to match, since that
+  path's read-only-ness came from kaish's own chokepoint rather than any of kaibo's four
+  levers. The ledger cut landed before the tag and removed the mount entirely: `ls /v`
+  returns `bin`, `blobs`, `jobs`, and `/v/approvals` is not found (verified on a 0.14
+  build). So there is no new model-readable surface, no `ExecResult.approval`, and no
+  battery to add. **The lesson worth keeping is about the probe we nearly shipped:** a
+  probe of a path that no longer exists returns "not found", which reads as containment
+  working rather than as absence — an all-clear that means nothing. Check that a probe
+  would report differently if its subject were broken versus if the probe itself were.
+- **The previous pin, kept because the reasoning pattern is the point.** The
+  `0.12.0 → 0.13.0` bump was again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
   full `cargo test` (598 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc`
   both empty. A large release (six crates bumped, ~270 changelog lines: lexer/parser
   fixes, stricter binary-input handling across several builtins, a browser/wasm target)
