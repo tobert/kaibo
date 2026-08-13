@@ -471,10 +471,15 @@ impl Arm {
                         caps,
                     ))
                 } else {
+                    // The chat-completions wire is where vLLM sends both reasoning
+                    // spellings on one message, which rig-core 0.41 cannot decode
+                    // (`crate::wire_repair`). Only this wire carries the `choices`
+                    // shape the repair recognizes, so only this client is wrapped —
+                    // the Responses builder above keeps the bare client.
                     let client = openai::CompletionsClient::builder()
                         .api_key(&key)
                         .base_url(&base_url)
-                        .http_client(http)
+                        .http_client(crate::wire_repair::Repaired::new(http))
                         .build()
                         .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
                     Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
