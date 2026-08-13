@@ -928,6 +928,15 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     /// OTLP/HTTP (protobuf) traces endpoint, e.g. `http://localhost:4318/v1/traces`.
     pub endpoint: String,
+    /// Whether to export the **logs** signal alongside traces. On whenever
+    /// `enabled` is — the two ride one opt-in, because kaibo's own `tracing` events
+    /// are strictly less sensitive than the prompts and completions the traces
+    /// already carry. Turn it off for a collector that takes spans but not logs.
+    pub logs: bool,
+    /// OTLP/HTTP logs endpoint. `None` derives it from [`endpoint`](Self::endpoint)
+    /// when that ends in the standard `/v1/traces`; any other shape is a loud load
+    /// error rather than a guess (see `telemetry::resolve_logs_endpoint`).
+    pub logs_endpoint: Option<String>,
     /// Extra headers on each export request (auth for a remote collector, etc.).
     /// File-only — a header map has no clean single-env-var form.
     pub headers: BTreeMap<String, String>,
@@ -944,6 +953,8 @@ impl Default for TelemetryConfig {
             // The session's `otlp-mcp` collector and most local collectors listen
             // here; flipping `enabled` alone targets localhost, never a remote.
             endpoint: "http://localhost:4318/v1/traces".to_string(),
+            logs: true,
+            logs_endpoint: None,
             headers: BTreeMap::new(),
             timeout: Duration::from_secs(10),
             service_name: "kaibo".to_string(),
@@ -2402,6 +2413,8 @@ struct RawConfig {
 struct RawTelemetry {
     enabled: Option<bool>,
     endpoint: Option<String>,
+    logs: Option<bool>,
+    logs_endpoint: Option<String>,
     headers: Option<BTreeMap<String, String>>,
     timeout_secs: Option<u64>,
     service_name: Option<String>,
@@ -2881,6 +2894,8 @@ fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
     Ok(TelemetryConfig {
         enabled: raw.enabled.unwrap_or(d.enabled),
         endpoint: raw.endpoint.unwrap_or(d.endpoint),
+        logs: raw.logs.unwrap_or(d.logs),
+        logs_endpoint: raw.logs_endpoint.or(d.logs_endpoint),
         headers: raw.headers.unwrap_or(d.headers),
         timeout,
         service_name: raw.service_name.unwrap_or(d.service_name),
@@ -3223,6 +3238,18 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_TELEMETRY_ENDPOINT") {
         telemetry.endpoint = Some(v);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_LOGS") {
+        // Same on/off grammar as KAIBO_TELEMETRY_ENABLED above, and for the same
+        // reason: it must be able to turn a file-enabled logs signal back off.
+        let on = {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        };
+        telemetry.logs = Some(on);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_LOGS_ENDPOINT") {
+        telemetry.logs_endpoint = Some(v);
     }
     if let Some(v) = get("KAIBO_TELEMETRY_TIMEOUT_SECS") {
         telemetry.timeout_secs = Some(parse_env_int("KAIBO_TELEMETRY_TIMEOUT_SECS", &v)?);
@@ -3809,7 +3836,10 @@ mod tests {
             // Explorers sweep and cite; none has shown reasoning pressure, so every
             // explorer slot inherits the [defaults] floor.
             if let Some(e) = cast.slots.get(&ModelRole::Explorer) {
-                assert_eq!(e.max_tokens, None, "explorer stays on the floor for {name:?}");
+                assert_eq!(
+                    e.max_tokens, None,
+                    "explorer stays on the floor for {name:?}"
+                );
             }
         }
     }

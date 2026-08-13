@@ -335,26 +335,33 @@ lowered by #114's role-identity preambles; n=3 can't tell). Open work, in order:
   If that shape shows up in practice it's a different problem (answer-quality, not
   emptiness) and wants its own thinking, not a heuristic bolted onto this gate.
 
-### A hallucinated tool call fails the phase with no corrective feedback (2026-08-09)
-Repro, twice: a `deliberate` dossier sweep on explorer `deepseek-v4-flash` failed 2×
-*identically* with `UnknownToolCall: 'run_sha'` (available: `attach`, `run_kaish`),
-killing the phase before the synth spent anything; a 2026-08-05 build died the same way
-on `run_grail`. The same model runs 80+-step `consult` sweeps clean, so this is
-flash-tier-under-a-restricted-toolset behavior on long prompts, not a broken model.
-Distinct from the shipped malformed-generation retry (`src/completion_retry.rs`): that
-resends the *same* request when the provider's output failed to parse; here the request
-parsed fine — the model named a tool that does not exist — and an identical resend
-re-hallucinates (the 2× identical failure proves it). Fix shape: a bounded corrective
-re-prompt that feeds the error back into the conversation as a tool-result/user turn
-("`run_sha` is not a tool; available: `attach`, `run_kaish`") so the model can correct
-itself, with the same loud-warn-per-attempt discipline the malformed retry has.
-Workaround meanwhile: `explorer_model = "deepseek-v4-pro"` (verified working);
-`docs/casts.md` carries the operator-facing guidance, framed clinically (Amy,
-2026-08-10: no specific failures in model-readable docs). Shaping datapoint for
-the fix: the repro ran with the DeepSeek wire's defaults — `thinking` enabled
-plus `reasoning_effort: "high"` are emitted regardless of model id
-(`src/consult/shaping.rs:306`, `:457`) — so deeper thinking is not the missing
-lever; corrective feedback is.
+### A hallucinated tool call — what's left after the feedback hook (2026-08-11)
+The recovery shipped: `UnknownToolFeedbackHook` (`consult/engine.rs`) answers a tool call
+naming a tool that does not exist with a tool result naming the real toolset, so the phase
+keeps its evidence and the model corrects itself inside the budget it already had. It rides
+`run_phase`, so every tool-driven phase inherits it. What the entry was tracking that the
+hook does *not* settle:
+
+- **Incidence is still unmeasured.** The hook emits a `warn` per occurrence carrying the
+  model id and the advertised toolset, which is the telemetry this class always needed
+  (the same shape the empty-answer entry asks for). Nobody has collected it yet. The
+  interesting split is which models do this, and whether the correction *lands* — a model
+  that answers the feedback with a second phantom name is a different problem than one
+  that reads it and moves on.
+- **Prevention is untouched.** The hook is recovery. The 2026-08-09 shaping datapoint
+  stands: the repro ran with `thinking` enabled plus `reasoning_effort: "high"` emitted
+  regardless of model id (`src/consult/shaping.rs:306`, `:457`), so deeper thinking was
+  never the missing lever. Whether the explorer preamble's toolset anchoring (#143) lowers
+  the rate is measurable now that occurrences are logged.
+- **A repeat offender still burns the budget.** Each recovery costs a turn, and nothing
+  counts them. A model that names a phantom tool every turn will exhaust `max_turns`
+  recovering. Bounding it means counting per phase and escalating to `Fail` — worth doing
+  only if the warn stream shows it happening, since the alternative today (the whole
+  phase dies at the first offense) was strictly worse.
+
+`docs/casts.md`'s operator-facing guidance and the `explorer_model = "deepseek-v4-pro"`
+workaround are both still accurate, and both are now belt-and-braces rather than the only
+defense.
 
 ### Dossier durability — what's left after keep + reuse (2026-08-07)
 A finished dossier now lands in the media CAS and can be handed back as `deliberate`'s
@@ -849,19 +856,21 @@ defaults (`credentials.rs`, `docs/config.md`). A secrets *manager* is still out 
 scope: by design the TOML references keys, never inlines them, so "point at
 `$SECRET_TOOL` output" would be a future key-source variant alongside env/file.
 
-### OTLP logs + metrics signals (deferred — traces shipped)
-The **traces** signal is in: `[telemetry]` (off by default) stands up an OTLP/HTTP
-exporter and a `tracing-opentelemetry` layer in `main.rs`, exporting the GenAI span
-tree rig already emits (`src/telemetry.rs`, `docs/config.md`). Two signals remain:
-- **Logs** — kaibo's `tracing` events (the `kaibo`-target log lines) as an OTLP
-  *logs* signal via `opentelemetry-appender-tracing`, a third layer in the same
-  registry stack. Today they still ride stderr + the MCP `notifications/message`
-  bridge only; nothing exports them.
-- **Metrics** — rig records token usage as span *fields*, not as metric
-  instruments. Real counters/histograms (tokens, per-phase latency, sweep fan-out)
-  are hand-rolled, or derived from spans at the collector. Decide which before
-  adding an `opentelemetry` metrics provider.
-Both reuse the same off-by-default `[telemetry]` gate and endpoint; the open
-question is whether the content/cost of a logs signal is worth it given traces
-already carry the prompts/completions. The session's `otlp-mcp` collector is the
-sink for a probe.
+### OTLP metrics signal (deferred — traces and logs shipped)
+**Metrics** — rig records token usage as span *fields*, not as metric instruments.
+Real counters/histograms (tokens, per-phase latency, sweep fan-out) are hand-rolled,
+or derived from spans at the collector. Decide which before adding an
+`opentelemetry` metrics provider; it reuses the same off-by-default `[telemetry]`
+gate and endpoint the other two signals do.
+
+### Now collect the two rates the logs signal was built for
+The sink shipped, so the counting can start — and until someone runs it, the two
+"incidence is unmeasured" entries above stay open on data, not on plumbing:
+- **Unknown-tool recovery rate.** Genba asked for it by name to cite when teaching
+  cross-model review. The `warn` carries the model id and the advertised toolset;
+  the split that matters is rescued-by-feedback vs. named-a-second-phantom-tool.
+  It cannot be benchmarked — a capable model asked to call a nonexistent tool
+  simply declines (measured 2026-08-11 against `openai-local` and `deepseek`), so
+  this comes from real sessions or not at all.
+- **Empty-answer incidence**, split by `finish_reason` and by
+  rescued-by-forced-turn, per that entry's first bullet.

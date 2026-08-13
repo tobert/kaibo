@@ -63,7 +63,16 @@ where
 pub(crate) fn record_kaish_result(exit_code: i64, output_bytes: usize) {
     let span = Span::current();
     span.record("kaish.exit_code", exit_code);
-    span.record("kaish.output_bytes", output_bytes as u64);
+    // i64, not u64: tracing-opentelemetry's span visitor implements `record_i64` but
+    // has no `record_u64` override, and `tracing_core::field::Visit::record_u64`'s
+    // default implementation falls back to `record_debug` when a visitor doesn't
+    // override it — which stringifies the value into an OTel `stringValue` attribute
+    // instead of an `intValue`. `kaish.exit_code` above is already `i64` and lands as
+    // an int; casting `output_bytes` to `i64` here (never `u64`) sends it through the
+    // same `record_i64` path so it lands as an int too. `usize as i64` is safe: a
+    // kaish output byte count is bounded by `output_limit_bytes`, nowhere near
+    // `i64::MAX`.
+    span.record("kaish.output_bytes", output_bytes as i64);
 }
 
 /// Erase a typed tool into a span-wrapped [`DynamicTool`] — the toolset-assembly
@@ -258,15 +267,15 @@ mod tests {
                 _ => {}
             }
         }
-        // `run_kaish`'s result fields arrive as native numbers, not strings.
+        // `run_kaish`'s result fields arrive as native numbers, not strings — both as
+        // `i64` (see the cast comment on `record_kaish_result`), so both are grabbed
+        // here rather than one landing in a `record_u64` override this visitor
+        // deliberately does not implement.
         fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
-            if f.name() == "kaish.exit_code" {
-                self.kaish_exit = Some(v);
-            }
-        }
-        fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
-            if f.name() == "kaish.output_bytes" {
-                self.kaish_bytes = Some(v);
+            match f.name() {
+                "kaish.exit_code" => self.kaish_exit = Some(v),
+                "kaish.output_bytes" => self.kaish_bytes = Some(v as u64),
+                _ => {}
             }
         }
         // `%summary`/`%name` record via Display, which arrives as a debug value.
@@ -489,6 +498,94 @@ mod tests {
                     && s.kaish_exit == Some(3)
                     && s.kaish_bytes == Some(4321)),
                 "the tool span must carry kaish.exit_code=3 and kaish.output_bytes=4321"
+            );
+        });
+    }
+
+    /// The type on the wire, not just the value: `kaish.output_bytes` must be
+    /// recorded through `Visit::record_i64`, the same method `kaish.exit_code` goes
+    /// through — never `record_u64`. This is the field-type bug confirmed on a real
+    /// exported trace (`kaish.exit_code -> {"intValue": "3"}`,
+    /// `kaish.output_bytes -> {"stringValue": "1608"}`): tracing-opentelemetry's span
+    /// visitor implements `record_i64` but has no `record_u64` override, so a u64
+    /// recording falls through to `Visit::record_u64`'s default (`record_debug`) and
+    /// ships as a string attribute. A value-only assertion (as in the test above)
+    /// cannot see this — a `u64` recording of `4321` and an `i64` recording of `4321`
+    /// both read back as `Some(4321)` through a visitor that implements both methods,
+    /// which is exactly why the wire bug shipped unnoticed. This test watches which
+    /// `Visit` method actually fires instead.
+    #[test]
+    fn kaish_output_bytes_is_recorded_as_i64_not_u64() {
+        #[derive(Default)]
+        struct TypeProbe {
+            exit_code_via_i64: bool,
+            output_bytes_via_i64: bool,
+            output_bytes_via_u64: bool,
+        }
+        impl tracing::field::Visit for TypeProbe {
+            fn record_i64(&mut self, field: &tracing::field::Field, _value: i64) {
+                match field.name() {
+                    "kaish.exit_code" => self.exit_code_via_i64 = true,
+                    "kaish.output_bytes" => self.output_bytes_via_i64 = true,
+                    _ => {}
+                }
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, _value: u64) {
+                if field.name() == "kaish.output_bytes" {
+                    self.output_bytes_via_u64 = true;
+                }
+            }
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+                // Deliberately blank: a debug-only visitor can't tell string from
+                // int, which is the whole failure mode under test. This override
+                // exists only so the default `record_i64`/`record_u64` -> `record_debug`
+                // fallback in `tracing_core::field::Visit` doesn't panic (its default
+                // body is a no-op already, but naming it keeps the probe's intent
+                // explicit: we watch the typed methods, not the debug fallback).
+            }
+        }
+
+        struct ProbeLayer(Arc<Mutex<TypeProbe>>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ProbeLayer {
+            fn on_record(
+                &self,
+                _id: &tracing::Id,
+                values: &tracing::span::Record<'_>,
+                _ctx: Context<'_, S>,
+            ) {
+                values.record(&mut *self.0.lock().unwrap());
+            }
+        }
+
+        serialized_capture(async {
+            let probe = Arc::new(Mutex::new(TypeProbe::default()));
+            let sub = tracing_subscriber::registry().with(ProbeLayer(Arc::clone(&probe)));
+            let _g = tracing::subscriber::set_default(sub);
+
+            let span = tracing::info_span!(
+                "tool",
+                "kaish.exit_code" = tracing::field::Empty,
+                "kaish.output_bytes" = tracing::field::Empty,
+            );
+            let _enter = span.enter();
+            record_kaish_result(3, 4321);
+            drop(_enter);
+            drop(_g);
+
+            let probe = probe.lock().unwrap();
+            assert!(
+                probe.exit_code_via_i64,
+                "kaish.exit_code must be recorded via record_i64"
+            );
+            assert!(
+                probe.output_bytes_via_i64 && !probe.output_bytes_via_u64,
+                "kaish.output_bytes must be recorded via record_i64 (matching \
+                 kaish.exit_code), not record_u64 — a u64 recording is the bug that \
+                 shipped kaish.output_bytes as a string attribute on the wire"
             );
         });
     }

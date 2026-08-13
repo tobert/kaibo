@@ -17,6 +17,13 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **The repo map gives each file's size and marks the files one read cannot return
+  whole**, so a model stops guessing how much of a file it will get.
+- **`[telemetry]` exports the logs signal too** — kaibo's own `tracing` events, which the
+  span tree never carried, so a warning like a model calling a tool that does not exist
+  becomes countable.
+- **`[telemetry] logs_endpoint`** — omit it and kaibo derives the sibling of `endpoint`;
+  a non-standard endpoint is a startup error naming the key, never a guessed destination.
 - **`deliberate` keeps its dossier in the media CAS, and `dossier` reuses one** — hand
   the digest to a second cast to reason over the same evidence for one synth's price.
 - **A refused dossier write never fails the deliberation** — you lose the record, not
@@ -61,6 +68,9 @@ record. Each later release appends a new section at the top.
   kaibo reads the accepted rungs back out of the client on every call.
 - **New MCP resource `kaibo://config/guide`** — the configuration manual embedded in the
   binary; example / live state / guide now split by job.
+- **CLI subcommands export telemetry too**, when `[telemetry]` is configured — every
+  export flushes before the process exits, so a short-lived `kaibo consult`/`kaish`/...
+  run no longer loses its spans to `process::exit`.
 
 ### Changed
 
@@ -78,6 +88,8 @@ record. Each later release appends a new section at the top.
   at flash-tier explorers inventing `run_*` tool names under a restricted toolset.
 - **kaibo's prompts are written in plain, literal English** — most of the models kaibo
   drives are not English-first, and figurative phrasing costs them attention.
+- **kaibo's models read a wide span around a grep hit in a large file, and run `file`
+  on an unfamiliar one** — whole-file reading stays the default everywhere else.
 - **`oneshot` and `deliberate`'s direct lane are one literal request** instead of a
   toolless pass through the managed loop — proven request-for-request identical.
 - **Batch treats `effort` as a floor, not an override** — a slot asking deeper than the
@@ -105,6 +117,8 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A model calling a tool that does not exist no longer throws away the investigation**
+  — it gets a tool result naming the real toolset, and corrects itself on the next turn.
 - **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or
   unstaffable tool was still listed and still callable; it is now neither.
 - **A new Claude Code sees kaibo's tools again.** The client negotiates protocol
@@ -152,6 +166,8 @@ record. Each later release appends a new section at the top.
   those lanes.
 - **The state-db-collides-with-project-tree refusal now also names
   `--root`/`--allow-path`** — usually the right fix; the refusal itself is unchanged.
+- **`kaish.output_bytes` lands as an OTel int, not a string** — it now rides the same
+  `record_i64` path as `kaish.exit_code` instead of the untyped `record_u64` fallback.
 
 ## [0.2.0] — 2026-07-29
 

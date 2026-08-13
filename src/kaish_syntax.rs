@@ -33,11 +33,22 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// prohibitions): say what reading looks like, rather than listing what is refused.
 /// Plain and literal per the agent-facing clarity rule in AGENTS.md — this block is
 /// embedded in every preamble, so an idiom here is charged to every model we drive.
+///
+/// Every `sed` range here is written **quoted**, and the rule is stated to the model
+/// rather than only demonstrated: kaish reserves a bare comma (brace expansion, lists),
+/// so `sed -n 120,400p` is a parse error on kaish 0.13 — the version the released binary
+/// runs — while the quoted form parses on 0.13 and later alike. Verified live against
+/// both. `addendum_teaches_quoted_spans_and_identifying_a_file` holds the quoting.
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so your work here is reading. Read \
 files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN .` finds matches whether \
-the target is a file or a directory. Each call starts at the project root; \
+the target is a file or a directory. When a grep hit lands in a large file, read a \
+wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that range \
+with its real line numbers. Quote the range, because an unquoted comma splits the \
+argument into separate words. Run `file FILE` on an unfamiliar file first; it names \
+the content as text or binary, so you know what you are about to read. \
+Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 126 means blocked by the \
@@ -342,7 +353,8 @@ pub fn kaibo_sandbox_doc() -> String {
          - `grep -rn PATTERN [PATH]` — find which files matter, then open them whole\n\
          - `grep -rn -B3 -A6 PATTERN .` — preview matches in context across files\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
-         - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim)\n\n\
+         - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file; quote the range, because an unquoted comma splits the argument into separate words\n\
+         - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
          ## Read-only boundary\n\
          The project is mounted read-only and external commands are off, by \
          construction. Writes, `git`, `touch`, `spawn`/`exec`, and any external \
@@ -472,6 +484,56 @@ mod tests {
                 "addendum must mention {needle:?}"
             );
         }
+    }
+
+    /// The two reading idioms that follow a grep hit, both verified live against the
+    /// kaish the released binary runs (0.13): a wide span around a match in a large
+    /// file, and `file` to learn what a file is before reading it. Whole-file reading
+    /// stays the default and is asserted next door; these are the follow-ups.
+    ///
+    /// The range is pinned **quoted**, by name. kaish reserves a bare comma, so
+    /// `sed -n 120,400p` is a parse error on 0.13 ("an unquoted comma splits this into
+    /// separate words") while the quoted form parses on 0.13 and later alike. A future
+    /// edit that "simplifies" the quotes away would break every model running today's
+    /// kaibo, and this is the test that catches it. The rule is also stated in prose,
+    /// not only demonstrated, so a model composing its own range gets it right.
+    #[test]
+    fn addendum_teaches_quoted_spans_and_identifying_a_file() {
+        let a = KAISH_SANDBOX_ADDENDUM;
+        assert!(
+            a.contains("`cat -n FILE | sed -n '120,400p'`"),
+            "the addendum must teach a wide span around a grep hit in a large file:\n{a}"
+        );
+        assert!(
+            a.contains("Quote the range"),
+            "the addendum must state the quoting rule, not only demonstrate it — a model \
+             composing its own range needs the rule:\n{a}"
+        );
+        assert!(
+            a.contains("`file FILE`"),
+            "the addendum must teach `file FILE` for an unfamiliar file, so a binary is \
+             identified rather than discovered by reading it:\n{a}"
+        );
+        // Structural, so it survives someone changing the example line numbers: every
+        // `sed -n` kaibo writes here is followed by a quote. The count is asserted too —
+        // a loop over zero matches passes green, so without this the whole scan would go
+        // quiet the day someone removed the last span example (caught in review, and the
+        // sibling scan in `prompts.rs` already had it).
+        let mut seen = 0;
+        for (i, _) in a.match_indices("sed -n ") {
+            let rest = &a[i + "sed -n ".len()..];
+            assert!(
+                rest.starts_with('\''),
+                "every `sed -n` range must be quoted — unquoted, kaish 0.13 refuses the \
+                 comma with a parse error:\n{a}"
+            );
+            seen += 1;
+        }
+        assert!(
+            seen > 0,
+            "the addendum must carry at least one `sed -n` span for the scan above to \
+             mean anything:\n{a}"
+        );
     }
 
     #[test]

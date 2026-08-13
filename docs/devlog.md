@@ -14,6 +14,217 @@ per ship date; multiple ships on a date get sub-bullets.
 
 ---
 
+## 2026-08-12 — three nudges, three nulls, and the lever that actually moves
+
+Amy noticed something we had all half-noticed: kaibo's agents read code in small,
+conservative slices. *"We've done rounds of tuning them to do bigger strides, but I
+wonder if we should do more thinking about how we prompt them."* The thinking turned
+into a measurement, and the measurement turned into a result none of us expected to
+like.
+
+The logs signal had just shipped, so for the first time there was a month of traces to
+ask. 16,105 real `run_kaish` reads, 18 models, each attributed to its phase's model
+through the `run_phase` parent span. The median delivered **1,837 bytes** — about 45
+lines — against a preamble whose first sentence already said "Read files WHOLE."
+Whole-file reads truncated **1.8%** of the time. So models were hedging against a risk
+that essentially never fired, and the obvious reason was that a file's size is
+unknowable from inside the sandbox until the file has been read.
+
+That gave a clean hypothesis and three ways at it. Publish the sizes in the repo map so
+the guess becomes a comparison. Say the rule several ways instead of once, because Amy's
+instinct was that repetition might carry where one clear sentence had not. Then put the
+budget in the tool result itself, so the number arrives at the moment the next read is
+chosen rather than in a preamble read once at the start.
+
+**All three moved nothing.** Not "a little" — nothing coherent. The third is the one
+worth recording, because it failed in an instructive shape: median up 17%, mean down,
+p90 down, small-read share up. A real effect moves those together. That is what noise
+looks like when you stare at it hopefully. Across every run, control and treatment
+medians sat in a ±10% band around 3,400 bytes.
+
+The honest conclusion was Amy's opening position, now with numbers behind it: *"the
+weights are the weights, we can only nudge them."*
+
+What the data does say, loudly, is in the column nobody was looking at. Under the
+**same** preamble and the same tools, `gpt-5.6-terra` reads at a median of 14,939 bytes
+and `z-ai/glm-4.7-flash` at 227. A **65× spread**, decided entirely by which model sits
+in the slot. Nothing written moved the number past noise; changing the model moves it by
+nearly two orders of magnitude. Read stride is a **casting** decision, not a prompting
+one, and that belongs in `docs/casts.md` rather than in another round of preamble edits.
+
+Two corrections the record is owed. First, an early framing here was too broad: "models
+read at 4% of the stride we ask for" came from the aggregate, but the explorer *alone*,
+post-#143 and #146, reads at a median near 5 KB. The 1,837-byte figure is dragged down
+by the consult driver, which reads smaller than the explorer it delegates to. Second,
+and more interesting: for a sweep that has `attach`, a small read followed by an attach
+is **correct**. `attach` routes a file's whole bytes past the explorer to whoever reads
+its report, never through the explorer's own context, which is strictly cheaper than
+reading it. Stride is the wrong metric there entirely. The A/B ran against the top-level
+`explore` tool, which deliberately withholds `attach` (`server/mod.rs:2030`), so it
+measured the one configuration where a bigger read is worth the most — a fair test, and
+still null.
+
+What ships is the half that stands on its own argument rather than on a moved metric:
+the map publishes each file's size and the size that still reads whole. That closes a
+real information gap whether or not any model acts on it differently today. The
+tool-result budget line was built, tested, measured, and **dropped** — Amy's call, and
+the right one: recurring cost on every tool result, three nulls of evidence, and nothing
+a model could act on that the map does not already say.
+
+The meta-lesson is the one worth keeping. Two rounds of prompt tuning had happened here
+before, on impression rather than measurement, and a third was queued. What stopped it
+was a month of traces and three A/Bs — a couple of hours, most of it spent fighting a
+decoder rather than a model. **Measure before writing prose at a model.** The prose is
+the expensive part, and it is the part that feels like progress.
+
+## 2026-08-12 — the CLI never had an exporter, and a byte count wore the wrong clothes
+
+Two findings, both surfaced by measuring a real trace instead of trusting the wiring.
+Trying to watch a `kaibo consult` run from a terminal for the unknown-tool span turned
+up nothing at all — `telemetry::init` was called exactly once, inside `serve()`'s
+dispatch arm in `main.rs`. Every CLI subcommand ran with zero exporter, `[telemetry]
+enabled = true` in `config.toml` notwithstanding. Amy's ask was blunt: the CLI should
+try to do otel if it has connection info.
+
+The fix isn't "call `init` everywhere" — every CLI arm leaves through
+`std::process::exit`, which runs no destructors, so a guard merely constructed and
+dropped loses whatever the batch processor hasn't exported yet. A short `kaish -c
+"..."` finishes before the processor's own export interval would ever fire, so a naive
+fix would have shipped the same invisible loss a second time. The guard is threaded
+through explicitly instead: `main.rs` stands up telemetry once, before dispatching to
+whichever subcommand ran, and calls `.shutdown()` on it after the subcommand returns
+and before `exit`. Proved with a real subprocess against a raw TCP collector
+(`tests/telemetry_cli.rs`) rather than trusted by inspection — breaking the flush (drop
+instead of shutdown) turns the test into a clean 10-second timeout with zero
+connections ever accepted, which is exactly the failure this fix has to rule out.
+Telemetry stays off by default either way: `init_cli_telemetry` returns `None` the
+moment `[telemetry]` isn't configured, before touching the subscriber at all.
+
+The second finding came off the same trace. `kaish.exit_code` landed as an OTel int;
+`kaish.output_bytes`, same span, same shape of field, landed as a *string*. Both are
+recorded with `Span::record` — `exit_code` as `i64`, `output_bytes` as `output_bytes as
+u64` — and that cast is the whole bug. tracing-opentelemetry's span visitor implements
+`record_i64` but never got a `record_u64` override; `tracing_core::field::Visit`'s
+default for an unoverridden method falls back to `record_debug`, which stringifies. The
+fix is one word, `u64` to `i64` — a kaish output byte count is nowhere near
+`i64::MAX`. Proving it needed a different kind of test than the obvious one: a
+value-only assertion (`kaish_bytes == Some(4321)`) can't see this bug, because a test
+visitor that implements both `record_i64` and `record_u64` reads back the same value
+either way — which is exactly how the wire bug shipped unnoticed. The test that can
+fail watches *which* `Visit` method actually fires, not what it reports back.
+
+Both are wire-visible changes for anyone already consuming these traces — CHANGELOG
+entries under Added (CLI export) and Fixed (the int/string field).
+
+## 2026-08-12 — the instrument had nowhere to report
+
+This one sat at P4 for weeks with an honest question attached: *is a logs signal worth
+the content and cost, given traces already carry the prompts and completions?* Framed
+that way the answer kept coming back "not yet", and that was right every time it was
+asked.
+
+What changed is that two parties wanted the same number. Genba — Amy's work fleet —
+asked for the unknown-tool recovery rate by name, to cite when they teach cross-model
+review. Our own tracker had been asking for the empty-answer incidence since the guard
+shipped. Both are `warn` events. Neither is a span. So the honest status of both entries
+was not "unmeasured" but *unmeasurable*: `[telemetry]` exported traces, while kaibo's
+events rode stderr and the MCP notification bridge, which the `mcp-notification-channels`
+finding already established do not reach a calling agent. We had built the instrument
+twice and never built the gauge.
+
+The day before, a provocation attempt closed the other road. Told to call a nonexistent
+tool, the local Gemma treated the name as a shell command, got kaish's `exit: 127`, found
+`checksum` in `help builtins`, and finished the task correctly. DeepSeek — the family
+that produced the phantom tool in the wild — simply declined to. **A capable model asked
+to fail on demand does not.** So there is no benchmark for this class, only passive
+collection, and passive collection needed a sink.
+
+That reframes the old question rather than answering it. The cost worry was about
+*content*: rig's spans carry prompts, completions, source snippets. But kaibo's own
+events are diagnostics kaibo writes about itself, strictly less sensitive than what an
+operator already accepted when they turned traces on. So logs ride the same opt-in — one
+`enabled`, both signals — and the layer's filter is `kaibo=info` rather than the traces
+layer's `info`. That asymmetry is the design, not an oversight: rig also emits
+event-level chatter repeating the prompt text, and exporting it again as loose log lines
+would pay twice for the most sensitive bytes we handle.
+
+The one real decision was the endpoint. Traces sit at `/v1/traces`, logs at `/v1/logs`,
+and it is tempting to just swap the suffix. But an operator whose collector lives at
+`/otlp/ingest` would then get their diagnostics posted to a URL they never chose, and
+they would discover it by the records never arriving — the exact silent failure this
+house refuses. So the derivation is scoped to the standard shape and anything else is a
+startup error naming `logs_endpoint`. Amy's ruling that same morning about `attach.rs`
+sharpened how that error reads: state the action, don't point at a tracker.
+
+Proved rather than assumed, twice over. Breaking the filter to `info` made the filter
+test fail with rig's chatter in the diff; making the derivation fall back silently made
+the refusal test fail. Then a local HTTP sink caught the real exports: two POSTs, one to
+`/v1/traces` and one to the **derived** `/v1/logs`, both carrying the probe marker. The
+offline test proves the filter; only the wire proves the record leaves the process.
+
+`docs/issues.md` keeps the metrics signal and gains a new entry — *now go collect the two
+rates*. The plumbing is no longer the blocker, which means the next honest status for
+those entries is a number or nothing.
+
+## 2026-08-11 — method_missing, for models
+
+We had this tracked as "a bounded corrective re-prompt": catch `UnknownToolCall`, feed the
+error back, ask again. That's how it reads in `issues.md`, written the day the second repro
+landed. Amy reframed it in one line before I'd written any code — *"can we catch incorrect
+tool calls and return an informational error? sorta hooking method_missing"* — and the
+reframe is the whole entry, because it changes what the fix *is*. A re-prompt is kaibo
+noticing a failure and spending a model call to work around it. `method_missing` is the
+call **succeeding**, with an answer that happens to say "that's not a thing, here's what
+is". The model was already going to take another turn. It doesn't need to be asked again;
+it needs to be told something useful.
+
+Then rig had already built it. `rig-agent 0.41` ships `AgentHook::on_invalid_tool_call`
+returning an `InvalidToolCallAction`, and kaibo has implemented `AgentHook` since the
+`view_image` break work — so the fix is a second hook on a stack we already own, not new
+plumbing. This keeps happening and it keeps being worth checking first: the same lesson as
+the retry policy we decided to upstream rather than hand-roll.
+
+Four resolutions were on offer, and the interesting one to reject was `Repair` — hand rig a
+replacement name and let the call through. It is *right there*, `run_sha` → `run_kaish`
+would have worked on both observed failures, and it is a silent fallback: kaibo guessing
+what the model meant and running a command nobody asked for. A wrong guess doesn't announce
+itself. `Skip` with a reason string is strictly more information and leaves the choice where
+it belongs. Amy picked it.
+
+Reading rig's source changed the message. When a call is skipped, *none* of the turn's tool
+calls execute — the peers come back as "not executed". That's a fact the model needs,
+because one told only that a single name was wrong will assume its other calls landed. So
+the message says the turn ran nothing and asks for the work again. A refusal owes the reader
+what was refused, why, and what to do instead; here "what to do instead" had a second half
+we would have missed by not reading the code we were calling.
+
+The test is the old repro. A scripted model reads a file, then calls `run_sha`, then
+answers — and deleting the `add_hook` line makes it fail with the production error
+verbatim: ``UnknownToolCall: model attempted to call unknown or disallowed tool `run_sha` ``.
+A satisfying shape for a regression test — the sabotage doesn't approximate the bug, it *is*
+the bug.
+
+The cross-family review (DeepSeek, dogfooding `consult`) came back sound and caught the one
+thing I'd written down wrong. I had the `ToolChoice::None` branch described as a live guard
+protecting the forced write-up turn. It isn't: `forced_finish_turn` builds its own agent and
+installs no hooks, so the hook never sees that tool choice at all. The branch is right and I
+kept it — it's the answer we'd want if that ever changed — but it is guarding a state this
+tree cannot produce, and a comment that oversells its own reach is the kind of thing that
+gets believed later. The correction is in the doc comment now, stated as plainly as the
+claim was.
+
+Its other finding was a real test gap: nothing exercised a model that names a phantom tool
+on *every* turn. The recovery costs a turn and nothing counts recoveries, so the only thing
+between a pathological model and an unbounded loop is that a skipped turn is still a turn.
+The review reasoned that through and concluded it was structurally safe. It was right, and
+now there's a test that would hang if it ever stopped being true — which is the version of
+that argument I trust.
+
+What this doesn't do is lower the rate. The hook is recovery, and the `warn` it emits per
+occurrence is the first time this class is measurable at all — which is now the open half in
+`issues.md`, alongside the question of whether a model that gets the feedback actually reads
+it.
+
 ## 2026-08-09 — the test that had to speak MCP, and the flag that had stopped working
 
 The plan was a Python script. `mcp_drive.py` would spawn kaibo, speak JSON-RPC at it, and
