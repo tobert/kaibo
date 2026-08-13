@@ -367,7 +367,8 @@ pub fn kaibo_sandbox_doc() -> String {
          ## Exit codes\n\
          The code tells you the shape of the outcome; the message tells you which \
          outcome it was. A refused write and an ordinary mistake both exit `1`, so \
-         read the stderr line — a refusal names itself.\n\
+         read the stderr line: a refusal says `permission denied: filesystem is \
+         read-only`.\n\
          - `0` — success\n\
          - `1` — the command failed. A refused write is one of these, and its message \
          reads `permission denied: filesystem is read-only`\n\
