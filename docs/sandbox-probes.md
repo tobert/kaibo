@@ -53,6 +53,21 @@ the message classifies the block:
 
 ---
 
+> **Substitute a real path for `$ROOT` before running anything below.** The batteries
+> run *inside* kaish, whose environment is deliberately empty — Battery C proves exactly
+> that — so `$ROOT` expands to nothing and every write retargets `/`, the ephemeral
+> in-memory scratch, where writes legitimately succeed. The battery then reports
+> `redirect=0 touch=0 mkdir=0` while proving nothing at all. Found the hard way,
+> 2026-08-13.
+>
+> That is the shape to watch for in every probe here, not just this one. Two probes in
+> this file have reported an all-clear while testing nothing: the one above, and the
+> `/v/approvals` battery drafted for the kaish 0.14 bump — kaish removed that mount
+> before the tag, and a probe of a path that no longer exists returns *not found*, which
+> reads as containment working rather than as absence. **Ask of any probe: would it
+> report something different if the thing it audits were broken, versus if the probe
+> itself were?** If both roads end in the same output, the probe is decoration.
+
 ## 1. Battery A — writes inside the root must all be refused
 
 ```sh
@@ -151,6 +166,9 @@ These are separate `run_kaish` calls, each with a different `path` arg:
 **Pass:** the canonicalize-then-`starts_with` check defeats `..` injected into the
 path arg itself, and a file (vs. directory) is refused at the parameter boundary.
 
+> The table gives the MCP spelling. Over the CLI (`kaibo kaish --path …`) the same
+> refusal is **exit 3**, with the same message naming the widening knobs.
+
 > A symlink *inside* the tree pointing *outside* it can't be created from inside
 > (the mount is read-only) and none ships in the repo — so it isn't reachable from a
 > live probe. It is pinned instead by
@@ -209,6 +227,44 @@ if the count moves in either direction — teeth pinned by the `teeth_*` cases i
 
 ---
 
+## 5b. Battery F — the media CAS stays out of reach
+
+Battery E audits the persistence store. kaibo has a **second** deliberate write surface,
+the media CAS, and it had no battery until 2026-08-13. Same discipline as the store: a
+fixed XDG path no model controls, refused if it resolves into an allowed tree, its own
+blessed write marker, and never mounted into kaish.
+
+**F1 — the CAS refuses a directory inside the project (startup, loud, nothing created).**
+
+```sh
+kaibo --cas-dir "$ROOT/castest" < /dev/null ; echo "exit=$?"
+ls -d "$ROOT/castest"       # must not exist
+```
+
+**Pass:** non-zero exit, `media CAS path must live outside every allowed project tree`,
+and no directory created. Assert the refusal also promises kaibo never invents a
+different path and never silently falls back to memory — a silent fallback is the
+failure that would matter here, so the sentence is part of the contract.
+
+**F2 — kaish can neither read nor enumerate the CAS.**
+
+```sh
+ls  $XDG_DATA_HOME/kaibo/cas   ; echo "cas-ls=$?"        # or ~/.local/share/kaibo/cas
+ls  $XDG_DATA_HOME/kaibo       ; echo "cas-parent-ls=$?"
+```
+
+**Pass:** `not found`, exit 1, for both. **Check the store is non-empty on the host
+first**, or this passes vacuously. Listing matters as much as reading: the CAS is kept
+out of kaish precisely because its read side would otherwise enumerate every project's
+artifacts, so the enumeration half is the one that proves the design.
+
+> **Not yet covered:** `save_artifact`, the model team's one-way write path into the CAS.
+> It is safe by *shape* — the address is the content hash, so the API has no
+> destination-path parameter to aim — but shape is what these batteries exist to check
+> empirically. Worth an F3 before a release.
+
+---
+
 ## 6. The always-on guard: the test suites
 
 The live probes are a periodic spot-check; the *continuous* guard is the test tree.
@@ -261,6 +317,24 @@ toolset has drifted from the direct one and that's the bug.
   persistence store) not re-run live this pass — unaffected by a kaish-kernel bump
   and already covered by `tests/containment.rs`/`tests/store.rs` in that same green
   run.
+- **2026-08-13** — Full battery A–E direct via `kaibo kaish` (built binary, main
+  `fb5ae71`), plus the new Battery F and a model-driven §7 pass, ahead of cutting v0.3.0.
+  All clear. A — nine writes refused `permission denied: filesystem is read-only`,
+  leftovers empty, host and `git status` clean. B — nine external commands `command not
+  found` (exit 127). C — every out-of-mount read `not found`; **all three real key files
+  on the host and the operator's own `config.toml` confirmed present on disk and
+  unreadable through kaish**; `env` and `kaish-vars` empty. D — all five `path` rows
+  matched, `..`-injection canonicalized to `/etc` and refused. E — E1 exit 1 with no file
+  created, E2's store unreadable *and* unlistable, E3 green (13 tests). **F — new: the
+  CAS refused an in-project `--cas-dir` with nothing created, and a populated CAS was
+  neither readable nor listable through kaish.** §7 — the model-driven pass ran on a
+  local cast (`lfm25-solo`, the one live local endpoint of seven) and matched the direct
+  runs exactly: write `exit 1`, `whoami` `exit 127`, `/etc/passwd` `exit 1`. Suites
+  green: containment 23, sandbox 6, run_kaish_tool 14, full `cargo test` exit 0.
+  Two findings, both about the *instrument* rather than the boundary: Battery A as
+  written proved nothing (`$ROOT` is empty inside kaish — §0 now says so), and the
+  `/v/approvals` battery drafted for the kaish 0.14 bump was deleted before it shipped,
+  because the ledger cut removed the mount it probed.
 - **2026-07-29** — Full battery A–E, direct via `kaibo kaish`/`kaibo --state-db`
   (built binary, commit `ffb0bdb`, pre-release checklist pass ahead of cutting real
   v0.2.0 — five PRs had landed since the last full run: rmcp 3.0.0-beta.5, the
