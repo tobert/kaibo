@@ -93,6 +93,10 @@ serde_json = "1"
 # base64 string (the only channel that lands image parts in model context). Already
 # in the tree transitively via rig-core; named here so the dep is ours, not implicit.
 base64 = "0.22"
+# rig's `HttpClientExt` is typed in `bytes::Bytes`, so `wire_repair`'s transport
+# wrapper needs the type by name. Already in the tree via reqwest/rig-core — zero new
+# crates; named here so the dep is ours, not implicit.
+bytes = "1"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
 # raw structs turns a typo'd key into a startup error rather than a silent no-op.
 toml = "0.8"
@@ -190,11 +194,6 @@ opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 # `start_paused` tests (the deferred-generate poll loop) auto-advance tokio's clock
 # instead of really sleeping the poll interval.
 tokio = { version = "1", features = ["test-util"] }
-# Request-body capture in `tests/effort_wire.rs` and `test_support::CaptureHttp`:
-# rig's `HttpClientExt` trait is typed in `bytes::Bytes`, so implementing a fake
-# transport needs the type by name. Already in the tree via reqwest/rig-core — zero
-# new crates.
-bytes = "1"
 # rmcp's CLIENT half, for `tests/mcp_stdio.rs`: it spawns the real kaibo binary and
 # drives it over stdio the way a client does, so the MCP surface (handshake,
 # tools/list, tools/call, resources/read) is covered end to end in-tree. Same version

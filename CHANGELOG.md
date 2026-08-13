@@ -113,6 +113,9 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **A complete answer from a vLLM-served model no longer arrives as a provider error** —
+  vLLM sends both `reasoning` and `reasoning_content`, which rig-core cannot decode, so
+  kaibo repairs the body before it is parsed.
 - **kaibo told models the wrong exit code for a refused write.** Six descriptions said
   `126` meant blocked; a refused write exits `1` saying `permission denied: filesystem is
   read-only`, and an external command exits `127`.

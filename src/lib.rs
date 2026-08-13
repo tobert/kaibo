@@ -47,6 +47,7 @@ pub mod telemetry;
 pub mod tls;
 pub mod tool_span;
 pub mod view_image;
+pub mod wire_repair;
 pub mod worktree;
 
 /// A scripted, offline stand-in for a provider client, for driving the consult loop
