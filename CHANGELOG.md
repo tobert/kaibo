@@ -59,6 +59,8 @@ record. Each later release appends a new section at the top.
   CAS, so one project's team cannot enumerate another's artifacts.
 - **Model listings show each model's output ceiling** beside the context window — size a
   synth slot's `max_tokens` from it.
+- **Model listings mark which models reason**, read from the provider's own catalog, so
+  picking a thinking model costs no guesswork and no API call of your own.
 - **The explorer can hand whole files to whoever reads its report** — an `attach` tool
   routes real bytes (images too) into the driver's context or the `deliberate` dossier,
   governed by `[defaults] max_attachments`.
