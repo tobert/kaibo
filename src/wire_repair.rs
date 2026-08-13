@@ -58,12 +58,19 @@ const ALIAS: &str = "reasoning";
 /// It covers every body that is not JSON, is not an object, has no `choices`, or holds
 /// only one of the two keys — including the Responses wire, whose payload has no
 /// `choices` at all.
+///
+/// Two shapes it declines to repair even though rig would fail on them, both requiring
+/// a serializer no provider is known to use: a key spelled with a `\u` escape, which the
+/// literal scan below cannot see, and a body holding a number outside `i64`/`u64`, which
+/// `serde_json` cannot represent without `arbitrary_precision`. Each leaves the caller
+/// exactly where it was before this module existed.
 pub fn repair_duplicate_reasoning(body: &[u8]) -> Option<Bytes> {
-    // Both keys must appear literally before it is worth parsing. Every response
-    // pays this scan and almost none pay the parse; `reasoning_content` contains
-    // `reasoning`, so the cheap test is one `find` for each spelling's quoted key.
+    // Both keys must appear literally before it is worth parsing. Every OpenAI chat
+    // response pays this scan and almost none pay the parse. The needles carry their
+    // quotes because `reasoning_content` starts with `reasoning`: quoted, `"reasoning"`
+    // does not occur inside `"reasoning_content"`, so the two tests stay independent.
     let looks_relevant =
-        memchr_contains(body, b"\"reasoning_content\"") && memchr_contains(body, b"\"reasoning\"");
+        contains_bytes(body, b"\"reasoning_content\"") && contains_bytes(body, b"\"reasoning\"");
     if !looks_relevant {
         return None;
     }
@@ -107,7 +114,7 @@ pub fn repair_duplicate_reasoning(body: &[u8]) -> Option<Bytes> {
 }
 
 /// Substring search over raw bytes, without pulling a dependency for it.
-fn memchr_contains(haystack: &[u8], needle: &[u8]) -> bool {
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
@@ -208,9 +215,120 @@ mod tests {
             "rig-core 0.41 cannot decode both reasoning spellings — if this now \
                          decodes, rig fixed it upstream and `wire_repair` can be deleted",
         );
+        // The `expect_err` above is the deletion trigger on its own. This second
+        // assertion is deliberately pinned to rig's wording so the test also fails
+        // when the payload starts failing for a *different* reason — a decode that
+        // breaks on something else is news, and silently satisfying the trigger with
+        // an unrelated error would hide it.
         assert!(
             err.to_string().contains("duplicate field"),
             "expected the duplicate-field decode failure, got: {err}"
+        );
+    }
+
+    /// A canned transport: one response body, whatever was asked. Enough to drive
+    /// [`Repaired::send`] end to end without a network.
+    #[derive(Clone, Debug, Default)]
+    struct CannedHttp(Vec<u8>);
+
+    impl HttpClientExt for CannedHttp {
+        fn send<T, U>(
+            &self,
+            _req: Request<T>,
+        ) -> impl std::future::Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
+        where
+            T: Into<Bytes> + Send,
+            U: From<Bytes> + Send + 'static,
+        {
+            let body = Bytes::from(self.0.clone());
+            async move {
+                let lazy: LazyBody<U> = Box::pin(async move { Ok(U::from(body)) });
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(lazy)
+                    .map_err(http_client::Error::Protocol)
+            }
+        }
+
+        // Unreachable for a completion, but the trait requires them. `async fn` can't
+        // express the trait's `+ Send + 'static` return bound, so the desugared form
+        // stays — the same constraint `test_support::CaptureHttp` documents.
+        #[allow(clippy::manual_async_fn)]
+        fn send_multipart<U>(
+            &self,
+            _req: Request<http_client::MultipartForm>,
+        ) -> impl std::future::Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
+        where
+            U: From<Bytes> + Send + 'static,
+        {
+            async move { Err(http_client::Error::StreamEnded) }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn send_streaming<T>(
+            &self,
+            _req: Request<T>,
+        ) -> impl std::future::Future<Output = http_client::Result<http_client::StreamingResponse>> + Send
+        where
+            T: Into<Bytes> + Send,
+        {
+            async move { Err(http_client::Error::StreamEnded) }
+        }
+    }
+
+    /// The seam itself, which is the whole reason this module is a wrapper rather
+    /// than a function: bytes go through [`Repaired::send`] and come out decodable by
+    /// rig, with the status and headers the inner transport set.
+    #[tokio::test]
+    async fn the_wrapper_hands_rig_a_body_rig_can_decode() {
+        let client = Repaired::new(CannedHttp(CAPTURED_VLLM.as_bytes().to_vec()));
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://vllm.example/v1/chat/completions")
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let response = client
+            .send::<Vec<u8>, Bytes>(request)
+            .await
+            .expect("the canned transport answers");
+        assert_eq!(response.status(), 200, "the inner status must survive");
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json",
+            "the inner headers must survive"
+        );
+
+        let bytes = response.into_body().await.expect("the body resolves");
+        decodes_with_rig(&bytes).expect(
+            "the wrapper must hand rig a decodable body — this is the property the \
+             whole module exists to provide",
+        );
+    }
+
+    /// A body with nothing to repair reaches rig byte-for-byte. The wrapper must be
+    /// transparent, not merely correct on the one shape it fixes.
+    #[tokio::test]
+    async fn the_wrapper_forwards_an_untouched_body_verbatim() {
+        const CLEAN: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        let client = Repaired::new(CannedHttp(CLEAN.as_bytes().to_vec()));
+        let request = Request::builder()
+            .uri("https://vllm.example/v1/chat/completions")
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let bytes = client
+            .send::<Vec<u8>, Bytes>(request)
+            .await
+            .expect("the canned transport answers")
+            .into_body()
+            .await
+            .expect("the body resolves");
+        assert_eq!(
+            bytes,
+            Bytes::from(CLEAN),
+            "an unrepaired body must be byte-identical"
         );
     }
 
