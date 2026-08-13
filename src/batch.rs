@@ -635,7 +635,7 @@ fn parse_results_jsonl(body: &str, submitted: Option<u64>) -> Result<Vec<BatchAn
 
 /// Render a poll for the calling agent. Pending shows progress; Done lists each item's
 /// answer (or its per-item failure) under a self-labelling footer naming who ran it —
-/// the provenance the `docs/issues.md` entry wants on a batch result.
+/// the provenance a batch result needs so a caller can tell which cast produced it.
 pub fn render_poll(poll: &BatchPoll, label: &str) -> String {
     match poll {
         BatchPoll::Pending { completed, total } => {
@@ -1805,8 +1805,8 @@ fn parse_openai_list(v: &Value) -> Result<(Vec<BatchListItem>, bool)> {
 /// **kaibo deletes nothing.** The input file is, in fact, the only surviving record of what
 /// was submitted (kaibo's store keeps the handle and label, never the prompts), and deleting
 /// an output file on poll would break re-polling a finished handle. OpenAI expires batch
-/// output files on its own (30 days today). An opt-in cleanup flag is tracked in
-/// `docs/issues.md`.
+/// output files on its own (30 days today). An opt-in early-cleanup flag remains an open
+/// idea, not yet implemented.
 pub struct OpenaiBatch {
     http: reqwest::Client,
     api_key: String,
@@ -2702,9 +2702,9 @@ mod tests {
         assert!(matches!(&answers[2].text, Err(m) if m.contains("expired")));
     }
 
-    /// `docs/issues.md`'s P3 batch cross-check, Anthropic side: a provider that silently
-    /// drops an item yields fewer lines than kaibo submitted, with no error naming the
-    /// gap. Submitting 3 but reading back 2 must synthesize the third as a loud per-item
+    /// The batch cross-check ([`cross_check_absentees`]), Anthropic side: a provider that
+    /// silently drops an item yields fewer lines than kaibo submitted, with no error naming
+    /// the gap. Submitting 3 but reading back 2 must synthesize the third as a loud per-item
     /// failure — never a quiet "2 results" that reads like the batch only ever had two.
     #[test]
     fn results_jsonl_cross_checks_submitted_ids() {
@@ -3363,10 +3363,10 @@ mod tests {
         assert!(matches!(&answers[1].text, Err(m) if m.contains("permission denied")));
     }
 
-    /// `docs/issues.md`'s P3 batch cross-check, Gemini side: a `SUCCEEDED` batch promises
-    /// every submitted item is in the inlined array, so a provider that silently drops one
-    /// must be caught here — submitting 3 but reading back 2 synthesizes the third as a
-    /// loud per-item failure.
+    /// The batch cross-check ([`cross_check_absentees`]), Gemini side: a `SUCCEEDED` batch
+    /// promises every submitted item is in the inlined array, so a provider that silently
+    /// drops one must be caught here — submitting 3 but reading back 2 synthesizes the third
+    /// as a loud per-item failure.
     #[test]
     fn gemini_poll_succeeded_cross_checks_submitted_ids() {
         let v = json!({
@@ -4115,12 +4115,12 @@ mod tests {
         assert_eq!(ids, ["zeta", "alpha"]);
     }
 
-    /// `docs/issues.md`'s P3 batch cross-check, OpenAI side: a per-file parse can't judge
-    /// completeness on its own (a missing id might just be sitting in the *other* file),
-    /// so the check runs once, on the merged set, in [`finalize_openai_answers`] — and
-    /// only for `completed`, the one state that promises the two files together cover
-    /// every submitted item. Submitting 3 but merging 2 (both from the output file here)
-    /// must synthesize the third as a loud per-item failure.
+    /// The batch cross-check ([`cross_check_absentees`]), OpenAI side: a per-file parse
+    /// can't judge completeness on its own (a missing id might just be sitting in the
+    /// *other* file), so the check runs once, on the merged set, in
+    /// [`finalize_openai_answers`] — and only for `completed`, the one state that promises
+    /// the two files together cover every submitted item. Submitting 3 but merging 2 (both
+    /// from the output file here) must synthesize the third as a loud per-item failure.
     #[test]
     fn finalize_openai_answers_cross_checks_a_completed_batch() {
         let answers = vec![

@@ -14,7 +14,7 @@
 .gemini-api-key
 
 # signoff.md — ephemeral, personal cross-session handoff; never commit.
-# Shared working notes live in docs/issues.md and docs/devlog.md.
+# Durable notes belong in the pull request and CHANGELOG.md instead.
 signoff.md
 
 # Node artifacts from tooling run inside the repo (codex CLI and friends). kaibo has

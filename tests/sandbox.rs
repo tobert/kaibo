@@ -288,8 +288,9 @@ async fn shadow_block_is_126_and_distinct_from_a_plain_failure() {
 
 /// The `/` scratch MemoryFs is bounded: a redirect that writes past the configured
 /// `scratch_limit_bytes` fails loudly (ENOSPC-style) instead of eating host RAM for
-/// the kernel's whole lifetime — the unbounded-scratch surprise tracked in
-/// `docs/issues.md`. The target is an ABSOLUTE path outside the project mount, so the
+/// the kernel's whole lifetime — without a cap, a redirect target outside the project
+/// could grow the in-memory scratch fs without bound for as long as the kernel runs.
+/// The target is an ABSOLUTE path outside the project mount, so the
 /// router sends it to the `/` MemoryFs (the budgeted mount) rather than the read-only
 /// project mount; a bare relative target would now resolve against cwd (the project)
 /// and be refused as read-only instead. Teeth: the generous default budget below

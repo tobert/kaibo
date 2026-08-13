@@ -153,7 +153,8 @@ The three open questions resolved this way:
 - **kaibo deletes nothing.** The input file is the only surviving record of what was
   submitted — the store keeps the handle and label, never the prompts — and deleting an
   output on poll would break re-polling a finished handle. OpenAI expires batch outputs
-  itself after 30 days. An opt-in cleanup flag is tracked in `docs/issues.md`.
+  itself after 30 days. An opt-in early-cleanup flag remains an open idea, not yet
+implemented.
 - **No model-steerable write path, because there is no local file.** The JSONL is built in
   memory (`openai_batch_jsonl`) and streamed straight into the multipart upload; results
   come back as strings. The only artifact lives in the caller's OpenAI account. Attachments

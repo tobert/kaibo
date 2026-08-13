@@ -467,7 +467,7 @@ async fn mount_layer_symlink_in_allowed_pointing_outside() {
     //
     // If this behavior ever changes (mount layer starts following the symlink and
     // returns outside bytes), this test will fail and must be escalated: add a P2
-    // entry to docs/issues.md as a mount-layer symlink-leak hole.
+    // hole in the mount layer, and it must be escalated rather than re-baselined.
     match &result {
         Ok(out) => {
             // The call succeeded — the mount followed the symlink. Check whether the
@@ -476,10 +476,10 @@ async fn mount_layer_symlink_in_allowed_pointing_outside() {
                 // MOUNT-LAYER SYMLINK LEAK: the read-only mount followed a symlink
                 // inside the allowed tree to a target outside it and returned the
                 // outside file's bytes. This is a new hole — add a P2 entry to
-                // docs/issues.md describing the mount-layer symlink-leak.
+                // read-only mount followed a symlink out of the allowed tree.
                 panic!(
                     "MOUNT-LAYER SYMLINK LEAK: outside bytes appeared through a symlink \
-                     inside the allowed tree — add a P2 entry to docs/issues.md. Got: {out}"
+                     inside the allowed tree — escalate before shipping. Got: {out}"
                 );
             }
             // Call succeeded but outside bytes weren't present — mount resolved the

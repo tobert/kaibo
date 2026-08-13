@@ -488,8 +488,8 @@ impl Arm {
     /// so Anthropic-upstream slugs bill the resident preamble at cache-read rates
     /// instead of full input price every turn; implicit-caching upstreams
     /// (DeepSeek/GLM/Kimi/Gemini/OpenAI) ignore the marker. The growing
-    /// transcript is not marked — an upstream rig limitation, tracked in
-    /// docs/issues.md. Kept as a named seam so the construction is unit-testable, and
+    /// transcript is not marked — an upstream rig limitation. Kept as a named seam so
+    /// the construction is unit-testable, and
     /// `from_slot` must route through here.
     ///
     /// Generic over the HTTP backend so a test can drive it with a capture transport
@@ -5399,7 +5399,7 @@ mod tests {
     /// nested `explore′`. All other tests pass `None` for thinking, so a regression
     /// that dropped `additional_params` in `run_phase`, or stopped `RunExplore`
     /// forwarding its arm's params to the nested loop, would slip through. These
-    /// shapes are provider-specific and have already drifted once (`docs/issues.md`).
+    /// shapes are provider-specific and have already drifted once.
     #[tokio::test]
     async fn thinking_params_reach_both_the_driver_and_every_sweep() {
         const SYNTH: &str = "capable-synth";

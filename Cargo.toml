@@ -58,7 +58,8 @@ rig-agent = { version = "0.41", default-features = false, features = ["derive", 
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
-# would otherwise hang a tool call forever (see consult.rs / docs/issues.md).
+# would otherwise hang a tool call forever (see consult.rs and the regression test
+# in tests/llm_timeout.rs).
 # Match rig's own reqwest: version 0.13, rustls TLS, no default-tls.
 #
 # `rustls-no-provider` (not `rustls`): reqwest's plain `rustls` feature hard-wires

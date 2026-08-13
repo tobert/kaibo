@@ -49,7 +49,8 @@ pub fn ensure_crypto_provider() {
 ///
 /// The client is bounded because rig exposes no native timeout and its prompt loop is
 /// non-streaming: a backend that connects but never answers would otherwise hang the
-/// whole call with no brake (the 2026-06-06 ~29-min wedge; `docs/issues.md`).
+/// whole call with no brake (the 2026-06-06 ~29-min wedge, regression-guarded in
+/// `tests/llm_timeout.rs`).
 /// `timeout` caps a single completion; `connect_timeout` fails a dead endpoint fast,
 /// capped at the deadline so a sub-10s backend timeout still dominates.
 pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {

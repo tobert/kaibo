@@ -685,7 +685,7 @@ invites you to retry the call, so the calling agent can drive the retry; a non-t
 error (auth, bad request) doesn't, since a retry won't help; and a kaibo-side failure is
 named as such rather than blamed on the provider. If a provider is reliably slow, raise
 that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
-— tracked as an upstream `rig` contribution in [`docs/issues.md`](docs/issues.md).)
+— an upstream `rig` contribution we haven't made yet.)
 
 One exception: when a provider cannot parse the tool call a model generated, kaibo asks
 that model for the turn twice more — otherwise a single fumbled tool call discards the
@@ -709,8 +709,8 @@ Agent contributions welcome. Every change lands through a pull request — for
 transparency, so anyone using kaibo can see what changed and why — and every
 user-facing change gets a [`CHANGELOG.md`](CHANGELOG.md) entry. See
 [`AGENTS.md`](AGENTS.md) for the architecture, the PR-and-changelog workflow, and
-working conventions, [`docs/issues.md`](docs/issues.md) for the live tracker of open
-work, and [`docs/devlog.md`](docs/devlog.md) for the shipped-work record.
+working conventions. Open work and the shipped-work narrative are tracked outside this
+repo; the pull requests and this changelog are the public record.
 
 ## Name
 

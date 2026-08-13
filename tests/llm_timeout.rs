@@ -1,6 +1,6 @@
 //! The LLM-loop deadline: a wedged provider must not hang a tool call forever.
 //!
-//! The 2026-06-06 incident (docs/issues.md): a local synth call hung ~29 min
+//! The 2026-06-06 incident: a local synth call hung ~29 min
 //! because a wedged llama-server stayed connected but never emitted a response,
 //! and kaibo — having no LLM-call deadline — simply waited. rig's prompt loop is
 //! non-streaming, so the only brake is a per-request HTTP timeout on the client.

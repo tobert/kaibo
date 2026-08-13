@@ -177,10 +177,16 @@ project and cannot run external commands.
   (`oneshot`, `deliberate` direct) skip the agent entirely via `Arm::complete` — one
   request, built with rig's own `CompletionRequestBuilder` so both paths move together on
   a rig bump.
-- **`docs/issues.md` is the live tracker** — open work only, kept cheap to skim
-  before new work. Delete entries when they ship; don't mark them done.
-- **`docs/devlog.md`** is a durable narrative from the agent's perspective — write
-  your story there.
+- **The tracker and the devlog live outside this repo.** Open work and the
+  shipped-work narrative moved out on 2026-08-13; the repo keeps code, tests, docs, and
+  `CHANGELOG.md`. Their content up to that date is still readable in git history at
+  `dc61620`. If you are working here without access to them, the pull requests and the
+  changelog are the record — write the *why* into the PR body, which becomes the merge
+  commit, and the entry into `CHANGELOG.md`.
+  - The two disciplines they carried still apply wherever they now live: a tracker holds
+    **open work only**, and an entry is *deleted* when it ships rather than marked done;
+    a devlog entry is written from the agent's own perspective and **rides the PR that
+    completes the arc**, never landing as follow-up work.
 - **`kaish-kernel` is a published crates.io dep** (pinned in `Cargo.toml`), still
   under active development upstream. A version bump can change its API — when you
   bump, adapt kaibo to the new shape, don't pin around it. (If you're co-developing
@@ -232,7 +238,7 @@ strictly its rules apply to that file — and kaibo's files sort like this.
 | Partial — keep the terms and the published/internal boundary; relax the rest | preambles and the kaish cheatsheet (`consult/prompts.rs`, `kaish_syntax.rs`), and `///` on `pub` items |
 | Terms only, one line per bullet | `CHANGELOG.md` |
 | Terms only | `README.md`, `docs/*.md` |
-| Exempt | `docs/devlog.md` — it tells the story from one person's view, and that needs a voice |
+| Exempt | the devlog, wherever it lives — it tells the story from one person's view, and that needs a voice |
 
 **Error strings carry the Full weight above — every rule in the guide applies — and they
 are the most valuable prose we own.**
@@ -420,8 +426,8 @@ even for a one-line doc fix.
 - **Every user-facing change updates `CHANGELOG.md`** under the top *unreleased*
   section, in the Keep a Changelog buckets (Added / Changed / Fixed / Security / …).
   Write what a *user* notices, not the file diff. Internal-only refactors need no entry —
-  the git log is their record (mirrors the `docs/issues.md` "delete when shipped"
-  discipline).
+  the git log is their record, the same way a tracker entry is deleted when it ships
+  rather than marked done.
 - **A changelog bullet is one line: the change, and at most one clause of reason.** The
   full reasoning belongs in the pull request body, which becomes the merge commit, so the
   bullet does not carry it. If a bullet needs three numbers and three reasons, write three

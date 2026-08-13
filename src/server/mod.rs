@@ -995,8 +995,8 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         (consult_live, "consult"),
         // `consult_submit` is the async sibling of `consult` — same capability, a
         // submit/collect surface rather than a blocking one — so it shares the `consult`
-        // flag and the same interactive-cast requirement. (docs/issues.md tracks a
-        // dedicated flag if anyone needs only one shape.)
+        // flag and the same interactive-cast requirement. (A dedicated flag per shape
+        // is a plausible split if anyone ever needs only one of the two gated alone.)
         (consult_live, "consult_submit"),
         // The single-phase explorer sweep — its own gate, and the broadest cast rule
         // (any cast with an explorer, interactive or not).
@@ -1173,7 +1173,7 @@ impl KaiboHandler {
         // it against the gates in the consistency test) is what keeps the advertised menu
         // and the call-time gate from drifting apart. The `cast` enum is the one
         // authoritative per-lane roster — the resident-prose roster this used to also
-        // append (`append_cast_roster`) was dropped as redundant; see `docs/devlog.md`.
+        // append (`append_cast_roster`) was dropped as redundant.
         //
         // Every empty roster here now belongs to a route the gate already removed, so
         // `inject_cast_enum`'s empty-list skip is a belt-and-braces guard rather than the

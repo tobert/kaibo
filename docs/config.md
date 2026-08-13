@@ -189,8 +189,8 @@ generated, kaibo asks that model for the turn twice more before failing — othe
 single fumbled tool call discards the whole investigation.
 
 The one setting that helps a slow backend is `request_timeout_secs`, above. Automatic
-retry and backoff belong in the shared HTTP layer, and landing them there is tracked as
-an upstream rig contribution in `docs/issues.md`.
+retry and backoff belong in the shared HTTP layer, and landing them there would take an
+upstream contribution to rig itself.
 
 ### Casts: `[casts.<name>]`
 
@@ -328,7 +328,7 @@ that can use it. Measured 2026-08-01:
 | DeepSeek | all seven (`none` … `max`), strictly validated. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
 | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
 | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
-| Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured** — see `docs/issues.md`. |
+| Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured.** |
 
 Every row above except the Anthropic one was measured against the live endpoint, and each
 is re-checkable: `tests/consult.rs` carries an `#[ignore]`d probe per provider that fails
@@ -722,9 +722,10 @@ pair on a thinking-kind slot; an alias collision; an unresolvable `server.cast`.
 A setting the operator clearly meant is never silently dropped. A misspelled knob that
 quietly does nothing is the failure mode these rules exist to prevent.
 
-Startup validation of *which backends are usable* is tracked separately in
-`docs/issues.md`. Project-local layering (a repo-root `.kaibo.toml` merged over the user
-config) is a plausible later addition, not implemented.
+Startup validation of *which backends are usable* is not implemented yet — today an
+unusable backend surfaces only when a call to it fails. Project-local layering (a
+repo-root `.kaibo.toml` merged over the user config) is a plausible later addition, not
+implemented.
 
 ## Telemetry (OpenTelemetry traces and logs)
 
@@ -901,7 +902,7 @@ shards and parsing a file per object, and it only gets slower as the store fills
 builds no index and offers no scan verb over it. Access is by address; a saved digest also
 rides the session turn that produced it, so tracking what was created lives with the
 conversation, not the store. An operator's cleanup, if wanted, is plain file mtime on the
-object tree for now — see `docs/issues.md`.
+object tree for now — a size- or age-based reclaim policy is still open.
 
 The sidecar is **first-writer-wins**: it records the first write of a given content and is
 never rewritten. Save bytes the store already holds and the record stays the original

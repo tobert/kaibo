@@ -108,6 +108,9 @@ record. Each later release appends a new section at the top.
 
 ### Removed
 
+- **`docs/issues.md` and `docs/devlog.md` are no longer in the repo** — open work and the
+  shipped-work narrative are tracked elsewhere; pull requests and this changelog are the
+  public record. Their history stays readable in git.
 - **The `kaibo://cas/<digest>` MCP resource** — never in a release, replaced by the
   `read_cas` tool; a stale request answers with the migration.
 
@@ -550,7 +553,7 @@ record. Each later release appends a new section at the top.
   lands later on the provider's result, notes the synchronous dossier-build cost in its
   submit acknowledgement. (Counts are exact on the normal path; the rare turn-cap and
   image-resume paths undercount, since the underlying loop yields no usage on those
-  exits — noted in `docs/issues.md`.)
+  exits.)
 - **A container image, built to be COPY'd.** Every release now ships
   `ghcr.io/tobert/kaibo` — multiarch (amd64/arm64), the fully-static binary in a
   distroless, shell-less, **non-root** base, signed and attested by the same
