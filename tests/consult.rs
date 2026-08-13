@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
 use kaibo::consult::{
-    consult, consult_user_prompt, oneshot, request_params, thinking_params, Arm, ConsultConfig,
-    ModelCaps, ModelShape, PhaseContext, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
+    consult, consult_user_prompt, effort_sinks, hosted_openai_responses_params, oneshot,
+    request_params, thinking_params, Arm, ConsultConfig, ModelCaps, ModelShape, PhaseContext,
+    ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
 use serde_json::{json, Value};
@@ -528,6 +529,40 @@ fn the_generic_openai_path_asks_for_reasoning_by_default() {
         "no `thinking` block on this wire — a strict gateway 403s the whole request: {p}"
     );
     assert!(p.get("reasoning").is_none(), "that shape is OpenRouter's: {p}");
+}
+
+/// The off-switch on the **Responses** wire, checked where the request is really built.
+///
+/// The sibling test below calls `ModelShape::to_params` directly, and that is exactly
+/// why it missed this: on a Responses-wire backend the engine *discards* that blob and
+/// replaces it with `hosted_openai_responses_params`, so a `to_params`-level assertion
+/// proves nothing about what gets sent. The first version of this feature shipped with
+/// `thinking_style = "off"` silently ignored on every hosted gpt-5 slot, green tests and
+/// all — found by a cross-family review reading the call site instead of the unit.
+#[test]
+fn thinking_style_off_reaches_the_responses_wire_too() {
+    // Reasoning is on for this model by default...
+    let on = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Auto)
+        .expect("a gpt-5 model takes reasoning");
+    assert_eq!(on["reasoning"]["effort"], "high");
+
+    // ...and `off` must remove it here, not merely in the shape the engine throws away.
+    let off = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Off);
+    assert!(
+        off.as_ref().and_then(|v| v.get("reasoning")).is_none(),
+        "thinking_style = off must silence the Responses wire, got {off:?}"
+    );
+
+    // And the reporting has to agree, or kaibo would say effort ships while it does not.
+    assert!(
+        !effort_sinks(
+            ProviderKind::Openai,
+            "gpt-5.6-sol",
+            ThinkingStyleOverride::Off,
+            true,
+        ),
+        "with reasoning off, the Responses wire has no effort sink to report"
+    );
 }
 
 #[test]

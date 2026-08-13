@@ -595,9 +595,15 @@ pub fn hosted_openai_responses_params(
     model: &str,
     top_p: Option<f64>,
     effort: &str,
+    style: ThinkingStyleOverride,
 ) -> Option<Value> {
     let mut obj = serde_json::Map::new();
-    if hosted_openai_accepts_reasoning(model) {
+    // `off` has to be honored here too, and it is easy to miss: this function does not
+    // build on [`ModelShape`], it REPLACES that blob at the call site, so the early
+    // return in `ModelShape::resolve` never reaches the Responses wire. Without this
+    // check an operator who switched reasoning off still got `reasoning:{effort}` on
+    // every gpt-5 slot — silently, because the setting looked honored everywhere else.
+    if hosted_openai_accepts_reasoning(model) && style != ThinkingStyleOverride::Off {
         obj.insert("reasoning".into(), json!({ "effort": effort }));
     }
     if hosted_openai_accepts_sampling(model) {
@@ -639,7 +645,7 @@ pub fn effort_sinks(
     responses_wire: bool,
 ) -> bool {
     if responses_wire {
-        return hosted_openai_accepts_reasoning(model);
+        return style != ThinkingStyleOverride::Off && hosted_openai_accepts_reasoning(model);
     }
     ModelShape::resolve(kind, model, style).sinks_effort()
 }
@@ -978,7 +984,7 @@ mod tests {
     /// `/chat/completions` shape, which stays toggle-less for local servers.
     #[test]
     fn hosted_openai_responses_params_are_model_aware_about_sampling() {
-        let params = hosted_openai_responses_params("gpt-5.6-sol", Some(0.95), DEFAULT_EFFORT)
+        let params = hosted_openai_responses_params("gpt-5.6-sol", Some(0.95), DEFAULT_EFFORT, ThinkingStyleOverride::Auto)
             .expect("hosted OpenAI sends Responses params");
         assert_eq!(
             params["reasoning"]["effort"], "high",
@@ -997,7 +1003,7 @@ mod tests {
             "Responses maps core max_tokens to max_output_tokens itself"
         );
 
-        let params = hosted_openai_responses_params("gpt-4.1-mini", Some(0.95), "low")
+        let params = hosted_openai_responses_params("gpt-4.1-mini", Some(0.95), "low", ThinkingStyleOverride::Auto)
             .expect("older chat GPT families keep sampling");
         assert!(
             params.get("reasoning").is_none(),
@@ -1013,7 +1019,7 @@ mod tests {
             "known sampling-compatible GPT families keep typed temperature"
         );
 
-        let params = hosted_openai_responses_params("gpt-5.6-sol", None, "none").unwrap();
+        let params = hosted_openai_responses_params("gpt-5.6-sol", None, "none", ThinkingStyleOverride::Auto).unwrap();
         assert_eq!(
             params["reasoning"]["effort"], "none",
             "the explicit no-reasoning effort passes through to rig's Responses enum"
@@ -1021,7 +1027,7 @@ mod tests {
         assert!(params.get("top_p").is_none());
 
         assert!(
-            hosted_openai_responses_params("unknown-openai-model", Some(0.95), "high").is_none(),
+            hosted_openai_responses_params("unknown-openai-model", Some(0.95), "high", ThinkingStyleOverride::Auto).is_none(),
             "unknown hosted models get no guessed provider-specific params"
         );
     }

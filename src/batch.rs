@@ -1435,7 +1435,12 @@ const OPENAI_INPUT_FILENAME: &str = "kaibo-batch-input.jsonl";
 pub fn openai_batch_shaping(model: &str, tunables: &SlotTunables) -> (u64, Option<Value>) {
     let max_tokens = tunables.max_tokens.max(BATCH_MAX_TOKENS_FLOOR);
     let params =
-        crate::consult::hosted_openai_responses_params(model, None, batch_effort(&tunables.effort));
+        crate::consult::hosted_openai_responses_params(
+            model,
+            None,
+            batch_effort(&tunables.effort),
+            tunables.thinking_style,
+        );
     (max_tokens, params)
 }
 

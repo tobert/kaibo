@@ -160,7 +160,12 @@ impl Path {
     /// than production does.
     fn shaped(&self, effort: &str) -> Option<Value> {
         if self.responses_wire() {
-            return hosted_openai_responses_params(self.model(), None, effort);
+            return hosted_openai_responses_params(
+                self.model(),
+                None,
+                effort,
+                ThinkingStyleOverride::Auto,
+            );
         }
         ModelShape::resolve(self.kind(), self.model(), ThinkingStyleOverride::Auto)
             .to_params(8192, None, None, effort)

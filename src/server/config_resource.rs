@@ -496,8 +496,13 @@ pub(crate) fn render_config_resource(
                         // `Auto` stays quiet: it is the no-override default and behaves
                         // identically to an absent override on every wire, Anthropic
                         // included.
-                        if t.thinking_style != ThinkingStyleOverride::Auto
-                            && backend.kind.wire() != Some(WireKind::Anthropic)
+                        // `Off` is honored on EVERY wire (it short-circuits before the
+                        // per-wire match), so it is never inert — only the Anthropic
+                        // TIERS are, and only away from Anthropic.
+                        if matches!(
+                            t.thinking_style,
+                            ThinkingStyleOverride::Adaptive | ThinkingStyleOverride::Budget
+                        ) && backend.kind.wire() != Some(WireKind::Anthropic)
                         {
                             inert.push("thinking_style");
                         }

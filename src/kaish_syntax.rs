@@ -379,6 +379,7 @@ pub fn kaibo_sandbox_doc() -> String {
          config disables none, so you will rarely see this\n\
          - `127` — command not found. Every external command answers this way, which \
          is what makes the host unreachable from here\n\
+         - `130` — the script was cancelled\n\
          - other non-zero — the script itself failed\n\n\
          ## Learn more kaish\n\
          These `kaibo://kaish/*` resources mirror kaish's own help, so you can go \
