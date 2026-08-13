@@ -4500,8 +4500,10 @@ mod tests {
             cfg.effort_diagnostics()
         );
 
-        // The same cast, with the effort written on the slot: now it is a claim the
-        // operator made, and it goes nowhere.
+        // The same cast, with the effort written on the slot AND reasoning switched
+        // off: now it is a claim the operator made, and it goes nowhere. `thinking_style
+        // = "off"` is what makes it inert — an openai-compatible backend carries
+        // `reasoning_effort`, so without the off-switch this slot would ship.
         let cfg = Config::from_toml_str(
             r#"
             [backends.lab]
@@ -4510,7 +4512,7 @@ mod tests {
             key_optional = true
 
             [casts.zorak]
-            synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+            synth = { backend = "lab", id = "gemma", effort = "xhigh", thinking_style = "off" }
             "#,
         )
         .unwrap();
@@ -4537,6 +4539,7 @@ mod tests {
             r#"
             [defaults]
             synth_effort = "low"
+            thinking_style = "off"
 
             [backends.lab]
             kind = "openai"
@@ -4553,7 +4556,9 @@ mod tests {
         assert_eq!(
             zorak.len(),
             1,
-            "the defaults effort is reported too: {inert:?}"
+            "a [defaults] effort is reported too, not just a per-slot one — here it is \
+             inert because [defaults] thinking_style = off turns reasoning off for every \
+             cast at once: {inert:?}"
         );
         assert_eq!(zorak[0].disposition.configured, "low");
         assert_eq!(zorak[0].disposition.source, EffortSource::Defaults);
@@ -4689,8 +4694,11 @@ mod tests {
             [casts.batch-off]
             synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "none" }
 
-            [casts.dropped]
+            [casts.local-thinks]
             synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+
+            [casts.dropped]
+            synth = { backend = "lab", id = "gemma", effort = "xhigh", thinking_style = "off" }
             "#,
         )
         .unwrap();
@@ -4724,7 +4732,20 @@ mod tests {
             EffortFate::SentAsOff,
             "a DEPTH floor must leave an explicit reasoning-off alone on the batch lane too"
         );
-        assert_eq!(fate("dropped"), EffortFate::NoSink);
+        assert_eq!(
+            fate("local-thinks"),
+            EffortFate::Sent,
+            "an OpenAI-compatible backend carries `reasoning_effort`, so a local slot's \
+             effort reaches the server — this is the whole point of the openai wire \
+             reasoning by default"
+        );
+        assert_eq!(
+            fate("dropped"),
+            EffortFate::NoSink,
+            "`thinking_style = off` is now the only way a slot has no sink: it is the \
+             operator saying send nothing, for a server that rejects the parameter \
+             instead of ignoring it"
+        );
 
         // Only the last two are things the operator needs to hear about.
         let diagnosed: Vec<String> = cfg
@@ -4732,7 +4753,8 @@ mod tests {
             .into_iter()
             .map(|d| d.cast)
             .filter(|c| {
-                ["plain", "off", "newer", "lifted", "dropped", "batch-off"].contains(&c.as_str())
+                ["plain", "off", "newer", "lifted", "dropped", "batch-off", "local-thinks"]
+                    .contains(&c.as_str())
             })
             .collect();
         assert_eq!(

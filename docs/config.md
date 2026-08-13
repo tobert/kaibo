@@ -273,7 +273,7 @@ Global tunables every slot falls back to. Per-slot overrides are documented abov
 | `synth_temperature` | 0.3 | `[0.0, 2.0]` |
 | `top_p` | 0.95 | `(0.0, 1.0]` |
 | `explorer_effort` / `synth_effort` | `"high"` | passthrough string |
-| `thinking_style` | `"auto"` | `auto` \| `adaptive` \| `budget` |
+| `thinking_style` | `"auto"` | `auto` \| `adaptive` \| `budget` \| `off` |
 | `request_timeout_secs` | 900 | > 0 |
 | `call_deadline_secs` | 3600 | > 0 |
 | `explorer_max_turns` | 100 | — |
@@ -358,11 +358,27 @@ the cast and slot, and `kaibo://config` lists `effort` under that slot's
 `inert_tunables`. The inherited built-in `"high"` stays quiet: every local cast inherits
 it onto a toggle-less wire, so warning there would be noise on every ordinary setup.
 
-**`thinking_style`.** Forces the Anthropic thinking shape instead of the built-in
-classifier. `auto` picks adaptive for Opus 4.6+, Sonnet 4.6, and Fable 5, and
-enabled-budget for older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or
-misclassified model ships. A no-op for non-Anthropic kinds; an unknown value is a load
+**`thinking_style`.** Forces the thinking shape instead of the built-in classifier.
+`auto` picks adaptive for Opus 4.6+, Sonnet 4.6, and Fable 5, and enabled-budget for
+older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or misclassified
+Anthropic model ships; those two are no-ops for other kinds. An unknown value is a load
 error.
+
+`off` is different: it applies to **every** provider and sends no reasoning parameter at
+all. Reasoning is on by default wherever a model can do it, because a thinking model
+asked to answer thin gives noticeably worse results — so `off` is the deliberate opt-out,
+not a tuning knob.
+
+Reach for it when a server **rejects** a parameter rather than ignoring it. Most
+OpenAI-compatible servers drop fields they do not know, and kaibo sends the portable
+`reasoning_effort` spelling for exactly that reason; but a strict gateway validates the
+whole body and refuses. Crusoe answers `403 Request blocked: parameter 'X' is not
+allowed`. That failure is loud and names the parameter, and kaibo passes the provider's
+message through to the calling agent, so the fix is one config line rather than a
+mystery. Note the rungs are per **model**, not per gateway — a provider may take
+`max` on one model and cap at `high` on another, and kaibo keeps no allowlist, so a
+rung a model does not take comes back as that provider's own error naming what it
+does take.
 
 **`call_deadline_secs`.** Whole-call wall-clock ceiling on an interactive
 `consult`/`explore`/`oneshot`, and the backstop for when the per-request

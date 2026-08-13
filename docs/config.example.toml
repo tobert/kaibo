@@ -150,8 +150,11 @@ top_p                = 0.95
 explorer_effort = "high"
 synth_effort    = "high"
 
-# Force the Anthropic thinking shape ("auto" | "adaptive" | "budget") instead of
-# the built-in model classifier — the escape hatch for a new or misclassified id.
+# Force the thinking shape ("auto" | "adaptive" | "budget" | "off") instead of the
+# built-in classifier. adaptive/budget are Anthropic tiers — the escape hatch for a
+# new or misclassified id. "off" sends no reasoning parameter on ANY provider: set it
+# for a server that REJECTS unknown parameters instead of ignoring them (reasoning is
+# on by default everywhere else). See docs/config.md.
 thinking_style = "auto"
 
 # Per-request LLM deadline (seconds): the wall-clock ceiling on ONE completion

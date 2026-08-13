@@ -246,8 +246,24 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     assert_eq!(d["temperature"], 0.3);
     assert_eq!(d["top_p"], 0.95);
 
-    // Nothing set anywhere → None (the leaf passes no additional_params at all).
-    assert!(request_params(ProviderKind::Openai, "m", 0, None, None).is_none());
+    // No sampling, no budget — but the openai wire still asks for reasoning, so the
+    // blob is not empty. `reasoning_effort` alone is the whole of it.
+    let o = request_params(ProviderKind::Openai, "m", 0, None, None)
+        .expect("the openai wire carries reasoning_effort even with no sampling set");
+    assert_eq!(o["reasoning_effort"], "high");
+    assert_eq!(
+        o.as_object().map(|m| m.len()),
+        Some(1),
+        "nothing rides along beside it: {o}"
+    );
+
+    // Reasoning off is what empties it — then the leaf passes no additional_params.
+    assert!(
+        ModelShape::resolve(ProviderKind::Openai, "m", ThinkingStyleOverride::Off)
+            .to_params(0, None, None, DEFAULT_EFFORT)
+            .is_none(),
+        "thinking_style = off leaves nothing to send"
+    );
 }
 
 #[test]
@@ -496,12 +512,49 @@ fn deepseek_v4_toggles_thinking_with_reasoning_effort() {
 }
 
 #[test]
-fn the_generic_openai_path_sends_no_thinking_toggle() {
-    // The local Gemma default (its --reasoning-format auto) already reasons, and
-    // there's no portable toggle across arbitrary OpenAI-compatible endpoints: None.
+fn the_generic_openai_path_asks_for_reasoning_by_default() {
+    // Reasoning is ON by default wherever a model can do it. `reasoning_effort` is the
+    // spelling the OpenAI-compatible field settled on, so kaibo sends it to any such
+    // endpoint rather than leaving a reasoning model running thin.
+    let p = thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET)
+        .expect("the openai-compatible wire carries reasoning_effort");
+    assert_eq!(p["reasoning_effort"], "high");
+    // One key, alone. DeepSeek pairs `reasoning_effort` with a `thinking` object, and
+    // borrowing that pairing is what a strict gateway refuses outright — Crusoe answers
+    // `403 Request blocked: parameter 'thinking' is not allowed`, failing the call
+    // instead of ignoring the field.
     assert!(
-        thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET).is_none()
+        p.get("thinking").is_none(),
+        "no `thinking` block on this wire — a strict gateway 403s the whole request: {p}"
     );
+    assert!(p.get("reasoning").is_none(), "that shape is OpenRouter's: {p}");
+}
+
+#[test]
+fn thinking_style_off_sends_no_reasoning_parameter_on_any_wire() {
+    // The escape hatch for a server that rejects unknown fields instead of ignoring
+    // them. It has to answer for every wire, not just the openai one, because the
+    // operator is saying "send nothing" — not "pick a different dialect".
+    for (kind, model) in [
+        (ProviderKind::Openai, "Gemma-4-E4B-it-GGUF"),
+        (ProviderKind::DeepSeek, "deepseek-v4-pro"),
+        (ProviderKind::Anthropic, "claude-sonnet-4-6"),
+        (ProviderKind::Gemini, "gemini-3.5-flash"),
+        (ProviderKind::OpenRouter, "z-ai/glm-5.2"),
+    ] {
+        let shape = ModelShape::resolve(kind, model, ThinkingStyleOverride::Off);
+        let p = shape.to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT);
+        let has_reasoning = p.as_ref().is_some_and(|v| {
+            ["thinking", "reasoning", "reasoning_effort", "output_config"]
+                .iter()
+                .any(|k| v.get(k).is_some())
+                || v.pointer("/generationConfig/thinkingConfig").is_some()
+        });
+        assert!(
+            !has_reasoning,
+            "{kind:?}/{model}: thinking_style = off must send no reasoning parameter, got {p:?}"
+        );
+    }
 }
 
 #[test]

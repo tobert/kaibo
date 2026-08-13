@@ -212,7 +212,23 @@ enum ThinkingStyle {
     /// thinkingLevel) and silently drops it for a model that has no reasoning knob, so
     /// emitting it unconditionally is safe.
     OpenRouterEffort,
-    /// No request-time toggle (the generic OpenAI path).
+    /// Bare `{reasoning_effort:<role>}`, with no `thinking` block beside it — the
+    /// OpenAI Chat Completions spelling the OpenAI-compatible field has settled on.
+    /// Hosted gateways, vLLM, and llama.cpp read this key, and a server that does not
+    /// know it ignores an unknown JSON field.
+    ///
+    /// Deliberately *not* [`ThinkingStyle::DeepSeekEffort`], which pairs the same key
+    /// with a `thinking` object. That pairing is DeepSeek's own and does not travel:
+    /// Crusoe validates the body against an allowlist and answers `403 Request
+    /// blocked: parameter 'thinking' is not allowed`, so borrowing the DeepSeek shape
+    /// fails the whole call instead of degrading (measured 2026-08-13).
+    ///
+    /// `none` rides through as `reasoning_effort: "none"` rather than being omitted:
+    /// that is this wire's own off-switch, and omitting the key leaves the model's
+    /// default on.
+    EffortOnly,
+    /// No request-time toggle. Reached when an operator sets `thinking_style = "off"`,
+    /// and on a media wire, which builds no completion request at all.
     None,
 }
 
@@ -235,6 +251,9 @@ pub enum ThinkingStyleOverride {
     Auto,
     Adaptive,
     Budget,
+    /// Send no reasoning parameter at all, on any provider. The escape hatch for a
+    /// server that rejects unknown fields instead of ignoring them.
+    Off,
 }
 
 impl std::str::FromStr for ThinkingStyleOverride {
@@ -244,8 +263,9 @@ impl std::str::FromStr for ThinkingStyleOverride {
             "auto" => Ok(Self::Auto),
             "adaptive" => Ok(Self::Adaptive),
             "budget" => Ok(Self::Budget),
+            "off" => Ok(Self::Off),
             other => Err(anyhow!(
-                "thinking_style {other:?} is not one of auto|adaptive|budget"
+                "thinking_style {other:?} is not one of auto|adaptive|budget|off"
             )),
         }
     }
@@ -284,12 +304,34 @@ impl ModelShape {
                 sampling_placement: SamplingPlacement::TopLevel,
             };
         };
+        // `off` is the operator's reasoning kill-switch and outranks every wire: a
+        // server that refuses the parameter needs kaibo to send nothing at all, and
+        // that answer cannot depend on which provider it pretends to be.
+        if ovr == ThinkingStyleOverride::Off {
+            let (sampling_under_thinking, sampling_placement) = match wire {
+                WireKind::Gemini => (true, SamplingPlacement::GeminiGenerationConfig),
+                _ => (true, SamplingPlacement::TopLevel),
+            };
+            return Self {
+                thinking: ThinkingStyle::None,
+                sampling_under_thinking,
+                sampling_placement,
+            };
+        }
         let thinking = match wire {
             WireKind::Anthropic => {
                 let adaptive = match ovr {
                     ThinkingStyleOverride::Auto => is_anthropic_adaptive(model),
                     ThinkingStyleOverride::Adaptive => true,
                     ThinkingStyleOverride::Budget => false,
+                    // `Off` returned above, before any wire was consulted. Panicking
+                    // rather than picking a tier is deliberate: if that early return is
+                    // ever removed, an operator who asked for no reasoning would
+                    // silently get Anthropic thinking billed instead, and a loud test
+                    // failure is the only way that gets noticed.
+                    ThinkingStyleOverride::Off => {
+                        unreachable!("thinking_style = off is answered before the wire match")
+                    }
                 };
                 if adaptive {
                     ThinkingStyle::AnthropicAdaptive
@@ -305,7 +347,7 @@ impl ModelShape {
             WireKind::Gemini => ThinkingStyle::GeminiLevel,
             WireKind::DeepSeek => ThinkingStyle::DeepSeekEffort,
             WireKind::OpenRouter => ThinkingStyle::OpenRouterEffort,
-            WireKind::Openai => ThinkingStyle::None,
+            WireKind::Openai => ThinkingStyle::EffortOnly,
         };
         let (sampling_under_thinking, sampling_placement) = match wire {
             WireKind::Anthropic => (false, SamplingPlacement::TopLevel),
@@ -344,6 +386,7 @@ impl ModelShape {
                 | ThinkingStyle::GeminiLevel
                 | ThinkingStyle::DeepSeekEffort
                 | ThinkingStyle::OpenRouterEffort
+                | ThinkingStyle::EffortOnly
         )
     }
 
@@ -488,6 +531,11 @@ impl ModelShape {
                 } else {
                     obj.insert("reasoning".into(), json!({ "effort": effort }));
                 }
+            }
+            ThinkingStyle::EffortOnly => {
+                // One key, nothing beside it. `none` is sent rather than omitted —
+                // it is this wire's off-switch, not an absence.
+                obj.insert("reasoning_effort".into(), json!(effort));
             }
             ThinkingStyle::None => {}
         }

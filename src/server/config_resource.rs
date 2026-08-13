@@ -935,8 +935,9 @@ mod tests {
         );
         assert_eq!(
             inert("oai", "synth"),
-            vec!["thinking_budget", "effort"],
-            "openai sends neither thinking knob; temperature it does send"
+            vec!["thinking_budget"],
+            "an openai-compatible wire carries `reasoning_effort`, so effort SHIPS; only \
+             a token budget has no sink there, and temperature it does send"
         );
         assert_eq!(
             inert("ant_budget", "explorer"),
@@ -1054,7 +1055,8 @@ mod tests {
             base_url = "http://127.0.0.1:8080/v1"
             key_optional = true
 
-            # Toggle-less wire: the defaults effort lands nowhere and must be flagged.
+            # An openai-compatible wire: the defaults effort DOES reach it, but the
+            # [defaults] thinking_style tier does not — only Anthropic reads a tier.
             [casts.lab_cast]
             synth = "lab/gemma"
 
@@ -1101,10 +1103,10 @@ mod tests {
         };
         assert_eq!(
             inert("lab_cast", "synth"),
-            vec!["effort", "thinking_style"],
-            "a [defaults] effort on a toggle-less wire is just as inert as a slot one, \
-             and the [defaults] thinking_style forced onto a non-Anthropic wire is \
-             equally never consulted"
+            vec!["thinking_style"],
+            "a [defaults] effort now REACHES an openai-compatible wire, so it is no \
+             longer inert; the [defaults] thinking_style tier forced onto a \
+             non-Anthropic wire still is, because only Anthropic reads a tier"
         );
         assert_eq!(
             inert("forced", "synth"),
@@ -1220,9 +1222,11 @@ mod tests {
             [casts.bat_off]
             synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "none" }
 
-            # No reasoning field at all — the drop.
+            # Reasoning switched off — the drop. An openai-compatible wire carries
+            # `reasoning_effort` on its own, so `thinking_style = "off"` is what makes
+            # this slot's effort go nowhere.
             [casts.lab_cast]
-            synth = { backend = "lab", id = "gemma", effort = "xhigh" }
+            synth = { backend = "lab", id = "gemma", effort = "xhigh", thinking_style = "off" }
 
             # Carries it fine.
             [casts.ds]

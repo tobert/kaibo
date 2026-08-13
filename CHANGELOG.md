@@ -74,6 +74,11 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **Reasoning is on by default on every OpenAI-compatible backend** — kaibo sends
+  `reasoning_effort`, so a thinking model behind a gateway or a local server no longer
+  answers thin.
+- **`thinking_style = "off"` turns reasoning off on any provider** — the escape hatch for
+  a server that rejects an unknown parameter instead of ignoring it.
 - **kaibo speaks MCP through the released rmcp 3.1.2**, off the 3.0 beta it shipped on,
   for that line's protocol conformance fixes.
 - **kaibo runs on kaish 0.14**, which stopped holding state for its embedders — the shell
