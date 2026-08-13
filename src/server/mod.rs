@@ -2523,9 +2523,10 @@ impl KaiboHandler {
         description = "Run a kaish (sh-like) script against the READ-ONLY project; \
             returns exit code + stdout + stderr. Read generously with line numbers — \
             `cat -n FILE` for a whole file, `grep -rn PATTERN .` to locate across \
-            files — and compose builtins with pipes (grep/jq/awk/find/...). Writes \
-            and external commands are refused (exit 126 = blocked, 124 = timed out); \
-            each call starts fresh at the project root. See `kaibo://kaish/*` (or \
+            files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
+            refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
+            external commands are unreachable (exit 127); 124 = timed out. \
+            Each call starts fresh at the project root. See `kaibo://kaish/*` (or \
             `help` in the script) for idioms and the bash habits that don't carry over."
     )]
     pub async fn run_kaish(
@@ -4208,9 +4209,11 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
   want to split, use the `split` builtin; that's the deliberate form.
 - Adjacent tokens don't paste together — quote to join: `\"$dir/file.txt\"`, not
   `$dir/file.txt`.
-- This shell is **read-only**: a write, a redirect that would create a file, or an
-  external command is refused (exit 126 = blocked by the sandbox; 124 = killed for running
-  too long). That's the boundary working, not a bug — read freely, and don't try to mutate.
+- This shell is **read-only**: a write or a redirect that would create a file is refused
+  with exit `1` and the message `permission denied: filesystem is read-only`; an external
+  command is unreachable and exits `127`. That's the boundary working, not a bug — read
+  freely, and don't try to mutate. Refusals and ordinary failures share exit `1`, so read
+  the stderr line when you need to tell them apart.
 
 Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
 vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
@@ -8169,10 +8172,23 @@ enabled = false
         }
     }
 
+    /// The sandbox resource is where the exit-code taxonomy is stated in full, so unlike
+    /// the terse addendum it *does* carry `126` — correctly, as the operator-disabled
+    /// builtin case. What it must also carry is the refusal's real signature, since a
+    /// refused write and an ordinary failure share exit `1` and only the message
+    /// separates them.
     #[test]
     fn reads_the_sandbox_doc_with_the_idioms_and_codes() {
         let text = read_text(SANDBOX_URI, &[]);
-        for needle in ["cat -n", "grep", "read-only", "126", "124"] {
+        for needle in [
+            "cat -n",
+            "grep",
+            "read-only",
+            "126",
+            "124",
+            "127",
+            "permission denied: filesystem is read-only",
+        ] {
             assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
         }
     }
@@ -8210,7 +8226,7 @@ enabled = false
             "backend/provider-id", // the batch handle shape
             "fire-and-forget",     // the async-workflow framing
             "read-only",           // the kaish shell boundary
-            "126",                 // the exit-code contract
+            "permission denied: filesystem is read-only", // how a refusal names itself
             "worktree",            // attach/path reaches a followed git worktree
             "Reviewing a change",  // prefer whole files over a diff for review
             "view_image",          // consult opens an attached image with view_image

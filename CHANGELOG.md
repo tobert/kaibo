@@ -120,6 +120,9 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **kaibo told models the wrong exit code for a refused write.** Six descriptions said
+  `126` meant blocked; a refused write exits `1` with `permission denied: filesystem is
+  read-only`, and an external command exits `127`.
 - **A model calling a tool that does not exist no longer throws away the investigation**
   — it gets a tool result naming the real toolset, and corrects itself on the next turn.
 - **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or

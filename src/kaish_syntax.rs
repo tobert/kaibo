@@ -52,9 +52,12 @@ the content as text or binary, so you know what you are about to read. \
 Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
-script was killed for running past its time budget; 126 means blocked by the \
-read-only sandbox; 127 is command-not-found; any other non-zero means the script \
-itself failed. To learn more, run `help`, `help syntax`, or `help <builtin>` in any \
+script was killed for running past its time budget; 127 is command-not-found, which \
+is how every external command answers here; 1 is an ordinary failure, and a refused \
+write is one of those — its message reads `permission denied: filesystem is \
+read-only`. Read the message and not only the code, because that sentence is what \
+tells a refusal apart from a mistake. \
+To learn more, run `help`, `help syntax`, or `help <builtin>` in any \
 script, or read the `kaibo://kaish/*` resources.";
 
 /// The canonical kaish operating contract, sourced from `kaish-help` so kaibo
@@ -362,13 +365,19 @@ pub fn kaibo_sandbox_doc() -> String {
          command are refused. This is the product: read freely, expect no write to \
          land.\n\n\
          ## Exit codes\n\
+         The code tells you the shape of the outcome; the message tells you which \
+         outcome it was. A refused write and an ordinary mistake both exit `1`, so \
+         read the stderr line — a refusal names itself.\n\
          - `0` — success\n\
+         - `1` — the command failed. A refused write is one of these, and its message \
+         reads `permission denied: filesystem is read-only`\n\
          - `3` — output exceeded the cap and was truncated to a head+tail sample \
          (not a failure; the full output is not returned)\n\
          - `124` — killed for exceeding the per-exec time budget\n\
-         - `126` — blocked by the read-only sandbox (collides with POSIX \
-         \"not executable\" — read the message to be sure)\n\
-         - `127` — command not found\n\
+         - `126` — a builtin the operator disabled in kaibo's config; the default \
+         config disables none, so you will rarely see this\n\
+         - `127` — command not found. Every external command answers this way, which \
+         is what makes the host unreachable from here\n\
          - other non-zero — the script itself failed\n\n\
          ## Learn more kaish\n\
          These `kaibo://kaish/*` resources mirror kaish's own help, so you can go \
@@ -474,17 +483,38 @@ mod tests {
         );
     }
 
+    /// The two things the synth preamble rewards (exact `file:line`) and the exit codes
+    /// an automated caller will misread without help. These are kaibo's own, so they live
+    /// in the addendum — kaish-help cannot know them.
+    ///
+    /// The negative assertion is the load-bearing one. Until 2026-08-13 all six of kaibo's
+    /// exit-code descriptions said `126` meant "blocked by the read-only sandbox". Nothing
+    /// emits 126 for a refused write: the read-only mount is structural and refuses with
+    /// the VFS's own `1` (`a14c7e7` moved it there in June 2026, and the prose never
+    /// followed), while 126 belongs to an operator-disabled builtin that the default
+    /// config never produces. A model told to branch on 126 to detect a refusal would
+    /// never detect one, and would read `1` as its own command failing. So this pins the
+    /// true discriminator — the message — and pins that the false code cannot come back.
     #[test]
     fn addendum_states_the_exit_code_contract_and_line_browsing() {
-        // The two things the synth preamble rewards (exact file:line) and the two
-        // codes an automated caller will misread without help. These are kaibo's,
-        // so they live in the addendum (kaish-help can't know our 126/124).
-        for needle in ["cat -n", "grep -rn", "126", "124"] {
+        for needle in [
+            "cat -n",
+            "grep -rn",
+            "124",
+            "127",
+            "permission denied: filesystem is read-only",
+        ] {
             assert!(
                 KAISH_SANDBOX_ADDENDUM.contains(needle),
                 "addendum must mention {needle:?}"
             );
         }
+        assert!(
+            !KAISH_SANDBOX_ADDENDUM.contains("126"),
+            "the addendum must not teach 126 as the blocked code — a refused write exits 1 \
+             and names itself, and 126 only fires for an operator-disabled builtin:\n{}",
+            KAISH_SANDBOX_ADDENDUM
+        );
     }
 
     /// The two reading idioms that follow a grep hit: a wide span around a match in a

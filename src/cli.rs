@@ -80,7 +80,9 @@ EXIT CODES
        worker infra crash
 
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
-this table (0 ok, 126 blocked, 124 timed out).";
+this table (0 ok, 1 the command failed, 124 timed out, 127 command not found).
+A refused write exits 1 and names itself on stderr: `permission denied:
+filesystem is read-only`.";
 
 /// kaibo — read-only codebase consultation from a model outside your own
 /// family. Ask a question; a synthesis agent (DeepSeek, Gemini, Anthropic, OpenRouter,
@@ -2414,7 +2416,8 @@ pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
             eprintln!(
                 "kaibo: the kaish shell failed while running your script, so its output is \
                  incomplete: {e:#}. This is a kaibo failure, not a script error — a script's \
-                 own exit codes are 0, 126 (blocked), and 124 (timed out)."
+                 own exit codes are 0 (ok), 1 (the command failed, which is also how a \
+                 refused write reports), 124 (timed out), and 127 (command not found)."
             );
             EXIT_CONSULT_FAILURE
         }
