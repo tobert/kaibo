@@ -31,7 +31,7 @@
 //! point — the provider is not busy, one generation came out wrong, and the next
 //! sampling of the same request is a fresh chance at it. Waiting is what a *transport*
 //! failure wants, and kaibo still does not retry a rate-limited or overloaded call at
-//! all; that is tracked as an upstream rig contribution in `docs/issues.md`. The retry
+//! all; fixing that would take an upstream contribution to rig itself. The retry
 //! also spends none of rig's turn budget, since rig never sees the failed attempt.
 //!
 //! **Detection is a heuristic on the error text**, by the same necessity as

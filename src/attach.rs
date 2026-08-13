@@ -23,7 +23,7 @@
 //! Size caps are loud too (a file past its cap is refused, never silently truncated).
 //!
 //! A typed `FileRef` variant is reserved here in spirit for the later Gemini File API
-//! path (oversized/reused media, Gemini-only) — see `docs/issues.md`. The *enum* is
+//! path — oversized or reused media, Gemini-only, and not built. The *enum* is
 //! additive — a new variant beside `Text`/`Image` — but be honest about the cost: `Text`
 //! and `Image` carry their bytes **inline**, which is exactly what lets the body builders
 //! stay pure synchronous functions. The File API is a stateful two-step (async-upload the
@@ -42,7 +42,8 @@ use std::sync::LazyLock;
 
 /// Cap on an attached *text* file's raw bytes. Generous — a large diff or source file
 /// fits — but bounded so a runaway file is refused loudly, not folded silently into
-/// every prompt (the `[context]` no-cap mistake in `docs/issues.md` is the lesson).
+/// every prompt. `[context]` house rules shipped with no cap at all and ride every turn
+/// of every phase; that is the mistake this cap exists not to repeat.
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Hard cap on the *number* of attachments in one call. The per-file caps bound a single
@@ -251,10 +252,13 @@ pub fn classify(
     // as text, and the sniffer is the same one `view_image` trusts.
     if let Some(mime) = crate::view_image::sniff_mime(bytes) {
         if bytes.len() > max_image {
+            // An upload path for oversized media (Gemini's File API) is a tracked
+            // follow-on. The refusal states the action available now instead of
+            // pointing at a tracker the reader cannot open.
             bail!(
                 "attachment `{display_path}` is {} bytes, over the {max_image}-byte image cap — \
-                 too large to inline (the Gemini File API path for oversized media is a tracked \
-                 follow-on; see docs/issues.md)",
+                 kaibo inlines image bytes whole and never resizes evidence. Attach a smaller \
+                 image, or continue without it.",
                 bytes.len()
             );
         }

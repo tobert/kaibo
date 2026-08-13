@@ -662,7 +662,7 @@ pub struct Backend {
     /// the wall-clock ceiling on a single completion call. rig's prompt loop is
     /// non-streaming and exposes no native timeout, so without this a provider
     /// that connects but never responds wedges the call indefinitely — exactly
-    /// the 2026-06-06 stall (see `consult.rs` / `docs/issues.md`). Seeded from
+    /// the 2026-06-06 stall regression-guarded in `tests/llm_timeout.rs`. Seeded from
     /// [`Defaults::request_timeout`], overridable per backend.
     pub request_timeout: Duration,
     /// OpenRouter only: upstream-host data policy (see [`DataCollection`]).

@@ -8,7 +8,8 @@
 //! uses, so containment and read-only stay structural), and returns them as a rig
 //! image part — the one channel that carries an image into model context. There is
 //! deliberately no base64/attach input: if a genuinely-never-a-file image ever needs
-//! viewing, that's added then (see the media-spine entry in `docs/issues.md`).
+//! viewing, that's future work, added when a concrete need for it appears rather
+//! than speculatively.
 //!
 //! **The image part is declared, not sniffed.** The output is a typed [`ToolOutput`]
 //! carrying a [`ToolResultContent::Text`] note and a [`ToolResultContent::Image`]

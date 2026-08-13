@@ -380,8 +380,9 @@ impl SessionStore {
     }
 
     /// v1 → v2: add `submitted_count` to `batch_handles`, so a poll can cross-check the
-    /// provider's returned `custom_id`s against how many kaibo actually sent — the fix for
-    /// a provider silently dropping an item (`docs/issues.md`, P3). `ALTER TABLE ADD
+    /// provider's returned `custom_id`s against how many kaibo actually sent — the gap
+    /// `cross_check_absentees` (`batch.rs`) fills when a provider silently drops an item.
+    /// `ALTER TABLE ADD
     /// COLUMN` with no `NOT NULL` leaves every pre-existing row `NULL`, which is exactly
     /// the "unknown, don't guess" value [`BatchHandle::submitted_count`] wants for a handle
     /// that predates this column.
@@ -954,8 +955,9 @@ mod tests {
     }
 
     /// A handle persisted before schema v2 added `submitted_count` reads back `None`, not
-    /// a guessed number — the honest-gap contract [`BatchHandle::submitted_count`] and
-    /// `docs/issues.md`'s batch cross-check promise. Simulated by inserting a row through
+    /// a guessed number — the honest-gap contract [`BatchHandle::submitted_count`] and the
+    /// batch cross-check `cross_check_absentees` (`batch.rs`) depends on it for. Simulated
+    /// by inserting a row through
     /// the store's own connection factory (never a second raw open of the file — see the
     /// module doc's MP-WAL warning) with `submitted_count` left unset, exactly what an
     /// `ALTER TABLE ADD COLUMN` leaves on every pre-existing row.

@@ -144,8 +144,8 @@
 //! conversation that created it, not in the store — a `consult`/`oneshot` session turn
 //! already records the artifact footer (digest, mime, size), so those digests sit beside
 //! the conversation in the persistence store, not in a CAS-side index. An operator's
-//! cleanup, if wanted, is plain file mtime on the object tree for now; see
-//! `docs/issues.md`.
+//! cleanup, if wanted, is plain file mtime on the object tree for now — a size- or
+//! age-based reclaim policy is still open.
 //!
 //! Because nothing here is ever rewritten, the sidecar's schema can only ever grow
 //! *compatibly* — see [`Provenance`]'s doc for the rule that keeps a decade-old sidecar
@@ -159,7 +159,7 @@
 //! any project's model team enumerate every other project's generated artifacts. The
 //! address is the capability here — you can only read a digest you already have — so the
 //! one leak surface a mount would open is enumeration, not disclosure of an already-known
-//! object. The decision not to mount it is recorded in `docs/devlog.md` (2026-07-25).
+//! object. Not mounting it is a deliberate decision, not an oversight.
 //!
 //! # `tests/no_write_path.rs`
 //!

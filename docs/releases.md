@@ -64,8 +64,8 @@ per-artifact `.sha256` sidecars stay for the README's download one-liner),
 **per-artifact SLSA provenance** via `actions/attest-build-provenance` (stored in
 GitHub's attestation store — `gh attestation verify <file> -R tobert/kaibo`, zero extra
 assets), and **one SPDX SBOM from `Cargo.lock`** (a bare Rust binary carries nothing for
-syft to read; `cargo-auditable` per-binary SBOMs are a tracked follow-up in
-`docs/issues.md`). README gained a "Verify a download" section with the exact
+syft to read; `cargo-auditable` per-binary SBOMs are a plausible follow-up, not started).
+README gained a "Verify a download" section with the exact
 invocations — including the identity flags keyless verification requires and
 `--ignore-missing` so a single-file download checks clean. New pins
 (`cosign-installer`, `attest-build-provenance`, `sbom-action`) digest-verified through
@@ -248,8 +248,8 @@ goes up as a PR, gets a **cross-family review**, and updates `CHANGELOG.md` wher
 user-facing. Ordered lowest-coupling first; signing after artifacts exist; channels last.
 
 ### PR 1 — this document
-The living plan itself (`docs/releases.md`) + a `docs/issues.md` pointer. Settles the
-decisions above. No pipeline change. *(You are reading the artifact.)*
+The living plan itself (`docs/releases.md`). Settles the decisions above. No pipeline
+change. *(You are reading the artifact.)*
 
 ### PR 2 — harden & extend the existing native matrix
 No framework, no ABI change — sharpen what's already there.
@@ -292,10 +292,10 @@ the decided layout in "Where we are now" above.**
 
 ### PR 4 — ghcr distroless image (multiarch, non-root) — a first-class distribution path
 Lands *after* signing so the image is **born signed** — we don't ship an unsigned primary
-artifact. **Realized 2026-07-13 — see "Where we are now"; the graceful no-stdin error
-moved to `docs/issues.md`** (it's a kaibo code change — the entrypoint *is* the binary in
-a shell-less image — not pipeline YAML; the README documents the `-i` footgun loudly in
-the meantime).
+artifact. **Realized 2026-07-13 — see "Where we are now"; the graceful no-stdin error is
+still open** (it's a kaibo code change — the entrypoint *is* the binary in a shell-less
+image — not pipeline YAML; the README documents the `-i` footgun loudly in the
+meantime).
 - **Multiarch `amd64`+`arm64`** manifest `FROM gcr.io/distroless/static:nonroot`, copying
   the static musl binaries already built per-arch; `USER nonroot`. Push to
   `ghcr.io/tobert/kaibo` (+`latest`); `cosign` signs the image with the PR 3 machinery.

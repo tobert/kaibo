@@ -52,9 +52,9 @@
 //! dispatch; [`StabilityClient::poll`] is the one-shot HTTP call over it — deliberately
 //! *not* a sleep/retry loop with wall-clock timing, so a caller (a test, a future MCP
 //! tool with its own cadence) drives the wait itself and this module never forces a
-//! timing model on it. No deferred `Operation` is wired yet (that's the next stage,
-//! deliberately out of scope here — see `docs/issues.md`); this is the plumbing that
-//! lets one land as a new `Operation` variant + a `shape()`/route arm, not a redesign.
+//! timing model on it. No deferred `Operation` is wired yet — that's the next stage,
+//! deliberately out of scope here; this is the plumbing that lets one land as a new
+//! `Operation` variant + a `shape()`/route arm, not a redesign.
 //!
 //! # `MediaType` — a closed six-variant enum, not a `String`
 //!
@@ -164,8 +164,8 @@
 //!
 //! Through [`crate::credentials::resolve`] — the same env-wins-over-dotfile core every
 //! keyed `ProviderKind` in `credentials.rs` already uses — not a second mechanism.
-//! Stability isn't a `ProviderKind` yet (that enum/config/cast wiring is explicitly the
-//! *next* stage; see `docs/issues.md`), so [`STABILITY_KEY_ENV_VAR`]/
+//! Stability isn't a `ProviderKind` yet — that enum/config/cast wiring is explicitly the
+//! *next* stage — so [`STABILITY_KEY_ENV_VAR`]/
 //! [`STABILITY_KEY_FILE_NAME`] and [`resolve_key`] live here rather than there until it
 //! is. Nothing in this module hardcodes a path to any specific machine's key-file — the
 //! file name is a fixed convention (matching every sibling provider), the directory
@@ -231,7 +231,7 @@ pub fn resolve_key() -> AnyResult<String> {
 pub struct StabilityRequest {
     /// Mandatory for every operation wired so far. A future prompt-less operation
     /// (`remove-background`, `erase`) would need this widened to `Option<String>` —
-    /// noted rather than solved speculatively; see `docs/issues.md`.
+    /// noted rather than solved speculatively.
     pub prompt: String,
     /// Bytes of an input image, for operations that take one (every edit/control/
     /// upscale call, and generate's own image-to-image mode — audio and 3D operations

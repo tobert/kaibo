@@ -176,8 +176,8 @@ fn is_vision_capable(wire: WireKind, _model: &str) -> bool {
         WireKind::Anthropic => true,
         // The gemini-* completion line is natively multimodal across 2.x/3.x.
         WireKind::Gemini => true,
-        // DeepSeek chat/reasoner are text-only on the wire (docs/issues.md, media
-        // spine): images attached to a blind model must fail loud, not get dropped.
+        // DeepSeek chat/reasoner are text-only on the wire: images attached to a
+        // blind model must fail loud, not get dropped.
         WireKind::DeepSeek => false,
         // A generic OpenAI-compatible endpoint can front anything; vision is opt-in
         // per slot (`vision = true` in the role table) rather than guessed from an

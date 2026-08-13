@@ -171,7 +171,7 @@ jobs:
       # dependency tree, which covers every target (the lockfile is a superset
       # including each platform's conditional deps). The binaries themselves
       # carry no dependency metadata for syft to read — that would take
-      # cargo-auditable, tracked as a follow-up in docs/issues.md.
+      # cargo-auditable, which kaibo does not build with yet.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
