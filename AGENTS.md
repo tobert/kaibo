@@ -452,20 +452,31 @@ even for a one-line doc fix.
   failed and told us. The *property* kept its test (`core_carries_no_write_side_teaching`):
   it now rests on upstream's default plus kaibo never opting in, and it still fails if
   either changes (proven by sabotage — composing `.with_overlay()` turns it red).
+  A second kaibo edit was forced by a *grammar* change rather than an API one: kaish 0.14
+  made a bare comma an ordinary bareword outside `[...]`/`{...}`, so the preamble sentence
+  teaching "quote the range, because an unquoted comma splits the argument" became false.
+  The quoted `sed` examples stayed (correct on every version) and the stated reason went —
+  a model reads that block every turn, and a false rule is worse than a missing one. The
+  test that pinned the rule now asserts its **absence**, which is what catches a merge
+  re-introducing it.
   Everything else on the checklist was inert here: `jobs --json` gaining a `path` field and
   lowercase `JobStatus` wire spellings (including the new `Killed`) reach no parse site,
   because model-facing kaish never grows `jobs`; `KernelConfig::agent()` defaulting
   `kill_on_parent_death = true` has no children to signal with `subprocess` off;
-  `Kernel::shutdown` taking `&self` matters only to a caller, and kaibo never calls it;
-  `ExecResult.approval` carrying `PendingApproval` is unreachable from a read-only
-  embedder. `ExecuteOptions`, `OutputLimitConfig`, and `ToolArgs` were untouched.
-  **The one thing this bump changes about the boundary:** kaish mounts an approvals ledger
-  at `/v/approvals` in every kernel, unconditionally — a model-readable path kaibo did not
-  have before. It is inert here (a fresh kernel per call means its observation log holds
-  only that call's own commands, and every mutation is refused), but its read-only-ness
-  comes from kaish's `vfs/approvalsfs.rs` chokepoint, **not** from any of kaibo's four
-  levers, because `/v/*` is kernel space our backend never sees. Battery F in
-  `docs/sandbox-probes.md` is how we keep checking the part of the boundary we don't own.
+  `Kernel::shutdown` taking `&self` matters only to a caller, and kaibo never calls it.
+  `ExecuteOptions`, `OutputLimitConfig`, and `ToolArgs` were untouched.
+  **This bump NARROWS the model-facing read surface, and that reverses what we planned
+  for.** Through the 0.14 release cycle kaish carried an approvals ledger mounted at
+  `/v/approvals` in every kernel, and this section was drafted to say the bump handed the
+  model a readable path it did not have before — with a probe battery to match, since that
+  path's read-only-ness came from kaish's own chokepoint rather than any of kaibo's four
+  levers. The ledger cut landed before the tag and removed the mount entirely: `ls /v`
+  returns `bin`, `blobs`, `jobs`, and `/v/approvals` is not found (verified on a 0.14
+  build). So there is no new model-readable surface, no `ExecResult.approval`, and no
+  battery to add. **The lesson worth keeping is about the probe we nearly shipped:** a
+  probe of a path that no longer exists returns "not found", which reads as containment
+  working rather than as absence — an all-clear that means nothing. Check that a probe
+  would report differently if its subject were broken versus if the probe itself were.
 - **The previous pin, kept because the reasoning pattern is the point.** The
   `0.12.0 → 0.13.0` bump was again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
   full `cargo test` (598 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc`

@@ -21,7 +21,7 @@ path = "src/main.rs"
 # `os-integration` (trash) OFF — so those builtins are never compiled in. kaibo's
 # read-only safety is thus structural (the dangerous surface doesn't exist),
 # backed by the runtime read-only mount; see src/sandbox.rs.
-kaish-kernel = { version = "0.13.0", default-features = false, features = ["localfs"] }
+kaish-kernel = { version = "0.14.0", default-features = false, features = ["localfs"] }
 # `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
 # named here rather than inherited from a transitive enabler.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
@@ -208,18 +208,3 @@ rmcp = { version = "3.1.2", default-features = false, features = [
     "client",
     "transport-child-process",
 ] }
-
-# TEMPORARY — DELETE BEFORE MERGE.
-#
-# This branch wires kaibo up to kaish 0.14 before kaish has tagged it. The dep
-# line above still asks for `0.13.0` on purpose: kaish's workspace version is
-# still `0.13.0` on `main`, so a patch source claiming `0.14.0` would not satisfy
-# the requirement. The patch swaps that same version for the pre-release code.
-#
-# When kaish tags `v0.14.0` and publishes: delete this whole block, set the
-# `kaish-kernel` dep above to `"0.14.0"`, `cargo update -p kaish-kernel`, and
-# re-run the gates. The PR does not merge with a git source in it — kaibo ships
-# from crates.io, and a rev pin here would make kaibo's build depend on a branch
-# that can be force-pushed or deleted.
-[patch.crates-io]
-kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "809e39f8bbe476d5dff0dfef5bee8574978987fb" }
