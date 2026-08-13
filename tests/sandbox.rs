@@ -442,3 +442,57 @@ async fn oversize_output_never_spills_to_the_host() {
         "kaibo's kernels run in-memory truncation, never disk spill"
     );
 }
+
+/// The exact refusal kaibo's prose quotes to models, bound to what the sandbox
+/// actually says.
+///
+/// Six published strings — the preamble addendum, the `kaibo://kaish/sandbox`
+/// resource, `kaibo --help`, the `kaibo kaish` failure message, the MCP `run_kaish`
+/// tool description, and `kaibo://tools` — tell a reader that a refused write exits
+/// `1` and identifies itself with `permission denied: filesystem is read-only`. That
+/// sentence is how a model tells a refusal from its own mistake, since both exit 1.
+///
+/// **kaibo does not own that string — kaish-kernel does.** Every other test here
+/// asserts the loose `contains("read-only")`, and the tests beside the prose assert
+/// only that kaibo's *own* text contains the sentence. So before this test, a kaish
+/// release that reworded the message would leave every assertion green while all six
+/// published strings quietly began lying. This is the one place the quote is checked
+/// against the shell, so a rewording upstream fails here, loudly, at the bump.
+///
+/// It pins the code too: `1`, not 126. The prose said 126 for two months because
+/// nothing tied the claim to behavior.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_write_exits_1_with_the_message_our_prose_quotes() {
+    const QUOTED: &str = "permission denied: filesystem is read-only";
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("keep.txt"), "hi").unwrap();
+    let kernel = build_readonly_kernel(dir.path()).unwrap();
+
+    // One case per builtin family kaibo's prose calls a "write": a redirect, a
+    // create, a directory, and a delete. Each must agree on both halves.
+    for script in [
+        "echo pwned > newfile.txt",
+        "touch newfile.txt",
+        "mkdir newdir",
+        "rm keep.txt",
+    ] {
+        let r = run(&kernel, script).await.unwrap();
+        assert_eq!(
+            r.code, 1,
+            "`{script}` must exit 1 — kaibo's published exit-code contract says a \
+             refused write is an ordinary failure, not 126. Got {r:?}"
+        );
+        assert!(
+            r.err.contains(QUOTED),
+            "`{script}` must refuse with the exact sentence kaibo quotes to models, \
+             {QUOTED:?}. If kaish reworded this, six published strings are now wrong — \
+             fix them together with this test. Got {r:?}"
+        );
+    }
+
+    assert!(
+        dir.path().join("keep.txt").exists(),
+        "the read-only mount must not have deleted a real file"
+    );
+}

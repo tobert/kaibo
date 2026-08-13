@@ -318,7 +318,12 @@ impl Arm {
         // request shape.
         let responses_wire = backend.uses_responses_wire();
         let params = if responses_wire {
-            super::shaping::hosted_openai_responses_params(&slot.id, Some(t.top_p), &t.effort)
+            super::shaping::hosted_openai_responses_params(
+                &slot.id,
+                Some(t.top_p),
+                &t.effort,
+                t.thinking_style,
+            )
         } else {
             params
         };

@@ -59,6 +59,8 @@ record. Each later release appends a new section at the top.
   CAS, so one project's team cannot enumerate another's artifacts.
 - **Model listings show each model's output ceiling** beside the context window — size a
   synth slot's `max_tokens` from it.
+- **Model listings mark which models reason**, read from the provider's own catalog, so
+  picking a thinking model costs no guesswork and no API call of your own.
 - **The explorer can hand whole files to whoever reads its report** — an `attach` tool
   routes real bytes (images too) into the driver's context or the `deliberate` dossier,
   governed by `[defaults] max_attachments`.
@@ -74,6 +76,11 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **Reasoning is on by default on every OpenAI-compatible backend** — kaibo sends
+  `reasoning_effort`, so a thinking model behind a gateway or a local server no longer
+  answers thin.
+- **`thinking_style = "off"` turns reasoning off on any provider** — the escape hatch for
+  a server that rejects an unknown parameter instead of ignoring it.
 - **kaibo speaks MCP through the released rmcp 3.1.2**, off the 3.0 beta it shipped on,
   for that line's protocol conformance fixes.
 - **kaibo runs on kaish 0.14**, which stopped holding state for its embedders — the shell
@@ -120,6 +127,9 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **kaibo told models the wrong exit code for a refused write.** Six descriptions said
+  `126` meant blocked; a refused write exits `1` with `permission denied: filesystem is
+  read-only`, and an external command exits `127`.
 - **A model calling a tool that does not exist no longer throws away the investigation**
   — it gets a tool result naming the real toolset, and corrects itself on the next turn.
 - **`--no-<tool>` gates work again over MCP.** Since the rmcp 3.0 upgrade a disabled or

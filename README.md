@@ -321,9 +321,12 @@ of parsing prose: `0` an answer, `2` a usage error (bad flag, unknown or
 wrong-for-the-tool cast), `3` a setup/containment rejection (a path outside
 the allowed set, a missing provider key), `4` the work ran and failed at
 runtime (a provider error, a model-loop failure). `kaibo kaish` is the one
-exception — it passes through kaish's own exit code (`0` ok, `126` blocked,
-`124` timed out) instead, since a script branches on *that* to know what the
-sandboxed command did. The same table is in `kaibo --help`.
+exception — it passes through kaish's own exit code (`0` ok, `1` the command
+failed, `124` timed out, `127` command not found) instead, since a script
+branches on *that* to know what the sandboxed command did. A refused write is an
+ordinary failure: it exits `1` and prints `permission denied: filesystem is
+read-only`, so branch on the message when you need to tell a refusal from a
+mistake. The same table is in `kaibo --help`.
 
 The shared flags (`--root`, `--allow-path`, `--cast`, `--config`, house-rules
 files, …) work before or after the subcommand and are documented in `kaibo

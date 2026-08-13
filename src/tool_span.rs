@@ -9,7 +9,7 @@
 //! always `ok`, because a non-zero *script* exit is normal output handed to the model,
 //! not a tool failure (see `explorer.rs`). So the span carries two more optional fields
 //! a tool may fill about its result: `kaish.exit_code` (the script's exit — `3` is the
-//! head+tail truncation, `124` a timeout, `126` blocked) and `kaish.output_bytes` (the
+//! head+tail truncation, `124` a timeout, `127` not found) and `kaish.output_bytes` (the
 //! delivered stdout size). Recorded by `run_kaish` via [`record_kaish_result`]; left
 //! empty (and thus unexported) by every other tool. This is what lets a trace tell a
 //! `cat -n` that *truncated* and forced narrow re-reads from one the model chose to

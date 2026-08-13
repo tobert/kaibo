@@ -63,12 +63,15 @@ impl Tool for Blocked {
     }
 
     async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
-        // Exit **126** = "blocked by the read-only sandbox". Distinct from the
-        // kernel's other non-zero codes a caller may see: 124 = killed for
+        // Exit **126** = a builtin an operator disabled in config. NOT the read-only
+        // refusal: the mount refuses a write structurally, with the VFS's own exit 1
+        // and `permission denied: filesystem is read-only`. Conflating the two is the
+        // error six published strings carried for two months; keep them apart here.
+        // The kernel's other non-zero codes a caller may see: 124 = killed for
         // exceeding [`KAISH_EXEC_TIMEOUT`], 130 = cancelled, 127 = command not
         // found, and any other non-zero = the script itself failed. 126 also
         // collides with POSIX "not executable", so an automated caller must read
-        // the message, not just the code, to classify a sandbox block.
+        // the message, not just the code, to classify a block.
         ExecResult::failure(
             126,
             format!(
@@ -101,7 +104,8 @@ fn apply_disabled_builtins(registry: &mut ToolRegistry, disable: &[String]) {
 /// this long; the budget exists so a hung provider script or a pathological loop
 /// can't wedge the single serial worker thread (there's no `max_turns` braking a
 /// caller-facing `run_kaish`). On elapse the kernel cancels and the script exits
-/// **124** — distinct from 126 (a builtin refused by the read-only sandbox). 30s
+/// **124** — distinct from 1 (a write the read-only mount refused) and from 126 (a
+/// builtin an operator disabled in config). 30s
 /// matches a patient MCP caller while still bounding a runaway.
 pub const KAISH_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 

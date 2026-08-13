@@ -80,6 +80,31 @@ pub struct DiscoveredModel {
     /// the endpoint doesn't advertise pricing on `/models` (only `Openai`-wire kinds
     /// do today; see [`parse_openai_models`]).
     pub pricing: Option<ModelPricing>,
+    /// Does this model take a reasoning parameter, per the provider's own catalog?
+    /// `Some(true)`/`Some(false)` when the endpoint publishes a parameter list,
+    /// `None` when it publishes none — an unknown, never a "no".
+    ///
+    /// Read from `supported_parameters`, which OpenRouter and vLLM-backed gateways
+    /// both ship. It answers *whether*, never *which rungs*: no catalog publishes the
+    /// ladder, and it moves per model (Crusoe takes `max` on DeepSeek-V4-Flash and
+    /// caps at `high` on Nemotron-Omni-Reasoning). A rung a model refuses comes back
+    /// as the provider's own error naming what it accepts, which is why kaibo keeps
+    /// no allowlist — see [`crate::consult::EffortWire`].
+    pub reasoning: Option<bool>,
+}
+
+/// Whether a catalog entry says this model takes a reasoning parameter.
+///
+/// Matched against the spellings the OpenAI-compatible field actually ships:
+/// `reasoning_effort` (vLLM and hosted gateways), plus OpenRouter's `reasoning` and
+/// `include_reasoning`. A catalog with no `supported_parameters` at all answers `None`
+/// — kaibo reports "unknown", never "unsupported", because a missing list is a silent
+/// endpoint rather than a negative claim.
+fn parse_reasoning_support(item: &Value) -> Option<bool> {
+    let params = item.get("supported_parameters")?.as_array()?;
+    Some(params.iter().filter_map(Value::as_str).any(|p| {
+        matches!(p, "reasoning_effort" | "reasoning" | "include_reasoning")
+    }))
 }
 
 /// Per-token price, kept as the provider's own string (fractional USD/token) rather
@@ -243,6 +268,7 @@ pub fn parse_openai_models(v: &Value) -> Vec<DiscoveredModel> {
                 .and_then(|tp| tp.get("max_completion_tokens"))
                 .and_then(Value::as_u64),
             pricing: parse_openai_pricing(item),
+            reasoning: parse_reasoning_support(item),
             raw: item.clone(),
         })
         .collect()
@@ -303,6 +329,7 @@ pub fn parse_anthropic_models(v: &Value) -> Vec<DiscoveredModel> {
             // Anthropic's `/v1/models` advertises neither pricing nor an output ceiling.
             output_ceiling: None,
             pricing: None,
+            reasoning: None,
             raw: item.clone(),
         })
         .collect()
@@ -329,6 +356,7 @@ pub fn parse_gemini_models(v: &Value) -> Vec<DiscoveredModel> {
                 output_ceiling: item.get("outputTokenLimit").and_then(Value::as_u64),
                 // Gemini's `/v1beta/models` doesn't advertise pricing.
                 pricing: None,
+                reasoning: None,
                 raw: item.clone(),
             }
         })
@@ -510,6 +538,9 @@ pub fn render_models(results: &BTreeMap<String, Result<Vec<DiscoveredModel>, Str
                     }
                     if !limits.is_empty() {
                         line.push_str(&format!(" ({})", limits.join(", ")));
+                    }
+                    if m.reasoning == Some(true) {
+                        line.push_str(" [reasoning]");
                     }
                     if let Some(p) = &m.pricing {
                         let mut parts = Vec::new();
@@ -1058,6 +1089,7 @@ mod tests {
                     input: Some("0.0000015".to_string()),
                     output: Some("0.000006".to_string()),
                 }),
+                reasoning: None,
                 raw: serde_json::json!({"id": "m1"}),
             }]),
         );
@@ -1094,6 +1126,7 @@ mod tests {
                 context_window: None,
                 output_ceiling: Some(16_384),
                 pricing: None,
+                reasoning: None,
                 raw: serde_json::json!({"id": "m1"}),
             }]),
         );
@@ -1114,6 +1147,7 @@ mod tests {
                 context_window: None,
                 output_ceiling: None,
                 pricing: None,
+                reasoning: None,
                 raw: serde_json::json!({"id": "m1"}),
             }]),
         );
@@ -1142,6 +1176,7 @@ mod tests {
                     input: Some("0.000001".to_string()),
                     output: None,
                 }),
+                reasoning: None,
                 raw: serde_json::json!({"id": "m1", "extra": "field"}),
             }]),
         );
@@ -1182,6 +1217,7 @@ mod tests {
                 context_window: None,
                 output_ceiling: None,
                 pricing: None,
+                reasoning: None,
                 raw: serde_json::json!({"id": "m1"}),
             }]),
         );
@@ -1256,4 +1292,72 @@ mod tests {
         assert_eq!(models[0].raw["pricing"], serde_json::json!({}));
     }
 
+}
+
+#[cfg(test)]
+mod reasoning_support_tests {
+    use super::*;
+
+    /// The catalog answers *whether* a model reasons, never *which rungs* it takes.
+    ///
+    /// A missing `supported_parameters` is `None` — unknown, not "no". The distinction
+    /// matters because most endpoints publish no parameter list at all, and rendering
+    /// those as unsupported would tell an operator the opposite of the truth.
+    #[test]
+    fn reasoning_support_reads_the_catalog_and_admits_when_it_cannot() {
+        let takes = serde_json::json!({
+            "id": "m",
+            "supported_parameters": ["temperature", "reasoning_effort", "top_p"]
+        });
+        assert_eq!(parse_reasoning_support(&takes), Some(true));
+
+        // OpenRouter's spellings, not vLLM's.
+        let openrouter = serde_json::json!({ "id": "m", "supported_parameters": ["reasoning"] });
+        assert_eq!(parse_reasoning_support(&openrouter), Some(true));
+
+        let listed_without = serde_json::json!({
+            "id": "m",
+            "supported_parameters": ["temperature", "top_p"]
+        });
+        assert_eq!(
+            parse_reasoning_support(&listed_without),
+            Some(false),
+            "a published list that omits it IS a negative claim"
+        );
+
+        let silent = serde_json::json!({ "id": "m" });
+        assert_eq!(
+            parse_reasoning_support(&silent),
+            None,
+            "no list at all is UNKNOWN — reporting `false` here would state the \
+             opposite of the truth for every endpoint that publishes nothing"
+        );
+    }
+
+    /// Only a positive answer earns a marker: an unknown must not read as a "no", and
+    /// a line cluttered with `[reasoning: unknown]` on every plain endpoint is noise.
+    #[test]
+    fn only_a_known_reasoning_model_is_marked() {
+        let mk = |reasoning| DiscoveredModel {
+            id: "m".into(),
+            display_name: None,
+            created: None,
+            context_window: None,
+            output_ceiling: None,
+            pricing: None,
+            reasoning,
+            raw: serde_json::json!({}),
+        };
+        let render = |r| {
+            let mut results = BTreeMap::new();
+            results.insert("b".to_string(), Ok(vec![mk(r)]));
+            render_models(&results)
+        };
+        assert!(render(Some(true)).contains("[reasoning]"));
+        assert!(!render(Some(false)).contains("[reasoning]"));
+        assert!(
+            !render(None).contains("[reasoning]"),
+            "unknown must not render as either answer"
+        );
+    }
 }

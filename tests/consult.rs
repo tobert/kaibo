@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
 use kaibo::consult::{
-    consult, consult_user_prompt, oneshot, request_params, thinking_params, Arm, ConsultConfig,
-    ModelCaps, ModelShape, PhaseContext, ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
+    consult, consult_user_prompt, effort_sinks, hosted_openai_responses_params, oneshot,
+    request_params, thinking_params, Arm, ConsultConfig, ModelCaps, ModelShape, PhaseContext,
+    ThinkingStyleOverride, DEFAULT_EFFORT, THINKING_BUDGET,
 };
 use kaibo::credentials::{load, ProviderKind};
 use serde_json::{json, Value};
@@ -246,8 +247,24 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     assert_eq!(d["temperature"], 0.3);
     assert_eq!(d["top_p"], 0.95);
 
-    // Nothing set anywhere → None (the leaf passes no additional_params at all).
-    assert!(request_params(ProviderKind::Openai, "m", 0, None, None).is_none());
+    // No sampling, no budget — but the openai wire still asks for reasoning, so the
+    // blob is not empty. `reasoning_effort` alone is the whole of it.
+    let o = request_params(ProviderKind::Openai, "m", 0, None, None)
+        .expect("the openai wire carries reasoning_effort even with no sampling set");
+    assert_eq!(o["reasoning_effort"], "high");
+    assert_eq!(
+        o.as_object().map(|m| m.len()),
+        Some(1),
+        "nothing rides along beside it: {o}"
+    );
+
+    // Reasoning off is what empties it — then the leaf passes no additional_params.
+    assert!(
+        ModelShape::resolve(ProviderKind::Openai, "m", ThinkingStyleOverride::Off)
+            .to_params(0, None, None, DEFAULT_EFFORT)
+            .is_none(),
+        "thinking_style = off leaves nothing to send"
+    );
 }
 
 #[test]
@@ -496,12 +513,83 @@ fn deepseek_v4_toggles_thinking_with_reasoning_effort() {
 }
 
 #[test]
-fn the_generic_openai_path_sends_no_thinking_toggle() {
-    // The local Gemma default (its --reasoning-format auto) already reasons, and
-    // there's no portable toggle across arbitrary OpenAI-compatible endpoints: None.
+fn the_generic_openai_path_asks_for_reasoning_by_default() {
+    // Reasoning is ON by default wherever a model can do it. `reasoning_effort` is the
+    // spelling the OpenAI-compatible field settled on, so kaibo sends it to any such
+    // endpoint rather than leaving a reasoning model running thin.
+    let p = thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET)
+        .expect("the openai-compatible wire carries reasoning_effort");
+    assert_eq!(p["reasoning_effort"], "high");
+    // One key, alone. DeepSeek pairs `reasoning_effort` with a `thinking` object, and
+    // borrowing that pairing is what a strict gateway refuses outright — Crusoe answers
+    // `403 Request blocked: parameter 'thinking' is not allowed`, failing the call
+    // instead of ignoring the field.
     assert!(
-        thinking_params(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", THINKING_BUDGET).is_none()
+        p.get("thinking").is_none(),
+        "no `thinking` block on this wire — a strict gateway 403s the whole request: {p}"
     );
+    assert!(p.get("reasoning").is_none(), "that shape is OpenRouter's: {p}");
+}
+
+/// The off-switch on the **Responses** wire, checked where the request is really built.
+///
+/// The sibling test below calls `ModelShape::to_params` directly, and that is exactly
+/// why it missed this: on a Responses-wire backend the engine *discards* that blob and
+/// replaces it with `hosted_openai_responses_params`, so a `to_params`-level assertion
+/// proves nothing about what gets sent. The first version of this feature shipped with
+/// `thinking_style = "off"` silently ignored on every hosted gpt-5 slot, green tests and
+/// all — found by a cross-family review reading the call site instead of the unit.
+#[test]
+fn thinking_style_off_reaches_the_responses_wire_too() {
+    // Reasoning is on for this model by default...
+    let on = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Auto)
+        .expect("a gpt-5 model takes reasoning");
+    assert_eq!(on["reasoning"]["effort"], "high");
+
+    // ...and `off` must remove it here, not merely in the shape the engine throws away.
+    let off = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Off);
+    assert!(
+        off.as_ref().and_then(|v| v.get("reasoning")).is_none(),
+        "thinking_style = off must silence the Responses wire, got {off:?}"
+    );
+
+    // And the reporting has to agree, or kaibo would say effort ships while it does not.
+    assert!(
+        !effort_sinks(
+            ProviderKind::Openai,
+            "gpt-5.6-sol",
+            ThinkingStyleOverride::Off,
+            true,
+        ),
+        "with reasoning off, the Responses wire has no effort sink to report"
+    );
+}
+
+#[test]
+fn thinking_style_off_sends_no_reasoning_parameter_on_any_wire() {
+    // The escape hatch for a server that rejects unknown fields instead of ignoring
+    // them. It has to answer for every wire, not just the openai one, because the
+    // operator is saying "send nothing" — not "pick a different dialect".
+    for (kind, model) in [
+        (ProviderKind::Openai, "Gemma-4-E4B-it-GGUF"),
+        (ProviderKind::DeepSeek, "deepseek-v4-pro"),
+        (ProviderKind::Anthropic, "claude-sonnet-4-6"),
+        (ProviderKind::Gemini, "gemini-3.5-flash"),
+        (ProviderKind::OpenRouter, "z-ai/glm-5.2"),
+    ] {
+        let shape = ModelShape::resolve(kind, model, ThinkingStyleOverride::Off);
+        let p = shape.to_params(THINKING_BUDGET, None, None, DEFAULT_EFFORT);
+        let has_reasoning = p.as_ref().is_some_and(|v| {
+            ["thinking", "reasoning", "reasoning_effort", "output_config"]
+                .iter()
+                .any(|k| v.get(k).is_some())
+                || v.pointer("/generationConfig/thinkingConfig").is_some()
+        });
+        assert!(
+            !has_reasoning,
+            "{kind:?}/{model}: thinking_style = off must send no reasoning parameter, got {p:?}"
+        );
+    }
 }
 
 #[test]

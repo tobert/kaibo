@@ -150,8 +150,11 @@ top_p                = 0.95
 explorer_effort = "high"
 synth_effort    = "high"
 
-# Force the Anthropic thinking shape ("auto" | "adaptive" | "budget") instead of
-# the built-in model classifier — the escape hatch for a new or misclassified id.
+# Force the thinking shape ("auto" | "adaptive" | "budget" | "off") instead of the
+# built-in classifier. adaptive/budget are Anthropic tiers — the escape hatch for a
+# new or misclassified id. "off" sends no reasoning parameter on ANY provider: set it
+# for a server that REJECTS unknown parameters instead of ignoring them (reasoning is
+# on by default everywhere else). See docs/config.md.
 thinking_style = "auto"
 
 # Per-request LLM deadline (seconds): the wall-clock ceiling on ONE completion
@@ -222,9 +225,11 @@ output_limit_bytes = 65536   # per-script output cap (64 KiB); exit 3 + head/tai
 # (StorageFull), never silently eating host RAM. Default 64 MiB; must be > 0 — there
 # is no "unbounded" setting, an unbounded scratch is the bug this prevents.
 scratch_limit_bytes = 67108864
-# Builtins to shadow-block ON TOP OF the read-only denylist (exit 126 if invoked).
-# This only makes the box STRICTER — it can't re-enable the read-only denylist
-# (git/touch/spawn/exec/kill/mktemp), and the dangerous axes aren't compiled in.
+# Builtins to shadow-block on top of the structural boundary (exit 126 if invoked).
+# This is the ONLY thing in kaibo that produces 126, and it is empty by default — a
+# refused write is not this, it exits 1 at the read-only mount.
+# Setting it only makes the box STRICTER. It cannot loosen anything: writes are
+# refused by the mount, and git/spawn/exec are not compiled in at all.
 # A name that isn't a real builtin is a loud startup error, not a silent no-op.
 # disable_builtins = ["grep", "find"]
 
