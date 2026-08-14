@@ -177,13 +177,14 @@ opentelemetry-appender-tracing = "0.32"
 # so it's ours, not implicit, matching how the other deps above are documented.
 sha2 = "0.10"
 
-# Local-filesystem validation for the persistence store (src/store.rs): turso's
-# multiprocess-WAL mode is unsupported on network filesystems (NFS/CIFS), where a
-# shared open can silently lose writes. On Linux we `statfs` the state dir and refuse a
-# known network fs magic. libc is already in the tree transitively (getrandom); named
-# here only under a Linux target so no new build cost lands on any platform, and no
-# heavy dependency is added for this check.
-[target.'cfg(target_os = "linux")'.dependencies]
+# libc is already in the tree transitively (getrandom); named here explicitly, scoped
+# to unix only so no new build cost lands on Windows. Two uses: local-filesystem
+# validation for the persistence store (src/store.rs, Linux-only `statfs` — turso's
+# multiprocess-WAL mode is unsupported on network filesystems, where a shared open can
+# silently lose writes) and detaching the MCP server from its launching terminal's
+# process group at startup (src/main.rs `setsid` — a job-control stop on that terminal
+# must not freeze the server too).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
