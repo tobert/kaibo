@@ -618,6 +618,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: DataCollection::default(),

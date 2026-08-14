@@ -14,10 +14,16 @@
 //! local keyless server) rather than tied to a hosted service. Its key is
 //! *optional* — `OPENAI_API_KEY` / `~/.openai-key` when talking to a keyed
 //! endpoint, or a placeholder ([`PLACEHOLDER_OPENAI_KEY`]) for the keyless local
-//! default. Per-backend resolution (env → key-file → placeholder) lives on
-//! `Backend::resolve_key` (`config.rs`); this module is the pure key/base-url core.
+//! default. Per-backend resolution (env → declared file/command → placeholder) lives
+//! on `Backend::resolve_key` (`config.rs`), whose sources are ALL declared in
+//! config.toml — never seeded — plus [`resolve_key_from_cmd`] for the operator-side
+//! command source (`api_key_cmd`, e.g. `op read`). This module is the pure
+//! key/base-url core.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -363,6 +369,170 @@ pub fn resolve(env_value: Option<&str>, key_file: &Path) -> Result<String> {
             key_file.display()
         )),
         Err(e) => Err(e).with_context(|| format!("reading key-file {}", key_file.display())),
+    }
+}
+
+/// Cap on a key command's stdout: refuse, not trim, past this. A key is a line;
+/// a command that prints a log is misbehaving, not "verbose".
+pub const KEY_CMD_MAX_OUTPUT: usize = 64 * 1024;
+
+/// Wall-clock ceiling on a key command. A child that hangs — an unlock prompt (a
+/// null stdin means we cannot answer one), a cold agent — must not wedge key
+/// resolution. Lazy client-build resolution makes this a pathological-case guard:
+/// with an unlocked session, `op read` finishes in a few hundred milliseconds.
+pub const KEY_CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a declared key command and return its stdout as the key.
+///
+/// `args` is raw argv — no shell, no `$VAR`/`~` expansion: the config layer never
+/// interpolates command elements, and neither do we. The child inherits kaibo's
+/// environment (where e.g. `op` finds its session or gpg-agent serves `pass`);
+/// `extra_env` is the test seam — unit tests inject through it instead of mutating
+/// the process environment.
+///
+/// All three stdio streams are pinned. Stdin is nulled: the child must never read
+/// the MCP stdio stream kaibo runs on, and a prompting tool fails fast instead of
+/// hanging on a TTY that does not exist. Stdout and stderr are piped and captured —
+/// stdout IS the key, stderr feeds failure errors only — so nothing a child prints
+/// can leak into kaibo's own stdout or a log.
+///
+/// The key is stdout, trimmed (key-file semantics). Empty, non-UTF-8, or
+/// over-[`KEY_CMD_MAX_OUTPUT`] output, a nonzero exit, a spawn failure, and a
+/// timeout are all loud errors — the no-silent-fallback rule: a declared-but-broken
+/// command never degrades to a placeholder.
+pub fn resolve_key_from_cmd(
+    args: &[String],
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+) -> Result<String> {
+    let mut cmd = std::process::Command::new(&args[0]);
+    cmd.args(&args[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !extra_env.is_empty() {
+        cmd.envs(extra_env.iter().copied());
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning key command {:?}", args[0]))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("key command stdout not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("key command stderr not piped")?;
+
+    // Drain both pipes on reader threads so a verbose child can never wedge the
+    // pipe; `read_capped` buffers only the first ~cap bytes and drains the rest.
+    let reader_stdout = std::thread::spawn(move || read_capped(stdout, KEY_CMD_MAX_OUTPUT));
+    let reader_stderr = std::thread::spawn(move || read_capped(stderr, KEY_CMD_MAX_OUTPUT));
+
+    // Wait for exit under a hard deadline; kill and report on timeout.
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "key command {:?} did not exit within {:.1}s and was killed — \
+                     stdin is closed, so an interactive unlock prompt cannot be \
+                     answered (unlock the tool once, or point it at a key that \
+                     needs no prompt)",
+                    args[0],
+                    timeout.as_secs_f64(),
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return Err(e).context("waiting for the key command"),
+        }
+    };
+
+    let out = reader_stdout
+        .join()
+        .map_err(|_| anyhow!("key command stdout reader panicked"))?;
+    let err = reader_stderr
+        .join()
+        .map_err(|_| anyhow!("key command stderr reader panicked"))?;
+
+    // A nonzero exit is the primary failure: name it and the child's own stderr
+    // tail ("Vault is locked"), never its stdout — a broken command may print
+    // anything to stdout, including part of an unrelated buffer.
+    if !status.success() {
+        let tail: String = String::from_utf8_lossy(&err)
+            .trim()
+            .chars()
+            .rev()
+            .take(512)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let suffix = if tail.is_empty() {
+            "".to_string()
+        } else {
+            format!(" — {tail}")
+        };
+        return Err(anyhow!(
+            "key command {:?} exited with {status}{suffix}: fix the command or \
+             the secret it reads (its stdout must be the key)",
+            args[0],
+        ));
+    }
+
+    // Refuse, not trim: a key is a single value, not a log.
+    if out.len() > KEY_CMD_MAX_OUTPUT {
+        return Err(anyhow!(
+            "key command {:?} printed more than {} bytes of output — a key is a \
+             single value; point the command at a field that prints one",
+            args[0],
+            KEY_CMD_MAX_OUTPUT,
+        ));
+    }
+
+    // Strict UTF-8, never lossy: a binary field (an `op read` of a file-type
+    // item) is a mistake to surface, not to mangle into a key.
+    let out = String::from_utf8(out).with_context(|| {
+        format!(
+            "key command {:?} printed non-UTF-8 output — the key must be text \
+             (a base64'd binary field? wrap it in a script that decodes)",
+            args[0]
+        )
+    })?;
+    let key = out.trim();
+    if key.is_empty() {
+        return Err(anyhow!(
+            "key command {:?} printed nothing — the command must print the key \
+             to stdout",
+            args[0]
+        ));
+    }
+    Ok(key.to_string())
+}
+
+/// Read a pipe to EOF, buffering roughly the first `cap` bytes and draining the
+/// rest — a stopped reader would wedge the child's pipe, turning a verbose child
+/// into a hang instead of a loud refusal.
+fn read_capped(mut r: impl Read, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(cap.min(65536));
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => return buf,
+            Ok(n) => {
+                if buf.len() <= cap {
+                    let room = cap + 1 - buf.len();
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            // A signal can interrupt a read; retry it, the child is still ours.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return buf,
+        }
     }
 }
 
