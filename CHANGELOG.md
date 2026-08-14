@@ -15,6 +15,12 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bump `kaish-kernel` to 0.14.1** — the explorer's shell no longer drops piped or
+  buffered stdin across `read`/`grep`/`cat`, and a loop or `if` that exits early keeps
+  what it already printed.
+
 ## [0.3.0] — 2026-08-13
 
 ### Added
