@@ -174,3 +174,207 @@ fn provider_paths_match_amys_dotfiles() {
     );
     assert_eq!(ProviderKind::Openai.key_file(home), home.join(".openai-key"));
 }
+
+// --- api_key_cmd: the operator-declared command source -----------------------
+//
+// The exec core (`resolve_key_from_cmd`) is exercised with `#!/bin/sh` stubs,
+// invoked by ABSOLUTE PATH (no PATH dependence, no child-env rebuild) in temp
+// dirs. Unix-only: a stub needs a shell at the executable.
+//
+// The blank-env discipline: the child inherits the test process env, but nothing
+// below depends on what that env contains — a stub reads only what it is given
+// (its own argv, `extra_env`). `extra_env` is the seam a unit test uses instead
+// of mutating the process environment.
+
+use kaibo::credentials::resolve_key_from_cmd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn stub_script(dir: &Path, body: &str, exit: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let seq = STUB_SEQ.fetch_add(1, Ordering::Relaxed);
+    let p = dir.join(format!("stub-{seq}"));
+    fs::write(&p, format!("#!/bin/sh\n{body}\nexit {exit}\n")).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_stdout_trimmed_is_the_key() {
+    let dir = tempdir().unwrap();
+    let p = stub_script(dir.path(), "printf 'sk-test\\n\\n'", 0);
+    let args = vec![p.to_string_lossy().into_owned()];
+    let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap();
+    assert_eq!(key, "sk-test", "stdout is trimmed like a key file's contents");
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_inherits_env_and_receives_argv() {
+    // `extra_env` is the test seam for what a real child sees inherited (HOME,
+    // OP_SERVICE_ACCOUNT_TOKEN); later argv elements pass through verbatim.
+    // Note: this proves the INJECTION seam, not raw process-env inheritance —
+    // `Command::new` inherits by default and nothing on this path calls
+    // `env_clear`, but asserting the ambient env would need a process-env
+    // mutation, which the blank-env discipline forbids (see stability.rs).
+    let dir = tempdir().unwrap();
+    let p = stub_script(dir.path(), "echo \"$KAIBO_STUB_VAR $1\"", 0);
+    let args = vec![p.to_string_lossy().into_owned(), "op://Vault/Item".into()];
+    let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[("KAIBO_STUB_VAR", "inherited")])
+        .unwrap();
+    assert_eq!(key, "inherited op://Vault/Item");
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_empty_stdout_is_loud() {
+    let dir = tempdir().unwrap();
+    let p = stub_script(dir.path(), ":", 0); // prints nothing, exits 0
+    let args = vec![p.to_string_lossy().into_owned()];
+    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("printed nothing"),
+        "an empty stdout is a broken command, not a keyless backend: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_non_utf8_stdout_is_loud() {
+    let dir = tempdir().unwrap();
+    let p = stub_script(dir.path(), "printf '\\377'", 0); // invalid UTF-8
+    let args = vec![p.to_string_lossy().into_owned()];
+    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("non-UTF-8"),
+        "binary output must be surfaced, not mangled into a key: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_oversized_stdout_is_refused_not_trimmed() {
+    let dir = tempdir().unwrap();
+    // 70 KiB of output: past the 64 KiB cap, and past the pipe buffer, so this
+    // also proves the reader drains a verbose child instead of wedging it.
+    let p = stub_script(dir.path(), "head -c 70000 /dev/zero", 0);
+    let args = vec![p.to_string_lossy().into_owned()];
+    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("more than 65536 bytes"),
+        "refuse, not trim: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout() {
+    let dir = tempdir().unwrap();
+    // The child says something secret on stdout and its diagnosis on stderr: the
+    // error carries the stderr tail (the operator can act on "Vault is locked")
+    // and NEVER the stdout (a broken command may print anything there).
+    let p = stub_script(
+        dir.path(),
+        "printf 'TOP-SECRET-KEY-MATERIAL\\n'; echo 'Vault is locked' >&2",
+        3,
+    );
+    let args = vec![p.to_string_lossy().into_owned()];
+    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("exited"), "must name the failure: {msg}");
+    assert!(
+        msg.contains("Vault is locked"),
+        "stderr tail reaches the failure error: {msg}"
+    );
+    assert!(
+        !msg.contains("TOP-SECRET-KEY-MATERIAL"),
+        "stdout must never appear in an error: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_missing_binary_is_loud() {
+    let args = vec!["/nonexistent-kaibo-test/op".to_string()];
+    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("spawning key command"),
+        "a typo'd binary name fails at resolve, not silently: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_timeout_kills_a_hung_child() {
+    let dir = tempdir().unwrap();
+    let p = stub_script(dir.path(), "sleep 60", 0); // would hang forever
+    let args = vec![p.to_string_lossy().into_owned()];
+    let err = resolve_key_from_cmd(&args, Duration::from_millis(200), &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("did not exit within") && msg.contains("killed"),
+        "a hung command is killed and named, not left to wedge resolution: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_stdin_is_nulled() {
+    // The child's read sees immediate EOF (stdin is closed, not inherited) AND
+    // its fd 0 is the null device — the two checks cover each other's blind
+    // spots: on a runner whose own stdin is /dev/null the EOF check alone would
+    // pass even if the pin were removed, and a char-device check alone would
+    // pass on a TTY-backed runner. The MCP-stream property itself (the child
+    // must never read kaibo's protocol stdin) is structurally pinned by
+    // `Stdio::null()` in `resolve_key_from_cmd`.
+    let dir = tempdir().unwrap();
+    let p = stub_script(
+        dir.path(),
+        "if [ -c /dev/stdin ] && ! read -r x; then echo null-stdin; else \
+         echo got-stdin; fi",
+        0,
+    );
+    let args = vec![p.to_string_lossy().into_owned()];
+    let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap();
+    assert_eq!(key, "null-stdin", "stdin must be closed, not inherited");
+}
+
+/// The concurrency property the async design leans on, codified: key resolution
+/// on a multi-thread tokio runtime must not stall a sibling task — kaibo runs
+/// `#[tokio::main]` and its whole client-construction chain is sync, so a bounded
+/// (≤30s) blocking resolve occupies one worker while others keep serving. A
+/// sleeping key command (350 ms) plus a ticker that must fire mid-sleep proves it;
+/// this test turns red the day the runtime flavor changes to single-threaded or
+/// the resolution path stops being safely blockable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_key_resolve_does_not_stall_a_sibling_task() {
+    let dir = tempdir().unwrap();
+    let p = stub_script(dir.path(), "sleep 1", 0);
+    let args = vec![p.to_string_lossy().into_owned()];
+
+    let ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        let mut ticks = 0u32;
+        for _ in 0..12 {
+            interval.tick().await;
+            ticks += 1;
+        }
+        ticks
+    });
+    let key = resolve_key_from_cmd(&args, Duration::from_millis(300), &[]).unwrap_err();
+    assert!(
+        key.to_string().contains("did not exit within"),
+        "the resolve must time out on the sleeping stub: {key}"
+    );
+    let ticks = ticker.await.expect("ticker task completes");
+    assert!(
+        ticks >= 2,
+        "a sibling task must keep progressing while the key command blocks \
+         (got {ticks} ticks in ~300ms)"
+    );
+}

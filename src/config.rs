@@ -650,11 +650,17 @@ pub struct Backend {
     /// -compatible gateway/proxy). A `Some` on any other keyed kind is rejected
     /// at load (rig fixes those endpoints).
     pub base_url: Option<String>,
-    /// Env var to read the API key from (checked before `api_key_file`).
+    /// Env var to read the API key from (checked before the file/command source).
     pub api_key_env: Option<String>,
     /// Key-file path, stored already `$VAR`/`~`-expanded (resolved once at load in
     /// `from_toml_str`). Used when the env var is unset/blank.
     pub api_key_file: Option<String>,
+    /// A command whose stdout is the API key: raw argv (`["op", "read",
+    /// "op://Vault/Item/Field"]`), run with no shell, stdin nulled, time-boxed
+    /// ([`credentials::KEY_CMD_TIMEOUT`]), output never logged. Declared only — kaibo
+    /// never seeds one — and mutually exclusive with `api_key_file` (a load error if
+    /// both are declared); env (`api_key_env`) still wins when set.
+    pub api_key_cmd: Option<Vec<String>>,
     /// When true, a missing key falls back to a placeholder bearer token instead of
     /// erroring (the keyless local-server case).
     pub key_optional: bool,
@@ -677,22 +683,32 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Resolve this backend's bearer token: configured env var (wins, when set and
-    /// non-blank), then the key file, then — if `key_optional` — a placeholder, else
-    /// a loud error.
+    /// Resolve this backend's bearer token: declared env var (wins, when set and
+    /// non-blank), then the declared file, then the declared command, then — if
+    /// `key_optional` — a placeholder, else a loud error. Every source is declared in
+    /// config.toml — kaibo seeds none of them — and a backend declares at most one of
+    /// file and command (enforced at load).
     ///
-    /// A *present but broken* key file (empty, unreadable, a directory) is a loud
-    /// error even for a `key_optional` backend: a key that's there but wrong is a
-    /// mistake, not "keyless". Only a genuinely absent file falls back. This is the
+    /// A *present but broken* key source (file empty/unreadable/a directory; command
+    /// exiting nonzero, empty, oversized, non-UTF-8, or timing out) is a loud error
+    /// even for a `key_optional` backend: a key that's there but wrong is a mistake,
+    /// not "keyless". Only a genuinely absent source falls back. This is the
     /// no-silent-fallback directive — we don't quietly send a placeholder when the
     /// user clearly meant to provide a key.
     pub fn resolve_key(&self) -> Result<String> {
+        // The env lookup is the only ambient read in the chain; the file/command
+        // arms read declared config, so the real-environment call is the trivial
+        // wrapper and the injected variant is the testable, pure one (`key_status`
+        // mirrors this exact split).
+        self.resolve_key_where(|name| std::env::var(name).ok())
+    }
+
+    /// The full resolution chain with the env lookup injected — the pure sibling of
+    /// [`resolve_key`](Self::resolve_key), testable without touching the real
+    /// environment (the same discipline `key_status` already follows).
+    pub fn resolve_key_where(&self, get_env: impl Fn(&str) -> Option<String>) -> Result<String> {
         // env wins, when set and non-blank.
-        if let Some(v) = self
-            .api_key_env
-            .as_deref()
-            .and_then(|name| std::env::var(name).ok())
-        {
+        if let Some(v) = self.api_key_env.as_deref().and_then(get_env) {
             let v = v.trim();
             if !v.is_empty() {
                 return Ok(v.to_string());
@@ -710,7 +726,19 @@ impl Backend {
             }
         }
 
-        // No env, no existing file.
+        // then a declared key command, run once. Raw argv, no shell: resolved by the
+        // same lazy rule as the file (first client build), inheriting kaibo's env
+        // (where e.g. `op` finds its session), stdout trimmed and never logged.
+        if let Some(args) = &self.api_key_cmd {
+            return credentials::resolve_key_from_cmd(
+                args,
+                credentials::KEY_CMD_TIMEOUT,
+                &[],
+            )
+            .with_context(|| format!("resolving key for backend {:?}", self.name));
+        }
+
+        // No env, no declared file or command.
         if self.key_optional {
             // Transport-shaped stand-in: a non-empty bearer for header-auth kinds,
             // the empty string for Gemini's `?key=` query auth (see
@@ -720,11 +748,11 @@ impl Backend {
             Ok(self.kind.placeholder_key().to_string())
         } else {
             Err(anyhow!(
-                "backend {:?} has no API key: env {} unset and key file {} absent — \
-                 set one, or key_optional = true only for a keyless endpoint",
+                "backend {:?} has no API key: no key source declared — set \
+                 api_key_env, api_key_file, or api_key_cmd in config.toml, or \
+                 key_optional = true only for a keyless endpoint (`kaibo example-config` \
+                 shows the shapes)",
                 self.name,
-                self.api_key_env.as_deref().unwrap_or("(none)"),
-                self.api_key_file.as_deref().unwrap_or("(none)"),
             ))
         }
     }
@@ -788,15 +816,16 @@ impl Backend {
 
     /// Whether this backend has a usable credential, judged *without* committing to a
     /// network call or pulling the secret into the answer path — the non-fatal sibling
-    /// of [`resolve_key`](Self::resolve_key). It mirrors the same precedence (env var,
-    /// then key file, then `key_optional`) but reports a verdict instead of returning
-    /// the secret or erroring. The env lookup is injected so the classification is
-    /// testable without touching the real environment.
+    /// of [`resolve_key`](Self::resolve_key). It mirrors the same precedence (declared
+    /// env var, then the declared file or command, then `key_optional`) but reports a
+    /// verdict instead of returning the secret or erroring. The env lookup is injected
+    /// so the classification is testable without touching the real environment.
     ///
-    /// A *present-but-broken* key file still reads as [`KeyStatus::Present`] here: it's
-    /// a configured credential, and `resolve_key` is the one that surfaces its breakage
-    /// loudly at call time. We deliberately don't read the file's contents — existence
-    /// is enough to say "the user set this up".
+    /// A *present-but-broken* key source still reads as [`KeyStatus::Present`] here: a
+    /// configured credential, and `resolve_key` is the one that surfaces its breakage
+    /// loudly at call time. The file's contents are never read (existence is enough);
+    /// a command is never run (there is no cheap offline equivalent of `exists()` —
+    /// a typo'd binary name passes classification and fails at the first resolve).
     pub fn key_status(&self, get_env: impl Fn(&str) -> Option<String>) -> KeyStatus {
         // env wins, when set and non-blank — same rule as resolve_key.
         if let Some(name) = self.api_key_env.as_deref() {
@@ -806,12 +835,18 @@ impl Backend {
                 }
             }
         }
-        // then a configured key file, if it exists (contents unread — see above). The
+        // then a declared key file, if it exists (contents unread — see above). The
         // path was `$VAR`/`~`-expanded once at load, so it's used verbatim here.
         if let Some(file) = self.api_key_file.as_deref().map(PathBuf::from) {
             if file.exists() {
                 return KeyStatus::Present;
             }
+        }
+        // then a declared key command — Present by declaration, never run (there is no
+        // cheap offline check for a command; a broken or typo'd one surfaces loudly at
+        // the first `resolve_key`, exactly like a broken key file).
+        if self.api_key_cmd.is_some() {
+            return KeyStatus::Present;
         }
         if self.key_optional {
             KeyStatus::Placeholder
@@ -1801,12 +1836,41 @@ impl Config {
 
         // Expand `$VAR`/`${VAR}` and a leading `~` in each backend's `api_key_file` — the
         // same uniform rule `root`/`allow_paths` get, so a portable `$XDG_CONFIG_HOME/key`
-        // (or the built-in `~/.gemini-api-key`) resolves per-environment. Done once here,
-        // loudly on an undefined/empty/non-UTF-8 variable, so the use-sites
+        // resolves per-environment. Done once here, loudly on an
+        // undefined/empty/non-UTF-8 variable, so the use-sites
         // (`resolve_key`/`key_status`) read an already-resolved path and stay infallible —
         // `key_status` feeds the offline cast-usability classifiers, which can't take a
-        // `Result`. Absolute/plain paths pass through unchanged.
+        // `Result`. Absolute/plain paths pass through unchanged. (A key *command*'s argv
+        // is deliberately NOT expanded — no shell, no interpolation, by design.)
         for b in backends.values_mut() {
+            // Declared-only key sources: a backend may declare a key file OR a key
+            // command, never both — two declared sources is an ambiguity worth a loud
+            // error (there is no precedence between them to silently pick). Checked on
+            // the MERGED backend — after `apply_to` overlays have run, so a source
+            // arriving from the builtin template or an earlier stanza cannot dodge the
+            // check — which is why it lives in the post-merge loop, not in `apply_to`
+            // itself. (Today no later layer can declare a backend source — the builtin
+            // template seeds none and env/CLI carry no stanzas — but the check is
+            // placement-proof by construction, and the single-stanza tests pin it.)
+            if b.api_key_file.is_some() && b.api_key_cmd.is_some() {
+                bail!(
+                    "backend {:?} declares both api_key_file and api_key_cmd — \
+                     declare one key source (env can still override it)",
+                    b.name,
+                );
+            }
+            // An empty argv names no executable — a typo, not an intent. `[""]` is
+            // left alone (it fails loudly at the first resolve, like any missing
+            // binary); the empty ARRAY cannot even spawn and is caught here.
+            if let Some(args) = &b.api_key_cmd {
+                if args.is_empty() {
+                    bail!(
+                        "backend {:?}: api_key_cmd = [] names no executable — \
+                         give it at least the command to run",
+                        b.name,
+                    );
+                }
+            }
             if let Some(f) = b.api_key_file.as_deref() {
                 let expanded = expand_path(f)?;
                 let what = format!("backend {:?} api_key_file", b.name);
@@ -2275,7 +2339,12 @@ fn builtin_aliases(name: &str) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
-/// A fresh backend template for `kind`, carrying that kind's default key source.
+/// A fresh backend template for `kind`, carrying NO key source — a backend's sources
+/// are declared in config.toml, never seeded, so the loader's semantics are exactly
+/// what the operator wrote (the old seeded env-var/dotfile defaults made the built-ins
+/// implicitly depend on conventions nobody declared). `key_optional` still follows the
+/// kind: the `openai` wire is keyless by default (a placeholder for the local server),
+/// every keyed kind requires a declared source before `resolve_key` can succeed.
 /// New file backends start here, then apply their overrides.
 fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
     Backend {
@@ -2286,8 +2355,9 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         // pure. Every keyed kind except anthropic and gemini rejects an explicit
         // base_url at load (see the validation loop above); theirs is optional.
         base_url: None,
-        api_key_env: Some(kind.env_var().to_string()),
-        api_key_file: Some(format!("~/{}", kind.key_file_name())),
+        api_key_env: None,
+        api_key_file: None,
+        api_key_cmd: None,
         key_optional: kind.key_optional(),
         request_timeout: defaults.request_timeout,
         // Deny is the only safe default: kaibo's prompts carry source code, and
@@ -2679,6 +2749,7 @@ struct RawBackend {
     base_url: Option<String>,
     api_key_env: Option<String>,
     api_key_file: Option<String>,
+    api_key_cmd: Option<Vec<String>>,
     key_optional: Option<bool>,
     request_timeout_secs: Option<u64>,
     data_collection: Option<String>,
@@ -2712,6 +2783,9 @@ impl RawBackend {
         }
         if let Some(v) = &self.api_key_file {
             b.api_key_file = Some(v.clone());
+        }
+        if let Some(v) = &self.api_key_cmd {
+            b.api_key_cmd = Some(v.clone());
         }
         if let Some(v) = self.key_optional {
             b.key_optional = v;
@@ -3995,10 +4069,15 @@ mod tests {
         let s = cast.require_slot(ModelRole::Synth).unwrap();
         assert_eq!((e.backend.as_str(), e.id.as_str()), ("anthropic", explorer));
         assert_eq!((s.backend.as_str(), s.id.as_str()), ("anthropic", synth));
-        // Connection details ride the backend, with today's key sources.
+        // Connection details ride the backend; key sources are DECLARED, never
+        // seeded — a fresh built-in has none, so `key_status` reads Missing until
+        // the operator declares api_key_env / api_key_file / api_key_cmd. This is
+        // the declared-only rule: the loader does exactly what the operator wrote.
         let b = cfg.resolve_backend("anthropic").unwrap();
         assert_eq!(b.kind, ProviderKind::Anthropic);
-        assert_eq!(b.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(b.api_key_env, None);
+        assert_eq!(b.api_key_file, None);
+        assert_eq!(b.api_key_cmd, None);
         assert!(!b.key_optional);
     }
 
@@ -4060,8 +4139,9 @@ mod tests {
         }
     }
 
-    /// The OpenRouter built-in: a keyed backend (OPENROUTER_API_KEY, no configurable
-    /// base URL) and a Qwen cast — a family we can't reach directly. Explorer is the
+    /// The OpenRouter built-in: a keyed gateway (no configurable base URL — the
+    /// endpoint is rig's; a key source is declared by the operator, never seeded)
+    /// and a Qwen cast — a family we can't reach directly. Explorer is the
     /// multimodal flash (vision pinned on, since OpenRouter's classifier defaults false),
     /// synth is the text-only flagship `qwen3.7-max` (no vision pin — classifier's false
     /// stands). Pins the whole built-in so a bad default fails here, not mid-call.
@@ -4088,7 +4168,9 @@ mod tests {
 
         let b = cfg.resolve_backend("openrouter").unwrap();
         assert_eq!(b.kind, ProviderKind::OpenRouter);
-        assert_eq!(b.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+        // Declared-only: no seeded env var, no seeded file, no seeded command.
+        assert_eq!(b.api_key_env, None);
+        assert_eq!(b.api_key_cmd, None);
         assert!(!b.key_optional, "OpenRouter is a keyed gateway");
         assert!(
             b.base_url.is_none(),
@@ -4439,20 +4521,29 @@ mod tests {
 
     // --- usability: the unconfigured-install signal ---------------------------
     //
-    // These point every keyed backend's `api_key_file` at a path that cannot exist,
-    // so the verdict depends ONLY on the injected env lookup — never on whether the
-    // test machine happens to have ~/.anthropic-key.txt. (Amy keeps real key files;
-    // a naive built-in test would pass on her box and fail in CI, or vice versa.)
+    // These point every keyed backend's key sources at something that cannot
+    // produce a key — api_key_file at a path that cannot exist, api_key_env DECLARED
+    // but never set by an injected lookup — so the verdict depends ONLY on the env
+    // map each test injects, never on whether the test machine happens to have
+    // ~/.anthropic-key.txt or a real ANTHROPIC_API_KEY. (Amy keeps real key files
+    // and real keys; a naive built-in test would pass on her box and fail in CI,
+    // or vice versa.) Declared-only: api_key_env is a config line here, exactly as
+    // this feature now requires.
     const NO_KEY_FILES: &str = r#"
         [backends.anthropic]
+        api_key_env = "ANTHROPIC_API_KEY"
         api_key_file = "/nonexistent-kaibo-test/anthropic"
         [backends.deepseek]
+        api_key_env = "DEEPSEEK_API_KEY"
         api_key_file = "/nonexistent-kaibo-test/deepseek"
         [backends.gemini]
+        api_key_env = "GEMINI_API_KEY"
         api_key_file = "/nonexistent-kaibo-test/gemini"
         [backends.openrouter]
+        api_key_env = "OPENROUTER_API_KEY"
         api_key_file = "/nonexistent-kaibo-test/openrouter"
         [backends.openai-local]
+        api_key_env = "OPENAI_API_KEY"
         api_key_file = "/nonexistent-kaibo-test/openai"
     "#;
 
@@ -4471,8 +4562,9 @@ mod tests {
         );
     }
 
-    /// The same config flips to Ready the moment the env var carries a key — so an
-    /// env-only setup (no config file) is never nagged.
+    /// The same config flips to Ready the moment the DECLARED env var carries a
+    /// key — an env-based setup means declaring `api_key_env` once, then exporting
+    /// the variable in the shell (the value itself stays out of the config).
     #[test]
     fn cast_usability_ready_when_env_key_present() {
         let cfg = Config::from_toml_str(&format!(
