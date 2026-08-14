@@ -449,55 +449,33 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.14.0"`. The `0.13.0 → 0.14.0` bump moved
-  **one** call site, and it was a deletion: `kaish_syntax.rs`'s
-  `strip_write_side_paragraphs`, which stripped the shared contract's "Overlay mode"
-  paragraph before it fronted kaibo's read-only shell. kaish-help #297 made that guidance
-  opt-in (`Concept::Overlay`, reached only via `Selector::with_overlay`), so the paragraph
-  stopped arriving and the filter had nothing to remove — its own guard assertion is what
-  failed and told us. The *property* kept its test (`core_carries_no_write_side_teaching`):
-  it now rests on upstream's default plus kaibo never opting in, and it still fails if
-  either changes (proven by sabotage — composing `.with_overlay()` turns it red).
-  A second kaibo edit was forced by a *grammar* change rather than an API one: kaish 0.14
-  made a bare comma an ordinary bareword outside `[...]`/`{...}`, so the preamble sentence
-  teaching "quote the range, because an unquoted comma splits the argument" became false.
-  The quoted `sed` examples stayed (correct on every version) and the stated reason went —
-  a model reads that block every turn, and a false rule is worse than a missing one. The
-  test that pinned the rule now asserts its **absence**, which is what catches a merge
-  re-introducing it.
-  Everything else on the checklist was inert here: `jobs --json` gaining a `path` field and
-  lowercase `JobStatus` wire spellings (including the new `Killed`) reach no parse site,
-  because model-facing kaish never grows `jobs`; `KernelConfig::agent()` defaulting
-  `kill_on_parent_death = true` has no children to signal with `subprocess` off;
-  `Kernel::shutdown` taking `&self` matters only to a caller, and kaibo never calls it.
-  `ExecuteOptions`, `OutputLimitConfig`, and `ToolArgs` were untouched.
-  **This bump NARROWS the model-facing read surface, and that reverses what we planned
-  for.** Through the 0.14 release cycle kaish carried an approvals ledger mounted at
-  `/v/approvals` in every kernel, and this section was drafted to say the bump handed the
-  model a readable path it did not have before — with a probe battery to match, since that
-  path's read-only-ness came from kaish's own chokepoint rather than any of kaibo's four
-  levers. The ledger cut landed before the tag and removed the mount entirely: `ls /v`
-  returns `bin`, `blobs`, `jobs`, and `/v/approvals` is not found (verified on a 0.14
-  build). So there is no new model-readable surface, no `ExecResult.approval`, and no
-  battery to add. **The lesson worth keeping is about the probe we nearly shipped:** a
-  probe of a path that no longer exists returns "not found", which reads as containment
-  working rather than as absence — an all-clear that means nothing. Check that a probe
-  would report differently if its subject were broken versus if the probe itself were.
+- **kaish pin.** Currently `kaish-kernel = "0.14.1"`. The `0.14.0 → 0.14.1` bump is a
+  patch release — **zero** call-site changes, `cargo build`/`clippy --all-targets`/full
+  `cargo test` (749 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc` both
+  empty, no **BREAKING** entries. Every changelog entry is a fix inside the shell
+  language itself, which model-facing kaish inherits for free with no Rust-side change:
+  `${s[0:5]}` string slicing (characters, not bytes; `${s:0:5}` — bash's different
+  convention — is now a loud error instead of silently vanishing); a pipeline's first
+  stage, `read`, and `grep`/`cat`'s streaming path no longer drop or skip buffered
+  stdin; `read` on empty stdin now fails instead of binding `""`; and `exit`/`return`/
+  `break`/`continue` now carry a block's already-printed output out instead of
+  discarding it. Net effect for kaibo: scripts the explorer already writes (a `read`
+  into a pipeline, an early `exit` inside a loop) now behave the way bash would, where
+  before they silently lost output or stdin.
 - **The previous pin, kept because the reasoning pattern is the point.** The
-  `0.12.0 → 0.13.0` bump was again API-compatible — **zero** call-site changes, `cargo build`/`clippy --all-targets`/
-  full `cargo test` (598 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc`
-  both empty. A large release (six crates bumped, ~270 changelog lines: lexer/parser
-  fixes, stricter binary-input handling across several builtins, a browser/wasm target)
-  but its **BREAKING (embedders)** entries all land on surface kaibo doesn't touch:
-  buffered stdin going `Vec<u8>` instead of `String` (`ExecContext::stdin`/
-  `ExecuteOptions::stdin`, `read_stdin_to_string` removed) only bites a caller that
-  feeds/reads kaish's own stdin, which kaibo never does (`cli.rs`'s `--attach`/piped-stdin
-  handling is unrelated CLI-level plumbing, not kaish's `ExecContext`); `ToolArgs::to_argv()`
-  returning `Result` instead of a bare `Vec<String>` only bites a caller that calls it —
-  `Blocked::execute` (`sandbox.rs`) receives a `ToolArgs` parameter but never calls
-  `.to_argv()` on it; and `output_limit::spill_aware_collect` + its private helpers being
-  removed is internal plumbing behind `OutputLimitConfig` (`.agent()`/`.set_limit()`/
-  `.with_output_limit()` in `sandbox.rs`), which the kaish changelog states explicitly is
-  unaffected. Precedent that a bump *can* move call sites: `0.8.4 → 0.9.0` renamed the
-  `mcp()` config constructors to `agent()` in `sandbox.rs`. Keep this current per the
-  **Working here** kaish-bump discipline before cutting.
+  `0.13.0 → 0.14.0` bump moved **one** call site — a deletion: `kaish_syntax.rs`'s
+  `strip_write_side_paragraphs`, whose target text kaish-help #297 made opt-in via
+  `Concept::Overlay`, so the filter had nothing left to strip and its own guard
+  assertion caught it (`core_carries_no_write_side_teaching` still passes, now resting
+  on upstream's default plus kaibo never opting in). It also forced one grammar-driven
+  prose edit: a bare comma became an ordinary bareword outside `[...]`/`{...}`, so the
+  preamble's "quote the range, because an unquoted comma splits the argument" rationale
+  went false; the quoted `sed` examples stayed, the false reason didn't, and the test
+  now asserts the reason's **absence**. Everything else on the 0.14.0 checklist was
+  inert (`jobs --json`'s new `path` field, lowercase `JobStatus`, `KernelConfig::agent()`'s
+  `kill_on_parent_death` default) because model-facing kaish never grows `jobs` or
+  spawns children with `subprocess` off. The lesson worth keeping: kaish's approvals
+  ledger (`/v/approvals`) was cut before the 0.14.0 tag, so a probe of that path would
+  have reported "not found" either way — an all-clear that would have meant nothing.
+  Check that a probe reports differently if its subject is broken versus if the probe
+  itself is.
