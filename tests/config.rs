@@ -1286,6 +1286,7 @@ fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {
         base_url: Some("http://localhost:1/v1".into()),
         api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
         api_key_file,
+        api_key_cmd: None,
         key_optional,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
@@ -1314,6 +1315,7 @@ fn key_optional_gemini_backend_resolves_to_an_empty_query_key() {
         base_url: Some("http://gateway.internal".into()),
         api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
         api_key_file: None,
+        api_key_cmd: None,
         key_optional: true,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
@@ -1362,6 +1364,7 @@ fn required_key_with_no_source_is_an_error() {
         base_url: None,
         api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
         api_key_file: None,
+        api_key_cmd: None,
         key_optional: false,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
@@ -1970,16 +1973,17 @@ fn an_image_slot_cannot_point_at_a_completion_backend() {
 
 // --- the openai-images kind ---------------------------------------------------
 
-/// The `openai-images` kind parses from TOML and seeds its defaults: the same key
-/// sources as the `openai` completion kind (`OPENAI_API_KEY` / `~/.openai-key`),
-/// but the key is REQUIRED. This kind's default endpoint is hosted OpenAI, so a
-/// keyless seed would let a minimal stanza load clean, staff `generate`, and then
-/// send `Bearer no-auth` to api.openai.com — a 401 on the first paid call instead
-/// of a loud config gap (the or-gpt cross-family review's posture reversal,
-/// 2026-08-03). A keyless local sd-server opts in with `key_optional = true`
-/// beside its explicit local `base_url`.
+/// The `openai-images` kind parses from TOML. Declared-only: it carries NO key
+/// source — the operator declares api_key_env / api_key_file / api_key_cmd (the
+/// `openai` completion kind's conventions are what they'd likely name, but kaibo
+/// seeds nothing) — and the key is REQUIRED by default: this kind's default endpoint
+/// is hosted OpenAI, so a keyless seed would let a minimal stanza load clean, staff
+/// `generate`, and then send `Bearer no-auth` to api.openai.com — a 401 on the
+/// first paid call instead of a loud config gap (the or-gpt cross-family review's
+/// posture reversal, 2026-08-03). A keyless local sd-server opts in with
+/// `key_optional = true` beside its explicit local `base_url`.
 #[test]
-fn openai_images_backend_parses_and_seeds_openai_key_sources() {
+fn openai_images_parses_without_seeding_key_sources() {
     let c = Config::from_toml_str(
         r#"
         [backends.imgs]
@@ -1989,12 +1993,10 @@ fn openai_images_backend_parses_and_seeds_openai_key_sources() {
     .expect("the openai-images kind must parse");
     let b = c.backends.get("imgs").expect("backend exists");
     assert_eq!(b.kind, kaibo::credentials::ProviderKind::OpenAiImages);
-    assert_eq!(b.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
-    assert!(
-        b.api_key_file.as_deref().is_some_and(|f| f.ends_with("/.openai-key")),
-        "the key file mirrors the openai completion kind's, got: {:?}",
-        b.api_key_file
-    );
+    // Declared-only: a fresh media stanza declares its own source or fails loudly.
+    assert_eq!(b.api_key_env, None);
+    assert_eq!(b.api_key_file, None);
+    assert_eq!(b.api_key_cmd, None);
     assert!(
         !b.key_optional,
         "key_optional seeds FALSE — the default endpoint is hosted, so a missing \
@@ -2462,5 +2464,241 @@ fn persistence_cli_wins_over_lower_layers() {
         c.persistence.path.unwrap(),
         std::path::PathBuf::from("/from/cli.db"),
         "--state-db wins over the file path"
+    );
+}
+
+// --- api_key_cmd: the declared command source --------------------------------
+//
+// Load-time rules (XOR, empty argv, no expansion) and resolve-time behavior
+// (env wins without running it, cmd resolves on a keyless backend). The stub
+// scripts are invoked by absolute path, Unix-only.
+
+#[cfg(unix)]
+fn cmd_stub(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// A backend may declare a key file OR a key command — both is an ambiguity with
+/// no sensible precedence, refused at load (the operator picks; env still overrides).
+#[test]
+fn file_and_cmd_declared_together_is_a_load_error() {
+    let err = Config::from_toml_str(
+        r#"
+        [backends.vault]
+        kind = "anthropic"
+        api_key_file = "/some/key"
+        api_key_cmd = ["op", "read", "op://Vault/Item"]
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("api_key_file") && msg.contains("api_key_cmd"),
+        "the load error must name both declared sources, got: {msg}"
+    );
+}
+
+/// An empty argv names no executable — a typo, not an intent.
+#[test]
+fn an_empty_api_key_cmd_is_a_load_error() {
+    let err = Config::from_toml_str(
+        r#"
+        [backends.vault]
+        kind = "anthropic"
+        api_key_cmd = []
+        "#,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("api_key_cmd") && msg.contains("executable"),
+        "the load error must name the field and the fix, got: {msg}"
+    );
+}
+
+/// Unlike `api_key_file`, a key command's argv is NEVER `$VAR`/`~`-expanded —
+/// no shell, no interpolation, by design. A literal `$HOME` stays literal.
+#[test]
+fn api_key_cmd_argv_is_not_var_expanded() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.vault]
+        kind = "anthropic"
+        api_key_cmd = ["$HOME/bin/op", "op://Vault/Item"]
+        "#,
+    )
+    .unwrap();
+    let b = c.resolve_backend("vault").unwrap();
+    assert_eq!(
+        b.api_key_cmd.as_deref(),
+        Some(&["$HOME/bin/op".to_string(), "op://Vault/Item".to_string()][..]),
+        "argv elements pass through load untouched — expansion is the command's own business"
+    );
+}
+
+/// `key_status` reads a declared command as Present WITHOUT running it — there is
+/// no cheap offline equivalent of `exists()` for a command, so a typo'd binary
+/// name passes classification and fails loudly at the first resolve instead.
+#[test]
+fn key_status_reads_a_declared_cmd_as_present_without_running_it() {
+    let b = Backend {
+        name: "vault".into(),
+        kind: ProviderKind::Anthropic,
+        base_url: None,
+        api_key_env: Some("KAIBO_TEST_DEFINITELY_UNSET_KEY".into()),
+        api_key_file: None,
+        api_key_cmd: Some(vec!["/nonexistent-kaibo-test/op".into()]),
+        key_optional: false,
+        request_timeout: Duration::from_secs(900),
+        data_collection: Default::default(),
+        wire: None,
+    };
+    assert_eq!(b.key_status(|_| None), kaibo::config::KeyStatus::Present);
+}
+
+/// The declared env source wins over the command WITHOUT running it — the
+/// sentinel oracle: the stub touches a file only if it runs, so "env key came
+/// back AND the sentinel is absent" proves the command never spawned. The
+/// no-env arm is the negative control (the command runs then).
+#[cfg(unix)]
+#[test]
+fn declared_env_wins_over_the_cmd_without_running_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("sentinel");
+    let stub = cmd_stub(
+        dir.path(),
+        "op-stub",
+        &format!("touch {}; printf 'cmd-key\\n'", sentinel.display()),
+    );
+    let b = Backend {
+        name: "vault".into(),
+        kind: ProviderKind::Anthropic,
+        base_url: None,
+        api_key_env: Some("KAIBO_TEST_CMD_ENV".into()),
+        api_key_file: None,
+        api_key_cmd: Some(vec![stub.to_string_lossy().into_owned()]),
+        key_optional: false,
+        request_timeout: Duration::from_secs(900),
+        data_collection: Default::default(),
+        wire: None,
+    };
+
+    // Env present: the injected lookup (the `resolve_key_where` seam, mirroring
+    // `key_status`'s) wins, and the command never spawns.
+    let key = b
+        .resolve_key_where(|n| (n == "KAIBO_TEST_CMD_ENV").then(|| "env-key".into()))
+        .expect("env source wins");
+    assert_eq!(key, "env-key");
+    assert!(
+        !sentinel.exists(),
+        "the command must not run when the env source resolves"
+    );
+
+    // Negative control: env absent → the command runs and its stdout is the key.
+    let key = b.resolve_key_where(|_| None).expect("cmd source resolves");
+    assert_eq!(key, "cmd-key", "the stub prints 'cmd-key' in the no-env case");
+    assert!(
+        sentinel.exists(),
+        "the no-env arm must actually run the command"
+    );
+}
+
+/// A keyless backend can pull a real key from a command: the cmd arm sits before
+/// the `key_optional` placeholder, so a declared command is used even when the
+/// backend would otherwise fall back to keyless.
+#[cfg(unix)]
+#[test]
+fn a_declared_key_cmd_resolves_even_on_a_key_optional_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = cmd_stub(dir.path(), "op-stub", "printf 'sk-local\\n'");
+    let b = Backend {
+        name: "local".into(),
+        kind: ProviderKind::Openai,
+        base_url: Some("http://localhost:1/v1".into()),
+        api_key_env: None,
+        api_key_file: None,
+        api_key_cmd: Some(vec![stub.to_string_lossy().into_owned()]),
+        key_optional: true,
+        request_timeout: Duration::from_secs(900),
+        data_collection: Default::default(),
+        wire: None,
+    };
+    let key = b.resolve_key().expect("cmd runs before the placeholder");
+    assert_eq!(key, "sk-local");
+}
+
+/// The stream-isolation property at the binary level (the plan's MCP-stdio test):
+/// a key command's stdout is captured AS THE KEY, never inherited into kaibo's own
+/// stdout — which, in an MCP server, IS the protocol stream. The stub prints a
+/// marker key; a real `oneshot` against a dead endpoint resolves the key (the
+/// command runs), then fails on the transport — so a leaked child stdout would put
+/// LEAK-KEY-123 in kaibo's stdout, and its absence alongside a transport failure
+/// proves the pin. Child env is rebuilt from scratch (blank-env discipline); the
+/// stub runs by absolute path, so no PATH is needed.
+#[cfg(unix)]
+#[test]
+fn a_key_commands_stdout_never_reaches_kaibos_own_stdout() {
+    let xdg = tempfile::tempdir().unwrap();
+    let home = xdg.path().join("home");
+    let config_home = xdg.path().join("config");
+    std::fs::create_dir_all(config_home.join("kaibo")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+
+    let stub = xdg.path().join("op-stub");
+    std::fs::write(&stub, "#!/bin/sh\nprintf 'LEAK-KEY-123\\n'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        config_home.join("kaibo/config.toml"),
+        format!(
+            "[backends.vault]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:1/v1\"\napi_key_cmd = [\"{}\"]\n\n[casts.vault-cast]\nsynth = \"vault/deepseek-v4-flash\"\n",
+            stub.display()
+        ),
+    )
+    .unwrap();
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"p\"\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kaibo"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", xdg.path().join("state"))
+        .env("XDG_DATA_HOME", xdg.path().join("data"))
+        .args([
+            "--root",
+            project.path().to_str().unwrap(),
+            "oneshot",
+            "--cast",
+            "vault-cast",
+            "hi",
+        ])
+        .output()
+        .expect("spawn the kaibo binary");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("LEAK-KEY-123"),
+        "the key command's stdout must be captured, not inherited into kaibo's own \
+         stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("refused")
+            || stderr.to_lowercase().contains("failed")
+            || stderr.to_lowercase().contains("error"),
+        "the run must fail on the dead transport AFTER resolving the key (proving the \
+         command ran):\n{stderr}"
     );
 }

@@ -57,8 +57,9 @@ Connection settings only. Models are never declared here.
 | `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` | required on a new backend | closed enum; selects client + request shape (`stability` and `openai-images` are the media kinds — image slots only) |
 | `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini` and the media kinds; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
-| `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
-| `api_key_file` | path | seeded from `kind` | file source, checked second |
+| `api_key_env` | env var *name* | unset — declared by you | env source, checked first |
+| `api_key_file` | path | unset — declared by you | file source, checked second (mutually exclusive with `api_key_cmd`) |
+| `api_key_cmd` | argv array | unset — declared by you | command source: stdout, trimmed, is the key (no shell, 30s ceiling, stdin closed) |
 | `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
 | `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` only; load error elsewhere |
 | `request_timeout_secs` | integer > 0 | `[defaults]` value (900) | per-single-completion ceiling |
@@ -123,21 +124,45 @@ proxy `/v1/batches` or the Files API.
 
 #### Key resolution
 
-A backend resolves its key from `api_key_env`, then `api_key_file`. Env wins.
+A backend resolves its key from its **declared** sources — `api_key_env` (an env var
+*name*), `api_key_file` (a path), or `api_key_cmd` (a command whose stdout is the key) —
+with env winning over the file/command source. Every source is declared in
+`config.toml`: kaibo seeds none of them, so the loader does exactly what the operator
+wrote (a fresh built-in backend has no key source until one is declared). A backend
+may declare at most one of `api_key_file` and `api_key_cmd` — both is a load error
+naming both fields; env may still be declared beside either, and wins when set.
 
-**Secrets never appear inline in the TOML** — only the *name* of an env var or the
-*path* to a key file. A config file should be safe to commit or paste.
+**Secrets never appear inline in the TOML** — only the *name* of an env var, the
+*path* to a key file, or the *argv* of a key command (a vault item path is a
+pointer, not the secret it resolves to). A config file should be safe to commit or
+paste.
+
+`api_key_cmd` runs the command with raw argv — no shell, no `$VAR`/`~` expansion in
+its elements (wrap a pipeline in a script and name the script). The child inherits
+kaibo's environment (where `op` finds its session, gpg-agent serves `pass`), but its
+stdin is closed (it must never read the MCP stdio stream — a prompting tool fails
+fast instead), its stdout is the key, trimmed, and it is given a 30s ceiling
+(`KEY_CMD_TIMEOUT`): a hung or oversized-emitter is killed/refused, loudly, and its
+output is never logged. 1Password's `op read "op://Vault/Item/Field"`, `pass show`,
+`gh auth token`, and any vault CLI fit this contract unchanged.
 
 `key_optional = true` substitutes a placeholder when no key is found, which is the
 keyless local-server case. The placeholder fits the auth style: an empty query key for
 Gemini, a non-empty bearer for header-auth backends (`src/credentials.rs`).
 
-A key file that is *present but broken* (empty, unreadable, a directory) is a loud error
-even on a keyless backend, because present-but-wrong is a mistake rather than "keyless".
-Only a genuinely absent file falls back.
+A key source that is *present but broken* (an empty/unreadable key file; a command
+that exits nonzero, prints nothing, prints non-UTF-8 or oversized output, or times
+out) is a loud error even on a keyless backend, because present-but-wrong is a
+mistake rather than "keyless". Only a genuinely absent source falls back. The command
+source is classified `Present` by `key_status` without being run (there is no cheap
+offline check for a command — the same asymmetry as an unread key file; a typo'd
+binary name surfaces loudly at the first resolve).
 
 **Timing.** Keys resolve lazily, when the backend is first used to build a client, not at
-config load. A missing or broken key on a backend no call touches never surfaces.
+config load. A missing or broken key source on a backend no call touches never
+surfaces. A key command therefore runs once per client build and the key lives for
+that client's lifetime — a rotated vault item is picked up at the next client build,
+not on the next call.
 
 #### `kind = "openrouter"` specifics
 
@@ -616,8 +641,9 @@ Everything else follows one naming rule:
 
 - **Provider key vars stay native.** `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
   `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `OPENAI_API_KEY` are not renamed to
-  `KAIBO_*`, because people and CI expect those names. A backend points at one via
-  `api_key_env`.
+  `KAIBO_*`, because people and CI expect those names. A backend points at one by
+  declaring `api_key_env` in its stanza (kaibo reads no key env var that isn't
+  declared).
 - **`OPENAI_BASE_URL` is kept** as a backward-compatible override for any openai-kind
   backend with no explicit `base_url`. New backends use the `base_url` config key.
 
@@ -1428,17 +1454,18 @@ local-default fallback applied; the raw configured value, when set, for the anth
 gemini kinds; and nothing for every other kind.
 
 **Secret-safety contract.** `kaibo://config` includes key *source metadata* — the env var
-name and file path an operator configured — and never the resolved key value. Keys resolve
-lazily at call time and are never cached in the `Config` struct, so the render function has
-no field holding a secret.
+name, file path, or key command argv an operator configured — and never the resolved
+key value. Keys resolve lazily at call time and are never cached in the `Config` struct,
+so the render function has no field holding a secret.
 
 The render destructures `Backend`, `ModelSlot`, `Defaults`, `ToolGating`, and
 `SandboxConfig` exhaustively, so a new field is a compile error at the render site. That
 makes rendering a field an explicit decision, subject to secret review, rather than a
 silent omission.
 
-`api_key_env` and `api_key_file` are included on purpose: an operator debugging a
-missing-key error needs to see which source the backend points at.
+`api_key_env`, `api_key_file`, and `api_key_cmd` are included on purpose: an operator
+debugging a missing-key error needs to see which source the backend points at (a vault
+item path in argv is a pointer, like the env var name — it never resolves a value).
 
 ## CLI mirrors
 

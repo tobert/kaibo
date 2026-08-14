@@ -24,13 +24,16 @@
 # ---------------------------------------------------------------------------
 # With nothing configured, kaibo starts fine and `run_kaish` works immediately —
 # the read-only shell needs no model. `consult` / `oneshot` need a
-# provider key on the default cast (`anthropic` out of the box). Give it one the
-# private way — kaibo reads the key at startup, so it never enters your chat:
-#   env:   export ANTHROPIC_API_KEY=sk-...     (or DEEPSEEK_/GEMINI_/OPENROUTER_/OPENAI_…)
-#   file:  printf %s 'sk-...' > ~/.anthropic-key.txt   (env wins over file)
-# Don't paste the key to the model — set the env var or key file in your shell.
-# Then RECONNECT the kaibo MCP server so it re-reads the environment and this file
-# (keys are read once at startup; in Claude Code: run /mcp and reconnect kaibo).
+# provider key on the default cast (`anthropic` out of the box). Give it one by
+# DECLARING a key source in this file — kaibo seeds none; the value stays out of
+# the config, so it never enters your chat:
+#   env:     api_key_env = "ANTHROPIC_API_KEY"    then export ANTHROPIC_API_KEY=sk-...
+#   file:    api_key_file = "~/.anthropic-key.txt" then printf %s 'sk-...' > that file
+#   command: api_key_cmd = ["op", "read", "op://Vault/Kaibo/Anthropic-key"]   (no shell)
+# Don't paste the key to the model — declare the source in config.toml and set
+# the actual value in your shell / vault. Then RECONNECT the kaibo MCP server so it
+# re-reads the environment and this file (keys are read once at startup; in Claude
+# Code: run /mcp and reconnect kaibo).
 # Prefer another provider? Pass cast="<backend-or-cast>" per call, or set
 # `cast` below.
 #
@@ -362,10 +365,15 @@ scratch_limit_bytes = 67108864
 # only. The rest describes the wire (endpoint, key source, per-request deadline).
 # Models live on cast slots, never here.
 #
-# Keys are referenced, never inlined: api_key_env names an env var, api_key_file a
-# path (~ ok). env wins over file. key_optional=true falls back to a placeholder
-# bearer token (keyless local servers). base_url is legal on the openai kind
-# (required for a new backend), the anthropic and gemini kinds (optional —
+# Keys are referenced, never inlined, and every source is DECLARED — kaibo seeds
+# none, so a backend reads only what you write here. Three sources, env winning over
+# the single file/command source: api_key_env names an env var, api_key_file a path
+# whose contents (trimmed) are the key (~ ok on the path), api_key_cmd a command whose
+# stdout (trimmed) is the key (raw argv — no shell, stdin closed, 30s ceiling).
+# A backend declares at most one of api_key_file and api_key_cmd — both = load error.
+# key_optional=true falls
+# back to a placeholder bearer token (keyless local servers). base_url is legal on
+# the openai kind (required for a new backend), the anthropic and gemini kinds (optional —
 # unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
 # and the media kinds (optional — unset dials api.stability.ai for stability,
 # api.openai.com/v1 for openai-images); set it to point the same wire at a
@@ -374,11 +382,12 @@ scratch_limit_bytes = 67108864
 # base_url at load (rig fixes those endpoints).
 # ---------------------------------------------------------------------------
 
-# --- The five built-ins, shown COMMENTED OUT with their current defaults. They
-#     ship in code already — kaibo runs with all five even when this whole file is
-#     absent — so uncomment one only to CHANGE something (a gateway base_url, a
-#     different key file, ...); these blocks are illustrative, not required
-#     configuration to copy verbatim. Their alias names (claude, google, local,
+# --- The five built-ins, shown COMMENTED OUT with their current models. They ship
+#     in code already — kaibo runs with all five even when this whole file is
+#     absent — but unlike the key wiring, kaibo seeds NO key source: uncomment one
+#     to CHANGE something (a gateway base_url, a different key source), and note the
+#     key lines below are the conventional sources to DECLARE, not defaults that
+#     exist without them. The alias names (claude, google, local,
 #     lemonade, gemma, gemma4) are reserved at both levels regardless of whether
 #     you uncomment them — naming a new backend or cast after one is a loud
 #     collision error. ---
@@ -387,6 +396,7 @@ scratch_limit_bytes = 67108864
 # kind = "anthropic"
 # api_key_env  = "ANTHROPIC_API_KEY"
 # api_key_file = "~/.anthropic-key.txt"
+# api_key_cmd  = ["op", "read", "op://Vault/Kaibo/Anthropic-key"]   # OR a command; see below
 # Uncomment to dial an Anthropic-Messages-API-compatible gateway/proxy (e.g. a
 # corporate LLM gateway) instead of api.anthropic.com directly. Optional —
 # unlike the openai kind, unset still resolves to rig's built-in endpoint.
@@ -436,8 +446,9 @@ scratch_limit_bytes = 67108864
 # key_optional = true                          # keyless local default → placeholder
 
 # --- New backends: any number of openai-kind endpoints, each its own connection.
-#     A new backend must declare its `kind`; it seeds that kind's default key
-#     sources, then your fields apply on top. A new openai-kind backend must also
+#     A new backend must declare its `kind`; it carries NO key source — declare one
+#     (api_key_env / api_key_file / api_key_cmd) — and your fields apply on top of
+#     the kind's non-key defaults. A new openai-kind backend must also
 #     set `base_url` (the OPENAI_BASE_URL / local-default fallback belongs to the
 #     built-in `openai-local` backend alone — a forgotten base_url is a load error, not
 #     a silent dial of the wrong server). ---
@@ -474,6 +485,18 @@ kind = "openai"
 base_url = "https://llm-gateway.example.internal/v1"
 api_key_env = "GATEWAY_API_KEY"
 wire = "responses"
+
+# A key from a command — `api_key_cmd`: the command's stdout, trimmed, is the key.
+# Raw argv, NO shell (no pipes/redirection/$VAR — wrap a pipeline in a script and
+# name the script). The child inherits kaibo's env, gets a CLOSED stdin (so an
+# interactive unlock prompt fails fast instead of hanging), a 30s ceiling, and its
+# output is never logged. 1Password (`op read op://Vault/Item/Field`) is the
+# natural fit; `pass show`, `gh auth token`, a vault CLI all work. A backend may
+# declare api_key_file OR api_key_cmd, never both — env (api_key_env) still wins
+# when set, so CI can override the vault with a one-off env var.
+[backends.vault-keyed]
+kind = "deepseek"
+api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 
 # ---------------------------------------------------------------------------
 # [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is

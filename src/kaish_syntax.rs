@@ -134,10 +134,13 @@ fn kaibo_lead() -> &'static str {
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has
-/// no usable provider (a fresh `cargo install` with no key set). Steers toward an env
-/// var or a key file — *never* pasting the key into the chat — names the default cast's
-/// backends and their key sources, points at the example resource, and reminds the user
-/// to reconnect the server (which only re-reads the environment and config at startup).
+/// no usable provider (a fresh `cargo install` with no key source declared). Steers
+/// toward DECLARING a key source in config.toml (api_key_env / api_key_file /
+/// api_key_cmd) — *never* pasting the key into the chat — names the default cast's
+/// backends and whatever source each already carries (else the kind's conventional
+/// env var, since conventions are exactly what guidance may name), points at the
+/// example resource, and reminds the user to reconnect the server (which only
+/// re-reads the environment and config at startup).
 ///
 /// Positive framing: it leads with what *works now* (`run_kaish` needs no provider) and
 /// what to do, not a wall of "you can't". Best-effort on the backend list — if the
@@ -149,14 +152,25 @@ fn setup_section(config: &Config) -> String {
         for slot in cast.slots.values() {
             if let Ok(b) = config.resolve_backend(&slot.backend) {
                 if seen.insert(b.name.clone()) {
-                    let env = b.api_key_env.as_deref().unwrap_or("(none)");
-                    let file = b.api_key_file.as_deref().unwrap_or("(none)");
+                    // Name what's already declared (and why it's still missing), else
+                    // the kind's conventional env var — the line an operator can act on.
+                    let declared = match (&b.api_key_env, &b.api_key_file, &b.api_key_cmd) {
+                        (Some(env), _, _) => format!("declared env `{env}` is unset"),
+                        (None, Some(f), _) => format!("declared key file `{f}` is absent"),
+                        // A cmd-backed backend is always `key_status` Present (never
+                        // run to classify), so this arm renders only in a partial-setup
+                        // cast (some other slot's backend is Missing) — and the message
+                        // stays neutral: the command itself is fine, it just has not
+                        // run yet.
+                        (None, None, Some(_)) => "declared key command (runs on first use)".into(),
+                        (None, None, None) => {
+                            format!("declare `api_key_env = \"{}\"`", b.kind.env_var())
+                        }
+                    };
                     lines.push(format!(
-                        "  - backend `{}` ({}) — set env `{}`, or write the key to `{}`",
+                        "  - backend `{}` ({}) — {declared}",
                         b.name,
                         b.kind.canonical_name(),
-                        env,
-                        file
                     ));
                 }
             }
@@ -171,16 +185,16 @@ fn setup_section(config: &Config) -> String {
     format!(
         "## Setup needed — no model provider configured\n\
          kaibo's default cast `{cast}` has no usable API key, so `consult`/`oneshot` \
-         can't reach a model. `run_kaish` works now (read-only shell, no model) to \
-         browse the code meanwhile.\n\n\
-         Give the cast a key via an **environment variable** or **key file** — kaibo \
-         reads either at startup, kept out of the chat (set in your shell, never \
-         pasted here):\n\
+         can't reach a model — but `run_kaish` works now (read-only shell, no model) \
+         to browse the code meanwhile.\n\n\
+         Key sources are declared, never assumed: add one to config.toml — an env var \
+         name (`api_key_env`), a key file path (`api_key_file`), or a command that \
+         prints the key (`api_key_cmd`). The value lives outside the config, so the \
+         secret stays out of the chat (set it in your shell, never paste it here):\n\
          {backends}\n\n\
-         Then **reconnect the kaibo MCP server** so it re-reads the environment \
-         (Claude Code: `/mcp`; other hosts: their own reload). Prefer another \
-         provider? The annotated `kaibo://config/example` resource (→ \
-         `~/.config/kaibo/config.toml`) shows every backend and cast.",
+         Then **reconnect the kaibo MCP server** so it re-reads config and env \
+         (Claude Code: `/mcp`). `kaibo example-config` prints the template \
+         (`kaibo://config/example`).",
         cast = config.default_cast,
     )
 }
@@ -330,15 +344,16 @@ pub fn kaibo_instructions_with_scope(
         "{setup}{lead}\n\n\
          {casts}\
          ## Scope\n\
-         Read-only, always: kaibo never writes and cannot run external commands. A \
+         Read-only, always: kaibo never writes your project, and runs only the \
+         key-fetch command your config declares (`api_key_cmd`, stdin closed, never \
+         logged). A \
          per-call `path` must canonicalize to at-or-under one of these allowed \
          trees{worktree_note}:\n\n\
          {root_line}\n\
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
-         More without spending a turn: `kaibo://config` (full config — casts, backends, \
-         tools, limits), `kaibo://tools` (attachments, overrides, async), \
-         `kaibo://kaish/*` (shell idioms)."
+         More without spending a turn: `kaibo://config`, `kaibo://tools`, \
+         `kaibo://kaish/*`."
     )
 }
 

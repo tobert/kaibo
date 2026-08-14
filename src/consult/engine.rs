@@ -5797,6 +5797,7 @@ mod tests {
             base_url: Some("http://localhost:13305/api/v1".into()),
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -5849,6 +5850,7 @@ mod tests {
             base_url: Some(crate::credentials::HOSTED_OPENAI_BASE_URL.into()),
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -5911,6 +5913,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -5988,6 +5991,7 @@ mod tests {
             base_url: Some("https://llm-gateway.example.internal/v1".into()),
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6032,6 +6036,7 @@ mod tests {
             base_url: Some(crate::credentials::HOSTED_OPENAI_BASE_URL.into()),
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6074,6 +6079,7 @@ mod tests {
             base_url: Some("https://gateway.example.ts.net".into()),
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6108,6 +6114,7 @@ mod tests {
             base_url: Some("https://llm-gateway.example.internal".into()),
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6146,6 +6153,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: Some(key_file.to_str().unwrap().to_string()),
+            api_key_cmd: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6194,6 +6202,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: Some(key_file.to_str().unwrap().to_string()),
+            api_key_cmd: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: crate::config::DataCollection::Allow,
@@ -6230,6 +6239,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: Some(key_file.to_str().unwrap().to_string()),
+            api_key_cmd: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6257,6 +6267,47 @@ mod tests {
         assert_eq!(
             params["provider"]["data_collection"], "deny",
             "the privacy pin coexists with the disable"
+        );
+    }
+
+    /// A key from a DECLARED COMMAND reaches the arm exactly like a key-file key:
+    /// `Arm::from_slot` runs the command once at construction (the lazy
+    /// client-build resolution), trims its stdout, and builds the rig client with
+    /// it. The stub is invoked by absolute path — no PATH dependence.
+    #[cfg(unix)]
+    #[test]
+    fn openrouter_arm_builds_from_a_declared_key_command() {
+        let defaults = crate::config::Defaults::default();
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("op-stub");
+        std::fs::write(&stub, "#!/bin/sh\nprintf 'sk-or-from-cmd\\n'\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let backend = crate::config::Backend {
+            name: "openrouter".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            api_key_cmd: Some(vec![
+                stub.to_string_lossy().into_owned(),
+                "op://Vault/Kaibo/OpenRouter".into(),
+            ]),
+            key_optional: false,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+            wire: None,
+        };
+        let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
+        let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .expect("a keyed openrouter arm builds from a key command");
+        assert_eq!(arm.model, "~anthropic/claude-sonnet-latest");
+        let params = arm.params.expect("the openrouter arm always sends params");
+        assert_eq!(
+            params["reasoning"]["effort"], defaults.synth_effort,
+            "thinking-on default survives a command-sourced key"
         );
     }
 
@@ -6352,6 +6403,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
@@ -6384,6 +6436,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             api_key_file: None,
+            api_key_cmd: None,
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
