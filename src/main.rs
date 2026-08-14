@@ -84,6 +84,21 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
 /// is byte-for-byte what it was before the CLI restructure. `common` carries the shared
 /// flags; `gates` the serve-only `--no-<tool>` toggles.
 async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
+    // The server's lifecycle belongs to whatever MCP client holds the stdio pipe, not to
+    // the terminal that client happens to be running in. Left in the launching terminal's
+    // process group, a stray job-control stop (Ctrl-Z, a backgrounded tab) freezes this
+    // process too — and if that catches turso mid-checkpoint, a live sibling can end up
+    // writing against a WAL the frozen one left half-rewritten. That is how a "short read
+    // on WAL frame" corruption showed up in the wild (2026-08-14): two kaibo processes sat
+    // stopped for most of a day after their parent `claude` session was suspended and
+    // abandoned in its terminal tab. `setsid` moves us into our own session so the
+    // launching terminal's job control can no longer reach us; shutdown then depends only
+    // on the peer closing stdio (or an explicit kill), which is already the intended MCP
+    // lifecycle. A failure here just means we're already a session/group leader — nothing
+    // to detach from, not worth failing startup over.
+    #[cfg(unix)]
+    let _ = unsafe { libc::setsid() };
+
     // Load config before logging so `server.log` can set the filter. A config error
     // is fatal and must be visible even though tracing isn't up yet — go to stderr.
     let config_path = common
