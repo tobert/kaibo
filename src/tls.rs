@@ -61,3 +61,35 @@ pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {
         .build()
         .map_err(|e| anyhow!("http client init: {e}"))
 }
+
+/// A client for fetching an artifact from an address a **provider** chose
+/// ([`crate::cas::fetch_artifact_bytes`]): TLS required, and exactly one hop.
+///
+/// Why this is a separate builder rather than a tightening of [`https_client`].
+/// Everywhere else in kaibo the endpoint is an operator's configured `base_url`, and
+/// where that redirects is the operator's own business. An artifact link is not: it
+/// arrives inside a provider's response, so every property kaibo checked before
+/// dialling is a promise only the first hop keeps.
+///
+/// Two settings, each closing a different hole:
+///
+/// - `https_only(true)` — reqwest's flag defaults to **false**, so an `https` URL
+///   redirecting to `http` is followed happily and the caller's scheme check would
+///   describe only the first hop.
+/// - `Policy::none()` — no redirects at all, so the bytes come from the address the
+///   provider named or from nowhere. Following a chain would let a provider response
+///   steer kaibo at an arbitrary reachable host, including a loopback or link-local
+///   address, which is a request kaibo has no reason to make. Verified against the
+///   real case before choosing it: DashScope's presigned OSS links answer `200`
+///   directly. A provider that does redirect surfaces as a `3xx`, which
+///   `fetch_artifact_bytes` reports as its own error rather than a generic failure.
+pub fn artifact_fetch_client(request_timeout: Duration) -> Result<reqwest::Client> {
+    ensure_crypto_provider();
+    reqwest::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(request_timeout.min(Duration::from_secs(10)))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| anyhow!("http client init: {e}"))
+}

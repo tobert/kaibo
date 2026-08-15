@@ -72,6 +72,18 @@ pub enum ProviderKind {
     /// `key_optional = true` beside its explicit local `base_url`. Like Stability,
     /// it is not in the built-in backend list and staffs only `image` cast slots.
     OpenAiImages,
+    /// Alibaba's DashScope multimodal-generation route — the third media kind, via
+    /// `src/dashscope.rs`, covering the `wan` image family. Media-only on purpose:
+    /// the same host serves text through an OpenAI-compatible endpoint, so a text
+    /// model on a DashScope backend belongs on `kind = "openai"` with that base URL,
+    /// and this kind stays the one wire kaibo speaks for DashScope image generation.
+    ///
+    /// This is the kind that made kaibo fetch an artifact URL. DashScope delivers
+    /// generated images as presigned links rather than inline bytes, and the CAS
+    /// addresses content by its hash — so there is no artifact at all until the bytes
+    /// are in hand (see `crate::cas::fetch_artifact_bytes`). Keyed and not built-in,
+    /// like the other media kinds: generation costs money per image.
+    DashScope,
 }
 
 impl ProviderKind {
@@ -79,7 +91,7 @@ impl ProviderKind {
     /// new kind can never be accepted by `FromStr` while staying unlisted in the message
     /// a user actually reads — a hand-maintained list in that string had already drifted
     /// once (`openrouter` shipped before it was named there).
-    pub const ALL: [ProviderKind; 7] = [
+    pub const ALL: [ProviderKind; 8] = [
         Self::Anthropic,
         Self::DeepSeek,
         Self::Gemini,
@@ -87,6 +99,7 @@ impl ProviderKind {
         Self::Openai,
         Self::Stability,
         Self::OpenAiImages,
+        Self::DashScope,
     ];
 
     /// Whether a missing credential is tolerated rather than a hard error. Only the
@@ -131,10 +144,12 @@ impl ProviderKind {
             // Reached only when an operator sets `key_optional = true` for a local
             // sd-server: header-bearer shaped, value ignored by such a server.
             | ProviderKind::OpenAiImages
-            // Never reached: Stability is not `key_optional`, so a missing key is a
-            // hard error long before a stand-in is wanted. It is a header-bearer wire,
-            // so it takes the same shape as the others if that ever changes.
-            | ProviderKind::Stability => PLACEHOLDER_OPENAI_KEY,
+            // Never reached: neither Stability nor DashScope is `key_optional`, so a
+            // missing key is a hard error long before a stand-in is wanted. Both are
+            // header-bearer wires, so they take the same shape as the others if that
+            // ever changes.
+            | ProviderKind::Stability
+            | ProviderKind::DashScope => PLACEHOLDER_OPENAI_KEY,
         }
     }
 
@@ -152,6 +167,7 @@ impl ProviderKind {
             ProviderKind::Openai => "openai",
             ProviderKind::Stability => "stability",
             ProviderKind::OpenAiImages => "openai-images",
+            ProviderKind::DashScope => "dashscope",
         }
     }
 
@@ -183,6 +199,10 @@ impl ProviderKind {
             // Reuses the constant `src/stability.rs` already resolves keys with, so the
             // facade and the config layer can never disagree about which var to read.
             ProviderKind::Stability => crate::stability::STABILITY_KEY_ENV_VAR,
+            // Its own credential, not shared with the `openai` kind: the same host
+            // serves text on an OpenAI-compatible route, and an operator who runs both
+            // wants one name per account, not one name per protocol.
+            ProviderKind::DashScope => crate::dashscope::DASHSCOPE_KEY_ENV_VAR,
         }
     }
 
@@ -199,6 +219,8 @@ impl ProviderKind {
             ProviderKind::Openai | ProviderKind::OpenAiImages => ".openai-key",
             // Same constant `src/stability.rs` uses, for the same reason as `env_var`.
             ProviderKind::Stability => crate::stability::STABILITY_KEY_FILE_NAME,
+            // Same reasoning as `env_var`: DashScope's own credential name.
+            ProviderKind::DashScope => crate::dashscope::DASHSCOPE_KEY_FILE_NAME,
         }
     }
 
@@ -222,6 +244,7 @@ impl ProviderKind {
             ProviderKind::Openai => ProviderClass::Wire(WireKind::Openai),
             ProviderKind::Stability => ProviderClass::Media(MediaKind::Stability),
             ProviderKind::OpenAiImages => ProviderClass::Media(MediaKind::OpenAiImages),
+            ProviderKind::DashScope => ProviderClass::Media(MediaKind::DashScope),
         }
     }
 
@@ -270,6 +293,9 @@ pub enum MediaKind {
     /// OpenAI's Images API shape (`/v1/images/generations`), via
     /// `src/openai_images.rs` — hosted OpenAI or a local sd-server.
     OpenAiImages,
+    /// Alibaba DashScope's multimodal-generation route, via `src/dashscope.rs` —
+    /// the `wan` image family, delivered as presigned URLs kaibo fetches.
+    DashScope,
 }
 
 /// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
@@ -307,6 +333,7 @@ impl std::str::FromStr for ProviderKind {
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
             "stability" => Ok(ProviderKind::Stability),
             "openai-images" => Ok(ProviderKind::OpenAiImages),
+            "dashscope" => Ok(ProviderKind::DashScope),
             other => Err(anyhow!(
                 "unknown provider {other:?} (expected one of: {})",
                 ProviderKind::ALL

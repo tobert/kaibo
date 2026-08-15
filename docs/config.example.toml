@@ -358,7 +358,7 @@ scratch_limit_bytes = 67108864
 # ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
 # completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
-# reasoning slots; the media kinds (stability | openai-images) serve `image` slots
+# reasoning slots; the media kinds (stability | openai-images | dashscope) serve `image` slots
 # only. The rest describes the wire (endpoint, key source, per-request deadline).
 # Models live on cast slots, never here.
 #
@@ -368,7 +368,8 @@ scratch_limit_bytes = 67108864
 # (required for a new backend), the anthropic and gemini kinds (optional —
 # unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
 # and the media kinds (optional — unset dials api.stability.ai for stability,
-# api.openai.com/v1 for openai-images); set it to point the same wire at a
+# api.openai.com/v1 for openai-images, dashscope-intl.aliyuncs.com for dashscope);
+# set it to point the same wire at a
 # compatible gateway/proxy (or a local server) instead — a ROOT in every case,
 # since the client appends its own path. Every other keyed kind rejects
 # base_url at load (rig fixes those endpoints).
@@ -483,7 +484,7 @@ wire = "responses"
 # `deep-dive`) so it can route by name without reading this file.
 #
 # Roles: explorer, synth (the reasoning phases), and image (the media member — it
-# points at a media backend, kind stability or openai-images, and staffs `generate`;
+# points at a media backend, kind stability, openai-images, or dashscope, and staffs `generate`;
 # see the image-slot examples below). A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
 # naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
@@ -536,7 +537,7 @@ explorer = "llama/qwen2.5-coder-7b"                              # bare ref: jus
 synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # --- The `image` slot: a MEDIA member on the team. It points at a media backend
-#     (kind = "stability" or "openai-images") and produces artifacts instead of
+#     (kind = "stability", "openai-images", or "dashscope") and produces artifacts instead of
 #     text, so the reasoning tunables (effort, thinking_budget, temperature, ...)
 #     do not apply to it — writing one there is inert and kaibo://config flags it.
 #     A cast carries it beside its reasoning slots; a cast without one cannot staff
@@ -574,6 +575,26 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # [casts.local-artist]
 # image = "sdcpp/sd3.5-large"             # whatever the local server loaded
+
+# --- The dashscope kind reaches Alibaba's wan image family. base_url is optional
+#     (unset dials dashscope-intl.aliyuncs.com); a dedicated-endpoint subscription
+#     sets its own host. Either way it is a ROOT — kaibo appends the route.
+#     Media-only on purpose: the same DashScope host serves TEXT on an
+#     OpenAI-compatible endpoint, so a qwen or deepseek model there belongs on a
+#     kind = "openai" backend pointed at <host>/compatible-mode/v1, beside this one.
+#     Provider knobs (n, size, seed, negative_prompt, ...) ride the `generate` tool's
+#     fields; n is 1..4, and size is "W*H" whose total pixels must land between
+#     589824 and 2073600. DashScope delivers artifacts as presigned links rather
+#     than inline bytes, so kaibo fetches each over TLS and stores the bytes; the
+#     mime comes from that response, and a type the media store cannot name is
+#     refused rather than guessed. ---
+
+# [backends.wan]
+# kind = "dashscope"              # key: DASHSCOPE_API_KEY / ~/.dashscope-key
+# base_url = "https://ws-<id>.us-east-1.maas.aliyuncs.com"   # dedicated endpoint
+
+# [casts.wan-artist]
+# image = "wan/wan2.6-t2i"        # the request's `model` field
 
 # --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
 #     per-role value for THIS slot only; knobs you omit fall back. Available:

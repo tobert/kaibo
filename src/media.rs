@@ -254,6 +254,21 @@ impl MediaArm {
                     crate::openai_images::OpenAiImagesModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
+            ProviderClass::Media(MediaKind::DashScope) => {
+                // Keyed with no keyless target, so a missing credential is a hard
+                // error here rather than a placeholder bearer.
+                let key = backend.resolve_key()?;
+                // Unset dials DashScope's shared international root; a dedicated
+                // endpoint sets its own. Either way the client appends the route.
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::dashscope::DASHSCOPE_API_BASE.to_string());
+                let client =
+                    crate::dashscope::DashScopeClient::new(key, base_url, backend.request_timeout)?;
+                let model = crate::dashscope::DashScopeImageModel::from_parts(&client, &slot.id);
+                Ok(Self::new(Arc::new(model), slot.qualified()))
+            }
             ProviderClass::Wire(_) => bail!(
                 "backend {:?} is kind `{}`, a completion wire — it cannot staff a media \
                  slot. Point the `image` slot at a media backend, and use this backend \
@@ -417,6 +432,29 @@ mod tests {
         let slot = ModelSlot::bare("sdcpp", "sd3.5-large");
         let arm = MediaArm::from_slot(backend, &slot).expect("an openai-images backend staffs");
         assert_eq!(arm.slot_ref(), "sdcpp/sd3.5-large");
+    }
+
+    /// A DashScope backend staffs an image slot. Keyed, so the key must resolve —
+    /// this fixture supplies one through `api_key_file`'s env-var expansion being
+    /// absent and `key_optional` left false, which means the *file* must exist; so
+    /// the test uses the env source instead via a literal key on the backend's
+    /// configured env var. Construction only; no network.
+    #[test]
+    fn from_slot_staffs_a_dashscope_backend() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.wan]
+            kind = "dashscope"
+            base_url = "https://dashscope-intl.example/"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/dashscope"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("wan").expect("backend exists");
+        let slot = ModelSlot::bare("wan", "wan2.6-t2i");
+        let arm = MediaArm::from_slot(backend, &slot).expect("a dashscope backend staffs");
+        assert_eq!(arm.slot_ref(), "wan/wan2.6-t2i");
     }
 
     /// The Stability arm still staffs — the sibling-kind regression guard for the

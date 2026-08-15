@@ -157,6 +157,11 @@ pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Resul
                 crate::credentials::MediaKind::OpenAiImages,
             ) => "the endpoint's own model names, e.g. gpt-image-1 hosted or whatever a \
                   local sd-server has loaded",
+            crate::credentials::ProviderClass::Media(crate::credentials::MediaKind::DashScope) => {
+                "the wan image models, e.g. wan2.6-t2i. A DashScope host serves its \
+                 catalog on an OpenAI-compatible endpoint, so point a `kind = \"openai\"` \
+                 backend at that base URL to list them"
+            }
             // The `else` above already proved this kind has no completion wire.
             crate::credentials::ProviderClass::Wire(_) => unreachable!("wire() was None"),
         };

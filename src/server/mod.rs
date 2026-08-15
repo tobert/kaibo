@@ -870,8 +870,9 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["generate"],
         Config::cast_can_generate,
-        "a cast with an `image` slot pointing at a media backend (kind `stability` or \
-         `openai-images`) — see the image-slot examples in docs/config.example.toml",
+        "a cast with an `image` slot pointing at a media backend (kind `stability`, \
+         `openai-images`, or `dashscope`) — see the image-slot examples in \
+         docs/config.example.toml",
     ),
 ];
 
@@ -2891,8 +2892,9 @@ impl KaiboHandler {
 
     #[tool(
         description = "Generate images from a text prompt with the cast's `image` \
-            model (a media backend: Stability, or an OpenAI-compatible images \
-            endpoint — hosted gpt-image or a local stable-diffusion.cpp sd-server). \
+            model (a media backend: Stability, an OpenAI-compatible images endpoint — \
+            hosted gpt-image or a local stable-diffusion.cpp sd-server — or DashScope's \
+            wan family). \
             Bytes are never inlined: each artifact lands in kaibo's content-addressed \
             media store and the result lists per-artifact digests — a \
             kaibo://cas/<digest> address, the mime, the provider's seed when reported, \
@@ -4158,9 +4160,9 @@ by waiting — the handles keep.
 ## Generate media: `generate`
 
 `generate` turns a text prompt into images through the cast's `image` slot — a media
-backend: Stability's v2beta family, or an OpenAI-compatible images endpoint (hosted
-gpt-image, or a local stable-diffusion.cpp sd-server; one call may return several
-images via `n`). It is advertised only when a configured cast carries that slot and
+backend: Stability's v2beta family, an OpenAI-compatible images endpoint (hosted
+gpt-image, or a local stable-diffusion.cpp sd-server), or DashScope's wan family; one
+call may return several images via `n`. It is advertised only when a configured cast carries that slot and
 the media CAS is on. The result is never inline bytes: each artifact lands in kaibo's
 content-addressed store and you get its digest as a `kaibo://cas/<digest>` address, the
 mime, the provider's seed when reported, and — when the store is on disk — the real file
@@ -4168,7 +4170,8 @@ path. Provider-native
 options ride the `fields` object verbatim, each value's JSON type preserved
 (Stability: `aspect_ratio` \"16:9\", `output_format` png|jpeg|webp, `seed`,
 `negative_prompt`, `style_preset`; OpenAI-compatible: `size` \"1024x1024\", `n`,
-`quality`, `output_format` png|jpeg|webp). An operation the provider declares
+`quality`, `output_format` png|jpeg|webp; DashScope: `size` \"1024*1024\", `n` 1-4,
+`seed`, `negative_prompt`). An operation the provider declares
 deferred hands back a `job-N` on the same collect verbs above — the lane is wired,
 though every route wired today answers in-call. Every artifact gets a provenance
 sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.

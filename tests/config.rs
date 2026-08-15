@@ -2464,3 +2464,111 @@ fn persistence_cli_wins_over_lower_layers() {
         "--state-db wins over the file path"
     );
 }
+
+// --- the dashscope kind --------------------------------------------------------
+
+/// The `dashscope` kind parses from TOML and seeds its OWN key sources —
+/// deliberately not shared with the `openai` completion kind, even though the same
+/// DashScope host serves text on an OpenAI-compatible route. An operator running
+/// both wires against one account wants one credential name per account, not one per
+/// protocol. The key is required: this kind has no keyless target.
+#[test]
+fn dashscope_backend_parses_and_seeds_its_own_key_sources() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.wan]
+        kind = "dashscope"
+        "#,
+    )
+    .expect("the dashscope kind must parse");
+    let b = c.backends.get("wan").expect("backend exists");
+    assert_eq!(b.kind, kaibo::credentials::ProviderKind::DashScope);
+    assert_eq!(b.api_key_env.as_deref(), Some("DASHSCOPE_API_KEY"));
+    assert!(
+        b.api_key_file
+            .as_deref()
+            .is_some_and(|f| f.ends_with("/.dashscope-key")),
+        "the key file is DashScope's own, not the openai kind's, got: {:?}",
+        b.api_key_file
+    );
+    assert!(
+        !b.key_optional,
+        "key_optional seeds FALSE — every DashScope endpoint is keyed"
+    );
+}
+
+/// base_url is optional and legal on a dashscope backend: unset dials the shared
+/// international root, and a dedicated-endpoint subscription sets its own host. The
+/// client appends the route either way, so the value is a ROOT.
+#[test]
+fn dashscope_base_url_is_optional_and_legal() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.shared]
+        kind = "dashscope"
+
+        [backends.dedicated]
+        kind = "dashscope"
+        base_url = "https://ws-example.us-east-1.maas.aliyuncs.com"
+        "#,
+    )
+    .expect("a dashscope backend may set a base_url, and may omit it");
+    assert!(
+        c.backends.get("shared").expect("exists").base_url.is_none(),
+        "unset means the kind's own default, resolved when the arm is staffed"
+    );
+    assert_eq!(
+        c.backends
+            .get("dedicated")
+            .expect("exists")
+            .base_url
+            .as_deref(),
+        Some("https://ws-example.us-east-1.maas.aliyuncs.com")
+    );
+}
+
+/// A dashscope backend staffs an image slot — the config half of the media pairing.
+#[test]
+fn an_image_slot_can_point_at_a_dashscope_backend() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.wan]
+        kind = "dashscope"
+
+        [casts.art]
+        image = "wan/wan2.6-t2i"
+        "#,
+    )
+    .expect("an image slot on a dashscope backend loads");
+    let cast = c.casts.get("art").expect("cast exists");
+    let slot = cast
+        .slot(kaibo::config::ModelRole::Image)
+        .expect("image slot resolves");
+    assert_eq!(slot.backend, "wan");
+    assert_eq!(slot.id, "wan2.6-t2i");
+}
+
+/// A reasoning slot pointed at a dashscope backend is refused at load — the
+/// class-based guard, which is also the load-time answer to "why is my text model on
+/// the wrong kind": DashScope text belongs on a `kind = "openai"` backend.
+#[test]
+fn a_reasoning_slot_cannot_point_at_a_dashscope_backend() {
+    for role in ["explorer", "synth"] {
+        let toml = format!(
+            r#"
+            [backends.wan]
+            kind = "dashscope"
+
+            [casts.broken]
+            {role} = "wan/qwen3.8-max"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a reasoning slot on a dashscope backend must be refused at load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(role) && msg.contains("dashscope") && msg.contains("media kind"),
+            "the error names the slot, the kind, and its class, got: {msg}"
+        );
+    }
+}

@@ -477,3 +477,29 @@ fn all_tools_disabled_refuses_to_start() {
         "the failure must say why; stderr was: {stderr}"
     );
 }
+
+/// A dashscope image slot staffs `generate` — the third media kind proving the gate
+/// is class-based rather than a hand-maintained kind list.
+#[test]
+fn a_dashscope_cast_staffs_generate() {
+    let mut config = Config::from_toml_str(
+        r#"
+        [backends.wan]
+        kind = "dashscope"
+        key_optional = true
+        api_key_file = "/nonexistent-kaibo-test/dashscope"
+
+        [casts.art]
+        image = "wan/wan2.6-t2i"
+        "#,
+    )
+    .expect("fixture config parses");
+    config.tools = ToolGating::default();
+    let tools = KaiboHandler::new_with_env(config, |_| None)
+        .expect("handler builds")
+        .advertised_tools();
+    assert!(
+        tools.contains(&"generate".to_string()),
+        "a dashscope image slot must staff `generate`; got {tools:?}"
+    );
+}

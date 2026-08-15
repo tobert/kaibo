@@ -48,3 +48,78 @@ fn reqwest_client_builds_once_the_ring_provider_is_installed() {
         "the installed default provider should be ring's"
     );
 }
+
+/// The artifact-fetch client refuses plaintext on its own, not just because
+/// `cas::fetch_artifact_bytes` checks the scheme up front.
+///
+/// This is the half that check cannot cover: reqwest follows redirects, and its
+/// `https_only` flag is off by default, so an `https` artifact link that bounced to
+/// `http` would be followed. Proving the CLIENT refuses `http` proves the property
+/// holds for every hop, redirect targets included.
+///
+/// Written as a **differential**, because the obvious version of this test passes for
+/// the wrong reason: a listener that accepts and hangs up makes *both* clients error,
+/// so the test stays green even with `https_only` removed. Here the server answers a
+/// real `200`, and the assertion is that the ordinary client GETS it while the fetch
+/// client does not — which can only be true if the scheme restriction is doing the
+/// work. Verified by removing `https_only(true)` and watching this fail.
+///
+/// Coverage limit, stated rather than papered over: the fetch client's OTHER setting,
+/// `Policy::none()`, has no offline test. `https_only` means it cannot be pointed at
+/// a local plaintext fixture, and serving TLS here would need a certificate this
+/// suite has no way to trust. The redirect path is exercised only by the `#[ignore]`d
+/// live probe. An assertion that merely constructed both clients was written and
+/// deleted — it could not fail, and a test that cannot fail is worse than none.
+#[tokio::test]
+async fn the_artifact_fetch_client_refuses_plaintext_the_ordinary_client_accepts() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Answer every comer with a complete, valid response.
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let body = "ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    let url = format!("http://{addr}/artifact.png");
+
+    // The control FIRST: if this fails, the fixture is broken and the refusal below
+    // would prove nothing.
+    let ordinary = kaibo::tls::https_client(std::time::Duration::from_secs(5))
+        .expect("the ordinary client builds");
+    let ok = ordinary
+        .get(&url)
+        .send()
+        .await
+        .expect("the ordinary client has no scheme restriction, so plaintext works");
+    assert_eq!(
+        ok.status().as_u16(),
+        200,
+        "the fixture server must really answer, or the refusal below means nothing"
+    );
+
+    let fetch = kaibo::tls::artifact_fetch_client(std::time::Duration::from_secs(5))
+        .expect("the fetch client builds");
+    let err = fetch
+        .get(&url)
+        .send()
+        .await
+        .expect_err("the fetch client must refuse plaintext even when it would work");
+    assert!(
+        !err.is_timeout(),
+        "the refusal must be a scheme refusal, not a timeout: {err}"
+    );
+}
