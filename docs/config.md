@@ -777,12 +777,12 @@ headers = { authorization = "Bearer <token>" }        # file-only; values are se
 
 | Variable | Effect |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | A **root**; kaibo appends `/v1/traces` and `/v1/logs`. Setting it enables telemetry. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | A **full URL**, used verbatim. Beats the root. |
-| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | A full URL for records. |
-| `OTEL_SERVICE_NAME` | `service.name` on both Resources. |
-| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | The GenAI conventions' own content opt-in, honoured verbatim. |
-| `OTEL_SDK_DISABLED` | Turns everything off, and beats every other source. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | kaibo appends `/v1/traces` and `/v1/logs` to this value — it is a root, not a full URL. Setting it turns telemetry on. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | kaibo posts spans to this value unchanged, and ignores the root above for spans. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | kaibo posts records to this value unchanged. |
+| `OTEL_SERVICE_NAME` | kaibo sets `service.name` to this value on both Resources. |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | kaibo exports content when this is set — it is the GenAI conventions' own name for the opt-in, read here unchanged. |
+| `OTEL_SDK_DISABLED` | kaibo exports nothing, whatever any other source says. |
 
 **Precedence: `KAIBO_TELEMETRY_*` / CLI > `config.toml` > `OTEL_*` > off.** This one
 family inverts kaibo's usual env-beats-file rule, deliberately. `OTEL_*` is *ambient* —
@@ -793,29 +793,36 @@ everything, because a kill switch something else can override is not a kill swit
 
 ### What is redacted, and how
 
-Content is dropped by an **allowlist** applied on export (`src/otel_filter.rs`), not by
-declining to record it. kaibo has no choice about that: the attributes carrying content
-— `gen_ai.prompt`, `gen_ai.input.messages`, `gen_ai.tool.call.arguments`,
-`gen_ai.tool.call.result` and their siblings — are emitted inside `rig`, not by kaibo.
-The last place kaibo owns is the exporter.
+kaibo drops content at the export step, rather than by declining to record it — the
+attributes that carry content (`gen_ai.prompt`, `gen_ai.input.messages`,
+`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, and their siblings) are written
+by `rig`, so kaibo cannot decline to set them and can only decline to send them.
 
-An allowlist rather than a denylist because the failure directions are not symmetric: a
-denylist fails **open** the day a dependency emits a new content attribute, while an
-allowlist fails **closed** — an unblessed name is simply never exported, and the cost of
-being wrong is a missing field rather than leaked source.
+The rule is an **allowlist**: kaibo exports the attributes it names and drops every
+other. A denylist would name the attributes to drop instead, and it would start leaking
+the day a dependency adds a content attribute nobody has listed yet. An allowlist gets
+that case wrong in the safe direction — a new attribute is missing from a dashboard until
+someone adds it, rather than being sent.
 
-Three surfaces are filtered, not one: span attributes, **event** attributes (kaibo's own
-log lines name paths — `running kaish: cat -n src/auth.rs`), and the **error status
-description**, where a provider's response body lands. The conventions draw that last
-line the same way: `error.type` is safe and kept, `exception.message` is sensitive and
-dropped. Span names are left alone — they are `{operation} {model}` identifiers.
+kaibo filters three parts of a span, not one:
 
-`capture` is the finer knob: name individual attributes in semantic-convention spelling
-to admit them without turning the whole content set on. An unknown name is never
-exported, so a typo costs a field rather than causing a leak.
+- **Span attributes** — the obvious one.
+- **Event attributes** — kaibo's own log lines are span events, and they name paths, as
+  in `running kaish: cat -n src/auth.rs`. An event keeps its name and timestamp, so a
+  reader still sees that something happened.
+- **The error status description** — a provider puts its response body there. kaibo keeps
+  `error.type`, which is a short enum, and drops the description, which is free text. The
+  GenAI conventions draw the same line: `error.type` is safe, `exception.message` is not.
 
-`kaibo://config` reports `capture_content` and a one-line `content_policy` describing
-what is leaving, and the startup log prints the same sentence beside the endpoint.
+Span names are exported unchanged, because a span name is an identifier of the form
+`{operation} {model}` and carries no content.
+
+Use `capture` to export one attribute without exporting all of them. kaibo never exports
+a name it does not know, so a misspelled entry costs you that attribute and cannot leak
+another one.
+
+`kaibo://config` reports `capture_content` and a one-line `content_policy` naming what
+leaves, and the startup log prints the same line beside the endpoint.
 
 **What you get.** The GenAI trace tree rig produces — a tool call → `run_phase` per
 phase → `invoke_agent` → a `chat` span per model turn, carrying `gen_ai.request.model`

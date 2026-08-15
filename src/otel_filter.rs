@@ -1,4 +1,5 @@
-//! The span-attribute allowlist: what kaibo is willing to put on the wire.
+//! The span-attribute allowlist: kaibo exports the attributes named here and drops
+//! every other one.
 //!
 //! # Why a filter and not a call-site rule
 //!
@@ -10,10 +11,10 @@
 //! `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` all come from inside the
 //! dependency. kaibo cannot decline to set them; it can only decline to export them.
 //!
-//! So the guard sits at the last place kaibo owns: a transparent wrapper around the
-//! `SpanExporter`, the same shape `completion_watch::Watched` and
-//! `wire_repair::Repaired` take around their traits. Everything the SDK produces
-//! passes through [`Filtered::export`] on its way out.
+//! So the guard goes at the export step, which kaibo does own: a transparent wrapper
+//! around the `SpanExporter`, the same shape `completion_watch::Watched` and
+//! `wire_repair::Repaired` take around their traits. Every span the SDK produces
+//! passes through [`Filtered::export`] before it leaves.
 //!
 //! # An allowlist, because the failure directions are not symmetric
 //!
@@ -39,9 +40,9 @@
 //! 1. **Span attributes** — the obvious one.
 //! 2. **Event attributes.** `tracing` events inside a span become span events, and
 //!    kaibo's own log lines are events: `running kaish: cat -n src/auth.rs` names a
-//!    real path and a real intent. Event attributes go through the same allowlist;
-//!    an event whose attributes all drop keeps its name and timestamp, so the
-//!    skeleton of what happened survives without the flesh.
+//!    real path and a real command. Event attributes go through the same allowlist.
+//!    An event whose attributes all drop keeps its name and timestamp — the record
+//!    that something happened is not content, so it stays.
 //! 3. **The error status description.** A failed provider call puts the response
 //!    body there, and a failed tool call can put a source snippet there. The
 //!    semantic conventions draw exactly this line — `error.type` is a safe,
@@ -161,7 +162,7 @@ pub const CONTENT_ATTRIBUTES: &[&str] = &[
     "message",
 ];
 
-/// What this process will put on the wire.
+/// The attributes this process exports. Everything else is dropped.
 #[derive(Debug, Clone)]
 pub struct AttributePolicy {
     allow: BTreeSet<String>,
@@ -198,23 +199,26 @@ impl AttributePolicy {
         self.content
     }
 
-    /// One line for the startup log, so an operator can see what is leaving without
-    /// reading config back.
+    /// One line naming what leaves this process, for the startup log and
+    /// `kaibo://config` — an operator can read the state without reading config back.
+    ///
+    /// Both spellings state the count, because the number is the part an operator can
+    /// check against a change they just made.
     pub fn describe(&self) -> String {
         if self.content {
             format!(
-                "prompts and responses INCLUDED ({} attributes allowed)",
+                "content exported — {} attributes, including prompts and responses",
                 self.allow.len()
             )
         } else {
             format!(
-                "content redacted — metadata only ({} attributes allowed)",
+                "content redacted — {} attributes, no prompts or responses",
                 self.allow.len()
             )
         }
     }
 
-    /// Strip everything this policy does not allow, in place.
+    /// Drop every attribute this policy does not allow, in place.
     pub fn scrub(&self, span: &mut SpanData) {
         span.attributes.retain(|kv| self.allows(kv.key.as_str()));
         for event in &mut span.events.events {
@@ -289,8 +293,8 @@ mod tests {
         );
     }
 
-    /// Every attribute rig is known to emit for content is gated. This is the list
-    /// that rots on a rig bump, so it is pinned explicitly rather than inferred.
+    /// Every attribute rig is known to emit for content is gated. A rig bump can add
+    /// to this list, so it is pinned by name rather than inferred.
     #[test]
     fn every_content_attribute_rig_emits_is_gated() {
         for name in [
@@ -365,14 +369,27 @@ mod tests {
         );
     }
 
-    /// The startup line says which mode is live, in words an operator can act on.
+    /// The startup line says which mode is live, in words an operator can act on, and
+    /// states the count either way — the number is what someone checks against a
+    /// change they just made.
     #[test]
-    fn describe_names_the_mode() {
-        assert!(AttributePolicy::new(false, &[])
-            .describe()
-            .contains("redacted"));
-        assert!(AttributePolicy::new(true, &[])
-            .describe()
-            .contains("INCLUDED"));
+    fn describe_names_the_mode_and_the_count() {
+        let off = AttributePolicy::new(false, &[]).describe();
+        assert!(off.contains("redacted"), "got: {off}");
+        assert!(
+            off.contains("no prompts or responses"),
+            "the redacted line must say what is absent, not only that it is redacted: {off}"
+        );
+        let on = AttributePolicy::new(true, &[]).describe();
+        assert!(
+            on.contains("including prompts and responses"),
+            "the opted-in line must name what is now leaving: {on}"
+        );
+        for line in [&off, &on] {
+            assert!(
+                line.chars().any(|c| c.is_ascii_digit()),
+                "both spellings state the attribute count: {line}"
+            );
+        }
     }
 }

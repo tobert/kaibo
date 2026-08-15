@@ -952,7 +952,7 @@ pub struct TelemetryConfig {
     /// rule — "instrumentations SHOULD NOT capture them by default, but SHOULD
     /// provide an option for users to opt in" — and name
     /// `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` as the opt-in, which
-    /// kaibo honours. Enforced by [`crate::otel_filter`], an allowlist applied on
+    /// kaibo honors. Enforced by [`crate::otel_filter`], an allowlist applied on
     /// the way out; see that module for why it is a filter and not a call-site rule.
     pub capture_content: bool,
     /// Extra attribute names to export, beyond the safe set — semantic-convention
@@ -3303,8 +3303,8 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
             telemetry.service_name = Some(v);
         }
     }
-    // The conventions' own name for the content opt-in. kaibo honours it verbatim so
-    // an operator who has set it for other instrumentations gets the same behaviour
+    // The conventions' own name for the content opt-in. kaibo reads it unchanged so
+    // an operator who has set it for other instrumentations gets the same behavior
     // here without learning a kaibo-specific spelling.
     if let Some(v) = get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT") {
         if telemetry.capture_content.is_none() {
