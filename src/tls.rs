@@ -61,3 +61,24 @@ pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {
         .build()
         .map_err(|e| anyhow!("http client init: {e}"))
 }
+
+/// The same client, but TLS is enforced on **every** hop rather than only the one
+/// kaibo dialled — for fetching an artifact from an address a *provider* chose
+/// ([`crate::cas::fetch_artifact_bytes`]).
+///
+/// Why this is a separate builder. reqwest follows up to ten redirects by default
+/// and its `https_only` flag defaults to false, so an `https` URL that redirects to
+/// `http` is followed happily. Everywhere else in kaibo the endpoint is an operator's
+/// configured `base_url`, and a redirect chain off it is the operator's own business.
+/// An artifact link is not: it arrives inside a provider response, so the scheme kaibo
+/// checked up front is a promise only the first hop keeps. `https_only(true)` makes it
+/// hold for the rest of the chain, which is what the caller's refusal claims.
+pub fn https_only_client(request_timeout: Duration) -> Result<reqwest::Client> {
+    ensure_crypto_provider();
+    reqwest::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(request_timeout.min(Duration::from_secs(10)))
+        .https_only(true)
+        .build()
+        .map_err(|e| anyhow!("http client init: {e}"))
+}

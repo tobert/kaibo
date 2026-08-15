@@ -1424,6 +1424,9 @@ pub const MAX_FETCH_BYTES: usize = 1 << 26;
 pub enum FetchError {
     /// The URL is not `https`. kaibo fetches artifacts over TLS only — a provider
     /// handing back a plaintext link is a provider to fix, not a body to trust.
+    /// This names the address kaibo was given; a *redirect* to plaintext is refused
+    /// by the client itself (`tls::https_only_client`) and surfaces as
+    /// [`FetchError::Transport`].
     #[error(
         "artifact URL must use https, but {0} does not — kaibo fetches generated \
          artifacts over TLS only"
@@ -1479,8 +1482,11 @@ pub async fn fetch_artifact_bytes(
     if !url.starts_with("https://") {
         return Err(FetchError::NotHttps(url.to_string()));
     }
+    // `https_only`, not the plain client: the check above only covers the address
+    // kaibo was handed, and reqwest follows redirects. A provider-chosen link that
+    // bounced to plaintext would otherwise defeat the refusal above.
     let client =
-        crate::tls::https_client(timeout).map_err(|e| FetchError::Transport(e.to_string()))?;
+        crate::tls::https_only_client(timeout).map_err(|e| FetchError::Transport(e.to_string()))?;
     let response = client
         .get(url)
         .send()
