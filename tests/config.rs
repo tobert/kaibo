@@ -2572,3 +2572,128 @@ fn a_reasoning_slot_cannot_point_at_a_dashscope_backend() {
         );
     }
 }
+
+// --- standard OTEL_* environment ------------------------------------------------
+
+/// Helper: load with no config file and a fixed env map.
+fn load_env(pairs: &[(&str, &str)]) -> Config {
+    let owned: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    Config::load_with(
+        None,
+        Some("/nonexistent/kaibo/config.toml".into()),
+        move |k| {
+            owned
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        },
+    )
+    .expect("config loads")
+}
+
+/// A collector in the environment turns telemetry ON by itself — the optimistic
+/// enable. Safe only because content is redacted, which the same assertion pins.
+#[test]
+fn an_otlp_endpoint_in_the_environment_enables_redacted_telemetry() {
+    let c = load_env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")]);
+    assert!(c.telemetry.enabled, "an OTLP endpoint is the opt-in signal");
+    assert_eq!(
+        c.telemetry.endpoint, "http://collector:4318/v1/traces",
+        "the BASE var is a root; the signal path is appended"
+    );
+    assert!(
+        !c.telemetry.capture_content,
+        "turning on by ambient environment must never also turn on content"
+    );
+}
+
+/// The per-signal var is a FULL url and is not suffixed — the other half of the
+/// OTLP rule, and the half that would silently 404 if we got it backwards.
+#[test]
+fn the_per_signal_endpoint_is_used_verbatim_and_beats_the_base() {
+    let c = load_env(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://base:4318"),
+        (
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "http://traces:4318/custom/path",
+        ),
+    ]);
+    assert_eq!(c.telemetry.endpoint, "http://traces:4318/custom/path");
+}
+
+/// A trailing slash on the base does not produce a doubled separator.
+#[test]
+fn a_trailing_slash_on_the_base_endpoint_is_tolerated() {
+    let c = load_env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318/")]);
+    assert_eq!(c.telemetry.endpoint, "http://collector:4318/v1/traces");
+}
+
+/// The conventions' own content opt-in is honoured verbatim, so an operator who
+/// already sets it for other instrumentations gets the same behaviour here.
+#[test]
+fn the_semconv_content_env_var_opts_in() {
+    let c = load_env(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+        ("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true"),
+    ]);
+    assert!(c.telemetry.capture_content);
+}
+
+/// `OTEL_SDK_DISABLED` is a kill switch: it beats the endpoint that would have
+/// enabled telemetry, and it beats KAIBO_TELEMETRY_ENABLED asking for it. A switch
+/// something else can override is not a kill switch.
+#[test]
+fn otel_sdk_disabled_beats_everything() {
+    let c = load_env(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+        ("KAIBO_TELEMETRY_ENABLED", "true"),
+        ("OTEL_SDK_DISABLED", "true"),
+    ]);
+    assert!(
+        !c.telemetry.enabled,
+        "the standard kill switch has the last word"
+    );
+}
+
+/// KAIBO_* beats OTEL_*: the kaibo-specific setting is the deliberate one, where
+/// OTEL_* may have been set by a platform for its own purposes.
+#[test]
+fn kaibo_env_beats_the_ambient_otel_env() {
+    let c = load_env(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://ambient:4318"),
+        (
+            "KAIBO_TELEMETRY_ENDPOINT",
+            "http://deliberate:4318/v1/traces",
+        ),
+    ]);
+    assert_eq!(c.telemetry.endpoint, "http://deliberate:4318/v1/traces");
+}
+
+/// An explicit `enabled = false` in the file is absolute — ambient environment may
+/// supply what you left blank, never override what you wrote.
+#[test]
+fn an_explicit_file_disable_survives_an_ambient_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[telemetry]\nenabled = false\n").expect("write");
+    let c = Config::load_with(Some(path), None, |k| {
+        (k == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| "http://collector:4318".to_string())
+    })
+    .expect("config loads");
+    assert!(
+        !c.telemetry.enabled,
+        "a stated refusal must beat the ambient environment"
+    );
+}
+
+/// With nothing in the environment, telemetry stays off — the optimistic enable is
+/// triggered by a real endpoint, not by the feature existing.
+#[test]
+fn no_otel_environment_leaves_telemetry_off() {
+    let c = load_env(&[]);
+    assert!(!c.telemetry.enabled);
+    assert!(!c.telemetry.capture_content);
+}

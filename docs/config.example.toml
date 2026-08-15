@@ -259,20 +259,44 @@ scratch_limit_bytes = 67108864
                                 # POSIX-unrestricted. A typo here is a load error.
 
 # ---------------------------------------------------------------------------
-# [telemetry] — OpenTelemetry export: traces and logs. OFF BY DEFAULT, and that
-# default is load-bearing: kaibo reads private source, and the spans rig emits carry
-# prompts, completions, and source snippets. A default run ships NOTHING. Enabling
-# opens an OUTBOUND OTLP/HTTP connection to `endpoint` — allowed under stdio-only
-# (kaibo never *binds* a socket), but a real boundary, so it's opt-in. rig already
-# emits the GenAI span tree (a tool call → each phase → each model turn, with token
-# usage); this just exports it. `logs` adds kaibo's own tracing events, which the
-# span tree does not carry. Transport is OTLP/HTTP + protobuf, reusing kaibo's
-# reqwest — no gRPC. Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,LOGS,LOGS_ENDPOINT,
-# TIMEOUT_SECS,SERVICE_NAME}. `headers` is file-only (a value can be a secret).
+# [telemetry] — OpenTelemetry export: traces and logs.
+#
+# Two separate questions, and kaibo answers them separately:
+#
+#   1. Do spans leave at all?     `enabled`
+#   2. Do they carry CONTENT?     `capture_content`  (default false)
+#
+# Content is off by default and that default is load-bearing: kaibo reads private
+# source, and the spans rig emits carry prompts, completions, and source snippets.
+# With it off, a trace carries model ids, token counts, durations, finish reasons,
+# and exit codes — enough to answer "what did this cost and where did the time go"
+# and nothing you would mind a collector holding. Enforced by an ALLOWLIST applied
+# on export, so an attribute nobody blessed is dropped even if a future dependency
+# starts emitting it.
+#
+# `enabled` turns ON BY ITSELF when the standard OTLP environment is present — if
+# OTEL_EXPORTER_OTLP_ENDPOINT (or ..._TRACES_ENDPOINT) is set, kaibo exports there.
+# That is safe precisely because content is redacted. Set `enabled = false` here to
+# refuse regardless of the environment; an explicit false always wins. OTEL_SDK_DISABLED
+# turns everything off and beats every other source.
+#
+# Standard environment kaibo honours: OTEL_EXPORTER_OTLP_ENDPOINT (a ROOT — the signal
+# path is appended), OTEL_EXPORTER_OTLP_{TRACES,LOGS}_ENDPOINT (FULL urls), OTEL_SERVICE_NAME,
+# OTEL_SDK_DISABLED, and OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT — the GenAI
+# semantic conventions' own name for the content opt-in.
+#
+# Precedence: KAIBO_TELEMETRY_* / CLI  >  this file  >  OTEL_*  >  off. OTEL_* sits
+# lowest on purpose: it is ambient, set by a platform for its own collector, so it may
+# supply what you left blank but never override what you wrote.
+#
+# Enabling opens an OUTBOUND OTLP/HTTP connection — allowed under stdio-only (kaibo
+# never *binds* a socket). Transport is OTLP/HTTP + protobuf, reusing kaibo's reqwest
+# — no gRPC. Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,LOGS,LOGS_ENDPOINT,TIMEOUT_SECS,
+# SERVICE_NAME,CAPTURE_CONTENT}. `headers` and `capture` are file-only.
 # ---------------------------------------------------------------------------
 
 # [telemetry]
-# enabled      = true                                # default false — opt in here
+# enabled      = true                                # default: on if OTEL_* names an endpoint
 # endpoint     = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
 # logs         = true                                # default true when enabled
 # Where log records go. Omit it and kaibo derives the sibling of `endpoint` when that
@@ -284,6 +308,15 @@ scratch_limit_bytes = 67108864
 # VALUES are secrets — they never appear in the kaibo://config render (only the
 # header names do).
 # headers = { authorization = "Bearer <token>" }
+# Export prompts, completions, and tool payloads on the spans. Default false. The
+# GenAI semantic conventions say instrumentations SHOULD NOT capture these by
+# default; kaibo also honours their env spelling,
+# OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
+# capture_content = false
+# Admit individual attributes beyond the safe set, by semantic-convention name —
+# the finer knob when you want one field rather than all of them. Unknown names are
+# simply never exported, so a typo costs you a field, never a leak.
+# capture = ["gen_ai.output.messages"]
 
 # ---------------------------------------------------------------------------
 # [cas] — the media content-addressed store: where an artifact-producing tool writes

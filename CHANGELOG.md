@@ -19,6 +19,11 @@ record. Each later release appends a new section at the top.
 
 - **`kind = "dashscope"`** — a media backend for Alibaba's wan image family, so
   `generate` can run on a DashScope subscription.
+- **kaibo honours the standard `OTEL_*` environment**, and exports to
+  `OTEL_EXPORTER_OTLP_ENDPOINT` without further configuration.
+- **`[telemetry] capture_content`** — prompts, completions, and tool payloads are
+  redacted from exported spans unless you opt in.
+- **`[telemetry] capture`** — admit individual attributes by semantic-convention name.
 
 ### Changed
 
@@ -27,6 +32,9 @@ record. Each later release appends a new section at the top.
   fetches the link by hand with their key.
 - **Every outbound request now identifies itself as `kaibo/<version>`** — kaibo's
   traffic previously carried no `User-Agent` at all.
+- **Telemetry enables itself when an OTLP endpoint is in the environment**, which is
+  safe because content is redacted by default. An explicit `enabled = false` still wins,
+  and `OTEL_SDK_DISABLED` beats everything.
 
 ### Fixed
 

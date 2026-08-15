@@ -185,6 +185,21 @@ where
         .build()
         .context("building the OTLP/HTTP span exporter")?;
 
+    // Every span leaves through the allowlist. Wrapping the exporter — rather than
+    // filtering at the call sites — is the only option available: the attributes
+    // carrying prompts and tool payloads are emitted inside rig, not by kaibo. See
+    // `crate::otel_filter`.
+    let policy = crate::otel_filter::AttributePolicy::new(cfg.capture_content, &cfg.capture);
+    // Say what is leaving, at the moment it starts leaving. An operator who enabled
+    // this through an ambient OTEL_* endpoint may not have thought about kaibo at
+    // all, so the line names the destination and the content policy together.
+    tracing::info!(
+        endpoint = %cfg.endpoint,
+        policy = %policy.describe(),
+        "telemetry enabled — exporting spans"
+    );
+    let exporter = crate::otel_filter::Filtered::new(exporter, policy);
+
     let resource = Resource::builder()
         .with_service_name(cfg.service_name.clone())
         .build();
