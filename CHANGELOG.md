@@ -25,6 +25,8 @@ record. Each later release appends a new section at the top.
 - **kaibo now fetches a generated artifact's URL when that is how a provider delivers
   it**, over TLS and size-bounded, instead of refusing it — otherwise the operator
   fetches the link by hand with their key.
+- **Every outbound request now identifies itself as `kaibo/<version>`** — kaibo's
+  traffic previously carried no `User-Agent` at all.
 
 ### Fixed
 

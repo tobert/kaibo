@@ -39,6 +39,26 @@ pub fn ensure_crypto_provider() {
     });
 }
 
+/// What kaibo calls itself on every outbound request: `kaibo/<version>`.
+///
+/// reqwest sends no `User-Agent` unless one is set, so before this existed kaibo's
+/// traffic arrived anonymous — `accept: */*` and a `host:` header, nothing else. Being
+/// named is ordinary good manners toward a provider, and it has two practical edges:
+/// an unnamed client draws the pessimistic rate-limit bucket, and a bot filter in front
+/// of an object store is far likelier to refuse one. That second case became real when
+/// [`artifact_fetch_client`] started dialling a CDN directly, where a refusal would
+/// surface as an opaque 403 on a request the operator does not know kaibo makes.
+///
+/// Nothing is disclosed by this that the request did not already carry — these are
+/// keyed endpoints, so the credential identifies the account before the header does.
+/// Short by choice (no URL, no OS or arch): enough for a provider to attribute traffic,
+/// no more.
+///
+/// The one request that does not carry it is the OTLP span export, whose client the
+/// OpenTelemetry SDK builds itself (see `telemetry.rs`) — and that one goes to the
+/// operator's own collector, where identifying kaibo to itself buys nothing.
+pub const USER_AGENT: &str = concat!("kaibo/", env!("CARGO_PKG_VERSION"));
+
 /// Build a reqwest HTTPS client carrying a per-request deadline — the **one**
 /// construction site for every provider client (rig completions and provider batches
 /// alike), so the `rustls-no-provider` + ring contract lives in exactly one place
@@ -56,6 +76,7 @@ pub fn ensure_crypto_provider() {
 pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {
     ensure_crypto_provider();
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .timeout(request_timeout)
         .connect_timeout(request_timeout.min(Duration::from_secs(10)))
         .build()
@@ -86,6 +107,7 @@ pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {
 pub fn artifact_fetch_client(request_timeout: Duration) -> Result<reqwest::Client> {
     ensure_crypto_provider();
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .timeout(request_timeout)
         .connect_timeout(request_timeout.min(Duration::from_secs(10)))
         .https_only(true)

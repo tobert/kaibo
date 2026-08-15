@@ -123,3 +123,61 @@ async fn the_artifact_fetch_client_refuses_plaintext_the_ordinary_client_accepts
         "the refusal must be a scheme refusal, not a timeout: {err}"
     );
 }
+
+/// kaibo names itself on the wire. Observed on a real socket rather than asserted
+/// against the builder, because the question is what a provider actually receives.
+///
+/// This started as a gap, not a regression: reqwest sends no `User-Agent` unless one
+/// is set, so kaibo's traffic arrived carrying only `accept` and `host`. The
+/// assertions below are deliberately about the header's PRESENCE and shape, not its
+/// exact version — pinning the version would turn every release into a test edit.
+#[tokio::test]
+async fn outbound_requests_name_kaibo_and_its_version() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Serve one request and hand back its head.
+    async fn capture(port_tx: tokio::sync::oneshot::Sender<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        port_tx
+            .send(listener.local_addr().unwrap().to_string())
+            .unwrap();
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap();
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            .await;
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(capture(tx));
+    let addr = rx.await.unwrap();
+    let client = kaibo::tls::https_client(std::time::Duration::from_secs(5)).unwrap();
+    let _ = client.get(format!("http://{addr}/probe")).send().await;
+    let head = server.await.unwrap();
+
+    let ua = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("user-agent:"))
+        .map(|l| l["user-agent:".len()..].trim().to_string())
+        .unwrap_or_else(|| panic!("no User-Agent reached the server; head was:\n{head}"));
+    assert_eq!(
+        ua,
+        kaibo::tls::USER_AGENT,
+        "the wire value must be exactly the constant, not a reqwest default"
+    );
+    assert!(
+        ua.starts_with("kaibo/"),
+        "a provider reading its logs should see kaibo by name, got {ua:?}"
+    );
+    assert!(
+        ua.len() > "kaibo/".len(),
+        "the version must actually be interpolated, got {ua:?}"
+    );
+    // Short form, decided deliberately: no URL, no OS, no arch.
+    assert!(
+        !ua.contains("http") && !ua.contains(' '),
+        "the short form carries a name and a version and nothing else, got {ua:?}"
+    );
+}
