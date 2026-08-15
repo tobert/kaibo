@@ -37,6 +37,7 @@ pub mod mcp_log;
 pub mod media;
 pub mod openai_images;
 pub mod orientation;
+pub mod otel_filter;
 pub mod progress;
 pub mod sandbox;
 pub mod server;

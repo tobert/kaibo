@@ -944,16 +944,36 @@ pub struct TelemetryConfig {
     pub timeout: Duration,
     /// `service.name` on the OTLP Resource — how this process shows up in traces.
     pub service_name: String,
+    /// Whether exported spans carry prompts, completions, and tool payloads.
+    ///
+    /// **Off by default**, which is what makes telemetry safe to enable
+    /// optimistically: a redacted trace carries model ids, token counts, durations,
+    /// and exit codes, and no source. The GenAI semantic conventions state the same
+    /// rule — "instrumentations SHOULD NOT capture them by default, but SHOULD
+    /// provide an option for users to opt in" — and name
+    /// `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` as the opt-in, which
+    /// kaibo honors. Enforced by [`crate::otel_filter`], an allowlist applied on
+    /// the way out; see that module for why it is a filter and not a call-site rule.
+    pub capture_content: bool,
+    /// Extra attribute names to export, beyond the safe set — semantic-convention
+    /// spellings, e.g. `gen_ai.output.messages`. The finer knob beside
+    /// [`capture_content`](Self::capture_content): admit one field without admitting
+    /// all of them. File-only; a list has no clean single-env-var form.
+    pub capture: Vec<String>,
 }
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
+            // Off unless something says otherwise — but "something" now includes a
+            // standard OTLP endpoint in the environment, resolved in `load_with`.
             enabled: false,
             // The session's `otlp-mcp` collector and most local collectors listen
             // here; flipping `enabled` alone targets localhost, never a remote.
             endpoint: "http://localhost:4318/v1/traces".to_string(),
             logs: true,
+            capture_content: false,
+            capture: Vec::new(),
             logs_endpoint: None,
             headers: BTreeMap::new(),
             timeout: Duration::from_secs(10),
@@ -2418,6 +2438,8 @@ struct RawTelemetry {
     headers: Option<BTreeMap<String, String>>,
     timeout_secs: Option<u64>,
     service_name: Option<String>,
+    capture_content: Option<bool>,
+    capture: Option<Vec<String>>,
 }
 
 /// The `[persistence]` stanza — durable sessions + batch handles. `enabled` defaults on;
@@ -2899,6 +2921,8 @@ fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
         headers: raw.headers.unwrap_or(d.headers),
         timeout,
         service_name: raw.service_name.unwrap_or(d.service_name),
+        capture_content: raw.capture_content.unwrap_or(d.capture_content),
+        capture: raw.capture.unwrap_or(d.capture),
     })
 }
 
@@ -3227,6 +3251,67 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     // disable_builtins is a list — file-only, no env form.
 
     let telemetry = raw.telemetry.get_or_insert_with(Default::default);
+
+    // --- The standard OTEL_* environment ---------------------------------------
+    //
+    // Applied BEFORE the KAIBO_* block below, and only into fields the config file
+    // left unset, so the precedence reads: KAIBO_* / CLI > config.toml > OTEL_* >
+    // off. That deliberately inverts kaibo's usual env-beats-file rule for this one
+    // family, and the reason is that OTEL_* is AMBIENT: a platform sets it for its
+    // own collector, not necessarily aiming it at kaibo. An operator who wrote
+    // `enabled = false` means it, and nothing in the environment may override that.
+    //
+    // The payoff is that a host already exporting telemetry gets kaibo's spans with
+    // no kaibo-specific configuration at all — safe to do only because content is
+    // redacted unless separately opted into (see `capture_content`).
+    let otel_bool = |v: &str| {
+        let v = v.trim().to_ascii_lowercase();
+        !v.is_empty() && v != "0" && v != "false" && v != "no"
+    };
+    // Per-signal endpoints are FULL URLs; the base is a ROOT the signal path is
+    // appended to. That is the OTLP spec's own rule, and getting it backwards would
+    // post spans to the wrong path and 404 against a real collector.
+    let otel_base = get("OTEL_EXPORTER_OTLP_ENDPOINT");
+    let otel_traces = get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").or_else(|| {
+        otel_base
+            .as_ref()
+            .map(|b| format!("{}/v1/traces", b.trim_end_matches('/')))
+    });
+    let otel_logs = get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").or_else(|| {
+        otel_base
+            .as_ref()
+            .map(|b| format!("{}/v1/logs", b.trim_end_matches('/')))
+    });
+    if let Some(endpoint) = otel_traces {
+        if telemetry.endpoint.is_none() {
+            telemetry.endpoint = Some(endpoint);
+        }
+        // An endpoint in the environment is the opt-in signal: it means someone runs
+        // a collector and expects processes to speak to it. Only when the file is
+        // silent — an explicit `enabled = false` stays false.
+        if telemetry.enabled.is_none() {
+            telemetry.enabled = Some(true);
+        }
+    }
+    if let Some(endpoint) = otel_logs {
+        if telemetry.logs_endpoint.is_none() {
+            telemetry.logs_endpoint = Some(endpoint);
+        }
+    }
+    if let Some(v) = get("OTEL_SERVICE_NAME") {
+        if telemetry.service_name.is_none() {
+            telemetry.service_name = Some(v);
+        }
+    }
+    // The conventions' own name for the content opt-in. kaibo reads it unchanged so
+    // an operator who has set it for other instrumentations gets the same behavior
+    // here without learning a kaibo-specific spelling.
+    if let Some(v) = get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT") {
+        if telemetry.capture_content.is_none() {
+            telemetry.capture_content = Some(otel_bool(&v));
+        }
+    }
+
     if let Some(v) = get("KAIBO_TELEMETRY_ENABLED") {
         // Same on/off grammar as the KAIBO_NO_* flags, but here it can flip a
         // file-enabled exporter *off* too — so set the parsed bool either way.
@@ -3256,6 +3341,23 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_TELEMETRY_SERVICE_NAME") {
         telemetry.service_name = Some(v);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_CAPTURE_CONTENT") {
+        // Same on/off grammar as the other KAIBO_* toggles, and set either way so it
+        // can turn a file-enabled capture back off.
+        let on = {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        };
+        telemetry.capture_content = Some(on);
+    }
+    // The SDK's standard kill switch, applied LAST so it beats every other source
+    // including KAIBO_*. An operator reaching for it wants everything off, and a
+    // switch something else can override is not a kill switch.
+    if let Some(v) = get("OTEL_SDK_DISABLED") {
+        if otel_bool(&v) {
+            telemetry.enabled = Some(false);
+        }
     }
     // headers is a map — file-only, no env form (same call as disable_builtins).
 

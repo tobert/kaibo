@@ -222,6 +222,16 @@ pub(crate) fn render_config_resource(
         service_name: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         header_names: Vec<String>,
+        /// Whether exported spans carry prompts, completions, and tool payloads.
+        /// The single most consequential telemetry fact for an operator, so it is
+        /// reported even when false.
+        capture_content: bool,
+        /// One line naming what that means in practice — the same sentence the
+        /// startup log prints, so the two can never disagree.
+        content_policy: String,
+        /// Attribute names admitted beyond the safe set, if any.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        capture: Vec<String>,
     }
 
     /// Persistence as resolved. `path` is the state db kaibo would open (absent only
@@ -590,6 +600,8 @@ pub(crate) fn render_config_resource(
         headers: telemetry_headers,
         timeout: telemetry_timeout,
         service_name: telemetry_service_name,
+        capture_content: telemetry_capture_content,
+        capture: telemetry_capture,
     } = &config.telemetry;
     let doc = ConfigDoc {
         allowed_paths: allowed_set
@@ -670,6 +682,13 @@ pub(crate) fn render_config_resource(
             timeout_secs: telemetry_timeout.as_secs(),
             service_name: telemetry_service_name.clone(),
             header_names: telemetry_headers.keys().cloned().collect(),
+            capture_content: *telemetry_capture_content,
+            content_policy: crate::otel_filter::AttributePolicy::new(
+                *telemetry_capture_content,
+                telemetry_capture,
+            )
+            .describe(),
+            capture: telemetry_capture.clone(),
         },
         persistence: PersistenceDoc {
             enabled: config.persistence.enabled,

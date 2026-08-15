@@ -259,20 +259,35 @@ scratch_limit_bytes = 67108864
                                 # POSIX-unrestricted. A typo here is a load error.
 
 # ---------------------------------------------------------------------------
-# [telemetry] — OpenTelemetry export: traces and logs. OFF BY DEFAULT, and that
-# default is load-bearing: kaibo reads private source, and the spans rig emits carry
-# prompts, completions, and source snippets. A default run ships NOTHING. Enabling
-# opens an OUTBOUND OTLP/HTTP connection to `endpoint` — allowed under stdio-only
-# (kaibo never *binds* a socket), but a real boundary, so it's opt-in. rig already
-# emits the GenAI span tree (a tool call → each phase → each model turn, with token
-# usage); this just exports it. `logs` adds kaibo's own tracing events, which the
-# span tree does not carry. Transport is OTLP/HTTP + protobuf, reusing kaibo's
-# reqwest — no gRPC. Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,LOGS,LOGS_ENDPOINT,
-# TIMEOUT_SECS,SERVICE_NAME}. `headers` is file-only (a value can be a secret).
+# [telemetry] — OpenTelemetry export: traces and logs.
+#
+# Two knobs, two questions. `enabled` decides whether spans leave at all.
+# `capture_content` decides whether they carry prompts, completions, and tool
+# payloads — default FALSE, so a span carries model ids, token counts, durations,
+# finish reasons, and exit codes, and no source.
+#
+# `enabled` defaults ON when OTEL_EXPORTER_OTLP_ENDPOINT or
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set — kaibo exports to the collector the
+# environment already names. Set `enabled = false` here to refuse whatever the
+# environment says; an explicit false always wins. OTEL_SDK_DISABLED turns every
+# signal off and beats every other source.
+#
+# Precedence: KAIBO_TELEMETRY_* / CLI > this file > OTEL_* > off. OTEL_* ranks last
+# because it is ambient — a platform sets it for its own collector, so it fills in
+# what you left blank and never overrides what you wrote.
+#
+# Enabling opens an OUTBOUND OTLP/HTTP connection — allowed under stdio-only, because
+# kaibo never *binds* a socket. Transport is OTLP/HTTP with protobuf, reusing kaibo's
+# reqwest — no gRPC.
+#
+# Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,LOGS,LOGS_ENDPOINT,TIMEOUT_SECS,SERVICE_NAME,
+# CAPTURE_CONTENT}, plus the standard OTEL_* set. `headers` and `capture` are
+# file-only. Which attributes survive redaction, and why the guard is an allowlist:
+# kaibo://config/guide, "Telemetry".
 # ---------------------------------------------------------------------------
 
 # [telemetry]
-# enabled      = true                                # default false — opt in here
+# enabled      = true                                # default: on if OTEL_* names an endpoint
 # endpoint     = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
 # logs         = true                                # default true when enabled
 # Where log records go. Omit it and kaibo derives the sibling of `endpoint` when that
@@ -284,6 +299,15 @@ scratch_limit_bytes = 67108864
 # VALUES are secrets — they never appear in the kaibo://config render (only the
 # header names do).
 # headers = { authorization = "Bearer <token>" }
+# Export prompts, completions, and tool payloads on the spans. Default false — the
+# GenAI semantic conventions say an instrumentation must not capture these unless
+# asked. kaibo reads their env spelling too,
+# OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
+# capture_content = false
+# Export named attributes beyond the default set, in semantic-convention spelling —
+# use this when you want one field rather than all of them. A name kaibo does not
+# know is never exported, so a typo costs a field and never leaks one.
+# capture = ["gen_ai.output.messages"]
 
 # ---------------------------------------------------------------------------
 # [cas] — the media content-addressed store: where an artifact-producing tool writes

@@ -743,20 +743,86 @@ implemented.
 
 ## Telemetry (OpenTelemetry traces and logs)
 
-**Off by default.** kaibo reads a private codebase, and the spans `rig-core` emits carry
-prompts, completions, and source snippets. A default run ships nothing off-box, so
-`[telemetry]` is opt-in.
+kaibo splits two questions that are usually conflated:
+
+1. **Do spans leave at all?** — `enabled`
+2. **Do they carry content?** — `capture_content`, default **false**
+
+That split is what lets telemetry be useful and safe at the same time. kaibo reads a
+private codebase, and the spans `rig-core` emits carry prompts, completions, and source
+snippets — so those are redacted unless you ask for them. What remains is model ids,
+token counts, durations, finish reasons, and exit codes: enough to answer *what did this
+cost and where did the time go*, with nothing a collector should not hold.
+
+**`enabled` turns on by itself when the standard OTLP environment is present.** If
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is set, kaibo
+exports there without any kaibo-specific configuration. That is only defensible because
+content is redacted; if you opt content in, you are choosing to send it to whatever that
+variable points at.
 
 ```toml
 [telemetry]
-enabled       = true                                # default false
-endpoint      = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
-logs          = true                                # default true when enabled
-logs_endpoint = "http://localhost:4318/v1/logs"     # omit to derive from endpoint
-timeout_secs  = 10                                  # per-export deadline; must be > 0
-service_name  = "kaibo"                             # service.name on both Resources
-headers = { authorization = "Bearer <token>" }      # file-only; values are secrets
+enabled         = true                                # default: on if OTEL_* names an endpoint
+endpoint        = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
+logs            = true                                # default true when enabled
+logs_endpoint   = "http://localhost:4318/v1/logs"     # omit to derive from endpoint
+timeout_secs    = 10                                  # per-export deadline; must be > 0
+service_name    = "kaibo"                             # service.name on both Resources
+capture_content = false                               # prompts/completions/tool payloads
+capture         = ["gen_ai.output.messages"]          # admit individual attributes
+headers = { authorization = "Bearer <token>" }        # file-only; values are secrets
 ```
+
+### The standard environment
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | kaibo appends `/v1/traces` and `/v1/logs` to this value — it is a root, not a full URL. Setting it turns telemetry on. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | kaibo posts spans to this value unchanged, and ignores the root above for spans. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | kaibo posts records to this value unchanged. |
+| `OTEL_SERVICE_NAME` | kaibo sets `service.name` to this value on both Resources. |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | kaibo exports content when this is set — it is the GenAI conventions' own name for the opt-in, read here unchanged. |
+| `OTEL_SDK_DISABLED` | kaibo exports nothing, whatever any other source says. |
+
+**Precedence: `KAIBO_TELEMETRY_*` / CLI > `config.toml` > `OTEL_*` > off.** This one
+family inverts kaibo's usual env-beats-file rule, deliberately. `OTEL_*` is *ambient* —
+a platform sets it for its own collector, not necessarily aiming it at kaibo — so it may
+supply what you left blank and never override what you wrote. An explicit
+`enabled = false` is absolute. `OTEL_SDK_DISABLED` is the one exception that beats
+everything, because a kill switch something else can override is not a kill switch.
+
+### What is redacted, and how
+
+kaibo drops content at the export step, rather than by declining to record it — the
+attributes that carry content (`gen_ai.prompt`, `gen_ai.input.messages`,
+`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, and their siblings) are written
+by `rig`, so kaibo cannot decline to set them and can only decline to send them.
+
+The rule is an **allowlist**: kaibo exports the attributes it names and drops every
+other. A denylist would name the attributes to drop instead, and it would start leaking
+the day a dependency adds a content attribute nobody has listed yet. An allowlist gets
+that case wrong in the safe direction — a new attribute is missing from a dashboard until
+someone adds it, rather than being sent.
+
+kaibo filters three parts of a span, not one:
+
+- **Span attributes** — the obvious one.
+- **Event attributes** — kaibo's own log lines are span events, and they name paths, as
+  in `running kaish: cat -n src/auth.rs`. An event keeps its name and timestamp, so a
+  reader still sees that something happened.
+- **The error status description** — a provider puts its response body there. kaibo keeps
+  `error.type`, which is a short enum, and drops the description, which is free text. The
+  GenAI conventions draw the same line: `error.type` is safe, `exception.message` is not.
+
+Span names are exported unchanged, because a span name is an identifier of the form
+`{operation} {model}` and carries no content.
+
+Use `capture` to export one attribute without exporting all of them. kaibo never exports
+a name it does not know, so a misspelled entry costs you that attribute and cannot leak
+another one.
+
+`kaibo://config` reports `capture_content` and a one-line `content_policy` naming what
+leaves, and the startup log prints the same line beside the endpoint.
 
 **What you get.** The GenAI trace tree rig produces — a tool call → `run_phase` per
 phase → `invoke_agent` → a `chat` span per model turn, carrying `gen_ai.request.model`
