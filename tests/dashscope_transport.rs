@@ -252,5 +252,13 @@ async fn a_response_with_no_images_is_refused() {
         })
         .await
         .expect_err("no images is not a success");
-    assert!(format!("{err:#}").contains("no images"), "got: {err:#}");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("without an image") && msg.contains("zero artifacts"),
+        "the refusal says what came back and why it is not a success, got: {msg}"
+    );
+    assert!(
+        msg.contains("again"),
+        "and it says what to do next, got: {msg}"
+    );
 }

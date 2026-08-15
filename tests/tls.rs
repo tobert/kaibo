@@ -63,6 +63,13 @@ fn reqwest_client_builds_once_the_ring_provider_is_installed() {
 /// real `200`, and the assertion is that the ordinary client GETS it while the fetch
 /// client does not — which can only be true if the scheme restriction is doing the
 /// work. Verified by removing `https_only(true)` and watching this fail.
+///
+/// Coverage limit, stated rather than papered over: the fetch client's OTHER setting,
+/// `Policy::none()`, has no offline test. `https_only` means it cannot be pointed at
+/// a local plaintext fixture, and serving TLS here would need a certificate this
+/// suite has no way to trust. The redirect path is exercised only by the `#[ignore]`d
+/// live probe. An assertion that merely constructed both clients was written and
+/// deleted — it could not fail, and a test that cannot fail is worse than none.
 #[tokio::test]
 async fn the_artifact_fetch_client_refuses_plaintext_the_ordinary_client_accepts() {
     use tokio::io::AsyncWriteExt as _;
@@ -104,7 +111,7 @@ async fn the_artifact_fetch_client_refuses_plaintext_the_ordinary_client_accepts
         "the fixture server must really answer, or the refusal below means nothing"
     );
 
-    let fetch = kaibo::tls::https_only_client(std::time::Duration::from_secs(5))
+    let fetch = kaibo::tls::artifact_fetch_client(std::time::Duration::from_secs(5))
         .expect("the fetch client builds");
     let err = fetch
         .get(&url)

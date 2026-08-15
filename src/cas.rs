@@ -1443,6 +1443,16 @@ pub enum FetchError {
          is short-lived, so generate again rather than reusing an old address"
     )]
     Status { status: u16 },
+    /// The address redirected. kaibo fetches an artifact from the address the
+    /// provider named or from nowhere, so a chain is refused rather than followed —
+    /// named separately from [`FetchError::Status`] because "the link expired" would
+    /// be the wrong diagnosis entirely.
+    #[error(
+        "the artifact link redirected ({status}), and kaibo fetches a generated artifact \
+         from the address the provider named rather than following it onward — the \
+         provider is returning an indirect link where a direct one is expected"
+    )]
+    Redirected { status: u16 },
     /// The artifact is larger than [`MAX_FETCH_BYTES`].
     #[error(
         "the generated artifact is {size} bytes, over kaibo's {limit}-byte ceiling for \
@@ -1482,17 +1492,25 @@ pub async fn fetch_artifact_bytes(
     if !url.starts_with("https://") {
         return Err(FetchError::NotHttps(url.to_string()));
     }
-    // `https_only`, not the plain client: the check above only covers the address
-    // kaibo was handed, and reqwest follows redirects. A provider-chosen link that
-    // bounced to plaintext would otherwise defeat the refusal above.
-    let client =
-        crate::tls::https_only_client(timeout).map_err(|e| FetchError::Transport(e.to_string()))?;
+    // Not the plain client: the check above covers only the address kaibo was handed,
+    // and reqwest both follows redirects and leaves `https_only` off by default. See
+    // `tls::artifact_fetch_client` for what each setting closes.
+    let client = crate::tls::artifact_fetch_client(timeout)
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
     let response = client
         .get(url)
         .send()
         .await
         .map_err(|e| FetchError::Transport(e.to_string()))?;
     let status = response.status();
+    // Reported before the generic status check so a redirect reads as what it is.
+    // Redirects are not followed, so a 3xx arrives here as a response rather than as
+    // the artifact, and "the link expired" would be the wrong thing to tell someone.
+    if status.is_redirection() {
+        return Err(FetchError::Redirected {
+            status: status.as_u16(),
+        });
+    }
     if !status.is_success() {
         return Err(FetchError::Status {
             status: status.as_u16(),
