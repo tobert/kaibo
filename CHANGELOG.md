@@ -15,6 +15,17 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+
+- **`kind = "dashscope"`** — a media backend for Alibaba's wan image family, so
+  `generate` can run on a DashScope subscription.
+
+### Changed
+
+- **kaibo now fetches a generated artifact's URL when that is how a provider delivers
+  it**, over TLS and size-bounded, instead of refusing it — otherwise the operator
+  fetches the link by hand with their key.
+
 ### Fixed
 
 - **Bump `kaish-kernel` to 0.14.1** — the explorer's shell no longer drops piped or

@@ -1409,3 +1409,121 @@ fn normalize(p: &Path) -> PathBuf {
     }
     out
 }
+
+// --- Fetching artifact bytes -------------------------------------------------
+
+/// The ceiling on one fetched artifact, in bytes. A generated image is single-digit
+/// megabytes (a 1280×1280 PNG measured 1.9 MiB), so this leaves generous headroom
+/// while keeping a wrong or hostile `Content-Length` from being answered with
+/// unbounded memory. Enforced twice: against the declared length before any body is
+/// read, and against the running total while it is.
+pub const MAX_FETCH_BYTES: usize = 1 << 26;
+
+/// Everything that can go wrong fetching an artifact into the CAS.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    /// The URL is not `https`. kaibo fetches artifacts over TLS only — a provider
+    /// handing back a plaintext link is a provider to fix, not a body to trust.
+    #[error(
+        "artifact URL must use https, but {0} does not — kaibo fetches generated \
+         artifacts over TLS only"
+    )]
+    NotHttps(String),
+    /// The request never completed (DNS, connect, TLS, timeout, dropped body).
+    #[error("fetching the generated artifact failed: {0}")]
+    Transport(String),
+    /// A non-2xx. A presigned link that has expired lands here, which is why the
+    /// status is named: it is the difference between "retry the generation" and
+    /// "something is wrong with the account".
+    #[error(
+        "fetching the generated artifact returned {status} — a presigned artifact link \
+         is short-lived, so generate again rather than reusing an old address"
+    )]
+    Status { status: u16 },
+    /// The artifact is larger than [`MAX_FETCH_BYTES`].
+    #[error(
+        "the generated artifact is {size} bytes, over kaibo's {limit}-byte ceiling for \
+         one artifact — ask the provider for a smaller size"
+    )]
+    TooLarge { size: usize, limit: usize },
+    /// A 2xx that carried no body. Never stored: an empty object would take a real
+    /// digest and read back as a valid, empty artifact.
+    #[error(
+        "the generated artifact came back empty — zero bytes is never treated as a \
+         successful generation"
+    )]
+    Empty,
+}
+
+/// Fetch one generated artifact's bytes over TLS, bounded by `timeout` and
+/// [`MAX_FETCH_BYTES`]. Returns the bytes and the response's `Content-Type` when it
+/// sent one, so a caller can prefer the server's own spelling over its guess.
+///
+/// **Why the CAS owns this.** kaibo's other media providers hand back inline bytes,
+/// and for a long time kaibo refused artifact URLs outright. DashScope only delivers
+/// presigned links, and a content-addressed store cannot address what it has not
+/// read: the digest *is* the address, so bytes are not a convenience here, they are
+/// the artifact's existence condition. Fetching one is the same kind of act as any
+/// other provider round trip — the address arrives inside an authenticated response
+/// to a request kaibo just made, so it is no more caller-chosen than the bytes would
+/// have been. It lives beside the store rather than inside one provider so the next
+/// URL-delivering provider reuses the bound and the refusals instead of restating
+/// them.
+///
+/// This does not write: it returns bytes for [`MediaStore::put`] to store under their
+/// hash, so the store stays the one place an object is created.
+pub async fn fetch_artifact_bytes(
+    url: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<(Vec<u8>, Option<String>), FetchError> {
+    if !url.starts_with("https://") {
+        return Err(FetchError::NotHttps(url.to_string()));
+    }
+    let client =
+        crate::tls::https_client(timeout).map_err(|e| FetchError::Transport(e.to_string()))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(FetchError::Status {
+            status: status.as_u16(),
+        });
+    }
+    // Refuse an oversized artifact before reading a byte of it, when the server says
+    // how big it is. The running check below is what holds when it does not.
+    if let Some(declared) = response.content_length() {
+        if declared > MAX_FETCH_BYTES as u64 {
+            return Err(FetchError::TooLarge {
+                size: declared as usize,
+                limit: MAX_FETCH_BYTES,
+            });
+        }
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| FetchError::Transport(e.to_string()))?
+    {
+        if bytes.len() + chunk.len() > MAX_FETCH_BYTES {
+            return Err(FetchError::TooLarge {
+                size: bytes.len() + chunk.len(),
+                limit: MAX_FETCH_BYTES,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(FetchError::Empty);
+    }
+    Ok((bytes, content_type))
+}

@@ -870,8 +870,9 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["generate"],
         Config::cast_can_generate,
-        "a cast with an `image` slot pointing at a media backend (kind `stability` or \
-         `openai-images`) — see the image-slot examples in docs/config.example.toml",
+        "a cast with an `image` slot pointing at a media backend (kind `stability`, \
+         `openai-images`, or `dashscope`) — see the image-slot examples in \
+         docs/config.example.toml",
     ),
 ];
 
@@ -2891,8 +2892,9 @@ impl KaiboHandler {
 
     #[tool(
         description = "Generate images from a text prompt with the cast's `image` \
-            model (a media backend: Stability, or an OpenAI-compatible images \
-            endpoint — hosted gpt-image or a local stable-diffusion.cpp sd-server). \
+            model (a media backend: Stability, an OpenAI-compatible images endpoint — \
+            hosted gpt-image or a local stable-diffusion.cpp sd-server — or DashScope's \
+            wan family). \
             Bytes are never inlined: each artifact lands in kaibo's content-addressed \
             media store and the result lists per-artifact digests — a \
             kaibo://cas/<digest> address, the mime, the provider's seed when reported, \

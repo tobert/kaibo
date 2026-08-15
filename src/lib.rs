@@ -28,6 +28,7 @@ pub mod config;
 pub mod consult;
 pub mod context;
 pub mod credentials;
+pub mod dashscope;
 pub mod discover;
 pub mod explorer;
 pub mod jobs;

@@ -7,10 +7,13 @@
 //! hosted OpenAI image generation (the gpt-image-1 family, at
 //! `https://api.openai.com/v1`) and local stable-diffusion.cpp's `sd-server`, which
 //! implements the same endpoint shape on a keyless local port. That is why this is
-//! ONE kind with a configurable `base_url` (default the hosted endpoint) and an
-//! optional key (`key_optional` seeds true — the sd-server case; an operator dialing
-//! hosted OpenAI sets `key_optional = false` explicitly), mirroring the `openai`
-//! completion kind's posture rather than Stability's.
+//! ONE kind with a configurable `base_url`, default the hosted endpoint. The key is
+//! REQUIRED by default, because that default endpoint is hosted OpenAI: a keyless seed
+//! would let a minimal stanza load clean and then send a placeholder bearer to
+//! api.openai.com, turning a loud load-time gap into a 401 on the first paid call. A
+//! keyless local sd-server opts in with `key_optional = true` beside its explicit local
+//! `base_url`. So the key *sources* mirror the `openai` completion kind while the
+//! requiredness matches Stability's — see [`crate::credentials::ProviderKind::key_optional`].
 //!
 //! # Sync-only, and b64 or error
 //!
@@ -25,9 +28,16 @@
 //! rejects the `response_format` parameter outright; older families (dall-e-2/3)
 //! default to URLs unless asked. So [`build_request_body`] seeds
 //! `response_format = "b64_json"` for every model family EXCEPT gpt-image-1's, and
-//! [`parse_response`] refuses a URL-only entry loudly — kaibo never fetches artifact
-//! URLs (a second network hop to an address the provider chose is a different trust
-//! shape than decoding bytes already in hand).
+//! [`parse_response`] refuses a URL-only entry loudly.
+//!
+//! That refusal is **this kind's rule, not kaibo's** — the distinction matters since
+//! `src/dashscope.rs` landed and does fetch its artifact URLs. The two cases differ in
+//! what the alternative costs. Here bytes are available for the asking, so a URL means
+//! the request lost its `response_format` and the credits were already spent; refusing
+//! is free and names a fix. DashScope delivers links and nothing else, so refusing
+//! there would only move the same fetch into the operator's shell with the key on a
+//! command line. The shared bound and refusals for a fetch live in
+//! [`crate::cas::fetch_artifact_bytes`].
 //!
 //! # Mime: from the request, not the response
 //!
@@ -200,9 +210,10 @@ impl std::fmt::Display for OpenAiImagesError {
                     write!(
                         f,
                         "Images API data[{index}] carries a URL instead of `b64_json` — \
-                         kaibo never fetches artifact URLs; artifacts must arrive as \
-                         base64. This model family defaults to URLs and appears to have \
-                         ignored (or been overridden on) `response_format = \"b64_json\"`"
+                         this API delivers bytes, so a URL here means the request lost \
+                         `response_format = \"b64_json\"`. Send it, or drop the \
+                         `response_format` field and let kaibo seed it. This model \
+                         family defaults to URLs when it is not asked"
                     )
                 } else {
                     write!(
@@ -791,8 +802,12 @@ mod tests {
         );
     }
 
-    /// A URL-only entry is refused loudly, naming the b64 requirement — kaibo never
-    /// fetches artifact URLs.
+    /// A URL-only entry is refused loudly, naming the b64 requirement AND the fix.
+    ///
+    /// The refusal is this kind's, not kaibo's — `src/dashscope.rs` fetches its
+    /// artifact URLs. So the message must point at the request that lost
+    /// `response_format`, which an operator can act on, rather than at a tree-wide
+    /// stance that is no longer true.
     #[test]
     fn parse_response_url_only_entry_is_refused_naming_b64() {
         let body = serde_json::json!({
@@ -811,8 +826,13 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("b64_json") && msg.contains("never fetches"),
-            "the message names the b64 requirement and the no-URL-fetch stance, got: {msg}"
+            msg.contains("b64_json") && msg.contains("response_format"),
+            "the message names the b64 requirement and the parameter that fixes it, got: {msg}"
+        );
+        assert!(
+            !msg.contains("never fetches"),
+            "kaibo does fetch artifact URLs now (src/dashscope.rs) — this message must \
+             not claim otherwise, got: {msg}"
         );
     }
 
