@@ -186,6 +186,30 @@ impl TurnRecord {
     }
 }
 
+/// The conventions' `error.type` for a failed completion — the failure's *class*, from
+/// rig's own error enum.
+///
+/// The variant name, never the message. A metric attribute mints a time series per
+/// distinct value, and every one of these variants carries a formatted string holding
+/// a URL, a provider's error body, or a serde path — unbounded cardinality, and content
+/// on the signal built to carry none. Seven variants is the right resolution for "what
+/// kind of thing went wrong", and the message is still in the error the caller gets.
+fn completion_error_type(error: &CompletionError) -> &'static str {
+    match error {
+        CompletionError::HttpError(_) => "http_error",
+        CompletionError::JsonError(_) => "json_error",
+        CompletionError::UrlError(_) => "url_error",
+        CompletionError::RequestError(_) => "request_error",
+        CompletionError::ResponseError(_) => "response_error",
+        CompletionError::ProviderError(_) => "provider_error",
+        CompletionError::ProviderResponse(_) => "provider_response_error",
+        // rig's enum is `#[non_exhaustive]`. A variant added upstream lands here
+        // rather than failing our build, and "other" is the honest label for a class
+        // we have not named yet — the metric keeps working across a rig bump.
+        _ => "other",
+    }
+}
+
 /// The per-call slot [`Watched`] records into: every completion of one phase, in
 /// order. Cheaply cloneable and `Send + Sync`, because the model is cloned into each
 /// agent rig builds (once per loop iteration, again for the forced final turn) and
@@ -250,19 +274,49 @@ impl CompletionLog {
 pub struct Watched<M> {
     inner: M,
     log: CompletionLog,
+    /// Who this arm calls, for the GenAI client metrics. `None` for an arm with no
+    /// provider behind it — the offline scripted client — which records nothing; see
+    /// [`crate::metrics::PhaseIdentity`].
+    ident: Option<MetricIdent>,
+}
+
+/// The owned half of [`crate::metrics::CallIdent`]. Owned because this wrapper is
+/// cloned into every agent rig builds and must outlive the call site that named it.
+#[derive(Clone, Debug)]
+struct MetricIdent {
+    provider: crate::credentials::ProviderKind,
+    model: String,
 }
 
 impl<M> Watched<M> {
-    /// Wrap `model` so its completions record into `log`.
-    pub fn new(model: M, log: CompletionLog) -> Self {
-        Self { inner: model, log }
+    /// Wrap `model` so its completions record into `log`, and — when the arm names a
+    /// provider — into the client metrics.
+    pub fn new(
+        model: M,
+        log: CompletionLog,
+        ident: Option<crate::metrics::PhaseIdentity>,
+        model_name: &str,
+    ) -> Self {
+        Self {
+            inner: model,
+            log,
+            ident: ident.map(|i| MetricIdent {
+                provider: i.provider,
+                model: model_name.to_string(),
+            }),
+        }
     }
 }
 
 /// Wrap a completion model so every turn records into `log` — the drop-in at an
 /// agent-builder call site, mirroring [`traced`](crate::tool_span::traced) for tools.
-pub fn watched<M: CompletionModel>(model: M, log: CompletionLog) -> Watched<M> {
-    Watched::new(model, log)
+pub fn watched<M: CompletionModel>(
+    model: M,
+    log: CompletionLog,
+    ident: Option<crate::metrics::PhaseIdentity>,
+    model_name: &str,
+) -> Watched<M> {
+    Watched::new(model, log, ident, model_name)
 }
 
 impl<M: CompletionModel> CompletionModel for Watched<M> {
@@ -276,14 +330,46 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
     /// one here would have to invent a log nobody holds, silently discarding every
     /// observation; a panic names the correct constructor instead.
     fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-        unreachable!("Watched is built by `watched(model, log)`, never by CompletionModel::make")
+        unreachable!(
+            "Watched is built by `watched(model, log, ..)`, never by CompletionModel::make"
+        )
     }
 
+    /// Still a pure passthrough: the response and every error are returned untouched.
+    /// What it now also does is *time* the call, because this is the one place kaibo
+    /// sees a single provider request begin and end — rig's agent hook fires per turn
+    /// of the outer loop, which is a different bracket once a turn retries.
     async fn completion(
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        let response = self.inner.completion(request).await?;
+        let started = std::time::Instant::now();
+        let result = self.inner.completion(request).await;
+        let elapsed = started.elapsed();
+
+        if let Some(ident) = &self.ident {
+            let call = crate::metrics::CallIdent {
+                provider: ident.provider,
+                model: &ident.model,
+            };
+            match &result {
+                // A failed call has no usage to report, but its duration is the
+                // number an operator most wants when a provider is degrading.
+                Err(error) => {
+                    crate::metrics::record_completion(
+                        call,
+                        elapsed,
+                        None,
+                        Some(completion_error_type(error)),
+                    );
+                }
+                Ok(response) => {
+                    crate::metrics::record_completion(call, elapsed, Some(&response.usage), None);
+                }
+            }
+        }
+
+        let response = result?;
         self.log.push(TurnRecord::observe(&response));
         Ok(response)
     }
@@ -490,7 +576,7 @@ mod tests {
 
         let bare = model.completion(req()).await.expect("bare completion");
         let log = CompletionLog::new();
-        let wrapped = watched(model.clone(), log.clone())
+        let wrapped = watched(model.clone(), log.clone(), None, "scripted")
             .completion(req())
             .await
             .expect("wrapped completion");
@@ -529,7 +615,9 @@ mod tests {
         let log = CompletionLog::new();
 
         let bare = model.completion(req()).await;
-        let wrapped = watched(model.clone(), log.clone()).completion(req()).await;
+        let wrapped = watched(model.clone(), log.clone(), None, "scripted")
+            .completion(req())
+            .await;
 
         assert_eq!(
             format!("{:?}", wrapped.unwrap_err()),
@@ -551,7 +639,7 @@ mod tests {
             ))
         });
         let log = CompletionLog::new();
-        watched(model, log.clone())
+        watched(model, log.clone(), None, "scripted")
             .completion(req())
             .await
             .expect("completion");

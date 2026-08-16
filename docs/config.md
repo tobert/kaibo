@@ -612,8 +612,11 @@ Everything else follows one naming rule:
 | ignore scope | `kaish.ignore.scope` *(`"enforced"` \| `"advisory"`; default `"enforced"`)* | — | — |
 | telemetry on/off | `telemetry.enabled` *(default false)* | `KAIBO_TELEMETRY_ENABLED` | — |
 | OTLP traces endpoint | `telemetry.endpoint` | `KAIBO_TELEMETRY_ENDPOINT` | — |
+| traces signal on/off | `telemetry.traces` *(default true when enabled)* | `KAIBO_TELEMETRY_TRACES` | — |
 | logs signal on/off | `telemetry.logs` *(default true when enabled)* | `KAIBO_TELEMETRY_LOGS` | — |
 | OTLP logs endpoint | `telemetry.logs_endpoint` *(derived from `endpoint` when omitted)* | `KAIBO_TELEMETRY_LOGS_ENDPOINT` | — |
+| metrics signal on/off | `telemetry.metrics` *(default true when enabled)* | `KAIBO_TELEMETRY_METRICS` | — |
+| OTLP metrics endpoint | `telemetry.metrics_endpoint` *(derived from `endpoint` when omitted)* | `KAIBO_TELEMETRY_METRICS_ENDPOINT` | — |
 | export timeout (s) | `telemetry.timeout_secs` *(must be > 0)* | `KAIBO_TELEMETRY_TIMEOUT_SECS` | — |
 | trace service name | `telemetry.service_name` | `KAIBO_TELEMETRY_SERVICE_NAME` | — |
 | export headers | `telemetry.headers` *(map; file-only — values are secrets)* | — | — |
@@ -741,12 +744,13 @@ unusable backend surfaces only when a call to it fails. Project-local layering (
 repo-root `.kaibo.toml` merged over the user config) is a plausible later addition, not
 implemented.
 
-## Telemetry (OpenTelemetry traces and logs)
+## Telemetry (OpenTelemetry traces, logs, and metrics)
 
-kaibo splits two questions that are usually conflated:
+kaibo splits three questions that are usually conflated:
 
-1. **Do spans leave at all?** — `enabled`
-2. **Do they carry content?** — `capture_content`, default **false**
+1. **Does anything leave at all?** — `enabled`
+2. **Which signals leave?** — `traces`, `logs`, `metrics`, each default **true** under `enabled`
+3. **Do spans carry content?** — `capture_content`, default **false**
 
 That split is what lets telemetry be useful and safe at the same time. kaibo reads a
 private codebase, and the spans `rig-core` emits carry prompts, completions, and source
@@ -764,8 +768,11 @@ variable points at.
 [telemetry]
 enabled         = true                                # default: on if OTEL_* names an endpoint
 endpoint        = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
+traces          = true                                # default true when enabled
 logs            = true                                # default true when enabled
 logs_endpoint   = "http://localhost:4318/v1/logs"     # omit to derive from endpoint
+metrics         = true                                # default true when enabled
+metrics_endpoint = "http://localhost:4318/v1/metrics" # omit to derive from endpoint
 timeout_secs    = 10                                  # per-export deadline; must be > 0
 service_name    = "kaibo"                             # service.name on both Resources
 capture_content = false                               # prompts/completions/tool payloads
@@ -777,9 +784,10 @@ headers = { authorization = "Bearer <token>" }        # file-only; values are se
 
 | Variable | Effect |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | kaibo appends `/v1/traces` and `/v1/logs` to this value — it is a root, not a full URL. Setting it turns telemetry on. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | kaibo appends `/v1/traces`, `/v1/logs`, and `/v1/metrics` to this value — it is a root, not a full URL. Setting it turns telemetry on. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | kaibo posts spans to this value unchanged, and ignores the root above for spans. |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | kaibo posts records to this value unchanged. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | kaibo posts measurements to this value unchanged. Setting it alone also turns telemetry on, for a platform that collects metrics and not traces. |
 | `OTEL_SERVICE_NAME` | kaibo sets `service.name` to this value on both Resources. |
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | kaibo exports content when this is set — it is the GenAI conventions' own name for the opt-in, read here unchanged. |
 | `OTEL_SDK_DISABLED` | kaibo exports nothing, whatever any other source says. |
@@ -853,6 +861,43 @@ Set `logs = false` for a collector that accepts spans but not records. Set
 the logs URL from `endpoint` only when that ends in `/v1/traces`, and **fails at startup
 naming the key** for any other shape rather than guessing a destination. A guess would
 surface only as records that never arrive.
+
+### The metrics signal
+
+Traces answer "what happened in this one call". Metrics answer "what is happening across
+every call", and they answer it without carrying anything a collector should not hold —
+**no metric in the GenAI semantic conventions has a content-bearing attribute.** Traces
+are made safe by a filter that must stay correct as `rig-core` changes; metrics need no
+filter at all. That is why `traces = false, metrics = true` is a supported posture and
+not a compromise: you keep spend, latency, and delegation, and no prompt can leave by
+that road even if the filter were wrong.
+
+kaibo emits six instruments, all histograms, all named by the conventions:
+
+| Metric | What it answers |
+|---|---|
+| `gen_ai.client.token.usage` | Spend, split by `gen_ai.token.type` (`input` / `output`) and by model |
+| `gen_ai.client.operation.duration` | How long one provider call took, including calls that failed |
+| `gen_ai.invoke_agent.duration` | How long a whole phase took, end to end |
+| `gen_ai.invoke_agent.inference_calls` | How many turns a phase used — a phase pinned at its turn cap shows as pile-up |
+| `gen_ai.invoke_agent.tool_calls` | **Did the consult driver delegate**, or read everything itself |
+| `gen_ai.execute_tool.duration` | How long one `run_kaish` / `explore′` / `view_image` took |
+
+The agent metrics carry `gen_ai.agent.name` — `synth` or `explorer` — and that label is
+what makes them worth reading. A delegated sweep is its own invocation, so its twenty
+turns are counted against `explorer`, and the driver's `tool_calls` counts only the
+delegation it made. Reading `gen_ai.invoke_agent.tool_calls` for `synth` therefore
+answers the delegation question directly, where before it took trace archaeology.
+
+Histogram bucket boundaries are the conventions' published advisory values, so kaibo's
+histograms are comparable with any other GenAI instrumentation's.
+
+**One asymmetry worth knowing.** `metrics` defaults on, and its endpoint derives from
+`endpoint` the same way `logs_endpoint` does. If your `endpoint` is non-standard and you
+have not set `metrics_endpoint`, kaibo warns and skips metrics rather than refusing to
+start — a config that worked before this signal existed must keep working. Write
+`metrics = true` explicitly and the same case becomes a startup error naming the key,
+because then you have asked for a signal kaibo cannot route.
 
 **Boundary.** Enabling opens an **outbound** OTLP connection to `endpoint`. This is
 allowed under kaibo's stdio-only invariant: kaibo can read a filesystem, so it must never

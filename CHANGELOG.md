@@ -17,6 +17,17 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`[telemetry]` exports the GenAI metrics signal** — token usage, call and phase
+  durations, turns per phase, and tool calls per phase, as the conventions name them.
+- **`gen_ai.invoke_agent.tool_calls` answers whether a consult driver delegated**,
+  split by `synth` / `explorer`, without reading a single trace.
+- **`[telemetry] traces` and `[telemetry] metrics`** — per-signal switches, so
+  `traces = false, metrics = true` exports kaibo's spend and latency and nothing else.
+  No metric can carry prompts, so that posture is safe by construction.
+- **`[telemetry] metrics_endpoint`** — omit it and kaibo derives the sibling of
+  `endpoint`, the same rule `logs_endpoint` follows.
+- **`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` turns telemetry on by itself**, for a
+  platform that collects metrics and not traces.
 - **`kind = "dashscope"`** — a media backend for Alibaba's wan image family, so
   `generate` can run on a DashScope subscription.
 - **kaibo reads the standard `OTEL_*` environment**, including `OTEL_SDK_DISABLED`.

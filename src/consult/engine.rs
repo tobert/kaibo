@@ -82,6 +82,7 @@ trait PhaseRunner: Send + Sync {
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
         break_on_tool_images: bool,
+        identity: Option<crate::metrics::PhaseIdentity>,
     ) -> PhaseFuture<'a>;
 
     /// One completion, straight to the provider — no agent, no tool loop. The
@@ -95,6 +96,7 @@ trait PhaseRunner: Send + Sync {
         temperature: Option<f64>,
         prompt: Message,
         params: Option<&'a Value>,
+        identity: Option<crate::metrics::PhaseIdentity>,
     ) -> PhaseFuture<'a>;
 }
 
@@ -125,6 +127,7 @@ where
         progress: &'a dyn ProgressSink,
         make_tools: ToolFactory<'a>,
         break_on_tool_images: bool,
+        identity: Option<crate::metrics::PhaseIdentity>,
     ) -> PhaseFuture<'a> {
         Box::pin(run_phase(
             &self.model,
@@ -138,6 +141,7 @@ where
             progress,
             make_tools,
             break_on_tool_images,
+            identity,
         ))
     }
 
@@ -148,6 +152,7 @@ where
         temperature: Option<f64>,
         prompt: Message,
         params: Option<&'a Value>,
+        identity: Option<crate::metrics::PhaseIdentity>,
     ) -> PhaseFuture<'a> {
         Box::pin(async move {
             run_completion(
@@ -159,6 +164,7 @@ where
                 temperature,
                 prompt,
                 params,
+                identity,
             )
             .await
         })
@@ -192,6 +198,11 @@ pub struct Arm {
     /// vision arm gets `view_image` when vision-in lands; a blind one never sees
     /// the tool).
     pub caps: ModelCaps,
+    /// Who this arm is, for the GenAI metrics: its provider and the cast role it
+    /// fills. `None` for an arm built through [`Arm::new`] — the offline injection
+    /// seam, where no provider is called and a recorded latency would be a fiction.
+    /// [`Arm::from_slot`] is the single live construction point and always sets it.
+    pub(crate) identity: Option<crate::metrics::PhaseIdentity>,
 }
 
 impl std::fmt::Debug for Arm {
@@ -268,6 +279,8 @@ impl Arm {
             temperature,
             params,
             caps,
+            // Set by `from_slot`, which is the only path that knows a backend.
+            identity: None,
         }
     }
 
@@ -277,7 +290,26 @@ impl Arm {
     /// falling back to the per-role `[defaults]`). This is the single place the
     /// four concrete client types live; a cast whose phases straddle any
     /// capability line — different kinds, even — is fit per-arm by construction.
+    /// Stamps the metrics identity onto whatever the wire-specific construction
+    /// below returns. Done here, once, rather than in each `WireKind` arm: this is
+    /// the only function that knows both the backend and the role, and threading two
+    /// more arguments through six construction arms would give six chances to forget
+    /// one.
     pub fn from_slot(
+        backend: &Backend,
+        slot: &ModelSlot,
+        role: ModelRole,
+        defaults: &Defaults,
+    ) -> Result<Self> {
+        let mut arm = Self::from_slot_unidentified(backend, slot, role, defaults)?;
+        arm.identity = Some(crate::metrics::PhaseIdentity {
+            provider: backend.kind,
+            agent: role.key(),
+        });
+        Ok(arm)
+    }
+
+    fn from_slot_unidentified(
         backend: &Backend,
         slot: &ModelSlot,
         role: ModelRole,
@@ -447,7 +479,13 @@ impl Arm {
                     .build()
                     .map_err(|e| anyhow!("openrouter client init: {e}"))?;
                 let model = Self::openrouter_completion_model(&client, &slot.id);
-                Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
+                Ok(Self::from_model(
+                    model,
+                    &slot.id,
+                    t.max_tokens,
+                    params,
+                    caps,
+                ))
             }
             WireKind::Openai => {
                 // Any OpenAI-compatible endpoint, addressed by the backend's base
@@ -542,6 +580,7 @@ impl Arm {
                 progress,
                 make_tools,
                 self.rewrites_tool_images(),
+                self.identity,
             )
             .await
     }
@@ -563,6 +602,7 @@ impl Arm {
                 self.temperature,
                 prompt,
                 self.params.as_ref(),
+                self.identity,
             )
             .await
     }
@@ -1101,6 +1141,7 @@ pub(crate) async fn run_phase<M, F>(
     progress: &dyn ProgressSink,
     make_tools: F,
     break_on_tool_images: bool,
+    identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -1119,6 +1160,7 @@ where
         progress,
         make_tools,
         break_on_tool_images,
+        identity,
     )
     .await
 }
@@ -1178,6 +1220,7 @@ pub(crate) async fn run_phase_logged<M, F>(
     progress: &dyn ProgressSink,
     make_tools: F,
     break_on_tool_images: bool,
+    identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -1189,6 +1232,10 @@ where
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
+    // This bracket IS the agent invocation the GenAI conventions name: it opens when
+    // the phase starts and closes when it answers or fails, which is the same span
+    // this function is instrumented with.
+    let started = std::time::Instant::now();
     let result = run_phase_loop(
         // Two wrappers, innermost first: [`retried`] sends a turn the provider could not
         // parse again, then [`watched`] records the response that finally came back. A
@@ -1196,7 +1243,12 @@ where
         // way — the order is about who resolves the failure, and the retry must resolve it
         // below the loop, which loses the transcript on a completion error
         // (`crate::completion_retry`).
-        &watched(retried(model.clone(), model_name), log.clone()),
+        &watched(
+            retried(model.clone(), model_name),
+            log.clone(),
+            identity,
+            model_name,
+        ),
         log,
         model_name,
         preamble,
@@ -1214,6 +1266,26 @@ where
     // phase reports how its last completion ended too.
     if let Some(reason) = log.last_finish_reason() {
         tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+    }
+    // The agent metrics, on every exit path for the same reason the finish reason is
+    // read here: a phase that died at turn 90 of 100 still made 90 inference calls,
+    // and the conventions say to count them. The counts come straight off the log —
+    // `len` is every completion this phase made, and each turn already recorded how
+    // many tool calls it emitted — so this is a read, not new bookkeeping.
+    //
+    // Sub-agent exclusion falls out of the structure: a delegated `explore′` sweep is
+    // its own `run_phase` with its own explorer identity, so its turns are counted
+    // against it, and the driver sees only the one tool call it made to reach it.
+    if let Some(identity) = identity {
+        let turns = log.turns();
+        crate::metrics::record_agent_invocation(
+            identity.agent,
+            model_name,
+            started.elapsed(),
+            turns.len() as u64,
+            turns.iter().map(|t| t.tool_calls as u64).sum(),
+            result.as_ref().err().map(|_| "phase_failed"),
+        );
     }
     result
 }
@@ -1584,6 +1656,7 @@ pub(crate) async fn run_completion<M>(
     temperature: Option<f64>,
     prompt: Message,
     thinking: Option<&Value>,
+    identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + 'static,
@@ -1591,53 +1664,86 @@ where
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
-    // Same two wrappers the loop uses: a single-shot lane declares no tools, so it
-    // cannot fumble a tool call, but a provider that could not shape the response
-    // (`MalformedResponse`) reaches here too and is worth the same retry.
-    let mut builder = watched(retried(model.clone(), model_name), log.clone())
+    // A single-shot lane is still an agent invocation — one with exactly one
+    // inference call and no tools. Recording it keeps `oneshot` and `deliberate`
+    // visible in the same series a consult reports into, rather than leaving a hole
+    // where the cheapest lane should be.
+    let started = std::time::Instant::now();
+    // Every exit below records the invocation, so the body runs inside a block whose
+    // value is the outcome. Three paths reach an end here — a failed call, an empty
+    // answer, and a real answer — and an agent metric that skipped two of them would
+    // undercount exactly the failures the conventions say to include.
+    let outcome = async {
+        // Same two wrappers the loop uses: a single-shot lane declares no tools, so it
+        // cannot fumble a tool call, but a provider that could not shape the response
+        // (`MalformedResponse`) reaches here too and is worth the same retry.
+        let mut builder = watched(
+            retried(model.clone(), model_name),
+            log.clone(),
+            identity,
+            model_name,
+        )
         .completion_request(prompt)
         .preamble(preamble.to_string())
         .max_tokens(max_tokens);
-    if let Some(t) = temperature {
-        builder = builder.temperature(t);
-    }
-    if let Some(params) = thinking {
-        builder = builder.additional_params(params.clone());
-    }
-    // `send()` is `model.completion(builder.build())` — the one provider call.
-    let response = builder.send().await;
-    if let Some(reason) = log.last_finish_reason() {
-        tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
-    }
-    // "model call failed" keeps this on the provider side of `classify_failure`
-    // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
-    // overload or rate limit here is still worth a caller retry.
-    let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
-    let answer = response
-        .choice
-        .iter()
-        .filter_map(|content| match content {
-            AssistantContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    // The single-shot lanes are toolless by definition, so an empty answer here can
-    // never satisfy the evidence gate the loop's recovery runs on — there is nothing
-    // gathered to write up, and no re-ask that wouldn't invite an ungrounded answer.
-    // Fail with the same diagnostics vocabulary as the loop, finish reason included
-    // (this path reads it off its own log).
-    if answer.trim().is_empty() {
-        return Err(empty_answer_error(
-            model_name,
-            1,
-            1,
-            &response.usage,
-            log.last_finish_reason().as_deref(),
-            "the single toolless completion returned no answer text, and a lane with \
+        if let Some(t) = temperature {
+            builder = builder.temperature(t);
+        }
+        if let Some(params) = thinking {
+            builder = builder.additional_params(params.clone());
+        }
+        // `send()` is `model.completion(builder.build())` — the one provider call.
+        let response = builder.send().await;
+        if let Some(reason) = log.last_finish_reason() {
+            tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
+        }
+        // "model call failed" keeps this on the provider side of `classify_failure`
+        // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
+        // overload or rate limit here is still worth a caller retry.
+        let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
+        let answer = response
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        // The single-shot lanes are toolless by definition, so an empty answer here can
+        // never satisfy the evidence gate the loop's recovery runs on — there is nothing
+        // gathered to write up, and no re-ask that wouldn't invite an ungrounded answer.
+        // Fail with the same diagnostics vocabulary as the loop, finish reason included
+        // (this path reads it off its own log).
+        if answer.trim().is_empty() {
+            return Err(empty_answer_error(
+                model_name,
+                1,
+                1,
+                &response.usage,
+                log.last_finish_reason().as_deref(),
+                "the single toolless completion returned no answer text, and a lane with \
              no tools has no gathered evidence to write up, so kaibo does not re-ask",
-        ));
+            ));
+        }
+        Ok((answer, response.usage))
     }
-    Ok((answer, response.usage))
+    .await;
+    // One inference call by definition — or two, when `retried` resent a generation
+    // the provider malformed — so the count comes off the log rather than a literal.
+    // No tools: a single-shot lane declares none, and a zero here is the honest
+    // reading that makes `oneshot` distinguishable from a consult that never
+    // delegated.
+    if let Some(identity) = identity {
+        crate::metrics::record_agent_invocation(
+            identity.agent,
+            model_name,
+            started.elapsed(),
+            log.len() as u64,
+            0,
+            outcome.as_ref().err().map(|_| "phase_failed"),
+        );
+    }
+    outcome
 }
 
 /// Run the explorer phase once and return its cited report. The explorer [`Arm`]
@@ -1892,10 +1998,7 @@ impl Tool for RunExplore {
         // Fold this sweep's tokens into the shared consult total before returning the
         // report to the driver — the synth's own `PromptResponse` will never see them.
         // Lock poisoning means another delegation panicked — surface it, don't mask.
-        *self
-            .usage_sink
-            .lock()
-            .expect("explore usage sink poisoned") += usage;
+        *self.usage_sink.lock().expect("explore usage sink poisoned") += usage;
         // A sweep that reported nothing is a *failed* sweep, not an empty one. Handing the
         // driver a blank tool result is the same silent-empty class one level down, and
         // worse in one way: the driver cannot tell a blank sweep from a sweep that found
@@ -2084,8 +2187,10 @@ fn consult_tools(
     // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
     // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
     // a `..`, or a symlink, and the reader then receives the same bytes twice.
-    let already_delivered: HashSet<PathBuf> =
-        crate::sweep_attach::delivered_seed(root, cfg.attachments.iter().map(|a| Path::new(a.path())));
+    let already_delivered: HashSet<PathBuf> = crate::sweep_attach::delivered_seed(
+        root,
+        cfg.attachments.iter().map(|a| Path::new(a.path())),
+    );
     let explore = RunExplore::new(
         explorer.clone(),
         cfg.explore.explorer_max_turns,
@@ -3045,6 +3150,8 @@ mod tests {
                 )?))])
             },
             false,
+            // Offline scripted arm: no provider is called, so nothing to attribute.
+            None,
         )
         .await
         .expect("the scripted loop answers");
@@ -3133,6 +3240,8 @@ mod tests {
                 )?))])
             },
             false,
+            // Offline scripted arm: no provider is called, so nothing to attribute.
+            None,
         )
         .await
         .expect("one malformed tool call must not fail the phase");
@@ -3225,6 +3334,8 @@ mod tests {
                 )?))])
             },
             false,
+            // Offline scripted arm: no provider is called, so nothing to attribute.
+            None,
         )
         .await
         .expect("a tool call naming a tool that does not exist must not fail the phase");
@@ -3341,6 +3452,8 @@ mod tests {
                 )?))])
             },
             false,
+            // Offline scripted arm: no provider is called, so nothing to attribute.
+            None,
         );
         let (answer, _usage) = tokio::time::timeout(Duration::from_secs(30), run)
             .await
@@ -3355,7 +3468,9 @@ mod tests {
             asked.len()
         );
         assert!(
-            asked.iter().any(|r| r.tool_choice == Some(ToolChoice::None)),
+            asked
+                .iter()
+                .any(|r| r.tool_choice == Some(ToolChoice::None)),
             "exhausting the budget must reach the forced write-up turn"
         );
     }
@@ -3524,8 +3639,14 @@ mod tests {
         // Expected = per-call usage × how many completions each model actually made.
         let ns = client.requests_for(SYNTH).len() as u64;
         let ne = client.requests_for(EXPLORER).len() as u64;
-        assert!(ns >= 2, "driver should delegate then answer (≥2 turns), got {ns}");
-        assert!(ne >= 1, "explorer should have been delegated at least one sweep");
+        assert!(
+            ns >= 2,
+            "driver should delegate then answer (≥2 turns), got {ns}"
+        );
+        assert!(
+            ne >= 1,
+            "explorer should have been delegated at least one sweep"
+        );
 
         assert_eq!(
             out.usage.input_tokens,
@@ -3653,9 +3774,15 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
-            .await
-            .expect("scripted consult should succeed");
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
     }
 
     /// The load-bearing wiring test: a sweep that calls `attach` must land its
@@ -3706,8 +3833,10 @@ mod tests {
 
         let synth_reqs = client.requests_for(SYNTH);
         assert!(
-            synth_reqs.iter().any(|r| r.transcript.contains("<file path=\"src/foo.rs\">")
-                && r.transcript.contains("fn target_marker")),
+            synth_reqs
+                .iter()
+                .any(|r| r.transcript.contains("<file path=\"src/foo.rs\">")
+                    && r.transcript.contains("fn target_marker")),
             "the driver's transcript must carry the attached file's numbered body: {:?}",
             synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
         );
@@ -3787,15 +3916,23 @@ mod tests {
                     Ok(text_response("ANSWER"))
                 }
             })
-            .on_model(EXPLORER, |_req| Ok(text_response("PLAIN REPORT: src/foo.rs:1")))
+            .on_model(EXPLORER, |_req| {
+                Ok(text_response("PLAIN REPORT: src/foo.rs:1"))
+            })
             .build();
 
         let dir = project_with_marker();
         let cfg = ConsultConfig::default();
 
-        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
-            .await
-            .expect("scripted consult should succeed");
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
 
         let synth_reqs = client.requests_for(SYNTH);
         assert!(
@@ -3940,9 +4077,15 @@ mod tests {
             ..ConsultConfig::default()
         };
 
-        consult_with("q", dir.path(), &arm(&client, EXPLORER), &arm(&client, SYNTH), &cfg)
-            .await
-            .expect("scripted consult should succeed");
+        consult_with(
+            "q",
+            dir.path(),
+            &arm(&client, EXPLORER),
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("scripted consult should succeed");
     }
 
     /// A sweep's `attach` call surfaces as `PhaseEvent::Attached` on the shared
@@ -4148,7 +4291,10 @@ mod tests {
                 .iter()
                 .any(|r| user_image_messages(&r.chat_history) > 0),
             "the OpenAI-shaped driver must receive the image on its own user turn: {:?}",
-            synth_reqs.iter().map(|r| r.chat_history.len()).collect::<Vec<_>>()
+            synth_reqs
+                .iter()
+                .map(|r| r.chat_history.len())
+                .collect::<Vec<_>>()
         );
         assert!(
             synth_reqs
@@ -4466,7 +4612,9 @@ mod tests {
                         json!({ "paths": ["src/foo.rs"] }),
                     ))
                 } else {
-                    Ok(text_response("DOSSIER REPORT: src/foo.rs is the relevant module"))
+                    Ok(text_response(
+                        "DOSSIER REPORT: src/foo.rs is the relevant module",
+                    ))
                 }
             })
             .build();
@@ -4658,7 +4806,8 @@ mod tests {
         .await
         .expect("deliberate_direct did not honor its deadline — it hung past 5s (no backstop)");
 
-        let err = outcome.expect_err("a wedged local synth must abort the deliberation, not answer");
+        let err =
+            outcome.expect_err("a wedged local synth must abort the deliberation, not answer");
         assert!(
             format!("{err:#}").contains("deadline"),
             "the abort must name the wall-clock deadline, got: {err:#}"
@@ -5092,7 +5241,9 @@ mod tests {
             finalizes[0].transcript
         );
         assert!(
-            !finalizes[0].transcript.contains("reached your research limit"),
+            !finalizes[0]
+                .transcript
+                .contains("reached your research limit"),
             "the forced turn must NOT claim a turn cap that was never hit: {:?}",
             finalizes[0].transcript
         );
@@ -5339,7 +5490,10 @@ mod tests {
         .expect_err("an explorer that reported nothing must fail, not return an empty report");
         // No tool results in its transcript, so no blind re-ask — the same gate.
         assert!(
-            !client.requests_for(EXPLORER).iter().any(is_finalize_request),
+            !client
+                .requests_for(EXPLORER)
+                .iter()
+                .any(is_finalize_request),
             "an explorer with no evidence must not be asked to report anyway"
         );
         let msg = format!("{err:#}").to_lowercase();
@@ -5547,7 +5701,11 @@ mod tests {
                     if transcript_text(req).contains("REPORT") {
                         Ok(text_response("ANSWER"))
                     } else {
-                        Ok(tool_call_response("s1", "explore", json!({ "question": "q" })))
+                        Ok(tool_call_response(
+                            "s1",
+                            "explore",
+                            json!({ "question": "q" }),
+                        ))
                     }
                 })
                 .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
@@ -5588,7 +5746,8 @@ mod tests {
             "both the driver and its sweep must emit a run_phase span, got {seen:?}"
         );
         assert!(
-            seen.iter().all(|v| v.as_deref() == Some(expected_str.as_str())),
+            seen.iter()
+                .all(|v| v.as_deref() == Some(expected_str.as_str())),
             "every run_phase span must record the exact thinking blob, got {seen:?}"
         );
 
@@ -5666,8 +5825,9 @@ mod tests {
         .await
         .unwrap();
 
-        let params =
-            |r: &crate::test_support::RecordedRequest| r.additional_params.as_ref().unwrap().clone();
+        let params = |r: &crate::test_support::RecordedRequest| {
+            r.additional_params.as_ref().unwrap().clone()
+        };
         // The adaptive synth: top-level adaptive thinking + effort, no Gemini nesting.
         for r in client.requests_for(SYNTH) {
             let p = params(&r);
@@ -6008,7 +6168,9 @@ mod tests {
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
             .expect("a responses-wire gateway arm builds offline with a placeholder key");
         assert_eq!(arm.model, "gpt-5.6-sol");
-        let params = arm.params.expect("responses-wire gateway sends Responses params");
+        let params = arm
+            .params
+            .expect("responses-wire gateway sends Responses params");
         assert_eq!(
             params["reasoning"]["effort"], "high",
             "reasoning effort reaches the gateway the same way it reaches Platform"
@@ -6272,7 +6434,10 @@ mod tests {
     /// short of the body would stay green through that.
     #[tokio::test]
     async fn openrouter_arm_enables_prompt_caching() {
-        async fn system_block(model: openrouter::CompletionModel<CaptureHttp>, http: &CaptureHttp) -> Value {
+        async fn system_block(
+            model: openrouter::CompletionModel<CaptureHttp>,
+            http: &CaptureHttp,
+        ) -> Value {
             let request = CompletionRequest {
                 model: None,
                 preamble: Some("ground every claim".into()),
@@ -6794,8 +6959,15 @@ mod tests {
         );
 
         let seeing_synth = vision_arm(&client, "synth-model");
-        let seeing = consult_tools(&explorer, dir.path(), &cfg, reports, usage_sink, &seeing_synth)
-            .expect("vision toolset builds");
+        let seeing = consult_tools(
+            &explorer,
+            dir.path(),
+            &cfg,
+            reports,
+            usage_sink,
+            &seeing_synth,
+        )
+        .expect("vision toolset builds");
         let seeing_names: Vec<String> = seeing.iter().map(|t| t.name().to_string()).collect();
         assert!(
             seeing_names.iter().any(|n| n == "view_image"),
