@@ -242,19 +242,24 @@ where
     // because a config that worked before the upgrade must not refuse to start over a
     // signal nobody asked for. The warning names the two keys either fix uses, so the
     // degraded case is still actionable rather than merely survivable.
-    let metrics_endpoint = match (cfg.metrics, resolve_metrics_endpoint(cfg)) {
-        (false, _) => None,
-        (true, Ok(endpoint)) => Some(endpoint),
-        (true, Err(e)) if cfg.metrics_explicit => return Err(e),
-        (true, Err(_)) => {
-            tracing::warn!(
+    let metrics_endpoint = if !cfg.metrics {
+        // Guarded rather than matched on a tuple, so a declined signal does no
+        // derivation work at all — the same shape `logs` above uses.
+        None
+    } else {
+        match resolve_metrics_endpoint(cfg) {
+            Ok(endpoint) => Some(endpoint),
+            Err(e) if cfg.metrics_explicit => return Err(e),
+            Err(_) => {
+                tracing::warn!(
                 endpoint = %cfg.endpoint,
                 "[telemetry] metrics is on by default but its endpoint cannot be derived \
                  from a non-standard endpoint, so metrics are not exported. Set \
                  [telemetry] metrics_endpoint to the collector's OTLP/HTTP metrics URL, \
                  or set metrics = false to stop reading this line."
-            );
-            None
+                );
+                None
+            }
         }
     };
 

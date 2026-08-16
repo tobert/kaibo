@@ -23,7 +23,7 @@
 //! | `gen_ai.client.token.usage` | [`record_completion`] | the provider's `Usage` on every turn |
 //! | `gen_ai.client.operation.duration` | [`record_completion`] | — (timed around the call) |
 //! | `gen_ai.invoke_agent.duration` | [`record_agent_invocation`] | — (timed around the phase) |
-//! | `gen_ai.invoke_agent.inference_calls` | [`record_agent_invocation`] | `CompletionLog::len` |
+//! | `gen_ai.invoke_agent.inference_calls` | [`record_agent_invocation`] | `CompletionLog::attempts` |
 //! | `gen_ai.invoke_agent.tool_calls` | [`record_agent_invocation`] | `TurnRecord::tool_calls`, summed |
 //! | `gen_ai.execute_tool.duration` | [`record_tool_execution`] | — (timed around the tool) |
 //!
@@ -39,7 +39,9 @@
 //! Straight from `metrics.yaml:188-225`, because two of them are counterintuitive:
 //!
 //! - Both agent call-count metrics are scoped to **one invocation**, and both
-//!   **include failed calls**. A phase that died at turn 90 still reports 90.
+//!   **include failed calls**. A phase that died at turn 90 still reports 90 — which
+//!   is why `inference_calls` reads `CompletionLog::attempts` and not its length: a
+//!   failed call produces no `TurnRecord`, so the length would report 89.
 //! - Both **exclude calls made by sub-agents**. kaibo's delegated `explore′` sweep is
 //!   a sub-agent invocation: it records its own `inference_calls` against its own
 //!   name, and the driver counts the delegation as **one tool call**. That is what

@@ -1277,13 +1277,14 @@ where
     // its own `run_phase` with its own explorer identity, so its turns are counted
     // against it, and the driver sees only the one tool call it made to reach it.
     if let Some(identity) = identity {
-        let turns = log.turns();
         crate::metrics::record_agent_invocation(
             identity.agent,
             model_name,
             started.elapsed(),
-            turns.len() as u64,
-            turns.iter().map(|t| t.tool_calls as u64).sum(),
+            // Attempts, not recorded turns: a call that failed produces no
+            // `TurnRecord`, and the conventions count it as an inference call anyway.
+            log.attempts(),
+            log.turns().iter().map(|t| t.tool_calls as u64).sum(),
             result.as_ref().err().map(|_| "phase_failed"),
         );
     }
@@ -1728,17 +1729,17 @@ where
         Ok((answer, response.usage))
     }
     .await;
-    // One inference call by definition — or two, when `retried` resent a generation
-    // the provider malformed — so the count comes off the log rather than a literal.
-    // No tools: a single-shot lane declares none, and a zero here is the honest
-    // reading that makes `oneshot` distinguishable from a consult that never
-    // delegated.
+    // One inference call by definition — or more, when `retried` resent a generation
+    // the provider malformed — so the count comes off the log's attempts rather than a
+    // literal, and a lane whose single call failed still reports the call it made. No
+    // tools: a single-shot lane declares none, and a zero here is the honest reading
+    // that makes `oneshot` distinguishable from a consult that never delegated.
     if let Some(identity) = identity {
         crate::metrics::record_agent_invocation(
             identity.agent,
             model_name,
             started.elapsed(),
-            log.len() as u64,
+            log.attempts(),
             0,
             outcome.as_ref().err().map(|_| "phase_failed"),
         );

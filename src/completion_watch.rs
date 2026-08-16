@@ -33,6 +33,7 @@
 //! reasoning), so holding it would grow with the transcript for a payload nothing
 //! reads. The extraction is the point; the haystack is not worth keeping.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rig_core::completion::message::AssistantContent;
@@ -220,7 +221,18 @@ fn completion_error_type(error: &CompletionError) -> &'static str {
 /// nothing to do with the kaish kernel — the log holds plain data, crosses `.await`
 /// freely, and never touches the `!Send` kernel behind `KaishWorker`.
 #[derive(Clone, Default, Debug)]
-pub struct CompletionLog(Arc<Mutex<Vec<TurnRecord>>>);
+pub struct CompletionLog {
+    turns: Arc<Mutex<Vec<TurnRecord>>>,
+    /// How many completions were *attempted*, which is not how many were recorded.
+    ///
+    /// A `TurnRecord` describes a provider *response*, so a call that failed produces
+    /// none — deliberate, and pinned by `a_provider_error_passes_through_untouched`.
+    /// That makes `turns` the wrong number for "how many inference calls did this
+    /// phase make", which the GenAI conventions say must include the failures. So the
+    /// attempt is counted separately, at the same seam, and the two answer different
+    /// questions: `turns` is what the provider said, `attempts` is what kaibo asked.
+    attempts: Arc<AtomicU64>,
+}
 
 impl CompletionLog {
     /// An empty log for one phase call.
@@ -228,14 +240,26 @@ impl CompletionLog {
         Self::default()
     }
 
-    /// Every completion recorded so far, oldest first — tool-loop turns included.
+    /// How many completions this phase attempted — every turn of the tool loop, the
+    /// forced final turn, each retry of a malformed generation, and every call that
+    /// failed. This is `gen_ai.invoke_agent.inference_calls`.
+    pub fn attempts(&self) -> u64 {
+        self.attempts.load(Ordering::Relaxed)
+    }
+
+    fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Every completion *response* recorded so far, oldest first — tool-loop turns
+    /// included. A failed call is absent; see [`attempts`](Self::attempts).
     pub fn turns(&self) -> Vec<TurnRecord> {
-        self.0.lock().expect("completion log poisoned").clone()
+        self.turns.lock().expect("completion log poisoned").clone()
     }
 
     /// The most recent completion — the turn that produced the answer (or failed to).
     pub fn last(&self) -> Option<TurnRecord> {
-        self.0
+        self.turns
             .lock()
             .expect("completion log poisoned")
             .last()
@@ -248,10 +272,10 @@ impl CompletionLog {
         self.last().and_then(|turn| turn.finish_reason)
     }
 
-    /// How many completions this phase has made — every turn of the tool loop, plus
-    /// any forced final turn.
+    /// How many completion *responses* this phase recorded. Not the inference-call
+    /// count — a failed call is missing from it; use [`attempts`](Self::attempts).
     pub fn len(&self) -> usize {
-        self.0.lock().expect("completion log poisoned").len()
+        self.turns.lock().expect("completion log poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -259,7 +283,10 @@ impl CompletionLog {
     }
 
     fn push(&self, turn: TurnRecord) {
-        self.0.lock().expect("completion log poisoned").push(turn);
+        self.turns
+            .lock()
+            .expect("completion log poisoned")
+            .push(turn);
     }
 }
 
@@ -346,6 +373,10 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
         let started = std::time::Instant::now();
         let result = self.inner.completion(request).await;
         let elapsed = started.elapsed();
+        // Counted before the outcome is inspected, so a failed call is an inference
+        // call — which is what the conventions require and what a phase that died at
+        // turn 90 has to report to be read honestly.
+        self.log.record_attempt();
 
         if let Some(ident) = &self.ident {
             let call = crate::metrics::CallIdent {
@@ -625,6 +656,12 @@ mod tests {
             "the provider's error reaches the caller unchanged"
         );
         assert!(log.is_empty(), "a failed call records no turn");
+        assert_eq!(
+            log.attempts(),
+            1,
+            "but it IS an inference call — the conventions count failures, and a phase \
+             that died at turn 90 must report 90, not 89"
+        );
     }
 
     /// A tool-call turn is recorded too — no text, one call, and whatever the
