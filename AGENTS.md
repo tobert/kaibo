@@ -147,7 +147,11 @@ project and cannot run external commands.
   shipped boundary now and then (write/external/read-escape/env/path batteries via
   `run_kaish`, plus an optional model-driven pass). It's framed as **defensive** work
   — auditing our own claims — and routes adversarial framing to a **local** cast so a
-  remote classifier never sees it. Re-run it before a release; stamp the "Last run" line.
+  remote classifier never sees it. Re-run it when the sandbox rules or the VFS change — a
+  `kaish-kernel` or `kaish-vfs` bump counts, and the 2026-07-18 run is the model — and
+  stamp the "Last run" line. A release by itself is not the trigger: the `cargo test`
+  suites guard every commit, so a release that touched neither the rules nor the VFS
+  gives the battery nothing new to find.
 - **Model loops are tested offline.** A scripted `CompletionClient` in
   `src/test_support.rs` (`#[cfg(test)]`) drives the *real* consult loop with no
   network — delegation→report aggregation, session replay, turn-cap recovery. It's
@@ -438,9 +442,11 @@ even for a one-line doc fix.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
-  `v*` tag. Before tagging: confirm the `kaish-kernel` and `turso` pins are current, re-run
-  `docs/sandbox-probes.md` and stamp its "Last run" line, and verify `cargo tree -i` is
-  empty for `aws-lc-rs` and `mimalloc` and the musl binary is `not a dynamic executable`.
+  `v*` tag. Before tagging: confirm the `kaish-kernel` and `turso` pins are current, and
+  verify `cargo tree -i` is empty for `aws-lc-rs` and `mimalloc` and the musl binary is
+  `not a dynamic executable`. Re-run `docs/sandbox-probes.md` when this release changed
+  the sandbox rules or the VFS — a `kaish-kernel` bump is the common case, so check the
+  pin first.
   After the release publishes: run the README "Verify a download" commands against a
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't
