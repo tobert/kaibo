@@ -925,9 +925,48 @@ pub enum CastUsability {
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
     /// Whether to stand up the OTLP exporter at all. `false` → zero overhead.
+    ///
+    /// The master switch over all three signals. Each signal has its own boolean
+    /// below, so an operator can take some and decline others.
     pub enabled: bool,
     /// OTLP/HTTP (protobuf) traces endpoint, e.g. `http://localhost:4318/v1/traces`.
+    ///
+    /// Also the root the other signals' endpoints are derived from, which is why it
+    /// keeps its meaning with [`traces`](Self::traces) off.
     pub endpoint: String,
+    /// Whether to export the **traces** signal. On whenever `enabled` is.
+    ///
+    /// Separable from `enabled` because traces are the content-adjacent signal: they
+    /// carry rig's span tree, which is where prompts and source snippets ride when
+    /// [`capture_content`](Self::capture_content) is on. An operator who wants
+    /// kaibo's spend and latency without that surface at all sets `traces = false,
+    /// metrics = true` — the metrics signal cannot carry content in the first place
+    /// (see `src/metrics.rs`).
+    pub traces: bool,
+    /// Whether to export the **metrics** signal. On whenever `enabled` is.
+    ///
+    /// Defaults on for the same reason [`logs`](Self::logs) does, only more so: no
+    /// metric in the GenAI conventions carries a content-bearing attribute, so this
+    /// signal is safe by construction rather than by the trace path's filter. Turn it
+    /// off for a collector that takes spans but not metrics.
+    pub metrics: bool,
+    /// OTLP/HTTP metrics endpoint. `None` derives it from
+    /// [`endpoint`](Self::endpoint) when that ends in the standard `/v1/traces`; any
+    /// other shape is a loud load error rather than a guess — the same rule
+    /// [`logs_endpoint`](Self::logs_endpoint) follows, for the same reason.
+    pub metrics_endpoint: Option<String>,
+    /// Whether the operator *wrote* `metrics`, rather than inheriting the default.
+    ///
+    /// Provenance, not a knob — it decides what an underivable metrics endpoint
+    /// means. Someone who wrote `metrics = true` against a non-standard `endpoint`
+    /// gets the same loud refusal `logs` gives, because they asked for a signal kaibo
+    /// cannot route. Someone who never mentioned metrics gets a warning and their
+    /// other signals, because the alternative is that a config working on 0.3.0
+    /// refuses to start after an upgrade over a signal they never asked for.
+    ///
+    /// This asymmetry with `logs` is deliberate: `logs` shipped with its rule, so no
+    /// working config ever broke on it.
+    pub metrics_explicit: bool,
     /// Whether to export the **logs** signal alongside traces. On whenever
     /// `enabled` is — the two ride one opt-in, because kaibo's own `tracing` events
     /// are strictly less sensitive than the prompts and completions the traces
@@ -971,10 +1010,16 @@ impl Default for TelemetryConfig {
             // The session's `otlp-mcp` collector and most local collectors listen
             // here; flipping `enabled` alone targets localhost, never a remote.
             endpoint: "http://localhost:4318/v1/traces".to_string(),
+            // Every signal rides the one opt-in. Declining a signal is a separate,
+            // deliberate act — an operator who turned telemetry on wants to see kaibo.
+            traces: true,
             logs: true,
+            metrics: true,
             capture_content: false,
             capture: Vec::new(),
             logs_endpoint: None,
+            metrics_endpoint: None,
+            metrics_explicit: false,
             headers: BTreeMap::new(),
             timeout: Duration::from_secs(10),
             service_name: "kaibo".to_string(),
@@ -2433,8 +2478,11 @@ struct RawConfig {
 struct RawTelemetry {
     enabled: Option<bool>,
     endpoint: Option<String>,
+    traces: Option<bool>,
     logs: Option<bool>,
     logs_endpoint: Option<String>,
+    metrics: Option<bool>,
+    metrics_endpoint: Option<String>,
     headers: Option<BTreeMap<String, String>>,
     timeout_secs: Option<u64>,
     service_name: Option<String>,
@@ -2916,8 +2964,12 @@ fn merge_telemetry(raw: RawTelemetry) -> Result<TelemetryConfig> {
     Ok(TelemetryConfig {
         enabled: raw.enabled.unwrap_or(d.enabled),
         endpoint: raw.endpoint.unwrap_or(d.endpoint),
+        traces: raw.traces.unwrap_or(d.traces),
         logs: raw.logs.unwrap_or(d.logs),
         logs_endpoint: raw.logs_endpoint.or(d.logs_endpoint),
+        metrics_explicit: raw.metrics.is_some(),
+        metrics: raw.metrics.unwrap_or(d.metrics),
+        metrics_endpoint: raw.metrics_endpoint.or(d.metrics_endpoint),
         headers: raw.headers.unwrap_or(d.headers),
         timeout,
         service_name: raw.service_name.unwrap_or(d.service_name),
@@ -3282,6 +3334,11 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
             .as_ref()
             .map(|b| format!("{}/v1/logs", b.trim_end_matches('/')))
     });
+    let otel_metrics = get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").or_else(|| {
+        otel_base
+            .as_ref()
+            .map(|b| format!("{}/v1/metrics", b.trim_end_matches('/')))
+    });
     if let Some(endpoint) = otel_traces {
         if telemetry.endpoint.is_none() {
             telemetry.endpoint = Some(endpoint);
@@ -3297,6 +3354,18 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
         if telemetry.logs_endpoint.is_none() {
             telemetry.logs_endpoint = Some(endpoint);
         }
+    }
+    if let Some(endpoint) = otel_metrics {
+        if telemetry.metrics_endpoint.is_none() {
+            telemetry.metrics_endpoint = Some(endpoint);
+        }
+    }
+    // A metrics-only collector in the environment turns telemetry on the same way a
+    // traces one does. Without this, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` alone —
+    // the exact shape of a platform that collects metrics and not traces — would set
+    // an endpoint kaibo never exports to.
+    if telemetry.enabled.is_none() && telemetry.metrics_endpoint.is_some() {
+        telemetry.enabled = Some(true);
     }
     if let Some(v) = get("OTEL_SERVICE_NAME") {
         if telemetry.service_name.is_none() {
@@ -3335,6 +3404,26 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_TELEMETRY_LOGS_ENDPOINT") {
         telemetry.logs_endpoint = Some(v);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_TRACES") {
+        // Same on/off grammar as the other signal toggles, and set either way so it
+        // can turn the file-enabled traces signal back off — which is the whole point
+        // of separating it from `enabled`.
+        let on = {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        };
+        telemetry.traces = Some(on);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_METRICS") {
+        let on = {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        };
+        telemetry.metrics = Some(on);
+    }
+    if let Some(v) = get("KAIBO_TELEMETRY_METRICS_ENDPOINT") {
+        telemetry.metrics_endpoint = Some(v);
     }
     if let Some(v) = get("KAIBO_TELEMETRY_TIMEOUT_SECS") {
         telemetry.timeout_secs = Some(parse_env_int("KAIBO_TELEMETRY_TIMEOUT_SECS", &v)?);
@@ -4855,8 +4944,16 @@ mod tests {
             .into_iter()
             .map(|d| d.cast)
             .filter(|c| {
-                ["plain", "off", "newer", "lifted", "dropped", "batch-off", "local-thinks"]
-                    .contains(&c.as_str())
+                [
+                    "plain",
+                    "off",
+                    "newer",
+                    "lifted",
+                    "dropped",
+                    "batch-off",
+                    "local-thinks",
+                ]
+                .contains(&c.as_str())
             })
             .collect();
         assert_eq!(

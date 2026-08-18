@@ -155,13 +155,18 @@ opentelemetry = "0.32"
 # `logs` is a default feature today and the logs signal would stop compiling without
 # it; named explicitly so a minor bump that re-sorts the defaults fails at resolve
 # time rather than by dropping a signal we ship.
-opentelemetry_sdk = { version = "0.32", features = ["logs"] }
+# `metrics` joins them for the GenAI metrics signal (src/metrics.rs), which needs the
+# SDK's meter provider and its periodic reader.
+opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics"] }
 # No `reqwest-rustls` here: that feature pulls `reqwest/default-tls` → `reqwest/rustls`
 # → aws-lc-rs, re-introducing the C provider we just dropped. The blocking exporter
 # builds a plain reqwest client and uses whatever TLS the (feature-unified) reqwest
 # was compiled with — i.e. our rustls-no-provider + ring. So we keep only the
 # transport features and let TLS come from the shared reqwest above.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-blocking-client"] }
+# `metrics` rides the same http-proto/blocking transport as the other two signals, so
+# it adds an exporter, not a second TLS stack — the aws-lc reasoning above is unchanged
+# by it (verified with `cargo tree -i aws-lc-rs`).
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "metrics", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = "0.33"
 # The LOGS signal's half of the bridge: `tracing` events → OTel log records. Traces
 # carry rig's spans (prompts, completions, token counts); this carries kaibo's own

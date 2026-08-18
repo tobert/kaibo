@@ -107,8 +107,20 @@ pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
                     "kaish.output_bytes" = field::Empty,
                 );
                 async move {
+                    // The metric measures the same bracket the span does, from the
+                    // same place, so a backend reading `gen_ai.execute_tool.duration`
+                    // and one reading the span's duration can never disagree.
+                    let started = std::time::Instant::now();
                     let result = run_traced(tool.as_ref(), context, args).await;
                     Span::current().record("outcome", if result.is_ok() { "ok" } else { "error" });
+                    // A failed tool call is still a tool execution with a duration —
+                    // the conventions say to count failures, and a tool that takes ten
+                    // seconds to fail is exactly what an operator needs to see.
+                    crate::metrics::record_tool_execution(
+                        &name,
+                        started.elapsed(),
+                        result.as_ref().err().map(tool_error_type),
+                    );
                     result
                 }
                 .instrument(span)
@@ -116,6 +128,19 @@ pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
             }) as WasmBoxedFuture<'_, Result<ToolOutput, ToolExecutionError>>
         },
     )
+}
+
+/// The conventions' `error.type` for a failed tool call — the *class* of failure, never
+/// the message.
+///
+/// A metric attribute mints one time series per distinct value, so the message (which
+/// carries paths, model ids, and shell output) would produce an unbounded series set
+/// *and* drag content onto the one signal built to carry none. rig already normalizes
+/// every tool failure into `ToolErrorKind`, whose `as_str` is documented as the stable
+/// machine-readable name — nine values, no payload. That is exactly the shape this
+/// attribute wants, so kaibo takes it rather than inventing a parallel vocabulary.
+fn tool_error_type(error: &ToolExecutionError) -> &'static str {
+    error.kind().as_str()
 }
 
 /// The erased call itself: parse, dispatch, then normalize both halves of the typed

@@ -259,12 +259,17 @@ scratch_limit_bytes = 67108864
                                 # POSIX-unrestricted. A typo here is a load error.
 
 # ---------------------------------------------------------------------------
-# [telemetry] — OpenTelemetry export: traces and logs.
+# [telemetry] — OpenTelemetry export: traces, logs, and metrics.
 #
-# Two knobs, two questions. `enabled` decides whether spans leave at all.
-# `capture_content` decides whether they carry prompts, completions, and tool
+# Two knobs, two questions. `enabled` decides whether anything leaves at all.
+# `capture_content` decides whether spans carry prompts, completions, and tool
 # payloads — default FALSE, so a span carries model ids, token counts, durations,
 # finish reasons, and exit codes, and no source.
+#
+# Each signal then has its own on/off key, all defaulting on under `enabled`. Only
+# traces can ever carry content, so `traces = false, metrics = true` exports kaibo's
+# spend, latency, and delegation with no prompt able to leave by that road — no
+# metric in the GenAI conventions has a content-bearing attribute.
 #
 # `enabled` defaults ON when OTEL_EXPORTER_OTLP_ENDPOINT or
 # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set — kaibo exports to the collector the
@@ -280,8 +285,9 @@ scratch_limit_bytes = 67108864
 # kaibo never *binds* a socket. Transport is OTLP/HTTP with protobuf, reusing kaibo's
 # reqwest — no gRPC.
 #
-# Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,LOGS,LOGS_ENDPOINT,TIMEOUT_SECS,SERVICE_NAME,
-# CAPTURE_CONTENT}, plus the standard OTEL_* set. `headers` and `capture` are
+# Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,TRACES,LOGS,LOGS_ENDPOINT,METRICS,
+# METRICS_ENDPOINT,TIMEOUT_SECS,SERVICE_NAME,CAPTURE_CONTENT}, plus the standard
+# OTEL_* set. `headers` and `capture` are
 # file-only. Which attributes survive redaction, and why the guard is an allowlist:
 # kaibo://config/guide, "Telemetry".
 # ---------------------------------------------------------------------------
@@ -289,10 +295,17 @@ scratch_limit_bytes = 67108864
 # [telemetry]
 # enabled      = true                                # default: on if OTEL_* names an endpoint
 # endpoint     = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
+# traces       = true                                # default true when enabled
 # logs         = true                                # default true when enabled
+# metrics      = true                                # default true when enabled
 # Where log records go. Omit it and kaibo derives the sibling of `endpoint` when that
 # ends in /v1/traces; any other shape is a load error rather than a guess.
 # logs_endpoint = "http://localhost:4318/v1/logs"
+# Same derivation for metrics. The one difference: with a non-standard `endpoint` and
+# no `metrics_endpoint`, a metrics you never wrote warns and stays off, while a
+# metrics you wrote as true is a load error — an upgrade must not break a config that
+# worked, but an asked-for signal kaibo cannot route must say so.
+# metrics_endpoint = "http://localhost:4318/v1/metrics"
 # timeout_secs = 10                                  # per-export deadline; must be > 0
 # service_name = "kaibo"                             # service.name on both Resources
 # Extra export headers (auth for a remote collector), sent on both signals. The

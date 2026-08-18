@@ -210,6 +210,10 @@ pub(crate) fn render_config_resource(
     struct TelemetryDoc {
         enabled: bool,
         endpoint: String,
+        /// Whether the span tree exports. Separable from `enabled` because traces are
+        /// the signal that can carry content; `metrics` cannot, so an operator may
+        /// take one and decline the other.
+        traces: bool,
         /// Whether kaibo's own `tracing` events export alongside the span tree.
         logs: bool,
         /// Where those records go, **as resolved** — the explicit `logs_endpoint` or
@@ -218,6 +222,14 @@ pub(crate) fn render_config_resource(
         /// in their head from the file.
         #[serde(skip_serializing_if = "Option::is_none")]
         logs_endpoint: Option<String>,
+        /// Whether the GenAI metrics signal exports. This one carries no content by
+        /// construction — no metric in the conventions has a content-bearing
+        /// attribute — so it is the signal to keep when declining traces.
+        metrics: bool,
+        /// Where the measurements go, **as resolved**. Absent when `metrics` is off.
+        /// Same derivation rule as `logs_endpoint`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metrics_endpoint: Option<String>,
         timeout_secs: u64,
         service_name: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -593,10 +605,18 @@ pub(crate) fn render_config_resource(
     let crate::config::TelemetryConfig {
         enabled: telemetry_enabled,
         endpoint: telemetry_endpoint,
+        traces: telemetry_traces,
         logs: telemetry_logs,
         // Read through `resolve_logs_endpoint` below, which is where the derivation
         // lives; the raw override alone would under-report where records go.
         logs_endpoint: _,
+        metrics: telemetry_metrics,
+        // Same as `logs_endpoint`: resolved below, not echoed.
+        metrics_endpoint: _,
+        // Provenance, not a knob: it decides whether an underivable metrics endpoint
+        // is a load error or a warning, which the resolved `metrics_endpoint` below
+        // already reflects by being absent.
+        metrics_explicit: _,
         headers: telemetry_headers,
         timeout: telemetry_timeout,
         service_name: telemetry_service_name,
@@ -672,12 +692,17 @@ pub(crate) fn render_config_resource(
         telemetry: TelemetryDoc {
             enabled: *telemetry_enabled,
             endpoint: telemetry_endpoint.clone(),
+            traces: *telemetry_traces,
             logs: *telemetry_logs,
             // A non-derivable endpoint is a fatal startup error, so a *running*
             // server always resolves here. Reported absent rather than guessed if
             // that ever stops being true.
             logs_endpoint: (*telemetry_logs)
                 .then(|| crate::telemetry::resolve_logs_endpoint(&config.telemetry).ok())
+                .flatten(),
+            metrics: *telemetry_metrics,
+            metrics_endpoint: (*telemetry_metrics)
+                .then(|| crate::telemetry::resolve_metrics_endpoint(&config.telemetry).ok())
                 .flatten(),
             timeout_secs: telemetry_timeout.as_secs(),
             service_name: telemetry_service_name.clone(),
