@@ -22,26 +22,48 @@
 //! model team gains nothing here. It has no new tool, kaish has no new builtin, no
 //! mount, and no knowledge that this store exists.
 //!
-//! # The write is unaimable, and so is the format
+//! # Two ways in, and `path` is the one to use
 //!
-//! Two parameters a first draft would have had, and why neither exists:
+//! A caller names a **`path`** or passes inline base64 **`content`**, exactly one. `path`
+//! is the working route and `content` is the fallback, which is the opposite of how this
+//! module was first built — the reasoning that got it wrong is worth keeping.
 //!
-//! - **No path, in either direction.** The address is the content's own hash, so there
-//!   is no destination to name; and there is no *source* path either. `save_artifact`
-//!   settled that question next door — a source-path parameter "was designed, argued,
-//!   and **dropped permanently** (2026-08-05)" — and reopening it in a neighbouring tool
-//!   would be relitigating a decision, not making one. Inline `content` is the whole
-//!   input surface. (A path would also need its own containment argument, which is a
-//!   separate review, not a rider on this one.)
+//! The first draft had `content` alone, arguing that `save_artifact` had settled the
+//! source-path question next door (designed, argued, dropped permanently, 2026-08-05).
+//! **That analogy is false, in both halves.** `save_artifact` is *model-facing*: the
+//! inner team writing out bytes it just authored, which are already in its context, and
+//! where a path parameter would hand the sandboxed team a filesystem read it is not
+//! supposed to have. `write_cas` is *operator-facing*: a client agent pointing at a file
+//! that already exists on a disk it can already read. A path grants that caller nothing
+//! it did not have.
+//!
+//! And inline-only is not merely suboptimal there, it does not work. Tool-call arguments
+//! are **completion tokens the calling model emits**, so a 3 MiB screenshot is roughly
+//! four megabytes of base64 the client has to write out one token at a time. No agent
+//! will do that, and the ones that try will truncate. `save_artifact`'s own cap doc
+//! records the same physics for the model-facing side; the conclusion for a tool whose
+//! caller has file access is a path, not a smaller cap.
+//!
+//! `content` stays for the case a path genuinely cannot serve: bytes that were never a
+//! file — an image pasted into a conversation, or one a client holds in memory.
+//!
+//! # What is still unaimable
+//!
+//! - **No destination, ever.** The address is the content's own hash, so there is
+//!   nothing to aim a write at, and no `pub` surface here takes a destination path.
+//! - **A source path is read-scoped, not free.** `path` obeys the same boundary as a
+//!   session root: canonicalize, require a regular file, require a containing allowed
+//!   tree, and then read **through the read-only kaish VFS** rather than `std::fs::read`
+//!   — the mechanism `resolve_attachments` and `view_image` already use, which closes the
+//!   check-then-open window structurally. That containment is not ceremony: the client
+//!   is itself a model, and a prompt-injected one asking kaibo to slurp `~/.ssh/id_rsa`
+//!   into the store and read it back is exactly the shape the boundary refuses.
 //! - **No `mime`.** The format is read out of the bytes' own magic number
 //!   ([`sniff_image`]), never asserted by the caller. A stated mime is a thing that can
 //!   be *wrong*: bytes stored under a lying extension make `read_cas` report a false
 //!   type and make every downstream [`Extension`] decision wrong, which is exactly the
 //!   silent corruption this codebase refuses. Deriving it means there is no parameter to
 //!   get wrong and no mismatch to detect.
-//!
-//! Between them, the whole input is bytes plus an optional label — nothing a caller can
-//! aim at anything.
 //!
 //! # Images only
 //!
@@ -124,8 +146,9 @@ pub fn sniff_image(bytes: &[u8]) -> Result<Extension, UploadError> {
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
     #[error(
-        "`content` decoded to zero bytes. An upload stores an image, so there is \
-         nothing to store. Pass the image's bytes base64-encoded in `content`."
+        "the upload is zero bytes. An upload stores an image, so there is nothing to \
+         store. Point `path` at an image file, or pass the image's bytes base64-encoded \
+         in `content`."
     )]
     Empty,
 
@@ -156,8 +179,29 @@ pub enum UploadError {
     )]
     BadLabel { cap: usize, actual: usize },
 
-    #[error("the media store refused the write: {0}")]
-    Store(String),
+    /// Sanitized when rendered, never passed through raw — two arms, because they call
+    /// for different next moves and neither may carry a number or a path.
+    ///
+    /// `CapacityExceeded` carries `current_bytes`: the store's total usage across every
+    /// project this kaibo has ever served. That is a cross-project side channel — it
+    /// tells a caller how much other projects' work is sitting in the store, and watching
+    /// it move across calls tells it more. `SaveError::Store` closes exactly this leak
+    /// for the model-facing tool; the caller here is a model too, so it closes here as
+    /// well. The operator still gets the whole typed error on the tracing log.
+    #[error("{}", sanitize_store_error(.0))]
+    Store(crate::cas::CasError),
+}
+
+/// The caller-facing rendering of a store refusal: what happened, and the next move.
+/// Never a byte count, never a path — see [`UploadError::Store`].
+fn sanitize_store_error(e: &crate::cas::CasError) -> &'static str {
+    match e {
+        crate::cas::CasError::CapacityExceeded { .. } => {
+            "kaibo's media store has no room for this image, so nothing was stored. A \
+             smaller image may still fit."
+        }
+        _ => "kaibo's media store refused this write, so nothing was stored.",
+    }
 }
 
 impl UploadError {
@@ -177,6 +221,16 @@ pub struct StoredUpload {
     /// what the caller believed it was uploading.
     pub extension: Extension,
     pub bytes: usize,
+    /// The bytes are stored and retrievable, but the sidecar beside them is not — so
+    /// nothing records what this image is or when it arrived.
+    ///
+    /// `save_artifact` reports this same middle outcome as an `Err` that carries the
+    /// digest, because its caller is a model whose next move is to name the URI in its
+    /// answer. `write_cas` reports it as a **flag on a success** instead, deliberately:
+    /// this caller's next move is to *use* the digest (feed it to an edit operation), and
+    /// an `Err` is the shape most likely to make it discard a digest that is perfectly
+    /// good. Loud, not silent, is the requirement — the result text says so plainly.
+    pub provenance_missing: bool,
 }
 
 /// Validate a label: a single short line, or nothing at all.
@@ -197,11 +251,11 @@ fn check_label(label: Option<&str>) -> Result<Option<String>, UploadError> {
     Ok(Some(label.to_string()))
 }
 
-/// Decode, identify, and store one uploaded image.
+/// Decode one base64 payload and store it — the `content` route.
 ///
-/// Every check runs **before** the store is touched, so a refused upload stored nothing
-/// — the same all-or-nothing posture `store_generated_artifacts` takes when it
-/// prevalidates every mime up front.
+/// A thin wrapper over [`store_bytes`]: the only thing inline delivery adds is the
+/// decode, and the only thing it can fail at that bytes from a file cannot is malformed
+/// base64.
 pub fn store_upload(
     store: &MediaStore,
     content: &str,
@@ -210,12 +264,30 @@ pub fn store_upload(
 ) -> Result<StoredUpload, UploadError> {
     use base64::Engine;
 
-    let label = check_label(label)?;
+    // Checked before the decode so a malformed label refuses without paying to decode a
+    // multi-megabyte payload first.
+    check_label(label)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(content.trim())
         .map_err(|e| UploadError::BadBase64 {
             cause: e.to_string(),
         })?;
+    store_bytes(store, &bytes, label, timestamp)
+}
+
+/// Identify and store one image's bytes, however they arrived.
+///
+/// The single admission point both routes share, so `path` and `content` cannot drift
+/// apart on what they accept. Every check runs **before** the store is touched, so a
+/// refused upload stored nothing — the same all-or-nothing posture
+/// `store_generated_artifacts` takes when it prevalidates every mime up front.
+pub fn store_bytes(
+    store: &MediaStore,
+    bytes: &[u8],
+    label: Option<&str>,
+    timestamp: i64,
+) -> Result<StoredUpload, UploadError> {
+    let label = check_label(label)?;
     if bytes.is_empty() {
         return Err(UploadError::Empty);
     }
@@ -225,7 +297,7 @@ pub fn store_upload(
             actual: bytes.len(),
         });
     }
-    let ext = sniff_image(&bytes)?;
+    let ext = sniff_image(bytes)?;
 
     let provenance = Provenance {
         // A client uploaded these bytes. No prompt produced them, no model rendered
@@ -251,8 +323,8 @@ pub fn store_upload(
     // an upload: the content is durable and retrievable, and denying it would orphan
     // stored bytes behind a message claiming nothing happened. The same argument
     // `ArtifactSink::save` records.
-    let digest = match store.put(&bytes, ext, &provenance) {
-        Ok(digest) => digest,
+    let (digest, provenance_missing) = match store.put(bytes, ext, &provenance) {
+        Ok(digest) => (digest, false),
         Err(crate::cas::CasError::ProvenanceNotRecorded { digest, cause }) => {
             tracing::warn!(
                 digest = %digest,
@@ -260,25 +332,37 @@ pub fn store_upload(
                 "upload stored without its provenance sidecar — the bytes are durable \
                  and retrievable, the housekeeping record is not"
             );
-            Digest::from_hex(&digest).expect("the store renders its own digests in canonical hex")
+            (
+                Digest::from_hex(&digest)
+                    .expect("the store renders its own digests in canonical hex"),
+                true,
+            )
         }
         Err(other) => {
             // The operator gets the whole typed error, paths and usage included; the
             // caller gets the sanitized rendering.
             tracing::warn!(error = %other, "media store refused a write_cas upload");
-            return Err(UploadError::Store(other.to_string()));
+            return Err(UploadError::Store(other));
         }
     };
 
     // What the artifact IS, per the store — not what this upload decided. The two differ
     // whenever identical content is already held under another container format, and the
     // result must agree with what `read_cas` reports and with the on-disk path.
-    let stored_ext = store.extension_for(&digest).unwrap_or(ext);
+    let stored_ext = store.extension_for(&digest).unwrap_or_else(|| {
+        tracing::warn!(
+            digest = %digest.to_hex(),
+            "upload stored but the store cannot name its format — falling back to the \
+             format read from the bytes"
+        );
+        ext
+    });
 
     Ok(StoredUpload {
         digest,
         extension: stored_ext,
         bytes: bytes.len(),
+        provenance_missing,
     })
 }
 

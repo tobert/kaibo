@@ -19,6 +19,8 @@ record. Each later release appends a new section at the top.
 
 - **`write_cas` stores an image in kaibo's media store and returns its digest** — the
   deposit half of `read_cas`, and how an image reaches kaibo at all.
+- **`write_cas` takes a `path` and reads the file itself**, so an image costs no tokens;
+  base64 `content` remains for an image that is not a file.
 - **`write_cas` reads the format from the bytes**, so png/jpeg/gif/webp are accepted by
   signature and there is no `mime` to state or get wrong.
 - **`[telemetry]` exports the GenAI metrics signal** — token usage, call and phase

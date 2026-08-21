@@ -7048,8 +7048,12 @@ mod tests {
     /// `save_artifact` is the interesting contrast: it IS an inner tool, but only on the
     /// driver loop and only with a sink, which is why the sweep assertions below name
     /// both and the driver assertions name only `read_cas`.
-    const CLIENT_ONLY_VERBS: [&str; 5] = [
+    const CLIENT_ONLY_VERBS: [&str; 6] = [
         "read_cas",
+        // The deposit half crosses the same line from the other side: a store spanning
+        // every project this kaibo has served is not something the inner team writes
+        // into by digest either.
+        "write_cas",
         "generate",
         "job_get",
         "job_list",

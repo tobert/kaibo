@@ -230,3 +230,90 @@ fn a_label_that_would_forge_a_result_line_is_refused_and_stores_nothing() {
         "the label is checked before the store is touched"
     );
 }
+
+/// **A sidecar that could not be written is still an upload, and the caller is told.**
+///
+/// The middle outcome of `Cas::put`: the object lands, the sidecar's `create_new` gets
+/// EACCES, and the bytes are durable and reachable at the digest. Denying the upload
+/// would orphan stored content behind a message claiming nothing happened.
+///
+/// `save_artifact` reports this same state as an `Err` carrying the digest, because its
+/// caller's next move is to name the URI in an answer. `write_cas` reports it as a
+/// success with `provenance_missing` set, because *this* caller's next move is to use
+/// the digest — and an `Err` is the shape most likely to make it throw away a digest that
+/// is perfectly good. Loud either way; never silent.
+///
+/// Driven the way `tests/cas.rs` drives it: place the object by hand, then close the
+/// shard directory to new files so only the sidecar write fails.
+#[test]
+#[cfg(unix)]
+fn an_upload_whose_sidecar_could_not_be_written_is_reported_not_hidden() {
+    use kaibo::cas::Digest;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (media, dir) = store();
+    let MediaStore::Disk(cas) = &media else {
+        unreachable!("store() builds a disk-backed CAS")
+    };
+    let bytes = png();
+    let digest = Digest::of_bytes(&bytes);
+    let hex = digest.to_hex();
+
+    let shard_dir = cas.root().join(&hex[0..2]).join(&hex[2..4]);
+    std::fs::create_dir_all(&shard_dir).expect("shard dir");
+    std::fs::write(shard_dir.join(format!("{hex}.png")), &bytes).expect("object by hand");
+    std::fs::set_permissions(&shard_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("close the shard");
+
+    // Root ignores the mode bits, so the premise would not hold — detect it before
+    // drawing any conclusion, exactly as tests/cas.rs does.
+    let can_write_anyway = std::fs::write(shard_dir.join("probe"), b"x").is_ok();
+    let result = store_upload(&media, &b64(&bytes), None, 1);
+    let _ = std::fs::set_permissions(&shard_dir, std::fs::Permissions::from_mode(0o755));
+
+    if can_write_anyway {
+        eprintln!(
+            "skipping: this process can write into a 0o500 directory (likely running as \
+             root) — cannot exercise a sidecar-write failure here"
+        );
+        return;
+    }
+
+    let stored = result.expect("the bytes are durable, so this is a success, not a refusal");
+    assert!(
+        stored.provenance_missing,
+        "the caller must be told the record beside the bytes is missing"
+    );
+    assert_eq!(
+        stored.digest, digest,
+        "and told where the bytes actually are"
+    );
+    let _ = dir;
+}
+
+/// A store refusal never hands the caller a byte count or a path.
+///
+/// `CapacityExceeded` carries `current_bytes` — the store's usage across every project
+/// this kaibo has served. That is a cross-project side channel: it says how much other
+/// work is sitting in the store, and watching it move across calls says more.
+/// `SaveError::Store` closes that leak for the model-facing tool; the caller here is a
+/// model too.
+#[test]
+fn a_store_refusal_is_sanitized_and_leaks_no_capacity_number() {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().join("cas");
+    // A cap far below the payload, so the very first put is refused for lack of room.
+    let cas = Cas::open(&root, &[], Some(8)).expect("cas opens");
+    let media = MediaStore::Disk(cas);
+
+    let err = store_upload(&media, &b64(&png()), None, 1).expect_err("no room");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no room"),
+        "the refusal names what happened and the next move: {msg}"
+    );
+    assert!(
+        !msg.contains('/') && !msg.chars().any(|c| c.is_ascii_digit()),
+        "a sanitized refusal carries neither a path nor a number: {msg}"
+    );
+}

@@ -680,20 +680,26 @@ pub struct ReadCasInput {
     pub length: Option<usize>,
 }
 
-/// Arguments for [`KaiboHandler::write_cas`] — the bytes, and an optional label.
+/// Arguments for [`KaiboHandler::write_cas`] — where the image is, and an optional label.
 ///
-/// No path, in either direction, and no `mime`. The address is the content hash, so
-/// there is no destination to name; the source is inline for the reason `save_artifact`
-/// settled next door (a source-path parameter was designed, argued, and dropped
-/// permanently); and the format is read out of the bytes rather than asserted, so there
-/// is no claim that can be wrong. See [`crate::upload`].
+/// Exactly one of `path` and `content`. There is no destination of any kind (the address
+/// is the content hash) and no `mime` (the format is read out of the bytes, so there is
+/// no claim that can be wrong). A source `path` is read-scoped to the allowed set and
+/// read through the read-only kaish VFS. See [`crate::upload`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteCasInput {
-    /// The image's raw bytes, base64-encoded (standard alphabet, padding included).
-    /// Capped at 8388608 bytes before encoding — a larger upload is refused, not
-    /// trimmed.
-    pub content: String,
+    /// Path to the image file to store. Relative paths resolve against the launch
+    /// directory. Must be a regular file inside the allowed set. This is the route to
+    /// use whenever the image is on disk.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// The image's raw bytes, base64-encoded — for an image that is not a file (pasted
+    /// into a conversation, or held in memory). Prefer `path`: these bytes are tokens
+    /// you have to write out, so a real screenshot costs far more here than a path does.
+    #[serde(default)]
+    pub content: Option<String>,
 
     /// One short line describing the image, recorded beside it and shown by `read_cas`.
     /// Optional, capped at 200 bytes, single-line.
@@ -2837,14 +2843,18 @@ impl KaiboHandler {
 
     #[tool(
         description = "Store an image in kaibo's media store and get back its digest — \
-            the deposit half of `read_cas`, and how an image REACHES kaibo. Pass the \
-            raw bytes base64-encoded in `content`; the result is a kaibo://cas/<digest> \
-            address, the mime, the size, and the real file path when the store is on \
-            disk. The format is read from the bytes themselves, so there is no mime to \
-            pass and none to get wrong: png, jpeg, gif and webp are accepted and \
-            anything else is refused. `content` is capped at 8388608 bytes before \
-            encoding and a larger upload is refused, not trimmed. Nothing is written to \
-            your project — this store is kaibo's own, addressed only by content hash."
+            the deposit half of `read_cas`, and how an image REACHES kaibo. Name the \
+            file in `path`: kaibo reads it itself, so the bytes never cost you a token. \
+            `content` takes base64 instead, for an image that is not a file; a real \
+            screenshot through `content` is megabytes you have to write out, so reach \
+            for `path` whenever the image is on disk. Pass exactly one. The result is a \
+            kaibo://cas/<digest> address, the mime, the size, and the real file path \
+            when the store is on disk. The format is read from the bytes themselves, so \
+            there is no mime to pass and none to get wrong: png, jpeg, gif and webp are \
+            accepted and anything else is refused. Images are capped at 8388608 bytes \
+            and a larger one is refused, not trimmed. `path` must be inside the allowed \
+            set, like every other path kaibo reads. Nothing is written to your project \
+            — this store is kaibo's own, addressed only by content hash."
     )]
     pub async fn write_cas(
         &self,
@@ -2860,13 +2870,55 @@ impl KaiboHandler {
                 None,
             ));
         };
-        let stored = crate::upload::store_upload(
-            store,
-            &input.content,
-            input.label.as_deref(),
-            now_epoch_secs(),
-        )
-        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // Exactly one source. Neither is a caller who has not said what to store; both
+        // is a caller who said it twice and would need kaibo to pick — a silent
+        // precedence rule is how the stored bytes come to disagree with the intent.
+        let stored = match (input.path.as_deref(), input.content.as_deref()) {
+            (Some(path), None) => {
+                let bytes = self
+                    .resolver
+                    .read_contained_file(path, crate::upload::MAX_UPLOAD_BYTES as u64)
+                    .await?;
+                crate::upload::store_bytes(
+                    store,
+                    &bytes,
+                    input.label.as_deref(),
+                    now_epoch_secs(),
+                )
+            }
+            (None, Some(content)) => crate::upload::store_upload(
+                store,
+                content,
+                input.label.as_deref(),
+                now_epoch_secs(),
+            ),
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "write_cas needs an image: name the file in `path`, or pass its \
+                     base64 bytes in `content` when it is not a file."
+                        .to_string(),
+                    None,
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "write_cas takes `path` or `content`, not both — kaibo will not \
+                     guess which one you meant to store. Pass the one that names this \
+                     image."
+                        .to_string(),
+                    None,
+                ))
+            }
+        }
+        // A store I/O failure or a capacity refusal is a server-side condition, not a
+        // parameter the caller got wrong — the same split `read_cas` makes between a bad
+        // digest and an unreadable object.
+        .map_err(|e| match e {
+            crate::upload::UploadError::Store(_) => {
+                McpError::internal_error(e.to_string(), None)
+            }
+            _ => McpError::invalid_params(e.to_string(), None),
+        })?;
 
         let hex = stored.digest.to_hex();
         let mut text = format!(
@@ -2877,6 +2929,16 @@ impl KaiboHandler {
         );
         if let Some(path) = store.path_for(&stored.digest) {
             text.push_str(&format!("\n   path: {}", path.display()));
+        }
+        if stored.provenance_missing {
+            // The bytes are durable and addressable; only the record beside them is
+            // missing. Said plainly rather than left to be discovered by a later
+            // `read_cas` reporting "provenance: absent".
+            text.push_str(
+                "\n   NOTE: the image is stored and retrievable, but kaibo could not \
+                 record the metadata beside it — nothing on disk says what this image is \
+                 or when it arrived. The digest above is still good.",
+            );
         }
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
@@ -6410,6 +6472,109 @@ enabled = false
         assert!(
             err.message.contains("corrupt"),
             "and it says so rather than reporting a miss: {}",
+            err.message
+        );
+    }
+
+    /// A minimal but real PNG header — enough that `sniff_image` reads a true signature.
+    fn png_bytes() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&[0, 0, 0, 13]);
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        v
+    }
+
+    fn write_cas_input(path: Option<&str>, content: Option<&str>) -> WriteCasInput {
+        WriteCasInput {
+            path: path.map(str::to_string),
+            content: content.map(str::to_string),
+            label: None,
+        }
+    }
+
+    /// **`path` is the working route: kaibo reads the file itself.**
+    ///
+    /// The reason this exists at all — tool-call arguments are completion tokens the
+    /// caller emits, so a real screenshot through `content` is megabytes the client has
+    /// to write out one token at a time. This proves the cheap route round-trips.
+    #[tokio::test]
+    async fn write_cas_stores_a_file_the_caller_names_by_path() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let img = dir.path().join("screenshot.png");
+        std::fs::write(&img, png_bytes()).expect("fixture writes");
+        let h = handler_from_toml(&format!(
+            "[server]\nallow_paths = [{:?}]\n",
+            dir.path().display().to_string()
+        ));
+
+        let result = h
+            .write_cas(Parameters(write_cas_input(
+                Some(&img.display().to_string()),
+                None,
+            )))
+            .await
+            .expect("a contained png stores");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("write_cas answers with text");
+        assert!(text.contains("image/png"), "{text}");
+        assert!(text.contains(CAS_RES_PREFIX), "{text}");
+    }
+
+    /// The boundary is not ceremony here: the client is itself a model, and a
+    /// prompt-injected one asking kaibo to pull a private key into the store and read it
+    /// back is exactly this shape. A path outside the allowed set is refused, and the
+    /// refusal names the boundary.
+    #[tokio::test]
+    async fn write_cas_refuses_a_path_outside_the_allowed_set() {
+        let allowed = tempfile::TempDir::new().expect("temp dir");
+        let elsewhere = tempfile::TempDir::new().expect("temp dir");
+        let img = elsewhere.path().join("secret.png");
+        std::fs::write(&img, png_bytes()).expect("fixture writes");
+        let h = handler_from_toml(&format!(
+            "[server]\nallow_paths = [{:?}]\n",
+            allowed.path().display().to_string()
+        ));
+
+        let err = h
+            .write_cas(Parameters(write_cas_input(
+                Some(&img.display().to_string()),
+                None,
+            )))
+            .await
+            .expect_err("an out-of-tree path is refused");
+        assert!(
+            err.message.contains("outside the allowed set"),
+            "the refusal must name the boundary: {}",
+            err.message
+        );
+    }
+
+    /// Two sources is a caller who said it twice. kaibo will not pick one — a silent
+    /// precedence rule is how the stored bytes come to disagree with the intent.
+    #[tokio::test]
+    async fn write_cas_refuses_both_path_and_content() {
+        let h = handler();
+        let err = h
+            .write_cas(Parameters(write_cas_input(Some("a.png"), Some("AAAA"))))
+            .await
+            .expect_err("two sources is ambiguous");
+        assert!(err.message.contains("not both"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn write_cas_refuses_neither_path_nor_content() {
+        let h = handler();
+        let err = h
+            .write_cas(Parameters(write_cas_input(None, None)))
+            .await
+            .expect_err("no source is nothing to store");
+        assert!(
+            err.message.contains("`path`") && err.message.contains("`content`"),
+            "the refusal names both ways in: {}",
             err.message
         );
     }

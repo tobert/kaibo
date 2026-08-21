@@ -1043,6 +1043,8 @@ client or the CLI caller runs them; the inner model team never can — the CAS i
 mounted into kaish and no cast-facing tool reads it, because kaibo state spans projects
 and a browsable CAS would let one project's team enumerate another's artifacts.
 
+An image gets *in* through `write_cas`, the deposit half: name the file in `path` (kaibo reads it itself, and the path obeys the same allowed-set boundary as every other path kaibo reads) or pass base64 `content` for an image that is not a file. The format is read from the bytes, so there is no mime to state. `write_cas` keys on the same `[cas] enabled` switch as `read_cas` — one store, one flag, both verbs. There is no CLI counterpart today.
+
 `read` is the only verb on either surface. There is no listing, no usage report, and no
 delete — each needs an index this store does not keep. Prune by file mtime over the object
 tree with your own tools.
