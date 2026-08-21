@@ -680,6 +680,27 @@ pub struct ReadCasInput {
     pub length: Option<usize>,
 }
 
+/// Arguments for [`KaiboHandler::write_cas`] — the bytes, and an optional label.
+///
+/// No path, in either direction, and no `mime`. The address is the content hash, so
+/// there is no destination to name; the source is inline for the reason `save_artifact`
+/// settled next door (a source-path parameter was designed, argued, and dropped
+/// permanently); and the format is read out of the bytes rather than asserted, so there
+/// is no claim that can be wrong. See [`crate::upload`].
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteCasInput {
+    /// The image's raw bytes, base64-encoded (standard alphabet, padding included).
+    /// Capped at 8388608 bytes before encoding — a larger upload is refused, not
+    /// trimmed.
+    pub content: String,
+
+    /// One short line describing the image, recorded beside it and shown by `read_cas`.
+    /// Optional, capped at 200 bytes, single-line.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 /// Arguments to `generate`: media generation through the cast's `image` slot. No
 /// `path` — generation reads no project (the prompt is the whole input), so there is
 /// nothing to scope to an allowed tree.
@@ -926,7 +947,7 @@ pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 15] = [
     "consult",
     "consult_submit",
     "explore",
@@ -936,6 +957,7 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
     "batch_submit",
     "generate",
     "read_cas",
+    "write_cas",
     "job_get",
     "job_cancel",
     "job_list",
@@ -949,11 +971,19 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
 /// generate anything, which is the useless-server state startup already refuses.
 ///
 /// The `job_*` verbs enforce this through their own liveness (they need a producer).
-/// `read_cas` cannot: it keys on the media CAS, which is ON by default, so counting it
-/// would make the empty-surface guard in `main` unreachable for every stock install — a
-/// check that can no longer fire is a check that no longer protects anything.
-pub(crate) const FOLLOWER_TOOL_NAMES: &[&str] =
-    &["read_cas", "job_get", "job_cancel", "job_list", "job_wait"];
+/// `read_cas` and `write_cas` cannot: they key on the media CAS, which is ON by default,
+/// so counting them would make the empty-surface guard in `main` unreachable for every
+/// stock install — a check that can no longer fire is a check that no longer protects
+/// anything. A kaibo whose entire offering is "hold the bytes I hand you and give them
+/// back" cannot investigate, answer, or generate anything either.
+pub(crate) const FOLLOWER_TOOL_NAMES: &[&str] = &[
+    "read_cas",
+    "write_cas",
+    "job_get",
+    "job_cancel",
+    "job_list",
+    "job_wait",
+];
 
 /// Which tools this config actually advertises: the operator's `--no-<tool>` flags AND
 /// a cast that can staff each one.
@@ -990,6 +1020,11 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     // `[artifacts] enabled` — that flag gates whether the model team may *write*, while
     // `generate`'s artifacts need retrieving whether or not a consult may save.
     let read_cas_live = config.cas.enabled;
+    // `write_cas` is the deposit half of the same contract and keys on the same one
+    // fact. No `--no-write-cas` flag, matching `read_cas`: `[cas] enabled = false` is
+    // already the operator's switch for this store, and a second way to say the same
+    // thing is a second thing to keep in agreement.
+    let write_cas_live = config.cas.enabled;
     let jobs_live = consult_live || batch_live || deliberate_live || generate_live;
 
     [
@@ -1013,6 +1048,10 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // Client-side retrieval by digest. Operator surface, like the resource it
         // replaces: the inner model team never carries it.
         (read_cas_live, "read_cas"),
+        // Client-side deposit by content. Operator surface for the same reason
+        // `read_cas` is: the caller is the operator's proxy, and the inner model team
+        // never carries either half.
+        (write_cas_live, "write_cas"),
         // The collect verbs follow their producers — see the fn doc. "Live" folds the
         // flag AND staffing together, so a producer nothing can staff keeps them no more
         // than a producer the operator switched off does: neither mints a handle.
@@ -2797,6 +2836,52 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Store an image in kaibo's media store and get back its digest — \
+            the deposit half of `read_cas`, and how an image REACHES kaibo. Pass the \
+            raw bytes base64-encoded in `content`; the result is a kaibo://cas/<digest> \
+            address, the mime, the size, and the real file path when the store is on \
+            disk. The format is read from the bytes themselves, so there is no mime to \
+            pass and none to get wrong: png, jpeg, gif and webp are accepted and \
+            anything else is refused. `content` is capped at 8388608 bytes before \
+            encoding and a larger upload is refused, not trimmed. Nothing is written to \
+            your project — this store is kaibo's own, addressed only by content hash."
+    )]
+    pub async fn write_cas(
+        &self,
+        Parameters(input): Parameters<WriteCasInput>,
+    ) -> Result<CallToolResult, McpError> {
+        // The route is dropped when the CAS is off, so this is a belt for a direct
+        // caller that bypasses the advertised list.
+        let Some(store) = &self.media_cas else {
+            return Err(McpError::invalid_params(
+                "the media CAS is disabled ([cas] enabled = false), so there is nowhere \
+                 to store an upload. Re-enable it (or remove the flag) and reconnect."
+                    .to_string(),
+                None,
+            ));
+        };
+        let stored = crate::upload::store_upload(
+            store,
+            &input.content,
+            input.label.as_deref(),
+            now_epoch_secs(),
+        )
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let hex = stored.digest.to_hex();
+        let mut text = format!(
+            "Stored 1 image (read it back with `read_cas`, passing the digest):\n\
+             {CAS_RES_PREFIX}{hex} ({}, {} bytes)",
+            stored.extension.mime(),
+            stored.bytes,
+        );
+        if let Some(path) = store.path_for(&stored.digest) {
+            text.push_str(&format!("\n   path: {}", path.display()));
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(
         description = "Read one stored artifact by its digest — what `generate` and a \
             consult's `save_artifact` hand back as kaibo://cas/<digest>. Metadata \
             always comes first: mime, total size, whether it is binary, the artifact's \
@@ -4175,6 +4260,22 @@ options ride the `fields` object verbatim, each value's JSON type preserved
 deferred hands back a `job-N` on the same collect verbs above — the lane is wired,
 though every route wired today answers in-call. Every artifact gets a provenance
 sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
+
+## Getting an image in: `write_cas`
+
+`write_cas` is the deposit half, and how an image reaches kaibo at all. Pass the raw bytes
+base64-encoded in `content`; you get back a `kaibo://cas/<digest>` address, the mime, the
+size, and the real file path when the store is on disk.
+
+There is no `mime` parameter and no path in either direction. The format is read out of the
+bytes themselves — png, jpeg, gif and webp are accepted, anything else is refused — so
+there is no claim to get wrong, and the address is the content hash, so there is nothing to
+aim. `content` is capped at 8388608 bytes before encoding, and a larger upload is refused
+rather than trimmed. An optional `label` records one short line about the image, which
+`read_cas` reports back.
+
+Nothing here writes to your project. This is kaibo's own store, and the inner model team
+neither carries this tool nor knows the store exists.
 
 ## Reading artifacts back: `read_cas`
 
@@ -6313,19 +6414,25 @@ enabled = false
         );
     }
 
-    /// **A server whose whole surface is `read_cas` does nothing, and says so.**
+    /// **A server whose whole surface is the media store's two halves does nothing, and
+    /// says so.**
     ///
     /// `has_substantive_tools` is what `main`'s empty-surface guard actually asks, and
     /// until this test it was only exercised through configurations the *flag* guard
     /// rejects first — so the follower rule itself was never pinned. Build the real
     /// degenerate server: every flag off, no staffable cast, media CAS on. It advertises
-    /// exactly one tool, that tool is a follower, and the answer is no.
+    /// exactly the store's deposit and retrieval verbs, both are followers, and the
+    /// answer is no.
     ///
-    /// This matters because `read_cas` rides a store that is ON by default. Counted as
-    /// substantive, it would keep the guard from ever firing on a stock install — a check
-    /// that cannot fire protects nothing.
+    /// This matters because `read_cas` and `write_cas` ride a store that is ON by
+    /// default. Counted as substantive, either would keep the guard from ever firing on a
+    /// stock install — a check that cannot fire protects nothing. `write_cas` is the
+    /// sharper case: it *accepts* content rather than only handing back what earlier runs
+    /// produced, so "it does something" is superficially true — but a server that can
+    /// only hold your bytes and give them back has still investigated, answered, and
+    /// generated nothing.
     #[test]
-    fn a_surface_of_only_read_cas_is_not_substantive() {
+    fn a_surface_of_only_the_media_store_is_not_substantive() {
         let h = hermetic_handler_from_toml(
             "[server.tools]\nconsult = false\nexplore = false\ndeliberate = false\n\
              oneshot = false\nrun_kaish = false\nbatch = false\nlist_models = false\n\
@@ -6333,13 +6440,13 @@ enabled = false
         );
         assert_eq!(
             h.advertised_tools(),
-            vec!["read_cas".to_string()],
-            "the degenerate surface is exactly the follower"
+            vec!["read_cas".to_string(), "write_cas".to_string()],
+            "the degenerate surface is exactly the two followers"
         );
         assert!(
             !h.has_substantive_tools(),
-            "a server that can only hand back what earlier runs produced is the useless \
-             server the startup guard exists to refuse"
+            "a server that can only hold bytes and hand them back is the useless server \
+             the startup guard exists to refuse"
         );
 
         // And the same handler with one castless tool back on IS substantive — the rule
@@ -6355,22 +6462,28 @@ enabled = false
         );
     }
 
-    /// `read_cas` is advertised exactly when the media CAS is live — the same liveness the
-    /// resource it replaces keyed on. It takes no cast, so nothing else gates it.
+    /// The media store's two halves are advertised exactly when it is live — the same
+    /// liveness the resource `read_cas` replaced keyed on. Neither takes a cast, so
+    /// nothing else gates either, and they move together: one `[cas] enabled` switch, not
+    /// two ways to say the same thing.
     #[test]
-    fn read_cas_is_advertised_only_while_the_media_cas_is_on() {
+    fn the_media_store_verbs_are_advertised_only_while_the_cas_is_on() {
         let on = handler();
-        assert!(
-            on.advertised_tools().contains(&"read_cas".to_string()),
-            "a live CAS advertises retrieval, got {:?}",
-            on.advertised_tools()
-        );
+        for verb in ["read_cas", "write_cas"] {
+            assert!(
+                on.advertised_tools().contains(&verb.to_string()),
+                "a live CAS advertises {verb}, got {:?}",
+                on.advertised_tools()
+            );
+        }
         let off = handler_from_toml("[cas]\nenabled = false\n");
-        assert!(
-            !off.advertised_tools().contains(&"read_cas".to_string()),
-            "no store, no retrieval verb, got {:?}",
-            off.advertised_tools()
-        );
+        for verb in ["read_cas", "write_cas"] {
+            assert!(
+                !off.advertised_tools().contains(&verb.to_string()),
+                "no store, no {verb}, got {:?}",
+                off.advertised_tools()
+            );
+        }
     }
 
     /// **The `kaibo://cas/<digest>` RESOURCE is gone.** Retrieval is a tool now, and the

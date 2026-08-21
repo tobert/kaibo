@@ -51,9 +51,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// `explore` / `oneshot` (and the job verbs that collect `consult_submit`'s handles)
 /// advertised — kaibo does not check that a local server is actually listening, only
 /// that a cast can be staffed. `run_kaish`, `list_models`, and `read_cas` need no cast
-/// at all. What is *missing* is the other half of the story: `batch_submit`,
-/// `deliberate`, and `generate` all need a cast shape no built-in provides, so their
-/// routes are dropped rather than advertised-and-broken.
+/// at all — and neither do the media store's two halves, `read_cas` and `write_cas`:
+/// holding bytes and handing them back needs no provider. What is *missing* is the
+/// other half of the story: `batch_submit`, `deliberate`, and `generate` all need a cast
+/// shape no built-in provides, so their routes are dropped rather than
+/// advertised-and-broken. Note the asymmetry that leaves: a keyless kaibo can accept an
+/// upload it cannot yet generate from.
 const KEYLESS_TOOLS: &[&str] = &[
     "consult",
     "consult_submit",
@@ -66,6 +69,7 @@ const KEYLESS_TOOLS: &[&str] = &[
     "oneshot",
     "read_cas",
     "run_kaish",
+    "write_cas",
 ];
 
 /// Marker line written into the temp project's `Cargo.toml`, so a successful read is
