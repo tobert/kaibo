@@ -39,7 +39,7 @@ async fn gpt_image_1_returns_real_png_bytes() {
 
     let request = MediaRequest {
         prompt: "a small lighthouse on a rocky cliff, watercolor".to_string(),
-        input_image: None,
+        inputs: Vec::new(),
         // The cheapest hosted shape; output_format png is gpt-image-1's default,
         // stated explicitly so the mime derivation is exercised end to end.
         fields: vec![

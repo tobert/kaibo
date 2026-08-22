@@ -731,6 +731,15 @@ pub struct GenerateInput {
     /// cast's image slot.
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
+
+    /// Input images for the operations that take them, as `{form-field: digest}` —
+    /// e.g. `{"image": "<digest>"}` for image-to-image, `{"image": "...", "mask":
+    /// "..."}` where an operation takes both. Each digest is one `write_cas` or
+    /// `generate` handed back, so an image already in kaibo's store is reused by
+    /// address and never re-sent. The form-field names are the provider's own; the
+    /// store decides each part's format, not you.
+    #[serde(default)]
+    pub inputs: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// One `generate` field value, as typed JSON: the schema face of
@@ -3049,7 +3058,13 @@ impl KaiboHandler {
             (metadata first, ranges on request; a small image comes back viewable). \
             Provider-native options (aspect_ratio, size, n, output_format, seed, \
             negative_prompt, style_preset, ...) pass through `fields` verbatim, each \
-            value's JSON type (string | number | boolean) preserved to the wire. An \
+            value's JSON type (string | number | boolean) preserved to the wire. \
+            To generate FROM an image rather than from the prompt alone, pass its \
+            digest in `inputs` under the provider's field name — \
+            `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
+            image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
+            an image already in the store is reused by address and never re-sent. \
+            Stability accepts input images; the other media backends do not and say so. An \
             operation the provider declares deferred returns a `job-N` handle for \
             job_wait/job_get instead (every route wired today answers in-call). \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
@@ -3122,10 +3137,17 @@ impl KaiboHandler {
                 ));
             }
         }
+        // Resolved before the arm is called, so a bad digest refuses without spending a
+        // provider request — and the store, not the caller, names each part's format.
+        let inputs = match input.inputs.as_ref() {
+            Some(asked) => crate::media::resolve_inputs(&store, asked)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?,
+            None => Vec::new(),
+        };
         let request = crate::media::MediaRequest {
             prompt: input.prompt.clone(),
             fields,
-            input_image: None,
+            inputs,
         };
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
@@ -5545,6 +5567,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::media::MediaModel for SyncArtifacts {
+        /// Stands in for Stability, the backend `inputs` exists for — so the handler
+        /// tests exercise the accepting path rather than the arm's refusal.
+        fn accepts_inputs(&self) -> bool {
+            true
+        }
+
         async fn generate(
             &self,
             _request: &crate::media::MediaRequest,
@@ -5621,6 +5649,7 @@ mod tests {
                 prompt: "a lighthouse at dusk".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("generate succeeds");
@@ -5667,6 +5696,7 @@ mod tests {
             prompt: "a red door".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
+            inputs: None,
         }))
         .await
         .expect("generate succeeds");
@@ -5702,6 +5732,7 @@ mod tests {
                 prompt: "slow art".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("submit succeeds");
@@ -5778,6 +5809,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 ),
+                inputs: None,
             }))
             .await
             .expect_err("a fields.prompt override must be refused");
@@ -5799,6 +5831,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 ),
+                inputs: None,
             }))
             .await
             .expect_err("a fields.model override must be refused");
@@ -5821,6 +5854,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5847,6 +5881,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5888,6 +5923,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5941,6 +5977,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -5984,6 +6021,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("anthropic".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect_err("no image slot must refuse");
@@ -6052,6 +6090,7 @@ enabled = false
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -6287,6 +6326,7 @@ enabled = false
             prompt: "p".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
+            inputs: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6322,6 +6362,7 @@ enabled = false
             prompt: "p".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
+            inputs: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6473,6 +6514,100 @@ enabled = false
             err.message.contains("corrupt"),
             "and it says so rather than reporting a miss: {}",
             err.message
+        );
+    }
+
+    /// Records the request the arm handed the provider, so the handler's wiring is
+    /// observable rather than inferred from a success.
+    #[derive(Default)]
+    struct RecordingProvider(std::sync::Mutex<Option<crate::media::MediaRequest>>);
+
+    #[async_trait::async_trait]
+    impl crate::media::MediaModel for RecordingProvider {
+        fn accepts_inputs(&self) -> bool {
+            true
+        }
+
+        async fn generate(
+            &self,
+            request: &crate::media::MediaRequest,
+        ) -> anyhow::Result<crate::media::MediaOutcome> {
+            *self.0.lock().unwrap() = Some(request.clone());
+            Ok(crate::media::MediaOutcome::Complete(vec![png(b"result")]))
+        }
+
+        async fn poll(
+            &self,
+            _job: &crate::media::MediaJobId,
+        ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+            unreachable!("this test never defers")
+        }
+    }
+
+    /// **The whole `inputs` path, driven through the tool face.**
+    ///
+    /// `resolve_inputs` is unit-tested on its own, but nothing proved the handler
+    /// actually threads a caller's digest into the request the provider receives — the
+    /// wiring is exactly what a later refactor drops silently, because dropping it still
+    /// returns a plausible image. This asserts the provider saw the part, under the
+    /// caller's field name, with the bytes and the format the store recorded.
+    #[tokio::test]
+    async fn generate_threads_caller_digests_into_the_providers_request() {
+        let provider = Arc::new(RecordingProvider::default());
+        let h = media_handler(provider.clone());
+        // Seed the store the way `write_cas` would, then hand `generate` that digest.
+        let digest = h
+            .media_store()
+            .expect("media CAS is on")
+            .put(
+                b"\x89PNG\r\n\x1a\nsource",
+                crate::cas::Extension::Png,
+                &textual_provenance(),
+            )
+            .expect("seeded")
+            .to_hex();
+
+        h.generate(Parameters(GenerateInput {
+            prompt: "erase the sign".to_string(),
+            cast: Some("artist".to_string()),
+            fields: None,
+            inputs: Some([("image".to_string(), digest)].into_iter().collect()),
+        }))
+        .await
+        .expect("a stored digest is a usable input");
+
+        let seen = provider.0.lock().unwrap().clone().expect("provider was called");
+        assert_eq!(seen.inputs.len(), 1, "the part reached the provider");
+        assert_eq!(seen.inputs[0].field, "image", "under the caller's field name");
+        assert_eq!(seen.inputs[0].bytes, b"\x89PNG\r\n\x1a\nsource");
+        assert_eq!(
+            seen.inputs[0].filename, "image.png",
+            "named from the store's record, not the caller's belief"
+        );
+        assert_eq!(seen.inputs[0].mime, "image/png");
+    }
+
+    /// A digest the store does not hold refuses at the tool face, before any provider
+    /// request is made — so a typo never costs a generation.
+    #[tokio::test]
+    async fn generate_refuses_an_unknown_input_digest_without_calling_the_provider() {
+        let provider = Arc::new(RecordingProvider::default());
+        let h = media_handler(provider.clone());
+        let absent = crate::cas::Digest::of_bytes(b"never stored").to_hex();
+
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "erase the sign".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+                inputs: Some([("image".to_string(), absent)].into_iter().collect()),
+            }))
+            .await
+            .expect_err("an absent digest is refused");
+        assert!(err.message.contains("holds no object"), "{}", err.message);
+        assert!(
+            provider.0.lock().unwrap().is_none(),
+            "the provider must never have been called"
         );
     }
 

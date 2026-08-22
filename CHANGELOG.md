@@ -17,6 +17,15 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **`generate` takes input images by digest** — `inputs {"image": "<digest>"}` is
+  image-to-image on Stability's `ultra` and `sd3` routes, reusing an image already in
+  the store rather than re-sending it.
+- **`generate` carries several named input parts**, so the operations that take
+  `image`+`mask` or `init_image`+`style_image` are reachable.
+- **A media backend with no input-image route refuses a call that carries one**, rather
+  than silently generating from the prompt alone and returning an unrelated image.
+- **An unknown or non-image input digest refuses before the provider is called**, so a
+  typo never costs a generation.
 - **`write_cas` stores an image in kaibo's media store and returns its digest** — the
   deposit half of `read_cas`, and how an image reaches kaibo at all.
 - **`write_cas` takes a `path` and reads the file itself**, so an image costs no tokens;

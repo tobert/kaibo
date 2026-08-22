@@ -15,7 +15,7 @@
 //! generate, takes an **input image** alongside its other fields. Building straight to
 //! rig's shape would mean rewriting this module's core type the day any of those
 //! lands. So the primary abstraction here is [`StabilityRequest`]/[`Operation`] —
-//! provider-native, already carrying an optional input image — and
+//! provider-native, already carrying its named binary input parts — and
 //! [`StabilityImageModel`]'s [`rig_core::image_generation::ImageGenerationModel`] impl
 //! is a thin translation at the bottom ([`from_rig_request`]) that only text-to-image
 //! ever needs.
@@ -225,7 +225,7 @@ pub fn resolve_key() -> AnyResult<String> {
 
 /// One request to a Stability v2beta image operation — provider-native (Stability's
 /// own `aspect_ratio`, not rig's `width`/`height`) and already shaped for growth. See
-/// the module doc for why `input_image` exists even though the only operation wired so
+/// the module doc for why `inputs` exists even though the only operation wired so
 /// far ([`Operation::Generate`]) never sets it.
 #[derive(Debug, Clone, Default)]
 pub struct StabilityRequest {
@@ -233,11 +233,12 @@ pub struct StabilityRequest {
     /// (`remove-background`, `erase`) would need this widened to `Option<String>` —
     /// noted rather than solved speculatively.
     pub prompt: String,
-    /// Bytes of an input image, for operations that take one (every edit/control/
-    /// upscale call, and generate's own image-to-image mode — audio and 3D operations
-    /// don't take one). Attached as a multipart file part named `image`, matching the
-    /// field name every one of those operations documents. `None` for text-to-image.
-    pub input_image: Option<Vec<u8>>,
+    /// The binary parts this operation carries, each under the form-field name that
+    /// operation documents — `image`, `mask`, `init_image`, `style_image`,
+    /// `subject_image`, `audio`. Several routes take more than one, so the name is data
+    /// rather than a constant this module can assume. Empty for text-to-image; attached
+    /// as named multipart file parts by [`StabilityClient::call`].
+    pub inputs: Vec<crate::media::MediaInput>,
     /// Stability's own `aspect_ratio` enum value (e.g. `"16:9"`), when this operation
     /// takes one. The rig adapter ([`from_rig_request`]) derives it from
     /// `ImageGenerationRequest`'s width/height via [`aspect_ratio_for`]; a caller
@@ -383,7 +384,7 @@ pub fn aspect_ratio_for(width: u32, height: u32) -> &'static str {
 /// request carries one), then every `request.fields` entry — a later entry with a name
 /// already present (including `aspect_ratio` itself, letting an explicit override win
 /// over a derived one) replaces it rather than duplicating the field. Pure and
-/// order-preserving; `request.input_image` is attached separately as a file part by
+/// order-preserving; `request.inputs` are attached separately as file parts by
 /// [`StabilityClient::call`], since it isn't a text field.
 pub fn build_form_fields(request: &StabilityRequest) -> Vec<(String, String)> {
     let mut fields: Vec<(String, String)> = vec![("prompt".to_string(), request.prompt.clone())];
@@ -899,7 +900,7 @@ pub fn from_rig_request(
         Operation::Generate(route),
         StabilityRequest {
             prompt: request.prompt.clone(),
-            input_image: None,
+            inputs: Vec::new(),
             aspect_ratio: Some(aspect_ratio_for(request.width, request.height).to_string()),
             fields,
         },
@@ -936,7 +937,7 @@ impl StabilityClient {
     }
 
     /// Run one call: build the multipart body from `request` ([`build_form_fields`] for
-    /// the text fields, plus an `image` file part when `request.input_image` is set),
+    /// the text fields, plus one named file part per `request.inputs` entry),
     /// POST to `op`'s endpoint with `Accept: image/*` (every operation wired so far is
     /// in the image family; a future audio/3D operation needs its own `Accept` value
     /// here, since that's a per-route fact, not a module-wide constant), and hand the
@@ -951,8 +952,23 @@ impl StabilityClient {
         for (name, value) in build_form_fields(request) {
             form = form.text(name, value);
         }
-        if let Some(bytes) = &request.input_image {
-            form = form.part("image", reqwest::multipart::Part::bytes(bytes.clone()));
+        // Each binary part under the provider's own field name, with a filename —
+        // a multipart file part without `filename=` is rejected or mis-typed by some
+        // servers, and every one of these routes is a file upload.
+        for input in &request.inputs {
+            form = form.part(
+                input.field.clone(),
+                reqwest::multipart::Part::bytes(input.bytes.clone())
+                    .file_name(input.filename.clone())
+                    .mime_str(&input.mime)
+                    .map_err(|e| {
+                        StabilityError::Transport(format!(
+                            "input part `{}` has mime {:?}, which is not a valid \
+                             content type: {e}",
+                            input.field, input.mime
+                        ))
+                    })?,
+            );
         }
 
         let url = format!("{}/v2beta/{}", self.base_url, op.path());
@@ -1139,7 +1155,7 @@ impl StabilityImageModel {
             Operation::Generate(route),
             StabilityRequest {
                 prompt: request.prompt.clone(),
-                input_image: request.input_image.clone(),
+                inputs: request.inputs.clone(),
                 // No derived ratio on this path: the neutral request has no
                 // width/height to bridge, and an `aspect_ratio` field from the caller
                 // rides `fields` verbatim.
@@ -1158,6 +1174,13 @@ impl StabilityImageModel {
 /// (see [`StabilityImageModel::image_generation`]'s forced error there).
 #[async_trait::async_trait]
 impl crate::media::MediaModel for StabilityImageModel {
+    /// Stability is the backend the whole `inputs` shape exists for: every `edit`,
+    /// `control` and `upscale` operation takes at least one, and `generate/ultra` and
+    /// `generate/sd3` take one for image-to-image.
+    fn accepts_inputs(&self) -> bool {
+        true
+    }
+
     async fn generate(
         &self,
         request: &crate::media::MediaRequest,
@@ -1322,7 +1345,7 @@ mod tests {
                 ("tiling".to_string(), FieldValue::Bool(true)),
                 ("style_preset".to_string(), FieldValue::Str("anime".to_string())),
             ],
-            input_image: None,
+            inputs: Vec::new(),
         });
         for (name, wire) in [("seed", "42"), ("tiling", "true"), ("style_preset", "anime")] {
             assert!(

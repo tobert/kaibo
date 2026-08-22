@@ -523,7 +523,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
-            input_image: None,
+            inputs: Vec::new(),
         }
     }
 

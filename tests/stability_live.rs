@@ -24,7 +24,7 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
 
     let request = StabilityRequest {
         prompt: "a small lighthouse on a rocky cliff, watercolor".to_string(),
-        input_image: None,
+        inputs: Vec::new(),
         aspect_ratio: Some("1:1".to_string()),
         fields: vec![("output_format".to_string(), "png".to_string())],
     };
