@@ -5567,6 +5567,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::media::MediaModel for SyncArtifacts {
+        /// Stands in for Stability, the backend `inputs` exists for — so the handler
+        /// tests exercise the accepting path rather than the arm's refusal.
+        fn accepts_inputs(&self) -> bool {
+            true
+        }
+
         async fn generate(
             &self,
             _request: &crate::media::MediaRequest,
@@ -6508,6 +6514,100 @@ enabled = false
             err.message.contains("corrupt"),
             "and it says so rather than reporting a miss: {}",
             err.message
+        );
+    }
+
+    /// Records the request the arm handed the provider, so the handler's wiring is
+    /// observable rather than inferred from a success.
+    #[derive(Default)]
+    struct RecordingProvider(std::sync::Mutex<Option<crate::media::MediaRequest>>);
+
+    #[async_trait::async_trait]
+    impl crate::media::MediaModel for RecordingProvider {
+        fn accepts_inputs(&self) -> bool {
+            true
+        }
+
+        async fn generate(
+            &self,
+            request: &crate::media::MediaRequest,
+        ) -> anyhow::Result<crate::media::MediaOutcome> {
+            *self.0.lock().unwrap() = Some(request.clone());
+            Ok(crate::media::MediaOutcome::Complete(vec![png(b"result")]))
+        }
+
+        async fn poll(
+            &self,
+            _job: &crate::media::MediaJobId,
+        ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+            unreachable!("this test never defers")
+        }
+    }
+
+    /// **The whole `inputs` path, driven through the tool face.**
+    ///
+    /// `resolve_inputs` is unit-tested on its own, but nothing proved the handler
+    /// actually threads a caller's digest into the request the provider receives — the
+    /// wiring is exactly what a later refactor drops silently, because dropping it still
+    /// returns a plausible image. This asserts the provider saw the part, under the
+    /// caller's field name, with the bytes and the format the store recorded.
+    #[tokio::test]
+    async fn generate_threads_caller_digests_into_the_providers_request() {
+        let provider = Arc::new(RecordingProvider::default());
+        let h = media_handler(provider.clone());
+        // Seed the store the way `write_cas` would, then hand `generate` that digest.
+        let digest = h
+            .media_store()
+            .expect("media CAS is on")
+            .put(
+                b"\x89PNG\r\n\x1a\nsource",
+                crate::cas::Extension::Png,
+                &textual_provenance(),
+            )
+            .expect("seeded")
+            .to_hex();
+
+        h.generate(Parameters(GenerateInput {
+            prompt: "erase the sign".to_string(),
+            cast: Some("artist".to_string()),
+            fields: None,
+            inputs: Some([("image".to_string(), digest)].into_iter().collect()),
+        }))
+        .await
+        .expect("a stored digest is a usable input");
+
+        let seen = provider.0.lock().unwrap().clone().expect("provider was called");
+        assert_eq!(seen.inputs.len(), 1, "the part reached the provider");
+        assert_eq!(seen.inputs[0].field, "image", "under the caller's field name");
+        assert_eq!(seen.inputs[0].bytes, b"\x89PNG\r\n\x1a\nsource");
+        assert_eq!(
+            seen.inputs[0].filename, "image.png",
+            "named from the store's record, not the caller's belief"
+        );
+        assert_eq!(seen.inputs[0].mime, "image/png");
+    }
+
+    /// A digest the store does not hold refuses at the tool face, before any provider
+    /// request is made — so a typo never costs a generation.
+    #[tokio::test]
+    async fn generate_refuses_an_unknown_input_digest_without_calling_the_provider() {
+        let provider = Arc::new(RecordingProvider::default());
+        let h = media_handler(provider.clone());
+        let absent = crate::cas::Digest::of_bytes(b"never stored").to_hex();
+
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "erase the sign".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+                inputs: Some([("image".to_string(), absent)].into_iter().collect()),
+            }))
+            .await
+            .expect_err("an absent digest is refused");
+        assert!(err.message.contains("holds no object"), "{}", err.message);
+        assert!(
+            provider.0.lock().unwrap().is_none(),
+            "the provider must never have been called"
         );
     }
 

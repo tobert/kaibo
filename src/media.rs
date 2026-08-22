@@ -150,16 +150,22 @@ pub struct MediaInput {
     pub field: String,
     /// The filename to send with the part, extension included (`image.png`).
     pub filename: String,
+    /// The part's own `Content-Type`. Carried for the same reason as the filename: a
+    /// multipart part with no mime defaults to `application/octet-stream`, which asks
+    /// the provider to infer a format it was never told — and the store already knows
+    /// the answer, so leaving the part untyped discards information rather than lacking
+    /// it.
+    pub mime: String,
     pub bytes: Vec<u8>,
 }
 
 impl MediaInput {
-    /// One input part, with the filename built from the field name and the extension the
-    /// store reported for these bytes.
-    pub fn new(field: impl Into<String>, extension: &str, bytes: Vec<u8>) -> Self {
+    /// One input part, named and typed from what the store says these bytes are.
+    pub fn new(field: impl Into<String>, extension: crate::cas::Extension, bytes: Vec<u8>) -> Self {
         let field = field.into();
         Self {
-            filename: format!("{field}.{extension}"),
+            filename: format!("{field}.{}", extension.as_str()),
+            mime: extension.mime().to_string(),
             field,
             bytes,
         }
@@ -213,7 +219,7 @@ pub fn resolve_inputs(
                 extension.mime()
             );
         }
-        out.push(MediaInput::new(field.clone(), extension.as_str(), bytes));
+        out.push(MediaInput::new(field.clone(), extension, bytes));
     }
     Ok(out)
 }
@@ -232,7 +238,7 @@ pub fn refuse_binary_inputs(request: &MediaRequest, provider: &str) -> Result<()
     let named: Vec<&str> = request.inputs.iter().map(|i| i.field.as_str()).collect();
     bail!(
         "this call carries the input image{} `{}`, and the {provider} backend has no \
-         operation that accepts one — nothing was generated. Point the cast's `image` \
+         operation that accepts input images — nothing was generated. Point the cast's `image` \
          slot at a backend whose operations take an input image (Stability), or drop \
          `inputs` to generate from the prompt alone.",
         if named.len() == 1 { "" } else { "s" },
@@ -297,6 +303,19 @@ pub trait MediaModel: Send + Sync {
     /// Collect one deferred job's result. One shot, no retry loop — the caller owns
     /// the cadence.
     async fn poll(&self, job: &MediaJobId) -> Result<MediaPollOutcome>;
+
+    /// Whether this provider has any operation that takes a binary input part.
+    ///
+    /// **Defaults to `false`, and that default is the point.** [`MediaArm::generate`]
+    /// refuses a request carrying inputs unless the model says it can take them, so a
+    /// provider added later that never thinks about `inputs` fails closed — it refuses
+    /// loudly instead of dropping the caller's image and generating from the prompt
+    /// alone. An impl that *can* take inputs opts in by overriding this; forgetting to
+    /// opt in costs a clear refusal, where forgetting a guard would have cost a
+    /// convincing wrong answer.
+    fn accepts_inputs(&self) -> bool {
+        false
+    }
 }
 
 /// A staffed media slot, ready to call: the model behind an `image = "backend/id"`
@@ -397,7 +416,14 @@ impl MediaArm {
     }
 
     /// Run one generation request on this arm.
+    ///
+    /// The single dispatch point for every media call, and therefore where the
+    /// binary-input guard belongs: one check the arm fastens, rather than a convention
+    /// each provider impl has to remember. See [`MediaModel::accepts_inputs`].
     pub async fn generate(&self, request: &MediaRequest) -> Result<MediaOutcome> {
+        if !self.model.accepts_inputs() {
+            refuse_binary_inputs(request, &self.slot_ref)?;
+        }
         self.model.generate(request).await
     }
 

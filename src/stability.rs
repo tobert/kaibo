@@ -15,7 +15,7 @@
 //! generate, takes an **input image** alongside its other fields. Building straight to
 //! rig's shape would mean rewriting this module's core type the day any of those
 //! lands. So the primary abstraction here is [`StabilityRequest`]/[`Operation`] —
-//! provider-native, already carrying an optional input image — and
+//! provider-native, already carrying its named binary input parts — and
 //! [`StabilityImageModel`]'s [`rig_core::image_generation::ImageGenerationModel`] impl
 //! is a thin translation at the bottom ([`from_rig_request`]) that only text-to-image
 //! ever needs.
@@ -233,10 +233,11 @@ pub struct StabilityRequest {
     /// (`remove-background`, `erase`) would need this widened to `Option<String>` —
     /// noted rather than solved speculatively.
     pub prompt: String,
-    /// Bytes of an input image, for operations that take one (every edit/control/
-    /// upscale call, and generate's own image-to-image mode — audio and 3D operations
-    /// don't take one). Attached as a multipart file part named `image`, matching the
-    /// field name every one of those operations documents. `None` for text-to-image.
+    /// The binary parts this operation carries, each under the form-field name that
+    /// operation documents — `image`, `mask`, `init_image`, `style_image`,
+    /// `subject_image`, `audio`. Several routes take more than one, so the name is data
+    /// rather than a constant this module can assume. Empty for text-to-image; attached
+    /// as named multipart file parts by [`StabilityClient::call`].
     pub inputs: Vec<crate::media::MediaInput>,
     /// Stability's own `aspect_ratio` enum value (e.g. `"16:9"`), when this operation
     /// takes one. The rig adapter ([`from_rig_request`]) derives it from
@@ -958,7 +959,15 @@ impl StabilityClient {
             form = form.part(
                 input.field.clone(),
                 reqwest::multipart::Part::bytes(input.bytes.clone())
-                    .file_name(input.filename.clone()),
+                    .file_name(input.filename.clone())
+                    .mime_str(&input.mime)
+                    .map_err(|e| {
+                        StabilityError::Transport(format!(
+                            "input part `{}` has mime {:?}, which is not a valid \
+                             content type: {e}",
+                            input.field, input.mime
+                        ))
+                    })?,
             );
         }
 
@@ -1165,6 +1174,13 @@ impl StabilityImageModel {
 /// (see [`StabilityImageModel::image_generation`]'s forced error there).
 #[async_trait::async_trait]
 impl crate::media::MediaModel for StabilityImageModel {
+    /// Stability is the backend the whole `inputs` shape exists for: every `edit`,
+    /// `control` and `upscale` operation takes at least one, and `generate/ultra` and
+    /// `generate/sd3` take one for image-to-image.
+    fn accepts_inputs(&self) -> bool {
+        true
+    }
+
     async fn generate(
         &self,
         request: &crate::media::MediaRequest,
