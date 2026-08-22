@@ -72,7 +72,7 @@ pub enum ProviderKind {
     /// `key_optional = true` beside its explicit local `base_url`. Like Stability,
     /// it is not in the built-in backend list and staffs only `image` cast slots.
     OpenAiImages,
-    /// Gemini's image generation — the third media kind, via `src/gemini_images.rs`.
+    /// Gemini's image generation — the fourth media kind, via `src/gemini_images.rs`.
     ///
     /// A *separate kind* from [`ProviderKind::Gemini`] for the same reason
     /// [`ProviderKind::OpenAiImages`] is separate from [`ProviderKind::Openai`]: one

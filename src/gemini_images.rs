@@ -91,6 +91,20 @@ pub enum GeminiImagesError {
     )]
     NoCandidates,
 
+    /// The model stopped without producing content, and said why.
+    ///
+    /// Distinct from [`GeminiImagesError::NoCandidates`] because the two are opposite
+    /// situations that a single message would describe wrongly: this one *has* a
+    /// candidate, or a prompt-level verdict, and the reason it carries is the whole
+    /// value of the error. Reporting "no candidates" here would be false and would throw
+    /// away the one field that says what to change.
+    #[error(
+        "gemini-images produced no content: {reason}. That is the model declining or \
+         stopping rather than a fault — the reason names which policy or limit it hit, so \
+         change the prompt or the input image to suit it."
+    )]
+    Blocked { reason: String },
+
     /// Parts came back, but none of them were image data.
     ///
     /// The most valuable error this module has, and the reason the model's own words are
@@ -160,33 +174,17 @@ pub fn build_request_body(request: &MediaRequest) -> Value {
     })
 }
 
-/// Walk one `generateContent` response into artifacts plus whatever the model said.
+/// Walk one candidate's parts into artifacts and commentary.
 ///
-/// Written for parts in general rather than images in particular: an `inlineData` part is
-/// an artifact whatever its mime, so the day a speech model rides this shape, the walk
-/// does not change.
-pub fn parse_response(status: u16, body: &[u8]) -> Result<MediaOutcome, GeminiImagesError> {
-    if !(200..300).contains(&status) {
-        return Err(GeminiImagesError::Provider {
-            status,
-            body: String::from_utf8_lossy(body).trim().to_string(),
-        });
-    }
-    let parsed: Value =
-        serde_json::from_slice(body).map_err(|e| GeminiImagesError::InvalidBody(e.to_string()))?;
-    let candidate = parsed
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|c| c.first())
-        .ok_or(GeminiImagesError::NoCandidates)?;
-    let parts = candidate
-        .get("content")
-        .and_then(|c| c.get("parts"))
-        .and_then(Value::as_array)
-        .ok_or(GeminiImagesError::NoCandidates)?;
-
-    let mut artifacts = Vec::new();
-    let mut said: Vec<String> = Vec::new();
+/// Split out so every candidate goes through the same walk, and written for parts in
+/// general: an `inlineData` part is an artifact whatever its mime, so the day a speech
+/// model rides this shape the walk does not change.
+fn walk_parts(
+    parts: &[Value],
+    artifacts: &mut Vec<MediaArtifact>,
+    said: &mut Vec<String>,
+    unknown: &mut std::collections::BTreeSet<String>,
+) -> Result<(), GeminiImagesError> {
     for part in parts {
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             if !text.trim().is_empty() {
@@ -199,6 +197,12 @@ pub fn parse_response(status: u16, body: &[u8]) -> Result<MediaOutcome, GeminiIm
         // shape emits the second. Accepting both costs one line and refusing one of them
         // would be a silent empty result.
         let Some(blob) = part.get("inlineData").or_else(|| part.get("inline_data")) else {
+            // Not text, not a blob. Recorded rather than dropped: if nothing usable comes
+            // back, the caller is told which shapes it *did* get, which is the difference
+            // between a debuggable response and "(nothing)".
+            if let Some(obj) = part.as_object() {
+                unknown.extend(obj.keys().cloned());
+            }
             continue;
         };
         let mime = blob
@@ -217,11 +221,77 @@ pub fn parse_response(status: u16, body: &[u8]) -> Result<MediaOutcome, GeminiIm
             seed: None,
         });
     }
+    Ok(())
+}
 
+/// Walk one `generateContent` response into artifacts plus whatever the model said.
+///
+/// Written for parts in general rather than images in particular: an `inlineData` part is
+/// an artifact whatever its mime, so the day a speech model rides this shape, the walk
+/// does not change.
+pub fn parse_response(status: u16, body: &[u8]) -> Result<MediaOutcome, GeminiImagesError> {
+    if !(200..300).contains(&status) {
+        return Err(GeminiImagesError::Provider {
+            status,
+            body: String::from_utf8_lossy(body).trim().to_string(),
+        });
+    }
+    let parsed: Value =
+        serde_json::from_slice(body).map_err(|e| GeminiImagesError::InvalidBody(e.to_string()))?;
+    // A prompt-level refusal has no candidates at all and puts its verdict here, so it
+    // is read before the candidate list is even looked for.
+    if let Some(block) = parsed
+        .get("promptFeedback")
+        .and_then(|f| f.get("blockReason"))
+        .and_then(Value::as_str)
+    {
+        return Err(GeminiImagesError::Blocked {
+            reason: format!("the prompt was blocked ({block})"),
+        });
+    }
+    let candidates = parsed
+        .get("candidates")
+        .and_then(Value::as_array)
+        .filter(|c| !c.is_empty())
+        .ok_or(GeminiImagesError::NoCandidates)?;
+
+    let mut artifacts = Vec::new();
+    let mut said: Vec<String> = Vec::new();
+    // Every candidate, not just the first. `candidateCount` rides `fields` straight into
+    // `generationConfig`, so a caller can ask for several — and each one is paid for.
+    // Keeping only `.first()` would drop artifacts the caller was billed for, silently.
+    let mut unknown_parts: std::collections::BTreeSet<String> = Default::default();
+    for candidate in candidates {
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            // A candidate with no content stopped for a reason it names. Only fatal if
+            // no other candidate produced anything, which the emptiness check below
+            // decides — one blocked candidate among several is not the whole answer.
+            if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+                said.push(format!("(stopped: {reason})"));
+            }
+            continue;
+        };
+        walk_parts(parts, &mut artifacts, &mut said, &mut unknown_parts)?;
+    }
     let note = (!said.is_empty()).then(|| said.join("\n\n"));
     if artifacts.is_empty() {
         return Err(GeminiImagesError::NoImageParts {
-            said: note.unwrap_or_else(|| "(nothing)".to_string()),
+            said: note.unwrap_or_else(|| {
+                if unknown_parts.is_empty() {
+                    "(nothing)".to_string()
+                } else {
+                    // Naming the shapes that did arrive is what makes a malformed
+                    // response debuggable instead of a shrug.
+                    format!(
+                        "(no text; the response carried only these part kinds: {})",
+                        unknown_parts.into_iter().collect::<Vec<_>>().join(", ")
+                    )
+                }
+            }),
         });
     }
     Ok(MediaOutcome::Complete { artifacts, note })
@@ -479,6 +549,74 @@ mod tests {
             parse_response(200, body.to_string().as_bytes()),
             Err(GeminiImagesError::MissingMime)
         ));
+    }
+
+    /// **A prompt-level block is not "no candidates".** Gemini refuses a prompt before
+    /// producing anything, with the verdict in `promptFeedback.blockReason` and no
+    /// candidate list at all. Reporting "returned no candidates" there would be false
+    /// and would throw away the one field that says what to change.
+    #[test]
+    fn a_blocked_prompt_reports_the_reason_not_an_empty_result() {
+        let body = serde_json::json!({ "promptFeedback": { "blockReason": "SAFETY" } });
+        let err = parse_response(200, body.to_string().as_bytes()).expect_err("blocked");
+        assert!(matches!(err, GeminiImagesError::Blocked { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("SAFETY"), "the verdict survives: {msg}");
+        assert!(msg.contains("prompt was blocked"), "{msg}");
+    }
+
+    /// A candidate that stopped without content names why in `finishReason`, and that
+    /// reason reaches the caller instead of being swallowed as an empty walk.
+    #[test]
+    fn a_candidate_that_stopped_carries_its_finish_reason() {
+        let body = serde_json::json!({
+            "candidates": [{ "finishReason": "IMAGE_SAFETY" }]
+        });
+        let err = parse_response(200, body.to_string().as_bytes()).expect_err("no image");
+        assert!(
+            err.to_string().contains("IMAGE_SAFETY"),
+            "the finish reason is the whole diagnosis: {err}"
+        );
+    }
+
+    /// **Every candidate is walked, not just the first.** `candidateCount` rides
+    /// `fields` straight into `generationConfig`, so a caller can ask for several — and
+    /// each is billed. Keeping only the first would drop paid-for artifacts silently.
+    #[test]
+    fn artifacts_from_every_candidate_survive() {
+        let body = serde_json::json!({
+            "candidates": [
+                {"content": {"parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": b64(b"one")}}
+                ]}},
+                {"content": {"parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": b64(b"two")}}
+                ]}}
+            ]
+        });
+        let MediaOutcome::Complete { artifacts, .. } =
+            parse_response(200, body.to_string().as_bytes()).expect("parses")
+        else {
+            panic!("synchronous")
+        };
+        assert_eq!(artifacts.len(), 2, "both paid-for images are kept");
+        assert_eq!(artifacts[0].bytes, b"one");
+        assert_eq!(artifacts[1].bytes, b"two");
+    }
+
+    /// When nothing usable comes back, the error names the part kinds that *did* arrive
+    /// — the difference between a debuggable response and "(nothing)".
+    #[test]
+    fn unrecognized_parts_are_named_rather_than_reported_as_nothing() {
+        let body = serde_json::json!({
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "whatever"}}
+            ]}}]
+        });
+        let err = parse_response(200, body.to_string().as_bytes()).expect_err("no image");
+        let msg = err.to_string();
+        assert!(msg.contains("functionCall"), "names what did arrive: {msg}");
+        assert!(!msg.contains("(nothing)"), "and does not shrug: {msg}");
     }
 
     #[test]

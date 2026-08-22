@@ -2104,7 +2104,16 @@ async fn generate_inner(
     // the call deadline, then says plainly that kaibo stopped watching while the provider
     // may not have stopped working.
     let artifacts = match outcome {
-        crate::media::MediaOutcome::Complete { artifacts, .. } => artifacts,
+        crate::media::MediaOutcome::Complete { artifacts, note } => {
+            // The model's own account of what it did, for a backend whose image
+            // generation is a conversation. To stderr, because stdout is the payload —
+            // and shown rather than dropped, for the same reason the MCP tool shows it:
+            // it is often the only explanation of what came back.
+            if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                eprintln!("kaibo: {note}");
+            }
+            artifacts
+        }
         crate::media::MediaOutcome::Deferred(job) => {
             eprintln!(
                 "kaibo: the provider is rendering in the background — this process waits \

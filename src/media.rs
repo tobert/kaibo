@@ -15,9 +15,11 @@
 //! a mime string, and a seed) — providers translate their native shapes at their own
 //! impl, exactly as rig providers translate into rig's completion types. Three live
 //! implementations today: Stability's (`src/stability.rs`, multipart form wire, sync
-//! and deferred shapes, and the only one with an operation vocabulary), OpenAI Images
-//! (`src/openai_images.rs`, JSON body wire, sync only), and DashScope
-//! (`src/dashscope.rs`).
+//! and deferred shapes), OpenAI Images (`src/openai_images.rs`, JSON body for
+//! `generations` and multipart for the two routes that carry files), DashScope
+//! (`src/dashscope.rs`), and Gemini (`src/gemini_images.rs`) — the odd one, whose wire
+//! is a *completion* endpoint rather than an images API, and the only one that answers
+//! with words as well as bytes.
 //!
 //! # The construction point
 //!
@@ -674,6 +676,25 @@ mod tests {
         let slot = ModelSlot::bare("wan", "wan2.6-t2i");
         let arm = MediaArm::from_slot(backend, &slot).expect("a dashscope backend staffs");
         assert_eq!(arm.slot_ref(), "wan/wan2.6-t2i");
+    }
+
+    /// The Gemini arm staffs an image slot — the construction half of the media kind
+    /// whose wire is a completion endpoint.
+    #[test]
+    fn from_slot_staffs_a_gemini_images_backend() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.gimg]
+            kind = "gemini-images"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/gemini"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("gimg").expect("backend exists");
+        let slot = ModelSlot::bare("gimg", "gemini-3-flash-image");
+        let arm = MediaArm::from_slot(backend, &slot).expect("a gemini-images backend staffs");
+        assert_eq!(arm.slot_ref(), "gimg/gemini-3-flash-image");
     }
 
     /// The Stability arm still staffs — the sibling-kind regression guard for the
