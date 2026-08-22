@@ -1047,7 +1047,7 @@ An image gets *in* through `write_cas`, the deposit half: name the file in `path
 
 `kaibo cas write FILE` is the command-line half, with the same admission rules and two deliberate differences: it takes a file and no base64, and it does not scope the path to the allowed set. That tool's caller is a model, so its path is limited to what a model may steer kaibo at; this command's caller is the operator, naming a file they can already read. It prints the bare digest on stdout and everything else on stderr, so `DIGEST=$(kaibo cas write shot.png)` works. An in-memory store is refused rather than written to — the digest would die with the process.
 
-`read` is the only verb on either surface. There is no listing, no usage report, and no
+`read` and `write` are the only verbs on either surface. There is no listing, no usage report, and no
 delete — each needs an index this store does not keep. Prune by file mtime over the object
 tree with your own tools.
 

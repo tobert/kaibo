@@ -546,10 +546,11 @@ pub struct GenerateCliArgs {
     pub json: bool,
 }
 
-/// `kaibo cas` — read what kaibo stored, by address.
+/// `kaibo cas` — store an image, and read back what kaibo stored, by address.
 ///
-/// `read` is the only verb, on purpose. The store is content-addressed and opaque: you
-/// reach an object with a digest you already hold. There is no listing, no usage report,
+/// `read` and `write` are the only verbs, on purpose. The store is content-addressed and
+/// opaque: you reach an object with a digest you already hold, and storing one is how you
+/// come to hold it. There is no listing, no usage report,
 /// and no delete, because none of those can exist without an index the store does not
 /// keep. kaibo never deletes an artifact — to reclaim space, delete files under the store
 /// directory yourself by mtime; `kaibo config` prints that path.
@@ -597,10 +598,14 @@ pub struct CasReadArgs {
 /// and an image over 8388608 bytes is refused rather than trimmed.
 ///
 /// There is no base64 input here and no allowed-set check on the path. Both differ from
-/// the MCP tool deliberately: that tool's caller is a model, so its path is scoped to what
-/// a model may steer kaibo at, and its bytes may be an image that was never a file. This
-/// command's caller is the operator, running with their own privileges, naming a file they
-/// can already read. Scoping it would be friction with nothing on the other side of it.
+/// the MCP tool deliberately, and the path one deserves its reason stated plainly, because
+/// `upload.rs` argues the opposite for its own caller and a reader will find that first:
+/// **that tool's caller is a model that can be prompt-injected**, so an attacker-authored
+/// instruction to pull `~/.ssh/id_rsa` into the store and read it back is a real shape the
+/// boundary refuses. This command's caller is the operator, running with their own
+/// privileges, naming a file they can already `cat`. Scoping it would be friction with
+/// nothing on the other side of it. The bytes differ for a duller reason: an MCP caller may
+/// hold an image that was never a file, and a shell user has a path.
 #[derive(Args, Debug)]
 pub struct CasWriteArgs {
     /// The image file to store. png, jpeg, gif or webp — the format is read from the
@@ -612,7 +617,7 @@ pub struct CasWriteArgs {
     #[arg(long, value_name = "TEXT")]
     pub label: Option<String>,
 
-    /// Emit a JSON object on stdout (digest, uri, mime, bytes, path) instead of the bare
+    /// Emit a JSON object on stdout — the digest and its metadata — instead of the bare
     /// digest.
     #[arg(long)]
     pub json: bool,
@@ -2191,29 +2196,6 @@ pub async fn run_cas(common: CommonArgs, args: CasArgs) -> i32 {
     }
 }
 
-/// Open the media store for a `cas` subcommand, refusing the two states in which the
-/// command cannot do its job — disabled, and in-memory.
-///
-/// The memory case is worth its own refusal on *both* verbs rather than a shrug. A
-/// one-shot CLI process that stores into an in-memory store has done nothing: the store
-/// dies with the process and the digest it printed can never resolve again. Reporting
-/// success there would hand back an address that is already dead.
-fn open_cas_for_cli(
-    resolver: &Resolver,
-    persistence_active: bool,
-    verb: &str,
-) -> Result<Arc<crate::cas::MediaStore>, SetupError> {
-    let store = open_media_cas(resolver, persistence_active)?.ok_or_else(|| SetupError {
-        kind: "usage",
-        message: format!(
-            "kaibo's artifact store is disabled (`[cas] enabled = false`), so there is \
-             nothing to {verb}. Set `[cas] enabled = true` in config.toml to turn it on."
-        ),
-        code: EXIT_USAGE,
-    })?;
-    Ok(store)
-}
-
 /// Run `kaibo cas write` — store one image file and print its digest.
 ///
 /// **stdout is the payload**, the CLI's standing contract: the bare digest and nothing
@@ -2222,7 +2204,14 @@ fn open_cas_for_cli(
 async fn cas_write_inner(args: &CasWriteArgs, resolver: &Resolver) -> Result<i32, SetupError> {
     let persistence = open_batch_store(resolver).await;
     let mode = resolver.config.cas_mode(persistence.is_some());
-    let store = open_cas_for_cli(resolver, persistence.is_some(), "store")?;
+    let store = open_media_cas(resolver, persistence.is_some())?.ok_or_else(|| SetupError {
+        kind: "usage",
+        message: "kaibo's artifact store is disabled (`[cas] enabled = false`), so there \
+                  is nowhere to store an image. Set `[cas] enabled = true` in config.toml \
+                  to turn it on."
+            .to_string(),
+        code: EXIT_USAGE,
+    })?;
     if mode == crate::config::CasMode::Memory {
         return Err(SetupError {
             kind: "setup",
@@ -2239,6 +2228,40 @@ async fn cas_write_inner(args: &CasWriteArgs, resolver: &Resolver) -> Result<i32
 
     // The operator named a file they can already read; kaibo reads it as itself. See the
     // type's doc for why there is no allowed-set check on this path.
+    //
+    // Stat first, then read. A path named by mistake can be a directory or a 10 GB file,
+    // and `std::fs::read` would slurp the whole thing into memory before the cap in
+    // `store_bytes` ever refused it — a denial of service by accident is still one. This
+    // is the same order `read_contained_file` uses on the MCP side.
+    let meta = std::fs::metadata(&args.path).map_err(|e| SetupError {
+        kind: "usage",
+        message: format!("cannot read {}: {e}", args.path.display()),
+        code: EXIT_USAGE,
+    })?;
+    if !meta.is_file() {
+        return Err(SetupError {
+            kind: "usage",
+            message: format!(
+                "{} is not a regular file. Name the image file itself.",
+                args.path.display()
+            ),
+            code: EXIT_USAGE,
+        });
+    }
+    if meta.len() > crate::upload::MAX_UPLOAD_BYTES as u64 {
+        return Err(SetupError {
+            kind: "usage",
+            message: format!(
+                "{} is {} bytes, over the {}-byte cap. Nothing was read or stored. Reduce \
+                 the image's resolution or re-encode it at a lower quality, then store the \
+                 smaller file.",
+                args.path.display(),
+                meta.len(),
+                crate::upload::MAX_UPLOAD_BYTES,
+            ),
+            code: EXIT_USAGE,
+        });
+    }
     let bytes = std::fs::read(&args.path).map_err(|e| SetupError {
         kind: "usage",
         message: format!("cannot read {}: {e}", args.path.display()),
@@ -2251,10 +2274,21 @@ async fn cas_write_inner(args: &CasWriteArgs, resolver: &Resolver) -> Result<i32
         args.label.as_deref(),
         crate::server::render::now_epoch_secs(),
     )
-    .map_err(|e| SetupError {
-        kind: "usage",
-        message: e.to_string(),
-        code: EXIT_USAGE,
+    // A store I/O failure or capacity refusal is an environmental condition, not an
+    // argument the caller got wrong — the same split the MCP tool makes between
+    // `invalid_params` and `internal_error`, and the one `cas_read_inner` already makes
+    // for a failed `store.get`.
+    .map_err(|e| match e {
+        crate::upload::UploadError::Store(_) => SetupError {
+            kind: "setup",
+            message: e.to_string(),
+            code: EXIT_SETUP,
+        },
+        _ => SetupError {
+            kind: "usage",
+            message: e.to_string(),
+            code: EXIT_USAGE,
+        },
     })?;
 
     let hex = stored.digest.to_hex();
@@ -3785,7 +3819,11 @@ mod tests {
         // The digest the command computed is the content's own hash, so recompute it
         // rather than scraping stdout, and prove `cas read` resolves it.
         let digest = crate::cas::Digest::of_bytes(&png_file_bytes());
-        let read = parse_cas_read(&["kaibo", "cas", "read", &digest.to_hex()]);
+        // `--json` on the read leg: `cas read` without it writes the object's raw bytes to
+        // stdout, which is its documented contract and exactly wrong inside a test suite —
+        // NUL bytes in the captured log make `grep` treat the whole thing as binary and
+        // silently print nothing, which is how a green run can look like no run at all.
+        let read = parse_cas_read(&["kaibo", "cas", "read", &digest.to_hex(), "--json"]);
         let code = cas_read_inner(&read, &resolver)
             .await
             .unwrap_or_else(|e| panic!("the digest just written must read: {}", e.message));
@@ -3835,6 +3873,71 @@ mod tests {
         .expect_err("no such file");
         assert_eq!(err.code, EXIT_USAGE);
         assert!(err.message.contains("nope.png"), "{}", err.message);
+    }
+
+    /// **The cap is enforced from the file's metadata, before a byte is read.**
+    ///
+    /// `store_bytes` would refuse an over-cap image anyway, but only after `std::fs::read`
+    /// had already pulled the whole thing into memory — so a path named by mistake (a disk
+    /// image, a core dump) would be a denial of service by accident before it was a
+    /// refusal. This drives a file one byte over the cap and asserts the refusal names the
+    /// size, which it can only do from the stat.
+    #[tokio::test]
+    async fn cas_write_refuses_an_over_cap_file_from_its_metadata() {
+        let (resolver, dir) = disk_cas_resolver();
+        // Sparse: `set_len` makes the file huge by *metadata* while allocating nothing.
+        // That is exactly what the check under test reads, and writing 8 MiB of real
+        // bytes into a tmpfs-backed temp dir alongside the rest of the suite is how you
+        // get a SIGBUS in an unrelated test that mmaps its store.
+        let big = dir.path().join("huge.png");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(crate::upload::MAX_UPLOAD_BYTES as u64 + 1)
+            .unwrap();
+        drop(f);
+
+        let err = cas_write_inner(
+            &parse_cas_write(&["kaibo", "cas", "write", big.to_str().unwrap()]),
+            &resolver,
+        )
+        .await
+        .expect_err("over the cap");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert!(
+            err.message.contains("over the")
+                && err
+                    .message
+                    .contains(&crate::upload::MAX_UPLOAD_BYTES.to_string()),
+            "the refusal names the cap: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Nothing was read or stored"),
+            "and says the bytes were never read: {}",
+            err.message
+        );
+    }
+
+    /// A directory produces an OS-dependent error from `std::fs::read` ("is a directory"
+    /// on Unix, something else elsewhere). Checking `is_file()` first gives one clear
+    /// message on every platform, the same one the MCP side gives.
+    #[tokio::test]
+    async fn cas_write_refuses_a_directory_with_one_clear_message() {
+        let (resolver, dir) = disk_cas_resolver();
+        let sub = dir.path().join("pictures");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let err = cas_write_inner(
+            &parse_cas_write(&["kaibo", "cas", "write", sub.to_str().unwrap()]),
+            &resolver,
+        )
+        .await
+        .expect_err("a directory is not an image file");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert!(
+            err.message.contains("not a regular file"),
+            "{}",
+            err.message
+        );
     }
 
     /// **An in-memory store is refused, not quietly written to.**
