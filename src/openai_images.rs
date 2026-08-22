@@ -185,6 +185,10 @@ pub enum OpenAiImagesError {
     /// build, before the call — any value, even a redundant `"b64_json"`, so the
     /// contract stays one-sided.
     CallerResponseFormat,
+    /// The caller named an `op` this client does not wire. Refused rather than run as a
+    /// plain generation: an edit request answered with a fresh unrelated image is a wrong
+    /// answer that looks like a right one, and the caller pays for it.
+    UnknownOperation { asked: String },
 }
 
 impl std::fmt::Display for OpenAiImagesError {
@@ -243,6 +247,13 @@ impl std::fmt::Display for OpenAiImagesError {
                  as base64 (`url` would spend credits on artifacts kaibo refuses to \
                  fetch), and kaibo already sends the right value per model family. \
                  Omit the field"
+            ),
+            OpenAiImagesError::UnknownOperation { asked } => write!(
+                f,
+                "`op` {asked:?} is not an operation kaibo wires for the Images API, so \
+                 nothing was generated. Pass one of: {}. Omit `op` entirely to generate \
+                 from the prompt alone.",
+                images_op_names().join(", ")
             ),
         }
     }
@@ -405,6 +416,110 @@ pub fn parse_response(
 /// An Images API connection: the `reqwest::Client` (ring-installed —
 /// [`crate::tls::https_client`] is the one build site in this codebase), the
 /// resolved key, and the base URL (a root through `/v1`; this client appends
+/// Turn the JSON body plus the request's input parts into a multipart form.
+///
+/// The scalars ride as text parts under the same names the JSON body uses — OpenAI
+/// documents the multipart form as the same field set — so one `build_request_body`
+/// serves both wires and the two cannot drift on what a knob is called. `prompt` is
+/// dropped for a route that documents none (`variations`), the same rule Stability's
+/// table drives.
+fn multipart_body(
+    body: &Value,
+    request: &MediaRequest,
+    op: &ImagesOp,
+) -> Result<reqwest::multipart::Form, OpenAiImagesError> {
+    let mut form = reqwest::multipart::Form::new();
+    if let Some(map) = body.as_object() {
+        for (k, v) in map {
+            if k == "prompt" && !op.takes_prompt {
+                continue;
+            }
+            let text = match v {
+                Value::String(s) => s.clone(),
+                Value::Null => continue,
+                other => other.to_string(),
+            };
+            form = form.text(k.clone(), text);
+        }
+    }
+    for input in &request.inputs {
+        form = form.part(
+            input.field.clone(),
+            reqwest::multipart::Part::bytes(input.bytes.clone())
+                .file_name(input.filename.clone())
+                .mime_str(&input.mime)
+                .map_err(|e| {
+                    OpenAiImagesError::Transport(format!(
+                        "input part `{}` has mime {:?}, which is not a valid content \
+                         type: {e}",
+                        input.field, input.mime
+                    ))
+                })?,
+        );
+    }
+    Ok(form)
+}
+
+/// One Images API route this client can address, beyond the default `generations`.
+///
+/// The same shape `stability::OpSpec` carries, for the same reason — one source for the
+/// parser, the refusal and the published cost — and deliberately *not* a shared type.
+/// These two providers agree on the idea of a named operation and on nothing else: the
+/// path is a different URL suffix, one wire is JSON and the other multipart, and the
+/// cost is a different unit. A common struct here would be three fields of coincidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImagesOp {
+    /// What a caller passes as `op`.
+    pub name: &'static str,
+    /// The path appended to the base URL.
+    pub path: &'static str,
+    /// Required binary parts, by form-field name.
+    pub inputs: &'static [&'static str],
+    /// Whether this route documents a `prompt`.
+    pub takes_prompt: bool,
+    /// What it costs, in the provider's own words — see `stability::OpSpec::cost` for
+    /// why kaibo quotes rather than converts. OpenAI publishes no flat per-call figure
+    /// for these; the price depends on the model, the size and the quality, so that is
+    /// what kaibo says rather than inventing a number.
+    pub cost: &'static str,
+}
+
+/// The Images API routes that take an input image, confirmed against
+/// `openai/openai-openapi`'s `openapi.yaml` (2026-08-22).
+///
+/// `generations` is absent on purpose: it is what a call with no `op` already does, and
+/// listing it would offer two spellings for one thing.
+pub const IMAGES_OPS: &[ImagesOp] = &[
+    ImagesOp {
+        name: "edits",
+        path: "/images/edits",
+        inputs: &["image"],
+        takes_prompt: true,
+        cost: "priced per image by model, size and quality",
+    },
+    ImagesOp {
+        name: "variations",
+        path: "/images/variations",
+        inputs: &["image"],
+        // The spec's required list is `image` alone — no `prompt` property at all. The
+        // same prompt-less shape `upscale/fast` has on Stability, which is the first
+        // evidence that flag was worth having rather than a Stability quirk.
+        takes_prompt: false,
+        cost: "priced per image by model and size",
+    },
+];
+
+/// Look up one Images operation by the name a caller passed.
+pub fn images_op_by_name(name: &str) -> Option<&'static ImagesOp> {
+    IMAGES_OPS.iter().find(|o| o.name == name)
+}
+
+/// Every operation name a caller may pass, rendered from the table so a refusal cannot
+/// list something [`images_op_by_name`] rejects.
+pub fn images_op_names() -> Vec<&'static str> {
+    IMAGES_OPS.iter().map(|o| o.name).collect()
+}
+
 /// `/images/generations`).
 #[derive(Clone)]
 pub struct OpenAiImagesClient {
@@ -437,13 +552,32 @@ impl OpenAiImagesClient {
         model: &str,
         request: &MediaRequest,
     ) -> Result<Vec<MediaArtifact>, OpenAiImagesError> {
+        // Two wires on one API, chosen by the route rather than sniffed: `generations`
+        // is JSON, `edits` and `variations` are multipart because they carry files.
+        // Whichever wire it is, `parse_response` sees the same `{data:[{b64_json}]}`.
+        let op = match request.op.as_deref() {
+            None => None,
+            Some(name) => Some(images_op_by_name(name).ok_or_else(|| {
+                OpenAiImagesError::UnknownOperation {
+                    asked: name.to_string(),
+                }
+            })?),
+        };
         let (body, format) = build_request_body(model, request)?;
-        let url = format!("{}/images/generations", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .json(&body)
+        let base = self.base_url.trim_end_matches('/');
+        let mut req = self.http.post(match op {
+            Some(o) => format!("{base}{}", o.path),
+            None => format!("{base}/images/generations"),
+        });
+        req = req.header(AUTHORIZATION, format!("Bearer {}", self.api_key));
+        req = match op {
+            // The JSON body's scalars become text parts; the input images become file
+            // parts under the caller's own field names, so an operation taking several
+            // images under one name sends several parts under that name.
+            Some(o) => req.multipart(multipart_body(&body, request, o)?),
+            None => req.json(&body),
+        };
+        let resp = req
             .send()
             .await
             .map_err(|e| OpenAiImagesError::Transport(e.to_string()))?;
@@ -481,6 +615,17 @@ impl OpenAiImagesModel {
 impl crate::media::MediaModel for OpenAiImagesModel {
     /// Always resolves to [`MediaOutcome::Complete`] — the Images API is
     /// synchronous, and `n` makes a multi-artifact list the normal shape.
+    /// The Images API takes an input image on `edits` and `variations`.
+    fn accepts_inputs(&self) -> bool {
+        true
+    }
+
+    /// Three routes behind one model id — `generations` (the default), `edits` and
+    /// `variations`.
+    fn accepts_ops(&self) -> bool {
+        true
+    }
+
     async fn generate(&self, request: &MediaRequest) -> AnyResult<MediaOutcome> {
         let artifacts = self.client.generate(&self.model, request).await?;
         Ok(MediaOutcome::Complete(artifacts))

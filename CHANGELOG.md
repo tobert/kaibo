@@ -20,6 +20,8 @@ record. Each later release appends a new section at the top.
 - **`kaibo cas write FILE`** stores an image from the command line and prints its
   digest — the CLI half of `write_cas`, so an operator can put an image in without an
   MCP client.
+- **`generate` reaches an OpenAI-compatible images backend's `edits` and `variations`
+  routes** through the same `op` parameter, over multipart where `generations` is JSON.
 - **`generate` reaches Stability's edit, control and upscale routes** through a new `op`
   parameter — twelve operations where three were wired.
 - **Each operation's cost is published on the `op` parameter** in the provider's own
