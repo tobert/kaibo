@@ -7,8 +7,9 @@
 //! [`rig_core::image_generation::ImageGenerationModel`], and that trait's request shape
 //! (`prompt`/`width`/`height`/`additional_params`) is deliberately thin — it fits a
 //! single text-to-image call and nothing else. Stability's v2beta API is bigger than
-//! that: alongside `stable-image/generate/{core,ultra,sd3}` (the only family wired
-//! here), it also ships upscale (conservative/creative/fast), edit
+//! that: alongside `stable-image/generate/{core,ultra,sd3}` and the synchronous
+//! `edit`/`control`/`upscale` routes wired in [`STABLE_IMAGE_OPS`], it also ships the
+//! deferred half of upscale (creative) and edit (replace-background-and-relight),
 //! (inpaint/outpaint/erase/search-and-replace/remove-background), control
 //! (sketch/structure/style), audio (`stable-audio` text-to-audio/audio-to-audio), and
 //! 3D (`stable-fast-3d`) — and every one of the image-family operations, unlike
@@ -22,8 +23,8 @@
 //!
 //! # Sync vs deferred — declared, not sniffed
 //!
-//! Every operation wired so far ([`Operation::Generate`]) is synchronous: the POST
-//! itself returns the artifact. But `upscale/creative`, `stable-audio`, and
+//! Every operation wired so far — the `generate` family and every row of
+//! [`STABLE_IMAGE_OPS`] — is synchronous: the POST itself returns the artifact. But `upscale/creative`, `stable-audio`, and
 //! `stable-fast-3d` are **deferred** — the POST only returns a job id, and the artifact
 //! comes later from a poll. The tempting shortcut — "202 means deferred, 200 means
 //! sync" — is wrong: confirmed against the live
@@ -225,14 +226,18 @@ pub fn resolve_key() -> AnyResult<String> {
 
 /// One request to a Stability v2beta image operation — provider-native (Stability's
 /// own `aspect_ratio`, not rig's `width`/`height`) and already shaped for growth. See
-/// the module doc for why `inputs` exists even though the only operation wired so
-/// far ([`Operation::Generate`]) never sets it.
+/// the module doc for the shape; every `edit`, `control` and `upscale` route sets
+/// `inputs`, and the `generate` family sets it for image-to-image.
 #[derive(Debug, Clone, Default)]
 pub struct StabilityRequest {
-    /// Mandatory for every operation wired so far. A future prompt-less operation
-    /// (`remove-background`, `erase`) would need this widened to `Option<String>` —
-    /// noted rather than solved speculatively.
-    pub prompt: String,
+    /// The text prompt, when this operation documents one.
+    ///
+    /// `Option` because two wired routes do not: `edit/remove-background` and
+    /// `upscale/fast` declare no `prompt` property, so sending one would be an
+    /// undocumented field on a provider that validates its own knobs. That was recorded
+    /// here as a future widening while only the `generate` family was wired; wiring the
+    /// `edit` and `upscale` families is what made it due.
+    pub prompt: Option<String>,
     /// The binary parts this operation carries, each under the form-field name that
     /// operation documents — `image`, `mask`, `init_image`, `style_image`,
     /// `subject_image`, `audio`. Several routes take more than one, so the name is data
@@ -254,13 +259,181 @@ pub struct StabilityRequest {
     pub fields: Vec<(String, String)>,
 }
 
-/// One Stability v2beta endpoint this facade can address. Only [`Operation::Generate`]
-/// is wired; `Upscale`/`Edit`/`Control`/`Audio`/`ThreeD` are the natural siblings v2beta
-/// already documents, each one endpoint path (and, for the deferred ones, a [`Shape`]
-/// arm) away — see the module doc.
+/// One synchronous `stable-image` operation outside the `generate` family: its caller-
+/// facing name, its endpoint path, what it costs, and the binary parts it requires.
+///
+/// A table rather than twelve enum variants with twelve `match` arms. These routes differ
+/// only in their path segment and in which fields Stability validates, so a table is the
+/// honest shape — and it means the tool's schema `enum`, the parser, the refusal message
+/// and the cost list all render from one source and cannot drift apart. The same argument
+/// `artifact::FORMATS` and `upload::SIGNATURES` record.
+///
+/// **`credits` is published to the model**, and that is the point of carrying it. One
+/// credit is about a US cent, and `upscale/conservative` costs *twenty times*
+/// `generate/core`. A model that reads the price before it picks a route spends
+/// differently from one that does not, and this is the cheapest place to tell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpSpec {
+    /// What a caller passes as `op` — the family and route, as Stability spells them.
+    pub name: &'static str,
+    /// The path segment after `/v2beta/`.
+    pub path: &'static str,
+    /// What this route costs, **in the provider's own unit, verbatim**.
+    ///
+    /// A string, not a number, and not normalized to anything. kaibo does not track the
+    /// pricing landscape and would go stale silently if it tried: Stability bills flat
+    /// credits, OpenAI Images bills per image by size and quality, Gemini bills per
+    /// image. So kaibo reports what the provider says and the caller does whatever
+    /// arithmetic it wants — a figure kaibo converted is a figure kaibo has to chase.
+    pub cost: &'static str,
+    /// The binary parts this route **requires**, by form-field name — the spec's own
+    /// `required` list intersected with its binary fields, nothing looser.
+    ///
+    /// Required, not accepted, and the distinction is not pedantry: `edit/erase` and
+    /// `edit/inpaint` take an optional `mask`, and an earlier version of this table
+    /// listed it here. That told a caller it had to supply one, when the spec offers a
+    /// second route to the same result — the alpha channel of `image` — and a caller
+    /// that believed the table would have gone looking for a mask it never needed.
+    /// Optional parts belong in the prose a caller reads, not in a field named for what
+    /// a route demands.
+    ///
+    /// Informational either way: Stability validates its own requirements and kaibo does
+    /// not second-guess them. This exists so a caller knows what to pass without paying
+    /// for a round trip to find out.
+    pub inputs: &'static [&'static str],
+    /// Whether this route documents a `prompt` field at all.
+    ///
+    /// Two do not — `edit/remove-background` and `upscale/fast` declare no `prompt`
+    /// property — so sending one is an undocumented field on a provider that validates
+    /// its own knobs. `edit/erase` is a third case and a genuine spec contradiction: its
+    /// `required` list names `prompt` while its properties do not contain it. Kept `true`
+    /// there, because the required list is the half that would produce a 400 if the
+    /// server enforces it, and omitting a field the spec calls required is the riskier
+    /// guess.
+    pub takes_prompt: bool,
+}
+
+/// Every synchronous `stable-image` route outside `generate`, confirmed against the live
+/// `https://api.stability.ai/v2alpha/openapi` spec (2026-08-22) — every row checked
+/// mechanically against that spec, not by eye: the path exists, a `2xx` carries an
+/// `image/*` content type (so `Shape::Sync` is a fact rather than an assumption), the
+/// `inputs` list equals the spec's required-and-binary fields, and `credits` matches the
+/// number in the route's own "### Credits" section. That check is worth re-running on any
+/// edit here; it is what caught `mask` being listed as required on the two `edit` routes
+/// where it is optional.
+///
+/// Deferred routes are deliberately absent: `upscale/creative` and
+/// `edit/replace-background-and-relight` return a job id rather than an artifact, so they
+/// need the deferred lane wired to a poll cadence, which is its own change. Audio and 3D
+/// are absent for a different reason — the media CAS cannot name `mp3`, `wav` or `glb` on
+/// disk yet, and storing them under an invented extension is exactly what
+/// `MediaType::to_cas_extension` refuses to do.
+pub const STABLE_IMAGE_OPS: &[OpSpec] = &[
+    OpSpec {
+        name: "edit/erase",
+        path: "stable-image/edit/erase",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "edit/inpaint",
+        path: "stable-image/edit/inpaint",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "edit/outpaint",
+        path: "stable-image/edit/outpaint",
+        cost: "4 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "edit/search-and-replace",
+        path: "stable-image/edit/search-and-replace",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "edit/search-and-recolor",
+        path: "stable-image/edit/search-and-recolor",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "edit/remove-background",
+        path: "stable-image/edit/remove-background",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: false,
+    },
+    OpSpec {
+        name: "control/sketch",
+        path: "stable-image/control/sketch",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "control/structure",
+        path: "stable-image/control/structure",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "control/style",
+        path: "stable-image/control/style",
+        cost: "5 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "control/style-transfer",
+        path: "stable-image/control/style-transfer",
+        cost: "8 credits",
+        inputs: &["init_image", "style_image"],
+        takes_prompt: true,
+    },
+    OpSpec {
+        name: "upscale/fast",
+        path: "stable-image/upscale/fast",
+        cost: "2 credits",
+        inputs: &["image"],
+        takes_prompt: false,
+    },
+    OpSpec {
+        name: "upscale/conservative",
+        path: "stable-image/upscale/conservative",
+        cost: "40 credits",
+        inputs: &["image"],
+        takes_prompt: true,
+    },
+];
+
+/// Look up one operation by the name a caller passed.
+pub fn op_by_name(name: &str) -> Option<&'static OpSpec> {
+    STABLE_IMAGE_OPS.iter().find(|o| o.name == name)
+}
+
+/// Every operation name a caller may pass, in table order — for a schema enum or a
+/// refusal, rendered from the table so it cannot drift from what `op_by_name` accepts.
+pub fn op_names() -> Vec<&'static str> {
+    STABLE_IMAGE_OPS.iter().map(|o| o.name).collect()
+}
+
+/// One Stability v2beta endpoint this facade can address. `Audio`/`ThreeD` and the two
+/// deferred `stable-image` routes are the remaining siblings v2beta documents — each one
+/// table row (and, for the deferred ones, a [`Shape`] arm) away. See the module doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     Generate(GenerateRoute),
+    /// One row of [`STABLE_IMAGE_OPS`] — every `edit`, `control` and sync `upscale` route.
+    StableImage(&'static OpSpec),
 }
 
 /// Whether an operation's POST returns its artifact directly, or only a job id to poll
@@ -283,6 +456,7 @@ impl Operation {
     fn path(&self) -> String {
         match self {
             Operation::Generate(route) => format!("stable-image/generate/{}", route.path_segment()),
+            Operation::StableImage(spec) => spec.path.to_string(),
         }
     }
 
@@ -291,7 +465,11 @@ impl Operation {
     /// new match arm here, not a rewrite of [`handle_response`]'s dispatch.
     fn shape(&self) -> Shape {
         match self {
-            Operation::Generate(_) => Shape::Sync,
+            // Every route in `STABLE_IMAGE_OPS` is synchronous by construction — the two
+            // deferred `stable-image` routes are deliberately not in that table, so this
+            // arm cannot be wrong for a row that exists. A deferred operation arrives as
+            // its own variant with its own arm.
+            Operation::Generate(_) | Operation::StableImage(_) => Shape::Sync,
         }
     }
 }
@@ -387,7 +565,11 @@ pub fn aspect_ratio_for(width: u32, height: u32) -> &'static str {
 /// order-preserving; `request.inputs` are attached separately as file parts by
 /// [`StabilityClient::call`], since it isn't a text field.
 pub fn build_form_fields(request: &StabilityRequest) -> Vec<(String, String)> {
-    let mut fields: Vec<(String, String)> = vec![("prompt".to_string(), request.prompt.clone())];
+    let mut fields: Vec<(String, String)> = Vec::new();
+    // Only when the operation documents one — see `StabilityRequest::prompt`.
+    if let Some(prompt) = &request.prompt {
+        fields.push(("prompt".to_string(), prompt.clone()));
+    }
     if let Some(ar) = &request.aspect_ratio {
         fields.push(("aspect_ratio".to_string(), ar.clone()));
     }
@@ -488,6 +670,11 @@ pub enum StabilityError {
     /// writing them under a wrong or invented extension would be exactly the
     /// silent-garbage failure this module's whole design refuses.
     NoCasExtension { media_type: MediaType },
+    /// The caller named an `op` this facade does not wire. Refused rather than run as the
+    /// default route: a text-to-image render returned for an `edit/inpaint` request is a
+    /// wrong answer that looks entirely like a right one, and it costs the caller a
+    /// generation to find out.
+    UnknownOperation { asked: String },
 }
 
 impl std::fmt::Display for StabilityError {
@@ -553,6 +740,13 @@ impl std::fmt::Display for StabilityError {
                 "media type {media_type:?} has no cas::Extension to be written under yet — the \
                  CAS cannot name this on disk, so refusing rather than writing it under a wrong \
                  or invented extension"
+            ),
+            StabilityError::UnknownOperation { asked } => write!(
+                f,
+                "`op` {asked:?} is not an operation kaibo wires for Stability, so nothing \
+                 was generated. Pass one of: {}. Omit `op` entirely to generate from the \
+                 prompt alone.",
+                op_names().join(", ")
             ),
         }
     }
@@ -899,7 +1093,7 @@ pub fn from_rig_request(
     Ok((
         Operation::Generate(route),
         StabilityRequest {
-            prompt: request.prompt.clone(),
+            prompt: Some(request.prompt.clone()),
             inputs: Vec::new(),
             aspect_ratio: Some(aspect_ratio_for(request.width, request.height).to_string()),
             fields,
@@ -1132,10 +1326,35 @@ impl StabilityImageModel {
     /// `output_format = "png"` default, then let the caller's own fields override —
     /// last write wins, the same contract [`build_form_fields`] applies again at
     /// send time.
-    fn media_request(&self, request: &crate::media::MediaRequest) -> (Operation, StabilityRequest) {
+    /// Resolve one neutral request into the operation it addresses and Stability's own
+    /// request shape.
+    ///
+    /// Fallible now, because the caller's `op` is a *name* and an unrecognized one has to
+    /// refuse rather than quietly run the default route — a text-to-image render returned
+    /// for an inpaint request is a wrong answer wearing a right one's clothes.
+    ///
+    /// The model slot picks the route only when no `op` is named. That split is the whole
+    /// reason `op` exists: a cast's `image` slot names one model, and this provider has
+    /// twenty-five operations behind it, so the operation is a property of the call and
+    /// the model id stays what it always was — the `generate` family's route selector.
+    fn media_request(
+        &self,
+        request: &crate::media::MediaRequest,
+    ) -> Result<(Operation, StabilityRequest), StabilityError> {
         let route = GenerateRoute::classify(&self.model);
+        let operation = match request.op.as_deref() {
+            None => Operation::Generate(route.clone()),
+            Some(name) => Operation::StableImage(op_by_name(name).ok_or_else(|| {
+                StabilityError::UnknownOperation {
+                    asked: name.to_string(),
+                }
+            })?),
+        };
         let mut fields: Vec<(String, String)> = Vec::new();
-        if let GenerateRoute::Sd3 { model } = &route {
+        // `model` belongs to the sd3 generate route alone. Sending it on an edit or
+        // control route would be a field that route never documented, so it rides only
+        // where it means something.
+        if let (Operation::Generate(_), GenerateRoute::Sd3 { model }) = (&operation, &route) {
             fields.push(("model".to_string(), model.clone()));
         }
         fields.push(("output_format".to_string(), "png".to_string()));
@@ -1151,10 +1370,16 @@ impl StabilityImageModel {
                 fields.push((k.clone(), v));
             }
         }
-        (
-            Operation::Generate(route),
+        // A route that documents no `prompt` does not get one, whatever the caller passed
+        // — stated on the tool's own `prompt` parameter rather than dropped quietly.
+        let prompt = match &operation {
+            Operation::StableImage(spec) if !spec.takes_prompt => None,
+            _ => Some(request.prompt.clone()),
+        };
+        Ok((
+            operation,
             StabilityRequest {
-                prompt: request.prompt.clone(),
+                prompt,
                 inputs: request.inputs.clone(),
                 // No derived ratio on this path: the neutral request has no
                 // width/height to bridge, and an `aspect_ratio` field from the caller
@@ -1162,7 +1387,7 @@ impl StabilityImageModel {
                 aspect_ratio: None,
                 fields,
             },
-        )
+        ))
     }
 }
 
@@ -1181,11 +1406,17 @@ impl crate::media::MediaModel for StabilityImageModel {
         true
     }
 
+    /// Stability is the only backend with an operation vocabulary — twenty-five routes
+    /// behind one model id.
+    fn accepts_ops(&self) -> bool {
+        true
+    }
+
     async fn generate(
         &self,
         request: &crate::media::MediaRequest,
     ) -> AnyResult<crate::media::MediaOutcome> {
-        let (op, stability_request) = self.media_request(request);
+        let (op, stability_request) = self.media_request(request)?;
         let response = self.client.call(&op, &stability_request).await?;
         Ok(match response {
             // Stability's operations each return exactly one artifact, so it rides as a
@@ -1273,7 +1504,7 @@ mod tests {
     #[test]
     fn build_form_fields_prompt_and_aspect_ratio() {
         let req = StabilityRequest {
-            prompt: "a cat wearing a hat".to_string(),
+            prompt: Some("a cat wearing a hat".to_string()),
             aspect_ratio: Some("16:9".to_string()),
             ..Default::default()
         };
@@ -1290,7 +1521,7 @@ mod tests {
     #[test]
     fn build_form_fields_appends_extra_fields_in_order() {
         let req = StabilityRequest {
-            prompt: "p".to_string(),
+            prompt: Some("p".to_string()),
             aspect_ratio: None,
             fields: vec![
                 ("output_format".to_string(), "webp".to_string()),
@@ -1312,7 +1543,7 @@ mod tests {
     #[test]
     fn build_form_fields_explicit_field_overrides_derived_aspect_ratio() {
         let req = StabilityRequest {
-            prompt: "p".to_string(),
+            prompt: Some("p".to_string()),
             aspect_ratio: Some("1:1".to_string()),
             fields: vec![("aspect_ratio".to_string(), "16:9".to_string())],
             ..Default::default()
@@ -1328,6 +1559,91 @@ mod tests {
         );
     }
 
+    /// **A named `op` routes to that operation's endpoint, not the model's.**
+    ///
+    /// The core claim of the op layer: the cast's `image` slot names one model, and the
+    /// operation is a property of the call, so `op` must win over `GenerateRoute` for
+    /// path selection. Driven across the whole table so a row added later is covered
+    /// without a new test.
+    #[test]
+    fn a_named_op_selects_that_routes_endpoint_over_the_models() {
+        let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
+        // An sd3 model id, so a leaked default would be visibly wrong in the path.
+        let model = StabilityImageModel::from_parts(&client, "sd3.5-large");
+        for spec in STABLE_IMAGE_OPS {
+            let (op, _req) = model
+                .media_request(&crate::media::MediaRequest {
+                    prompt: "p".to_string(),
+                    fields: Vec::new(),
+                    inputs: Vec::new(),
+                    op: Some(spec.name.to_string()),
+                })
+                .unwrap_or_else(|e| panic!("{} must resolve: {e}", spec.name));
+            assert_eq!(op.path(), spec.path, "{} routed wrong", spec.name);
+            assert_eq!(op.shape(), Shape::Sync, "{} is a sync route", spec.name);
+        }
+    }
+
+    /// `model` is the sd3 *generate* route's field. Sending it on an edit or control
+    /// route would be a field that route never documented — and, since Stability
+    /// validates its own knobs, an avoidable provider 400 the caller pays for.
+    #[test]
+    fn the_sd3_model_field_rides_the_generate_route_only() {
+        let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
+        let model = StabilityImageModel::from_parts(&client, "sd3.5-large");
+
+        let (_, generate) = model
+            .media_request(&crate::media::MediaRequest {
+                prompt: "p".into(),
+                fields: Vec::new(),
+                inputs: Vec::new(),
+                op: None,
+            })
+            .expect("no op is the generate route");
+        assert!(
+            generate
+                .fields
+                .iter()
+                .any(|(k, v)| k == "model" && v == "sd3.5-large"),
+            "the sd3 generate route carries its model field: {:?}",
+            generate.fields
+        );
+
+        let (_, edit) = model
+            .media_request(&crate::media::MediaRequest {
+                prompt: "p".into(),
+                fields: Vec::new(),
+                inputs: Vec::new(),
+                op: Some("edit/inpaint".into()),
+            })
+            .expect("a wired op resolves");
+        assert!(
+            !edit.fields.iter().any(|(k, _)| k == "model"),
+            "an edit route documents no `model` field: {:?}",
+            edit.fields
+        );
+    }
+
+    /// An unrecognized `op` refuses before any request is built, and the refusal lists
+    /// every name that would have worked — rendered from the same table the parser reads.
+    #[test]
+    fn an_unknown_op_refuses_and_lists_what_is_wired() {
+        let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
+        let model = StabilityImageModel::from_parts(&client, "core");
+        let err = model
+            .media_request(&crate::media::MediaRequest {
+                prompt: "p".into(),
+                fields: Vec::new(),
+                inputs: Vec::new(),
+                op: Some("edit/inpaintt".into()),
+            })
+            .expect_err("a typo must not fall through to the default route");
+        let msg = err.to_string();
+        assert!(msg.contains("edit/inpaintt"), "names what was asked: {msg}");
+        assert!(msg.contains("edit/inpaint"), "lists the real one: {msg}");
+        assert!(msg.contains("nothing was generated"), "{msg}");
+    }
+
     /// Typed neutral field values land on Stability's all-string multipart wire in
     /// their wire spelling — `seed = 42` (a caller number) becomes the text `42`,
     /// a bool becomes `true` — losslessly, since this wire was always text. The
@@ -1338,16 +1654,29 @@ mod tests {
         use crate::media::FieldValue;
         let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
         let model = StabilityImageModel::from_parts(&client, "core");
-        let (_, req) = model.media_request(&crate::media::MediaRequest {
-            prompt: "p".to_string(),
-            fields: vec![
-                ("seed".to_string(), FieldValue::Num(serde_json::Number::from(42))),
-                ("tiling".to_string(), FieldValue::Bool(true)),
-                ("style_preset".to_string(), FieldValue::Str("anime".to_string())),
-            ],
-            inputs: Vec::new(),
-        });
-        for (name, wire) in [("seed", "42"), ("tiling", "true"), ("style_preset", "anime")] {
+        let (_, req) = model
+            .media_request(&crate::media::MediaRequest {
+                prompt: "p".to_string(),
+                fields: vec![
+                    (
+                        "seed".to_string(),
+                        FieldValue::Num(serde_json::Number::from(42)),
+                    ),
+                    ("tiling".to_string(), FieldValue::Bool(true)),
+                    (
+                        "style_preset".to_string(),
+                        FieldValue::Str("anime".to_string()),
+                    ),
+                ],
+                inputs: Vec::new(),
+                op: None,
+            })
+            .expect("no `op` resolves to the model's generate route");
+        for (name, wire) in [
+            ("seed", "42"),
+            ("tiling", "true"),
+            ("style_preset", "anime"),
+        ] {
             assert!(
                 req.fields.iter().any(|(k, v)| k == name && v == wire),
                 "{name} must reach the form fields as the text {wire:?}, got {:?}",

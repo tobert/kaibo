@@ -57,6 +57,7 @@ async fn wan_t2i_returns_real_image_bytes_through_a_fetched_link() {
             ("size".to_string(), FieldValue::Str("768*768".to_string())),
         ],
         inputs: Vec::new(),
+        op: None,
     };
     let outcome = model.generate(&request).await.expect("live generation");
     let MediaOutcome::Complete(artifacts) = outcome else {

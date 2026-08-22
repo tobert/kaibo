@@ -680,6 +680,20 @@ pub struct ReadCasInput {
     pub length: Option<usize>,
 }
 
+/// One entry of `generate`'s `inputs`: which form field a stored image fills.
+///
+/// A pair rather than a map entry so a field name may repeat — see `GenerateInput::inputs`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateInputRef {
+    /// The provider's form-field name for this part — `image`, `mask`, `init_image`,
+    /// `style_image`.
+    pub field: String,
+    /// The stored image's digest: 64 lowercase hex, as `write_cas` or `generate` printed
+    /// it (the tail of a `kaibo://cas/<digest>` address).
+    pub digest: String,
+}
+
 /// Arguments for [`KaiboHandler::write_cas`] — where the image is, and an optional label.
 ///
 /// Exactly one of `path` and `content`. There is no destination of any kind (the address
@@ -732,14 +746,48 @@ pub struct GenerateInput {
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
 
-    /// Input images for the operations that take them, as `{form-field: digest}` —
-    /// e.g. `{"image": "<digest>"}` for image-to-image, `{"image": "...", "mask":
-    /// "..."}` where an operation takes both. Each digest is one `write_cas` or
-    /// `generate` handed back, so an image already in kaibo's store is reused by
-    /// address and never re-sent. The form-field names are the provider's own; the
-    /// store decides each part's format, not you.
+    /// Input images for the operations that take them, as a list of
+    /// `{"field": "<form-field>", "digest": "<digest>"}` — e.g.
+    /// `[{"field": "image", "digest": "..."}]` for image-to-image, or an `image` and a
+    /// `mask` entry where an operation takes both. Each digest is one `write_cas` or
+    /// `generate` handed back, so an image already in kaibo's store is reused by address
+    /// and never re-sent. The field names are the provider's own; the store decides each
+    /// part's format, not you.
+    ///
+    /// A list rather than a map because a field name can repeat: an operation that takes
+    /// several source images under one name needs two entries called `image`, which a map
+    /// cannot express. Order is preserved, since a provider may care about it.
     #[serde(default)]
-    pub inputs: Option<std::collections::BTreeMap<String, String>>,
+    pub inputs: Option<Vec<GenerateInputRef>>,
+
+    /// Which operation to run, when the backend has more than one. Omit it to generate
+    /// from the prompt alone.
+    ///
+    /// Stability's operations, each with the cost the provider itself quotes and the
+    /// `inputs` field names it requires. Costs are the provider's own unit, passed
+    /// through unconverted — work out what that means in money yourself if you need to,
+    /// and note the spread: `upscale/conservative` costs twenty times `generate/core`.
+    ///
+    /// **Stability:** `edit/erase` 5 credits (image), `edit/inpaint` 5 credits (image),
+    /// `edit/outpaint` 4 credits (image), `edit/search-and-replace` 5 credits (image),
+    /// `edit/search-and-recolor` 5 credits (image), `edit/remove-background` 5 credits
+    /// (image), `control/sketch` 5 credits (image), `control/structure` 5 credits
+    /// (image), `control/style` 5 credits (image), `control/style-transfer` 8 credits
+    /// (init_image, style_image), `upscale/fast` 2 credits (image),
+    /// `upscale/conservative` 40 credits (image).
+    ///
+    /// **An OpenAI-compatible images backend:** `edits` priced per image by model, size
+    /// and quality (image; up to 16 `image` entries), `variations` priced per image by
+    /// model and size (image; takes no prompt).
+    ///
+    /// `edit/erase` and `edit/inpaint` also take an optional `mask` in `inputs`, or an
+    /// alpha channel on the image instead. Text knobs ride `fields`, not `inputs`:
+    /// `edit/search-and-replace` needs `search_prompt` there, `edit/search-and-recolor`
+    /// needs `select_prompt`. `prompt` is ignored on any route that documents none —
+    /// Stability's `edit/remove-background` and `upscale/fast`, and the Images API's
+    /// `variations`.
+    #[serde(default)]
+    pub op: Option<String>,
 }
 
 /// One `generate` field value, as typed JSON: the schema face of
@@ -2888,12 +2936,7 @@ impl KaiboHandler {
                     .resolver
                     .read_contained_file(path, crate::upload::MAX_UPLOAD_BYTES as u64)
                     .await?;
-                crate::upload::store_bytes(
-                    store,
-                    &bytes,
-                    input.label.as_deref(),
-                    now_epoch_secs(),
-                )
+                crate::upload::store_bytes(store, &bytes, input.label.as_deref(), now_epoch_secs())
             }
             (None, Some(content)) => crate::upload::store_upload(
                 store,
@@ -2923,9 +2966,7 @@ impl KaiboHandler {
         // parameter the caller got wrong — the same split `read_cas` makes between a bad
         // digest and an unreadable object.
         .map_err(|e| match e {
-            crate::upload::UploadError::Store(_) => {
-                McpError::internal_error(e.to_string(), None)
-            }
+            crate::upload::UploadError::Store(_) => McpError::internal_error(e.to_string(), None),
             _ => McpError::invalid_params(e.to_string(), None),
         })?;
 
@@ -3064,7 +3105,11 @@ impl KaiboHandler {
             `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
             image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
             an image already in the store is reused by address and never re-sent. \
-            Stability accepts input images; the other media backends do not and say so. An \
+            Stability accepts input images; the other media backends do not and say so. \
+            `op` picks an operation when the backend has more than one — Stability's \
+            edit, control and upscale routes, each with its required `inputs` keys and \
+            its credit cost listed on the parameter, so you can see the price before you \
+            pick. Omit `op` to generate from the prompt. An \
             operation the provider declares deferred returns a `job-N` handle for \
             job_wait/job_get instead (every route wired today answers in-call). \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
@@ -3140,14 +3185,21 @@ impl KaiboHandler {
         // Resolved before the arm is called, so a bad digest refuses without spending a
         // provider request — and the store, not the caller, names each part's format.
         let inputs = match input.inputs.as_ref() {
-            Some(asked) => crate::media::resolve_inputs(&store, asked)
-                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?,
+            Some(asked) => {
+                let pairs: Vec<(String, String)> = asked
+                    .iter()
+                    .map(|r| (r.field.clone(), r.digest.clone()))
+                    .collect();
+                crate::media::resolve_inputs(&store, &pairs)
+                    .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+            }
             None => Vec::new(),
         };
         let request = crate::media::MediaRequest {
             prompt: input.prompt.clone(),
             fields,
             inputs,
+            op: input.op.clone(),
         };
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
@@ -3702,7 +3754,9 @@ impl KaiboHandler {
 /// answer). Fulfilling stays the right call: a client that asks for the newest
 /// version wants what that version's other features buy it, and the two fields cost
 /// kaibo nothing to answer truthfully.
-fn sep_2549_cache_fields(context: &RequestContext<RoleServer>) -> (Option<u64>, Option<CacheScope>) {
+fn sep_2549_cache_fields(
+    context: &RequestContext<RoleServer>,
+) -> (Option<u64>, Option<CacheScope>) {
     // ISO `YYYY-MM-DD` versions compare lexically the same as chronologically.
     let required = context
         .protocol_version()
@@ -5650,6 +5704,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("generate succeeds");
@@ -5697,6 +5752,7 @@ mod tests {
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
+            op: None,
         }))
         .await
         .expect("generate succeeds");
@@ -5733,6 +5789,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("submit succeeds");
@@ -5810,6 +5867,7 @@ mod tests {
                     .collect(),
                 ),
                 inputs: None,
+                op: None,
             }))
             .await
             .expect_err("a fields.prompt override must be refused");
@@ -5832,6 +5890,7 @@ mod tests {
                     .collect(),
                 ),
                 inputs: None,
+                op: None,
             }))
             .await
             .expect_err("a fields.model override must be refused");
@@ -5855,6 +5914,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5882,6 +5942,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5924,6 +5985,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5978,6 +6040,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -6022,6 +6085,7 @@ mod tests {
                 cast: Some("anthropic".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect_err("no image slot must refuse");
@@ -6091,6 +6155,7 @@ enabled = false
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -6327,6 +6392,7 @@ enabled = false
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
+            op: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6363,6 +6429,7 @@ enabled = false
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
+            op: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6571,14 +6638,26 @@ enabled = false
             prompt: "erase the sign".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
-            inputs: Some([("image".to_string(), digest)].into_iter().collect()),
+            inputs: Some(vec![GenerateInputRef {
+                field: "image".to_string(),
+                digest,
+            }]),
+            op: None,
         }))
         .await
         .expect("a stored digest is a usable input");
 
-        let seen = provider.0.lock().unwrap().clone().expect("provider was called");
+        let seen = provider
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider was called");
         assert_eq!(seen.inputs.len(), 1, "the part reached the provider");
-        assert_eq!(seen.inputs[0].field, "image", "under the caller's field name");
+        assert_eq!(
+            seen.inputs[0].field, "image",
+            "under the caller's field name"
+        );
         assert_eq!(seen.inputs[0].bytes, b"\x89PNG\r\n\x1a\nsource");
         assert_eq!(
             seen.inputs[0].filename, "image.png",
@@ -6600,7 +6679,11 @@ enabled = false
                 prompt: "erase the sign".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
-                inputs: Some([("image".to_string(), absent)].into_iter().collect()),
+                inputs: Some(vec![GenerateInputRef {
+                    field: "image".to_string(),
+                    digest: absent,
+                }]),
+                op: None,
             }))
             .await
             .expect_err("an absent digest is refused");
@@ -6609,6 +6692,71 @@ enabled = false
             provider.0.lock().unwrap().is_none(),
             "the provider must never have been called"
         );
+    }
+
+    /// **The `op` parameter's prose must agree with the table it describes.**
+    ///
+    /// That doc is hand-written — schemars renders a doc comment, not a table — and this
+    /// change already proved the drift is real rather than theoretical: it listed
+    /// `search_prompt` and `select_prompt` as `inputs` keys when they are text `fields`,
+    /// so a model following it would have put a prompt where a digest goes and been
+    /// refused for a reason that was our fault. It also listed a credit figure per
+    /// operation, which is the sort of number that silently goes stale.
+    ///
+    /// So: every operation in the table appears in the doc, with its own credit figure,
+    /// and no operation appears that the table does not wire.
+    #[test]
+    fn the_op_parameter_doc_agrees_with_the_operation_table() {
+        let schema = schemars::schema_for!(GenerateInput);
+        let json = serde_json::to_string(&schema).expect("the schema serializes");
+        let doc = json
+            .split("\"op\"")
+            .nth(1)
+            .expect("the schema carries the op property")
+            // Backticks are markdown for the reader, noise for a match — the doc writes
+            // "`edit/erase` 5 credits" and the fact being pinned is "edit/erase 5
+            // credits". Whitespace is collapsed for the same reason: a doc comment wraps
+            // where the line ends, so "size\nand quality" and "size and quality" are the
+            // same sentence and only one of them is what the author wrote.
+            .replace('`', "");
+        // The doc arrives JSON-escaped, so a line break is the two characters `\` and
+        // `n`, which no whitespace routine can see. Unescape first, then collapse.
+        let doc: String = doc
+            .replace("\\n", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Both provider tables: the doc is one parameter and has to describe every
+        // operation a caller may pass, whichever backend staffs the slot.
+        let wired: Vec<(&str, &str)> = crate::stability::STABLE_IMAGE_OPS
+            .iter()
+            .map(|o| (o.name, o.cost))
+            .chain(
+                crate::openai_images::IMAGES_OPS
+                    .iter()
+                    .map(|o| (o.name, o.cost)),
+            )
+            .collect();
+        for (name, cost) in wired {
+            assert!(
+                doc.contains(name),
+                "the `op` doc must name {name}, or a caller cannot discover it"
+            );
+            assert!(
+                doc.contains(&format!("{name} {cost}")),
+                "the `op` doc must carry {name}'s cost as {cost:?} — a stale price is \
+                 worse than none, because it is trusted"
+            );
+        }
+        // And nothing the table does not wire: a doc naming a route that refuses is a
+        // trap, and it is the shape a half-finished revert leaves behind.
+        for absent in ["upscale/creative", "edit/replace-background-and-relight"] {
+            assert!(
+                !doc.contains(absent),
+                "the `op` doc names {absent}, which `op_by_name` refuses"
+            );
+        }
     }
 
     /// A minimal but real PNG header — enough that `sniff_image` reads a true signature.
@@ -8633,7 +8781,7 @@ enabled = false
         );
         let text = read_text(TOOLS_URI, &[]);
         for needle in [
-            "attach",              // the attachment guidance moved here
+            "attach",                                     // the attachment guidance moved here
             "inlined",             // the consult-vs-oneshot attach distinction
             "whole file",          // the toolless-model whole-files steer
             "verbatim",            // the model-id override semantics

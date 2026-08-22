@@ -150,10 +150,7 @@ impl super::Resolver {
             )
         })?;
         let meta = std::fs::metadata(&canon).map_err(|e| {
-            McpError::invalid_params(
-                format!("{} could not be read: {e}", canon.display()),
-                None,
-            )
+            McpError::invalid_params(format!("{} could not be read: {e}", canon.display()), None)
         })?;
         if !meta.is_file() {
             return Err(McpError::invalid_params(
@@ -178,23 +175,16 @@ impl super::Resolver {
                 None,
             ));
         }
-        let worker =
-            KaishWorker::spawn_with(&tree, self.config.sandbox.clone()).map_err(|e| {
-                McpError::internal_error(
-                    format!("file reader for {}: {e:#}", tree.display()),
-                    None,
-                )
-            })?;
+        let worker = KaishWorker::spawn_with(&tree, self.config.sandbox.clone()).map_err(|e| {
+            McpError::internal_error(format!("file reader for {}: {e:#}", tree.display()), None)
+        })?;
         // One byte past the cap, so a file raced larger between the stat and this read
         // comes back over-length and is refused below rather than read whole.
         let bytes = worker
             .read_file_capped(canon.clone(), max_bytes + 1)
             .await
             .map_err(|e| {
-                McpError::invalid_params(
-                    format!("reading {}: {e:#}", canon.display()),
-                    None,
-                )
+                McpError::invalid_params(format!("reading {}: {e:#}", canon.display()), None)
             })?;
         if bytes.len() as u64 > max_bytes {
             return Err(McpError::invalid_params(
