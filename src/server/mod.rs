@@ -744,7 +744,8 @@ pub struct GenerateInput {
     /// Which operation to run, when the backend has more than one. Omit it to generate
     /// from the prompt alone. Stability's operations and what each costs in credits (one
     /// credit is about a US cent, so `upscale/conservative` is twenty times
-    /// `generate/core`): `edit/erase` 5 (image+mask), `edit/inpaint` 5 (image+mask),
+    /// `generate/core`): `edit/erase` 5 (image; optional `mask`, or an alpha channel on the image),
+    /// `edit/inpaint` 5 (image; optional `mask`, or an alpha channel on the image),
     /// `edit/outpaint` 4 (image), `edit/search-and-replace` 5 (image, `search_prompt`),
     /// `edit/search-and-recolor` 5 (image, `select_prompt`), `edit/remove-background` 5
     /// (image), `control/sketch` 5 (image), `control/structure` 5 (image),

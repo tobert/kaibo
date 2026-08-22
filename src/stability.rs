@@ -275,14 +275,31 @@ pub struct OpSpec {
     pub path: &'static str,
     /// Stability's flat credit price per successful generation.
     pub credits: u32,
-    /// The binary parts this route requires, by form-field name. Informational: Stability
-    /// validates its own requirements, and kaibo does not second-guess them — this drives
-    /// the tool description so a caller knows what to pass without a round trip.
+    /// The binary parts this route **requires**, by form-field name — the spec's own
+    /// `required` list intersected with its binary fields, nothing looser.
+    ///
+    /// Required, not accepted, and the distinction is not pedantry: `edit/erase` and
+    /// `edit/inpaint` take an optional `mask`, and an earlier version of this table
+    /// listed it here. That told a caller it had to supply one, when the spec offers a
+    /// second route to the same result — the alpha channel of `image` — and a caller
+    /// that believed the table would have gone looking for a mask it never needed.
+    /// Optional parts belong in the prose a caller reads, not in a field named for what
+    /// a route demands.
+    ///
+    /// Informational either way: Stability validates its own requirements and kaibo does
+    /// not second-guess them. This exists so a caller knows what to pass without paying
+    /// for a round trip to find out.
     pub inputs: &'static [&'static str],
 }
 
 /// Every synchronous `stable-image` route outside `generate`, confirmed against the live
-/// `https://api.stability.ai/v2alpha/openapi` spec (2026-08-21).
+/// `https://api.stability.ai/v2alpha/openapi` spec (2026-08-22) — every row checked
+/// mechanically against that spec, not by eye: the path exists, a `2xx` carries an
+/// `image/*` content type (so `Shape::Sync` is a fact rather than an assumption), the
+/// `inputs` list equals the spec's required-and-binary fields, and `credits` matches the
+/// number in the route's own "### Credits" section. That check is worth re-running on any
+/// edit here; it is what caught `mask` being listed as required on the two `edit` routes
+/// where it is optional.
 ///
 /// Deferred routes are deliberately absent: `upscale/creative` and
 /// `edit/replace-background-and-relight` return a job id rather than an artifact, so they
@@ -295,13 +312,13 @@ pub const STABLE_IMAGE_OPS: &[OpSpec] = &[
         name: "edit/erase",
         path: "stable-image/edit/erase",
         credits: 5,
-        inputs: &["image", "mask"],
+        inputs: &["image"],
     },
     OpSpec {
         name: "edit/inpaint",
         path: "stable-image/edit/inpaint",
         credits: 5,
-        inputs: &["image", "mask"],
+        inputs: &["image"],
     },
     OpSpec {
         name: "edit/outpaint",

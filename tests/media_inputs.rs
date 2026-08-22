@@ -376,3 +376,34 @@ async fn the_arm_refuses_a_named_op_for_a_provider_that_never_opted_in() {
         .expect_err("must refuse");
     assert!(format!("{err:#}").contains("edit/inpaint"));
 }
+
+/// **`inputs` means required, not accepted** — pinned because getting it wrong is silent.
+///
+/// An earlier version of the table listed `mask` as an input of `edit/erase` and
+/// `edit/inpaint`. The spec's required list for both is `image` alone: a mask is
+/// optional, and the alpha channel of `image` is the documented alternative. Listing it
+/// under a field named for what a route *demands* told a caller to go find something it
+/// never needed — a wrong instruction, published to a model, that costs a round trip and
+/// no error to discover.
+///
+/// The table is checked mechanically against the live spec on edit (see
+/// `STABLE_IMAGE_OPS`'s doc). This is the in-tree half, for the regression that check
+/// would catch only if someone remembered to run it.
+#[test]
+fn the_inputs_list_carries_required_parts_only() {
+    for name in ["edit/erase", "edit/inpaint"] {
+        let spec = op_by_name(name).expect("wired");
+        assert_eq!(
+            spec.inputs,
+            &["image"],
+            "{name} requires `image` alone — a mask is optional, and an alpha channel on \
+             the image is the documented alternative"
+        );
+    }
+    // And a route that genuinely requires two still says so, so this test cannot pass by
+    // the list having been emptied.
+    assert_eq!(
+        op_by_name("control/style-transfer").expect("wired").inputs,
+        &["init_image", "style_image"],
+    );
+}
