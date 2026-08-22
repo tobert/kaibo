@@ -115,6 +115,99 @@ impl super::Resolver {
     /// by racing a re-check. One worker is spawned per *distinct* containing tree and
     /// reused across attachments under it, so the common case (files under one project
     /// root) builds a single worker.
+    /// Read one caller-named file's bytes, contained.
+    ///
+    /// The single-file sibling of [`resolve_attachments`](Self::resolve_attachments),
+    /// and it obeys exactly the same boundary for the same reasons: canonicalize
+    /// (symlinks and `..` resolved), require a regular file, require a containing
+    /// allowed tree, refuse an over-cap file from its metadata *before* reading it, then
+    /// read **through the read-only kaish VFS** rooted at that tree rather than
+    /// `std::fs::read`.
+    ///
+    /// That last step is the one worth not skipping. The canonicalize-and-check above is
+    /// a friendly early error; the VFS re-resolves at read time and refuses to follow a
+    /// symlink out of the mount, which closes the check-then-open window structurally
+    /// instead of by racing a re-check. `tests/containment.rs`'s `mount_layer_symlink_*`
+    /// battery is what proves it.
+    ///
+    /// The read is capped at `max_bytes`, and a file that grows past the cap between the
+    /// stat and the read is refused by length rather than slurped — the same
+    /// stat-then-read swap `resolve_attachments` guards against.
+    pub(crate) async fn read_contained_file(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, McpError> {
+        let raw = PathBuf::from(path);
+        let canon = std::fs::canonicalize(&raw).map_err(|e| {
+            McpError::invalid_params(
+                format!(
+                    "{} could not be resolved: {e}. Paths are relative to kaibo's launch \
+                     directory unless absolute.",
+                    raw.display()
+                ),
+                None,
+            )
+        })?;
+        let meta = std::fs::metadata(&canon).map_err(|e| {
+            McpError::invalid_params(
+                format!("{} could not be read: {e}", canon.display()),
+                None,
+            )
+        })?;
+        if !meta.is_file() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "{} is not a regular file. Name the image file itself.",
+                    canon.display()
+                ),
+                None,
+            ));
+        }
+        let tree = self
+            .containing_tree(&canon)
+            .ok_or_else(|| self.containment_error(&raw, &canon))?;
+        // Refused from the file's metadata, before a single byte is read.
+        if meta.len() > max_bytes {
+            return Err(McpError::invalid_params(
+                format!(
+                    "{} is {} bytes, over the {max_bytes}-byte cap. Nothing was read.",
+                    canon.display(),
+                    meta.len()
+                ),
+                None,
+            ));
+        }
+        let worker =
+            KaishWorker::spawn_with(&tree, self.config.sandbox.clone()).map_err(|e| {
+                McpError::internal_error(
+                    format!("file reader for {}: {e:#}", tree.display()),
+                    None,
+                )
+            })?;
+        // One byte past the cap, so a file raced larger between the stat and this read
+        // comes back over-length and is refused below rather than read whole.
+        let bytes = worker
+            .read_file_capped(canon.clone(), max_bytes + 1)
+            .await
+            .map_err(|e| {
+                McpError::invalid_params(
+                    format!("reading {}: {e:#}", canon.display()),
+                    None,
+                )
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(McpError::invalid_params(
+                format!(
+                    "{} is over the {max_bytes}-byte cap. Nothing was stored.",
+                    canon.display()
+                ),
+                None,
+            ));
+        }
+        Ok(bytes)
+    }
+
     pub async fn resolve_attachments(
         &self,
         paths: &[String],

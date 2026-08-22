@@ -17,7 +17,7 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// the client's artifact-retrieval verb, live exactly while the media CAS is (see
 /// `read_cas_is_advertised_only_while_the_media_cas_is_on`), so every `--no-<tool>` case
 /// below keeps it.
-const ALL_TOOLS: [&str; 14] = [
+const ALL_TOOLS: [&str; 15] = [
     "batch_submit",
     "consult",
     "consult_submit",
@@ -32,6 +32,7 @@ const ALL_TOOLS: [&str; 14] = [
     "oneshot",
     "read_cas",
     "run_kaish",
+    "write_cas",
 ];
 
 /// A config where every tool is *staffable*, so these tests measure the `--no-<tool>`

@@ -680,6 +680,33 @@ pub struct ReadCasInput {
     pub length: Option<usize>,
 }
 
+/// Arguments for [`KaiboHandler::write_cas`] — where the image is, and an optional label.
+///
+/// Exactly one of `path` and `content`. There is no destination of any kind (the address
+/// is the content hash) and no `mime` (the format is read out of the bytes, so there is
+/// no claim that can be wrong). A source `path` is read-scoped to the allowed set and
+/// read through the read-only kaish VFS. See [`crate::upload`].
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteCasInput {
+    /// Path to the image file to store. Relative paths resolve against the launch
+    /// directory. Must be a regular file inside the allowed set. This is the route to
+    /// use whenever the image is on disk.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// The image's raw bytes, base64-encoded — for an image that is not a file (pasted
+    /// into a conversation, or held in memory). Prefer `path`: these bytes are tokens
+    /// you have to write out, so a real screenshot costs far more here than a path does.
+    #[serde(default)]
+    pub content: Option<String>,
+
+    /// One short line describing the image, recorded beside it and shown by `read_cas`.
+    /// Optional, capped at 200 bytes, single-line.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 /// Arguments to `generate`: media generation through the cast's `image` slot. No
 /// `path` — generation reads no project (the prompt is the whole input), so there is
 /// nothing to scope to an allowed tree.
@@ -926,7 +953,7 @@ pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 15] = [
     "consult",
     "consult_submit",
     "explore",
@@ -936,6 +963,7 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
     "batch_submit",
     "generate",
     "read_cas",
+    "write_cas",
     "job_get",
     "job_cancel",
     "job_list",
@@ -949,11 +977,19 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 14] = [
 /// generate anything, which is the useless-server state startup already refuses.
 ///
 /// The `job_*` verbs enforce this through their own liveness (they need a producer).
-/// `read_cas` cannot: it keys on the media CAS, which is ON by default, so counting it
-/// would make the empty-surface guard in `main` unreachable for every stock install — a
-/// check that can no longer fire is a check that no longer protects anything.
-pub(crate) const FOLLOWER_TOOL_NAMES: &[&str] =
-    &["read_cas", "job_get", "job_cancel", "job_list", "job_wait"];
+/// `read_cas` and `write_cas` cannot: they key on the media CAS, which is ON by default,
+/// so counting them would make the empty-surface guard in `main` unreachable for every
+/// stock install — a check that can no longer fire is a check that no longer protects
+/// anything. A kaibo whose entire offering is "hold the bytes I hand you and give them
+/// back" cannot investigate, answer, or generate anything either.
+pub(crate) const FOLLOWER_TOOL_NAMES: &[&str] = &[
+    "read_cas",
+    "write_cas",
+    "job_get",
+    "job_cancel",
+    "job_list",
+    "job_wait",
+];
 
 /// Which tools this config actually advertises: the operator's `--no-<tool>` flags AND
 /// a cast that can staff each one.
@@ -990,6 +1026,11 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     // `[artifacts] enabled` — that flag gates whether the model team may *write*, while
     // `generate`'s artifacts need retrieving whether or not a consult may save.
     let read_cas_live = config.cas.enabled;
+    // `write_cas` is the deposit half of the same contract and keys on the same one
+    // fact. No `--no-write-cas` flag, matching `read_cas`: `[cas] enabled = false` is
+    // already the operator's switch for this store, and a second way to say the same
+    // thing is a second thing to keep in agreement.
+    let write_cas_live = config.cas.enabled;
     let jobs_live = consult_live || batch_live || deliberate_live || generate_live;
 
     [
@@ -1013,6 +1054,10 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // Client-side retrieval by digest. Operator surface, like the resource it
         // replaces: the inner model team never carries it.
         (read_cas_live, "read_cas"),
+        // Client-side deposit by content. Operator surface for the same reason
+        // `read_cas` is: the caller is the operator's proxy, and the inner model team
+        // never carries either half.
+        (write_cas_live, "write_cas"),
         // The collect verbs follow their producers — see the fn doc. "Live" folds the
         // flag AND staffing together, so a producer nothing can staff keeps them no more
         // than a producer the operator switched off does: neither mints a handle.
@@ -2797,6 +2842,108 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Store an image in kaibo's media store and get back its digest — \
+            the deposit half of `read_cas`, and how an image REACHES kaibo. Name the \
+            file in `path`: kaibo reads it itself, so the bytes never cost you a token. \
+            `content` takes base64 instead, for an image that is not a file; a real \
+            screenshot through `content` is megabytes you have to write out, so reach \
+            for `path` whenever the image is on disk. Pass exactly one. The result is a \
+            kaibo://cas/<digest> address, the mime, the size, and the real file path \
+            when the store is on disk. The format is read from the bytes themselves, so \
+            there is no mime to pass and none to get wrong: png, jpeg, gif and webp are \
+            accepted and anything else is refused. Images are capped at 8388608 bytes \
+            and a larger one is refused, not trimmed. `path` must be inside the allowed \
+            set, like every other path kaibo reads. Nothing is written to your project \
+            — this store is kaibo's own, addressed only by content hash."
+    )]
+    pub async fn write_cas(
+        &self,
+        Parameters(input): Parameters<WriteCasInput>,
+    ) -> Result<CallToolResult, McpError> {
+        // The route is dropped when the CAS is off, so this is a belt for a direct
+        // caller that bypasses the advertised list.
+        let Some(store) = &self.media_cas else {
+            return Err(McpError::invalid_params(
+                "the media CAS is disabled ([cas] enabled = false), so there is nowhere \
+                 to store an upload. Re-enable it (or remove the flag) and reconnect."
+                    .to_string(),
+                None,
+            ));
+        };
+        // Exactly one source. Neither is a caller who has not said what to store; both
+        // is a caller who said it twice and would need kaibo to pick — a silent
+        // precedence rule is how the stored bytes come to disagree with the intent.
+        let stored = match (input.path.as_deref(), input.content.as_deref()) {
+            (Some(path), None) => {
+                let bytes = self
+                    .resolver
+                    .read_contained_file(path, crate::upload::MAX_UPLOAD_BYTES as u64)
+                    .await?;
+                crate::upload::store_bytes(
+                    store,
+                    &bytes,
+                    input.label.as_deref(),
+                    now_epoch_secs(),
+                )
+            }
+            (None, Some(content)) => crate::upload::store_upload(
+                store,
+                content,
+                input.label.as_deref(),
+                now_epoch_secs(),
+            ),
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "write_cas needs an image: name the file in `path`, or pass its \
+                     base64 bytes in `content` when it is not a file."
+                        .to_string(),
+                    None,
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "write_cas takes `path` or `content`, not both — kaibo will not \
+                     guess which one you meant to store. Pass the one that names this \
+                     image."
+                        .to_string(),
+                    None,
+                ))
+            }
+        }
+        // A store I/O failure or a capacity refusal is a server-side condition, not a
+        // parameter the caller got wrong — the same split `read_cas` makes between a bad
+        // digest and an unreadable object.
+        .map_err(|e| match e {
+            crate::upload::UploadError::Store(_) => {
+                McpError::internal_error(e.to_string(), None)
+            }
+            _ => McpError::invalid_params(e.to_string(), None),
+        })?;
+
+        let hex = stored.digest.to_hex();
+        let mut text = format!(
+            "Stored 1 image (read it back with `read_cas`, passing the digest):\n\
+             {CAS_RES_PREFIX}{hex} ({}, {} bytes)",
+            stored.extension.mime(),
+            stored.bytes,
+        );
+        if let Some(path) = store.path_for(&stored.digest) {
+            text.push_str(&format!("\n   path: {}", path.display()));
+        }
+        if stored.provenance_missing {
+            // The bytes are durable and addressable; only the record beside them is
+            // missing. Said plainly rather than left to be discovered by a later
+            // `read_cas` reporting "provenance: absent".
+            text.push_str(
+                "\n   NOTE: the image is stored and retrievable, but kaibo could not \
+                 record the metadata beside it — nothing on disk says what this image is \
+                 or when it arrived. The digest above is still good.",
+            );
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(
         description = "Read one stored artifact by its digest — what `generate` and a \
             consult's `save_artifact` hand back as kaibo://cas/<digest>. Metadata \
             always comes first: mime, total size, whether it is binary, the artifact's \
@@ -4175,6 +4322,22 @@ options ride the `fields` object verbatim, each value's JSON type preserved
 deferred hands back a `job-N` on the same collect verbs above — the lane is wired,
 though every route wired today answers in-call. Every artifact gets a provenance
 sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
+
+## Getting an image in: `write_cas`
+
+`write_cas` is the deposit half, and how an image reaches kaibo at all. Pass the raw bytes
+base64-encoded in `content`; you get back a `kaibo://cas/<digest>` address, the mime, the
+size, and the real file path when the store is on disk.
+
+There is no `mime` parameter and no path in either direction. The format is read out of the
+bytes themselves — png, jpeg, gif and webp are accepted, anything else is refused — so
+there is no claim to get wrong, and the address is the content hash, so there is nothing to
+aim. `content` is capped at 8388608 bytes before encoding, and a larger upload is refused
+rather than trimmed. An optional `label` records one short line about the image, which
+`read_cas` reports back.
+
+Nothing here writes to your project. This is kaibo's own store, and the inner model team
+neither carries this tool nor knows the store exists.
 
 ## Reading artifacts back: `read_cas`
 
@@ -6313,19 +6476,128 @@ enabled = false
         );
     }
 
-    /// **A server whose whole surface is `read_cas` does nothing, and says so.**
+    /// A minimal but real PNG header — enough that `sniff_image` reads a true signature.
+    fn png_bytes() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&[0, 0, 0, 13]);
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        v
+    }
+
+    fn write_cas_input(path: Option<&str>, content: Option<&str>) -> WriteCasInput {
+        WriteCasInput {
+            path: path.map(str::to_string),
+            content: content.map(str::to_string),
+            label: None,
+        }
+    }
+
+    /// **`path` is the working route: kaibo reads the file itself.**
+    ///
+    /// The reason this exists at all — tool-call arguments are completion tokens the
+    /// caller emits, so a real screenshot through `content` is megabytes the client has
+    /// to write out one token at a time. This proves the cheap route round-trips.
+    #[tokio::test]
+    async fn write_cas_stores_a_file_the_caller_names_by_path() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let img = dir.path().join("screenshot.png");
+        std::fs::write(&img, png_bytes()).expect("fixture writes");
+        let h = handler_from_toml(&format!(
+            "[server]\nallow_paths = [{:?}]\n",
+            dir.path().display().to_string()
+        ));
+
+        let result = h
+            .write_cas(Parameters(write_cas_input(
+                Some(&img.display().to_string()),
+                None,
+            )))
+            .await
+            .expect("a contained png stores");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("write_cas answers with text");
+        assert!(text.contains("image/png"), "{text}");
+        assert!(text.contains(CAS_RES_PREFIX), "{text}");
+    }
+
+    /// The boundary is not ceremony here: the client is itself a model, and a
+    /// prompt-injected one asking kaibo to pull a private key into the store and read it
+    /// back is exactly this shape. A path outside the allowed set is refused, and the
+    /// refusal names the boundary.
+    #[tokio::test]
+    async fn write_cas_refuses_a_path_outside_the_allowed_set() {
+        let allowed = tempfile::TempDir::new().expect("temp dir");
+        let elsewhere = tempfile::TempDir::new().expect("temp dir");
+        let img = elsewhere.path().join("secret.png");
+        std::fs::write(&img, png_bytes()).expect("fixture writes");
+        let h = handler_from_toml(&format!(
+            "[server]\nallow_paths = [{:?}]\n",
+            allowed.path().display().to_string()
+        ));
+
+        let err = h
+            .write_cas(Parameters(write_cas_input(
+                Some(&img.display().to_string()),
+                None,
+            )))
+            .await
+            .expect_err("an out-of-tree path is refused");
+        assert!(
+            err.message.contains("outside the allowed set"),
+            "the refusal must name the boundary: {}",
+            err.message
+        );
+    }
+
+    /// Two sources is a caller who said it twice. kaibo will not pick one — a silent
+    /// precedence rule is how the stored bytes come to disagree with the intent.
+    #[tokio::test]
+    async fn write_cas_refuses_both_path_and_content() {
+        let h = handler();
+        let err = h
+            .write_cas(Parameters(write_cas_input(Some("a.png"), Some("AAAA"))))
+            .await
+            .expect_err("two sources is ambiguous");
+        assert!(err.message.contains("not both"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn write_cas_refuses_neither_path_nor_content() {
+        let h = handler();
+        let err = h
+            .write_cas(Parameters(write_cas_input(None, None)))
+            .await
+            .expect_err("no source is nothing to store");
+        assert!(
+            err.message.contains("`path`") && err.message.contains("`content`"),
+            "the refusal names both ways in: {}",
+            err.message
+        );
+    }
+
+    /// **A server whose whole surface is the media store's two halves does nothing, and
+    /// says so.**
     ///
     /// `has_substantive_tools` is what `main`'s empty-surface guard actually asks, and
     /// until this test it was only exercised through configurations the *flag* guard
     /// rejects first — so the follower rule itself was never pinned. Build the real
     /// degenerate server: every flag off, no staffable cast, media CAS on. It advertises
-    /// exactly one tool, that tool is a follower, and the answer is no.
+    /// exactly the store's deposit and retrieval verbs, both are followers, and the
+    /// answer is no.
     ///
-    /// This matters because `read_cas` rides a store that is ON by default. Counted as
-    /// substantive, it would keep the guard from ever firing on a stock install — a check
-    /// that cannot fire protects nothing.
+    /// This matters because `read_cas` and `write_cas` ride a store that is ON by
+    /// default. Counted as substantive, either would keep the guard from ever firing on a
+    /// stock install — a check that cannot fire protects nothing. `write_cas` is the
+    /// sharper case: it *accepts* content rather than only handing back what earlier runs
+    /// produced, so "it does something" is superficially true — but a server that can
+    /// only hold your bytes and give them back has still investigated, answered, and
+    /// generated nothing.
     #[test]
-    fn a_surface_of_only_read_cas_is_not_substantive() {
+    fn a_surface_of_only_the_media_store_is_not_substantive() {
         let h = hermetic_handler_from_toml(
             "[server.tools]\nconsult = false\nexplore = false\ndeliberate = false\n\
              oneshot = false\nrun_kaish = false\nbatch = false\nlist_models = false\n\
@@ -6333,13 +6605,13 @@ enabled = false
         );
         assert_eq!(
             h.advertised_tools(),
-            vec!["read_cas".to_string()],
-            "the degenerate surface is exactly the follower"
+            vec!["read_cas".to_string(), "write_cas".to_string()],
+            "the degenerate surface is exactly the two followers"
         );
         assert!(
             !h.has_substantive_tools(),
-            "a server that can only hand back what earlier runs produced is the useless \
-             server the startup guard exists to refuse"
+            "a server that can only hold bytes and hand them back is the useless server \
+             the startup guard exists to refuse"
         );
 
         // And the same handler with one castless tool back on IS substantive — the rule
@@ -6355,22 +6627,28 @@ enabled = false
         );
     }
 
-    /// `read_cas` is advertised exactly when the media CAS is live — the same liveness the
-    /// resource it replaces keyed on. It takes no cast, so nothing else gates it.
+    /// The media store's two halves are advertised exactly when it is live — the same
+    /// liveness the resource `read_cas` replaced keyed on. Neither takes a cast, so
+    /// nothing else gates either, and they move together: one `[cas] enabled` switch, not
+    /// two ways to say the same thing.
     #[test]
-    fn read_cas_is_advertised_only_while_the_media_cas_is_on() {
+    fn the_media_store_verbs_are_advertised_only_while_the_cas_is_on() {
         let on = handler();
-        assert!(
-            on.advertised_tools().contains(&"read_cas".to_string()),
-            "a live CAS advertises retrieval, got {:?}",
-            on.advertised_tools()
-        );
+        for verb in ["read_cas", "write_cas"] {
+            assert!(
+                on.advertised_tools().contains(&verb.to_string()),
+                "a live CAS advertises {verb}, got {:?}",
+                on.advertised_tools()
+            );
+        }
         let off = handler_from_toml("[cas]\nenabled = false\n");
-        assert!(
-            !off.advertised_tools().contains(&"read_cas".to_string()),
-            "no store, no retrieval verb, got {:?}",
-            off.advertised_tools()
-        );
+        for verb in ["read_cas", "write_cas"] {
+            assert!(
+                !off.advertised_tools().contains(&verb.to_string()),
+                "no store, no {verb}, got {:?}",
+                off.advertised_tools()
+            );
+        }
     }
 
     /// **The `kaibo://cas/<digest>` RESOURCE is gone.** Retrieval is a tool now, and the
