@@ -3202,6 +3202,12 @@ impl KaiboHandler {
             inputs,
             op: input.op.clone(),
         };
+        // Asked before dispatch so an operation or an input this backend has no route
+        // for is reported as the bad parameter it is, rather than as a failed call the
+        // caller is told to report. `MediaArm::generate` asks again as the structural
+        // backstop — see `MediaArm::refuse_unsupported`.
+        arm.refuse_unsupported(&request)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
             Ok(crate::media::MediaOutcome::Complete { artifacts, note }) => {
@@ -6674,6 +6680,51 @@ enabled = false
             "named from the store's record, not the caller's belief"
         );
         assert_eq!(seen.inputs[0].mime, "image/png");
+    }
+
+    /// **An unsupported `op` is a bad parameter, not a kaibo fault.**
+    ///
+    /// The arm's guard was already refusing correctly, but the handler mapped every arm
+    /// error through `consultation_failed`, which tells the caller "this is a kaibo-side
+    /// error — please report it". That framing sends someone to the issue tracker over a
+    /// parameter they could drop. Found by running a real Gemini call, not by reading the
+    /// code.
+    #[tokio::test]
+    async fn generate_reports_an_unsupported_op_as_a_parameter_error() {
+        let provider = Arc::new(RecordingProvider::default());
+        let h = media_handler(provider.clone());
+
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "anything".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+                inputs: None,
+                // `RecordingProvider` accepts inputs but declares no operations.
+                op: Some("edit/remove-background".to_string()),
+            }))
+            .await
+            .expect_err("a provider with no operations refuses");
+
+        assert!(
+            !err.message.contains("report it"),
+            "a caller mistake must not be dressed as a kaibo bug: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("no named operations"),
+            "and it must say what is wrong: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("drop `op`"),
+            "and what to do instead: {}",
+            err.message
+        );
+        assert!(
+            provider.0.lock().unwrap().is_none(),
+            "nothing reached the provider, so nothing was billed"
+        );
     }
 
     /// A digest the store does not hold refuses at the tool face, before any provider

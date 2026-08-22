@@ -501,13 +501,30 @@ impl MediaArm {
     /// binary-input guard belongs: one check the arm fastens, rather than a convention
     /// each provider impl has to remember. See [`MediaModel::accepts_inputs`].
     pub async fn generate(&self, request: &MediaRequest) -> Result<MediaOutcome> {
+        self.refuse_unsupported(request)?;
+        self.model.generate(request).await
+    }
+
+    /// Whether this arm's provider can serve everything the request asks for.
+    ///
+    /// One implementation, two callers, so they cannot drift. The handler calls it
+    /// *before* dispatching so a caller mistake is reported as a bad parameter — which
+    /// is what it is, and what tells the caller to drop `op` rather than file a bug.
+    /// [`MediaArm::generate`] calls it again as the structural backstop: it is the single
+    /// dispatch point every media call passes through, so a provider added later that
+    /// never considers `op` or `inputs` still fails closed.
+    ///
+    /// Found by running it: the refusal fired correctly on a live Gemini call and was
+    /// then wrapped in "this is a kaibo-side error — please report it", which would send
+    /// a caller to the issue tracker over a parameter they could simply drop.
+    pub fn refuse_unsupported(&self, request: &MediaRequest) -> Result<()> {
         if !self.model.accepts_inputs() {
             refuse_binary_inputs(request, &self.slot_ref)?;
         }
         if !self.model.accepts_ops() {
             refuse_operation(request, &self.slot_ref)?;
         }
-        self.model.generate(request).await
+        Ok(())
     }
 
     /// Collect one deferred job's result.
