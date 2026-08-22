@@ -20,6 +20,12 @@ record. Each later release appends a new section at the top.
 - **`kaibo cas write FILE`** stores an image from the command line and prints its
   digest — the CLI half of `write_cas`, so an operator can put an image in without an
   MCP client.
+- **`generate` reaches Stability's edit, control and upscale routes** through a new `op`
+  parameter — twelve operations where three were wired.
+- **Each operation's credit cost is published on the `op` parameter**, so a model sees
+  that `upscale/conservative` costs twenty times `generate/core` before it picks.
+- **An unrecognized `op`, or one on a backend with no operations, is refused** rather
+  than run as a text-to-image generation.
 - **`generate` takes input images by digest** — `inputs {"image": "<digest>"}` is
   image-to-image on Stability's `ultra` and `sd3` routes, reusing an image already in
   the store rather than re-sending it.

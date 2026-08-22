@@ -2093,6 +2093,7 @@ async fn generate_inner(
         // Text-to-image only from the CLI today: the edit/upscale operations that take an
         // input image would need a file to read, and the CLI has no such argument yet.
         inputs: Vec::new(),
+        op: None,
     };
     let outcome = match arm.generate(&request).await {
         Ok(o) => o,

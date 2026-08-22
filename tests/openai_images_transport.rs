@@ -134,6 +134,7 @@ async fn dall_e_round_trip_sends_typed_body_and_collects_ordered_artifacts() {
                     ("size".to_string(), FieldValue::Str("1024x1024".to_string())),
                 ],
                 inputs: Vec::new(),
+                op: None,
             },
         )
         .await

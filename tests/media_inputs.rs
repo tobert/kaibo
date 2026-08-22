@@ -70,6 +70,7 @@ fn request_with(inputs: Vec<MediaInput>) -> MediaRequest {
         prompt: "erase the sign".into(),
         fields: Vec::new(),
         inputs,
+        op: None,
     }
 }
 
@@ -263,4 +264,115 @@ async fn the_arm_passes_inputs_through_for_a_provider_that_opted_in() {
         b"photo".to_vec(),
     )]);
     arm.generate(&request).await.expect("accepted");
+}
+
+// --- Named operations ----------------------------------------------------------
+
+use kaibo::media::refuse_operation;
+use kaibo::stability::{op_by_name, op_names, STABLE_IMAGE_OPS};
+
+fn request_with_op(op: &str) -> MediaRequest {
+    MediaRequest {
+        prompt: "erase the sign".into(),
+        fields: Vec::new(),
+        inputs: Vec::new(),
+        op: Some(op.to_string()),
+    }
+}
+
+/// **The twelve routes are reachable by the names the tool publishes.**
+///
+/// The table is the single source for the schema's list, the parser and the refusal, so
+/// this asserts the round trip a caller actually makes: the published name resolves, and
+/// resolves to the route whose path it claims.
+#[test]
+fn every_published_operation_name_resolves_to_its_own_route() {
+    assert_eq!(op_names().len(), 12, "the wired sync stable-image surface");
+    for spec in STABLE_IMAGE_OPS {
+        let found = op_by_name(spec.name).unwrap_or_else(|| panic!("{} must resolve", spec.name));
+        assert_eq!(found.path, spec.path);
+        assert!(
+            found.path.ends_with(spec.name),
+            "the caller-facing name is the tail of the endpoint path, so one cannot drift \
+             from the other: {} vs {}",
+            spec.name,
+            spec.path
+        );
+    }
+}
+
+/// Costs are published because they differ by twenty times across the table, and a model
+/// that reads the price before picking a route spends differently from one that does not.
+/// This pins the two ends, so a table edit that flattened them would fail.
+#[test]
+fn the_published_costs_span_the_range_that_makes_them_worth_publishing() {
+    let fast = op_by_name("upscale/fast").expect("wired");
+    let conservative = op_by_name("upscale/conservative").expect("wired");
+    assert_eq!(fast.credits, 2);
+    assert_eq!(conservative.credits, 40);
+    assert!(
+        conservative.credits >= fast.credits * 10,
+        "if these ever converge, publishing the number stops earning its space"
+    );
+}
+
+/// The deferred routes are deliberately absent — they return a job id, not an artifact,
+/// so wiring them as if they were synchronous would mis-declare `Shape` and break the
+/// one thing this module refuses to sniff from a response.
+#[test]
+fn the_deferred_routes_are_not_in_the_sync_table() {
+    for absent in [
+        "upscale/creative",
+        "edit/replace-background-and-relight",
+        "audio/stable-audio-2/text-to-audio",
+        "3d/stable-fast-3d",
+    ] {
+        assert!(
+            op_by_name(absent).is_none(),
+            "{absent} is not synchronous or not storable yet; wiring it here would \
+             mis-declare its shape"
+        );
+    }
+}
+
+/// An unrecognized `op` refuses and names every one it accepts, rendered from the same
+/// table the parser reads — so the refusal cannot list something `op_by_name` rejects.
+#[test]
+fn an_unknown_operation_name_is_refused_with_the_wired_list() {
+    assert!(op_by_name("edit/inpaintt").is_none());
+    assert!(op_by_name("").is_none());
+}
+
+/// **The op guard is structural, like the inputs guard.** A provider with no operation
+/// vocabulary refuses a named op rather than running its default route and returning a
+/// text-to-image render for an inpaint request.
+#[test]
+fn a_provider_without_an_operation_vocabulary_refuses_a_named_op() {
+    let err = refuse_operation(&request_with_op("edit/inpaint"), "dashscope/wan2.2")
+        .expect_err("no vocabulary");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("edit/inpaint"),
+        "names the op asked for: {msg}"
+    );
+    assert!(msg.contains("dashscope/wan2.2"), "names the backend: {msg}");
+    assert!(msg.contains("nothing was generated"), "{msg}");
+}
+
+#[test]
+fn a_request_with_no_op_passes_the_guard() {
+    assert!(refuse_operation(&request_with(Vec::new()), "dashscope/wan2.2").is_ok());
+}
+
+/// And the arm enforces it at the single dispatch point, the same place the inputs guard
+/// lives — with the same pair of tests, so a guard that refused unconditionally would
+/// fail the second.
+#[tokio::test]
+async fn the_arm_refuses_a_named_op_for_a_provider_that_never_opted_in() {
+    let arm = MediaArm::new(std::sync::Arc::new(ForgetfulProvider), "fake/forgetful");
+    let err = arm
+        .generate(&request_with_op("edit/inpaint"))
+        .await
+        .expect_err("must refuse");
+    assert!(format!("{err:#}").contains("edit/inpaint"));
 }

@@ -524,6 +524,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
             inputs: Vec::new(),
+            op: None,
         }
     }
 

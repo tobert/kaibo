@@ -740,6 +740,19 @@ pub struct GenerateInput {
     /// store decides each part's format, not you.
     #[serde(default)]
     pub inputs: Option<std::collections::BTreeMap<String, String>>,
+
+    /// Which operation to run, when the backend has more than one. Omit it to generate
+    /// from the prompt alone. Stability's operations and what each costs in credits (one
+    /// credit is about a US cent, so `upscale/conservative` is twenty times
+    /// `generate/core`): `edit/erase` 5 (image+mask), `edit/inpaint` 5 (image+mask),
+    /// `edit/outpaint` 4 (image), `edit/search-and-replace` 5 (image, `search_prompt`),
+    /// `edit/search-and-recolor` 5 (image, `select_prompt`), `edit/remove-background` 5
+    /// (image), `control/sketch` 5 (image), `control/structure` 5 (image),
+    /// `control/style` 5 (image), `control/style-transfer` 8 (init_image+style_image),
+    /// `upscale/fast` 2 (image), `upscale/conservative` 40 (image). The parenthesised
+    /// names are the `inputs` keys that operation needs.
+    #[serde(default)]
+    pub op: Option<String>,
 }
 
 /// One `generate` field value, as typed JSON: the schema face of
@@ -3064,7 +3077,11 @@ impl KaiboHandler {
             `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
             image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
             an image already in the store is reused by address and never re-sent. \
-            Stability accepts input images; the other media backends do not and say so. An \
+            Stability accepts input images; the other media backends do not and say so. \
+            `op` picks an operation when the backend has more than one — Stability's \
+            edit, control and upscale routes, each with its required `inputs` keys and \
+            its credit cost listed on the parameter, so you can see the price before you \
+            pick. Omit `op` to generate from the prompt. An \
             operation the provider declares deferred returns a `job-N` handle for \
             job_wait/job_get instead (every route wired today answers in-call). \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
@@ -3148,6 +3165,7 @@ impl KaiboHandler {
             prompt: input.prompt.clone(),
             fields,
             inputs,
+            op: input.op.clone(),
         };
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
@@ -5650,6 +5668,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("generate succeeds");
@@ -5697,6 +5716,7 @@ mod tests {
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
+            op: None,
         }))
         .await
         .expect("generate succeeds");
@@ -5733,6 +5753,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("submit succeeds");
@@ -5810,6 +5831,7 @@ mod tests {
                     .collect(),
                 ),
                 inputs: None,
+                op: None,
             }))
             .await
             .expect_err("a fields.prompt override must be refused");
@@ -5832,6 +5854,7 @@ mod tests {
                     .collect(),
                 ),
                 inputs: None,
+                op: None,
             }))
             .await
             .expect_err("a fields.model override must be refused");
@@ -5855,6 +5878,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5882,6 +5906,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5924,6 +5949,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5978,6 +6004,7 @@ mod tests {
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -6022,6 +6049,7 @@ mod tests {
                 cast: Some("anthropic".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect_err("no image slot must refuse");
@@ -6091,6 +6119,7 @@ enabled = false
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
+                op: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -6327,6 +6356,7 @@ enabled = false
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
+            op: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6363,6 +6393,7 @@ enabled = false
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
+            op: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6572,6 +6603,7 @@ enabled = false
             cast: Some("artist".to_string()),
             fields: None,
             inputs: Some([("image".to_string(), digest)].into_iter().collect()),
+            op: None,
         }))
         .await
         .expect("a stored digest is a usable input");
@@ -6601,6 +6633,7 @@ enabled = false
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: Some([("image".to_string(), absent)].into_iter().collect()),
+                op: None,
             }))
             .await
             .expect_err("an absent digest is refused");

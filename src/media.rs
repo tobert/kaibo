@@ -134,6 +134,16 @@ pub struct MediaRequest {
     /// binary sibling, and it is a `Vec` for the same reason: a provider may care about
     /// order.
     pub inputs: Vec<MediaInput>,
+
+    /// Which of the provider's operations to run, in that provider's own vocabulary
+    /// (`"edit/inpaint"`, `"control/style-transfer"`). `None` is the provider's default
+    /// — text-to-image everywhere today.
+    ///
+    /// Provider-neutral only in the sense `fields` is: kaibo carries the string and the
+    /// provider answers for its own vocabulary. It is *not* the model slot's job — a
+    /// cast's `image` slot names one model, and Stability alone has twenty-five
+    /// operations behind it, so an operation is a property of the call.
+    pub op: Option<String>,
 }
 
 /// One binary part of a generation request: which form field it fills, what to call it
@@ -222,6 +232,23 @@ pub fn resolve_inputs(
         out.push(MediaInput::new(field.clone(), extension, bytes));
     }
     Ok(out)
+}
+
+/// Refuse a named operation on a provider that has no vocabulary of them.
+///
+/// Same failure being prevented as [`refuse_binary_inputs`]: running the default route
+/// for a caller who named a different one returns a plausible artifact for the wrong
+/// question, stored with a digest and a sidecar that make it look deliberate.
+pub fn refuse_operation(request: &MediaRequest, provider: &str) -> Result<()> {
+    let Some(op) = &request.op else {
+        return Ok(());
+    };
+    bail!(
+        "this call asks for operation `{op}`, and the {provider} backend has no named \
+         operations — it generates from a prompt and nothing else, so nothing was \
+         generated. Point the cast's `image` slot at a backend with an operation \
+         vocabulary (Stability), or drop `op`."
+    )
 }
 
 /// Refuse a request carrying binary inputs on a provider that has no route for them.
@@ -314,6 +341,17 @@ pub trait MediaModel: Send + Sync {
     /// opt in costs a clear refusal, where forgetting a guard would have cost a
     /// convincing wrong answer.
     fn accepts_inputs(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider has a vocabulary of named operations at all.
+    ///
+    /// Defaults to `false` for the same reason as [`accepts_inputs`](Self::accepts_inputs),
+    /// and enforced in the same place: a provider that ignored `op` would run its default
+    /// route and hand back a text-to-image render when the caller asked for an inpaint —
+    /// a wrong answer that looks entirely like a right one. Failing closed costs a
+    /// refusal instead.
+    fn accepts_ops(&self) -> bool {
         false
     }
 }
@@ -423,6 +461,9 @@ impl MediaArm {
     pub async fn generate(&self, request: &MediaRequest) -> Result<MediaOutcome> {
         if !self.model.accepts_inputs() {
             refuse_binary_inputs(request, &self.slot_ref)?;
+        }
+        if !self.model.accepts_ops() {
+            refuse_operation(request, &self.slot_ref)?;
         }
         self.model.generate(request).await
     }
