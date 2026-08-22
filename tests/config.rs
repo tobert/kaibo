@@ -1991,7 +1991,9 @@ fn openai_images_backend_parses_and_seeds_openai_key_sources() {
     assert_eq!(b.kind, kaibo::credentials::ProviderKind::OpenAiImages);
     assert_eq!(b.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
     assert!(
-        b.api_key_file.as_deref().is_some_and(|f| f.ends_with("/.openai-key")),
+        b.api_key_file
+            .as_deref()
+            .is_some_and(|f| f.ends_with("/.openai-key")),
         "the key file mirrors the openai completion kind's, got: {:?}",
         b.api_key_file
     );
@@ -2175,7 +2177,10 @@ fn cas_defaults_to_the_xdg_data_dir_and_no_cap() {
         c.cas.max_bytes, None,
         "the CAS ships uncapped — a cap costs an O(objects) walk per write, so it is opt-in"
     );
-    let dir = c.cas.dir.expect("a default CAS dir resolves from XDG_DATA_HOME or HOME");
+    let dir = c
+        .cas
+        .dir
+        .expect("a default CAS dir resolves from XDG_DATA_HOME or HOME");
     assert!(
         dir.ends_with("kaibo/cas"),
         "the default CAS dir is <data>/kaibo/cas, got {}",
@@ -2226,10 +2231,7 @@ fn cas_mode_follows_persistence_and_the_off_switch_wins() {
 /// The file layer sets both knobs, and `$VAR`/`~` in `dir` expand like every other path.
 #[test]
 fn cas_file_layer_sets_dir_and_cap() {
-    let c = Config::from_toml_str(
-        "[cas]\ndir = \"/srv/art\"\nmax_bytes = 1024\n",
-    )
-    .unwrap();
+    let c = Config::from_toml_str("[cas]\ndir = \"/srv/art\"\nmax_bytes = 1024\n").unwrap();
     assert_eq!(c.cas.dir.unwrap(), std::path::PathBuf::from("/srv/art"));
     assert_eq!(c.cas.max_bytes, Some(1024));
 }
@@ -2239,8 +2241,8 @@ fn cas_file_layer_sets_dir_and_cap() {
 /// fails on first use with a capacity error no operator could explain.
 #[test]
 fn cas_zero_max_bytes_is_a_loud_load_error() {
-    let err = Config::from_toml_str("[cas]\nmax_bytes = 0\n")
-        .expect_err("max_bytes = 0 must be refused");
+    let err =
+        Config::from_toml_str("[cas]\nmax_bytes = 0\n").expect_err("max_bytes = 0 must be refused");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("max_bytes") && msg.contains("> 0"),
@@ -2280,8 +2282,7 @@ fn cas_env_overrides_the_file() {
 /// grammar every other optional flag here uses.
 #[test]
 fn cas_cli_wins_and_absent_flags_do_not_clobber() {
-    let mut c =
-        Config::from_toml_str("[cas]\ndir = \"/from/file\"\nmax_bytes = 111\n").unwrap();
+    let mut c = Config::from_toml_str("[cas]\ndir = \"/from/file\"\nmax_bytes = 111\n").unwrap();
     c.apply_cli(
         None,
         None,
@@ -2696,4 +2697,81 @@ fn no_otel_environment_leaves_telemetry_off() {
     let c = load_env(&[]);
     assert!(!c.telemetry.enabled);
     assert!(!c.telemetry.capture_content);
+}
+
+// --- the gemini-images kind ------------------------------------------------------
+
+/// The `gemini-images` kind parses and **shares `gemini`'s key sources** — one Google
+/// credential per account, not one per use of the endpoint. That sharing is the
+/// difference from `dashscope`, which deliberately keeps its own: there the two wires
+/// are separate protocols against one host, whereas here they are literally the same
+/// endpoint asked for a different modality.
+///
+/// The key is required: the default target is Google's hosted service, so a keyless
+/// seed would 401 on the first paid call instead of failing at load.
+#[test]
+fn gemini_images_backend_parses_and_shares_the_gemini_key_sources() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.gimg]
+        kind = "gemini-images"
+        "#,
+    )
+    .expect("the gemini-images kind must parse");
+    let b = c.backends.get("gimg").expect("backend exists");
+    assert_eq!(b.kind, kaibo::credentials::ProviderKind::GeminiImages);
+    assert_eq!(b.api_key_env.as_deref(), Some("GEMINI_API_KEY"));
+    assert!(
+        b.api_key_file
+            .as_deref()
+            .is_some_and(|f| f.ends_with("/.gemini-api-key")),
+        "it shares the `gemini` key file rather than minting a second name, got: {:?}",
+        b.api_key_file
+    );
+    assert!(
+        !b.key_optional,
+        "the default target is Google's hosted service, so the key is required"
+    );
+}
+
+/// An `image` slot may point at it — the whole reason the kind exists.
+#[test]
+fn an_image_slot_can_point_at_a_gemini_images_backend() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.gimg]
+        kind = "gemini-images"
+
+        [casts.painter]
+        image = "gimg/gemini-3-flash-image"
+        "#,
+    )
+    .expect("an image slot on a gemini-images backend is the supported pairing");
+    assert!(c.casts.contains_key("painter"));
+}
+
+/// **A reasoning slot pointed at `gemini-images` is refused at load**, and this is the
+/// pairing most likely to be got wrong: `gemini` and `gemini-images` are the same vendor
+/// on the same endpoint, so an operator who types the wrong one has made a plausible
+/// mistake rather than an obvious one. Text belongs on `kind = "gemini"`.
+#[test]
+fn a_reasoning_slot_cannot_point_at_a_gemini_images_backend() {
+    for role in ["explorer", "synth"] {
+        let toml = format!(
+            r#"
+            [backends.gimg]
+            kind = "gemini-images"
+
+            [casts.broken]
+            {role} = "gimg/gemini-3-flash"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a reasoning slot on a gemini-images backend must be refused at load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(role) && msg.contains("gemini-images") && msg.contains("media kind"),
+            "the error names the slot, the kind, and its class, got: {msg}"
+        );
+    }
 }

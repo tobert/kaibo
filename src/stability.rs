@@ -1423,7 +1423,7 @@ impl crate::media::MediaModel for StabilityImageModel {
             // one-element list — the neutral outcome is a Vec because many image models
             // return several per call, and the CAS story is per-artifact digests.
             StabilityResponse::Complete(a) => {
-                crate::media::MediaOutcome::Complete(vec![media_artifact(a)])
+                crate::media::MediaOutcome::complete(vec![media_artifact(a)])
             }
             StabilityResponse::Deferred(id) => crate::media::MediaOutcome::Deferred(
                 crate::media::MediaJobId(id.as_str().to_string()),
