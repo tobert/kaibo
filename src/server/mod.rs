@@ -3203,7 +3203,7 @@ impl KaiboHandler {
         };
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
-            Ok(crate::media::MediaOutcome::Complete(artifacts)) => {
+            Ok(crate::media::MediaOutcome::Complete { artifacts, note }) => {
                 let rendered = match store_generated_artifacts(
                     &store,
                     &artifacts,
@@ -3213,6 +3213,15 @@ impl KaiboHandler {
                 ) {
                     Ok(text) => text,
                     Err(e) => return Ok(consultation_failed("generate", &cast.name, e)),
+                };
+                // A provider whose image generation is a completion call answers with
+                // words as well as bytes, and those words are often the only account of
+                // what it actually did. Shown above the digests rather than dropped.
+                let rendered = match note {
+                    Some(note) if !note.trim().is_empty() => {
+                        format!("{}\n\n{rendered}", note.trim())
+                    }
+                    _ => rendered,
                 };
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     with_provenance(
@@ -5631,7 +5640,7 @@ mod tests {
             &self,
             _request: &crate::media::MediaRequest,
         ) -> anyhow::Result<crate::media::MediaOutcome> {
-            Ok(crate::media::MediaOutcome::Complete(self.0.clone()))
+            Ok(crate::media::MediaOutcome::complete(self.0.clone()))
         }
 
         async fn poll(
@@ -6600,7 +6609,7 @@ enabled = false
             request: &crate::media::MediaRequest,
         ) -> anyhow::Result<crate::media::MediaOutcome> {
             *self.0.lock().unwrap() = Some(request.clone());
-            Ok(crate::media::MediaOutcome::Complete(vec![png(b"result")]))
+            Ok(crate::media::MediaOutcome::complete(vec![png(b"result")]))
         }
 
         async fn poll(

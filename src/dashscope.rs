@@ -422,7 +422,7 @@ impl crate::media::MediaModel for DashScopeImageModel {
                 seed: None,
             });
         }
-        Ok(MediaOutcome::Complete(artifacts))
+        Ok(MediaOutcome::complete(artifacts))
     }
 
     /// Unreachable: every operation on this route is synchronous, so `generate`

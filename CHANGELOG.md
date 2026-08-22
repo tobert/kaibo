@@ -17,6 +17,11 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **A `gemini-images` backend kind** — Gemini image generation through `generate`, the
+  same face as every other image backend. Takes input images; has no named operations.
+- **`generate` shows what the model said** above the digests, for a backend whose image
+  generation is a conversation and answers with words as well as bytes.
+
 - **`kaibo cas write FILE`** stores an image from the command line and prints its
   digest — the CLI half of `write_cas`, so an operator can put an image in without an
   MCP client.

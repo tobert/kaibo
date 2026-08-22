@@ -304,8 +304,33 @@ pub struct MediaJobId(pub String);
 /// blesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaOutcome {
-    Complete(Vec<MediaArtifact>),
+    Complete {
+        artifacts: Vec<MediaArtifact>,
+        /// What the model said alongside the artifacts, when it says anything.
+        ///
+        /// Empty for an images API: Stability, the Images API and DashScope answer with
+        /// bytes and nothing else. It exists for the providers whose image generation is
+        /// a *completion* call — Gemini's `generateContent` returns text parts and image
+        /// parts interleaved in one response, and a model that says "I moved the sign
+        /// left instead, the original crop cut it off" has told the caller something the
+        /// bytes do not.
+        ///
+        /// Carried rather than dropped because dropping it is a silent loss of the only
+        /// explanation of what happened. The same channel is what a speech model's
+        /// transcript will ride when that wave lands.
+        note: Option<String>,
+    },
     Deferred(MediaJobId),
+}
+
+impl MediaOutcome {
+    /// A completed outcome with no commentary — what every images API returns.
+    pub fn complete(artifacts: Vec<MediaArtifact>) -> Self {
+        MediaOutcome::Complete {
+            artifacts,
+            note: None,
+        }
+    }
 }
 
 /// One poll's outcome: still running, or done. A poll is never itself deferred
@@ -402,6 +427,20 @@ impl MediaArm {
                 let client =
                     crate::stability::StabilityClient::new(key, base_url, backend.request_timeout)?;
                 let model = crate::stability::StabilityImageModel::from_parts(&client, &slot.id);
+                Ok(Self::new(Arc::new(model), slot.qualified()))
+            }
+            ProviderClass::Media(MediaKind::GeminiImages) => {
+                let key = backend.resolve_key()?;
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::gemini_images::DEFAULT_BASE_URL.to_string());
+                let client = crate::gemini_images::GeminiImagesClient::new(
+                    &key,
+                    &base_url,
+                    backend.request_timeout,
+                )?;
+                let model = crate::gemini_images::GeminiImagesModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
             ProviderClass::Media(MediaKind::OpenAiImages) => {

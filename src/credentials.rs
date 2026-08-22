@@ -72,6 +72,17 @@ pub enum ProviderKind {
     /// `key_optional = true` beside its explicit local `base_url`. Like Stability,
     /// it is not in the built-in backend list and staffs only `image` cast slots.
     OpenAiImages,
+    /// Gemini's image generation — the third media kind, via `src/gemini_images.rs`.
+    ///
+    /// A *separate kind* from [`ProviderKind::Gemini`] for the same reason
+    /// [`ProviderKind::OpenAiImages`] is separate from [`ProviderKind::Openai`]: one
+    /// vendor, two APIs, and a cast slot has to know which one it is pointing at. The
+    /// twist here is that Gemini's image generation is not a distinct *endpoint* — it is
+    /// `models/{model}:generateContent`, the same call as text, with
+    /// `responseModalities` naming what comes back. So this kind is a media kind whose
+    /// wire is a completion wire, which is exactly why it needs its own name: a reasoning
+    /// slot pointed here would resolve a completion model that answers in pictures.
+    GeminiImages,
     /// Alibaba's DashScope multimodal-generation route — the third media kind, via
     /// `src/dashscope.rs`, covering the `wan` image family. Media-only on purpose:
     /// the same host serves text through an OpenAI-compatible endpoint, so a text
@@ -91,7 +102,7 @@ impl ProviderKind {
     /// new kind can never be accepted by `FromStr` while staying unlisted in the message
     /// a user actually reads — a hand-maintained list in that string had already drifted
     /// once (`openrouter` shipped before it was named there).
-    pub const ALL: [ProviderKind; 8] = [
+    pub const ALL: [ProviderKind; 9] = [
         Self::Anthropic,
         Self::DeepSeek,
         Self::Gemini,
@@ -99,6 +110,7 @@ impl ProviderKind {
         Self::Openai,
         Self::Stability,
         Self::OpenAiImages,
+        Self::GeminiImages,
         Self::DashScope,
     ];
 
@@ -144,6 +156,7 @@ impl ProviderKind {
             // Reached only when an operator sets `key_optional = true` for a local
             // sd-server: header-bearer shaped, value ignored by such a server.
             | ProviderKind::OpenAiImages
+            | ProviderKind::GeminiImages
             // Never reached: neither Stability nor DashScope is `key_optional`, so a
             // missing key is a hard error long before a stand-in is wanted. Both are
             // header-bearer wires, so they take the same shape as the others if that
@@ -167,6 +180,7 @@ impl ProviderKind {
             ProviderKind::Openai => "openai",
             ProviderKind::Stability => "stability",
             ProviderKind::OpenAiImages => "openai-images",
+            ProviderKind::GeminiImages => "gemini-images",
             ProviderKind::DashScope => "dashscope",
         }
     }
@@ -190,7 +204,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
-            ProviderKind::Gemini => "GEMINI_API_KEY",
+            ProviderKind::Gemini | ProviderKind::GeminiImages => "GEMINI_API_KEY",
             ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
             // The images kind shares the completion kind's key sources on purpose:
             // both talk to the same OpenAI account when hosted, and both cover a
@@ -213,7 +227,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => ".anthropic-key.txt",
             ProviderKind::DeepSeek => ".deepseek-key",
-            ProviderKind::Gemini => ".gemini-api-key",
+            ProviderKind::Gemini | ProviderKind::GeminiImages => ".gemini-api-key",
             ProviderKind::OpenRouter => ".openrouter-key",
             // Shared with the images kind — see `env_var`.
             ProviderKind::Openai | ProviderKind::OpenAiImages => ".openai-key",
@@ -244,6 +258,7 @@ impl ProviderKind {
             ProviderKind::Openai => ProviderClass::Wire(WireKind::Openai),
             ProviderKind::Stability => ProviderClass::Media(MediaKind::Stability),
             ProviderKind::OpenAiImages => ProviderClass::Media(MediaKind::OpenAiImages),
+            ProviderKind::GeminiImages => ProviderClass::Media(MediaKind::GeminiImages),
             ProviderKind::DashScope => ProviderClass::Media(MediaKind::DashScope),
         }
     }
@@ -293,6 +308,8 @@ pub enum MediaKind {
     /// OpenAI's Images API shape (`/v1/images/generations`), via
     /// `src/openai_images.rs` — hosted OpenAI or a local sd-server.
     OpenAiImages,
+    /// Gemini's `generateContent` asked for image output, via `src/gemini_images.rs`.
+    GeminiImages,
     /// Alibaba DashScope's multimodal-generation route, via `src/dashscope.rs` —
     /// the `wan` image family, delivered as presigned URLs kaibo fetches.
     DashScope,
@@ -333,6 +350,7 @@ impl std::str::FromStr for ProviderKind {
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
             "stability" => Ok(ProviderKind::Stability),
             "openai-images" => Ok(ProviderKind::OpenAiImages),
+            "gemini-images" => Ok(ProviderKind::GeminiImages),
             "dashscope" => Ok(ProviderKind::DashScope),
             other => Err(anyhow!(
                 "unknown provider {other:?} (expected one of: {})",

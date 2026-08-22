@@ -2104,7 +2104,7 @@ async fn generate_inner(
     // the call deadline, then says plainly that kaibo stopped watching while the provider
     // may not have stopped working.
     let artifacts = match outcome {
-        crate::media::MediaOutcome::Complete(artifacts) => artifacts,
+        crate::media::MediaOutcome::Complete { artifacts, .. } => artifacts,
         crate::media::MediaOutcome::Deferred(job) => {
             eprintln!(
                 "kaibo: the provider is rendering in the background — this process waits \

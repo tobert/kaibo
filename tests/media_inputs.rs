@@ -222,7 +222,7 @@ impl MediaModel for AcceptingProvider {
             1,
             "the parts reach the provider intact"
         );
-        Ok(MediaOutcome::Complete(Vec::new()))
+        Ok(MediaOutcome::complete(Vec::new()))
     }
     async fn poll(&self, _job: &MediaJobId) -> anyhow::Result<MediaPollOutcome> {
         unreachable!("this test never defers")
