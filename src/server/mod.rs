@@ -768,7 +768,7 @@ pub struct GenerateInput {
     /// through unconverted — work out what that means in money yourself if you need to,
     /// and note the spread: `upscale/conservative` costs twenty times `generate/core`.
     ///
-    /// `edit/erase` 5 credits (image), `edit/inpaint` 5 credits (image),
+    /// **Stability:** `edit/erase` 5 credits (image), `edit/inpaint` 5 credits (image),
     /// `edit/outpaint` 4 credits (image), `edit/search-and-replace` 5 credits (image),
     /// `edit/search-and-recolor` 5 credits (image), `edit/remove-background` 5 credits
     /// (image), `control/sketch` 5 credits (image), `control/structure` 5 credits
@@ -776,11 +776,16 @@ pub struct GenerateInput {
     /// (init_image, style_image), `upscale/fast` 2 credits (image),
     /// `upscale/conservative` 40 credits (image).
     ///
+    /// **An OpenAI-compatible images backend:** `edits` priced per image by model, size
+    /// and quality (image; up to 16 `image` entries), `variations` priced per image by
+    /// model and size (image; takes no prompt).
+    ///
     /// `edit/erase` and `edit/inpaint` also take an optional `mask` in `inputs`, or an
     /// alpha channel on the image instead. Text knobs ride `fields`, not `inputs`:
     /// `edit/search-and-replace` needs `search_prompt` there, `edit/search-and-recolor`
-    /// needs `select_prompt`. `prompt` is ignored on `edit/remove-background` and
-    /// `upscale/fast`, which document none.
+    /// needs `select_prompt`. `prompt` is ignored on any route that documents none —
+    /// Stability's `edit/remove-background` and `upscale/fast`, and the Images API's
+    /// `variations`.
     #[serde(default)]
     pub op: Option<String>,
 }
@@ -6709,21 +6714,39 @@ enabled = false
             .nth(1)
             .expect("the schema carries the op property")
             // Backticks are markdown for the reader, noise for a match — the doc writes
-            // "`edit/erase` 5 (image)" and the fact being pinned is "edit/erase 5".
+            // "`edit/erase` 5 credits" and the fact being pinned is "edit/erase 5
+            // credits". Whitespace is collapsed for the same reason: a doc comment wraps
+            // where the line ends, so "size\nand quality" and "size and quality" are the
+            // same sentence and only one of them is what the author wrote.
             .replace('`', "");
+        // The doc arrives JSON-escaped, so a line break is the two characters `\` and
+        // `n`, which no whitespace routine can see. Unescape first, then collapse.
+        let doc: String = doc
+            .replace("\\n", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        for spec in crate::stability::STABLE_IMAGE_OPS {
+        // Both provider tables: the doc is one parameter and has to describe every
+        // operation a caller may pass, whichever backend staffs the slot.
+        let wired: Vec<(&str, &str)> = crate::stability::STABLE_IMAGE_OPS
+            .iter()
+            .map(|o| (o.name, o.cost))
+            .chain(
+                crate::openai_images::IMAGES_OPS
+                    .iter()
+                    .map(|o| (o.name, o.cost)),
+            )
+            .collect();
+        for (name, cost) in wired {
             assert!(
-                doc.contains(spec.name),
-                "the `op` doc must name {}, or a caller cannot discover it",
-                spec.name
+                doc.contains(name),
+                "the `op` doc must name {name}, or a caller cannot discover it"
             );
             assert!(
-                doc.contains(&format!("{} {}", spec.name, spec.cost)),
-                "the `op` doc must carry {}'s cost as {:?} — a stale price is worse than \
-                 none, because it is trusted",
-                spec.name,
-                spec.cost
+                doc.contains(&format!("{name} {cost}")),
+                "the `op` doc must carry {name}'s cost as {cost:?} — a stale price is \
+                 worse than none, because it is trusted"
             );
         }
         // And nothing the table does not wire: a doc naming a route that refuses is a

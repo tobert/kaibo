@@ -252,3 +252,197 @@ async fn provider_401_surfaces_readably_over_the_wire() {
         "the status and the provider's message both surface, got: {msg}"
     );
 }
+
+// --- The multipart routes (`edits`, `variations`) -------------------------------
+
+/// One captured request with its body left as raw bytes — the JSON-parsing capture
+/// above cannot read a multipart body, and the point of these tests is what the bytes
+/// on the wire actually are.
+struct CapturedRaw {
+    head: String,
+    body: Vec<u8>,
+}
+
+impl CapturedRaw {
+    fn request_line(&self) -> &str {
+        self.head.lines().next().unwrap_or("")
+    }
+    fn header(&self, name: &str) -> Option<String> {
+        let want = format!("{}:", name.to_ascii_lowercase());
+        self.head.lines().find_map(|line| {
+            line.to_ascii_lowercase()
+                .starts_with(&want)
+                .then(|| line[want.len()..].trim().to_string())
+        })
+    }
+    fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+}
+
+async fn one_shot_server_raw(
+    status: u16,
+    response_body: String,
+) -> (String, tokio::sync::oneshot::Receiver<CapturedRaw>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let head_end = loop {
+            let mut chunk = [0u8; 4096];
+            let n = sock.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "client hung up mid-request");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+        let content_length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .expect("reqwest declares Content-Length for an in-memory multipart form");
+        while buf.len() < head_end + content_length {
+            let mut chunk = [0u8; 4096];
+            let n = sock.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "client hung up mid-body");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let body = buf[head_end..head_end + content_length].to_vec();
+        let response = format!(
+            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+            response_body.len(),
+        );
+        sock.write_all(response.as_bytes()).await.unwrap();
+        sock.shutdown().await.ok();
+        tx.send(CapturedRaw { head, body }).ok();
+    });
+    (format!("http://{addr}/v1"), rx)
+}
+
+fn png_part(field: &str, bytes: &[u8]) -> kaibo::media::MediaInput {
+    kaibo::media::MediaInput::new(field, kaibo::cas::Extension::Png, bytes.to_vec())
+}
+
+/// **`op: "edits"` dials the edits route over multipart with the image on the wire.**
+///
+/// The transport truth the table tests cannot see: a different URL, a different wire
+/// (multipart, not JSON), the input image present as a named file part with its mime,
+/// and the prompt still carried because this route documents one.
+#[tokio::test]
+async fn edits_posts_multipart_with_the_named_image_part() {
+    let img = b"\x89PNG\r\n\x1a\nthe-source-image";
+    let (base, rx) = one_shot_server_raw(
+        200,
+        format!(r#"{{"data":[{{"b64_json":"{}"}}]}}"#, b64(b"result")),
+    )
+    .await;
+    let client = OpenAiImagesClient::new("sk-test", &base, Duration::from_secs(5)).unwrap();
+    let artifacts = client
+        .generate(
+            "gpt-image-1",
+            &MediaRequest {
+                prompt: "put a hat on the cat".into(),
+                fields: vec![("n".into(), FieldValue::Num(1.into()))],
+                inputs: vec![png_part("image", img)],
+                op: Some("edits".into()),
+            },
+        )
+        .await
+        .expect("an edits call round-trips");
+    assert_eq!(artifacts.len(), 1);
+
+    let cap = rx.await.unwrap();
+    assert_eq!(cap.request_line(), "POST /v1/images/edits HTTP/1.1");
+    let ct = cap.header("content-type").expect("a content type");
+    assert!(
+        ct.starts_with("multipart/form-data"),
+        "edits carries files, so it is multipart, not JSON: {ct}"
+    );
+    let text = cap.body_text();
+    assert!(
+        text.contains(r#"name="image""#) && text.contains(r#"filename="image.png""#),
+        "the image rides as a named file part: {text:.400}"
+    );
+    assert!(text.contains("image/png"), "with its own content type");
+    assert!(
+        cap.body.windows(img.len()).any(|w| w == img),
+        "the actual image bytes reach the wire"
+    );
+    assert!(
+        text.contains("put a hat on the cat"),
+        "edits documents a prompt, so it is sent"
+    );
+}
+
+/// **`variations` sends no prompt**, because the route documents none — the same rule
+/// `upscale/fast` gets on Stability, driven by the same `takes_prompt` flag. A prompt
+/// sent to a route that never declared one is an undocumented field on an API that
+/// validates its own.
+#[tokio::test]
+async fn variations_omits_the_prompt_the_route_does_not_document() {
+    let (base, rx) = one_shot_server_raw(
+        200,
+        format!(r#"{{"data":[{{"b64_json":"{}"}}]}}"#, b64(b"result")),
+    )
+    .await;
+    let client = OpenAiImagesClient::new("sk-test", &base, Duration::from_secs(5)).unwrap();
+    client
+        .generate(
+            "dall-e-2",
+            &MediaRequest {
+                prompt: "IGNORE ME".into(),
+                fields: Vec::new(),
+                inputs: vec![png_part("image", b"\x89PNG\r\n\x1a\nsrc")],
+                op: Some("variations".into()),
+            },
+        )
+        .await
+        .expect("a variations call round-trips");
+
+    let cap = rx.await.unwrap();
+    assert_eq!(cap.request_line(), "POST /v1/images/variations HTTP/1.1");
+    let text = cap.body_text();
+    assert!(
+        !text.contains("IGNORE ME"),
+        "variations documents no prompt, so none is sent: {text:.400}"
+    );
+    assert!(
+        text.contains(r#"name="image""#),
+        "the source image is still sent"
+    );
+}
+
+/// An unknown `op` refuses before a socket is opened — no server is started here, and
+/// the test would hang rather than pass if the client dialled anyway.
+#[tokio::test]
+async fn an_unknown_images_op_refuses_without_dialling() {
+    let client =
+        OpenAiImagesClient::new("sk-test", "http://127.0.0.1:1/v1", Duration::from_secs(5))
+            .unwrap();
+    let err = client
+        .generate(
+            "gpt-image-1",
+            &MediaRequest {
+                prompt: "p".into(),
+                fields: Vec::new(),
+                inputs: Vec::new(),
+                op: Some("edit".into()),
+            },
+        )
+        .await
+        .expect_err("`edit` is not `edits`");
+    let msg = err.to_string();
+    assert!(msg.contains("edit"), "names what was asked: {msg}");
+    assert!(
+        msg.contains("edits") && msg.contains("variations"),
+        "lists the real ones: {msg}"
+    );
+}

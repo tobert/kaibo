@@ -461,3 +461,64 @@ fn the_callers_order_is_preserved() {
     assert_eq!(resolved[0].field, "style_image");
     assert_eq!(resolved[1].field, "init_image");
 }
+
+// --- OpenAI Images operations --------------------------------------------------
+
+use kaibo::openai_images::{images_op_by_name, images_op_names, IMAGES_OPS};
+
+/// **`op` generalizes off Stability.** The mechanism is shared; only the table is
+/// per-provider. This is the evidence for that claim rather than the assertion of it.
+#[test]
+fn the_images_api_has_its_own_operation_table_on_the_same_mechanism() {
+    assert_eq!(images_op_names(), vec!["edits", "variations"]);
+    for op in IMAGES_OPS {
+        assert_eq!(images_op_by_name(op.name).expect("resolves").path, op.path);
+        assert!(
+            op.path.starts_with("/images/"),
+            "{} must be a route under the Images API, got {}",
+            op.name,
+            op.path
+        );
+    }
+}
+
+/// `generations` is deliberately not a name a caller can pass: it is what a call with no
+/// `op` already does, and two spellings for one thing is a trap rather than a
+/// convenience.
+#[test]
+fn the_default_route_is_not_also_an_op_name() {
+    assert!(images_op_by_name("generations").is_none());
+}
+
+/// **`variations` documents no prompt** — the spec's required list is `image` alone.
+/// That is the same prompt-less shape `upscale/fast` has on Stability, on a different
+/// provider, which is what makes `takes_prompt` a real property rather than a quirk of
+/// one API.
+#[test]
+fn variations_takes_no_prompt_the_way_upscale_fast_does_not() {
+    assert!(!images_op_by_name("variations").expect("wired").takes_prompt);
+    assert!(images_op_by_name("edits").expect("wired").takes_prompt);
+    // The cross-provider half of the claim.
+    assert!(!op_by_name("upscale/fast").expect("wired").takes_prompt);
+}
+
+/// Costs are the provider's own words. OpenAI publishes no flat per-call figure for
+/// these — the price depends on model, size and quality — so kaibo says that rather
+/// than inventing a number it would then have to chase.
+#[test]
+fn the_images_costs_quote_the_provider_rather_than_a_figure() {
+    for op in IMAGES_OPS {
+        assert!(
+            op.cost.contains("priced per image"),
+            "{} should quote how the provider prices it, got {:?}",
+            op.name,
+            op.cost
+        );
+        assert!(
+            !op.cost.chars().any(|c| c.is_ascii_digit()),
+            "{} invents a figure kaibo would have to keep current: {:?}",
+            op.name,
+            op.cost
+        );
+    }
+}
