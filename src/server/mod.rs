@@ -56,7 +56,7 @@ mod cas_read;
 mod config_resource;
 mod containment;
 mod dossier;
-mod render;
+pub(crate) mod render;
 mod resolver;
 
 pub use resolver::Resolver;

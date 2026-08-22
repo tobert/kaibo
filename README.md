@@ -263,6 +263,7 @@ human at a terminal can drive kaibo directly:
 | `run_kaish` | `kaibo kaish -c 'script'` |
 | `generate` | `kaibo generate "prompt" [--cast … --field k=v --json]` |
 | `read_cas` | `kaibo cas read <digest> [--offset … --length … --json]` |
+| `write_cas` | `kaibo cas write FILE [--label … --json]` |
 | `batch_submit`, `job_get`/`job_list`/`job_cancel` (batch handles) | `kaibo batch submit \| get \| list \| cancel` |
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
@@ -303,7 +304,7 @@ kaibo cas read <digest>                # a text artifact reads on your terminal
 ```
 
 The bounded, base64-averse rules `read_cas` follows exist to protect a model's context
-window; a pipe has no such budget. `read` is the only verb — the store is content-addressed
+window; a pipe has no such budget. `read` and `write` are the only verbs — the store is content-addressed
 and opaque, with no listing, usage report, or delete, because none of those can exist
 without an index it deliberately does not keep.
 
