@@ -7,8 +7,9 @@
 //! [`rig_core::image_generation::ImageGenerationModel`], and that trait's request shape
 //! (`prompt`/`width`/`height`/`additional_params`) is deliberately thin — it fits a
 //! single text-to-image call and nothing else. Stability's v2beta API is bigger than
-//! that: alongside `stable-image/generate/{core,ultra,sd3}` (the only family wired
-//! here), it also ships upscale (conservative/creative/fast), edit
+//! that: alongside `stable-image/generate/{core,ultra,sd3}` and the synchronous
+//! `edit`/`control`/`upscale` routes wired in [`STABLE_IMAGE_OPS`], it also ships the
+//! deferred half of upscale (creative) and edit (replace-background-and-relight),
 //! (inpaint/outpaint/erase/search-and-replace/remove-background), control
 //! (sketch/structure/style), audio (`stable-audio` text-to-audio/audio-to-audio), and
 //! 3D (`stable-fast-3d`) — and every one of the image-family operations, unlike
@@ -22,8 +23,8 @@
 //!
 //! # Sync vs deferred — declared, not sniffed
 //!
-//! Every operation wired so far ([`Operation::Generate`]) is synchronous: the POST
-//! itself returns the artifact. But `upscale/creative`, `stable-audio`, and
+//! Every operation wired so far — the `generate` family and every row of
+//! [`STABLE_IMAGE_OPS`] — is synchronous: the POST itself returns the artifact. But `upscale/creative`, `stable-audio`, and
 //! `stable-fast-3d` are **deferred** — the POST only returns a job id, and the artifact
 //! comes later from a poll. The tempting shortcut — "202 means deferred, 200 means
 //! sync" — is wrong: confirmed against the live
@@ -225,14 +226,18 @@ pub fn resolve_key() -> AnyResult<String> {
 
 /// One request to a Stability v2beta image operation — provider-native (Stability's
 /// own `aspect_ratio`, not rig's `width`/`height`) and already shaped for growth. See
-/// the module doc for why `inputs` exists even though the only operation wired so
-/// far ([`Operation::Generate`]) never sets it.
+/// the module doc for the shape; every `edit`, `control` and `upscale` route sets
+/// `inputs`, and the `generate` family sets it for image-to-image.
 #[derive(Debug, Clone, Default)]
 pub struct StabilityRequest {
-    /// Mandatory for every operation wired so far. A future prompt-less operation
-    /// (`remove-background`, `erase`) would need this widened to `Option<String>` —
-    /// noted rather than solved speculatively.
-    pub prompt: String,
+    /// The text prompt, when this operation documents one.
+    ///
+    /// `Option` because two wired routes do not: `edit/remove-background` and
+    /// `upscale/fast` declare no `prompt` property, so sending one would be an
+    /// undocumented field on a provider that validates its own knobs. That was recorded
+    /// here as a future widening while only the `generate` family was wired; wiring the
+    /// `edit` and `upscale` families is what made it due.
+    pub prompt: Option<String>,
     /// The binary parts this operation carries, each under the form-field name that
     /// operation documents — `image`, `mask`, `init_image`, `style_image`,
     /// `subject_image`, `audio`. Several routes take more than one, so the name is data
@@ -290,6 +295,16 @@ pub struct OpSpec {
     /// not second-guess them. This exists so a caller knows what to pass without paying
     /// for a round trip to find out.
     pub inputs: &'static [&'static str],
+    /// Whether this route documents a `prompt` field at all.
+    ///
+    /// Two do not — `edit/remove-background` and `upscale/fast` declare no `prompt`
+    /// property — so sending one is an undocumented field on a provider that validates
+    /// its own knobs. `edit/erase` is a third case and a genuine spec contradiction: its
+    /// `required` list names `prompt` while its properties do not contain it. Kept `true`
+    /// there, because the required list is the half that would produce a 400 if the
+    /// server enforces it, and omitting a field the spec calls required is the riskier
+    /// guess.
+    pub takes_prompt: bool,
 }
 
 /// Every synchronous `stable-image` route outside `generate`, confirmed against the live
@@ -313,72 +328,84 @@ pub const STABLE_IMAGE_OPS: &[OpSpec] = &[
         path: "stable-image/edit/erase",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "edit/inpaint",
         path: "stable-image/edit/inpaint",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "edit/outpaint",
         path: "stable-image/edit/outpaint",
         credits: 4,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "edit/search-and-replace",
         path: "stable-image/edit/search-and-replace",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "edit/search-and-recolor",
         path: "stable-image/edit/search-and-recolor",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "edit/remove-background",
         path: "stable-image/edit/remove-background",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: false,
     },
     OpSpec {
         name: "control/sketch",
         path: "stable-image/control/sketch",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "control/structure",
         path: "stable-image/control/structure",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "control/style",
         path: "stable-image/control/style",
         credits: 5,
         inputs: &["image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "control/style-transfer",
         path: "stable-image/control/style-transfer",
         credits: 8,
         inputs: &["init_image", "style_image"],
+        takes_prompt: true,
     },
     OpSpec {
         name: "upscale/fast",
         path: "stable-image/upscale/fast",
         credits: 2,
         inputs: &["image"],
+        takes_prompt: false,
     },
     OpSpec {
         name: "upscale/conservative",
         path: "stable-image/upscale/conservative",
         credits: 40,
         inputs: &["image"],
+        takes_prompt: true,
     },
 ];
 
@@ -532,7 +559,11 @@ pub fn aspect_ratio_for(width: u32, height: u32) -> &'static str {
 /// order-preserving; `request.inputs` are attached separately as file parts by
 /// [`StabilityClient::call`], since it isn't a text field.
 pub fn build_form_fields(request: &StabilityRequest) -> Vec<(String, String)> {
-    let mut fields: Vec<(String, String)> = vec![("prompt".to_string(), request.prompt.clone())];
+    let mut fields: Vec<(String, String)> = Vec::new();
+    // Only when the operation documents one — see `StabilityRequest::prompt`.
+    if let Some(prompt) = &request.prompt {
+        fields.push(("prompt".to_string(), prompt.clone()));
+    }
     if let Some(ar) = &request.aspect_ratio {
         fields.push(("aspect_ratio".to_string(), ar.clone()));
     }
@@ -1056,7 +1087,7 @@ pub fn from_rig_request(
     Ok((
         Operation::Generate(route),
         StabilityRequest {
-            prompt: request.prompt.clone(),
+            prompt: Some(request.prompt.clone()),
             inputs: Vec::new(),
             aspect_ratio: Some(aspect_ratio_for(request.width, request.height).to_string()),
             fields,
@@ -1333,10 +1364,16 @@ impl StabilityImageModel {
                 fields.push((k.clone(), v));
             }
         }
+        // A route that documents no `prompt` does not get one, whatever the caller passed
+        // — stated on the tool's own `prompt` parameter rather than dropped quietly.
+        let prompt = match &operation {
+            Operation::StableImage(spec) if !spec.takes_prompt => None,
+            _ => Some(request.prompt.clone()),
+        };
         Ok((
             operation,
             StabilityRequest {
-                prompt: request.prompt.clone(),
+                prompt,
                 inputs: request.inputs.clone(),
                 // No derived ratio on this path: the neutral request has no
                 // width/height to bridge, and an `aspect_ratio` field from the caller
@@ -1461,7 +1498,7 @@ mod tests {
     #[test]
     fn build_form_fields_prompt_and_aspect_ratio() {
         let req = StabilityRequest {
-            prompt: "a cat wearing a hat".to_string(),
+            prompt: Some("a cat wearing a hat".to_string()),
             aspect_ratio: Some("16:9".to_string()),
             ..Default::default()
         };
@@ -1478,7 +1515,7 @@ mod tests {
     #[test]
     fn build_form_fields_appends_extra_fields_in_order() {
         let req = StabilityRequest {
-            prompt: "p".to_string(),
+            prompt: Some("p".to_string()),
             aspect_ratio: None,
             fields: vec![
                 ("output_format".to_string(), "webp".to_string()),
@@ -1500,7 +1537,7 @@ mod tests {
     #[test]
     fn build_form_fields_explicit_field_overrides_derived_aspect_ratio() {
         let req = StabilityRequest {
-            prompt: "p".to_string(),
+            prompt: Some("p".to_string()),
             aspect_ratio: Some("1:1".to_string()),
             fields: vec![("aspect_ratio".to_string(), "16:9".to_string())],
             ..Default::default()

@@ -13,10 +13,11 @@
 //!
 //! The vocabulary here is deliberately provider-neutral (a [`MediaArtifact`] is bytes,
 //! a mime string, and a seed) — providers translate their native shapes at their own
-//! impl, exactly as rig providers translate into rig's completion types. Two live
+//! impl, exactly as rig providers translate into rig's completion types. Three live
 //! implementations today: Stability's (`src/stability.rs`, multipart form wire, sync
-//! and deferred shapes) and OpenAI Images (`src/openai_images.rs`, JSON body wire,
-//! sync only).
+//! and deferred shapes, and the only one with an operation vocabulary), OpenAI Images
+//! (`src/openai_images.rs`, JSON body wire, sync only), and DashScope
+//! (`src/dashscope.rs`).
 //!
 //! # The construction point
 //!

@@ -742,16 +742,24 @@ pub struct GenerateInput {
     pub inputs: Option<std::collections::BTreeMap<String, String>>,
 
     /// Which operation to run, when the backend has more than one. Omit it to generate
-    /// from the prompt alone. Stability's operations and what each costs in credits (one
-    /// credit is about a US cent, so `upscale/conservative` is twenty times
-    /// `generate/core`): `edit/erase` 5 (image; optional `mask`, or an alpha channel on the image),
-    /// `edit/inpaint` 5 (image; optional `mask`, or an alpha channel on the image),
-    /// `edit/outpaint` 4 (image), `edit/search-and-replace` 5 (image, `search_prompt`),
-    /// `edit/search-and-recolor` 5 (image, `select_prompt`), `edit/remove-background` 5
-    /// (image), `control/sketch` 5 (image), `control/structure` 5 (image),
-    /// `control/style` 5 (image), `control/style-transfer` 8 (init_image+style_image),
-    /// `upscale/fast` 2 (image), `upscale/conservative` 40 (image). The parenthesised
-    /// names are the `inputs` keys that operation needs.
+    /// from the prompt alone.
+    ///
+    /// Stability's operations, with what each costs in credits — one credit is about a
+    /// US cent, so `upscale/conservative` is twenty times `generate/core` — and the
+    /// `inputs` keys it requires:
+    ///
+    /// `edit/erase` 5 (image), `edit/inpaint` 5 (image), `edit/outpaint` 4 (image),
+    /// `edit/search-and-replace` 5 (image), `edit/search-and-recolor` 5 (image),
+    /// `edit/remove-background` 5 (image), `control/sketch` 5 (image),
+    /// `control/structure` 5 (image), `control/style` 5 (image),
+    /// `control/style-transfer` 8 (init_image, style_image), `upscale/fast` 2 (image),
+    /// `upscale/conservative` 40 (image).
+    ///
+    /// `edit/erase` and `edit/inpaint` also take an optional `mask` in `inputs`, or an
+    /// alpha channel on the image instead. Text knobs ride `fields`, not `inputs`:
+    /// `edit/search-and-replace` needs `search_prompt` there, `edit/search-and-recolor`
+    /// needs `select_prompt`. `prompt` is ignored on `edit/remove-background` and
+    /// `upscale/fast`, which document none.
     #[serde(default)]
     pub op: Option<String>,
 }
@@ -2902,12 +2910,7 @@ impl KaiboHandler {
                     .resolver
                     .read_contained_file(path, crate::upload::MAX_UPLOAD_BYTES as u64)
                     .await?;
-                crate::upload::store_bytes(
-                    store,
-                    &bytes,
-                    input.label.as_deref(),
-                    now_epoch_secs(),
-                )
+                crate::upload::store_bytes(store, &bytes, input.label.as_deref(), now_epoch_secs())
             }
             (None, Some(content)) => crate::upload::store_upload(
                 store,
@@ -2937,9 +2940,7 @@ impl KaiboHandler {
         // parameter the caller got wrong — the same split `read_cas` makes between a bad
         // digest and an unreadable object.
         .map_err(|e| match e {
-            crate::upload::UploadError::Store(_) => {
-                McpError::internal_error(e.to_string(), None)
-            }
+            crate::upload::UploadError::Store(_) => McpError::internal_error(e.to_string(), None),
             _ => McpError::invalid_params(e.to_string(), None),
         })?;
 
@@ -3721,7 +3722,9 @@ impl KaiboHandler {
 /// answer). Fulfilling stays the right call: a client that asks for the newest
 /// version wants what that version's other features buy it, and the two fields cost
 /// kaibo nothing to answer truthfully.
-fn sep_2549_cache_fields(context: &RequestContext<RoleServer>) -> (Option<u64>, Option<CacheScope>) {
+fn sep_2549_cache_fields(
+    context: &RequestContext<RoleServer>,
+) -> (Option<u64>, Option<CacheScope>) {
     // ISO `YYYY-MM-DD` versions compare lexically the same as chronologically.
     let required = context
         .protocol_version()
@@ -6609,9 +6612,17 @@ enabled = false
         .await
         .expect("a stored digest is a usable input");
 
-        let seen = provider.0.lock().unwrap().clone().expect("provider was called");
+        let seen = provider
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider was called");
         assert_eq!(seen.inputs.len(), 1, "the part reached the provider");
-        assert_eq!(seen.inputs[0].field, "image", "under the caller's field name");
+        assert_eq!(
+            seen.inputs[0].field, "image",
+            "under the caller's field name"
+        );
         assert_eq!(seen.inputs[0].bytes, b"\x89PNG\r\n\x1a\nsource");
         assert_eq!(
             seen.inputs[0].filename, "image.png",
@@ -6643,6 +6654,53 @@ enabled = false
             provider.0.lock().unwrap().is_none(),
             "the provider must never have been called"
         );
+    }
+
+    /// **The `op` parameter's prose must agree with the table it describes.**
+    ///
+    /// That doc is hand-written — schemars renders a doc comment, not a table — and this
+    /// change already proved the drift is real rather than theoretical: it listed
+    /// `search_prompt` and `select_prompt` as `inputs` keys when they are text `fields`,
+    /// so a model following it would have put a prompt where a digest goes and been
+    /// refused for a reason that was our fault. It also listed a credit figure per
+    /// operation, which is the sort of number that silently goes stale.
+    ///
+    /// So: every operation in the table appears in the doc, with its own credit figure,
+    /// and no operation appears that the table does not wire.
+    #[test]
+    fn the_op_parameter_doc_agrees_with_the_operation_table() {
+        let schema = schemars::schema_for!(GenerateInput);
+        let json = serde_json::to_string(&schema).expect("the schema serializes");
+        let doc = json
+            .split("\"op\"")
+            .nth(1)
+            .expect("the schema carries the op property")
+            // Backticks are markdown for the reader, noise for a match — the doc writes
+            // "`edit/erase` 5 (image)" and the fact being pinned is "edit/erase 5".
+            .replace('`', "");
+
+        for spec in crate::stability::STABLE_IMAGE_OPS {
+            assert!(
+                doc.contains(spec.name),
+                "the `op` doc must name {}, or a caller cannot discover it",
+                spec.name
+            );
+            assert!(
+                doc.contains(&format!("{} {}", spec.name, spec.credits)),
+                "the `op` doc must carry {}'s cost as {} credits — a stale price is worse \
+                 than none, because it is trusted",
+                spec.name,
+                spec.credits
+            );
+        }
+        // And nothing the table does not wire: a doc naming a route that refuses is a
+        // trap, and it is the shape a half-finished revert leaves behind.
+        for absent in ["upscale/creative", "edit/replace-background-and-relight"] {
+            assert!(
+                !doc.contains(absent),
+                "the `op` doc names {absent}, which `op_by_name` refuses"
+            );
+        }
     }
 
     /// A minimal but real PNG header — enough that `sniff_image` reads a true signature.
@@ -8667,7 +8725,7 @@ enabled = false
         );
         let text = read_text(TOOLS_URI, &[]);
         for needle in [
-            "attach",              // the attachment guidance moved here
+            "attach",                                     // the attachment guidance moved here
             "inlined",             // the consult-vs-oneshot attach distinction
             "whole file",          // the toolless-model whole-files steer
             "verbatim",            // the model-id override semantics
