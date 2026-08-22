@@ -201,7 +201,7 @@ impl MediaInput {
 /// built.
 pub fn resolve_inputs(
     store: &crate::cas::MediaStore,
-    asked: &std::collections::BTreeMap<String, String>,
+    asked: &[(String, String)],
 ) -> Result<Vec<MediaInput>> {
     let mut out = Vec::with_capacity(asked.len());
     for (field, digest_hex) in asked {

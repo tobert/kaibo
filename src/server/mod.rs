@@ -680,6 +680,20 @@ pub struct ReadCasInput {
     pub length: Option<usize>,
 }
 
+/// One entry of `generate`'s `inputs`: which form field a stored image fills.
+///
+/// A pair rather than a map entry so a field name may repeat — see `GenerateInput::inputs`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateInputRef {
+    /// The provider's form-field name for this part — `image`, `mask`, `init_image`,
+    /// `style_image`.
+    pub field: String,
+    /// The stored image's digest: 64 lowercase hex, as `write_cas` or `generate` printed
+    /// it (the tail of a `kaibo://cas/<digest>` address).
+    pub digest: String,
+}
+
 /// Arguments for [`KaiboHandler::write_cas`] — where the image is, and an optional label.
 ///
 /// Exactly one of `path` and `content`. There is no destination of any kind (the address
@@ -732,28 +746,35 @@ pub struct GenerateInput {
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
 
-    /// Input images for the operations that take them, as `{form-field: digest}` —
-    /// e.g. `{"image": "<digest>"}` for image-to-image, `{"image": "...", "mask":
-    /// "..."}` where an operation takes both. Each digest is one `write_cas` or
-    /// `generate` handed back, so an image already in kaibo's store is reused by
-    /// address and never re-sent. The form-field names are the provider's own; the
-    /// store decides each part's format, not you.
+    /// Input images for the operations that take them, as a list of
+    /// `{"field": "<form-field>", "digest": "<digest>"}` — e.g.
+    /// `[{"field": "image", "digest": "..."}]` for image-to-image, or an `image` and a
+    /// `mask` entry where an operation takes both. Each digest is one `write_cas` or
+    /// `generate` handed back, so an image already in kaibo's store is reused by address
+    /// and never re-sent. The field names are the provider's own; the store decides each
+    /// part's format, not you.
+    ///
+    /// A list rather than a map because a field name can repeat: an operation that takes
+    /// several source images under one name needs two entries called `image`, which a map
+    /// cannot express. Order is preserved, since a provider may care about it.
     #[serde(default)]
-    pub inputs: Option<std::collections::BTreeMap<String, String>>,
+    pub inputs: Option<Vec<GenerateInputRef>>,
 
     /// Which operation to run, when the backend has more than one. Omit it to generate
     /// from the prompt alone.
     ///
-    /// Stability's operations, with what each costs in credits — one credit is about a
-    /// US cent, so `upscale/conservative` is twenty times `generate/core` — and the
-    /// `inputs` keys it requires:
+    /// Stability's operations, each with the cost the provider itself quotes and the
+    /// `inputs` field names it requires. Costs are the provider's own unit, passed
+    /// through unconverted — work out what that means in money yourself if you need to,
+    /// and note the spread: `upscale/conservative` costs twenty times `generate/core`.
     ///
-    /// `edit/erase` 5 (image), `edit/inpaint` 5 (image), `edit/outpaint` 4 (image),
-    /// `edit/search-and-replace` 5 (image), `edit/search-and-recolor` 5 (image),
-    /// `edit/remove-background` 5 (image), `control/sketch` 5 (image),
-    /// `control/structure` 5 (image), `control/style` 5 (image),
-    /// `control/style-transfer` 8 (init_image, style_image), `upscale/fast` 2 (image),
-    /// `upscale/conservative` 40 (image).
+    /// `edit/erase` 5 credits (image), `edit/inpaint` 5 credits (image),
+    /// `edit/outpaint` 4 credits (image), `edit/search-and-replace` 5 credits (image),
+    /// `edit/search-and-recolor` 5 credits (image), `edit/remove-background` 5 credits
+    /// (image), `control/sketch` 5 credits (image), `control/structure` 5 credits
+    /// (image), `control/style` 5 credits (image), `control/style-transfer` 8 credits
+    /// (init_image, style_image), `upscale/fast` 2 credits (image),
+    /// `upscale/conservative` 40 credits (image).
     ///
     /// `edit/erase` and `edit/inpaint` also take an optional `mask` in `inputs`, or an
     /// alpha channel on the image instead. Text knobs ride `fields`, not `inputs`:
@@ -3159,8 +3180,14 @@ impl KaiboHandler {
         // Resolved before the arm is called, so a bad digest refuses without spending a
         // provider request — and the store, not the caller, names each part's format.
         let inputs = match input.inputs.as_ref() {
-            Some(asked) => crate::media::resolve_inputs(&store, asked)
-                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?,
+            Some(asked) => {
+                let pairs: Vec<(String, String)> = asked
+                    .iter()
+                    .map(|r| (r.field.clone(), r.digest.clone()))
+                    .collect();
+                crate::media::resolve_inputs(&store, &pairs)
+                    .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+            }
             None => Vec::new(),
         };
         let request = crate::media::MediaRequest {
@@ -6606,7 +6633,10 @@ enabled = false
             prompt: "erase the sign".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
-            inputs: Some([("image".to_string(), digest)].into_iter().collect()),
+            inputs: Some(vec![GenerateInputRef {
+                field: "image".to_string(),
+                digest,
+            }]),
             op: None,
         }))
         .await
@@ -6644,7 +6674,10 @@ enabled = false
                 prompt: "erase the sign".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
-                inputs: Some([("image".to_string(), absent)].into_iter().collect()),
+                inputs: Some(vec![GenerateInputRef {
+                    field: "image".to_string(),
+                    digest: absent,
+                }]),
                 op: None,
             }))
             .await
@@ -6686,11 +6719,11 @@ enabled = false
                 spec.name
             );
             assert!(
-                doc.contains(&format!("{} {}", spec.name, spec.credits)),
-                "the `op` doc must carry {}'s cost as {} credits — a stale price is worse \
-                 than none, because it is trusted",
+                doc.contains(&format!("{} {}", spec.name, spec.cost)),
+                "the `op` doc must carry {}'s cost as {:?} — a stale price is worse than \
+                 none, because it is trusted",
                 spec.name,
-                spec.credits
+                spec.cost
             );
         }
         // And nothing the table does not wire: a doc naming a route that refuses is a

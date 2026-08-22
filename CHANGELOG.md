@@ -22,13 +22,14 @@ record. Each later release appends a new section at the top.
   MCP client.
 - **`generate` reaches Stability's edit, control and upscale routes** through a new `op`
   parameter — twelve operations where three were wired.
-- **Each operation's credit cost is published on the `op` parameter**, so a model sees
-  that `upscale/conservative` costs twenty times `generate/core` before it picks.
+- **Each operation's cost is published on the `op` parameter** in the provider's own
+  unit, unconverted — so a model sees the twenty-fold spread before it picks a route.
 - **An unrecognized `op`, or one on a backend with no operations, is refused** rather
   than run as a text-to-image generation.
-- **`generate` takes input images by digest** — `inputs {"image": "<digest>"}` is
-  image-to-image on Stability's `ultra` and `sd3` routes, reusing an image already in
-  the store rather than re-sending it.
+- **`generate` takes input images by digest** — `inputs [{"field": "image", "digest":
+  "..."}]` is image-to-image on Stability's `ultra` and `sd3` routes, reusing an image
+  already in the store rather than re-sending it. A field name may repeat, for the
+  operations that take several source images under one name.
 - **`generate` carries several named input parts**, so an operation taking
   `init_image`+`style_image`, or an image plus an optional mask, is reachable.
 - **A media backend with no input-image route refuses a call that carries one**, rather

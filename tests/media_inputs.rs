@@ -20,8 +20,6 @@
 //! `resolve_inputs` take the caller's word for the extension and
 //! `the_store_names_the_parts_format_not_the_caller` fails.
 
-use std::collections::BTreeMap;
-
 use kaibo::cas::{Cas, Digest, Extension, MediaStore, Provenance};
 use kaibo::media::{
     refuse_binary_inputs, resolve_inputs, MediaArm, MediaInput, MediaJobId, MediaModel,
@@ -58,7 +56,7 @@ fn put(store: &MediaStore, bytes: &[u8], ext: Extension) -> String {
         .to_hex()
 }
 
-fn asked(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+fn asked(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -308,11 +306,22 @@ fn every_published_operation_name_resolves_to_its_own_route() {
 fn the_published_costs_span_the_range_that_makes_them_worth_publishing() {
     let fast = op_by_name("upscale/fast").expect("wired");
     let conservative = op_by_name("upscale/conservative").expect("wired");
-    assert_eq!(fast.credits, 2);
-    assert_eq!(conservative.credits, 40);
+    assert_eq!(fast.cost, "2 credits");
+    assert_eq!(conservative.cost, "40 credits");
+    // Costs are the provider's own words, so this reads the number back out rather than
+    // comparing integers kaibo does not keep. If a provider ever quotes a range or a
+    // formula instead of a flat figure, that is the provider's unit too and this test is
+    // the right place to notice.
+    let n = |s: &str| -> u32 {
+        s.split_whitespace()
+            .next()
+            .expect("a cost leads with its amount")
+            .parse()
+            .expect("Stability quotes flat integer credits today")
+    };
     assert!(
-        conservative.credits >= fast.credits * 10,
-        "if these ever converge, publishing the number stops earning its space"
+        n(conservative.cost) >= n(fast.cost) * 10,
+        "if these ever converge, publishing the figure stops earning its space"
     );
 }
 
@@ -406,4 +415,49 @@ fn the_inputs_list_carries_required_parts_only() {
         op_by_name("control/style-transfer").expect("wired").inputs,
         &["init_image", "style_image"],
     );
+}
+
+/// **A field name may repeat, which is why `inputs` is a list and not a map.**
+///
+/// Stability never needs this — every one of its form fields has a distinct name — so a
+/// map worked by luck of that shape. OpenAI's `/images/edits` takes "one or more source
+/// images" as repeated `image` parts, and a `BTreeMap<String, String>` cannot express
+/// two entries under one key: the second silently replaces the first, which is a
+/// dropped input wearing a success.
+///
+/// Caught by surveying the other providers' specs before the parameter shipped, not
+/// after. Pinned here so the shape cannot quietly revert to a map.
+#[test]
+fn two_parts_may_share_one_field_name() {
+    let (store, _d) = store();
+    let first = put(&store, b"\x89PNG\r\n\x1a\nfirst", Extension::Png);
+    let second = put(&store, b"\x89PNG\r\n\x1a\nsecond", Extension::Png);
+    assert_ne!(first, second, "the fixtures must be distinct objects");
+
+    let resolved = resolve_inputs(&store, &asked(&[("image", &first), ("image", &second)]))
+        .expect("a repeated field name resolves to two parts");
+
+    assert_eq!(
+        resolved.len(),
+        2,
+        "both parts survive; neither replaced the other"
+    );
+    assert_eq!(resolved[0].field, "image");
+    assert_eq!(resolved[1].field, "image");
+    assert_eq!(resolved[0].bytes, b"\x89PNG\r\n\x1a\nfirst");
+    assert_eq!(resolved[1].bytes, b"\x89PNG\r\n\x1a\nsecond");
+}
+
+/// And the order the caller gave is the order the provider receives — a provider may
+/// care which source image is first, and a map would have sorted them by key instead.
+#[test]
+fn the_callers_order_is_preserved() {
+    let (store, _d) = store();
+    let a = put(&store, b"\x89PNG\r\n\x1a\naaa", Extension::Png);
+    let b = put(&store, b"\x89PNG\r\n\x1a\nbbb", Extension::Png);
+    // Deliberately not alphabetical: a map keyed by field name would reorder these.
+    let resolved = resolve_inputs(&store, &asked(&[("style_image", &a), ("init_image", &b)]))
+        .expect("resolves");
+    assert_eq!(resolved[0].field, "style_image");
+    assert_eq!(resolved[1].field, "init_image");
 }

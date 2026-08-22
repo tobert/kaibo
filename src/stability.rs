@@ -278,8 +278,14 @@ pub struct OpSpec {
     pub name: &'static str,
     /// The path segment after `/v2beta/`.
     pub path: &'static str,
-    /// Stability's flat credit price per successful generation.
-    pub credits: u32,
+    /// What this route costs, **in the provider's own unit, verbatim**.
+    ///
+    /// A string, not a number, and not normalized to anything. kaibo does not track the
+    /// pricing landscape and would go stale silently if it tried: Stability bills flat
+    /// credits, OpenAI Images bills per image by size and quality, Gemini bills per
+    /// image. So kaibo reports what the provider says and the caller does whatever
+    /// arithmetic it wants — a figure kaibo converted is a figure kaibo has to chase.
+    pub cost: &'static str,
     /// The binary parts this route **requires**, by form-field name — the spec's own
     /// `required` list intersected with its binary fields, nothing looser.
     ///
@@ -326,84 +332,84 @@ pub const STABLE_IMAGE_OPS: &[OpSpec] = &[
     OpSpec {
         name: "edit/erase",
         path: "stable-image/edit/erase",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "edit/inpaint",
         path: "stable-image/edit/inpaint",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "edit/outpaint",
         path: "stable-image/edit/outpaint",
-        credits: 4,
+        cost: "4 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "edit/search-and-replace",
         path: "stable-image/edit/search-and-replace",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "edit/search-and-recolor",
         path: "stable-image/edit/search-and-recolor",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "edit/remove-background",
         path: "stable-image/edit/remove-background",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: false,
     },
     OpSpec {
         name: "control/sketch",
         path: "stable-image/control/sketch",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "control/structure",
         path: "stable-image/control/structure",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "control/style",
         path: "stable-image/control/style",
-        credits: 5,
+        cost: "5 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "control/style-transfer",
         path: "stable-image/control/style-transfer",
-        credits: 8,
+        cost: "8 credits",
         inputs: &["init_image", "style_image"],
         takes_prompt: true,
     },
     OpSpec {
         name: "upscale/fast",
         path: "stable-image/upscale/fast",
-        credits: 2,
+        cost: "2 credits",
         inputs: &["image"],
         takes_prompt: false,
     },
     OpSpec {
         name: "upscale/conservative",
         path: "stable-image/upscale/conservative",
-        credits: 40,
+        cost: "40 credits",
         inputs: &["image"],
         takes_prompt: true,
     },
