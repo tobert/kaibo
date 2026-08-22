@@ -121,10 +121,123 @@ pub struct MediaRequest {
     /// default — that merge is the provider's business, not a contract of this
     /// struct.
     pub fields: Vec<(String, FieldValue)>,
-    /// Bytes of an input image, for the operations that take one (edit / upscale /
-    /// image-to-image). `None` for text-to-image. Carried on the request now so the
-    /// trait does not churn when those operations land.
-    pub input_image: Option<Vec<u8>>,
+    /// The binary parts this operation carries, in the order the caller gave them.
+    /// Empty for text-to-image.
+    ///
+    /// **Named, and plural, because the provider's operations are.** A first cut had a
+    /// single `input_image: Option<Vec<u8>>`, which fits `edit/outpaint` and
+    /// `control/sketch` and fits nothing else: `edit/erase` and `edit/inpaint` take
+    /// `image` *and* `mask`, `control/style-transfer` takes `init_image` *and*
+    /// `style_image`, and `edit/replace-background-and-relight` takes three. The field
+    /// *name* varies too — `image`, `audio`, `subject_image` — so the name is data, not
+    /// a constant a provider impl can assume. This is the text-part `fields` list's
+    /// binary sibling, and it is a `Vec` for the same reason: a provider may care about
+    /// order.
+    pub inputs: Vec<MediaInput>,
+}
+
+/// One binary part of a generation request: which form field it fills, what to call it
+/// on the wire, and the bytes.
+///
+/// The filename is carried rather than derived. A multipart file part without a
+/// `filename=` is rejected or mis-typed by some servers, and guessing one from the bytes
+/// would put a second, weaker format opinion next to the one the media store already
+/// holds — the store is the authority on what an object is (`MediaStore::extension_for`),
+/// so the caller that resolved the bytes passes the name the store gave them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaInput {
+    /// The provider's own form-field name — `image`, `mask`, `init_image`, `audio`.
+    pub field: String,
+    /// The filename to send with the part, extension included (`image.png`).
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+impl MediaInput {
+    /// One input part, with the filename built from the field name and the extension the
+    /// store reported for these bytes.
+    pub fn new(field: impl Into<String>, extension: &str, bytes: Vec<u8>) -> Self {
+        let field = field.into();
+        Self {
+            filename: format!("{field}.{extension}"),
+            field,
+            bytes,
+        }
+    }
+}
+
+/// Resolve caller-named `{form-field: digest}` pairs into request parts, reading the
+/// bytes out of the media store.
+///
+/// This is the join that makes the media lane compose: `write_cas` (or a previous
+/// `generate`) hands the caller a digest, and the caller feeds that digest straight back
+/// in as the input to an edit. Digests are the operator's currency for exactly this — no
+/// bytes cross the wire twice, and the chain from source image to edited result is
+/// recorded in the store at every hop.
+///
+/// The store, not the caller, says what each object is: the filename's extension comes
+/// from [`crate::cas::MediaStore::extension_for`], so a part can never be labelled
+/// something the object is not.
+///
+/// Every failure is named and nothing is sent: a bad digest, a digest for an object this
+/// store does not hold, or an object that is not an image all refuse before a request is
+/// built.
+pub fn resolve_inputs(
+    store: &crate::cas::MediaStore,
+    asked: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<MediaInput>> {
+    let mut out = Vec::with_capacity(asked.len());
+    for (field, digest_hex) in asked {
+        let digest = crate::cas::Digest::from_hex(digest_hex).map_err(|_| {
+            anyhow::anyhow!(
+                "`inputs.{field}` is not a digest: {digest_hex:?}. A digest is the 64 \
+                 lowercase hex characters `write_cas` and `generate` hand back — the tail \
+                 of a kaibo://cas/<digest> address."
+            )
+        })?;
+        let (bytes, extension) = store
+            .get(&digest)
+            .map_err(|e| {
+                anyhow::anyhow!("`inputs.{field}`: reading {digest_hex} from the media store: {e}")
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`inputs.{field}`: this store holds no object at {digest_hex}. Store \
+                     the image with `write_cas` first and pass the digest it returns."
+                )
+            })?;
+        if !extension.is_image() {
+            bail!(
+                "`inputs.{field}`: the object at {digest_hex} is {}, not an image. An \
+                 input part is an image; pass the digest of one.",
+                extension.mime()
+            );
+        }
+        out.push(MediaInput::new(field.clone(), extension.as_str(), bytes));
+    }
+    Ok(out)
+}
+
+/// Refuse a request carrying binary inputs on a provider that has no route for them.
+///
+/// **Dropping them is the failure this exists to prevent.** A provider impl that ignored
+/// `inputs` would send the prompt alone, get back a plausible image, and store it with a
+/// digest and a provenance sidecar — the caller asked to edit *this* picture and received
+/// an unrelated one that looks like a success. That is silent corruption of the result,
+/// and it is far worse than a refusal naming the two ways forward.
+pub fn refuse_binary_inputs(request: &MediaRequest, provider: &str) -> Result<()> {
+    if request.inputs.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<&str> = request.inputs.iter().map(|i| i.field.as_str()).collect();
+    bail!(
+        "this call carries the input image{} `{}`, and the {provider} backend has no \
+         operation that accepts one — nothing was generated. Point the cast's `image` \
+         slot at a backend whose operations take an input image (Stability), or drop \
+         `inputs` to generate from the prompt alone.",
+        if named.len() == 1 { "" } else { "s" },
+        named.join("`, `"),
+    )
 }
 
 /// One generated artifact, provider-neutral: the bytes, the wire content type in the
@@ -250,8 +363,7 @@ impl MediaArm {
                     base_url,
                     backend.request_timeout,
                 )?;
-                let model =
-                    crate::openai_images::OpenAiImagesModel::from_parts(&client, &slot.id);
+                let model = crate::openai_images::OpenAiImagesModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
             ProviderClass::Media(MediaKind::DashScope) => {

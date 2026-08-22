@@ -482,6 +482,7 @@ impl crate::media::MediaModel for OpenAiImagesModel {
     /// Always resolves to [`MediaOutcome::Complete`] — the Images API is
     /// synchronous, and `n` makes a multi-artifact list the normal shape.
     async fn generate(&self, request: &MediaRequest) -> AnyResult<MediaOutcome> {
+        crate::media::refuse_binary_inputs(request, "OpenAI Images")?;
         let artifacts = self.client.generate(&self.model, request).await?;
         Ok(MediaOutcome::Complete(artifacts))
     }
@@ -523,7 +524,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
-            input_image: None,
+            inputs: Vec::new(),
         }
     }
 

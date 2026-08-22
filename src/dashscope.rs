@@ -400,6 +400,7 @@ impl crate::media::MediaModel for DashScopeImageModel {
     /// the honest outcome is an error naming which artifact failed, not a shorter
     /// list the caller has no way to notice.
     async fn generate(&self, request: &MediaRequest) -> AnyResult<MediaOutcome> {
+        crate::media::refuse_binary_inputs(request, "DashScope")?;
         let body = build_request_body(&self.model, request);
         let response = self.client.post_generation(&body).await?;
         let urls = parse_response(&response)?;

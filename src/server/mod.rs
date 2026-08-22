@@ -731,6 +731,15 @@ pub struct GenerateInput {
     /// cast's image slot.
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
+
+    /// Input images for the operations that take them, as `{form-field: digest}` —
+    /// e.g. `{"image": "<digest>"}` for image-to-image, `{"image": "...", "mask":
+    /// "..."}` where an operation takes both. Each digest is one `write_cas` or
+    /// `generate` handed back, so an image already in kaibo's store is reused by
+    /// address and never re-sent. The form-field names are the provider's own; the
+    /// store decides each part's format, not you.
+    #[serde(default)]
+    pub inputs: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// One `generate` field value, as typed JSON: the schema face of
@@ -3049,7 +3058,13 @@ impl KaiboHandler {
             (metadata first, ranges on request; a small image comes back viewable). \
             Provider-native options (aspect_ratio, size, n, output_format, seed, \
             negative_prompt, style_preset, ...) pass through `fields` verbatim, each \
-            value's JSON type (string | number | boolean) preserved to the wire. An \
+            value's JSON type (string | number | boolean) preserved to the wire. \
+            To generate FROM an image rather than from the prompt alone, pass its \
+            digest in `inputs` under the provider's field name — \
+            `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
+            image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
+            an image already in the store is reused by address and never re-sent. \
+            Stability accepts input images; the other media backends do not and say so. An \
             operation the provider declares deferred returns a `job-N` handle for \
             job_wait/job_get instead (every route wired today answers in-call). \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
@@ -3122,10 +3137,17 @@ impl KaiboHandler {
                 ));
             }
         }
+        // Resolved before the arm is called, so a bad digest refuses without spending a
+        // provider request — and the store, not the caller, names each part's format.
+        let inputs = match input.inputs.as_ref() {
+            Some(asked) => crate::media::resolve_inputs(&store, asked)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?,
+            None => Vec::new(),
+        };
         let request = crate::media::MediaRequest {
             prompt: input.prompt.clone(),
             fields,
-            input_image: None,
+            inputs,
         };
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
@@ -5621,6 +5643,7 @@ mod tests {
                 prompt: "a lighthouse at dusk".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("generate succeeds");
@@ -5667,6 +5690,7 @@ mod tests {
             prompt: "a red door".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
+            inputs: None,
         }))
         .await
         .expect("generate succeeds");
@@ -5702,6 +5726,7 @@ mod tests {
                 prompt: "slow art".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("submit succeeds");
@@ -5778,6 +5803,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 ),
+                inputs: None,
             }))
             .await
             .expect_err("a fields.prompt override must be refused");
@@ -5799,6 +5825,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 ),
+                inputs: None,
             }))
             .await
             .expect_err("a fields.model override must be refused");
@@ -5821,6 +5848,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5847,6 +5875,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5888,6 +5917,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("a tool-result error, not a protocol error");
@@ -5941,6 +5971,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -5984,6 +6015,7 @@ mod tests {
                 prompt: "p".to_string(),
                 cast: Some("anthropic".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect_err("no image slot must refuse");
@@ -6052,6 +6084,7 @@ enabled = false
                 prompt: "p".to_string(),
                 cast: Some("artist".to_string()),
                 fields: None,
+                inputs: None,
             }))
             .await
             .expect("submit succeeds"),
@@ -6287,6 +6320,7 @@ enabled = false
             prompt: "p".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
+            inputs: None,
         }))
         .await
         .expect("generate succeeds");
@@ -6322,6 +6356,7 @@ enabled = false
             prompt: "p".to_string(),
             cast: Some("artist".to_string()),
             fields: None,
+            inputs: None,
         }))
         .await
         .expect("generate succeeds");
