@@ -2968,8 +2968,20 @@ fn batch_poll_envelope(poll: &BatchPoll) -> serde_json::Value {
                 Err(reason) => serde_json::json!({ "custom_id": a.custom_id, "ok": false, "error": reason }),
             }).collect::<Vec<_>>(),
         }),
-        BatchPoll::Failed { state, message } => {
-            serde_json::json!({ "status": "failed", "state": state, "message": message })
+        BatchPoll::Failed {
+            state,
+            message,
+            submitted,
+        } => {
+            // `submitted` rides the envelope so a script can see how many prompts are
+            // unspent without parsing the rendered prose; `null` when it was never
+            // recorded, never 0 — a batch is never submitted with no items.
+            serde_json::json!({
+                "status": "failed",
+                "state": state,
+                "message": message,
+                "submitted": submitted,
+            })
         }
     }
 }
@@ -3568,10 +3580,21 @@ mod tests {
         let failed = batch_poll_envelope(&BatchPoll::Failed {
             state: "expired".into(),
             message: "too late".into(),
+            submitted: Some(3),
         });
         assert_eq!(failed["status"], "failed");
         assert_eq!(failed["state"], "expired");
         assert_eq!(failed["message"], "too late");
+        assert_eq!(failed["submitted"], 3);
+
+        // An unrecorded count is `null`, not 0 — a batch is never submitted with no items,
+        // so a 0 here would read as a real count and mislead a script.
+        let failed = batch_poll_envelope(&BatchPoll::Failed {
+            state: "expired".into(),
+            message: "too late".into(),
+            submitted: None,
+        });
+        assert!(failed["submitted"].is_null(), "{failed}");
     }
 
     #[test]

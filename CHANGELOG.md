@@ -73,6 +73,12 @@ record. Each later release appends a new section at the top.
   content is redacted by default.
 - **An explicit `[telemetry] enabled = false` beats the environment**, and
   `OTEL_SDK_DISABLED` beats every source.
+- **A failed batch now names where the failure happened** — the provider accepted the
+  batch and failed it afterward, so a bare provider string no longer reads as a kaibo bug.
+- **A failed batch now counts its unspent prompts** and points at `batch_submit`, in the
+  rendered poll and as `submitted` in `batch get --json`.
+- **A failed batch now names the cast that ran it**, the provenance footer a completed
+  batch already carried.
 
 ### Fixed
 

@@ -164,7 +164,18 @@ pub enum BatchPoll {
     /// Anthropic's interim `Cancelling`). `state` is the provider's raw state string;
     /// `message` is its reason. Distinct from `Done(vec![])` — that would render as
     /// "0 results" and read like success; this names the failure honestly.
-    Failed { state: String, message: String },
+    ///
+    /// `submitted` is how many items the batch was sent with, when kaibo recorded it.
+    /// Not a cross-check here (there are no results to check against): it is what the
+    /// render counts when it tells the caller how many prompts are unspent, because
+    /// rebuilding those prompts from the caller's own context is the expensive part of
+    /// a failed batch. `None` when the count was never recorded, and the render then
+    /// offers the recovery without inventing a number.
+    Failed {
+        state: String,
+        message: String,
+        submitted: Option<u64>,
+    },
 }
 
 /// One batch as the provider's list endpoint reports it — enough to re-address and
@@ -657,8 +668,26 @@ pub fn render_poll(poll: &BatchPoll, label: &str) -> String {
             s.push_str(&format!("\n———\nkaibo · batch · {label}"));
             s
         }
-        BatchPoll::Failed { state, message } => {
-            format!("Batch ended in {state} — {message}. No per-item results to return.")
+        BatchPoll::Failed {
+            state,
+            message,
+            submitted,
+        } => {
+            // "Unspent", not "never ran": a zero-result poll proves no answer came back,
+            // not that no item started. Cancel and expire reach this arm too, and there an
+            // item may have begun before the terminal event. The counted line restates the
+            // first line rather than inferring past it.
+            let prompts = match submitted {
+                Some(n) => format!("The {n} submitted prompt(s) are unspent"),
+                None => "The submitted prompts are unspent".to_string(),
+            };
+            format!(
+                "Batch ended in {state} — {message}. No item returned an answer.\n\n\
+                 kaibo sent the request and the provider accepted the batch. This state and \
+                 the message above came from the provider after that.\n\n\
+                 {prompts}. Resubmit them with `batch_submit` once the cause is cleared.\n\
+                 \n———\nkaibo · batch · {label}"
+            )
         }
     }
 }
@@ -1125,6 +1154,7 @@ fn parse_gemini_poll(v: &Value, submitted: Option<u64>) -> Result<BatchPoll> {
             Ok(BatchPoll::Failed {
                 state: state.to_string(),
                 message,
+                submitted,
             })
         }
         other => Err(anyhow!("unknown gemini batch state {other:?}: {v}")),
@@ -2017,6 +2047,7 @@ impl BatchProvider for OpenaiBatch {
                         message: openai_batch_error_text(&v).unwrap_or_else(|| {
                             "the provider returned no result file and no error detail".to_string()
                         }),
+                        submitted,
                     });
                 }
                 Ok(BatchPoll::Done(finalize_openai_answers(
@@ -3541,7 +3572,8 @@ mod tests {
             parse_gemini_poll(&v, None).unwrap(),
             BatchPoll::Failed {
                 state: "BATCH_STATE_CANCELLED".into(),
-                message: "Batch x failed without error.".into()
+                message: "Batch x failed without error.".into(),
+                submitted: None,
             }
         );
     }
@@ -4218,11 +4250,135 @@ mod tests {
             &BatchPoll::Failed {
                 state: "BATCH_STATE_EXPIRED".into(),
                 message: "ran past its 24h window".into(),
+                submitted: None,
             },
             "gemini · gemini-3-pro-preview",
         );
         assert!(out.contains("BATCH_STATE_EXPIRED"));
         assert!(out.contains("ran past its 24h window"));
+    }
+
+    /// The reason a whole-batch failure is hard to act on is that the provider's text
+    /// arrives bare: "Cannot find file ..." reads like a kaibo bug. The render names the
+    /// step boundary — kaibo sent it, the provider accepted it, this state came after —
+    /// so a caller can tell a request-construction fault from a provider/account one.
+    #[test]
+    fn render_failed_names_where_the_failure_happened() {
+        let out = render_poll(
+            &BatchPoll::Failed {
+                state: "failed".into(),
+                message: "Cannot find file file-VC5eF687ZfDPFKkBrPGZpa".into(),
+                submitted: Some(3),
+            },
+            "gpt · gpt-5.6-sol",
+        );
+        assert!(
+            out.contains("accepted"),
+            "the render must say the provider accepted the batch: {out}"
+        );
+        assert!(
+            out.contains("provider"),
+            "the render must attribute the message to the provider: {out}"
+        );
+    }
+
+    /// A failed batch returned no answer, so its prompts are unspent — and the caller has
+    /// to be told, because reconstructing them from its own context is the expensive part.
+    #[test]
+    fn render_failed_names_the_unspent_prompts() {
+        let out = render_poll(
+            &BatchPoll::Failed {
+                state: "failed".into(),
+                message: "Cannot find file file-VC5eF687ZfDPFKkBrPGZpa".into(),
+                submitted: Some(3),
+            },
+            "gpt · gpt-5.6-sol",
+        );
+        assert!(
+            out.contains("3 submitted prompt"),
+            "the render must count the unspent prompts: {out}"
+        );
+        assert!(
+            out.contains("batch_submit"),
+            "the render must name the action that recovers them: {out}"
+        );
+    }
+
+    /// The render says the prompts are *unspent*, never that they "never ran". A zero-result
+    /// poll proves no answer came back; it does not prove no item started. Cancel and expire
+    /// reach this arm too, and there an item may well have begun before the terminal event —
+    /// so the counted line restates what the first line knows instead of escalating past it.
+    #[test]
+    fn render_failed_claims_unspent_not_unstarted() {
+        let out = render_poll(
+            &BatchPoll::Failed {
+                state: "BATCH_STATE_CANCELLED".into(),
+                message: "cancelled by request".into(),
+                submitted: Some(3),
+            },
+            "gemini · gemini-pro-latest",
+        );
+        assert!(out.contains("unspent"), "{out}");
+        assert!(
+            !out.contains("never ran"),
+            "kaibo cannot know an item never started: {out}"
+        );
+    }
+
+    /// A failed batch names who ran it, exactly as a completed one does. Without the footer
+    /// a cross-model study loses the provenance trail at the moment it most needs it — the
+    /// failure — and cannot tell which cast the provider refused.
+    #[test]
+    fn render_failed_carries_the_provenance_footer() {
+        let out = render_poll(
+            &BatchPoll::Failed {
+                state: "failed".into(),
+                message: "Cannot find file file-VC5eF687ZfDPFKkBrPGZpa".into(),
+                submitted: Some(3),
+            },
+            "gpt · gpt-5.6-sol",
+        );
+        assert!(
+            out.contains("kaibo · batch · gpt · gpt-5.6-sol"),
+            "a failed batch must name its cast too: {out}"
+        );
+    }
+
+    /// With no count recorded the render still offers the recovery, and invents no number.
+    #[test]
+    fn render_failed_without_a_count_still_offers_resubmission() {
+        let out = render_poll(
+            &BatchPoll::Failed {
+                state: "failed".into(),
+                message: "no detail".into(),
+                submitted: None,
+            },
+            "gpt · gpt-5.6-sol",
+        );
+        assert!(out.contains("batch_submit"), "{out}");
+        assert!(
+            !out.contains("0 submitted prompt"),
+            "an unknown count must not render as zero: {out}"
+        );
+    }
+
+    /// The submitted count reaches the failure arm, not just the cross-check on the
+    /// succeeded arm — it is what the recovery line counts.
+    #[test]
+    fn gemini_poll_failed_carries_the_submitted_count() {
+        let v = json!({
+            "metadata": { "state": "BATCH_STATE_FAILED",
+                "batchStats": { "requestCount": "4", "pendingRequestCount": "4" } },
+            "error": { "code": 13, "message": "Batch x failed without error." }
+        });
+        assert_eq!(
+            parse_gemini_poll(&v, Some(4)).unwrap(),
+            BatchPoll::Failed {
+                state: "BATCH_STATE_FAILED".into(),
+                message: "Batch x failed without error.".into(),
+                submitted: Some(4),
+            }
+        );
     }
 
     /// The scripted provider drives a full submit → pending → done flow offline.
