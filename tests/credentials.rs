@@ -325,7 +325,8 @@ fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout_or_stderr() {
     );
 }
 
-#[cfg(unix)]
+// Not gated `#[cfg(unix)]` like its neighbors: the empty-argv guard returns before
+// `Command` is ever touched, so it needs no shell stub and runs on every platform.
 #[test]
 fn key_command_empty_argv_is_a_loud_error_not_a_panic() {
     let err = resolve_key_from_cmd(&[], Duration::from_secs(5), &[]).unwrap_err();
