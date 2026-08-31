@@ -63,7 +63,9 @@ fn empty_file_is_an_error_not_an_empty_key() {
 fn openai_parses_from_friendly_aliases() {
     // Canonical "openai", plus the names people reach for when it points at the
     // local keyless default (Gemma served by Lemonade).
-    for s in ["openai", "OpenAI", "local", "lemonade", "  GEMMA ", "gemma4"] {
+    for s in [
+        "openai", "OpenAI", "local", "lemonade", "  GEMMA ", "gemma4",
+    ] {
         assert_eq!(
             ProviderKind::from_str(s).unwrap(),
             ProviderKind::Openai,
@@ -166,13 +168,22 @@ fn provider_paths_match_amys_dotfiles() {
         ProviderKind::Anthropic.key_file(home),
         home.join(".anthropic-key.txt")
     );
-    assert_eq!(ProviderKind::DeepSeek.key_file(home), home.join(".deepseek-key"));
-    assert_eq!(ProviderKind::Gemini.key_file(home), home.join(".gemini-api-key"));
+    assert_eq!(
+        ProviderKind::DeepSeek.key_file(home),
+        home.join(".deepseek-key")
+    );
+    assert_eq!(
+        ProviderKind::Gemini.key_file(home),
+        home.join(".gemini-api-key")
+    );
     assert_eq!(
         ProviderKind::OpenRouter.key_file(home),
         home.join(".openrouter-key")
     );
-    assert_eq!(ProviderKind::Openai.key_file(home), home.join(".openai-key"));
+    assert_eq!(
+        ProviderKind::Openai.key_file(home),
+        home.join(".openai-key")
+    );
 }
 
 // --- api_key_cmd: the operator-declared command source -----------------------
@@ -210,7 +221,10 @@ fn key_command_stdout_trimmed_is_the_key() {
     let p = stub_script(dir.path(), "printf 'sk-test\\n\\n'", 0);
     let args = vec![p.to_string_lossy().into_owned()];
     let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap();
-    assert_eq!(key, "sk-test", "stdout is trimmed like a key file's contents");
+    assert_eq!(
+        key, "sk-test",
+        "stdout is trimmed like a key file's contents"
+    );
 }
 
 #[cfg(unix)]
@@ -225,8 +239,12 @@ fn key_command_inherits_env_and_receives_argv() {
     let dir = tempdir().unwrap();
     let p = stub_script(dir.path(), "echo \"$KAIBO_STUB_VAR $1\"", 0);
     let args = vec![p.to_string_lossy().into_owned(), "op://Vault/Item".into()];
-    let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[("KAIBO_STUB_VAR", "inherited")])
-        .unwrap();
+    let key = resolve_key_from_cmd(
+        &args,
+        Duration::from_secs(5),
+        &[("KAIBO_STUB_VAR", "inherited")],
+    )
+    .unwrap();
     assert_eq!(key, "inherited op://Vault/Item");
 }
 
@@ -273,11 +291,13 @@ fn key_command_oversized_stdout_is_refused_not_trimmed() {
 
 #[cfg(unix)]
 #[test]
-fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout() {
+fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout_or_stderr() {
     let dir = tempdir().unwrap();
-    // The child says something secret on stdout and its diagnosis on stderr: the
-    // error carries the stderr tail (the operator can act on "Vault is locked")
-    // and NEVER the stdout (a broken command may print anything there).
+    // The child says something secret on stdout, and something that COULD be a
+    // secret on stderr too (a wrapper traced with `set -x` prints exactly this
+    // shape): the error names the exit status and a stderr byte count, and NEVER
+    // quotes either stream's content — stdout because a broken command may print
+    // anything there, stderr because it can carry the secret as easily as stdout.
     let p = stub_script(
         dir.path(),
         "printf 'TOP-SECRET-KEY-MATERIAL\\n'; echo 'Vault is locked' >&2",
@@ -288,12 +308,30 @@ fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout() {
     let msg = err.to_string();
     assert!(msg.contains("exited"), "must name the failure: {msg}");
     assert!(
-        msg.contains("Vault is locked"),
-        "stderr tail reaches the failure error: {msg}"
+        msg.contains("suppressed"),
+        "must say stderr was suppressed rather than shown: {msg}"
+    );
+    assert!(
+        msg.contains("bytes on stderr"),
+        "a bounded, safe summary (a byte count) stands in for stderr's content: {msg}"
+    );
+    assert!(
+        !msg.contains("Vault is locked"),
+        "stderr's content must never reach the error — it can carry the secret itself: {msg}"
     );
     assert!(
         !msg.contains("TOP-SECRET-KEY-MATERIAL"),
         "stdout must never appear in an error: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn key_command_empty_argv_is_a_loud_error_not_a_panic() {
+    let err = resolve_key_from_cmd(&[], Duration::from_secs(5), &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("api_key_cmd") && err.to_string().contains("executable"),
+        "an empty argv is a config error naming the field and the fix, not a panic: {err}"
     );
 }
 

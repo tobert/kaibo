@@ -695,6 +695,11 @@ impl Backend {
     /// not "keyless". Only a genuinely absent source falls back. This is the
     /// no-silent-fallback directive — we don't quietly send a placeholder when the
     /// user clearly meant to provide a key.
+    ///
+    /// No caching: this runs on every client build, not once per process or once per
+    /// call. A `consult` call builds one client per cast role (synth and explorer),
+    /// so a command-backed key spawns once per role — twice for a two-role cast, an
+    /// `op read` and a 1Password audit-log entry each time, not once for the call.
     pub fn resolve_key(&self) -> Result<String> {
         // The env lookup is the only ambient read in the chain; the file/command
         // arms read declared config, so the real-environment call is the trivial
@@ -726,16 +731,13 @@ impl Backend {
             }
         }
 
-        // then a declared key command, run once. Raw argv, no shell: resolved by the
-        // same lazy rule as the file (first client build), inheriting kaibo's env
-        // (where e.g. `op` finds its session), stdout trimmed and never logged.
+        // then a declared key command. Raw argv, no shell, and no caching: this runs
+        // on every call to resolve_key, i.e. every client build — see the doc above —
+        // inheriting kaibo's env (where e.g. `op` finds its session), stdout trimmed
+        // and never logged.
         if let Some(args) = &self.api_key_cmd {
-            return credentials::resolve_key_from_cmd(
-                args,
-                credentials::KEY_CMD_TIMEOUT,
-                &[],
-            )
-            .with_context(|| format!("resolving key for backend {:?}", self.name));
+            return credentials::resolve_key_from_cmd(args, credentials::KEY_CMD_TIMEOUT, &[])
+                .with_context(|| format!("resolving key for backend {:?}", self.name));
         }
 
         // No env, no declared file or command.

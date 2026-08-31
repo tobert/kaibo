@@ -430,27 +430,44 @@ pub const KEY_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Run a declared key command and return its stdout as the key.
 ///
 /// `args` is raw argv — no shell, no `$VAR`/`~` expansion: the config layer never
-/// interpolates command elements, and neither do we. The child inherits kaibo's
-/// environment (where e.g. `op` finds its session or gpg-agent serves `pass`);
-/// `extra_env` is the test seam — unit tests inject through it instead of mutating
-/// the process environment.
+/// interpolates command elements, and neither do we. An empty `args` names no
+/// executable — config load already refuses `api_key_cmd = []`, but this is a
+/// `pub fn` a direct caller can reach without going through config, so it returns
+/// the same loud error rather than panicking on `args[0]`. The child inherits
+/// kaibo's environment (where e.g. `op` finds its session or gpg-agent serves
+/// `pass`); `extra_env` is the test seam — unit tests inject through it instead of
+/// mutating the process environment.
 ///
 /// All three stdio streams are pinned. Stdin is nulled: the child must never read
 /// the MCP stdio stream kaibo runs on, and a prompting tool fails fast instead of
 /// hanging on a TTY that does not exist. Stdout and stderr are piped and captured —
-/// stdout IS the key, stderr feeds failure errors only — so nothing a child prints
-/// can leak into kaibo's own stdout or a log.
+/// stdout IS the key, so nothing a child prints there can leak into kaibo's own
+/// stdout or a log. Stderr is captured too, but never quoted into an error or a log:
+/// a wrapper script traced with `set -x`, or a tool that echoes the secret on its
+/// own failure path, can put the key on stderr as easily as stdout, so a failure
+/// names only the exit status and a byte count, never stderr's content.
 ///
 /// The key is stdout, trimmed (key-file semantics). Empty, non-UTF-8, or
 /// over-[`KEY_CMD_MAX_OUTPUT`] output, a nonzero exit, a spawn failure, and a
 /// timeout are all loud errors — the no-silent-fallback rule: a declared-but-broken
 /// command never degrades to a placeholder.
+///
+/// No caching: this runs fresh on every call, and [`crate::config::Backend::resolve_key`]
+/// has no memoization either, so a caller that builds a client per cast role —
+/// `consult`'s synth and explorer, say — runs this command once per role, not once
+/// per top-level call.
 pub fn resolve_key_from_cmd(
     args: &[String],
     timeout: Duration,
     extra_env: &[(&str, &str)],
 ) -> Result<String> {
-    let mut cmd = std::process::Command::new(&args[0]);
+    let Some(program) = args.first() else {
+        return Err(anyhow!(
+            "api_key_cmd names no executable — give it at least the command to \
+             run (`kaibo example-config` shows the shape)"
+        ));
+    };
+    let mut cmd = std::process::Command::new(program);
     cmd.args(&args[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -460,7 +477,7 @@ pub fn resolve_key_from_cmd(
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawning key command {:?}", args[0]))?;
+        .with_context(|| format!("spawning key command {:?}", program))?;
     let stdout = child
         .stdout
         .take()
@@ -488,7 +505,7 @@ pub fn resolve_key_from_cmd(
                      stdin is closed, so an interactive unlock prompt cannot be \
                      answered (unlock the tool once, or point it at a key that \
                      needs no prompt)",
-                    args[0],
+                    program,
                     timeout.as_secs_f64(),
                 ));
             }
@@ -504,28 +521,18 @@ pub fn resolve_key_from_cmd(
         .join()
         .map_err(|_| anyhow!("key command stderr reader panicked"))?;
 
-    // A nonzero exit is the primary failure: name it and the child's own stderr
-    // tail ("Vault is locked"), never its stdout — a broken command may print
-    // anything to stdout, including part of an unrelated buffer.
+    // A nonzero exit is the primary failure: name it and how much stderr the
+    // child wrote, never stderr's content — stderr can carry the secret itself
+    // (a wrapper script run with `set -x`, or a tool that echoes on its own
+    // failure path), so it is suppressed exactly where stdout already is.
     if !status.success() {
-        let tail: String = String::from_utf8_lossy(&err)
-            .trim()
-            .chars()
-            .rev()
-            .take(512)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let suffix = if tail.is_empty() {
-            "".to_string()
-        } else {
-            format!(" — {tail}")
-        };
         return Err(anyhow!(
-            "key command {:?} exited with {status}{suffix}: fix the command or \
-             the secret it reads (its stdout must be the key)",
-            args[0],
+            "key command {:?} exited with {status} ({} bytes on stderr, \
+             suppressed — stderr can carry the secret itself): run the command \
+             directly to see why it failed, then fix it or the secret it reads \
+             (its stdout must be the key)",
+            program,
+            err.len(),
         ));
     }
 
@@ -534,7 +541,7 @@ pub fn resolve_key_from_cmd(
         return Err(anyhow!(
             "key command {:?} printed more than {} bytes of output — a key is a \
              single value; point the command at a field that prints one",
-            args[0],
+            program,
             KEY_CMD_MAX_OUTPUT,
         ));
     }
@@ -545,7 +552,7 @@ pub fn resolve_key_from_cmd(
         format!(
             "key command {:?} printed non-UTF-8 output — the key must be text \
              (a base64'd binary field? wrap it in a script that decodes)",
-            args[0]
+            program
         )
     })?;
     let key = out.trim();
@@ -553,7 +560,7 @@ pub fn resolve_key_from_cmd(
         return Err(anyhow!(
             "key command {:?} printed nothing — the command must print the key \
              to stdout",
-            args[0]
+            program
         ));
     }
     Ok(key.to_string())

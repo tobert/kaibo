@@ -97,9 +97,11 @@ by re-declaration.
 - **`kind = "openai-images"`** — optional. Unset dials hosted OpenAI
   (`https://api.openai.com/v1`). Set, it points the same wire at any server speaking
   `/v1/images/generations` — a local stable-diffusion.cpp `sd-server`
-  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Key sources
-  are shared with the `openai` kind (the same `OPENAI_API_KEY` / `~/.openai-key`),
-  but the key is **required by default**: the default endpoint is hosted, so a
+  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Declared-only,
+  like every kind (see Key resolution below): kaibo seeds no source, but shares the
+  `openai` kind's conventional names (`OPENAI_API_KEY` / `~/.openai-key`) — one OpenAI
+  credential, not two to maintain, if you declare the same `api_key_env` on both. The
+  key is **required by default**: the default endpoint is hosted, so a
   keyless seed would send a placeholder bearer to a paid API and 401 on the first
   call instead of failing loudly at setup. A keyless local `sd-server` backend sets
   `key_optional = true` beside its local `base_url`. The `generate` tool's
@@ -157,6 +159,16 @@ wrote (a fresh built-in backend has no key source until one is declared). A back
 may declare at most one of `api_key_file` and `api_key_cmd` — both is a load error
 naming both fields; env may still be declared beside either, and wins when set.
 
+**Upgrading from a kaibo that seeded built-in keys.** Older kaibo read
+`ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` and the matching env var / dotfile for
+every built-in backend without being told to. That seeding is gone: a built-in
+backend with no declared source now has no key, `resolve_key` refuses it, and the
+handshake roster drops every cast built on it. Add one `api_key_env`, `api_key_file`,
+or `api_key_cmd` line per backend you use (`kaibo example-config` shows the shapes,
+and the Built-in registry table below still lists each one's conventional env var
+and dotfile name) — those names still work as *values* for the fields, they are
+just no longer assumed.
+
 **Secrets never appear inline in the TOML** — only the *name* of an env var, the
 *path* to a key file, or the *argv* of a key command (a vault item path is a
 pointer, not the secret it resolves to). A config file should be safe to commit or
@@ -168,8 +180,12 @@ kaibo's environment (where `op` finds its session, gpg-agent serves `pass`), but
 stdin is closed (it must never read the MCP stdio stream — a prompting tool fails
 fast instead), its stdout is the key, trimmed, and it is given a 30s ceiling
 (`KEY_CMD_TIMEOUT`): a hung or oversized-emitter is killed/refused, loudly, and its
-output is never logged. 1Password's `op read "op://Vault/Item/Field"`, `pass show`,
-`gh auth token`, and any vault CLI fit this contract unchanged.
+output is never logged. A nonzero exit names the exit status and how many bytes the
+command wrote to stderr, never stderr's content — a wrapper script traced with
+`set -x`, or a tool that echoes the secret on its own failure path, can put the key
+on stderr as easily as stdout, so don't trace a key command. 1Password's `op read
+"op://Vault/Item/Field"`, `pass show`, `gh auth token`, and any vault CLI fit this
+contract unchanged.
 
 `key_optional = true` substitutes a placeholder when no key is found, which is the
 keyless local-server case. The placeholder fits the auth style: an empty query key for
@@ -183,11 +199,14 @@ source is classified `Present` by `key_status` without being run (there is no ch
 offline check for a command — the same asymmetry as an unread key file; a typo'd
 binary name surfaces loudly at the first resolve).
 
-**Timing.** Keys resolve lazily, when the backend is first used to build a client, not at
-config load. A missing or broken key source on a backend no call touches never
-surfaces. A key command therefore runs once per client build and the key lives for
-that client's lifetime — a rotated vault item is picked up at the next client build,
-not on the next call.
+**Timing.** Keys resolve lazily, when a backend is used to build a client, not at
+config load, and are never cached: every client build resolves fresh. A missing or
+broken key source on a backend no call touches never surfaces. This makes the cost of
+`api_key_cmd` a per-*role* cost, not a per-*call* one: one `consult` (or `oneshot`,
+`batch_submit`, …) call builds a client for each cast role it uses — synth and
+explorer, for a two-role cast — so a command-backed key runs once per role, an `op
+read` and a 1Password audit-log entry each. A rotated vault item is picked up at the
+very next build, at the cost of running the command again on every one.
 
 #### `kind = "openrouter"` specifics
 
@@ -483,13 +502,17 @@ behavioral guard rather than a memory one (the per-file and cumulative byte caps
 Five backends and five same-named single-backend casts ship in code, plus two batch
 casts. This is why a missing config file is not an error.
 
-| backend | kind | base_url | key env / file | aliases |
+| backend | kind | base_url | conventional key env / file (declare to use) | aliases |
 |---|---|---|---|---|
 | `anthropic` | anthropic | — *(optional)* | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
 | `deepseek` | deepseek | — | `DEEPSEEK_API_KEY` / `~/.deepseek-key` | — |
 | `gemini` | gemini | — *(optional, host root)* | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
 | `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
+
+None of these are seeded (see Key resolution above): a built-in backend has no key
+source until you declare `api_key_env`/`api_key_file` naming one of these values, or
+`api_key_cmd` for a vault command instead.
 
 No built-in sets `wire`. It matters only for a new openai-kind backend whose endpoint is
 not OpenAI Platform's own but should still take the Responses shape; see
