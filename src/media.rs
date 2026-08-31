@@ -480,6 +480,17 @@ impl MediaArm {
                 let model = crate::dashscope::DashScopeImageModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
+            ProviderClass::Media(MediaKind::Bfl) => {
+                // Keyed with no keyless target, same as Stability/DashScope.
+                let key = backend.resolve_key()?;
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::bfl::DEFAULT_BASE_URL.to_string());
+                let client = crate::bfl::BflClient::new(key, base_url, backend.request_timeout)?;
+                let model = crate::bfl::BflImageModel::from_parts(&client, &slot.id);
+                Ok(Self::new(Arc::new(model), slot.qualified()))
+            }
             ProviderClass::Wire(_) => bail!(
                 "backend {:?} is kind `{}`, a completion wire — it cannot staff a media \
                  slot. Point the `image` slot at a media backend, and use this backend \
@@ -712,6 +723,27 @@ mod tests {
         let slot = ModelSlot::bare("gimg", "gemini-3-flash-image");
         let arm = MediaArm::from_slot(backend, &slot).expect("a gemini-images backend staffs");
         assert_eq!(arm.slot_ref(), "gimg/gemini-3-flash-image");
+    }
+
+    /// A BFL backend staffs an image slot. Keyed, so the key must resolve — this
+    /// fixture supplies one through `key_optional = true` plus a nonexistent
+    /// `api_key_file`, the same shape `from_slot_staffs_a_dashscope_backend` uses.
+    /// Construction only; no network.
+    #[test]
+    fn from_slot_staffs_a_bfl_backend() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.bfl]
+            kind = "bfl"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/bfl"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("bfl").expect("backend exists");
+        let slot = ModelSlot::bare("bfl", "flux-2-pro");
+        let arm = MediaArm::from_slot(backend, &slot).expect("a bfl backend staffs");
+        assert_eq!(arm.slot_ref(), "bfl/flux-2-pro");
     }
 
     /// The Stability arm still staffs — the sibling-kind regression guard for the

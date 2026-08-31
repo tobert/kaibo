@@ -101,6 +101,15 @@ pub enum ProviderKind {
     /// are in hand (see `crate::cas::fetch_artifact_bytes`). Keyed and not built-in,
     /// like the other media kinds: generation costs money per image.
     DashScope,
+    /// Black Forest Labs' FLUX image family — the fifth media kind, via
+    /// `src/bfl.rs`. One endpoint per named operation (`flux-dev`, `flux-2-pro`, ...),
+    /// and every one of them asynchronous: a create call returns a job id and a
+    /// `polling_url` to poll — unlike Stability (mostly synchronous) or
+    /// DashScope/Gemini (always synchronous). `generate` polls in-call for the
+    /// common fast case and falls back to a `job-N` handle only when the provider is
+    /// still working past that budget; see `src/bfl.rs`'s module doc. Keyed and not
+    /// built-in, like the other media kinds: generation costs money per image.
+    Bfl,
 }
 
 impl ProviderKind {
@@ -108,7 +117,7 @@ impl ProviderKind {
     /// new kind can never be accepted by `FromStr` while staying unlisted in the message
     /// a user actually reads — a hand-maintained list in that string had already drifted
     /// once (`openrouter` shipped before it was named there).
-    pub const ALL: [ProviderKind; 9] = [
+    pub const ALL: [ProviderKind; 10] = [
         Self::Anthropic,
         Self::DeepSeek,
         Self::Gemini,
@@ -118,6 +127,7 @@ impl ProviderKind {
         Self::OpenAiImages,
         Self::GeminiImages,
         Self::DashScope,
+        Self::Bfl,
     ];
 
     /// Whether a missing credential is tolerated rather than a hard error. Only the
@@ -163,12 +173,13 @@ impl ProviderKind {
             // sd-server: header-bearer shaped, value ignored by such a server.
             | ProviderKind::OpenAiImages
             | ProviderKind::GeminiImages
-            // Never reached: neither Stability nor DashScope is `key_optional`, so a
-            // missing key is a hard error long before a stand-in is wanted. Both are
-            // header-bearer wires, so they take the same shape as the others if that
-            // ever changes.
+            // Never reached: none of Stability, DashScope, or BFL is `key_optional`,
+            // so a missing key is a hard error long before a stand-in is wanted. All
+            // three are header-bearer wires, so they take the same shape as the
+            // others if that ever changes.
             | ProviderKind::Stability
-            | ProviderKind::DashScope => PLACEHOLDER_OPENAI_KEY,
+            | ProviderKind::DashScope
+            | ProviderKind::Bfl => PLACEHOLDER_OPENAI_KEY,
         }
     }
 
@@ -188,6 +199,7 @@ impl ProviderKind {
             ProviderKind::OpenAiImages => "openai-images",
             ProviderKind::GeminiImages => "gemini-images",
             ProviderKind::DashScope => "dashscope",
+            ProviderKind::Bfl => "bfl",
         }
     }
 
@@ -223,6 +235,9 @@ impl ProviderKind {
             // serves text on an OpenAI-compatible route, and an operator who runs both
             // wants one name per account, not one name per protocol.
             ProviderKind::DashScope => crate::dashscope::DASHSCOPE_KEY_ENV_VAR,
+            // Reuses the constant `src/bfl.rs` already resolves keys with, so the
+            // facade and the config layer can never disagree about which var to read.
+            ProviderKind::Bfl => crate::bfl::BFL_KEY_ENV_VAR,
         }
     }
 
@@ -241,6 +256,8 @@ impl ProviderKind {
             ProviderKind::Stability => crate::stability::STABILITY_KEY_FILE_NAME,
             // Same reasoning as `env_var`: DashScope's own credential name.
             ProviderKind::DashScope => crate::dashscope::DASHSCOPE_KEY_FILE_NAME,
+            // Same constant `src/bfl.rs` uses, for the same reason as `env_var`.
+            ProviderKind::Bfl => crate::bfl::BFL_KEY_FILE_NAME,
         }
     }
 
@@ -266,6 +283,7 @@ impl ProviderKind {
             ProviderKind::OpenAiImages => ProviderClass::Media(MediaKind::OpenAiImages),
             ProviderKind::GeminiImages => ProviderClass::Media(MediaKind::GeminiImages),
             ProviderKind::DashScope => ProviderClass::Media(MediaKind::DashScope),
+            ProviderKind::Bfl => ProviderClass::Media(MediaKind::Bfl),
         }
     }
 
@@ -319,6 +337,9 @@ pub enum MediaKind {
     /// Alibaba DashScope's multimodal-generation route, via `src/dashscope.rs` —
     /// the `wan` image family, delivered as presigned URLs kaibo fetches.
     DashScope,
+    /// Black Forest Labs' FLUX image family, via `src/bfl.rs` — every operation
+    /// asynchronous, delivered as a signed URL kaibo fetches.
+    Bfl,
 }
 
 /// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
@@ -358,6 +379,7 @@ impl std::str::FromStr for ProviderKind {
             "openai-images" => Ok(ProviderKind::OpenAiImages),
             "gemini-images" => Ok(ProviderKind::GeminiImages),
             "dashscope" => Ok(ProviderKind::DashScope),
+            "bfl" => Ok(ProviderKind::Bfl),
             other => Err(anyhow!(
                 "unknown provider {other:?} (expected one of: {})",
                 ProviderKind::ALL

@@ -103,3 +103,15 @@ one does.
 
 - 2026-08-31 — spec written from the live OpenAPI dump; implementation
   delegated. No key yet; offline build first.
+- 2026-08-31 — `src/bfl.rs` landed: the five starter ops, request/response parsing,
+  and every terminal-status error, all offline and failing-first. Shape decided:
+  hybrid inline-poll-then-`Deferred` — `generate` polls in-call for
+  `INLINE_POLL_BUDGET` (30s) and falls back to the existing `Deferred`/`job-N` lane
+  only past that, so the common fast case returns bytes and the rare slow one still
+  gets a handle; this is the first shape from the spec's two options, with `Deferred`
+  as its documented bound. `AsyncResponse.cost` rides `MediaOutcome::Complete`'s
+  `note` channel on the fast path only — no note channel exists on the deferred
+  path today, recorded as a future widening. Wired into `credentials.rs`,
+  `media.rs`, `discover.rs`, `server/mod.rs`, and the config docs the same way
+  #168 wired `gemini-images`. Still no `BFL_API_KEY`; `tests/bfl_live.rs` is
+  `#[ignore]`d and ready for one.

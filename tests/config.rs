@@ -3010,4 +3010,105 @@ fn a_key_commands_stdout_never_reaches_kaibos_own_stdout() {
         "the run must fail on the dead transport AFTER resolving the key (proving the \
          command ran):\n{stderr}"
     );
+
+// --- the bfl kind ------------------------------------------------------------------
+
+/// The `bfl` kind parses from TOML. Declared-only, like every other kind: the
+/// operator names `api_key_env`/`api_key_file`/`api_key_cmd` themselves — kaibo
+/// seeds nothing, not even BFL's own conventional `BFL_API_KEY` / `.bfl-key` names.
+/// The key is required: like Stability and DashScope, this kind has no keyless
+/// target.
+#[test]
+fn bfl_backend_parses_without_seeding_key_sources() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.flux]
+        kind = "bfl"
+        "#,
+    )
+    .expect("the bfl kind must parse");
+    let b = c.backends.get("flux").expect("backend exists");
+    assert_eq!(b.kind, kaibo::credentials::ProviderKind::Bfl);
+    // Declared-only: a fresh media stanza declares its own source or fails loudly.
+    assert_eq!(b.api_key_env, None);
+    assert_eq!(b.api_key_file, None);
+    assert_eq!(b.api_key_cmd, None);
+    assert!(!b.key_optional, "key_optional seeds FALSE — BFL is keyed");
+}
+
+/// base_url is optional and legal on a bfl backend: unset dials api.bfl.ai, and a
+/// compatible gateway/proxy sets its own host. The client appends the op path
+/// either way, so the value is a ROOT.
+#[test]
+fn bfl_base_url_is_optional_and_legal() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.hosted]
+        kind = "bfl"
+
+        [backends.gateway]
+        kind = "bfl"
+        base_url = "https://llm-gateway.example.internal/bfl"
+        "#,
+    )
+    .expect("a bfl backend may set a base_url, and may omit it");
+    assert!(
+        c.backends.get("hosted").expect("exists").base_url.is_none(),
+        "unset means the kind's own default, resolved when the arm is staffed"
+    );
+    assert_eq!(
+        c.backends
+            .get("gateway")
+            .expect("exists")
+            .base_url
+            .as_deref(),
+        Some("https://llm-gateway.example.internal/bfl")
+    );
+}
+
+/// A bfl backend staffs an image slot — the config half of the media pairing. The
+/// slot's model id is one of BFL's named operations, and also `generate`'s default
+/// `op`.
+#[test]
+fn an_image_slot_can_point_at_a_bfl_backend() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.flux]
+        kind = "bfl"
+
+        [casts.art]
+        image = "flux/flux-2-pro"
+        "#,
+    )
+    .expect("an image slot on a bfl backend loads");
+    let cast = c.casts.get("art").expect("cast exists");
+    let slot = cast
+        .slot(kaibo::config::ModelRole::Image)
+        .expect("image slot resolves");
+    assert_eq!(slot.backend, "flux");
+    assert_eq!(slot.id, "flux-2-pro");
+}
+
+/// A reasoning slot pointed at a bfl backend is refused at load — the same
+/// class-based guard every other media kind gets.
+#[test]
+fn a_reasoning_slot_cannot_point_at_a_bfl_backend() {
+    for role in ["explorer", "synth"] {
+        let toml = format!(
+            r#"
+            [backends.flux]
+            kind = "bfl"
+
+            [casts.broken]
+            {role} = "flux/flux-2-pro"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a reasoning slot on a bfl backend must be refused at load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(role) && msg.contains("bfl") && msg.contains("media kind"),
+            "the error names the slot, the kind, and its class, got: {msg}"
+        );
+    }
 }

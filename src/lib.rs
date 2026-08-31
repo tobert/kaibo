@@ -20,6 +20,7 @@
 pub mod artifact;
 pub mod attach;
 pub mod batch;
+pub mod bfl;
 pub mod cas;
 pub mod cli;
 pub mod completion_retry;

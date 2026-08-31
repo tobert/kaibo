@@ -20,7 +20,7 @@ of backends and casts. A missing file at the default path is not an error.
 
 ```
 ProviderKind = anthropic | deepseek | gemini | openrouter | openai   (completion wires)
-             | stability | openai-images | gemini-images | dashscope (media kinds)
+             | stability | openai-images | gemini-images | dashscope | bfl (media kinds)
 Backend      = { name, kind, base_url?, key source, request_timeout }
 Cast         = { name, role → ModelSlot }                  (freely spans backends)
 ModelSlot    = "backend/model-id"  or  { backend, id, pins…, tunables… }
@@ -32,12 +32,12 @@ Each concept owns one idea:
   selects the client and the request shape), `base_url`, a key source, and
   `request_timeout`. Answers "how do I reach Gemini". Kinds divide into two classes:
   the completion wires (everything through rig's completion clients) and the media
-  kinds (`stability`, `openai-images`, `gemini-images`, `dashscope` — image-generation APIs with no
+  kinds (`stability`, `openai-images`, `gemini-images`, `dashscope`, `bfl` — image-generation APIs with no
   completion surface).
 - **role** — a *job* a model serves. Three exist: `explorer` and `synth`, the two
   reasoning phases, and `image`, the media member that staffs the `generate` tool.
   A reasoning role takes a completion backend; the `image` role takes a media backend
-  (kind `stability`, `openai-images`, `gemini-images`, or `dashscope`) — pairing either with the wrong class is a
+  (kind `stability`, `openai-images`, `gemini-images`, `dashscope`, or `bfl`) — pairing either with the wrong class is a
   load error naming the fix. Image *input* is a slot capability (the `vision` pin on
   a reasoning slot), not a role.
 - **cast** — a *composition*. A named assignment of models to roles. This is what the
@@ -54,7 +54,7 @@ Connection settings only. Models are never declared here.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-images` \| `dashscope` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-images`, and `dashscope` are the media kinds — image slots only) |
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-images` \| `dashscope` \| `bfl` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-images`, `dashscope`, and `bfl` are the media kinds — image slots only) |
 | `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini` and the media kinds; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | unset — declared by you | env source, checked first |
@@ -120,6 +120,17 @@ by re-declaration.
   returns artifacts as presigned links, so kaibo fetches each over TLS and stores
   the bytes; the artifact's mime is the fetch response's `Content-Type`, and one the
   media store cannot name is refused rather than guessed.
+- **`kind = "bfl"`** — optional. Unset dials `https://api.bfl.ai`. Every FLUX
+  operation is asynchronous: a create call answers `{id, polling_url, ...}`, and
+  `generate` polls `polling_url` (a regional host, dialled verbatim — never rebuilt
+  from `base_url`) in-call for the common fast case, falling back to a `job-N` handle
+  only when a generation is still running past that budget. The key is required, from
+  its own sources (`BFL_API_KEY` / `~/.bfl-key`). The image-slot model id names one of
+  five operations (`flux-dev`, `flux-2-pro`, `flux-2-flex`, `flux-pro-1.1-ultra`,
+  `flux-kontext-pro`) and is also `generate`'s default `op`. The generated artifact
+  arrives as a signed link good for about ten minutes, fetched the same way
+  DashScope's is; the mime comes from the fetched bytes, and one the media store
+  cannot name is refused rather than guessed.
 - **Every other kind** — a load error. rig fixes those endpoints.
 
 The value is a root the client versions itself, never a full endpoint path. rig's
@@ -129,7 +140,7 @@ same way, and the media clients append their own route (`/v2beta/...` for
 `stability`; `/v1beta/models/{model}:generateContent` for `gemini-images`;
 `/images/generations` for `openai-images`, so give that one a URL
 through `/v1`; the multimodal-generation route for `dashscope`, so give that one a
-bare host).
+bare host; one path per operation for `bfl`, e.g. `/v1/flux-2-pro`).
 
 #### `wire`
 
@@ -285,7 +296,8 @@ media member: it points at a media-kind backend and staffs the `generate` tool. 
 model id means what that kind says it means — for `stability` it picks the route
 (`core`, `ultra`, or an SD3.5 variant); for `gemini-images` it is the model in the request path; for `openai-images` it is the `model` field
 (`gpt-image-1` hosted, or whatever a local sd-server loaded); for `dashscope` it is
-the `model` field too (`wan2.6-t2i`). It sends one
+the `model` field too (`wan2.6-t2i`); for `bfl` it names one of five operations
+(`flux-2-pro`, ...) and doubles as `generate`'s default `op`. It sends one
 generation request, not a reasoning loop, so the reasoning tunables (`effort`,
 `thinking_budget`, `temperature`, ...) written on it are inert — `kaibo://config`
 flags them under `inert_tunables`.
@@ -742,7 +754,7 @@ Which cast shape staffs which tool:
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
-| `generate` | a cast with an `image` slot (a media backend: kind `stability`, `openai-images`, `gemini-images`, or `dashscope`) — plus `[cas]` on |
+| `generate` | a cast with an `image` slot (a media backend: kind `stability`, `openai-images`, `gemini-images`, `dashscope`, or `bfl`) — plus `[cas]` on |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 

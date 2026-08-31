@@ -780,6 +780,13 @@ pub struct GenerateInput {
     /// and quality (image; up to 16 `image` entries), `variations` priced per image by
     /// model and size (image; takes no prompt).
     ///
+    /// **BFL (FLUX):** `flux-dev` (the cheap rung — probing and drafts), `flux-2-pro`
+    /// (the quality default), `flux-2-flex` (parameter-heavy control),
+    /// `flux-pro-1.1-ultra` (high-resolution stills), `flux-kontext-pro` (editing with
+    /// reference inputs) — every one takes `input_image`..`input_image_8` in `inputs`.
+    /// Omit `op` to run the cast's image-slot model id as the operation instead. Cost
+    /// is reported per request, not a fixed table — read it in the result.
+    ///
     /// `edit/erase` and `edit/inpaint` also take an optional `mask` in `inputs`, or an
     /// alpha channel on the image instead. Text knobs ride `fields`, not `inputs`:
     /// `edit/search-and-replace` needs `search_prompt` there, `edit/search-and-recolor`
@@ -955,7 +962,7 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         &["generate"],
         Config::cast_can_generate,
         "a cast with an `image` slot pointing at a media backend (kind `stability`, \
-         `openai-images`, `gemini-images`, or `dashscope`) — see the image-slot \
+         `openai-images`, `gemini-images`, `dashscope`, or `bfl`) — see the image-slot \
          examples in \
          docs/config.example.toml",
     ),
@@ -3091,8 +3098,8 @@ impl KaiboHandler {
     #[tool(
         description = "Generate images from a text prompt with the cast's `image` \
             model (a media backend: Stability, an OpenAI-compatible images endpoint — \
-            hosted gpt-image or a local stable-diffusion.cpp sd-server — Gemini, or \
-            DashScope's wan family). \
+            hosted gpt-image or a local stable-diffusion.cpp sd-server — Gemini, \
+            DashScope's wan family, or Black Forest Labs' FLUX). \
             Bytes are never inlined: each artifact lands in kaibo's content-addressed \
             media store and the result lists per-artifact digests — a \
             kaibo://cas/<digest> address, the mime, the provider's seed when reported, \
@@ -3106,13 +3113,13 @@ impl KaiboHandler {
             `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
             image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
             an image already in the store is reused by address and never re-sent. \
-            Stability and Gemini accept input images; the others do not and say so. \
-            `op` picks an operation when the backend has more than one — Stability's \
-            edit, control and upscale routes, each with its required `inputs` keys and \
-            its credit cost listed on the parameter, so you can see the price before you \
-            pick. Omit `op` to generate from the prompt. An \
-            operation the provider declares deferred returns a `job-N` handle for \
-            job_wait/job_get instead (every route wired today answers in-call). \
+            Stability, Gemini, and BFL accept input images; the others do not and say \
+            so. `op` picks an operation when the backend has more than one — \
+            Stability's edit, control and upscale routes, each with its required \
+            `inputs` keys and its credit cost listed on the parameter; BFL's five FLUX \
+            endpoints, priced per request. Omit `op` to generate from the prompt (BFL: \
+            runs the image slot's model id). Most operations answer in-call; one still \
+            generating past its budget returns a `job-N` handle for job_wait/job_get. \
             Provenance (prompt, model, cast, seed) is recorded beside every artifact."
     )]
     pub async fn generate(

@@ -398,7 +398,7 @@ scratch_limit_bytes = 67108864
 # ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
 # completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
-# reasoning slots; the media kinds (stability | openai-images | gemini-images | dashscope) serve `image` slots
+# reasoning slots; the media kinds (stability | openai-images | gemini-images | dashscope | bfl) serve `image` slots
 # only. The rest describes the wire (endpoint, key source, per-request deadline).
 # Models live on cast slots, never here.
 #
@@ -414,7 +414,7 @@ scratch_limit_bytes = 67108864
 # unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
 # and the media kinds (optional — unset dials api.stability.ai for stability,
 # api.openai.com/v1 for openai-images, generativelanguage.googleapis.com for
-# gemini-images, dashscope-intl.aliyuncs.com for dashscope);
+# gemini-images, dashscope-intl.aliyuncs.com for dashscope, api.bfl.ai for bfl);
 # set it to point the same wire at a
 # compatible gateway/proxy (or a local server) instead — a ROOT in every case,
 # since the client appends its own path. Every other keyed kind rejects
@@ -545,8 +545,8 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 # `deep-dive`) so it can route by name without reading this file.
 #
 # Roles: explorer, synth (the reasoning phases), and image (the media member — it
-# points at a media backend, kind stability, openai-images, gemini-images, or dashscope, and staffs `generate`;
-# see the image-slot examples below). A typo'd role is a loud load
+# points at a media backend, kind stability, openai-images, gemini-images, dashscope,
+# or bfl, and staffs `generate`; see the image-slot examples below). A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
 # naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
 #
@@ -598,7 +598,8 @@ explorer = "llama/qwen2.5-coder-7b"                              # bare ref: jus
 synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # --- The `image` slot: a MEDIA member on the team. It points at a media backend
-#     (kind = "stability", "openai-images", "gemini-images", or "dashscope") and produces artifacts instead of
+#     (kind = "stability", "openai-images", "gemini-images", "dashscope", or "bfl")
+#     and produces artifacts instead of
 #     text, so the reasoning tunables (effort, thinking_budget, temperature, ...)
 #     do not apply to it — writing one there is inert and kaibo://config flags it.
 #     A cast carries it beside its reasoning slots; a cast without one cannot staff
@@ -669,6 +670,20 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # [casts.wan-artist]
 # image = "wan/wan2.6-t2i"        # the request's `model` field
+
+# --- The bfl kind reaches Black Forest Labs' FLUX family. base_url is optional
+#     (unset dials api.bfl.ai). Every operation is asynchronous — a create call
+#     returns a job id and a polling_url kaibo polls, in-call for a fast generation
+#     and as a `job-N` handle only past that budget. The slot's model id names one of
+#     five operations (flux-dev, flux-2-pro, flux-2-flex, flux-pro-1.1-ultra,
+#     flux-kontext-pro) and doubles as `generate`'s default `op`; a per-call `op`
+#     overrides it. Every operation takes input_image..input_image_8 in `inputs`. ---
+
+# [backends.bfl]
+# kind = "bfl"                    # key: BFL_API_KEY / ~/.bfl-key
+
+# [casts.flux-artist]
+# image = "bfl/flux-2-pro"        # the default operation; override per call with `op`
 
 # --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
 #     per-role value for THIS slot only; knobs you omit fall back. Available:
