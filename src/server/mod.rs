@@ -740,9 +740,12 @@ pub struct GenerateInput {
     /// pass `n` as a number and ids like `user` as strings. (Stability:
     /// aspect_ratio "16:9", output_format png|jpeg|webp, seed, negative_prompt,
     /// style_preset, ...; OpenAI-compatible images endpoints: size "1024x1024", n,
-    /// quality, output_format png|jpeg|webp, ...). The provider validates its own
-    /// knobs. `prompt` and `model` are reserved: use the prompt parameter and the
-    /// cast's image slot.
+    /// quality, output_format png|jpeg|webp, ...; BFL: width and height in pixels,
+    /// seed, output_format, safety_tolerance 0-5). The provider validates its own
+    /// knobs, and the spellings are per-backend — BFL ignores a field it does not
+    /// know (an `aspect_ratio` there changes nothing, measured), so size a FLUX
+    /// image with width and height. `prompt` and `model` are reserved: use the
+    /// prompt parameter and the cast's image slot.
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
 
