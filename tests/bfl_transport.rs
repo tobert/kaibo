@@ -3,7 +3,11 @@
 //! op's own path with an `x-key` header, and the *poll* call dials the create
 //! response's `polling_url` **verbatim** — a different host/port than the create
 //! call's own base URL, proving it is never rebuilt from `base_url`. See the module
-//! doc in `src/bfl.rs` for why that distinction matters (a regional polling host).
+//! doc in `src/bfl.rs`'s "Polling is TLS-strict" section for the trust-shape
+//! reasoning this file also exercises: `polling_url` is a provider-chosen address
+//! carrying the `x-key` credential, so the poll leg runs over
+//! `crate::tls::artifact_fetch_client` (https-only, no redirects) rather than the
+//! general client `create` uses.
 //!
 //! Two one-shot servers stand in for the two hops: a "create" server answers the
 //! POST, naming a "poll" server's address as its `polling_url`; if kaibo ever
@@ -13,18 +17,25 @@
 //! and `tests/dashscope_transport.rs` already rely on for their own "dials the
 //! right place" assertions.
 //!
-//! The final hop — fetching `result.sample` — takes `https` only
-//! (`cas::fetch_artifact_bytes`), so a plain `TcpListener` cannot serve it; that walk
-//! is covered by `artifact_mime`'s unit tests in `src/bfl.rs` and, end to end, by the
-//! `#[ignore]`d live probe in `tests/bfl_live.rs`. Keeping the scheme check
-//! un-mocked here is the point, same as the DashScope precedent: an offline test
-//! that could reach a plaintext artifact URL would be testing a kaibo that does not
-//! exist.
+//! The poll leg being TLS-strict means an offline plain-`TcpListener` can no longer
+//! stand in for a *successful* poll exchange the way it used to — the same reason
+//! `result.sample` (`cas::fetch_artifact_bytes`) never could. An offline test that
+//! could reach a plaintext `polling_url` would be testing a kaibo that does not
+//! exist, so this file proves the refusal instead: a plaintext `polling_url` is
+//! refused with the poll listener seeing zero connections, and an `https://`
+//! `polling_url` at a plain listener is dialled (proving the verbatim address) and
+//! then fails its TLS handshake, since a bare `TcpListener` speaks no TLS. Every
+//! poll outcome *other* than "refused before/at the wire" — `Pending`, `Ready`,
+//! `Task not found`, and the rest — is covered by `src/bfl.rs`'s unit tests over
+//! `parse_poll_response` and, for the inline-poll-then-defer decision specifically,
+//! `inline_step`; a live exchange is `tests/bfl_live.rs`'s job.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kaibo::bfl::{BflClient, BflImageModel};
-use kaibo::media::{MediaModel, MediaOutcome, MediaRequest};
+use kaibo::media::{MediaModel, MediaRequest};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -111,25 +122,79 @@ fn request(prompt: &str) -> MediaRequest {
     }
 }
 
-/// The create call dials `{base}{op.path}` with `x-key`, and the poll call dials the
-/// create response's `polling_url` **verbatim** — a different host entirely, which
-/// only a literal (not reconstructed) URL can reach. The poll server answers `Ready`
-/// with a plaintext `sample` link, which the fetch guard then refuses — proving the
-/// whole create → poll → fetch chain ran, with TLS enforcement never bypassed offline.
+/// **The security-relevant case.** A plaintext `polling_url` — a provider-chosen
+/// address that would carry the `x-key` credential — is refused with the poll
+/// listener seeing ZERO connections: proof the refusal happens client-side, before
+/// any byte of the poll request leaves, not merely that the eventual round trip goes
+/// badly. Asserting on the returned error text alone would not rule out kaibo having
+/// dialled the listener first; checking the listener's own accept count is what
+/// does. The create server DOES see its POST, proving the chain reached the poll
+/// step rather than failing earlier for an unrelated reason — a check that examines
+/// nothing is the failure this test is written to avoid.
 #[tokio::test]
-async fn poll_dials_the_polling_url_verbatim_not_the_create_bases_host() {
-    let (poll_base, poll_captured) = one_shot_server(
+async fn a_plaintext_polling_url_is_refused_with_the_poll_listener_seeing_no_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let poll_addr = listener.local_addr().unwrap();
+
+    let polling_url = format!("http://{poll_addr}/v1/get_result?id=t-1");
+    let (create_base, create_captured) = one_shot_server(
         200,
-        serde_json::json!({
-            "id": "t-99",
-            "status": "Ready",
-            "result": {"sample": "http://artifact.test/0.png"},
-        })
-        .to_string(),
+        serde_json::json!({"id": "t-1", "polling_url": polling_url}).to_string(),
     )
     .await;
-    let polling_url = format!("{poll_base}/v1/get_result?id=t-99");
 
+    let client = BflClient::new("k", create_base, Duration::from_secs(2)).unwrap();
+    let model = BflImageModel::from_parts(&client, "flux-dev");
+    let err = model
+        .generate(&request("a red cube"))
+        .await
+        .expect_err("a plaintext polling_url must be refused");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("https"), "names the requirement: {msg}");
+    assert!(msg.contains(&polling_url), "names the offending URL: {msg}");
+
+    // The listener must see zero connections — refused client-side, before any byte
+    // of the request left, not discovered only after a real round trip failed.
+    let accept_attempt = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+    assert!(
+        accept_attempt.is_err(),
+        "the poll listener must see zero connections — refused client-side"
+    );
+
+    // The chain reached the poll step: the create call happened and was answered,
+    // so the refusal above is the poll leg's, not an earlier unrelated failure.
+    let create = create_captured
+        .await
+        .expect("create server saw one request");
+    assert_eq!(create.request_line(), "POST /v1/flux-dev HTTP/1.1");
+}
+
+/// The poll call dials the create response's `polling_url` **verbatim** — a
+/// different host/port entirely than the create call's own base, which only a
+/// literal (not reconstructed) address can reach. Proven by handing back an
+/// `https://` URL at a bare `TcpListener`: the poll client dials it — the listener
+/// observes a real TCP connection, which is only possible if the exact address was
+/// used — and then fails its TLS handshake, since a bare listener speaks no TLS.
+/// That failure is the expected shape here, not a test bug: this file cannot stand
+/// up a real TLS endpoint, so proving the *dial* is the offline ceiling; a full
+/// exchange is `tests/bfl_live.rs`'s job. The `x-key`-on-poll header assertion this
+/// test used to make when the poll leg ran over plain HTTP is no longer observable
+/// this way — TLS never completes, so no HTTP request is ever readable on the wire
+/// — and now belongs to the live probe instead (an unauthenticated poll answers 401
+/// there).
+#[tokio::test]
+async fn poll_dials_the_polling_url_verbatim_not_the_create_bases_host() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let poll_addr = listener.local_addr().unwrap();
+    let connected = Arc::new(AtomicBool::new(false));
+    let connected_flag = connected.clone();
+    tokio::spawn(async move {
+        if listener.accept().await.is_ok() {
+            connected_flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let polling_url = format!("https://{poll_addr}/v1/get_result?id=t-99");
     let (create_base, create_captured) = one_shot_server(
         200,
         serde_json::json!({
@@ -143,14 +208,17 @@ async fn poll_dials_the_polling_url_verbatim_not_the_create_bases_host() {
 
     let client = BflClient::new("test-key-1", create_base, Duration::from_secs(5)).unwrap();
     let model = BflImageModel::from_parts(&client, "flux-2-pro");
-    let err = model
+    model
         .generate(&request("a red cube on a white table"))
         .await
-        .expect_err("the sample link is plaintext, so the fetch guard refuses it");
-    let msg = format!("{err:#}");
+        .expect_err("a bare TCP listener speaks no TLS, so the handshake must fail");
+
+    // The connection attempt itself is the proof the poll dialled the exact
+    // polling_url handed back by create, rather than reconstructing something
+    // pointed at create_base — the accept only fires if the address was verbatim.
     assert!(
-        msg.contains("https") && msg.contains("http://artifact.test/0.png"),
-        "the refusal names the requirement and the offending URL, got: {msg}"
+        connected.load(Ordering::SeqCst),
+        "the poll listener must see a real connection attempt, proving the verbatim dial"
     );
 
     let create = create_captured
@@ -163,19 +231,6 @@ async fn poll_dials_the_polling_url_verbatim_not_the_create_bases_host() {
     );
     assert_eq!(create.header("x-key").as_deref(), Some("test-key-1"));
     assert_eq!(create.body["prompt"], "a red cube on a white table");
-
-    let poll = poll_captured.await.expect("poll server saw one request");
-    assert!(
-        poll.request_line()
-            .starts_with("GET /v1/get_result?id=t-99 "),
-        "the poll dialled the create response's polling_url verbatim, got: {}",
-        poll.request_line()
-    );
-    assert_eq!(
-        poll.header("x-key").as_deref(),
-        Some("test-key-1"),
-        "the poll call authenticates too"
-    );
 }
 
 /// A 422 validation error on the create call renders readably, and no poll is ever
@@ -201,59 +256,4 @@ async fn a_422_on_create_renders_the_validation_detail_and_never_polls() {
     assert!(msg.contains("422"), "{msg}");
     assert!(msg.contains("body.width"), "{msg}");
     assert!(msg.contains("multiple of 32"), "{msg}");
-}
-
-/// `Task not found` on the poll surfaces its own clear error, distinct from a
-/// generic provider error, over the real wire — not just the pure-function tests.
-#[tokio::test]
-async fn task_not_found_on_poll_is_reported_over_the_wire() {
-    let (poll_base, _poll_captured) = one_shot_server(
-        200,
-        serde_json::json!({"id": "t-1", "status": "Task not found"}).to_string(),
-    )
-    .await;
-    let polling_url = format!("{poll_base}/v1/get_result?id=t-1");
-    let (create_base, _create_captured) = one_shot_server(
-        200,
-        serde_json::json!({"id": "t-1", "polling_url": polling_url}).to_string(),
-    )
-    .await;
-    let client = BflClient::new("k", create_base, Duration::from_secs(5)).unwrap();
-    let model = BflImageModel::from_parts(&client, "flux-dev");
-    let err = model
-        .generate(&request("a red cube"))
-        .await
-        .expect_err("an expired task id must surface");
-    assert!(format!("{err:#}").contains("Generate again"));
-}
-
-/// When the provider is still working past the inline-poll budget, `generate`
-/// returns `Deferred` carrying the same `polling_url` the create call handed
-/// back — the fallback shape the background job lane (or the CLI's own wait loop)
-/// continues from via a single `poll` GET. The budget is forced to zero so this
-/// resolves after exactly one poll, not real wall-clock time.
-#[tokio::test]
-async fn a_still_pending_generation_defers_with_the_same_polling_url() {
-    let (poll_base, _poll_captured) = one_shot_server(
-        200,
-        serde_json::json!({"id": "t-7", "status": "Pending"}).to_string(),
-    )
-    .await;
-    let polling_url = format!("{poll_base}/v1/get_result?id=t-7");
-    let (create_base, _create_captured) = one_shot_server(
-        200,
-        serde_json::json!({"id": "t-7", "polling_url": polling_url}).to_string(),
-    )
-    .await;
-    let client = BflClient::new("k", create_base, Duration::from_secs(5)).unwrap();
-    let model = BflImageModel::from_parts(&client, "flux-dev")
-        .with_inline_poll_timing(Duration::ZERO, Duration::from_millis(1));
-    let outcome = model
-        .generate(&request("a red cube"))
-        .await
-        .expect("a pending generation is not an error");
-    let MediaOutcome::Deferred(job) = outcome else {
-        panic!("expected Deferred, got {outcome:?}");
-    };
-    assert_eq!(job.0, polling_url, "the same polling_url rides the job id");
 }

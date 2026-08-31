@@ -25,6 +25,19 @@ media lane. The motivating use is concept images.
   returned `polling_url` verbatim (regional host — never reconstruct it from
   the base URL) until `ResultResponse.status` leaves
   `Pending`/`Reasoning`/`Generating`.
+- **The poll leg is https-only with no redirects.** `polling_url` is an
+  address BFL chose, not the operator's own `base_url`, and the poll request
+  carries the `x-key` credential — the same trust shape
+  `crate::cas::fetch_artifact_bytes` already takes for `result.sample`, and
+  worse, since the key rides along. A plain `http://` `polling_url` is
+  refused before a single byte of the request leaves (no connection is
+  attempted at all — `crate::tls::artifact_fetch_client`'s `https_only(true)`),
+  and a redirecting `polling_url` is refused rather than followed
+  (`Policy::none()`) — reqwest strips the standard `Authorization` header on a
+  cross-host redirect but not a custom header like `x-key`, so following one
+  would carry the key to whatever host it names. The create call itself keeps
+  the general client: `base_url` is the operator's own configured endpoint,
+  and where that redirects is the operator's business.
 - Terminal statuses: `Ready` (the artifact), `Error`, `Request Moderated`,
   `Content Moderated`, `Task not found` — each of the last four is its own loud
   error naming what the provider said and what the caller can change.
@@ -115,3 +128,11 @@ one does.
   `media.rs`, `discover.rs`, `server/mod.rs`, and the config docs the same way
   #168 wired `gemini-images`. Still no `BFL_API_KEY`; `tests/bfl_live.rs` is
   `#[ignore]`d and ready for one.
+- 2026-08-31 — review finding fixed: the poll leg shared `create`'s general
+  client, so a plaintext or redirecting `polling_url` (provider-chosen,
+  carrying the `x-key` credential) would have dialled or followed it. `poll_once`
+  now runs over `crate::tls::artifact_fetch_client` (https-only, no redirects) —
+  the same posture the `result.sample` fetch already had, extended to
+  `polling_url`. Failing-first: a new transport test proved today's code makes a
+  real connection to a plaintext `polling_url`; it passes now that the poll
+  client refuses one before dialling.

@@ -11,6 +11,27 @@
 //! dialled **verbatim**, never rebuilt from `base_url` — until its status leaves
 //! `Pending`/`Reasoning`/`Generating`.
 //!
+//! # Polling is TLS-strict, and carries the credential
+//!
+//! `polling_url` is an address BFL chose, not one the operator configured — the same
+//! trust shape [`crate::cas::fetch_artifact_bytes`] already takes for `result.sample`
+//! (see [`crate::tls::artifact_fetch_client`]'s doc: "every property kaibo checked
+//! before dialling is a promise only the first hop keeps"). It is worse here, because
+//! the poll request also carries the `x-key` credential: a plain `http://`
+//! `polling_url` would send that key in the clear, and reqwest strips the standard
+//! `Authorization` header on a cross-host redirect but **not** a custom header like
+//! `x-key` — so a redirecting `polling_url` would carry the key onward to whatever
+//! host the redirect names. [`BflClient`] therefore polls through
+//! [`crate::tls::artifact_fetch_client`] rather than the general client `create` uses:
+//! `https_only(true)` refuses a plain-`http` `polling_url` before a single byte of the
+//! request leaves (no connection is even attempted), and `Policy::none()` means a
+//! redirect is never followed — it surfaces as its own refusal
+//! ([`BflError::UnsafePollingUrl`]) instead of the key riding onward. `create` keeps
+//! the general client: `base_url` is the operator's own configured endpoint, and
+//! where the operator's endpoint redirects is the operator's business — exactly the
+//! split [`crate::tls::artifact_fetch_client`]'s own doc draws between "an operator's
+//! configured `base_url`" and "an address that arrives inside a provider's response".
+//!
 //! # The shape: inline-poll-then-defer, not strictly one or the other
 //!
 //! `docs/bfl.md` offers two shapes and asks which one lands: poll inline within the
@@ -207,6 +228,19 @@ pub enum BflError {
     /// A 2xx poll response that is not `{id, status, ...}`.
     #[error("BFL's poll response didn't parse as {{id, status, ...}}: {0}")]
     InvalidPollBody(String),
+
+    /// `polling_url` — a provider-chosen address carrying the `x-key` credential on
+    /// every poll — is not a plain `https` address, or its response redirected.
+    /// Refused rather than dialled: see the module doc's "Polling is TLS-strict"
+    /// section. This names BFL's own response, not a mistake in the caller's request.
+    #[error(
+        "BFL's poll response named an address kaibo will not dial: {polling_url:?} \
+         ({reason}). kaibo's API key rides this request, so it only follows a plain \
+         https link with no redirect — an unverified hop would carry the key onward. \
+         This is BFL's own response, not a mistake in your request; retry the \
+         generation"
+    )]
+    UnsafePollingUrl { polling_url: String, reason: String },
 
     /// The caller named an `op` (or the slot's model id resolved to one) that this
     /// facade does not wire. Refused rather than run as a guessed default: an
@@ -520,11 +554,18 @@ fn artifact_mime(content_type: Option<&str>, bytes: &[u8]) -> Result<String, Bfl
 
 // --- The HTTP client -------------------------------------------------------------
 
-/// A configured BFL connection: credential, base URL, and the one HTTPS client built
-/// through kaibo's TLS seam.
+/// A configured BFL connection: credential, base URL, and two HTTPS clients built
+/// through kaibo's TLS seam — one per trust shape. See the module doc's "Polling is
+/// TLS-strict" section for why the poll leg does not share `create`'s client.
 #[derive(Clone)]
 pub struct BflClient {
     http: reqwest::Client,
+    /// The poll leg's own client — [`crate::tls::artifact_fetch_client`], the same
+    /// posture [`crate::cas::fetch_artifact_bytes`] takes for `result.sample`:
+    /// `polling_url` is a provider-chosen address carrying the `x-key` credential,
+    /// so it gets `https_only(true)` and no redirects rather than `create`'s general
+    /// client.
+    poll_http: reqwest::Client,
     api_key: String,
     base_url: String,
     request_timeout: Duration,
@@ -547,6 +588,7 @@ impl BflClient {
     ) -> AnyResult<Self> {
         Ok(Self {
             http: crate::tls::https_client(request_timeout)?,
+            poll_http: crate::tls::artifact_fetch_client(request_timeout)?,
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             request_timeout,
@@ -572,17 +614,37 @@ impl BflClient {
         parse_create_response(status, &bytes)
     }
 
-    /// `GET polling_url` **verbatim** — never rebuilt from `base_url`. See the module
-    /// doc: `polling_url` is a regional host BFL names in the create response.
+    /// `GET polling_url` **verbatim** — never rebuilt from `base_url` — over the
+    /// TLS-strict poll client. See the module doc's "Polling is TLS-strict" section:
+    /// `polling_url` is a provider-chosen address that carries the `x-key`
+    /// credential, so it is checked before dialling (a plain `http` address is
+    /// refused with zero connection attempts) and again after the first hop answers
+    /// (a redirect is refused rather than followed, since `Policy::none()` hands
+    /// back the 3xx response itself rather than an error).
     async fn poll_once(&self, polling_url: &str) -> Result<PollDecision, BflError> {
+        if !polling_url.starts_with("https://") {
+            return Err(BflError::UnsafePollingUrl {
+                polling_url: polling_url.to_string(),
+                reason: "not an https address".to_string(),
+            });
+        }
         let resp = self
-            .http
+            .poll_http
             .get(polling_url)
             .header("x-key", &self.api_key)
             .send()
             .await
             .map_err(|e| BflError::Transport(e.to_string()))?;
-        let status = resp.status().as_u16();
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(BflError::UnsafePollingUrl {
+                polling_url: polling_url.to_string(),
+                reason: format!(
+                    "the response redirected ({status}), and a redirect is never followed"
+                ),
+            });
+        }
+        let status = status.as_u16();
         let bytes = resp
             .bytes()
             .await
@@ -640,6 +702,33 @@ impl BflImageModel {
     }
 }
 
+/// What the inline poll loop in [`BflImageModel::generate`] does with one poll
+/// outcome, given whether the in-call budget is already spent. Pure and unit-tested
+/// directly, extracted for exactly one reason: once the poll leg is TLS-strict (see
+/// [`BflClient::poll_once`]), an offline transport test can no longer drive the loop
+/// over a live "still pending" poll target, so the budget-exhausted branch needs a
+/// seam that does not require a socket at all.
+#[derive(Debug, Clone, PartialEq)]
+enum InlineStep {
+    /// Keep polling: sleep [`INLINE_POLL_INTERVAL`], then poll again.
+    KeepPolling,
+    /// The provider is done; fetch this URL and resolve.
+    Ready { sample_url: String },
+    /// Still `Pending` past the budget: hand back a job carrying the exact
+    /// `polling_url` that was being polled — see the module doc's "shape" section.
+    Defer(MediaJobId),
+}
+
+fn inline_step(decision: PollDecision, budget_spent: bool, polling_url: &str) -> InlineStep {
+    match decision {
+        PollDecision::Ready { sample_url } => InlineStep::Ready { sample_url },
+        PollDecision::Pending if budget_spent => {
+            InlineStep::Defer(MediaJobId(polling_url.to_string()))
+        }
+        PollDecision::Pending => InlineStep::KeepPolling,
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::media::MediaModel for BflImageModel {
     /// Every op in [`BFL_OPS`] takes `input_image`..`input_image_8` — an edit is an
@@ -663,23 +752,24 @@ impl crate::media::MediaModel for BflImageModel {
         let note = cost_note(&created);
         let started = tokio::time::Instant::now();
         loop {
-            match self.client.poll_once(&created.polling_url).await? {
-                PollDecision::Ready { sample_url } => {
+            let decision = self.client.poll_once(&created.polling_url).await?;
+            let budget_spent = started.elapsed() >= self.inline_poll_budget;
+            match inline_step(decision, budget_spent, &created.polling_url) {
+                InlineStep::Ready { sample_url } => {
                     let artifact = self.client.fetch_artifact(&sample_url).await?;
                     return Ok(MediaOutcome::Complete {
                         artifacts: vec![artifact],
                         note,
                     });
                 }
-                PollDecision::Pending => {
-                    if started.elapsed() >= self.inline_poll_budget {
-                        // Still working after the in-call budget: hand back the same
-                        // polling_url as a job the caller's own cadence (the
-                        // background job lane, or the CLI's wait loop) continues
-                        // from `poll` — a single GET, no sleep, same as every other
-                        // deferred kind.
-                        return Ok(MediaOutcome::Deferred(MediaJobId(created.polling_url)));
-                    }
+                InlineStep::Defer(job) => {
+                    // Still working after the in-call budget: hand back the same
+                    // polling_url as a job the caller's own cadence (the background
+                    // job lane, or the CLI's wait loop) continues from `poll` — a
+                    // single GET, no sleep, same as every other deferred kind.
+                    return Ok(MediaOutcome::Deferred(job));
+                }
+                InlineStep::KeepPolling => {
                     tokio::time::sleep(self.inline_poll_interval).await;
                 }
             }
@@ -1027,6 +1117,98 @@ mod tests {
     fn a_non_2xx_poll_is_a_provider_error() {
         let err = parse_poll_response(404, b"{}").expect_err("404");
         assert!(matches!(err, BflError::Provider { status: 404, .. }));
+    }
+
+    // --- polling_url safety ----------------------------------------------------------
+
+    /// The scheme check fires with no client and no network at all: a plaintext
+    /// `polling_url` is refused before `BflClient` ever touches the socket. See the
+    /// module doc's "Polling is TLS-strict" section — the real-socket proof that
+    /// zero connections happen lives in `tests/bfl_transport.rs`.
+    #[tokio::test]
+    async fn poll_once_refuses_a_plaintext_polling_url_without_dialing() {
+        let client = BflClient::new("k", "https://example.test", Duration::from_secs(5)).unwrap();
+        let err = client
+            .poll_once("http://127.0.0.1:1/get_result?id=t-1")
+            .await
+            .expect_err("plaintext must be refused");
+        match err {
+            BflError::UnsafePollingUrl {
+                polling_url,
+                reason,
+            } => {
+                assert_eq!(polling_url, "http://127.0.0.1:1/get_result?id=t-1");
+                assert!(reason.contains("https"), "{reason}");
+            }
+            other => panic!("expected UnsafePollingUrl, got {other:?}"),
+        }
+    }
+
+    /// The refusal names what was refused, why (the credential rides this request),
+    /// and that it is BFL's own response rather than a mistake in the caller's
+    /// request — the house rule for a refusal string.
+    #[test]
+    fn unsafe_polling_url_names_what_why_and_whose_mistake_it_is_not() {
+        let err = BflError::UnsafePollingUrl {
+            polling_url: "http://evil.example/x".to_string(),
+            reason: "not an https address".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http://evil.example/x"),
+            "names the url: {msg}"
+        );
+        assert!(
+            msg.contains("API key rides this request"),
+            "names why: {msg}"
+        );
+        assert!(
+            msg.contains("not a mistake in your request"),
+            "says whose fault it is: {msg}"
+        );
+    }
+
+    // --- inline poll decision ----------------------------------------------------------
+
+    /// A `Ready` decision resolves regardless of the budget — the artifact is in
+    /// hand, so there is nothing left to defer.
+    #[test]
+    fn ready_resolves_even_with_the_budget_already_spent() {
+        let step = inline_step(
+            PollDecision::Ready {
+                sample_url: "https://delivery.bfl.ai/0.png".to_string(),
+            },
+            true,
+            "https://api.us1.bfl.ai/v1/get_result?id=t-1",
+        );
+        assert_eq!(
+            step,
+            InlineStep::Ready {
+                sample_url: "https://delivery.bfl.ai/0.png".to_string()
+            }
+        );
+    }
+
+    /// Still pending and the budget isn't spent yet: keep polling.
+    #[test]
+    fn pending_before_the_budget_keeps_polling() {
+        let step = inline_step(
+            PollDecision::Pending,
+            false,
+            "https://api.us1.bfl.ai/v1/get_result?id=t-1",
+        );
+        assert_eq!(step, InlineStep::KeepPolling);
+    }
+
+    /// **The decision this extraction exists for.** Still pending once the in-call
+    /// budget is spent: defer, and the job carries the *exact* `polling_url` that
+    /// was being polled — the caller's own cadence (the background job lane, or the
+    /// CLI's wait loop) has to reach the same address, not one reconstructed later.
+    #[test]
+    fn pending_past_the_budget_defers_with_the_identical_polling_url() {
+        let polling_url = "https://api.us1.bfl.ai/v1/get_result?id=t-1";
+        let step = inline_step(PollDecision::Pending, true, polling_url);
+        assert_eq!(step, InlineStep::Defer(MediaJobId(polling_url.to_string())));
     }
 
     // --- mime sniffing --------------------------------------------------------------
