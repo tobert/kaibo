@@ -167,6 +167,11 @@ pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Resul
                  catalog on an OpenAI-compatible endpoint, so point a `kind = \"openai\"` \
                  backend at that base URL to list them"
             }
+            crate::credentials::ProviderClass::Media(crate::credentials::MediaKind::Bfl) => {
+                "the documented FLUX operations: flux-dev, flux-2-pro, flux-2-flex, \
+                 flux-pro-1.1-ultra, or flux-kontext-pro — the cast's image-slot model id \
+                 names one directly"
+            }
             // The `else` above already proved this kind has no completion wire.
             crate::credentials::ProviderClass::Wire(_) => unreachable!("wire() was None"),
         };

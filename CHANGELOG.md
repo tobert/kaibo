@@ -17,6 +17,9 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
+- **A `bfl` backend kind** — Black Forest Labs' FLUX image family through `generate`,
+  five named operations, polled in-call for a fast generation and as a `job-N` handle
+  only past that budget.
 - **A `gemini-images` backend kind** — Gemini image generation through `generate`, the
   same face as every other image backend. Takes input images; has no named operations.
 - **`generate` shows what the model said** above the digests, for a backend whose image
