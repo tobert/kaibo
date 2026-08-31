@@ -31,6 +31,7 @@ pub mod credentials;
 pub mod dashscope;
 pub mod discover;
 pub mod explorer;
+pub mod gemini_images;
 pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;

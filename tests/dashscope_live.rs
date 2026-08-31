@@ -60,7 +60,7 @@ async fn wan_t2i_returns_real_image_bytes_through_a_fetched_link() {
         op: None,
     };
     let outcome = model.generate(&request).await.expect("live generation");
-    let MediaOutcome::Complete(artifacts) = outcome else {
+    let MediaOutcome::Complete { artifacts, .. } = outcome else {
         panic!("this route is synchronous, so the outcome is always Complete");
     };
 

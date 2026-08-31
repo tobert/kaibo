@@ -15,9 +15,11 @@
 //! a mime string, and a seed) — providers translate their native shapes at their own
 //! impl, exactly as rig providers translate into rig's completion types. Three live
 //! implementations today: Stability's (`src/stability.rs`, multipart form wire, sync
-//! and deferred shapes, and the only one with an operation vocabulary), OpenAI Images
-//! (`src/openai_images.rs`, JSON body wire, sync only), and DashScope
-//! (`src/dashscope.rs`).
+//! and deferred shapes), OpenAI Images (`src/openai_images.rs`, JSON body for
+//! `generations` and multipart for the two routes that carry files), DashScope
+//! (`src/dashscope.rs`), and Gemini (`src/gemini_images.rs`) — the odd one, whose wire
+//! is a *completion* endpoint rather than an images API, and the only one that answers
+//! with words as well as bytes.
 //!
 //! # The construction point
 //!
@@ -304,8 +306,33 @@ pub struct MediaJobId(pub String);
 /// blesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaOutcome {
-    Complete(Vec<MediaArtifact>),
+    Complete {
+        artifacts: Vec<MediaArtifact>,
+        /// What the model said alongside the artifacts, when it says anything.
+        ///
+        /// Empty for an images API: Stability, the Images API and DashScope answer with
+        /// bytes and nothing else. It exists for the providers whose image generation is
+        /// a *completion* call — Gemini's `generateContent` returns text parts and image
+        /// parts interleaved in one response, and a model that says "I moved the sign
+        /// left instead, the original crop cut it off" has told the caller something the
+        /// bytes do not.
+        ///
+        /// Carried rather than dropped because dropping it is a silent loss of the only
+        /// explanation of what happened. The same channel is what a speech model's
+        /// transcript will ride when that wave lands.
+        note: Option<String>,
+    },
     Deferred(MediaJobId),
+}
+
+impl MediaOutcome {
+    /// A completed outcome with no commentary — what every images API returns.
+    pub fn complete(artifacts: Vec<MediaArtifact>) -> Self {
+        MediaOutcome::Complete {
+            artifacts,
+            note: None,
+        }
+    }
 }
 
 /// One poll's outcome: still running, or done. A poll is never itself deferred
@@ -404,6 +431,20 @@ impl MediaArm {
                 let model = crate::stability::StabilityImageModel::from_parts(&client, &slot.id);
                 Ok(Self::new(Arc::new(model), slot.qualified()))
             }
+            ProviderClass::Media(MediaKind::GeminiImages) => {
+                let key = backend.resolve_key()?;
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::gemini_images::DEFAULT_BASE_URL.to_string());
+                let client = crate::gemini_images::GeminiImagesClient::new(
+                    &key,
+                    &base_url,
+                    backend.request_timeout,
+                )?;
+                let model = crate::gemini_images::GeminiImagesModel::from_parts(&client, &slot.id);
+                Ok(Self::new(Arc::new(model), slot.qualified()))
+            }
             ProviderClass::Media(MediaKind::OpenAiImages) => {
                 // Key sources are shared with the `openai` completion kind, but the
                 // key is required by default (the default endpoint is hosted OpenAI
@@ -460,13 +501,30 @@ impl MediaArm {
     /// binary-input guard belongs: one check the arm fastens, rather than a convention
     /// each provider impl has to remember. See [`MediaModel::accepts_inputs`].
     pub async fn generate(&self, request: &MediaRequest) -> Result<MediaOutcome> {
+        self.refuse_unsupported(request)?;
+        self.model.generate(request).await
+    }
+
+    /// Whether this arm's provider can serve everything the request asks for.
+    ///
+    /// One implementation, two callers, so they cannot drift. The handler calls it
+    /// *before* dispatching so a caller mistake is reported as a bad parameter — which
+    /// is what it is, and what tells the caller to drop `op` rather than file a bug.
+    /// [`MediaArm::generate`] calls it again as the structural backstop: it is the single
+    /// dispatch point every media call passes through, so a provider added later that
+    /// never considers `op` or `inputs` still fails closed.
+    ///
+    /// Found by running it: the refusal fired correctly on a live Gemini call and was
+    /// then wrapped in "this is a kaibo-side error — please report it", which would send
+    /// a caller to the issue tracker over a parameter they could simply drop.
+    pub fn refuse_unsupported(&self, request: &MediaRequest) -> Result<()> {
         if !self.model.accepts_inputs() {
             refuse_binary_inputs(request, &self.slot_ref)?;
         }
         if !self.model.accepts_ops() {
             refuse_operation(request, &self.slot_ref)?;
         }
-        self.model.generate(request).await
+        Ok(())
     }
 
     /// Collect one deferred job's result.
@@ -635,6 +693,25 @@ mod tests {
         let slot = ModelSlot::bare("wan", "wan2.6-t2i");
         let arm = MediaArm::from_slot(backend, &slot).expect("a dashscope backend staffs");
         assert_eq!(arm.slot_ref(), "wan/wan2.6-t2i");
+    }
+
+    /// The Gemini arm staffs an image slot — the construction half of the media kind
+    /// whose wire is a completion endpoint.
+    #[test]
+    fn from_slot_staffs_a_gemini_images_backend() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.gimg]
+            kind = "gemini-images"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/gemini"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("gimg").expect("backend exists");
+        let slot = ModelSlot::bare("gimg", "gemini-3-flash-image");
+        let arm = MediaArm::from_slot(backend, &slot).expect("a gemini-images backend staffs");
+        assert_eq!(arm.slot_ref(), "gimg/gemini-3-flash-image");
     }
 
     /// The Stability arm still staffs — the sibling-kind regression guard for the

@@ -395,7 +395,7 @@ scratch_limit_bytes = 67108864
 # ---------------------------------------------------------------------------
 # [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
 # completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
-# reasoning slots; the media kinds (stability | openai-images | dashscope) serve `image` slots
+# reasoning slots; the media kinds (stability | openai-images | gemini-images | dashscope) serve `image` slots
 # only. The rest describes the wire (endpoint, key source, per-request deadline).
 # Models live on cast slots, never here.
 #
@@ -405,7 +405,8 @@ scratch_limit_bytes = 67108864
 # (required for a new backend), the anthropic and gemini kinds (optional —
 # unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
 # and the media kinds (optional — unset dials api.stability.ai for stability,
-# api.openai.com/v1 for openai-images, dashscope-intl.aliyuncs.com for dashscope);
+# api.openai.com/v1 for openai-images, generativelanguage.googleapis.com for
+# gemini-images, dashscope-intl.aliyuncs.com for dashscope);
 # set it to point the same wire at a
 # compatible gateway/proxy (or a local server) instead — a ROOT in every case,
 # since the client appends its own path. Every other keyed kind rejects
@@ -521,7 +522,7 @@ wire = "responses"
 # `deep-dive`) so it can route by name without reading this file.
 #
 # Roles: explorer, synth (the reasoning phases), and image (the media member — it
-# points at a media backend, kind stability, openai-images, or dashscope, and staffs `generate`;
+# points at a media backend, kind stability, openai-images, gemini-images, or dashscope, and staffs `generate`;
 # see the image-slot examples below). A typo'd role is a loud load
 # error. A cast may omit roles — the tool that needs a missing role fails at call time,
 # naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
@@ -574,7 +575,7 @@ explorer = "llama/qwen2.5-coder-7b"                              # bare ref: jus
 synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # --- The `image` slot: a MEDIA member on the team. It points at a media backend
-#     (kind = "stability", "openai-images", or "dashscope") and produces artifacts instead of
+#     (kind = "stability", "openai-images", "gemini-images", or "dashscope") and produces artifacts instead of
 #     text, so the reasoning tunables (effort, thinking_budget, temperature, ...)
 #     do not apply to it — writing one there is inert and kaibo://config flags it.
 #     A cast carries it beside its reasoning slots; a cast without one cannot staff
@@ -612,6 +613,19 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 # [casts.local-artist]
 # image = "sdcpp/sd3.5-large"             # whatever the local server loaded
+
+# --- The gemini-images kind is the odd one: Gemini has no images endpoint. Image
+# generation is models/{model}:generateContent — the same call as text — with
+# responseModalities naming what comes back. It is a separate kind from `gemini` so a
+# cast slot knows which use it points at; a reasoning slot aimed here would resolve a
+# completion model that answers in pictures. Same key as `gemini`.
+# [backends.gemini-images]
+# kind = "gemini-images"          # key: GEMINI_API_KEY / ~/.gemini-api-key
+# # base_url defaults to https://generativelanguage.googleapis.com
+#
+# It takes input images (an edit is an instruction plus the picture it refers to) and
+# has no named operations, so `generate`'s `op` parameter is refused on it. It answers
+# with words as well as bytes; kaibo shows what the model said above the digests.
 
 # --- The dashscope kind reaches Alibaba's wan image family. base_url is optional
 #     (unset dials dashscope-intl.aliyuncs.com); a dedicated-endpoint subscription

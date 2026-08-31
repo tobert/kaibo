@@ -955,7 +955,8 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         &["generate"],
         Config::cast_can_generate,
         "a cast with an `image` slot pointing at a media backend (kind `stability`, \
-         `openai-images`, or `dashscope`) — see the image-slot examples in \
+         `openai-images`, `gemini-images`, or `dashscope`) — see the image-slot \
+         examples in \
          docs/config.example.toml",
     ),
 ];
@@ -3090,8 +3091,8 @@ impl KaiboHandler {
     #[tool(
         description = "Generate images from a text prompt with the cast's `image` \
             model (a media backend: Stability, an OpenAI-compatible images endpoint — \
-            hosted gpt-image or a local stable-diffusion.cpp sd-server — or DashScope's \
-            wan family). \
+            hosted gpt-image or a local stable-diffusion.cpp sd-server — Gemini, or \
+            DashScope's wan family). \
             Bytes are never inlined: each artifact lands in kaibo's content-addressed \
             media store and the result lists per-artifact digests — a \
             kaibo://cas/<digest> address, the mime, the provider's seed when reported, \
@@ -3105,7 +3106,7 @@ impl KaiboHandler {
             `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
             image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
             an image already in the store is reused by address and never re-sent. \
-            Stability accepts input images; the other media backends do not and say so. \
+            Stability and Gemini accept input images; the others do not and say so. \
             `op` picks an operation when the backend has more than one — Stability's \
             edit, control and upscale routes, each with its required `inputs` keys and \
             its credit cost listed on the parameter, so you can see the price before you \
@@ -3201,9 +3202,15 @@ impl KaiboHandler {
             inputs,
             op: input.op.clone(),
         };
+        // Asked before dispatch so an operation or an input this backend has no route
+        // for is reported as the bad parameter it is, rather than as a failed call the
+        // caller is told to report. `MediaArm::generate` asks again as the structural
+        // backstop — see `MediaArm::refuse_unsupported`.
+        arm.refuse_unsupported(&request)
+            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
         let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
         match arm.generate(&request).instrument(span).await {
-            Ok(crate::media::MediaOutcome::Complete(artifacts)) => {
+            Ok(crate::media::MediaOutcome::Complete { artifacts, note }) => {
                 let rendered = match store_generated_artifacts(
                     &store,
                     &artifacts,
@@ -3213,6 +3220,15 @@ impl KaiboHandler {
                 ) {
                     Ok(text) => text,
                     Err(e) => return Ok(consultation_failed("generate", &cast.name, e)),
+                };
+                // A provider whose image generation is a completion call answers with
+                // words as well as bytes, and those words are often the only account of
+                // what it actually did. Shown above the digests rather than dropped.
+                let rendered = match note {
+                    Some(note) if !note.trim().is_empty() => {
+                        format!("{}\n\n{rendered}", note.trim())
+                    }
+                    _ => rendered,
                 };
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     with_provenance(
@@ -5631,7 +5647,7 @@ mod tests {
             &self,
             _request: &crate::media::MediaRequest,
         ) -> anyhow::Result<crate::media::MediaOutcome> {
-            Ok(crate::media::MediaOutcome::Complete(self.0.clone()))
+            Ok(crate::media::MediaOutcome::complete(self.0.clone()))
         }
 
         async fn poll(
@@ -6600,7 +6616,7 @@ enabled = false
             request: &crate::media::MediaRequest,
         ) -> anyhow::Result<crate::media::MediaOutcome> {
             *self.0.lock().unwrap() = Some(request.clone());
-            Ok(crate::media::MediaOutcome::Complete(vec![png(b"result")]))
+            Ok(crate::media::MediaOutcome::complete(vec![png(b"result")]))
         }
 
         async fn poll(
@@ -6664,6 +6680,51 @@ enabled = false
             "named from the store's record, not the caller's belief"
         );
         assert_eq!(seen.inputs[0].mime, "image/png");
+    }
+
+    /// **An unsupported `op` is a bad parameter, not a kaibo fault.**
+    ///
+    /// The arm's guard was already refusing correctly, but the handler mapped every arm
+    /// error through `consultation_failed`, which tells the caller "this is a kaibo-side
+    /// error — please report it". That framing sends someone to the issue tracker over a
+    /// parameter they could drop. Found by running a real Gemini call, not by reading the
+    /// code.
+    #[tokio::test]
+    async fn generate_reports_an_unsupported_op_as_a_parameter_error() {
+        let provider = Arc::new(RecordingProvider::default());
+        let h = media_handler(provider.clone());
+
+        let err = h
+            .generate(Parameters(GenerateInput {
+                prompt: "anything".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+                inputs: None,
+                // `RecordingProvider` accepts inputs but declares no operations.
+                op: Some("edit/remove-background".to_string()),
+            }))
+            .await
+            .expect_err("a provider with no operations refuses");
+
+        assert!(
+            !err.message.contains("report it"),
+            "a caller mistake must not be dressed as a kaibo bug: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("no named operations"),
+            "and it must say what is wrong: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("drop `op`"),
+            "and what to do instead: {}",
+            err.message
+        );
+        assert!(
+            provider.0.lock().unwrap().is_none(),
+            "nothing reached the provider, so nothing was billed"
+        );
     }
 
     /// A digest the store does not hold refuses at the tool face, before any provider

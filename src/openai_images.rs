@@ -628,7 +628,7 @@ impl crate::media::MediaModel for OpenAiImagesModel {
 
     async fn generate(&self, request: &MediaRequest) -> AnyResult<MediaOutcome> {
         let artifacts = self.client.generate(&self.model, request).await?;
-        Ok(MediaOutcome::Complete(artifacts))
+        Ok(MediaOutcome::complete(artifacts))
     }
 
     /// Unreachable in practice: `generate` above never returns
