@@ -136,3 +136,8 @@ one does.
   `polling_url`. Failing-first: a new transport test proved today's code makes a
   real connection to a plaintext `polling_url`; it passes now that the poll
   client refuses one before dialling.
+- 2026-08-31 — live-validated end to end with a real key: `kaibo generate --cast
+  flux` (op `flux-2-pro`) returned a real artifact into the CAS on the inline
+  path, cost reported as BFL's own 3 credits / 1 output MP, and the TLS-strict
+  poll client worked against the real regional `polling_url`. The `#[ignore]`d
+  live test remains for regression runs.
