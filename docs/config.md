@@ -88,8 +88,11 @@ by re-declaration.
   `https://generativelanguage.googleapis.com`. Gemini has no images endpoint: image
   generation is `models/{model}:generateContent`, the same call as text, with the
   requested modalities naming what comes back — which is why this is a separate kind
-  from `gemini`, so a cast slot knows which use it points at. Same key as `gemini`
-  (`GEMINI_API_KEY` / `~/.gemini-api-key`). It takes input images and has no named
+  from `gemini`, so a cast slot knows which use it points at. Declared-only, like
+  every kind (see Key resolution below): kaibo seeds no source, but shares
+  `gemini`'s conventional names (`GEMINI_API_KEY` / `~/.gemini-api-key`) — declaring
+  the same `api_key_env` on both backends points them at one Google credential
+  instead of minting a second name. It takes input images and has no named
   operations, so `generate`'s `op` is refused on it.
 - **`kind = "openai-images"`** — optional. Unset dials hosted OpenAI
   (`https://api.openai.com/v1`). Set, it points the same wire at any server speaking
@@ -105,10 +108,11 @@ by re-declaration.
 - **`kind = "dashscope"`** — optional. Unset dials DashScope's shared international
   root (`https://dashscope-intl.aliyuncs.com`); a dedicated-endpoint subscription
   sets its own host. Give it a bare host, not a path — the client appends the
-  multimodal-generation route. The key is required, from its own sources
-  (`DASHSCOPE_API_KEY` / `~/.dashscope-key`, not shared with the `openai` kind):
-  every DashScope endpoint is keyed, and one credential name per account beats one
-  per protocol when the same host also serves text. This kind is **media-only** — a
+  multimodal-generation route. The key is required, and — declared-only like every
+  kind (see Key resolution below) — kaibo seeds no source; its own conventional
+  names (`DASHSCOPE_API_KEY` / `~/.dashscope-key`, not shared with the `openai`
+  kind) are one credential name per account, not one per protocol when the same
+  host also serves text. This kind is **media-only** — a
   qwen or deepseek model on a DashScope host belongs on a `kind = "openai"` backend
   pointed at `<host>/compatible-mode/v1`, configured beside this one. DashScope
   returns artifacts as presigned links, so kaibo fetches each over TLS and stores

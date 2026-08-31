@@ -2468,13 +2468,15 @@ fn persistence_cli_wins_over_lower_layers() {
 
 // --- the dashscope kind --------------------------------------------------------
 
-/// The `dashscope` kind parses from TOML and seeds its OWN key sources —
-/// deliberately not shared with the `openai` completion kind, even though the same
-/// DashScope host serves text on an OpenAI-compatible route. An operator running
+/// The `dashscope` kind parses from TOML. Declared-only, like every other kind: the
+/// operator names `api_key_env`/`api_key_file`/`api_key_cmd` themselves — kaibo
+/// seeds nothing, not even DashScope's OWN conventional env var / key file names
+/// (deliberately not shared with the `openai` completion kind, even though the same
+/// DashScope host serves text on an OpenAI-compatible route — an operator running
 /// both wires against one account wants one credential name per account, not one per
-/// protocol. The key is required: this kind has no keyless target.
+/// protocol). The key is required: this kind has no keyless target.
 #[test]
-fn dashscope_backend_parses_and_seeds_its_own_key_sources() {
+fn dashscope_backend_parses_without_seeding_key_sources() {
     let c = Config::from_toml_str(
         r#"
         [backends.wan]
@@ -2484,14 +2486,10 @@ fn dashscope_backend_parses_and_seeds_its_own_key_sources() {
     .expect("the dashscope kind must parse");
     let b = c.backends.get("wan").expect("backend exists");
     assert_eq!(b.kind, kaibo::credentials::ProviderKind::DashScope);
-    assert_eq!(b.api_key_env.as_deref(), Some("DASHSCOPE_API_KEY"));
-    assert!(
-        b.api_key_file
-            .as_deref()
-            .is_some_and(|f| f.ends_with("/.dashscope-key")),
-        "the key file is DashScope's own, not the openai kind's, got: {:?}",
-        b.api_key_file
-    );
+    // Declared-only: a fresh media stanza declares its own source or fails loudly.
+    assert_eq!(b.api_key_env, None);
+    assert_eq!(b.api_key_file, None);
+    assert_eq!(b.api_key_cmd, None);
     assert!(
         !b.key_optional,
         "key_optional seeds FALSE — every DashScope endpoint is keyed"
@@ -2701,16 +2699,19 @@ fn no_otel_environment_leaves_telemetry_off() {
 
 // --- the gemini-images kind ------------------------------------------------------
 
-/// The `gemini-images` kind parses and **shares `gemini`'s key sources** — one Google
-/// credential per account, not one per use of the endpoint. That sharing is the
-/// difference from `dashscope`, which deliberately keeps its own: there the two wires
-/// are separate protocols against one host, whereas here they are literally the same
-/// endpoint asked for a different modality.
-///
-/// The key is required: the default target is Google's hosted service, so a keyless
-/// seed would 401 on the first paid call instead of failing at load.
+/// The `gemini-images` kind parses. Declared-only, like every other kind: kaibo
+/// seeds no key source, even though `gemini-images` **shares `gemini`'s conventional
+/// env var and key-file names** (`credentials::ProviderKind::env_var`/
+/// `key_file_name`) — one Google credential per account, not one per use of the
+/// endpoint, so an operator who declares `api_key_env = "GEMINI_API_KEY"` on both
+/// backends points them at the same key. That sharing is the difference from
+/// `dashscope`, which keeps its own conventional names: there the two wires are
+/// separate protocols against one host, whereas here they are literally the same
+/// endpoint asked for a different modality. The key is required: the default target
+/// is Google's hosted service, so a keyless seed would 401 on the first paid call
+/// instead of failing at load.
 #[test]
-fn gemini_images_backend_parses_and_shares_the_gemini_key_sources() {
+fn gemini_images_backend_parses_without_seeding_key_sources() {
     let c = Config::from_toml_str(
         r#"
         [backends.gimg]
@@ -2720,14 +2721,10 @@ fn gemini_images_backend_parses_and_shares_the_gemini_key_sources() {
     .expect("the gemini-images kind must parse");
     let b = c.backends.get("gimg").expect("backend exists");
     assert_eq!(b.kind, kaibo::credentials::ProviderKind::GeminiImages);
-    assert_eq!(b.api_key_env.as_deref(), Some("GEMINI_API_KEY"));
-    assert!(
-        b.api_key_file
-            .as_deref()
-            .is_some_and(|f| f.ends_with("/.gemini-api-key")),
-        "it shares the `gemini` key file rather than minting a second name, got: {:?}",
-        b.api_key_file
-    );
+    // Declared-only: a fresh media stanza declares its own source or fails loudly.
+    assert_eq!(b.api_key_env, None);
+    assert_eq!(b.api_key_file, None);
+    assert_eq!(b.api_key_cmd, None);
     assert!(
         !b.key_optional,
         "the default target is Google's hosted service, so the key is required"
@@ -2909,7 +2906,10 @@ fn declared_env_wins_over_the_cmd_without_running_it() {
 
     // Negative control: env absent → the command runs and its stdout is the key.
     let key = b.resolve_key_where(|_| None).expect("cmd source resolves");
-    assert_eq!(key, "cmd-key", "the stub prints 'cmd-key' in the no-env case");
+    assert_eq!(
+        key, "cmd-key",
+        "the stub prints 'cmd-key' in the no-env case"
+    );
     assert!(
         sentinel.exists(),
         "the no-env arm must actually run the command"
