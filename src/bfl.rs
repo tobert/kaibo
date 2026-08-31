@@ -275,7 +275,10 @@ pub enum BflError {
     ReadyWithNoSample,
 
     /// `status: "Error"` — the provider ran the request and failed on it.
-    #[error("BFL reported a generation error: {detail}")]
+    #[error(
+        "BFL reported a generation error: {detail}. The provider ran the request \
+         and failed on its own side — retry the generation"
+    )]
     GenerationError { detail: String },
 
     /// `status: "Request Moderated"` — refused before generation ran.
