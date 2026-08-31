@@ -234,8 +234,15 @@ fn transient_wait(attempt: u32, error: &CompletionError) -> std::time::Duration 
         .and_then(delay_hint_seconds)
         .filter(|seconds| *seconds >= 0.0);
     match hint {
-        Some(hint) => std::time::Duration::from_secs_f64(hint.max(backoff.as_secs_f64()))
-            .min(TRANSIENT_BACKOFF_CAP),
+        // Cap the number, then convert: a hint can be finite yet larger than a
+        // `Duration` holds (twenty digits of seconds), and `from_secs_f64` panics on
+        // overflow — so a `.min` on the converted value would run one step too late.
+        Some(hint) => {
+            let seconds = hint
+                .max(backoff.as_secs_f64())
+                .min(TRANSIENT_BACKOFF_CAP.as_secs_f64());
+            std::time::Duration::from_secs_f64(seconds)
+        }
         None => backoff,
     }
 }
@@ -714,5 +721,19 @@ mod tests {
                 "must not parse a delay out of: {body:?}"
             );
         }
+    }
+
+    /// A hint too large for a `Duration` is capped, never a panic. Twenty digits of
+    /// seconds is finite as an `f64` (so the finiteness guard passes) yet larger than
+    /// `Duration`'s `u64::MAX`-seconds ceiling — the cap must apply to the number
+    /// before it becomes a `Duration`, or the conversion itself dies first.
+    #[test]
+    fn an_absurd_delay_hint_is_capped_not_a_panic() {
+        let error = status_error(429, "Please try again in 99999999999999999999s.");
+        let wait = transient_wait(1, &error);
+        assert!(
+            wait <= TRANSIENT_BACKOFF_CAP,
+            "a huge hint waits the cap, got {wait:?}"
+        );
     }
 }
