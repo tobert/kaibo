@@ -58,7 +58,10 @@ with a hosted synth; a call picks its team with the `cast` arg. Backends and cas
 `config.toml`, `KAIBO_*` env, then CLI flags (precedence: per-call > CLI > env > file >
 built-in); a missing config file is a non-error. See `docs/config.md`, and
 `docs/casts.md` for the backends/casts design rationale. kaibo never modifies the
-project and cannot run external commands.
+project and runs no external command except the one its own config declares —
+`api_key_cmd`, the operator-side key fetch: argv-only, stdin closed, time-boxed,
+output never logged, unreachable from the model-facing shell (see the operator
+surface rule in the invariants).
 
 ## Invariants — do not weaken without a failing-first test
 
@@ -106,6 +109,13 @@ project and cannot run external commands.
   projects, so surfacing it to a cast is a cross-project leak. Concretely — **model-facing
   kaish never grows `jobs`/`ps` or any kaibo-state builtin**; operator job/state visibility
   lives only in the tools (MCP, CLI, later the REPL), never in the shell we hand a model.
+  The one operator-side *resolve* surface — the config-declared `api_key_cmd` (a backend's
+  key from a command like `op read`; note this is a READ surface, unlike the store/CAS
+  record/emit surfaces) — follows the same line: config-gated, argv-only (no shell),
+  stdin closed, `KEY_CMD_TIMEOUT`-bounded, output never logged, and reachable only
+  through `Backend::resolve_key` at client construction, which the model-facing kaish
+  (sandbox lever 3, unchanged) can never reach. The model can *trigger* it by calling a
+  tool on a cmd-backed backend, but cannot control its argv or environment.
 - **Persistence engine (turso) — do not weaken.** Pure-Rust `turso`, **exact-pinned**
   (`=0.7.x` — `.db-tshm` format and API both drift between releases) with
   **`default-features = false`** (defaults pull mimalloc's global-allocator hijack + fts)

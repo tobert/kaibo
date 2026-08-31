@@ -188,6 +188,7 @@ and keep stdin open:
 claude mcp add kaibo -- docker run --rm -i \
   -u "$(id -u):$(id -g)" \
   -v "$PWD:/work:ro" \
+  -v "$HOME/.config/kaibo:/config:ro" -e XDG_CONFIG_HOME=/config \
   -e DEEPSEEK_API_KEY \
   ghcr.io/tobert/kaibo:latest
 ```
@@ -197,8 +198,10 @@ claude mcp add kaibo -- docker run --rm -i \
   no shell to debug into.
 - `-u` runs the container as you so the mount's file permissions line up;
   podman users want `--userns=keep-id` in its place.
-- Pass provider keys by name (`-e DEEPSEEK_API_KEY`) — the value rides your
-  shell environment, never your MCP config.
+- Declare the key source, then pass the value: the `-v "$HOME/.config/kaibo:/config:ro"`
+  mount ships your `config.toml` with e.g. `api_key_env = "DEEPSEEK_API_KEY"`, and
+  `-e DEEPSEEK_API_KEY` carries the value from your shell (kaibo reads no key env var
+  that config.toml doesn't declare).
 - The `:ro` mount is an OS-enforced belt under kaibo's own read-only sandbox:
   kaibo never writes to your project either way, this just makes the kernel agree.
 
@@ -237,12 +240,11 @@ for you:
       //   "args": ["--config", "/path/to/config.toml"]   // use an explicit config file
       "args": [],
       // The consulted models need provider keys — but don't put them here; this
-      // file tends to get committed. Leave `env` empty and kaibo reads keys from
-      // your shell environment (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY,
-      // GEMINI_API_KEY, OPENROUTER_API_KEY, …), or point a backend at a key FILE
-      // via `api_key_file` in config.toml. Config stores only the env-var NAME or
-      // the file PATH — never the secret. A missing key only matters when you
-      // actually call a cast that needs it.
+      // file tends to get committed. Leave `env` empty and give the cast's backend a
+      // DECLARED key source in config.toml: `api_key_env = "ANTHROPIC_API_KEY"` (the
+      // value rides your shell environment), `api_key_file`, or `api_key_cmd`.
+      // Config stores only the source NAME/PATH/argv — never the secret. A missing
+      // key only matters when you actually call a cast that needs it.
       "env": {}
     }
   }

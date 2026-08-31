@@ -57,8 +57,9 @@ Connection settings only. Models are never declared here.
 | `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-images` \| `dashscope` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-images`, and `dashscope` are the media kinds — image slots only) |
 | `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini` and the media kinds; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
-| `api_key_env` | env var *name* | seeded from `kind` | env source, checked first |
-| `api_key_file` | path | seeded from `kind` | file source, checked second |
+| `api_key_env` | env var *name* | unset — declared by you | env source, checked first |
+| `api_key_file` | path | unset — declared by you | file source, checked second (mutually exclusive with `api_key_cmd`) |
+| `api_key_cmd` | argv array | unset — declared by you | command source: stdout, trimmed, is the key (no shell, 30s ceiling, stdin closed) |
 | `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
 | `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` only; load error elsewhere |
 | `request_timeout_secs` | integer > 0 | `[defaults]` value (900) | per-single-completion ceiling |
@@ -87,15 +88,20 @@ by re-declaration.
   `https://generativelanguage.googleapis.com`. Gemini has no images endpoint: image
   generation is `models/{model}:generateContent`, the same call as text, with the
   requested modalities naming what comes back — which is why this is a separate kind
-  from `gemini`, so a cast slot knows which use it points at. Same key as `gemini`
-  (`GEMINI_API_KEY` / `~/.gemini-api-key`). It takes input images and has no named
+  from `gemini`, so a cast slot knows which use it points at. Declared-only, like
+  every kind (see Key resolution below): kaibo seeds no source, but shares
+  `gemini`'s conventional names (`GEMINI_API_KEY` / `~/.gemini-api-key`) — declaring
+  the same `api_key_env` on both backends points them at one Google credential
+  instead of minting a second name. It takes input images and has no named
   operations, so `generate`'s `op` is refused on it.
 - **`kind = "openai-images"`** — optional. Unset dials hosted OpenAI
   (`https://api.openai.com/v1`). Set, it points the same wire at any server speaking
   `/v1/images/generations` — a local stable-diffusion.cpp `sd-server`
-  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Key sources
-  are shared with the `openai` kind (the same `OPENAI_API_KEY` / `~/.openai-key`),
-  but the key is **required by default**: the default endpoint is hosted, so a
+  (`base_url = "http://localhost:1234/v1"`) is the expected local case. Declared-only,
+  like every kind (see Key resolution below): kaibo seeds no source, but shares the
+  `openai` kind's conventional names (`OPENAI_API_KEY` / `~/.openai-key`) — one OpenAI
+  credential, not two to maintain, if you declare the same `api_key_env` on both. The
+  key is **required by default**: the default endpoint is hosted, so a
   keyless seed would send a placeholder bearer to a paid API and 401 on the first
   call instead of failing loudly at setup. A keyless local `sd-server` backend sets
   `key_optional = true` beside its local `base_url`. The `generate` tool's
@@ -104,10 +110,11 @@ by re-declaration.
 - **`kind = "dashscope"`** — optional. Unset dials DashScope's shared international
   root (`https://dashscope-intl.aliyuncs.com`); a dedicated-endpoint subscription
   sets its own host. Give it a bare host, not a path — the client appends the
-  multimodal-generation route. The key is required, from its own sources
-  (`DASHSCOPE_API_KEY` / `~/.dashscope-key`, not shared with the `openai` kind):
-  every DashScope endpoint is keyed, and one credential name per account beats one
-  per protocol when the same host also serves text. This kind is **media-only** — a
+  multimodal-generation route. The key is required, and — declared-only like every
+  kind (see Key resolution below) — kaibo seeds no source; its own conventional
+  names (`DASHSCOPE_API_KEY` / `~/.dashscope-key`, not shared with the `openai`
+  kind) are one credential name per account, not one per protocol when the same
+  host also serves text. This kind is **media-only** — a
   qwen or deepseek model on a DashScope host belongs on a `kind = "openai"` backend
   pointed at `<host>/compatible-mode/v1`, configured beside this one. DashScope
   returns artifacts as presigned links, so kaibo fetches each over TLS and stores
@@ -144,21 +151,62 @@ proxy `/v1/batches` or the Files API.
 
 #### Key resolution
 
-A backend resolves its key from `api_key_env`, then `api_key_file`. Env wins.
+A backend resolves its key from its **declared** sources — `api_key_env` (an env var
+*name*), `api_key_file` (a path), or `api_key_cmd` (a command whose stdout is the key) —
+with env winning over the file/command source. Every source is declared in
+`config.toml`: kaibo seeds none of them, so the loader does exactly what the operator
+wrote (a fresh built-in backend has no key source until one is declared). A backend
+may declare at most one of `api_key_file` and `api_key_cmd` — both is a load error
+naming both fields; env may still be declared beside either, and wins when set.
 
-**Secrets never appear inline in the TOML** — only the *name* of an env var or the
-*path* to a key file. A config file should be safe to commit or paste.
+**Upgrading from a kaibo that seeded built-in keys.** Older kaibo read
+`ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` and the matching env var / dotfile for
+every built-in backend without being told to. That seeding is gone: a built-in
+backend with no declared source now has no key, `resolve_key` refuses it, and the
+handshake roster drops every cast built on it. Add one `api_key_env`, `api_key_file`,
+or `api_key_cmd` line per backend you use (`kaibo example-config` shows the shapes,
+and the Built-in registry table below still lists each one's conventional env var
+and dotfile name) — those names still work as *values* for the fields, they are
+just no longer assumed.
+
+**Secrets never appear inline in the TOML** — only the *name* of an env var, the
+*path* to a key file, or the *argv* of a key command (a vault item path is a
+pointer, not the secret it resolves to). A config file should be safe to commit or
+paste.
+
+`api_key_cmd` runs the command with raw argv — no shell, no `$VAR`/`~` expansion in
+its elements (wrap a pipeline in a script and name the script). The child inherits
+kaibo's environment (where `op` finds its session, gpg-agent serves `pass`), but its
+stdin is closed (it must never read the MCP stdio stream — a prompting tool fails
+fast instead), its stdout is the key, trimmed, and it is given a 30s ceiling
+(`KEY_CMD_TIMEOUT`): a hung or oversized-emitter is killed/refused, loudly, and its
+output is never logged. A nonzero exit names the exit status and how many bytes the
+command wrote to stderr, never stderr's content — a wrapper script traced with
+`set -x`, or a tool that echoes the secret on its own failure path, can put the key
+on stderr as easily as stdout, so don't trace a key command. 1Password's `op read
+"op://Vault/Item/Field"`, `pass show`, `gh auth token`, and any vault CLI fit this
+contract unchanged.
 
 `key_optional = true` substitutes a placeholder when no key is found, which is the
 keyless local-server case. The placeholder fits the auth style: an empty query key for
 Gemini, a non-empty bearer for header-auth backends (`src/credentials.rs`).
 
-A key file that is *present but broken* (empty, unreadable, a directory) is a loud error
-even on a keyless backend, because present-but-wrong is a mistake rather than "keyless".
-Only a genuinely absent file falls back.
+A key source that is *present but broken* (an empty/unreadable key file; a command
+that exits nonzero, prints nothing, prints non-UTF-8 or oversized output, or times
+out) is a loud error even on a keyless backend, because present-but-wrong is a
+mistake rather than "keyless". Only a genuinely absent source falls back. The command
+source is classified `Present` by `key_status` without being run (there is no cheap
+offline check for a command — the same asymmetry as an unread key file; a typo'd
+binary name surfaces loudly at the first resolve).
 
-**Timing.** Keys resolve lazily, when the backend is first used to build a client, not at
-config load. A missing or broken key on a backend no call touches never surfaces.
+**Timing.** Keys resolve lazily, when a backend is used to build a client, not at
+config load, and are never cached: every client build resolves fresh. A missing or
+broken key source on a backend no call touches never surfaces. This makes the cost of
+`api_key_cmd` a per-*role* cost, not a per-*call* one: one `consult` (or `oneshot`,
+`batch_submit`, …) call builds a client for each cast role it uses — synth and
+explorer, for a two-role cast — so a command-backed key runs once per role, an `op
+read` and a 1Password audit-log entry each. A rotated vault item is picked up at the
+very next build, at the cost of running the command again on every one.
 
 #### `kind = "openrouter"` specifics
 
@@ -454,13 +502,17 @@ behavioral guard rather than a memory one (the per-file and cumulative byte caps
 Five backends and five same-named single-backend casts ship in code, plus two batch
 casts. This is why a missing config file is not an error.
 
-| backend | kind | base_url | key env / file | aliases |
+| backend | kind | base_url | conventional key env / file (declare to use) | aliases |
 |---|---|---|---|---|
 | `anthropic` | anthropic | — *(optional)* | `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` | `claude` |
 | `deepseek` | deepseek | — | `DEEPSEEK_API_KEY` / `~/.deepseek-key` | — |
 | `gemini` | gemini | — *(optional, host root)* | `GEMINI_API_KEY` / `~/.gemini-api-key` | `google` |
 | `openrouter` | openrouter | — *(fixed)* | `OPENROUTER_API_KEY` / `~/.openrouter-key` | — |
 | `openai-local` | openai | `http://localhost:13305/api/v1` | `OPENAI_API_KEY` / `~/.openai-key` *(optional)* | `local`, `lemonade`, `gemma`, `gemma4` |
+
+None of these are seeded (see Key resolution above): a built-in backend has no key
+source until you declare `api_key_env`/`api_key_file` naming one of these values, or
+`api_key_cmd` for a vault command instead.
 
 No built-in sets `wire`. It matters only for a new openai-kind backend whose endpoint is
 not OpenAI Platform's own but should still take the Responses shape; see
@@ -641,8 +693,9 @@ Everything else follows one naming rule:
 
 - **Provider key vars stay native.** `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
   `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `OPENAI_API_KEY` are not renamed to
-  `KAIBO_*`, because people and CI expect those names. A backend points at one via
-  `api_key_env`.
+  `KAIBO_*`, because people and CI expect those names. A backend points at one by
+  declaring `api_key_env` in its stanza (kaibo reads no key env var that isn't
+  declared).
 - **`OPENAI_BASE_URL` is kept** as a backward-compatible override for any openai-kind
   backend with no explicit `base_url`. New backends use the `base_url` config key.
 
@@ -1565,17 +1618,18 @@ local-default fallback applied; the raw configured value, when set, for the anth
 gemini kinds; and nothing for every other kind.
 
 **Secret-safety contract.** `kaibo://config` includes key *source metadata* — the env var
-name and file path an operator configured — and never the resolved key value. Keys resolve
-lazily at call time and are never cached in the `Config` struct, so the render function has
-no field holding a secret.
+name, file path, or key command argv an operator configured — and never the resolved
+key value. Keys resolve lazily at call time and are never cached in the `Config` struct,
+so the render function has no field holding a secret.
 
 The render destructures `Backend`, `ModelSlot`, `Defaults`, `ToolGating`, and
 `SandboxConfig` exhaustively, so a new field is a compile error at the render site. That
 makes rendering a field an explicit decision, subject to secret review, rather than a
 silent omission.
 
-`api_key_env` and `api_key_file` are included on purpose: an operator debugging a
-missing-key error needs to see which source the backend points at.
+`api_key_env`, `api_key_file`, and `api_key_cmd` are included on purpose: an operator
+debugging a missing-key error needs to see which source the backend points at (a vault
+item path in argv is a pointer, like the env var name — it never resolves a value).
 
 ## CLI mirrors
 

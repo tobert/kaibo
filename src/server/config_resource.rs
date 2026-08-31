@@ -314,6 +314,12 @@ pub(crate) fn render_config_resource(
         /// unset/blank. The PATH, not its contents.
         #[serde(skip_serializing_if = "Option::is_none")]
         api_key_file: Option<String>,
+        /// The declared key command's argv (e.g. `["op", "read", "op://Vault/Item/Field"]`)
+        /// — the reference, not the value it prints. Rendered because it is a configured
+        /// source pointer like `api_key_env`/`api_key_file`; the command's stdout (the
+        /// actual key) never appears here.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        api_key_cmd: Option<Vec<String>>,
         /// True when a missing key falls back to a placeholder (keyless endpoint).
         key_optional: bool,
         request_timeout_secs: u64,
@@ -389,6 +395,7 @@ pub(crate) fn render_config_resource(
                 base_url,
                 api_key_env,
                 api_key_file,
+                api_key_cmd,
                 key_optional,
                 request_timeout,
                 data_collection,
@@ -405,6 +412,9 @@ pub(crate) fn render_config_resource(
                 // KEY SOURCE ONLY — env var name or file path, never the value.
                 api_key_env: api_key_env.clone(),
                 api_key_file: api_key_file.clone(),
+                // The command's argv is a source pointer too: the vault path it reads,
+                // not the key it prints.
+                api_key_cmd: api_key_cmd.clone(),
                 key_optional: *key_optional,
                 request_timeout_secs: request_timeout.as_secs(),
                 data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter).then_some(
@@ -1405,7 +1415,21 @@ mod tests {
     /// slots rendered as "backend/id" carrying resolved caps.
     #[test]
     fn config_resource_renders_expected_fields() {
-        let config = Config::builtin();
+        // Declared-only key sources: give the built-in anthropic backend an env
+        // source and add a command-sourced backend, so the render's key-source
+        // promise (sources visible, values never) has something to render.
+        let config = Config::from_toml_str(
+            r#"
+            [backends.anthropic]
+            api_key_env = "ANTHROPIC_API_KEY"
+
+            [backends.vault]
+            kind = "openai"
+            base_url = "http://localhost:9/v1"
+            api_key_cmd = ["op", "read", "op://Vault/Kaibo/OpenAI-key"]
+            "#,
+        )
+        .unwrap();
         let allowed = vec![std::path::PathBuf::from("/tmp/test-allowed")];
         let body = render_config_resource(
             &config,
@@ -1478,11 +1502,16 @@ mod tests {
             deepseek_synth.contains("vision = false"),
             "deepseek slot carries resolved vision=false:\n{deepseek_synth}"
         );
-        // Key SOURCES (env var name / file path) must appear — operators configured
-        // them and need to see them for diagnostics.
+        // Key SOURCES (env var name / file path / command argv) must appear —
+        // operators configured them and need to see them for diagnostics. The
+        // rendered argv is a vault path, a pointer like the env var name, never a key.
         assert!(
             body.contains("ANTHROPIC_API_KEY"),
             "config resource must show key source env var names:\n{body}"
+        );
+        assert!(
+            body.contains("api_key_cmd") && body.contains("op://Vault/Kaibo/OpenAI-key"),
+            "config resource must show the declared key command's argv:\n{body}"
         );
         // Telemetry state is part of the resolved runtime: an operator must be able
         // to see whether kaibo is shipping spans off-box and to where.

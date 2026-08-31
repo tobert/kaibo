@@ -66,6 +66,14 @@ record. Each later release appends a new section at the top.
 - **`[telemetry] capture_content`** — off by default, so exported spans carry no prompts,
   completions, or tool payloads.
 - **`[telemetry] capture`** — export one named attribute without exporting all of them.
+- **Backend keys can come from a command** — `[backends.<name>] api_key_cmd = ["op",
+  "read", "op://Vault/Item/Field"]` runs the declared command (no shell, stdin closed,
+  30s ceiling, output never logged) and uses its trimmed stdout as the API key: a
+  1Password / `pass` / `gh auth token` credential without a secret in a file.
+- **Key sources are declared, never seeded** — the built-in backends no longer read
+  `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` / etc. out of the box; an operator names
+  the source (`api_key_env`, `api_key_file`, or `api_key_cmd`) in config.toml once, and
+  `api_key_file` + `api_key_cmd` together is a load error naming both.
 
 ### Changed
 
@@ -84,6 +92,12 @@ record. Each later release appends a new section at the top.
   rendered poll and as `submitted` in `batch get --json`.
 - **A failed batch now names the cast that ran it**, the provenance footer a completed
   batch already carried.
+- **Setup guidance steers toward declaring a key source in config.toml** (with
+  `kaibo example-config` for the shape) instead of exporting an env var.
+- **Breaking: an upgrading operator must add a key source to every backend they use** —
+  the built-ins no longer seed one, so a cast built on an undeclared backend silently
+  drops out of the roster; add `api_key_env`/`api_key_file`/`api_key_cmd` per backend to
+  bring it back (`kaibo example-config` shows the shapes).
 
 ### Fixed
 

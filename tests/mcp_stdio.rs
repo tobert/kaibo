@@ -130,7 +130,9 @@ impl Server {
             tokio::process::Command::new(env!("CARGO_BIN_EXE_kaibo")).configure(|cmd| {
                 // Clear first: the developer's provider keys and `KAIBO_*` overrides would
                 // otherwise decide which tools get advertised. kaibo runs no external
-                // command, so it needs nothing else from the environment.
+                // command except a config-declared `api_key_cmd`, which these tests name
+                // by absolute path (PATH is not rebuilt here), so nothing else from the
+                // environment is needed.
                 cmd.env_clear()
                     .env("HOME", &home)
                     .env("XDG_CONFIG_HOME", &config_home)

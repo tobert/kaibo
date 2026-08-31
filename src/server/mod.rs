@@ -4071,10 +4071,13 @@ model listing (the `list_models` tool, or `kaibo models` on the CLI) and set tha
 slot's `max_tokens` from the ceiling, because reasoning bills into the same completion \
 budget as the answer. Some providers publish no ceiling; there, look it up in the \
 provider's own model documentation.
-4. Keep secrets in the environment or a key file. A backend names an env var \
-(`api_key_env`) or a key-file path (`api_key_file`); the TOML carries the name or path, \
-the secret stays outside it. Tell me which env vars to set or files to write, and let \
-me put the keys in myself.
+4. Keep secrets out of the config. A backend stanza DECLARES a key source — an env \
+var name (`api_key_env`), a key-file path (`api_key_file`), or a command whose \
+stdout is the key (`api_key_cmd`, e.g. `[\"op\", \"read\", \"op://Vault/Item/Field\"]`) — \
+and kaibo seeds none of them, so nothing works until one is declared. The TOML \
+carries the name, path, or argv; the VALUE stays in the env, file, or vault (the \
+key command runs with stdin closed, a 30-second ceiling, and its output is never \
+logged). Tell me which sources to declare, and let me put the keys in myself.
 5. (Optional) Read scope. By default kaibo reads only the project tree (plus linked git \
 worktrees) and only ever *reads* it — never writes to your project. To let the team see \
 a scratch space — a \
