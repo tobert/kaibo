@@ -457,6 +457,15 @@ even for a one-line doc fix.
   `not a dynamic executable`. Re-run `docs/sandbox-probes.md` when this release changed
   the sandbox rules or the VFS — a `kaish-kernel` bump is the common case, so check the
   pin first.
+  **"Current" is not the whole gate: do not release on a kaish version carrying a known
+  unfixed bug in a surface kaibo hands a model.** Being on the newest tag is not the
+  same as being on a good one — a bump can be the *first* thing to find a bug, and then
+  shipping it is a decision rather than an oversight. When a bump's probe run turns up
+  kernel bugs, report them upstream and hold the release for the patch; developing on
+  the new pin meanwhile is fine, because a merge is reversible and a release is not.
+  Amy set this precedent on 2026-09-01 for the 0.17.0 bump, whose probe run found
+  `readlink -f` broken on every operand on a rooted mount: *"we're not gonna release
+  kaibo until we get on 0.17.1, so those symlink issues won't ship."*
   After the release publishes: run the README "Verify a download" commands against a
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't
