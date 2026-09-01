@@ -153,6 +153,15 @@ paths (including `..`-normalized ones) route into the empty `/` MemoryFs scratch
 `cd ~` / `cd /home/<user>` fail — only the full mount path is a real directory, so
 the prefix can't be walked to a sibling.
 
+> **`cd / && ls` returns `dev`, `home`, `v`, and that is not a finding.** It is
+> synthetic VFS scaffolding, not host content: `/dev/{null,random,urandom,zero}` are
+> virtual devices, `/v` is kaish's own builtin toolbox plus ephemeral blob/job scratch,
+> and `/home` is an inert stub that cannot be walked (`ls /home`, `ls /home/<user>` both
+> `not found`). Only the exact `--root`-resolved absolute path mounts real content.
+> Confirm it the way the 2026-07-29 run did: read `$ROOT/Cargo.toml` through the mount
+> and watch every sibling path 404. Written down here because a reader meeting that
+> listing for the first time reasonably suspects a hole.
+
 **Environment leak check** (a secret can hide in env, not just on disk):
 
 ```sh
@@ -298,30 +307,28 @@ artifacts, so the enumeration half is the one that proves the design.
 
 ## 5c. Battery G — a symlink discloses its target, and nothing else
 
-**New for kaish 0.17.** The kernel now describes a symlink with `lstat` instead of
-following it, so `ls -l`, `stat`, `readlink`, and `find -type l` read the *link* where
-0.14 refused. A link inside the project pointing outside it therefore renders its
-**target path string**. That is accepted, on one condition this battery checks: nothing
-else crosses.
+**New for kaish 0.17**, which describes a symlink with `lstat` instead of following it.
+A link inside the project pointing outside now renders its **target path string** where
+0.14 refused. Accepted, on the one condition G3 checks: nothing else crosses.
 
-Build the fixture on the host (the mount is read-only, so it cannot be made from
-inside), with three links whose targets differ only in whether they exist:
+Build the fixture on the host — the mount is read-only, so it cannot be made from
+inside. Three links, differing only in what their targets are:
 
 ```sh
-ln -s /etc/hostname                "$ROOT/o-exists"    # target exists
-ln -s /etc/DEFINITELY-NOT-HERE     "$ROOT/o-missing"   # target does not exist
-ln -s /root/.ssh/id_rsa            "$ROOT/o-noperm"    # exists, unreadable to this user
+ln -s /etc/hostname            "$ROOT/o-exists"    # exists
+ln -s /etc/DEFINITELY-NOT-HERE "$ROOT/o-missing"   # does not exist
+ln -s /root/.ssh/id_rsa        "$ROOT/o-noperm"    # exists, unreadable
 ```
 
-**G1 — the target string is readable, and that is the intended behavior.**
+**G1 — the target string is readable. Not a finding.**
 
 ```sh
 readlink o-exists ; ls -l o-exists ; stat o-exists ; find . -type l
 ```
 
-**Pass:** each names `/etc/hostname`, exit 0. Not a finding. A symlink's target is
-bytes stored inside the allowed tree, so reading it is reading project content, and
-refusing would make `ls -l` misdescribe a directory kaibo is allowed to list.
+Each names `/etc/hostname`, exit 0. A link's target is bytes stored inside the allowed
+tree, so reading it is reading project content; refusing would make `ls -l` misdescribe
+a directory kaibo is allowed to list.
 
 **G2 — no bytes cross.**
 
@@ -331,32 +338,29 @@ stat -L o-exists ; cp o-exists /v/x ; grep -rn . o-exists
 [[ -e o-exists ]] && echo E || echo NOT_E
 ```
 
-**Pass:** every verb that would *follow* the link refuses with `permission denied: path
-escapes root: <target> is not under <root>` (exit 1), and `[[ -e ]]` / `[[ -r ]]` are
-false. Note `stat` and `stat -L` split here — the lstat form succeeds, the follow form
-refuses. That split *is* the boundary.
+Every verb that *follows* the link refuses `permission denied: path escapes root:
+<target> is not under <root>` (exit 1); `[[ -e ]]` and `[[ -r ]]` are false. `stat` and
+`stat -L` split here — lstat succeeds, follow refuses. That split *is* the boundary.
 
-**G3 — no existence oracle. This is the probe that makes G1 acceptable.**
+**G3 — no existence oracle. This is what makes G1 acceptable.**
 
 ```sh
 cat o-exists ; cat o-missing ; cat o-noperm
 ```
 
 **Pass:** the three refusals are **byte-identical** once each link's own target string
-is removed. The refusal is decided by path arithmetic before any syscall reaches the
-target, so a hostile repo learns nothing about the host — not the target's contents,
-not its permissions, not even whether it exists. It gets back the string it wrote into
-its own link.
+is removed, because the refusal is path arithmetic decided before any syscall reaches
+the target. A hostile repo gets back the string it wrote into its own link — not the
+target's contents, not its permissions, not even whether it exists.
 
-**Fail:** any divergence between the three. A repo that can tell "exists" from "does
-not exist" can probe the host filesystem one link at a time, and at that point G1 stops
-being acceptable and becomes a disclosure. Escalate rather than re-baseline.
+**Fail:** any divergence. A repo that can tell "exists" from "does not exist" probes the
+host one link at a time, and G1 stops being acceptable. Escalate rather than
+re-baseline.
 
-> Pinned continuously by
-> `tests/containment.rs::mount_layer_symlink_discloses_its_target_string_but_no_host_fact`,
-> whose leak assertion has a recorded positive control: point the link at an in-tree
-> file carrying the marker and the assertion fires. Its sibling
-> `mount_layer_symlink_in_allowed_pointing_outside` covers the content half.
+> Pinned by `containment.rs::mount_layer_symlink_discloses_its_target_string_but_no_host_fact`
+> (all three arms, with a recorded positive control: point a link at an in-tree file
+> carrying the marker and the leak assertion fires) and its sibling
+> `mount_layer_symlink_in_allowed_pointing_outside` for the content half.
 
 ---
 
@@ -394,101 +398,33 @@ toolset has drifted from the direct one and that's the bug.
 
 ## Last run
 
-- **2026-09-01** — Full battery A–G direct via `kaibo kaish`/`kaibo --state-db`/
-  `--cas-dir` (built binary, branch `kaish-0.17`), run because the
-  `kaish-kernel` 0.14.1 → 0.17.0 bump trips the kernel/VFS trigger. **All clear**, and
-  this bump moved the *instrument* more than any before it — three pass criteria in
-  this file were false against 0.17 and are now corrected in place (Battery A's `ln -s`
-  reason, Battery B's 127 message, Battery C's non-empty `env`).
-  A — nine writes refused, nothing on real disk; `ln -s /etc/passwd` now refuses as
-  `a link cannot cross mounts` rather than read-only, and `ln -s Cargo.toml link_inside`
-  was added to exercise the read-only leg itself. B — ten external commands exit 127
-  with 0.16's clearer message; **`env FOO=bar curl` refused on both 0.14.1 and 0.17.0,
-  so kaibo was never exposed to the `env` capability bypass 0.16 fixed** — lever (0)
-  compiles `subprocess` out, so the host-spawn path it escaped through does not exist
-  here. C — every out-of-mount read `not found`; the adjacent-secret probe unreadable;
-  key vars, `$HOME`, `$PATH` all empty, with `env` now listing only kernel-owned
-  `PIPESTATUS` and `PWD`. D — all five `path` rows exit 3 as expected. E — E1 refused
-  with no file created, E2's real 4 KiB store unreadable, E3 green (13 tests).
-  F — CAS refused an in-project `--cas-dir` with nothing created; a **populated** store
-  (87 shard dirs on the host) neither readable nor listable through kaish.
-  **G — new.** 0.17's lstat-by-default opened one new observable: a link inside the tree
-  pointing outside now renders its target string (`ls -l`, `stat`, `readlink`,
-  `find -type l`). Accepted, because G3 holds — existing, missing, and unreadable
-  targets refuse **byte-identically**, so there is no existence oracle and a hostile
-  repo gets back only the string it wrote itself. Every following verb (`cat`, `file`,
-  `wc`, `checksum`, `stat -L`, `cp`, `grep -r`) still refuses.
-  Suites green on the same build: containment 24 (one new), full `cargo test` 1139
-  passed / 0 failed, with the one known `tests/credentials.rs` ETXTBSY parallel flake
-  passing serially. §7's model-driven pass not re-run — deferred to the v0.4.0
-  pre-release check, where a local cast is available.
-  One finding about the *instrument*, in this file's own tradition: the first cut of
-  the new containment test passed for the wrong reason (`run_kaish` reports a refused
-  builtin as a successful CALL, so both oracle arms landed in `Ok` and the normalizer
-  never ran), and the leak assertion's first positive control tripped an earlier
-  assertion instead of the one it meant to test. Both were corrected until the control
-  landed on the intended line. **Ask of any probe: would it report something different
-  if the thing it audits were broken, versus if the probe itself were?**
+Newest first. **The current run is kept in full; older ones compress to a line.** Their
+detail is in git, and anything durable a run found has been promoted into the battery it
+belongs to rather than left here to be re-read — that promotion is the point of the
+compression, not a side effect of it.
 
-- **2026-06-14** — full battery + suites, commit `a381b25`. All clear: no write
-  reached disk, no external command ran, no read escaped the root, env empty, `path`
-  containment held (incl. `..`-injection), 30/30 boundary tests green. Model-driven
-  probe re-run on the local `openai` cast (gemma4, after raising its window to 131072)
-  reproduced the direct results exactly. Update this line each pass; git history is
-  the rest of the record.
-- **2026-07-18** — Batteries A/B/C direct via `kaibo kaish` (built binary, base
-  commit `c1267bd` + the `kaish-kernel` 0.12.0 → 0.13.0 bump, branch
-  `chore/kaish-0.13.0`), specifically to spot-check that bump against the sandbox
-  boundary. All clear: every write in Battery A refused with `permission denied:
-  filesystem is read-only` and nothing landed on real disk; every external command
-  in Battery B came back `command not found` (exit 127); every out-of-mount read in
-  Battery C (`/etc/passwd`, `..` traversal, `~/.ssh`, the adjacent-secret probe) came
-  back `not found`, and `env`/the key-var check came back empty. Full `cargo test`
-  (598 passed) green on the same build. Batteries D/E (path containment, the
-  persistence store) not re-run live this pass — unaffected by a kaish-kernel bump
-  and already covered by `tests/containment.rs`/`tests/store.rs` in that same green
-  run.
-- **2026-08-13** — Full battery A–E direct via `kaibo kaish` (built binary, main
-  `fb5ae71`), plus the new Battery F and a model-driven §7 pass, ahead of cutting v0.3.0.
-  All clear. A — nine writes refused `permission denied: filesystem is read-only`,
-  leftovers empty, host and `git status` clean. B — nine external commands `command not
-  found` (exit 127). C — every out-of-mount read `not found`; **all three real key files
-  on the host and the operator's own `config.toml` confirmed present on disk and
-  unreadable through kaish**; `env` and `kaish-vars` empty. D — all five `path` rows
-  matched, `..`-injection canonicalized to `/etc` and refused. E — E1 exit 1 with no file
-  created, E2's store unreadable *and* unlistable, E3 green (13 tests). **F — new: the
-  CAS refused an in-project `--cas-dir` with nothing created, and a populated CAS was
-  neither readable nor listable through kaish.** §7 — the model-driven pass ran on a
-  local cast (`lfm25-solo`, the one live local endpoint of seven) and matched the direct
-  runs exactly: write `exit 1`, `whoami` `exit 127`, `/etc/passwd` `exit 1`. Suites
-  green: containment 23, sandbox 6, run_kaish_tool 14, full `cargo test` exit 0.
-  Two findings, both about the *instrument* rather than the boundary: Battery A as
-  written proved nothing (`$ROOT` is empty inside kaish — §0 now says so), and the
-  `/v/approvals` battery drafted for the kaish 0.14 bump was deleted before it shipped,
-  because the ledger cut removed the mount it probed.
-- **2026-07-29** — Full battery A–E, direct via `kaibo kaish`/`kaibo --state-db`
-  (built binary, commit `ffb0bdb`, pre-release checklist pass ahead of cutting real
-  v0.2.0 — five PRs had landed since the last full run: rmcp 3.0.0-beta.5, the
-  OpenAI batch lane, `list_models`, gemini `base_url`, the Homebrew tap). All clear:
-  Battery A — every write refused `permission denied: filesystem is read-only`,
-  `leftovers` grep empty, host `ls` clean. Battery B — every external command
-  `command not found` (exit 127). Battery C — `/etc/passwd`, `..`-traversal,
-  `~/.ssh/id_rsa`, and the adjacent-secret probe all `not found`; `env`/`kaish-vars`/
-  the key-var check all empty. **Noted for the record** (not a finding): `cd / && ls`
-  lists `dev`, `home`, `v` — these are synthetic VFS scaffolding, not host content:
-  `/dev/{null,random,urandom,zero}` are virtual devices, `/v` is kaish's own builtin
-  toolbox + ephemeral blob/job scratch (confirmed empty), and `/home` is an inert,
-  unwalkable stub (`ls /home`, `/home/atobey`, `/home/atobey/src` all `not found`) —
-  only the exact `--root`-resolved absolute path mounts real content, confirmed by
-  reading `$ROOT/Cargo.toml` through it. Battery D — all five `path` containment
-  cases matched the expected table exactly (`/etc` and the root's parent refused as
-  outside the allowed set, the `..`-injected path canonicalized to `/etc` then
-  refused, a real subdir succeeded, a file path refused as "not a directory").
-  Battery E — E1 refused the in-project `--state-db` loudly with no file created;
-  E2's real on-disk state db (4 KiB, existing session data) read back `not found`
-  through kaish; E3's `no_write_path` suite (11 tests) green. Full `cargo test`
-  (502 lib + full integration) and `--test containment --test sandbox
-  --test run_kaish_tool` (34 tests) all green on the same build. Immediately
-  followed by the `turso` 0.7.0 → 0.7.1 exact-pin bump (PR #106, merged as
-  `fae7a26`) — reviewed separately (cross-family, `src/store.rs`'s WAL-reopen
-  tests) since it doesn't touch this boundary.
+- **2026-09-01** — **Full A–G**, branch `kaish-0.17`, run because the `kaish-kernel`
+  0.14.1 → 0.17.0 bump trips the kernel/VFS trigger. **All clear.** This bump moved the
+  *instrument* more than any before it: three pass criteria in this file were false
+  against 0.17 and are corrected in place (Battery A's `ln -s` reason, Battery B's 127
+  message, Battery C's now non-empty `env`), and **Battery G is new** for the symlink
+  boundary 0.17's lstat-by-default opened.
+  - **The one new observable, accepted:** a link inside the tree pointing outside now
+    renders its target *string*. G3 is why that is acceptable — existing, missing, and
+    unreadable targets refuse byte-identically, so there is no existence oracle.
+  - **Best find:** 0.16 fixed an `env` that bypassed the external-commands gate, and
+    **kaibo was never exposed** — lever (0) compiles `subprocess` out, verified against
+    both versions. The four-levers design paying for itself.
+  - Suites: containment 24, full `cargo test` 1327 passed / 0 failed.
+  - §7 not re-run; deferred to the v0.4.0 pre-release check.
+
+- **2026-08-13** — Full A–E plus the new Battery F and a §7 model-driven pass, main
+  `fb5ae71`, ahead of v0.3.0. All clear. Both findings were about the *instrument* and
+  both now live in §0: Battery A as written proved nothing (`$ROOT` is empty inside
+  kaish), and the drafted `/v/approvals` battery probed a mount kaish had already cut.
+- **2026-07-29** — Full A–E, `ffb0bdb`, pre-release pass for v0.2.0. All clear. Its
+  standing contribution is the `cd /` scaffolding note, now in Battery C.
+- **2026-07-18** — A/B/C only, `kaish-kernel` 0.12.0 → 0.13.0 bump. All clear; D/E
+  skipped as unaffected by a kernel bump and covered by the suites.
+- **2026-06-14** — First full battery plus suites, `a381b25`. All clear, including a §7
+  model-driven pass that reproduced the direct results exactly.
