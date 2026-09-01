@@ -452,20 +452,13 @@ even for a one-line doc fix.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
-  `v*` tag. Before tagging: confirm the `kaish-kernel` and `turso` pins are current, and
-  verify `cargo tree -i` is empty for `aws-lc-rs` and `mimalloc` and the musl binary is
-  `not a dynamic executable`. Re-run `docs/sandbox-probes.md` when this release changed
-  the sandbox rules or the VFS — a `kaish-kernel` bump is the common case, so check the
-  pin first.
-  **"Current" is not the whole gate: do not release on a kaish version carrying a known
-  unfixed bug in a surface kaibo hands a model.** Being on the newest tag is not the
-  same as being on a good one — a bump can be the *first* thing to find a bug, and then
-  shipping it is a decision rather than an oversight. When a bump's probe run turns up
-  kernel bugs, report them upstream and hold the release for the patch; developing on
-  the new pin meanwhile is fine, because a merge is reversible and a release is not.
-  Amy set this precedent on 2026-09-01 for the 0.17.0 bump, whose probe run found
-  `readlink -f` broken on every operand on a rooted mount: *"we're not gonna release
-  kaibo until we get on 0.17.1, so those symlink issues won't ship."*
+  `v*` tag. Before tagging: confirm the `kaish-kernel` and `turso` pins are current
+  *and* carry no known unfixed bug — current is not the same as good, and a bump is
+  often what finds one, so hold the release for the patch and keep developing on the
+  pin (a merge is reversible; a release is not). Verify `cargo tree -i` is empty for
+  `aws-lc-rs` and `mimalloc` and the musl binary is `not a dynamic executable`. Re-run
+  `docs/sandbox-probes.md` when this release changed the sandbox rules or the VFS — a
+  `kaish-kernel` bump is the common case, so check the pin first.
   After the release publishes: run the README "Verify a download" commands against a
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't
@@ -474,67 +467,12 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.17.0"`, a 0.14.1 → 0.17.0 jump that
-  inherits three releases' breaks at once. **Compile-time exposure was one line pair**,
-  exactly as the pre-bump audit predicted: `IgnoreScope` went `#[non_exhaustive]` in
-  0.16, breaking the exhaustive match at `server/config_resource.rs`. The wildcard arm
-  we added names the unrecognized variant rather than rendering a default label,
-  mirroring the parse direction in `config::merge_kaish`, which refuses an unrecognized
-  `scope` outright. Everything else was free: kaibo builds no `ExecContext` literal
-  (0.17's other BREAKING item), uses no plan-side redaction API, walks no AST, and
-  0.16's `execute → Result<_, KernelError>` flows through `anyhow`'s `?` unchanged
-  because `KernelError: Error`.
-- **The lesson from the 0.17 bump: the compiler found less than the shell did.** One
-  compile error, but four *behavioral* changes reached the model-facing surface, and
-  only running the shell found them. Two made kaibo's own prose false and were fixed
-  in prose: 0.16 made `grep -r` prefix hits with the operand as written, so the
-  `grep -rn PATTERN .` idiom we teach started emitting `./src/foo.rs:12` for every
-  citation (the bare form is now taught, and the old sentence's claim that the idiom
-  works "whether the target is a file or a directory" went too — a named file drops the
-  filename, which is the half a citation needs); and 0.16 replaced the bare
-  `command not found` for a refused external command, which two surfaces quoted. Two
-  more arrived free through `kaish-help`, which kaibo composes rather than restates —
-  compound statements now feed pipes, and `yes`/`no` stopped being lexer errors. **When
-  you bump kaish, diff the rendered contract and run the shell; do not stop at a green
-  build.** A throwaway crate that calls `compose(&Recipe::tool_description(), …)` under
-  both versions diffs the composed contract in one command.
-- **And when a kaish idiom changes, grep for it — it is never in one place.** The
-  `grep -rn PATTERN .` fix landed first in `KAISH_SANDBOX_ADDENDUM` alone, and the
-  cross-family review found the same idiom in **five** other model- and operator-facing
-  surfaces: the explorer preamble (`consult/prompts.rs`), the MCP `run_kaish` tool
-  description and the `kaibo://tools` doc (`server/mod.rs`), the `kaibo://kaish/sandbox`
-  recipes (`kaish_syntax.rs`), and the `kaibo kaish -c` help (`cli.rs`). Fixing one is
-  worse than fixing none: a model reads the addendum every turn *and* the explorer
-  preamble every sweep, so a half-fix teaches two contradictory idioms and the model has
-  no way to tell which is right. Test fixtures that merely *contain* the idiom
-  (`progress.rs`, `consult/engine.rs`) are not part of this — they are inputs, not
-  teaching. Nor is a named-directory operand (`grep -rn PATTERN DIR/`), which is
-  correct: GNU joins the operand as written, so a named directory still cites a usable
-  path. It is `.` specifically that adds the `./`.
-- **The 0.17 bump also moved the sandbox boundary, and the runbook with it.**
-  lstat-by-default means a symlink inside the project pointing outside now renders its
-  target path string through `ls -l`/`stat`/`readlink`/`find -type l`, where 0.14
-  refused. Accepted rather than narrowed, on a measured condition: existing, missing,
-  and unreadable targets refuse **byte-identically**, so there is no existence oracle
-  and a hostile repo learns only the string it wrote into its own link. A link's target
-  is bytes inside the tree, so reading it is reading project content. Pinned by
-  `containment.rs::mount_layer_symlink_discloses_its_target_string_but_no_host_fact`
-  and by Battery G in `docs/sandbox-probes.md`. Also worth knowing: 0.16 fixed an `env`
-  that bypassed the external-commands gate, and **kaibo was never exposed** — lever (0)
-  compiles `subprocess` out, so the host-spawn path it escaped through does not exist
-  here. That is the four-levers design paying for itself, and it is the kind of
-  evidence worth recording when it happens.
-- **The previous pin, kept because the reasoning pattern is the point.** The
-  `0.13.0 → 0.14.0` bump moved **one** call site — a deletion: `kaish_syntax.rs`'s
-  `strip_write_side_paragraphs`, whose target text kaish-help #297 made opt-in via
-  `Concept::Overlay`, so the filter had nothing left to strip and its own guard
-  assertion caught it (`core_carries_no_write_side_teaching` still passes, now resting
-  on upstream's default plus kaibo never opting in). It also forced one grammar-driven
-  prose edit: a bare comma became an ordinary bareword outside `[...]`/`{...}`, so the
-  preamble's "quote the range, because an unquoted comma splits the argument" rationale
-  went false; the quoted `sed` examples stayed, the false reason didn't, and the test
-  now asserts the reason's **absence**. The lesson worth keeping: kaish's approvals
-  ledger (`/v/approvals`) was cut before the 0.14.0 tag, so a probe of that path would
-  have reported "not found" either way — an all-clear that would have meant nothing.
-  Check that a probe reports differently if its subject is broken versus if the probe
-  itself is.
+- **kaish pin.** Currently `kaish-kernel = "0.17.0"` (from 0.14.1, inheriting three
+  releases' breaks; compile-time exposure was one `#[non_exhaustive]` match arm).
+  **When you bump kaish, run the shell — a green build is not the check.** That bump's
+  four behavioral changes all reached the model-facing surface and none broke
+  compilation; two made kaibo's own prose false. Diff the composed contract under both
+  versions with a throwaway crate calling `compose(&Recipe::tool_description(), …)`,
+  then probe the shell by hand. And **grep for any idiom you correct — a kaish idiom is
+  never in one file** (the `grep -rn PATTERN .` fix landed in six). Each bump's own
+  story stays in its PR.
