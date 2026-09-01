@@ -21,7 +21,7 @@ path = "src/main.rs"
 # `os-integration` (trash) OFF — so those builtins are never compiled in. kaibo's
 # read-only safety is thus structural (the dangerous surface doesn't exist),
 # backed by the runtime read-only mount; see src/sandbox.rs.
-kaish-kernel = { version = "0.14.1", default-features = false, features = ["localfs"] }
+kaish-kernel = { version = "0.17.0", default-features = false, features = ["localfs"] }
 # `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
 # named here rather than inherited from a transitive enabler.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

@@ -959,3 +959,100 @@ async fn sweep_attach_refuses_a_symlink_escape() {
         "a symlink escaping the root must be refused: {receipt}"
     );
 }
+
+// --- (5b) mount-layer probe: symlink METADATA vs symlink CONTENT -------------
+
+/// The companion to [`mount_layer_symlink_in_allowed_pointing_outside`], which pins
+/// the *content* half. kaish 0.17 made `ls -l`, `stat`, `readlink`, and `find -type l`
+/// describe a symlink with `lstat` instead of following it, so a link inside the
+/// allowed tree pointing outside now renders its **target path string** where kaish
+/// 0.14 refused. This test states the boundary that replaced it, in two halves:
+///
+/// 1. **The target string is readable, and that is deliberate.** A symlink's target
+///    is bytes stored inside the allowed tree — reading it is reading project
+///    content, and refusing would make `ls -l` misdescribe a directory kaibo is
+///    allowed to list.
+/// 2. **Nothing else crosses.** Every verb that would *follow* the link out still
+///    refuses, and — the property that makes half 1 safe — the refusal is decided by
+///    path arithmetic before any syscall reaches the target, so an existing target, a
+///    missing one, and an unreadable one are indistinguishable. A hostile repo gets
+///    back the string it wrote into its own link and nothing about the host, not even
+///    existence.
+///
+/// If half 2 ever weakens — outside bytes appear, or the three refusals stop matching
+/// — this test fails, and that is an escalation, not a re-baseline: the disclosure in
+/// half 1 is only acceptable *because* half 2 holds.
+#[tokio::test]
+async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
+    let allowed = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let secret = outside.path().join("outside_secret.txt");
+    fs::write(&secret, "outside-contents-xyz\n").unwrap();
+    let missing = outside.path().join("definitely-not-here.txt");
+    assert!(!missing.exists(), "the missing-target fixture must not exist");
+
+    std::os::unix::fs::symlink(&secret, allowed.path().join("to_existing")).unwrap();
+    std::os::unix::fs::symlink(&missing, allowed.path().join("to_missing")).unwrap();
+
+    let handler = handler_with_allowed(Some(allowed.path()), &[]);
+    let root = allowed.path().to_string_lossy().to_string();
+
+    // --- half 1: the link's own target string is readable ---------------------
+    let shown = try_run(&handler, &root, "readlink to_existing")
+        .await
+        .expect("reading the link itself stays inside the tree, so it succeeds");
+    assert!(
+        shown.contains(&secret.display().to_string()),
+        "`readlink` names the link's target verbatim — that string is project content; \
+         got: {shown}"
+    );
+
+    // --- half 2a: no bytes cross ----------------------------------------------
+    // `cat` is covered by the sibling test; `stat -L` and `wc -c` are the verbs 0.17
+    // newly split from their lstat forms, so they are the ones worth pinning here.
+    for script in ["cat to_existing", "stat -L to_existing", "wc -c to_existing"] {
+        let out = try_run(&handler, &root, script).await;
+        let text = match &out {
+            Ok(t) => t.clone(),
+            Err(e) => e.clone(),
+        };
+        assert!(
+            !text.contains("outside-contents-xyz"),
+            "MOUNT-LAYER SYMLINK LEAK: `{script}` returned bytes from outside the \
+             allowed tree — escalate before shipping. Got: {text}"
+        );
+    }
+
+    // --- half 2b: no existence oracle -----------------------------------------
+    // The refusal must be decided by path arithmetic, not by touching the target. So
+    // an existing target and a missing one must refuse the same way; if they ever
+    // diverge, a hostile repo can probe the host filesystem one link at a time.
+    let existing = try_run(&handler, &root, "cat to_existing").await;
+    let absent = try_run(&handler, &root, "cat to_missing").await;
+    // `run_kaish` reports a refused builtin as a successful CALL carrying kaish's exit
+    // code and stderr, so both arms land in `Ok` — normalize the text, not the variant.
+    // Two things legitimately differ and neither is a host fact: the target path the
+    // repo itself wrote, and the link's own name.
+    let shape = |r: &Result<String, String>, target: &std::path::Path, link: &str| {
+        let text = match r {
+            Ok(t) => t.clone(),
+            Err(e) => e.clone(),
+        };
+        text.replace(&target.display().to_string(), "<TARGET>")
+            .replace(link, "<LINK>")
+    };
+    let existing_shape = shape(&existing, &secret, "to_existing");
+    assert_eq!(
+        existing_shape,
+        shape(&absent, &missing, "to_missing"),
+        "EXISTENCE ORACLE: a link to an existing outside file and a link to a missing \
+         one must be indistinguishable once the repo's own target string is removed — \
+         otherwise the tree can be probed one link at a time. Escalate before shipping."
+    );
+    // And the shared outcome must be a refusal, not a shared success — two identical
+    // `cat`s that both PRINTED the file would also compare equal.
+    assert!(
+        existing_shape.contains("permission denied") && existing_shape.contains("escapes root"),
+        "the shared outcome must be the path-escape refusal, got: {existing_shape}"
+    );
+}

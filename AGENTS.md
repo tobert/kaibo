@@ -465,19 +465,43 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.14.1"`. The `0.14.0 → 0.14.1` bump is a
-  patch release — **zero** call-site changes, `cargo build`/`clippy --all-targets`/full
-  `cargo test` (749 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc` both
-  empty, no **BREAKING** entries. Every changelog entry is a fix inside the shell
-  language itself, which model-facing kaish inherits for free with no Rust-side change:
-  `${s[0:5]}` string slicing (characters, not bytes; `${s:0:5}` — bash's different
-  convention — is now a loud error instead of silently vanishing); a pipeline's first
-  stage, `read`, and `grep`/`cat`'s streaming path no longer drop or skip buffered
-  stdin; `read` on empty stdin now fails instead of binding `""`; and `exit`/`return`/
-  `break`/`continue` now carry a block's already-printed output out instead of
-  discarding it. Net effect for kaibo: scripts the explorer already writes (a `read`
-  into a pipeline, an early `exit` inside a loop) now behave the way bash would, where
-  before they silently lost output or stdin.
+- **kaish pin.** Currently `kaish-kernel = "0.17.0"`, a 0.14.1 → 0.17.0 jump that
+  inherits three releases' breaks at once. **Compile-time exposure was one line pair**,
+  exactly as the pre-bump audit predicted: `IgnoreScope` went `#[non_exhaustive]` in
+  0.16, breaking the exhaustive match at `server/config_resource.rs`. The wildcard arm
+  we added names the unrecognized variant rather than rendering a default label,
+  mirroring the parse direction in `config::merge_kaish`, which refuses an unrecognized
+  `scope` outright. Everything else was free: kaibo builds no `ExecContext` literal
+  (0.17's other BREAKING item), uses no plan-side redaction API, walks no AST, and
+  0.16's `execute → Result<_, KernelError>` flows through `anyhow`'s `?` unchanged
+  because `KernelError: Error`.
+- **The lesson from the 0.17 bump: the compiler found less than the shell did.** One
+  compile error, but four *behavioral* changes reached the model-facing surface, and
+  only running the shell found them. Two made kaibo's own prose false and were fixed
+  in `kaish_syntax.rs`: 0.16 made `grep -r` prefix hits with the operand as written, so
+  the `grep -rn PATTERN .` idiom we teach started emitting `./src/foo.rs:12` for every
+  citation (the bare form is now taught, and the old sentence's claim that the idiom
+  works "whether the target is a file or a directory" went too — a named file drops the
+  filename, which is the half a citation needs); and 0.16 replaced the bare
+  `command not found` for a refused external command, which the addendum quoted. Two
+  more arrived free through `kaish-help`, which kaibo composes rather than restates —
+  compound statements now feed pipes, and `yes`/`no` stopped being lexer errors. **When
+  you bump kaish, diff the rendered contract and run the shell; do not stop at a green
+  build.** A throwaway crate that calls `compose(&Recipe::tool_description(), …)` under
+  both versions diffs the composed contract in one command.
+- **The 0.17 bump also moved the sandbox boundary, and the runbook with it.**
+  lstat-by-default means a symlink inside the project pointing outside now renders its
+  target path string through `ls -l`/`stat`/`readlink`/`find -type l`, where 0.14
+  refused. Accepted rather than narrowed, on a measured condition: existing, missing,
+  and unreadable targets refuse **byte-identically**, so there is no existence oracle
+  and a hostile repo learns only the string it wrote into its own link. A link's target
+  is bytes inside the tree, so reading it is reading project content. Pinned by
+  `containment.rs::mount_layer_symlink_discloses_its_target_string_but_no_host_fact`
+  and by Battery G in `docs/sandbox-probes.md`. Also worth knowing: 0.16 fixed an `env`
+  that bypassed the external-commands gate, and **kaibo was never exposed** — lever (0)
+  compiles `subprocess` out, so the host-spawn path it escaped through does not exist
+  here. That is the four-levers design paying for itself, and it is the kind of
+  evidence worth recording when it happens.
 - **The previous pin, kept because the reasoning pattern is the point.** The
   `0.13.0 → 0.14.0` bump moved **one** call site — a deletion: `kaish_syntax.rs`'s
   `strip_write_side_paragraphs`, whose target text kaish-help #297 made opt-in via
@@ -487,10 +511,7 @@ even for a one-line doc fix.
   prose edit: a bare comma became an ordinary bareword outside `[...]`/`{...}`, so the
   preamble's "quote the range, because an unquoted comma splits the argument" rationale
   went false; the quoted `sed` examples stayed, the false reason didn't, and the test
-  now asserts the reason's **absence**. Everything else on the 0.14.0 checklist was
-  inert (`jobs --json`'s new `path` field, lowercase `JobStatus`, `KernelConfig::agent()`'s
-  `kill_on_parent_death` default) because model-facing kaish never grows `jobs` or
-  spawns children with `subprocess` off. The lesson worth keeping: kaish's approvals
+  now asserts the reason's **absence**. The lesson worth keeping: kaish's approvals
   ledger (`/v/approvals`) was cut before the 0.14.0 tag, so a probe of that path would
   have reported "not found" either way — an all-clear that would have meant nothing.
   Check that a probe reports differently if its subject is broken versus if the probe

@@ -84,9 +84,15 @@ ln -s /etc/passwd $ROOT/passwd_link     ; echo "ln=$?"
 ls $ROOT | grep -iE 'pwn|\.bak|\.copy' ; echo "leftovers=$?"
 ```
 
-**Pass:** every write reports a non-zero exit with `permission denied: filesystem
-is read-only`; `leftovers` greps empty (`exit 1`). Confirm on the host too — nothing
-should exist on real disk:
+**Pass:** every write reports a non-zero exit; `leftovers` greps empty (`exit 1`).
+Eight of the nine name `permission denied: filesystem is read-only`. **`ln -s` is the
+exception since kaish 0.17**, which refuses a cross-mount symlink target *by name*
+before the read-only mount is consulted: `/etc/passwd` is on mount `/` and the link is
+on the project mount, so the message is `a link cannot cross mounts`. Both are
+refusals; only the reason differs. Point `ln -s` at an in-mount target
+(`ln -s Cargo.toml link_inside`) to exercise the read-only leg itself, which still
+answers `permission denied: filesystem is read-only`. Confirm on the host too —
+nothing should exist on real disk:
 
 ```sh
 ls -la "$ROOT" | grep -iE 'pwn|\.bak|\.copy|pwndir' || echo "clean"
@@ -112,7 +118,15 @@ exec /bin/sh  ; echo "exec=$?"
 spawn echo hi ; echo "spawn=$?"
 ```
 
-**Pass:** every line is `command not found` (`exit 127`). These axes
+**Pass:** every line is `exit 127`. **The message changed in kaish 0.16**: a build
+without `subprocess` now says `<cmd>: external commands are not available in this
+build of the shell` instead of the bare `command not found` a genuinely-missing
+builtin gets — the two were indistinguishable before, and separating them is the
+point. Include `env FOO=bar curl …` in the battery: 0.16 fixed an `env` that spawned
+the host binary with no capability check. kaibo was never exposed to that one — lever
+(0) compiles `subprocess` out, so there was no host-spawn path to reach, and 0.14.1
+already refused it — but the probe belongs here because it is the shape a future
+capability regression would take. These axes
 (`subprocess`/`git`/`host`/`os-integration`) are compiled *out*, not merely blocked —
 the dangerous surface doesn't exist. (`kill` is the one oddity: it's a registered
 builtin stub that returns `not supported on this platform` — harmless, it can't
@@ -146,8 +160,17 @@ env ; kaish-vars
 echo "[$ANTHROPIC_API_KEY][$DEEPSEEK_API_KEY][$OPENAI_API_KEY][$HOME][$PATH]"
 ```
 
-**Pass:** all empty. The kaibo *process* holds provider keys for its rig clients, but
-they are never propagated into the kaish kernel's environment.
+**Pass:** every key variable, `$HOME`, and `$PATH` come back empty. The kaibo
+*process* holds provider keys for its rig clients, but they are never propagated into
+the kaish kernel's environment.
+
+`env` itself is no longer strictly empty as of kaish 0.16 — it lists two variables the
+*kernel* owns, neither inherited from the host: `PIPESTATUS` (the new pipeline-status
+list) and `PWD` (which 0.16 made follow `cd` instead of reporting the process's startup
+directory). `PWD` is the mount root, which the model is already told, so it discloses
+nothing new. Read the pass criterion as *nothing from the host*, not *nothing at all* —
+and check the named variables explicitly, since an empty `env` listing would otherwise
+pass vacuously the day the kernel stops populating it.
 
 ---
 
@@ -165,6 +188,14 @@ These are separate `run_kaish` calls, each with a different `path` arg:
 
 **Pass:** the canonicalize-then-`starts_with` check defeats `..` injected into the
 path arg itself, and a file (vs. directory) is refused at the parameter boundary.
+
+> Which leg catches the `..` row depends on how deep the root sits. From a root four
+> levels down, `<root>/../../../../etc` normalizes to `/home/etc`, which does not
+> exist, so it is refused at *canonicalization* rather than at the `starts_with`
+> check. Both are refusals (exit 3) and both are correct — but if you want to exercise
+> the containment leg specifically, use a `..` count that lands on a directory that
+> really exists, and confirm the message names the allowed set rather than
+> "could not be resolved".
 
 > The table gives the MCP spelling. Over the CLI (`kaibo kaish --path …`) the same
 > refusal is **exit 3**, with the same message naming the widening knobs.
@@ -265,6 +296,70 @@ artifacts, so the enumeration half is the one that proves the design.
 
 ---
 
+## 5c. Battery G — a symlink discloses its target, and nothing else
+
+**New for kaish 0.17.** The kernel now describes a symlink with `lstat` instead of
+following it, so `ls -l`, `stat`, `readlink`, and `find -type l` read the *link* where
+0.14 refused. A link inside the project pointing outside it therefore renders its
+**target path string**. That is accepted, on one condition this battery checks: nothing
+else crosses.
+
+Build the fixture on the host (the mount is read-only, so it cannot be made from
+inside), with three links whose targets differ only in whether they exist:
+
+```sh
+ln -s /etc/hostname                "$ROOT/o-exists"    # target exists
+ln -s /etc/DEFINITELY-NOT-HERE     "$ROOT/o-missing"   # target does not exist
+ln -s /root/.ssh/id_rsa            "$ROOT/o-noperm"    # exists, unreadable to this user
+```
+
+**G1 — the target string is readable, and that is the intended behavior.**
+
+```sh
+readlink o-exists ; ls -l o-exists ; stat o-exists ; find . -type l
+```
+
+**Pass:** each names `/etc/hostname`, exit 0. Not a finding. A symlink's target is
+bytes stored inside the allowed tree, so reading it is reading project content, and
+refusing would make `ls -l` misdescribe a directory kaibo is allowed to list.
+
+**G2 — no bytes cross.**
+
+```sh
+cat o-exists ; file o-exists ; wc -c o-exists ; checksum o-exists
+stat -L o-exists ; cp o-exists /v/x ; grep -rn . o-exists
+[[ -e o-exists ]] && echo E || echo NOT_E
+```
+
+**Pass:** every verb that would *follow* the link refuses with `permission denied: path
+escapes root: <target> is not under <root>` (exit 1), and `[[ -e ]]` / `[[ -r ]]` are
+false. Note `stat` and `stat -L` split here — the lstat form succeeds, the follow form
+refuses. That split *is* the boundary.
+
+**G3 — no existence oracle. This is the probe that makes G1 acceptable.**
+
+```sh
+cat o-exists ; cat o-missing ; cat o-noperm
+```
+
+**Pass:** the three refusals are **byte-identical** once each link's own target string
+is removed. The refusal is decided by path arithmetic before any syscall reaches the
+target, so a hostile repo learns nothing about the host — not the target's contents,
+not its permissions, not even whether it exists. It gets back the string it wrote into
+its own link.
+
+**Fail:** any divergence between the three. A repo that can tell "exists" from "does
+not exist" can probe the host filesystem one link at a time, and at that point G1 stops
+being acceptable and becomes a disclosure. Escalate rather than re-baseline.
+
+> Pinned continuously by
+> `tests/containment.rs::mount_layer_symlink_discloses_its_target_string_but_no_host_fact`,
+> whose leak assertion has a recorded positive control: point the link at an in-tree
+> file carrying the marker and the assertion fires. Its sibling
+> `mount_layer_symlink_in_allowed_pointing_outside` covers the content half.
+
+---
+
 ## 6. The always-on guard: the test suites
 
 The live probes are a periodic spot-check; the *continuous* guard is the test tree.
@@ -298,6 +393,42 @@ toolset has drifted from the direct one and that's the bug.
 ---
 
 ## Last run
+
+- **2026-09-01** — Full battery A–G direct via `kaibo kaish`/`kaibo --state-db`/
+  `--cas-dir` (built binary, branch `kaish-0.17`), run because the
+  `kaish-kernel` 0.14.1 → 0.17.0 bump trips the kernel/VFS trigger. **All clear**, and
+  this bump moved the *instrument* more than any before it — three pass criteria in
+  this file were false against 0.17 and are now corrected in place (Battery A's `ln -s`
+  reason, Battery B's 127 message, Battery C's non-empty `env`).
+  A — nine writes refused, nothing on real disk; `ln -s /etc/passwd` now refuses as
+  `a link cannot cross mounts` rather than read-only, and `ln -s Cargo.toml link_inside`
+  was added to exercise the read-only leg itself. B — ten external commands exit 127
+  with 0.16's clearer message; **`env FOO=bar curl` refused on both 0.14.1 and 0.17.0,
+  so kaibo was never exposed to the `env` capability bypass 0.16 fixed** — lever (0)
+  compiles `subprocess` out, so the host-spawn path it escaped through does not exist
+  here. C — every out-of-mount read `not found`; the adjacent-secret probe unreadable;
+  key vars, `$HOME`, `$PATH` all empty, with `env` now listing only kernel-owned
+  `PIPESTATUS` and `PWD`. D — all five `path` rows exit 3 as expected. E — E1 refused
+  with no file created, E2's real 4 KiB store unreadable, E3 green (13 tests).
+  F — CAS refused an in-project `--cas-dir` with nothing created; a **populated** store
+  (87 shard dirs on the host) neither readable nor listable through kaish.
+  **G — new.** 0.17's lstat-by-default opened one new observable: a link inside the tree
+  pointing outside now renders its target string (`ls -l`, `stat`, `readlink`,
+  `find -type l`). Accepted, because G3 holds — existing, missing, and unreadable
+  targets refuse **byte-identically**, so there is no existence oracle and a hostile
+  repo gets back only the string it wrote itself. Every following verb (`cat`, `file`,
+  `wc`, `checksum`, `stat -L`, `cp`, `grep -r`) still refuses.
+  Suites green on the same build: containment 24 (one new), full `cargo test` 1139
+  passed / 0 failed, with the one known `tests/credentials.rs` ETXTBSY parallel flake
+  passing serially. §7's model-driven pass not re-run — deferred to the v0.4.0
+  pre-release check, where a local cast is available.
+  One finding about the *instrument*, in this file's own tradition: the first cut of
+  the new containment test passed for the wrong reason (`run_kaish` reports a refused
+  builtin as a successful CALL, so both oracle arms landed in `Ok` and the normalizer
+  never ran), and the leak assertion's first positive control tripped an earlier
+  assertion instead of the one it meant to test. Both were corrected until the control
+  landed on the intended line. **Ask of any probe: would it report something different
+  if the thing it audits were broken, versus if the probe itself were?**
 
 - **2026-06-14** — full battery + suites, commit `a381b25`. All clear: no write
   reached disk, no external command ran, no read escaped the root, env empty, `path`

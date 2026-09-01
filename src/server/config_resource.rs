@@ -179,7 +179,9 @@ pub(crate) fn render_config_resource(
         /// User's global gitignore (`core.excludesFile`) honored.
         global_gitignore: bool,
         /// `"enforced"` (all walkers incl. `find`) or `"advisory"` (polite tools only).
-        scope: &'static str,
+        /// A scope kaish added and kaibo has not mapped renders as
+        /// `"unrecognized (<variant>)"` — never as one of the two kaibo knows.
+        scope: String,
     }
 
     #[derive(Serialize)]
@@ -675,9 +677,14 @@ pub(crate) fn render_config_resource(
                 defaults: ignore.use_defaults(),
                 auto_gitignore: ignore.auto_gitignore(),
                 global_gitignore: ignore.use_global_gitignore(),
+                // `IgnoreScope` is `#[non_exhaustive]`: a kaish release can add a scope
+                // kaibo's loader cannot produce. Name it rather than render one of the
+                // two labels for it — the same posture as the parse direction in
+                // `config::merge_kaish`, which refuses an unrecognized `scope` outright.
                 scope: match ignore.scope() {
-                    kaish_kernel::IgnoreScope::Enforced => "enforced",
-                    kaish_kernel::IgnoreScope::Advisory => "advisory",
+                    kaish_kernel::IgnoreScope::Enforced => "enforced".to_string(),
+                    kaish_kernel::IgnoreScope::Advisory => "advisory".to_string(),
+                    other => format!("unrecognized ({other:?})"),
                 },
             },
         },

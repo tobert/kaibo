@@ -81,6 +81,26 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **kaish upgraded to 0.17.0** (from 0.14.1) — the read-only shell gains symlink
+  support, pipeline-stage compound statements, `set -o pipefail`, and base-aware
+  arithmetic.
+- **`grep -rn PATTERN` is what kaibo teaches now**, without the trailing `.` — kaish
+  0.16 prefixes hits with the operand as written, so the bare form is the one that
+  yields repo-relative `file:line` citations.
+- **A refused external command explains itself** — `curl: external commands are not
+  available in this build of the shell` rather than a bare `command not found`, still
+  exit 127.
+- **`ls -l`, `stat`, `readlink`, and `find -type l` describe a symlink itself** instead
+  of following it, so a link is visible as a link. A link pointing outside the project
+  shows its target path; every read that would follow it out is still refused.
+- **A compound statement can feed a pipe** — `for f in …; do …; done | grep x` is no
+  longer a parse error.
+- **`yes` and `no` are ordinary strings**, not lexer errors, so `echo yes` runs.
+- **`${#v}` counts characters, not bytes**, and a non-ASCII value no longer fails to
+  lex — `v=日本語; echo ${#v}` answers 3.
+- **Arithmetic refuses a leading zero and reads other bases** — `$((007))` names the
+  spelling that works, `$((0xff))` is 255.
+
 - **kaibo now fetches a generated artifact's URL when that is how a provider delivers
   it**, over TLS and size-bounded, instead of refusing it — otherwise the operator
   fetches the link by hand with their key.

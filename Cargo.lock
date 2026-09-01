@@ -1799,9 +1799,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca46877cd7054bab96febfd74cbbee5171117aeefe3e9f45225d76d149e5b58c"
+checksum = "8c827be08f68998d484f1f8ab75bc9286d5af73914e68922e3307df172b70c5f"
 dependencies = [
  "async-trait",
  "ignore",
@@ -1811,18 +1811,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86524376f903577c9662191da4b332d6252fa4b537c9c836161c96283713df6e"
+checksum = "66429f16e23a1cde9d3f31576ee7f5c8702cde9ffe61dcba8d764293fae43141"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c5acec8d7d4a6ddb8d2073cb46fd2e2c073ef1312de9e26e6453173edb90cb8"
+checksum = "272ad77a8b76a4421f0825f6a3f933e03565c2cd5695220d94f1393faf17376c"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1862,14 +1862,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-opentelemetry 0.32.1",
+ "unicode-ident",
+ "unicode-normalization",
+ "unicode-script",
+ "unicode-security",
  "unicode-width 0.2.2",
 ]
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fc289a868ae84be26ae734f009c6c9d74730398605fbd589ca0ed69af68b3c5"
+checksum = "456b91321479390b3fadc10f5973aa969fec0aa89abb513d671e2218bbd0c4b2"
 dependencies = [
  "async-trait",
  "clap",
@@ -1878,9 +1882,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff88d6ba8a63a0f86bfe2042dbedd6f619eacb8180642f894a839984db83c2d8"
+checksum = "303b23573cb6e586fa3e1207ecb6d0e8778f575b0be180d11298704db34fe592"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1892,13 +1896,14 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be31036c668524eda6cdf449ec9b7584c83c2632359f5bb9f6122fa7ac998be4"
+checksum = "36d977d0d38ca7707d88dc8514319403b364517ebf7afb76251432962a67a93b"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
  "kaish-types",
+ "rustix 1.1.4",
  "tokio",
 ]
 
@@ -3639,6 +3644,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f"
+dependencies = [
+ "tinyvec_macros",
+]
+
+[[package]]
+name = "tinyvec_macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
 name = "tokio"
 version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4172,6 +4192,31 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
+
+[[package]]
+name = "unicode-security"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e4ddba1535dd35ed8b61c52166b7155d7f4e4b8847cec6f48e71dc66d8b5e50"
+dependencies = [
+ "unicode-normalization",
+ "unicode-script",
+]
 
 [[package]]
 name = "unicode-segmentation"
