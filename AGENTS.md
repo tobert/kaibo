@@ -452,11 +452,13 @@ even for a one-line doc fix.
 - **Cutting a release.** Bump `version` in `Cargo.toml`, retitle the unreleased
   section to `## [X.Y.Z] — <date>` and open a fresh empty unreleased section above it,
   then tag `vX.Y.Z` — `.github/workflows/release.yml` builds the platform matrix on a
-  `v*` tag. Before tagging: confirm the `kaish-kernel` and `turso` pins are current, and
-  verify `cargo tree -i` is empty for `aws-lc-rs` and `mimalloc` and the musl binary is
-  `not a dynamic executable`. Re-run `docs/sandbox-probes.md` when this release changed
-  the sandbox rules or the VFS — a `kaish-kernel` bump is the common case, so check the
-  pin first.
+  `v*` tag. Before tagging: confirm the `kaish-kernel` and `turso` pins are current
+  *and* carry no known unfixed bug — current is not the same as good, and a bump is
+  often what finds one, so hold the release for the patch and keep developing on the
+  pin (a merge is reversible; a release is not). Verify `cargo tree -i` is empty for
+  `aws-lc-rs` and `mimalloc` and the musl binary is `not a dynamic executable`. Re-run
+  `docs/sandbox-probes.md` when this release changed the sandbox rules or the VFS — a
+  `kaish-kernel` bump is the common case, so check the pin first.
   After the release publishes: run the README "Verify a download" commands against a
   fresh asset (`gh attestation verify`, `cosign verify-blob` with the new tag's
   identity) — the tag-gated publish job signs releases, and signing an operator can't
@@ -465,33 +467,12 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.14.1"`. The `0.14.0 → 0.14.1` bump is a
-  patch release — **zero** call-site changes, `cargo build`/`clippy --all-targets`/full
-  `cargo test` (749 passed) all clean, `cargo tree -i aws-lc-rs` and `-i mimalloc` both
-  empty, no **BREAKING** entries. Every changelog entry is a fix inside the shell
-  language itself, which model-facing kaish inherits for free with no Rust-side change:
-  `${s[0:5]}` string slicing (characters, not bytes; `${s:0:5}` — bash's different
-  convention — is now a loud error instead of silently vanishing); a pipeline's first
-  stage, `read`, and `grep`/`cat`'s streaming path no longer drop or skip buffered
-  stdin; `read` on empty stdin now fails instead of binding `""`; and `exit`/`return`/
-  `break`/`continue` now carry a block's already-printed output out instead of
-  discarding it. Net effect for kaibo: scripts the explorer already writes (a `read`
-  into a pipeline, an early `exit` inside a loop) now behave the way bash would, where
-  before they silently lost output or stdin.
-- **The previous pin, kept because the reasoning pattern is the point.** The
-  `0.13.0 → 0.14.0` bump moved **one** call site — a deletion: `kaish_syntax.rs`'s
-  `strip_write_side_paragraphs`, whose target text kaish-help #297 made opt-in via
-  `Concept::Overlay`, so the filter had nothing left to strip and its own guard
-  assertion caught it (`core_carries_no_write_side_teaching` still passes, now resting
-  on upstream's default plus kaibo never opting in). It also forced one grammar-driven
-  prose edit: a bare comma became an ordinary bareword outside `[...]`/`{...}`, so the
-  preamble's "quote the range, because an unquoted comma splits the argument" rationale
-  went false; the quoted `sed` examples stayed, the false reason didn't, and the test
-  now asserts the reason's **absence**. Everything else on the 0.14.0 checklist was
-  inert (`jobs --json`'s new `path` field, lowercase `JobStatus`, `KernelConfig::agent()`'s
-  `kill_on_parent_death` default) because model-facing kaish never grows `jobs` or
-  spawns children with `subprocess` off. The lesson worth keeping: kaish's approvals
-  ledger (`/v/approvals`) was cut before the 0.14.0 tag, so a probe of that path would
-  have reported "not found" either way — an all-clear that would have meant nothing.
-  Check that a probe reports differently if its subject is broken versus if the probe
-  itself is.
+- **kaish pin.** Currently `kaish-kernel = "0.17.0"` (from 0.14.1, inheriting three
+  releases' breaks; compile-time exposure was one `#[non_exhaustive]` match arm).
+  **When you bump kaish, run the shell — a green build is not the check.** That bump's
+  four behavioral changes all reached the model-facing surface and none broke
+  compilation; two made kaibo's own prose false. Diff the composed contract under both
+  versions with a throwaway crate calling `compose(&Recipe::tool_description(), …)`,
+  then probe the shell by hand. And **grep for any idiom you correct — a kaish idiom is
+  never in one file** (the `grep -rn PATTERN .` fix landed in six). Each bump's own
+  story stays in its PR.

@@ -34,6 +34,15 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// Plain and literal per the agent-facing clarity rule in AGENTS.md — this block is
 /// embedded in every preamble, so an idiom here is charged to every model we drive.
 ///
+/// The grep idiom is written **without an operand**, and that is deliberate. kaish
+/// 0.16 made `grep -r` prefix each hit with the operand as written, matching GNU: an
+/// explicit `.` yields `./src/foo.rs:12`, a named file yields no path at all, and only
+/// a *defaulted* operand yields the bare `src/foo.rs:12` a citation wants. Since every
+/// call starts at the project root, the operand kaibo used to teach only ever added
+/// two characters to every citation the explorer earns. The old sentence also promised
+/// the idiom worked "whether the target is a file or a directory" — the file case
+/// drops the filename, which is the half a citation needs, so the promise went with it.
+///
 /// Every `sed` range here is written **quoted**, but the addendum no longer explains
 /// why, because the reason stopped being true. kaish reserved a bare comma through
 /// 0.13, making `sed -n 120,400p` a parse error; kaish 0.14 made a comma an ordinary
@@ -44,16 +53,19 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so your work here is reading. Read \
-files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN .` finds matches whether \
-the target is a file or a directory. When a grep hit lands in a large file, read a \
+files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN` searches the \
+whole project and prefixes every hit with its path from the root. When a grep hit \
+lands in a large file, read a \
 wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that range \
 with its real line numbers. Run `file FILE` on an unfamiliar file first; it names \
 the content as text or binary, so you know what you are about to read. \
 Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
-script was killed for running past its time budget; 127 is command-not-found, which \
-is how every external command answers here; 1 is an ordinary failure, and a refused \
+script was killed for running past its time budget; 127 is how every external \
+command answers here — its message names the refusal, as in `curl: external \
+commands are not available in this build of the shell`; 1 is an ordinary failure, \
+and a refused \
 write is one of those — its message reads `permission denied: filesystem is \
 read-only`. Read the message and not only the code, because that sentence is what \
 tells a refusal apart from a mistake. \
@@ -369,8 +381,9 @@ pub fn kaibo_sandbox_doc() -> String {
          Lead with line numbers so every claim cites `file:line`, and read files \
          whole:\n\
          - `cat -n FILE` — the whole file, numbered; the default move on any file that matters\n\
-         - `grep -rn PATTERN [PATH]` — find which files matter, then open them whole\n\
-         - `grep -rn -B3 -A6 PATTERN .` — preview matches in context across files\n\
+         - `grep -rn PATTERN` — find which files matter, then open them whole; every hit is prefixed with its path from the project root\n\
+         - `grep -rn -B3 -A6 PATTERN` — preview matches in context across files\n\
+         - `grep -rn PATTERN DIR/` — narrow to a subtree; hits are prefixed with the operand as written, so a named directory still cites a usable path\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
          - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file\n\
          - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
@@ -392,8 +405,9 @@ pub fn kaibo_sandbox_doc() -> String {
          - `124` — killed for exceeding the per-exec time budget\n\
          - `126` — a builtin the operator disabled in kaibo's config; the default \
          config disables none, so you will rarely see this\n\
-         - `127` — command not found. Every external command answers this way, which \
-         is what makes the host unreachable from here\n\
+         - `127` — every external command answers this way, and its message names \
+         the refusal (`curl: external commands are not available in this build of \
+         the shell`), which is what makes the host unreachable from here\n\
          - `130` — the script was cancelled\n\
          - other non-zero — the script itself failed\n\n\
          ## Learn more kaish\n\

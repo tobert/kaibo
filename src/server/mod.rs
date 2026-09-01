@@ -2636,7 +2636,7 @@ impl KaiboHandler {
     #[tool(
         description = "Run a kaish (sh-like) script against the READ-ONLY project; \
             returns exit code + stdout + stderr. Read generously with line numbers — \
-            `cat -n FILE` for a whole file, `grep -rn PATTERN .` to locate across \
+            `cat -n FILE` for a whole file, `grep -rn PATTERN` to locate across \
             files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
             refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
             external commands are unreachable (exit 127); 124 = timed out. \
@@ -4469,7 +4469,7 @@ byte forever.
 `run_kaish` runs a kaish (sh-like) script against the project and returns exit code +
 stdout + stderr. Lead with the idioms that produce accurate `file:line`s: `cat -n FILE`
 to read a file WHOLE (the default; most files fit in one read),
-`grep -rn PATTERN .` to find which files matter. A whole read that truncates (exit 3)
+`grep -rn PATTERN` to find which files matter. A whole read that truncates (exit 3)
 still returns the start and end of the file; read the rest as targeted wide spans
 (`grep -n SYMBOL FILE`, then `cat -n FILE | sed -n '1200,2400p'`). Compose builtins with pipes
 (`grep`/`jq`/`awk`/`find`/…). Each call starts fresh at the project root.

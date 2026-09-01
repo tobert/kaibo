@@ -507,7 +507,7 @@ pub struct DeliberateArgs {
 pub struct KaishArgs {
     /// The kaish (sh-like) script to run against the read-only project. Required — kaibo
     /// has no interactive shell, so `-c` is the only way in (a missing `-c` is a usage
-    /// error, not a prompt). `cat -n FILE`, `grep -rn PATTERN .`, pipes with jq/awk/find.
+    /// error, not a prompt). `cat -n FILE`, `grep -rn PATTERN`, pipes with jq/awk/find.
     #[arg(short = 'c', value_name = "SCRIPT")]
     pub command: Option<String>,
 
