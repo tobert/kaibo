@@ -434,6 +434,19 @@ pub fn response_error(msg: impl Into<String>) -> CompletionError {
     CompletionError::ResponseError(msg.into())
 }
 
+/// A provider error carrying an HTTP status and body — the shape
+/// `CompletionError::from_http_response` builds from a real non-success response.
+/// This is the only way to construct a status-bearing [`CompletionError`] offline, so
+/// it is what drives [`Retried`](crate::completion_retry::Retried)'s
+/// transient-transport classification and its delay-hint parsing in tests. `status`
+/// must be a valid three-digit HTTP status (100-999); anything else is a test bug, so
+/// this panics rather than silently degrading to a status-less error.
+pub fn status_error(status: u16, body: impl Into<String>) -> CompletionError {
+    let status = http::StatusCode::from_u16(status)
+        .unwrap_or_else(|_| panic!("{status} is not a valid HTTP status code"));
+    CompletionError::from_http_response(status, body)
+}
+
 // ---- request accessors -----------------------------------------------------
 
 /// Concatenated text of every `User` message in the request history, oldest→newest,

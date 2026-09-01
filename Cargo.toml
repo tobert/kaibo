@@ -182,6 +182,14 @@ opentelemetry-appender-tracing = "0.32"
 # so it's ours, not implicit, matching how the other deps above are documented.
 sha2 = "0.10"
 
+# Full jitter for the transient-transport backoff (src/completion_retry.rs): kaibo's
+# own bursts (rig's `buffer_unordered` tool-call fan-out) can put several arms into a
+# rate limit together, so each wait is drawn uniformly at random instead of every
+# caller retrying on the same clock. Pure Rust, no C/asm; already in the tree
+# transitively via opentelemetry_sdk (both kaish-kernel's and kaibo's own pin), so this
+# adds zero new crates — named here so the dep is ours, not implicit.
+rand = "0.9"
+
 # libc is already in the tree transitively (getrandom); named here explicitly, scoped
 # to unix only so no new build cost lands on Windows. Two uses: local-filesystem
 # validation for the persistence store (src/store.rs, Linux-only `statfs` — turso's
@@ -214,3 +222,10 @@ rmcp = { version = "3.1.2", default-features = false, features = [
     "client",
     "transport-child-process",
 ] }
+# `http::StatusCode`, to build a status-bearing `CompletionError` offline
+# (`test_support::status_error`) — the only way to drive
+# `completion_retry::is_transient_transport_failure`'s status branch without a live
+# provider. Already in the tree transitively via rig-core/reqwest; named here so the
+# dep is ours, not implicit. Dev-only: production code reads the status rig hands back
+# through `provider_response_status()` and never names the type itself.
+http = "1"
