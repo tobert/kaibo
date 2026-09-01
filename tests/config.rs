@@ -3010,6 +3010,7 @@ fn a_key_commands_stdout_never_reaches_kaibos_own_stdout() {
         "the run must fail on the dead transport AFTER resolving the key (proving the \
          command ran):\n{stderr}"
     );
+}
 
 // --- the bfl kind ------------------------------------------------------------------
 
