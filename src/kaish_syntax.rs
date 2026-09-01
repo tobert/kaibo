@@ -381,8 +381,9 @@ pub fn kaibo_sandbox_doc() -> String {
          Lead with line numbers so every claim cites `file:line`, and read files \
          whole:\n\
          - `cat -n FILE` — the whole file, numbered; the default move on any file that matters\n\
-         - `grep -rn PATTERN [PATH]` — find which files matter, then open them whole\n\
-         - `grep -rn -B3 -A6 PATTERN .` — preview matches in context across files\n\
+         - `grep -rn PATTERN` — find which files matter, then open them whole; every hit is prefixed with its path from the project root\n\
+         - `grep -rn -B3 -A6 PATTERN` — preview matches in context across files\n\
+         - `grep -rn PATTERN DIR/` — narrow to a subtree; hits are prefixed with the operand as written, so a named directory still cites a usable path\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
          - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file\n\
          - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
@@ -404,8 +405,9 @@ pub fn kaibo_sandbox_doc() -> String {
          - `124` — killed for exceeding the per-exec time budget\n\
          - `126` — a builtin the operator disabled in kaibo's config; the default \
          config disables none, so you will rarely see this\n\
-         - `127` — command not found. Every external command answers this way, which \
-         is what makes the host unreachable from here\n\
+         - `127` — every external command answers this way, and its message names \
+         the refusal (`curl: external commands are not available in this build of \
+         the shell`), which is what makes the host unreachable from here\n\
          - `130` — the script was cancelled\n\
          - other non-zero — the script itself failed\n\n\
          ## Learn more kaish\n\

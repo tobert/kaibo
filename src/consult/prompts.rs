@@ -217,7 +217,7 @@ pub fn report_preamble() -> String {
          anyway and let the result tell you otherwise.\n\n\
          Prefer the bigger read. Reading too much costs you one read. Reading too \
          little costs you every read after it.\n\n\
-         Use `grep -rn PATTERN .` to find WHICH files matter (`-B4 -A8` shows a \
+         Use `grep -rn PATTERN` to find WHICH files matter (`-B4 -A8` shows a \
          preview around each match). Once grep names a file, open that file whole. \
          When the file is large, read a wide span around each match instead, with \
          `cat -n FILE | sed -n '120,400p'`. That keeps the real line numbers, so your \

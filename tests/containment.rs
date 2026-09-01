@@ -974,10 +974,11 @@ async fn sweep_attach_refuses_a_symlink_escape() {
 ///    allowed to list.
 /// 2. **Nothing else crosses.** Every verb that would *follow* the link out still
 ///    refuses, and — the property that makes half 1 safe — the refusal is decided by
-///    path arithmetic before any syscall reaches the target, so an existing target, a
-///    missing one, and an unreadable one are indistinguishable. A hostile repo gets
-///    back the string it wrote into its own link and nothing about the host, not even
-///    existence.
+///    path arithmetic before any syscall reaches the target, so all three existence
+///    states — an existing target, a missing one, and one that exists but cannot be
+///    read — are indistinguishable. A hostile repo gets back the string it wrote into
+///    its own link and nothing about the host: not the contents, not the permissions,
+///    not even existence.
 ///
 /// If half 2 ever weakens — outside bytes appear, or the three refusals stop matching
 /// — this test fails, and that is an escalation, not a re-baseline: the disclosure in
@@ -990,9 +991,16 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     fs::write(&secret, "outside-contents-xyz\n").unwrap();
     let missing = outside.path().join("definitely-not-here.txt");
     assert!(!missing.exists(), "the missing-target fixture must not exist");
+    // A third existence state: present on disk but unreadable. The refusal must not
+    // distinguish it either — if kaibo ever stats a target to check permissions before
+    // the path-escape check, this arm is the one that catches it.
+    let unreadable = outside.path().join("unreadable.txt");
+    fs::write(&unreadable, "unreadable-contents\n").unwrap();
+    fs::set_permissions(&unreadable, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
 
     std::os::unix::fs::symlink(&secret, allowed.path().join("to_existing")).unwrap();
     std::os::unix::fs::symlink(&missing, allowed.path().join("to_missing")).unwrap();
+    std::os::unix::fs::symlink(&unreadable, allowed.path().join("to_unreadable")).unwrap();
 
     let handler = handler_with_allowed(Some(allowed.path()), &[]);
     let root = allowed.path().to_string_lossy().to_string();
@@ -1029,6 +1037,7 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     // diverge, a hostile repo can probe the host filesystem one link at a time.
     let existing = try_run(&handler, &root, "cat to_existing").await;
     let absent = try_run(&handler, &root, "cat to_missing").await;
+    let noperm = try_run(&handler, &root, "cat to_unreadable").await;
     // `run_kaish` reports a refused builtin as a successful CALL carrying kaish's exit
     // code and stderr, so both arms land in `Ok` — normalize the text, not the variant.
     // Two things legitimately differ and neither is a host fact: the target path the
@@ -1048,6 +1057,14 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
         "EXISTENCE ORACLE: a link to an existing outside file and a link to a missing \
          one must be indistinguishable once the repo's own target string is removed — \
          otherwise the tree can be probed one link at a time. Escalate before shipping."
+    );
+    assert_eq!(
+        existing_shape,
+        shape(&noperm, &unreadable, "to_unreadable"),
+        "EXISTENCE ORACLE: a link to a readable outside file and one to an unreadable \
+         outside file must be indistinguishable too — a permission-shaped difference \
+         probes the host just as well as an existence-shaped one. Escalate before \
+         shipping."
     );
     // And the shared outcome must be a refusal, not a shared success — two identical
     // `cat`s that both PRINTED the file would also compare equal.

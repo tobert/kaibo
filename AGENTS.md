@@ -478,17 +478,30 @@ even for a one-line doc fix.
 - **The lesson from the 0.17 bump: the compiler found less than the shell did.** One
   compile error, but four *behavioral* changes reached the model-facing surface, and
   only running the shell found them. Two made kaibo's own prose false and were fixed
-  in `kaish_syntax.rs`: 0.16 made `grep -r` prefix hits with the operand as written, so
-  the `grep -rn PATTERN .` idiom we teach started emitting `./src/foo.rs:12` for every
+  in prose: 0.16 made `grep -r` prefix hits with the operand as written, so the
+  `grep -rn PATTERN .` idiom we teach started emitting `./src/foo.rs:12` for every
   citation (the bare form is now taught, and the old sentence's claim that the idiom
   works "whether the target is a file or a directory" went too — a named file drops the
   filename, which is the half a citation needs); and 0.16 replaced the bare
-  `command not found` for a refused external command, which the addendum quoted. Two
+  `command not found` for a refused external command, which two surfaces quoted. Two
   more arrived free through `kaish-help`, which kaibo composes rather than restates —
   compound statements now feed pipes, and `yes`/`no` stopped being lexer errors. **When
   you bump kaish, diff the rendered contract and run the shell; do not stop at a green
   build.** A throwaway crate that calls `compose(&Recipe::tool_description(), …)` under
   both versions diffs the composed contract in one command.
+- **And when a kaish idiom changes, grep for it — it is never in one place.** The
+  `grep -rn PATTERN .` fix landed first in `KAISH_SANDBOX_ADDENDUM` alone, and the
+  cross-family review found the same idiom in **five** other model- and operator-facing
+  surfaces: the explorer preamble (`consult/prompts.rs`), the MCP `run_kaish` tool
+  description and the `kaibo://tools` doc (`server/mod.rs`), the `kaibo://kaish/sandbox`
+  recipes (`kaish_syntax.rs`), and the `kaibo kaish -c` help (`cli.rs`). Fixing one is
+  worse than fixing none: a model reads the addendum every turn *and* the explorer
+  preamble every sweep, so a half-fix teaches two contradictory idioms and the model has
+  no way to tell which is right. Test fixtures that merely *contain* the idiom
+  (`progress.rs`, `consult/engine.rs`) are not part of this — they are inputs, not
+  teaching. Nor is a named-directory operand (`grep -rn PATTERN DIR/`), which is
+  correct: GNU joins the operand as written, so a named directory still cites a usable
+  path. It is `.` specifically that adds the `./`.
 - **The 0.17 bump also moved the sandbox boundary, and the runbook with it.**
   lstat-by-default means a symlink inside the project pointing outside now renders its
   target path string through `ls -l`/`stat`/`readlink`/`find -type l`, where 0.14
