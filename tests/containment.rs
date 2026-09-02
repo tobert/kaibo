@@ -990,13 +990,20 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     let secret = outside.path().join("outside_secret.txt");
     fs::write(&secret, "outside-contents-xyz\n").unwrap();
     let missing = outside.path().join("definitely-not-here.txt");
-    assert!(!missing.exists(), "the missing-target fixture must not exist");
+    assert!(
+        !missing.exists(),
+        "the missing-target fixture must not exist"
+    );
     // A third existence state: present on disk but unreadable. The refusal must not
     // distinguish it either — if kaibo ever stats a target to check permissions before
     // the path-escape check, this arm is the one that catches it.
     let unreadable = outside.path().join("unreadable.txt");
     fs::write(&unreadable, "unreadable-contents\n").unwrap();
-    fs::set_permissions(&unreadable, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    fs::set_permissions(
+        &unreadable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
 
     std::os::unix::fs::symlink(&secret, allowed.path().join("to_existing")).unwrap();
     std::os::unix::fs::symlink(&missing, allowed.path().join("to_missing")).unwrap();
@@ -1018,7 +1025,11 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     // --- half 2a: no bytes cross ----------------------------------------------
     // `cat` is covered by the sibling test; `stat -L` and `wc -c` are the verbs 0.17
     // newly split from their lstat forms, so they are the ones worth pinning here.
-    for script in ["cat to_existing", "stat -L to_existing", "wc -c to_existing"] {
+    for script in [
+        "cat to_existing",
+        "stat -L to_existing",
+        "wc -c to_existing",
+    ] {
         let out = try_run(&handler, &root, script).await;
         let text = match &out {
             Ok(t) => t.clone(),
@@ -1071,5 +1082,153 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     assert!(
         existing_shape.contains("permission denied") && existing_shape.contains("escapes root"),
         "the shared outcome must be the path-escape refusal, got: {existing_shape}"
+    );
+}
+
+// --- (5c) mount-layer probe: the mount's ancestors are walkable -------------
+
+/// kaish 0.17.1 restored a mount point's *ancestors* to navigable directories: with a
+/// backend at `/` and the project mounted deeper, `ls`, `stat`, `cd`, and the file
+/// tests answered "not found" for every directory above the project, and now they
+/// synthesize as directories. kaibo always mounts `/`, so this reaches the shell we
+/// hand a model on every call.
+///
+/// Accepted, on the conditions this test states. **The chain is synthesized from
+/// kaibo's own mount table, not read from the host**, in three parts:
+///
+/// 1. **Every level lists only the one component leading to the mount.** Checked at
+///    two levels, because the claim is about the chain and one level would leave a
+///    higher-level synthesis bug unpinned.
+/// 2. **Nothing beside the chain is reachable** — a sibling directory, a file dropped
+///    in an ancestor, and its bytes all stay absent from `cat`, `grep`, `find`, `ls`.
+/// 3. **No existence oracle on a named ancestor path.** `stat` and `realpath` are the
+///    verbs that would answer "does this exist" without returning bytes, and `realpath`
+///    is new to this release — so an existing host file beside the chain and an absent
+///    one must refuse identically. Only the synthesized components resolve.
+///
+/// So a model walking up recovers the root path string the caller already handed it,
+/// and nothing else. If any part fails, that is an escalation, not a re-baseline.
+///
+/// The recorded positive control: move the mount itself up by handing `outer.path()`
+/// to both `handler_with_allowed` and `root`. The siblings are then genuinely inside
+/// the mount, and the leak assertions fire — so a run where every probe came back
+/// empty cannot pass as a clean one.
+#[tokio::test]
+async fn mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else() {
+    // outer/OUTER_SIBLING
+    // outer/mid/MID_SIBLING
+    // outer/mid/project        <- the only allowed tree
+    // outer/mid/ancestor_secret.txt
+    // Two chain levels, each with a sibling that must never appear.
+    let outer = tempdir().unwrap();
+    let mid = outer.path().join("mid");
+    let project = mid.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("inside.txt"), "inside-contents\n").unwrap();
+    fs::create_dir(outer.path().join("OUTER_SIBLING")).unwrap();
+    fs::create_dir(mid.join("MID_SIBLING")).unwrap();
+    let secret = mid.join("ancestor_secret.txt");
+    fs::write(&secret, "ancestor-secret-xyz\n").unwrap();
+    let absent = mid.join("definitely-not-here.txt");
+    assert!(!absent.exists(), "the absent-file fixture must not exist");
+
+    let handler = handler_with_allowed(Some(&project), &[]);
+    let root = project.to_string_lossy().to_string();
+    let outer_abs = outer.path().display().to_string();
+    let mid_abs = mid.display().to_string();
+
+    let text_of = |r: Result<String, String>| match r {
+        Ok(t) => t,
+        Err(e) => e,
+    };
+
+    // --- 1: each level lists only the way down to the mount -------------------
+    for (level, listed, sibling) in [
+        (&mid_abs, "project", "MID_SIBLING"),
+        (&outer_abs, "mid", "OUTER_SIBLING"),
+    ] {
+        let listing = try_run(&handler, &root, &format!("ls {level}"))
+            .await
+            .expect("an ancestor of the mount is a synthesized directory, so listing it succeeds");
+        assert!(
+            listing.contains(listed),
+            "the ancestor listing names the component leading to the mount, got: {listing}"
+        );
+        assert!(
+            !listing.contains(sibling) && !listing.contains("ancestor_secret"),
+            "HOST LEAK: `ls {level}` listed a real sibling — the chain is being read \
+             from the host, not synthesized from the mount table. Escalate before \
+             shipping. Got: {listing}"
+        );
+    }
+
+    // --- 2: nothing beside the chain is reachable -----------------------------
+    for script in [
+        format!("cat {mid_abs}/ancestor_secret.txt"),
+        format!("grep -rn ancestor-secret-xyz {mid_abs}"),
+        format!("grep -rn ancestor-secret-xyz {mid_abs}/ancestor_secret.txt"),
+    ] {
+        let text = text_of(try_run(&handler, &root, &script).await);
+        assert!(
+            !text.contains("ancestor-secret-xyz"),
+            "HOST LEAK: `{script}` returned bytes from beside the project through the \
+             synthesized ancestor chain. Escalate before shipping. Got: {text}"
+        );
+    }
+    // `find` and `ls` echo their operand in a refusal, so the leak they can commit is
+    // reporting a path they DISCOVERED. Both must come back with nothing found.
+    let found = text_of(try_run(&handler, &root, &format!("find {outer_abs} -type f")).await);
+    assert!(
+        !found.contains("ancestor_secret.txt"),
+        "HOST LEAK: `find` walked the synthesized chain into real host entries. \
+         Escalate before shipping. Got: {found}"
+    );
+    let sibling = text_of(try_run(&handler, &root, &format!("ls {mid_abs}/MID_SIBLING")).await);
+    assert!(
+        sibling.contains("not found") || sibling.contains("permission denied"),
+        "HOST LEAK: a real sibling directory of the project listed successfully \
+         through the synthesized chain. Escalate before shipping. Got: {sibling}"
+    );
+
+    // --- 3: no existence oracle on a named ancestor path ----------------------
+    // `stat` and `realpath` answer "does this exist" without returning bytes, and
+    // `realpath` resolves for the first time in this release — so this is the verb
+    // pair most likely to have gained an oracle. A real file beside the chain and a
+    // path that was never created must be indistinguishable.
+    for verb in ["stat", "realpath"] {
+        let present =
+            text_of(try_run(&handler, &root, &format!("{verb} {}", secret.display())).await);
+        let missing =
+            text_of(try_run(&handler, &root, &format!("{verb} {}", absent.display())).await);
+        // The refusal echoes the operand twice — as typed, and again root-relative with
+        // the leading slash stripped. Both are the path the script itself supplied, so
+        // both are normalized away; what must not differ is anything else.
+        let shape = |t: &str, path: &std::path::Path| {
+            let abs = path.display().to_string();
+            t.replace(&abs, "<PATH>")
+                .replace(abs.trim_start_matches('/'), "<PATH>")
+        };
+        assert_eq!(
+            shape(&present, &secret),
+            shape(&missing, &absent),
+            "EXISTENCE ORACLE: `{verb}` told a real file beside the chain apart from one \
+             that was never created — the synthesized chain can be used to probe the host \
+             one path at a time. Escalate before shipping."
+        );
+        // A shared success would compare equal too, so name the shared outcome.
+        assert!(
+            present.contains("not found"),
+            "the shared outcome must be a refusal, got: {present}"
+        );
+    }
+
+    // The positive control: without it, a run where every probe came back empty
+    // because the shell was broken would pass every assertion above.
+    let inside = try_run(&handler, &root, "cat inside.txt")
+        .await
+        .expect("reading inside the mount succeeds");
+    assert!(
+        inside.contains("inside-contents"),
+        "the probe must be able to read the project it is pointed at, got: {inside}"
     );
 }

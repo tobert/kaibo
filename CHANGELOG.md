@@ -81,9 +81,11 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
-- **kaish upgraded to 0.17.0** (from 0.14.1) — the read-only shell gains symlink
+- **kaish upgraded to 0.17.1** (from 0.14.1) — the read-only shell gains symlink
   support, pipeline-stage compound statements, `set -o pipefail`, and base-aware
   arithmetic.
+- **`readlink -f` and `realpath` resolve a path again** — both failed on every operand
+  before, naming neither the operand nor its target.
 - **`grep -rn PATTERN` is what kaibo teaches now**, without the trailing `.` — kaish
   0.16 prefixes hits with the operand as written, so the bare form is the one that
   yields repo-relative `file:line` citations.
@@ -93,6 +95,8 @@ record. Each later release appends a new section at the top.
 - **`ls -l`, `stat`, `readlink`, and `find -type l` describe a symlink itself** instead
   of following it, so a link is visible as a link. A link pointing outside the project
   shows its target path; every read that would follow it out is still refused.
+- **The directories above the project list again** — each names only the next component
+  down to the project, so the shell shows the root path the caller already gave it.
 - **A compound statement can feed a pipe** — `for f in …; do …; done | grep x` is no
   longer a parse error.
 - **`yes` and `no` are ordinary strings**, not lexer errors, so `echo yes` runs.
