@@ -147,12 +147,12 @@ ls ~/*.txt                              ; echo "glob-out=$?"
 find /etc -maxdepth 1                   ; echo "find-out=$?"
 ```
 
-**Pass:** everything outside the single mount comes back `not found` — out-of-mount
+**Pass:** every *read* outside the single mount comes back `not found` — out-of-mount
 paths (including `..`-normalized ones) route into the empty `/` MemoryFs scratch and
 404. The adjacent API-key files must be **unreadable**; that's the headline result.
-The mount's own prefix (`/home`, `/home/<user>`, …) *lists* — see the note below — but
-each level names only the next component toward the mount, so it can't be walked to a
-sibling.
+The mount's own prefix *directories* (`/home`, `/home/<user>`, …) are the one exception
+and they list — see the note below — but each level names only the next component
+toward the mount, so it can't be walked to a sibling.
 
 > **`cd / && ls` returns `dev`, `home`, `v`, and that is not a finding.** It is
 > synthetic VFS scaffolding, not host content: `/dev/{null,random,urandom,zero}` are
@@ -170,8 +170,14 @@ sibling.
 > mount** — the host's real siblings, files, and bytes stay absent — so a model walking
 > up recovers the root path string the caller already handed it and nothing else. Check
 > it by counting: `ls /tmp` returns one entry where the host `/tmp` holds thousands.
-> Pinned by `containment.rs::mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else`,
-> with a recorded positive control.
+>
+> **And check the oracle, the way G3 does for links:** `stat` and `realpath` on a real
+> host file beside the chain, and on a path that was never created, must refuse
+> byte-identically once the operand is removed — those two verbs answer "does this
+> exist" without returning bytes, and `realpath` resolves for the first time in 0.17.1.
+> Only the synthesized components resolve. Pinned by
+> `containment.rs::mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else`,
+> which checks two chain levels and carries a recorded positive control.
 
 **Environment leak check** (a secret can hide in env, not just on disk):
 
@@ -425,8 +431,9 @@ compression, not a side effect of it.
   - **The one new observable, accepted:** the directories *above* the mount list again,
     each naming only the next component down to the project. Battery C's `/home` note
     is corrected in place. Synthesis, not host reads — counted it: `ls /tmp` returns one
-    entry where the host holds 3575. Adjacent secrets, siblings, and the state db and
-    media CAS all stay invisible (E2/F2 re-run).
+    entry where the host holds 3575, and `stat`/`realpath` cannot tell a real host file
+    beside the chain from one that was never created. Adjacent secrets, siblings, and
+    the state db and media CAS all stay invisible (E2/F2 re-run).
   - **The probe caught itself once:** E1 run without `--root` created a state db, because
     the fixture was then outside every allowed tree and the guard correctly did not fire.
     The §0 question — would this read differently if the probe were broken? — is what
