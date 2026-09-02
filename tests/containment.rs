@@ -990,13 +990,20 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     let secret = outside.path().join("outside_secret.txt");
     fs::write(&secret, "outside-contents-xyz\n").unwrap();
     let missing = outside.path().join("definitely-not-here.txt");
-    assert!(!missing.exists(), "the missing-target fixture must not exist");
+    assert!(
+        !missing.exists(),
+        "the missing-target fixture must not exist"
+    );
     // A third existence state: present on disk but unreadable. The refusal must not
     // distinguish it either — if kaibo ever stats a target to check permissions before
     // the path-escape check, this arm is the one that catches it.
     let unreadable = outside.path().join("unreadable.txt");
     fs::write(&unreadable, "unreadable-contents\n").unwrap();
-    fs::set_permissions(&unreadable, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    fs::set_permissions(
+        &unreadable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
 
     std::os::unix::fs::symlink(&secret, allowed.path().join("to_existing")).unwrap();
     std::os::unix::fs::symlink(&missing, allowed.path().join("to_missing")).unwrap();
@@ -1018,7 +1025,11 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     // --- half 2a: no bytes cross ----------------------------------------------
     // `cat` is covered by the sibling test; `stat -L` and `wc -c` are the verbs 0.17
     // newly split from their lstat forms, so they are the ones worth pinning here.
-    for script in ["cat to_existing", "stat -L to_existing", "wc -c to_existing"] {
+    for script in [
+        "cat to_existing",
+        "stat -L to_existing",
+        "wc -c to_existing",
+    ] {
         let out = try_run(&handler, &root, script).await;
         let text = match &out {
             Ok(t) => t.clone(),
@@ -1071,5 +1082,105 @@ async fn mount_layer_symlink_discloses_its_target_string_but_no_host_fact() {
     assert!(
         existing_shape.contains("permission denied") && existing_shape.contains("escapes root"),
         "the shared outcome must be the path-escape refusal, got: {existing_shape}"
+    );
+}
+
+// --- (5c) mount-layer probe: the mount's ancestors are walkable -------------
+
+/// kaish 0.17.1 restored a mount point's *ancestors* to navigable directories: with a
+/// backend at `/` and the project mounted deeper, `ls`, `stat`, `cd`, and the file
+/// tests answered "not found" for every directory above the project, and now they
+/// synthesize as directories. kaibo always mounts `/`, so this reaches the shell we
+/// hand a model on every call.
+///
+/// Accepted, on the condition this test states: **the chain is synthesized from
+/// kaibo's own mount table, not read from the host.** Each ancestor lists exactly the
+/// one component that leads to the mount, so a model walking up from the project
+/// recovers only the root path string the caller already handed it — a sibling
+/// directory, a file dropped in an ancestor, and its bytes all stay invisible.
+///
+/// If the synthesis ever starts reading the host, this test fails: the sibling
+/// appears in a listing, or the file's name or contents cross. That is an escalation,
+/// not a re-baseline.
+///
+/// The recorded positive control: move the mount itself up by handing `outer.path()`
+/// to both `handler_with_allowed` and `root`. The sibling is then genuinely inside the
+/// mount, and the first leak assertion fires — so a run where every probe came back
+/// empty cannot pass as a clean one.
+#[tokio::test]
+async fn mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else() {
+    // outer/{project, SIBLING_DIR, ancestor_secret.txt} — only `project` is allowed.
+    let outer = tempdir().unwrap();
+    let project = outer.path().join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("inside.txt"), "inside-contents\n").unwrap();
+    fs::create_dir(outer.path().join("SIBLING_DIR")).unwrap();
+    fs::write(
+        outer.path().join("ancestor_secret.txt"),
+        "ancestor-secret-xyz\n",
+    )
+    .unwrap();
+
+    let handler = handler_with_allowed(Some(&project), &[]);
+    let root = project.to_string_lossy().to_string();
+    let outer_abs = outer.path().display().to_string();
+
+    // --- the chain is walkable, and lists only the way down to the mount ------
+    let listing = try_run(&handler, &root, &format!("ls {outer_abs}"))
+        .await
+        .expect("the mount's parent is a synthesized directory, so listing it succeeds");
+    assert!(
+        listing.contains("project"),
+        "the ancestor listing names the component leading to the mount, got: {listing}"
+    );
+    assert!(
+        !listing.contains("SIBLING_DIR") && !listing.contains("ancestor_secret"),
+        "HOST LEAK: an ancestor listed a real sibling of the project — the chain is \
+         being read from the host, not synthesized from the mount table. Escalate \
+         before shipping. Got: {listing}"
+    );
+
+    // --- and nothing in an ancestor is reachable -----------------------------
+    // Each probe names what would count as a leak: the secret's bytes, or its name
+    // appearing where the shell found it rather than where the script typed it.
+    let text_of = |r: Result<String, String>| match r {
+        Ok(t) => t,
+        Err(e) => e,
+    };
+    for script in [
+        format!("cat {outer_abs}/ancestor_secret.txt"),
+        format!("grep -rn ancestor-secret-xyz {outer_abs}"),
+        format!("grep -rn ancestor-secret-xyz {outer_abs}/ancestor_secret.txt"),
+    ] {
+        let text = text_of(try_run(&handler, &root, &script).await);
+        assert!(
+            !text.contains("ancestor-secret-xyz"),
+            "HOST LEAK: `{script}` returned bytes from beside the project through the \
+             synthesized ancestor chain. Escalate before shipping. Got: {text}"
+        );
+    }
+    // `find` and `ls` echo their operand in a refusal, so the leak they can commit is
+    // reporting a path they DISCOVERED. Both must come back with nothing found.
+    let found = text_of(try_run(&handler, &root, &format!("find {outer_abs} -type f")).await);
+    assert!(
+        !found.contains("ancestor_secret.txt"),
+        "HOST LEAK: `find` walked the synthesized chain into real host entries. \
+         Escalate before shipping. Got: {found}"
+    );
+    let sibling = text_of(try_run(&handler, &root, &format!("ls {outer_abs}/SIBLING_DIR")).await);
+    assert!(
+        sibling.contains("not found") || sibling.contains("permission denied"),
+        "HOST LEAK: a real sibling directory of the project listed successfully \
+         through the synthesized chain. Escalate before shipping. Got: {sibling}"
+    );
+
+    // The positive control: without it, a run where every probe came back empty
+    // because the shell was broken would pass every assertion above.
+    let inside = try_run(&handler, &root, "cat inside.txt")
+        .await
+        .expect("reading inside the mount succeeds");
+    assert!(
+        inside.contains("inside-contents"),
+        "the probe must be able to read the project it is pointed at, got: {inside}"
     );
 }

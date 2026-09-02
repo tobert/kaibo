@@ -150,17 +150,28 @@ find /etc -maxdepth 1                   ; echo "find-out=$?"
 **Pass:** everything outside the single mount comes back `not found` — out-of-mount
 paths (including `..`-normalized ones) route into the empty `/` MemoryFs scratch and
 404. The adjacent API-key files must be **unreadable**; that's the headline result.
-`cd ~` / `cd /home/<user>` fail — only the full mount path is a real directory, so
-the prefix can't be walked to a sibling.
+The mount's own prefix (`/home`, `/home/<user>`, …) *lists* — see the note below — but
+each level names only the next component toward the mount, so it can't be walked to a
+sibling.
 
 > **`cd / && ls` returns `dev`, `home`, `v`, and that is not a finding.** It is
 > synthetic VFS scaffolding, not host content: `/dev/{null,random,urandom,zero}` are
 > virtual devices, `/v` is kaish's own builtin toolbox plus ephemeral blob/job scratch,
-> and `/home` is an inert stub that cannot be walked (`ls /home`, `ls /home/<user>` both
-> `not found`). Only the exact `--root`-resolved absolute path mounts real content.
+> and `/home` is the synthesized head of the path down to the mount. Only the exact
+> `--root`-resolved absolute path mounts real content.
 > Confirm it the way the 2026-07-29 run did: read `$ROOT/Cargo.toml` through the mount
 > and watch every sibling path 404. Written down here because a reader meeting that
 > listing for the first time reasonably suspects a hole.
+
+> **The prefix is walkable as of kaish 0.17.1, and that is not a finding either.**
+> 0.17.0 answered `not found` for every directory above the mount; 0.17.1 restored them
+> as synthesized directories, so `ls /home` → `<user>`, `ls /home/<user>` → the next
+> component, down to the project. Each level lists **only the component leading to the
+> mount** — the host's real siblings, files, and bytes stay absent — so a model walking
+> up recovers the root path string the caller already handed it and nothing else. Check
+> it by counting: `ls /tmp` returns one entry where the host `/tmp` holds thousands.
+> Pinned by `containment.rs::mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else`,
+> with a recorded positive control.
 
 **Environment leak check** (a secret can hide in env, not just on disk):
 
@@ -403,20 +414,34 @@ detail is in git, and anything durable a run found has been promoted into the ba
 belongs to rather than left here to be re-read — that promotion is the point of the
 compression, not a side effect of it.
 
-- **2026-09-01** — **Full A–G**, branch `kaish-0.17`, run because the `kaish-kernel`
-  0.14.1 → 0.17.0 bump trips the kernel/VFS trigger. **All clear.** This bump moved the
-  *instrument* more than any before it: three pass criteria in this file were false
-  against 0.17 and are corrected in place (Battery A's `ln -s` reason, Battery B's 127
-  message, Battery C's now non-empty `env`), and **Battery G is new** for the symlink
-  boundary 0.17's lstat-by-default opened.
-  - **The one new observable, accepted:** a link inside the tree pointing outside now
-    renders its target *string*. G3 is why that is acceptable — existing, missing, and
-    unreadable targets refuse byte-identically, so there is no existence oracle.
-  - **Best find:** 0.16 fixed an `env` that bypassed the external-commands gate, and
-    **kaibo was never exposed** — lever (0) compiles `subprocess` out, verified against
-    both versions. The four-levers design paying for itself.
-  - Suites: containment 24, full `cargo test` 1327 passed / 0 failed.
+- **2026-09-02** — **Full A–G**, branch `kaish-0.17.1`, run because the `kaish-kernel`
+  0.17.0 → 0.17.1 patch touches the VFS and so trips the trigger. **All clear.** Every
+  battery was run against **both** pins and diffed; A, B, D, E, F and G came back
+  byte-identical, so the two changes below are the whole delta a model can see.
+  - **The release blocker is fixed:** `readlink -f` and `realpath` resolve an in-tree
+    path (exit 0) and refuse an escape by name, where 0.17.0 failed on every operand
+    with `No such file or directory: /tmp`. G3 re-run on the new canonicalize path —
+    existing, missing, and unreadable targets still refuse byte-identically.
+  - **The one new observable, accepted:** the directories *above* the mount list again,
+    each naming only the next component down to the project. Battery C's `/home` note
+    is corrected in place. Synthesis, not host reads — counted it: `ls /tmp` returns one
+    entry where the host holds 3575. Adjacent secrets, siblings, and the state db and
+    media CAS all stay invisible (E2/F2 re-run).
+  - **The probe caught itself once:** E1 run without `--root` created a state db, because
+    the fixture was then outside every allowed tree and the guard correctly did not fire.
+    The §0 question — would this read differently if the probe were broken? — is what
+    found it.
+  - Suites: containment 25 (one new), full `cargo test` 1147 passed. The lone failure is
+    the known `tests/credentials.rs` ETXTBSY exec race under parallelism; green serially,
+    reproduces on unmodified code.
   - §7 not re-run; deferred to the v0.4.0 pre-release check.
+
+- **2026-09-01** — Full A–G, branch `kaish-0.17`, for the 0.14.1 → 0.17.0 bump. All
+  clear. Three pass criteria here were false against 0.17 and were corrected in place;
+  **Battery G is new** for the symlink boundary lstat-by-default opened. Its accepted
+  observable: a link pointing outside renders its target *string*, safe because G3 shows
+  no existence oracle. Best find: 0.16 fixed an `env` that bypassed the external-commands
+  gate and **kaibo was never exposed** — lever (0) compiles `subprocess` out.
 
 - **2026-08-13** — Full A–E plus the new Battery F and a §7 model-driven pass, main
   `fb5ae71`, ahead of v0.3.0. All clear. Both findings were about the *instrument* and
