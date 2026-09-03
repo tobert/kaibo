@@ -197,21 +197,51 @@ fn provider_paths_match_amys_dotfiles() {
 // (its own argv, `extra_env`). `extra_env` is the seam a unit test uses instead
 // of mutating the process environment.
 
+use anyhow::Result;
 use kaibo::credentials::resolve_key_from_cmd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Keeps stub *creation* and child *spawning* from overlapping, which is what makes
+/// these tests safe to run in parallel.
+///
+/// The race without it: writing a stub holds a write fd on it, and `fork` hands every
+/// open fd to the child. A sibling test that forks during that window gives its child a
+/// duplicate of the write fd, and the child keeps it until it reaches `exec` — so an
+/// `exec` of that stub in the meantime fails `ETXTBSY`, "Text file busy". `O_CLOEXEC`
+/// does not help: the fd closes *at* exec, and the whole window is before it.
+///
+/// A read/write lock rather than a plain mutex, because the two operations are not
+/// symmetric. Creation takes the exclusive side — brief, and it must exclude every
+/// spawn. Spawning takes the shared side, so resolves still run concurrently with each
+/// other and `a_blocking_key_resolve_does_not_stall_a_sibling_task` keeps testing what
+/// it was written to test.
+///
+/// Poisoning is stepped over deliberately: a panicking assertion in one test would
+/// otherwise fail every later one with a lock error instead of its own message.
+static STUB_EXEC: RwLock<()> = RwLock::new(());
+
 #[cfg(unix)]
 fn stub_script(dir: &Path, body: &str, exit: i32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
+    let _creating = STUB_EXEC.write().unwrap_or_else(PoisonError::into_inner);
     let seq = STUB_SEQ.fetch_add(1, Ordering::Relaxed);
     let p = dir.join(format!("stub-{seq}"));
     fs::write(&p, format!("#!/bin/sh\n{body}\nexit {exit}\n")).unwrap();
     fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     p
+}
+
+/// `resolve_key_from_cmd` with the shared side of [`STUB_EXEC`] held across the spawn.
+/// Every call in this file goes through here, including the ones whose command is not a
+/// stub — a spawn that fails at `exec` has already forked, so it is in the race too.
+fn resolve_stub(args: &[String], timeout: Duration, extra_env: &[(&str, &str)]) -> Result<String> {
+    let _spawning = STUB_EXEC.read().unwrap_or_else(PoisonError::into_inner);
+    resolve_key_from_cmd(args, timeout, extra_env)
 }
 
 #[cfg(unix)]
@@ -220,7 +250,7 @@ fn key_command_stdout_trimmed_is_the_key() {
     let dir = tempdir().unwrap();
     let p = stub_script(dir.path(), "printf 'sk-test\\n\\n'", 0);
     let args = vec![p.to_string_lossy().into_owned()];
-    let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap();
+    let key = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap();
     assert_eq!(
         key, "sk-test",
         "stdout is trimmed like a key file's contents"
@@ -239,7 +269,7 @@ fn key_command_inherits_env_and_receives_argv() {
     let dir = tempdir().unwrap();
     let p = stub_script(dir.path(), "echo \"$KAIBO_STUB_VAR $1\"", 0);
     let args = vec![p.to_string_lossy().into_owned(), "op://Vault/Item".into()];
-    let key = resolve_key_from_cmd(
+    let key = resolve_stub(
         &args,
         Duration::from_secs(5),
         &[("KAIBO_STUB_VAR", "inherited")],
@@ -254,7 +284,7 @@ fn key_command_empty_stdout_is_loud() {
     let dir = tempdir().unwrap();
     let p = stub_script(dir.path(), ":", 0); // prints nothing, exits 0
     let args = vec![p.to_string_lossy().into_owned()];
-    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    let err = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap_err();
     assert!(
         err.to_string().contains("printed nothing"),
         "an empty stdout is a broken command, not a keyless backend: {err}"
@@ -267,7 +297,7 @@ fn key_command_non_utf8_stdout_is_loud() {
     let dir = tempdir().unwrap();
     let p = stub_script(dir.path(), "printf '\\377'", 0); // invalid UTF-8
     let args = vec![p.to_string_lossy().into_owned()];
-    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    let err = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap_err();
     assert!(
         err.to_string().contains("non-UTF-8"),
         "binary output must be surfaced, not mangled into a key: {err}"
@@ -282,7 +312,7 @@ fn key_command_oversized_stdout_is_refused_not_trimmed() {
     // also proves the reader drains a verbose child instead of wedging it.
     let p = stub_script(dir.path(), "head -c 70000 /dev/zero", 0);
     let args = vec![p.to_string_lossy().into_owned()];
-    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    let err = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap_err();
     assert!(
         err.to_string().contains("more than 65536 bytes"),
         "refuse, not trim: {err}"
@@ -304,7 +334,7 @@ fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout_or_stderr() {
         3,
     );
     let args = vec![p.to_string_lossy().into_owned()];
-    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    let err = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("exited"), "must name the failure: {msg}");
     assert!(
@@ -329,7 +359,7 @@ fn key_command_nonzero_exit_is_loud_and_never_leaks_stdout_or_stderr() {
 // `Command` is ever touched, so it needs no shell stub and runs on every platform.
 #[test]
 fn key_command_empty_argv_is_a_loud_error_not_a_panic() {
-    let err = resolve_key_from_cmd(&[], Duration::from_secs(5), &[]).unwrap_err();
+    let err = resolve_stub(&[], Duration::from_secs(5), &[]).unwrap_err();
     assert!(
         err.to_string().contains("api_key_cmd") && err.to_string().contains("executable"),
         "an empty argv is a config error naming the field and the fix, not a panic: {err}"
@@ -340,7 +370,7 @@ fn key_command_empty_argv_is_a_loud_error_not_a_panic() {
 #[test]
 fn key_command_missing_binary_is_loud() {
     let args = vec!["/nonexistent-kaibo-test/op".to_string()];
-    let err = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap_err();
+    let err = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap_err();
     assert!(
         err.to_string().contains("spawning key command"),
         "a typo'd binary name fails at resolve, not silently: {err}"
@@ -353,7 +383,7 @@ fn key_command_timeout_kills_a_hung_child() {
     let dir = tempdir().unwrap();
     let p = stub_script(dir.path(), "sleep 60", 0); // would hang forever
     let args = vec![p.to_string_lossy().into_owned()];
-    let err = resolve_key_from_cmd(&args, Duration::from_millis(200), &[]).unwrap_err();
+    let err = resolve_stub(&args, Duration::from_millis(200), &[]).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("did not exit within") && msg.contains("killed"),
@@ -379,7 +409,7 @@ fn key_command_stdin_is_nulled() {
         0,
     );
     let args = vec![p.to_string_lossy().into_owned()];
-    let key = resolve_key_from_cmd(&args, Duration::from_secs(5), &[]).unwrap();
+    let key = resolve_stub(&args, Duration::from_secs(5), &[]).unwrap();
     assert_eq!(key, "null-stdin", "stdin must be closed, not inherited");
 }
 
@@ -405,7 +435,7 @@ async fn a_blocking_key_resolve_does_not_stall_a_sibling_task() {
         }
         ticks
     });
-    let key = resolve_key_from_cmd(&args, Duration::from_millis(300), &[]).unwrap_err();
+    let key = resolve_stub(&args, Duration::from_millis(300), &[]).unwrap_err();
     assert!(
         key.to_string().contains("did not exit within"),
         "the resolve must time out on the sleeping stub: {key}"
