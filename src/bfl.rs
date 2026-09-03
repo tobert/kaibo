@@ -745,6 +745,14 @@ impl crate::media::MediaModel for BflImageModel {
         true
     }
 
+    /// BFL's ops *are* model ids, so the op that runs is the model that ran — this is
+    /// the provider [`MediaModel::effective_model`] exists for. Resolved the same way
+    /// `generate` resolves it, from the one function, so the recorded model cannot
+    /// drift from the endpoint the call went to.
+    fn effective_model(&self, request: &MediaRequest) -> Option<String> {
+        Some(resolve_op_name(request, &self.model).to_string())
+    }
+
     async fn generate(&self, request: &MediaRequest) -> AnyResult<MediaOutcome> {
         refuse_webhook_fields(request)?;
         let op_name = resolve_op_name(request, &self.model);
@@ -846,6 +854,40 @@ mod tests {
     fn resolve_op_name_falls_back_to_the_slot_model_when_op_is_omitted() {
         let r = request("a lighthouse");
         assert_eq!(resolve_op_name(&r, "flux-2-pro"), "flux-2-pro");
+    }
+
+    /// The provenance half of the two tests above: resolving the op right is only half
+    /// the job, because the sidecar is what an operator reads months later to decide
+    /// whether an artifact can be trusted or reproduced — and BFL's ops are model ids,
+    /// so an `op` changes which model made the bytes.
+    ///
+    /// Measured before this existed: `generate` with `op: "flux-dev"` recorded
+    /// `"model": "bfl/flux-2-pro"`, naming a model that never ran and, at BFL's
+    /// per-request pricing, a different cost.
+    #[test]
+    fn the_recorded_model_is_the_op_that_ran_not_the_slot() {
+        use crate::media::MediaModel;
+        let client = BflClient::new("k", "http://localhost:0", Duration::from_secs(1))
+            .expect("a client builds; no request is made");
+        let model = BflImageModel::from_parts(&client, "flux-2-pro");
+
+        let mut asked = request("a lighthouse");
+        asked.op = Some("flux-dev".to_string());
+        assert_eq!(
+            model.effective_model(&asked).as_deref(),
+            Some("flux-dev"),
+            "an `op` names the model that ran, so provenance must report it"
+        );
+
+        // The control: with no `op`, the slot model is what ran and the arm falls back
+        // to the slot ref. Without this arm the test would pass on an impl that always
+        // reported "flux-dev".
+        let plain = request("a lighthouse");
+        assert_eq!(
+            model.effective_model(&plain).as_deref(),
+            Some("flux-2-pro"),
+            "with no `op` the slot model is the model that ran"
+        );
     }
 
     // --- request building ---------------------------------------------------------
