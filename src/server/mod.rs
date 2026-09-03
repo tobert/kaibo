@@ -6910,6 +6910,59 @@ enabled = false
         );
     }
 
+    /// The sibling of the out-of-tree refusal, one indirection along: the path the
+    /// caller names *is* inside the allowed tree, and the file it lands on is not.
+    /// `read_contained_file` canonicalizes before it checks a containing tree, so the
+    /// link resolves to its target and the target is what gets judged.
+    ///
+    /// Worth its own test rather than folding into the sibling, because the two fail
+    /// for different reasons and only one of them survives a refactor that checks the
+    /// path as written. A store that followed the link would be an exfiltration route
+    /// with a read-back verb attached — `read_cas` hands the bytes to the client — and
+    /// the injected-client threat model is the same one the sibling test names.
+    ///
+    /// The doc on `read_contained_file` points at `tests/containment.rs`'s
+    /// `mount_layer_symlink_*` battery for this property, but that battery drives
+    /// `run_kaish`. This is the same shape on the upload path.
+    #[tokio::test]
+    async fn write_cas_refuses_a_symlink_inside_the_tree_pointing_outside() {
+        let allowed = tempfile::TempDir::new().expect("temp dir");
+        let elsewhere = tempfile::TempDir::new().expect("temp dir");
+        let target = elsewhere.path().join("secret.png");
+        std::fs::write(&target, png_bytes()).expect("fixture writes");
+        let link = allowed.path().join("innocent.png");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let h = handler_from_toml(&format!(
+            "[server]\nallow_paths = [{:?}]\n",
+            allowed.path().display().to_string()
+        ));
+
+        let err = h
+            .write_cas(Parameters(write_cas_input(
+                Some(&link.display().to_string()),
+                None,
+            )))
+            .await
+            .expect_err("a link out of the tree is refused, however innocent its own path");
+        assert!(
+            err.message.contains("outside the allowed set"),
+            "the refusal must name the boundary, not the link: {}",
+            err.message
+        );
+        // The positive control: the same store, the same handler, a real file inside the
+        // tree. Without it a handler that refused everything would pass the assertion
+        // above and prove nothing.
+        let real = allowed.path().join("real.png");
+        std::fs::write(&real, png_bytes()).expect("fixture writes");
+        h.write_cas(Parameters(write_cas_input(
+            Some(&real.display().to_string()),
+            None,
+        )))
+        .await
+        .expect("a real file inside the tree still stores");
+    }
+
     /// Two sources is a caller who said it twice. kaibo will not pick one — a silent
     /// precedence rule is how the stored bytes come to disagree with the intent.
     #[tokio::test]

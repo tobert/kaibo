@@ -381,6 +381,103 @@ re-baseline.
 
 ---
 
+## 5d. Battery H — the media CAS write path stores what it says, where it says
+
+Batteries E and F ask whether kaibo's two write surfaces can be *aimed* at the project.
+This one asks the other half, and it is the one the CAS's design argument rests on: **the
+store is safe by shape, not by policy.** The address is the content hash, so the write
+API has no destination parameter for a model to point anywhere. H1 and H2 are what turn
+that sentence into a measurement.
+
+Run against a scratch store so the operator's real one is untouched:
+`--cas-dir "$SCRATCH/cas" --state-db "$SCRATCH/state.db"`. Fixtures: two small PNGs
+differing in one pixel, and one text file.
+
+**H1 — the address is the content hash, and the operator can check the arithmetic.**
+
+```sh
+sha256sum red.png blue.png
+kaibo --cas-dir "$SCRATCH/cas" --state-db "$SCRATCH/state.db" cas write red.png
+kaibo --cas-dir "$SCRATCH/cas" --state-db "$SCRATCH/state.db" cas write red.png
+kaibo --cas-dir "$SCRATCH/cas" --state-db "$SCRATCH/state.db" cas write blue.png
+find "$SCRATCH/cas" -name '*.png'
+```
+
+**Pass:** each stored object's filename **equals `sha256sum` of the file that produced
+it**, the two `red.png` writes yield one object, and `blue.png` yields a second. Two
+objects, not three. Do the comparison with `sha256sum` rather than by eye: it is the
+whole claim, and it is cheap to verify independently.
+
+Note what is *absent* from those commands — a destination. `cas write` takes the file to
+read and nothing else; `write_cas` takes `path` **or** `content` plus a `label`, where
+`path` is a *source* and is containment-checked like any other read. No write surface
+accepts a destination, so there is no parameter to aim.
+
+**H2 — a second write of the same bytes is a no-op, not a rewrite.**
+
+```sh
+stat -c 'inode=%i mtime=%.9Y size=%s' "$SCRATCH/cas"/<shard>/<digest>.png
+kaibo … cas write red.png        # again
+stat -c 'inode=%i mtime=%.9Y size=%s' "$SCRATCH/cas"/<shard>/<digest>.png
+```
+
+**Pass:** inode, mtime **to the nanosecond**, and size all unchanged. `create_new` means
+an occupied address is never reopened, so an edit is a copy at a new address and stored
+bytes are immutable. Compare the mtime, not just the object count — a rewrite with
+identical bytes would keep the count and still prove the store mutable.
+
+**H3 — a refused write stores nothing.**
+
+```sh
+kaibo … cas write notanimage.txt ; echo "exit=$?"
+find "$SCRATCH/cas" -type f | wc -l
+```
+
+**Pass:** refused because the bytes carry no image signature — the message names the
+first bytes it saw and the four containers the store holds — and the file count is
+**unchanged from before the call**. Take the count on both sides; "a refusal happened" is
+not the same claim as "nothing landed".
+
+**H4 — a freshly written object is still invisible to kaish.**
+
+F2 asks this of the store as a whole. Ask it again of an object written *this minute*,
+since a store that was simply empty would pass F2 without proving anything:
+
+```sh
+# host-side first — the denominator:
+find "$SCRATCH/cas" -type f        # must be non-empty
+# then, through run_kaish:
+ls "$SCRATCH/cas" ; cat "$SCRATCH/cas"/<shard>/<digest>.png ; find "$SCRATCH/cas" -type f
+```
+
+**Pass:** `not found`, exit 1, for all three, while the host listing shows the objects
+exist. The CAS is never mounted, so its read side cannot enumerate one project's
+artifacts from another.
+
+**H5 — the store refuses to be a lie.**
+
+The failure that would matter here is a silent one: a digest handed back that will not
+resolve later.
+
+```sh
+kaibo --no-persistence cas write red.png ; echo "exit=$?"
+```
+
+**Pass:** **nothing is stored** and the refusal says why — an in-memory store dies with
+the process, so the digest would be unreadable the moment the command exits. A store
+backed by tmpfs is accepted but warns that the artifacts will not survive the host. Both
+are the no-silent-fallback rule: a paid-for artifact is never quietly discarded, and a
+digest kaibo cannot honor is never issued.
+
+> Pinned by `tests/write_cas.rs` (12 cases — content addressing, `create_new`, and every
+> refusal asserting the store is still empty afterward) and, for the source-path half,
+> `server::tests::write_cas_refuses_a_path_outside_the_allowed_set` and
+> `write_cas_refuses_a_symlink_inside_the_tree_pointing_outside`. Teeth: replace
+> `containing_tree`'s refusal in `read_contained_file` with a fallback to the file's own
+> parent and both of those fail.
+
+---
+
 ## 6. The always-on guard: the test suites
 
 The live probes are a periodic spot-check; the *continuous* guard is the test tree.
@@ -438,6 +535,13 @@ compression, not a side effect of it.
     the fixture was then outside every allowed tree and the guard correctly did not fire.
     The §0 question — would this read differently if the probe were broken? — is what
     found it.
+  - **Battery H is new**, written from its own first run against a scratch store: the CAS
+    write path had containment (F) but nothing measured its *shape*. All clear — a stored
+    object's name equals `sha256sum` of its input, a repeat write leaves inode and mtime
+    untouched, a refusal stores nothing, and a fresh object stays invisible to kaish.
+    Writing it found one missing test, now added: `write_cas` had no case for a symlink
+    inside the tree pointing out, the leg `read_contained_file`'s own doc calls the one
+    worth not skipping.
   - Suites: containment 25 (one new), full `cargo test` 1147 passed. The lone failure is
     the known `tests/credentials.rs` ETXTBSY exec race under parallelism; green serially,
     reproduces on unmodified code.
