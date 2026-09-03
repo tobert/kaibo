@@ -372,6 +372,26 @@ pub trait MediaModel: Send + Sync {
         false
     }
 
+    /// The model id this request actually runs, when the provider's `op` names a
+    /// **model** rather than a route.
+    ///
+    /// Defaults to `None` — "the cast's `image` slot already names it" — which is true
+    /// for every provider whose operations are routes over one model: Stability's
+    /// `edit/inpaint` and the Images API's `edits` change what is done, not what runs.
+    /// BFL is the exception, and the reason this exists: its ops *are* model ids
+    /// (`flux-dev`, `flux-2-pro`), so an `op` there changes which model produced the
+    /// bytes and the slot ref stops describing them.
+    ///
+    /// This carries the same rule that makes `fields.model` a refusal in `generate` —
+    /// **recorded provenance must describe the request that ran.** That guard closed the
+    /// hole a caller could open through `fields`; this closes the one `op` opened. A
+    /// provider that reroutes to another model and stays silent here records a model
+    /// that did not run, which is a quiet wrong answer in the one record an operator
+    /// decides trust from.
+    fn effective_model(&self, _request: &MediaRequest) -> Option<String> {
+        None
+    }
+
     /// Whether this provider has a vocabulary of named operations at all.
     ///
     /// Defaults to `false` for the same reason as [`accepts_inputs`](Self::accepts_inputs),
@@ -504,6 +524,24 @@ impl MediaArm {
     /// The `"backend/model-id"` this arm was staffed from.
     pub fn slot_ref(&self) -> &str {
         &self.slot_ref
+    }
+
+    /// The model ref to record and report for one request: the slot's, unless the
+    /// provider says an `op` rerouted to a different model
+    /// ([`MediaModel::effective_model`]).
+    ///
+    /// Recomposed against the slot ref's own backend, so the recorded id stays in the
+    /// `backend/model` shape every other provenance line uses. Split on the FIRST `/`
+    /// only — a model id may contain more (`crusoe/deepseek-ai/Deepseek-V4-Flash`), so
+    /// the backend is the head and everything after it is the model.
+    pub fn recorded_model(&self, request: &MediaRequest) -> String {
+        match self.model.effective_model(request) {
+            Some(ran) => match self.slot_ref.split_once('/') {
+                Some((backend, _)) => format!("{backend}/{ran}"),
+                None => ran,
+            },
+            None => self.slot_ref.clone(),
+        }
     }
 
     /// Run one generation request on this arm.

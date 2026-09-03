@@ -3218,14 +3218,18 @@ impl KaiboHandler {
         // backstop — see `MediaArm::refuse_unsupported`.
         arm.refuse_unsupported(&request)
             .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
-        let span = tracing::info_span!("generate", cast = %cast.name, model = %arm.slot_ref());
+        // Every model name below is the one that RAN, not the slot's — a BFL `op`
+        // reroutes to another model, and a record naming the wrong one is worse than no
+        // record. See `MediaArm::recorded_model`.
+        let ran = arm.recorded_model(&request);
+        let span = tracing::info_span!("generate", cast = %cast.name, model = %ran);
         match arm.generate(&request).instrument(span).await {
             Ok(crate::media::MediaOutcome::Complete { artifacts, note }) => {
                 let rendered = match store_generated_artifacts(
                     &store,
                     &artifacts,
                     &input.prompt,
-                    arm.slot_ref(),
+                    &ran,
                     &cast.name,
                 ) {
                     Ok(text) => text,
@@ -3244,7 +3248,7 @@ impl KaiboHandler {
                     with_provenance(
                         rendered,
                         &cast.name,
-                        &[("image", arm.slot_ref())],
+                        &[("image", ran.as_str())],
                         &Usage::new(),
                     ),
                 )]))
@@ -3255,10 +3259,10 @@ impl KaiboHandler {
             // stability::Operation::shape), never a sniffed response.
             Ok(crate::media::MediaOutcome::Deferred(provider_job)) => {
                 let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
-                let label = format!("generate · cast {} · image {}", cast.name, arm.slot_ref());
+                let label = format!("generate · cast {} · image {}", cast.name, ran);
                 let prompt = input.prompt.clone();
                 let cast_name = cast.name.clone();
-                let slot_ref = arm.slot_ref().to_string();
+                let slot_ref = ran.clone();
                 let deadline = self.config.defaults.call_deadline;
                 let poll_arm = arm.clone();
                 let id = self.jobs.submit(label, progress_log, async move {
@@ -3305,8 +3309,7 @@ impl KaiboHandler {
                     "Deferred: `{id}` — the provider is generating in the background \
                      (cast `{}`, image `{}`). Collect it with `job_get {id}` or park on \
                      `job_wait`; stop it with `job_cancel {id}`.",
-                    cast.name,
-                    arm.slot_ref()
+                    cast.name, ran
                 ))]))
             }
             Err(e) => Ok(consultation_failed("generate", &cast.name, e)),
@@ -5767,6 +5770,71 @@ mod tests {
         assert!(
             text.contains("cast `artist`") && text.contains("sd/core"),
             "the provenance footer names the cast and image model:\n{text}"
+        );
+    }
+
+    /// A provider whose `op` names a *model* rather than a route — BFL, whose ops are
+    /// model ids — must have that model reach the sidecar and the footer, not the slot's.
+    ///
+    /// The wiring half of `bfl::tests::the_recorded_model_is_the_op_that_ran_not_the_slot`:
+    /// that one proves BFL resolves the op, this one proves the handler carries the
+    /// answer all the way to what an operator reads. Found live before the fix — a
+    /// `generate` with `op: "flux-dev"` recorded `"model": "bfl/flux-2-pro"`.
+    #[tokio::test]
+    async fn generate_records_the_model_an_op_rerouted_to_not_the_slot() {
+        /// Reroutes like BFL: whatever `op` says is the model that ran.
+        struct Rerouting(Vec<crate::media::MediaArtifact>);
+
+        #[async_trait::async_trait]
+        impl crate::media::MediaModel for Rerouting {
+            fn accepts_ops(&self) -> bool {
+                true
+            }
+            fn effective_model(&self, request: &crate::media::MediaRequest) -> Option<String> {
+                request.op.clone()
+            }
+            async fn generate(
+                &self,
+                _request: &crate::media::MediaRequest,
+            ) -> anyhow::Result<crate::media::MediaOutcome> {
+                Ok(crate::media::MediaOutcome::Complete {
+                    artifacts: self.0.clone(),
+                    note: None,
+                })
+            }
+            async fn poll(
+                &self,
+                _job: &crate::media::MediaJobId,
+            ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+                unreachable!("this model completes in-call")
+            }
+        }
+
+        let artifact = png(b"rerouted");
+        let h = media_handler(Arc::new(Rerouting(vec![artifact])));
+        let result = h
+            .generate(Parameters(GenerateInput {
+                prompt: "a red door".to_string(),
+                cast: Some("artist".to_string()),
+                fields: None,
+                inputs: None,
+                op: Some("flux-dev".to_string()),
+            }))
+            .await
+            .expect("generate succeeds");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("generate answers with text");
+        assert!(
+            text.contains("sd/flux-dev"),
+            "the footer names the model that RAN, recomposed onto the slot's backend:\n{text}"
+        );
+        assert!(
+            !text.contains("sd/core"),
+            "the slot's model did not run, so it must not be reported as though it \
+             had:\n{text}"
         );
     }
 
