@@ -15,6 +15,8 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-03
+
 ### Added
 
 - **`bfl` and `gemini-images` backend kinds** — the FLUX and Gemini image families
