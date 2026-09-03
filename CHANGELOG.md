@@ -17,123 +17,96 @@ record. Each later release appends a new section at the top.
 
 ### Added
 
-- **A `bfl` backend kind** — Black Forest Labs' FLUX image family through `generate`,
-  five named operations, polled in-call for a fast generation and as a `job-N` handle
-  only past that budget.
-- **A `gemini-images` backend kind** — Gemini image generation through `generate`, the
-  same face as every other image backend. Takes input images; has no named operations.
-- **`generate` shows what the model said** above the digests, for a backend whose image
-  generation is a conversation and answers with words as well as bytes.
-- **Transient provider failures (rate limits and overloads) are retried with backoff**
-  instead of failing the whole call.
-- **`kaibo cas write FILE`** stores an image from the command line and prints its
-  digest — the CLI half of `write_cas`, so an operator can put an image in without an
-  MCP client.
-- **`generate` reaches an OpenAI-compatible images backend's `edits` and `variations`
-  routes** through the same `op` parameter, over multipart where `generations` is JSON.
+- **`bfl` and `gemini-images` backend kinds** — the FLUX and Gemini image families
+  through `generate`.
+- **A slow generation comes back as a `job-N` handle** rather than holding the call, once
+  it runs past the in-call budget.
+- **`kind = "dashscope"`** — Alibaba's wan image family, so `generate` runs on a
+  DashScope subscription.
 - **`generate` reaches Stability's edit, control and upscale routes** through a new `op`
   parameter — twelve operations where three were wired.
-- **Each operation's cost is published on the `op` parameter** in the provider's own
-  unit, unconverted — so a model sees the twenty-fold spread before it picks a route.
+- **`generate` reaches an OpenAI-compatible backend's `edits` and `variations` routes**
+  through the same `op`.
+- **Each operation's cost is published on the `op` parameter**, in the provider's own
+  unit, so a model sees the twenty-fold spread before it picks a route.
 - **An unrecognized `op`, or one on a backend with no operations, is refused** rather
   than run as a text-to-image generation.
-- **`generate` takes input images by digest** — `inputs [{"field": "image", "digest":
-  "..."}]` is image-to-image on Stability's `ultra` and `sd3` routes, reusing an image
-  already in the store rather than re-sending it. A field name may repeat, for the
-  operations that take several source images under one name.
-- **`generate` carries several named input parts**, so an operation taking
-  `init_image`+`style_image`, or an image plus an optional mask, is reachable.
+- **`generate` takes input images by digest**, reusing an image already in the store,
+  and carries several named parts where an operation needs them.
 - **A media backend with no input-image route refuses a call that carries one**, rather
-  than silently generating from the prompt alone and returning an unrelated image.
+  than generating from the prompt alone.
 - **An unknown or non-image input digest refuses before the provider is called**, so a
   typo never costs a generation.
-- **`write_cas` stores an image in kaibo's media store and returns its digest** — the
-  deposit half of `read_cas`, and how an image reaches kaibo at all.
+- **`generate` shows what the model said** above the digests, for a backend that answers
+  with words as well as bytes.
+- **`write_cas` stores an image and returns its digest** — the deposit half of
+  `read_cas`, and how an image reaches kaibo at all.
 - **`write_cas` takes a `path` and reads the file itself**, so an image costs no tokens;
   base64 `content` remains for an image that is not a file.
-- **`write_cas` reads the format from the bytes**, so png/jpeg/gif/webp are accepted by
-  signature and there is no `mime` to state or get wrong.
-- **`[telemetry]` exports the GenAI metrics signal** — token usage, call and phase
-  durations, turns per phase, and tool calls per phase, as the conventions name them.
+- **`write_cas` reads the format from the bytes** — png, jpeg, gif and webp by
+  signature, so there is no `mime` to state or get wrong.
+- **`kaibo cas write FILE`** — the CLI half, so an operator can deposit an image without
+  an MCP client.
+- **Transient provider failures are retried with backoff** instead of failing the call.
+- **`[telemetry]` exports the GenAI metrics signal** — token usage, durations, turns and
+  tool calls per phase.
 - **`gen_ai.invoke_agent.tool_calls` answers whether a consult driver delegated**,
-  split by `synth` / `explorer`, without reading a single trace.
-- **`[telemetry] traces` and `[telemetry] metrics`** — per-signal switches, so
-  `traces = false, metrics = true` exports kaibo's spend and latency and nothing else.
-  No metric can carry prompts, so that posture is safe by construction.
+  without reading a single trace.
+- **`[telemetry] traces` and `[telemetry] metrics`** — per-signal switches; no metric can
+  carry prompts, so metrics-only is safe by construction.
 - **`[telemetry] metrics_endpoint`** — omit it and kaibo derives the sibling of
-  `endpoint`, the same rule `logs_endpoint` follows.
-- **`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` turns telemetry on by itself**, for a
-  platform that collects metrics and not traces.
-- **`kind = "dashscope"`** — a media backend for Alibaba's wan image family, so
-  `generate` can run on a DashScope subscription.
+  `endpoint`.
+- **`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` turns telemetry on by itself**, for a platform
+  that collects metrics and not traces.
 - **kaibo reads the standard `OTEL_*` environment**, including `OTEL_SDK_DISABLED`.
-- **`[telemetry] capture_content`** — off by default, so exported spans carry no prompts,
+- **`[telemetry] capture_content`** — off by default, so spans carry no prompts,
   completions, or tool payloads.
 - **`[telemetry] capture`** — export one named attribute without exporting all of them.
-- **Backend keys can come from a command** — `[backends.<name>] api_key_cmd = ["op",
-  "read", "op://Vault/Item/Field"]` runs the declared command (no shell, stdin closed,
-  30s ceiling, output never logged) and uses its trimmed stdout as the API key: a
-  1Password / `pass` / `gh auth token` credential without a secret in a file.
-- **Key sources are declared, never seeded** — the built-in backends no longer read
-  `ANTHROPIC_API_KEY` / `~/.anthropic-key.txt` / etc. out of the box; an operator names
-  the source (`api_key_env`, `api_key_file`, or `api_key_cmd`) in config.toml once, and
-  `api_key_file` + `api_key_cmd` together is a load error naming both.
+- **Backend keys can come from a command** — `api_key_cmd = ["op", "read", "op://…"]`
+  runs it with no shell, stdin closed, and the output never logged.
 
 ### Changed
 
-- **kaish upgraded to 0.17.1** (from 0.14.1) — the read-only shell gains symlink
-  support, pipeline-stage compound statements, `set -o pipefail`, and base-aware
-  arithmetic.
-- **`readlink -f` and `realpath` resolve a path again** — both failed on every operand
-  before, naming neither the operand nor its target.
-- **`grep -rn PATTERN` is what kaibo teaches now**, without the trailing `.` — kaish
-  0.16 prefixes hits with the operand as written, so the bare form is the one that
-  yields repo-relative `file:line` citations.
-- **A refused external command explains itself** — `curl: external commands are not
-  available in this build of the shell` rather than a bare `command not found`, still
-  exit 127.
-- **`ls -l`, `stat`, `readlink`, and `find -type l` describe a symlink itself** instead
-  of following it, so a link is visible as a link. A link pointing outside the project
-  shows its target path; every read that would follow it out is still refused.
+- **kaish upgraded to 0.17.1** (from 0.14.0) — the read-only shell gains symlinks,
+  compound statements in pipes, `set -o pipefail`, and base-aware arithmetic.
+- **`ls -l`, `stat`, `readlink`, and `find -type l` describe a symlink itself** — one
+  pointing outside the project shows its target path.
+- **Every read that would follow a link out of the project is still refused**, so the
+  target's contents, permissions, and existence stay unreachable.
 - **The directories above the project list again** — each names only the next component
-  down to the project, so the shell shows the root path the caller already gave it.
-- **A compound statement can feed a pipe** — `for f in …; do …; done | grep x` is no
-  longer a parse error.
+  down to the project.
+- **`readlink -f` and `realpath` resolve a path again** — both failed on every operand.
+- **A compound statement can feed a pipe** — `for f in …; do …; done | grep x` parses.
+- **`${#v}` counts characters, not bytes** — `v=日本語; echo ${#v}` answers 3.
+- **Arithmetic refuses a leading zero and reads other bases** — `$((0xff))` is 255.
 - **`yes` and `no` are ordinary strings**, not lexer errors, so `echo yes` runs.
-- **`${#v}` counts characters, not bytes**, and a non-ASCII value no longer fails to
-  lex — `v=日本語; echo ${#v}` answers 3.
-- **Arithmetic refuses a leading zero and reads other bases** — `$((007))` names the
-  spelling that works, `$((0xff))` is 255.
-
-- **kaibo now fetches a generated artifact's URL when that is how a provider delivers
-  it**, over TLS and size-bounded, instead of refusing it — otherwise the operator
-  fetches the link by hand with their key.
-- **Every outbound request now identifies itself as `kaibo/<version>`** — kaibo's
-  traffic previously carried no `User-Agent` at all.
+- **`grep -rn PATTERN` is what kaibo teaches now**, without the trailing `.`, so
+  citations come back repo-relative.
+- **A refused external command explains itself** — `curl: external commands are not
+  available in this build of the shell`, still exit 127.
+- **kaibo fetches a generated artifact's URL when that is how a provider delivers it**,
+  over TLS and size-bounded, instead of refusing it.
+- **Every outbound request identifies itself as `kaibo/<version>`** — kaibo's traffic
+  previously carried no `User-Agent` at all.
 - **Telemetry turns on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set** — safe now that
   content is redacted by default.
 - **An explicit `[telemetry] enabled = false` beats the environment**, and
   `OTEL_SDK_DISABLED` beats every source.
-- **A failed batch now names where the failure happened** — the provider accepted the
-  batch and failed it afterward, so a bare provider string no longer reads as a kaibo bug.
-- **A failed batch now counts its unspent prompts** and points at `batch_submit`, in the
-  rendered poll and as `submitted` in `batch get --json`.
-- **A failed batch now names the cast that ran it**, the provenance footer a completed
-  batch already carried.
-- **Setup guidance steers toward declaring a key source in config.toml** (with
-  `kaibo example-config` for the shape) instead of exporting an env var.
+- **A failed batch names where it failed, counts its unspent prompts, and names the cast
+  that ran it** — a bare provider string used to read as a kaibo bug.
+- **Setup guidance steers toward declaring a key source in config.toml** instead of
+  exporting an env var.
 - **Breaking: an upgrading operator must add a key source to every backend they use** —
-  the built-ins no longer seed one, so a cast built on an undeclared backend silently
-  drops out of the roster; add `api_key_env`/`api_key_file`/`api_key_cmd` per backend to
-  bring it back (`kaibo example-config` shows the shapes).
+  a cast on an undeclared backend silently drops out of the roster.
+- **Key sources are declared, never seeded** — name `api_key_env`, `api_key_file`, or
+  `api_key_cmd` per backend (`kaibo example-config` shows the shapes).
 
 ### Fixed
 
 - **The README's cosign floor said 3, and 2.5 verifies a release** — the old floor turned
   away working installs.
-- **Bump `kaish-kernel` to 0.14.1** — the explorer's shell no longer drops piped or
-  buffered stdin across `read`/`grep`/`cat`, and a loop or `if` that exits early keeps
-  what it already printed.
+- **The explorer's shell no longer drops piped or buffered stdin** across
+  `read`/`grep`/`cat`, and a loop that exits early keeps what it already printed.
 
 ## [0.3.0] — 2026-08-13
 
