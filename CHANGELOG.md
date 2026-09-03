@@ -129,6 +129,8 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **The README's cosign floor said 3, and 2.5 verifies a release** — the old floor turned
+  away working installs.
 - **Bump `kaish-kernel` to 0.14.1** — the explorer's shell no longer drops piped or
   buffered stdin across `read`/`grep`/`cat`, and a loop or `if` that exits early keeps
   what it already printed.

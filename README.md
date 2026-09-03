@@ -143,10 +143,12 @@ against any file from the release:
 gh attestation verify kaibo-v0.2.0-x86_64-unknown-linux-musl.tar.gz -R tobert/kaibo
 ```
 
-With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) ≥ 3
+With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) ≥ 2.5
 (no GitHub tooling needed), verify the signed checksum manifest once and it
-covers every file it lists. Grab `checksums.txt` and `checksums.txt.sigstore.json`
-from the release, substituting the tag you downloaded in the identity:
+covers every file it lists. 2.4 and older cannot read the bundle format and
+answer `bundle does not contain cert for verification`. Grab `checksums.txt` and
+`checksums.txt.sigstore.json` from the release, substituting the tag you
+downloaded in the identity:
 
 ```sh
 cosign verify-blob \
