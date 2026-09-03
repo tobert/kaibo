@@ -33,7 +33,7 @@ gh attestation verify kaibo-${TAG}-x86_64-unknown-linux-musl.tar.gz -R tobert/ka
 gh attestation verify oci://ghcr.io/tobert/kaibo:${VERSION} -R tobert/kaibo
 ```
 
-Or keyless-verify the signed checksum manifest with cosign ≥ 3 (covers every file it lists, works offline):
+Or keyless-verify the signed checksum manifest with cosign ≥ 2.5 (covers every file it lists, works offline):
 
 ```sh
 cosign verify-blob \

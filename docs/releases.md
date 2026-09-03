@@ -59,7 +59,7 @@ publish job, so a `workflow_dispatch` smoke run never mints an OIDC identity (bu
 keep `contents: read`; the publish job adds `id-token: write` + `attestations: write`).
 The layout, decided with Amy: **one signed aggregate `checksums.txt`** (cosign keyless —
 verify once, `sha256sum -c` covers any file it lists; one signature shape, the
-self-contained `.sigstore.json` bundle, which verifies offline with cosign ≥ 3; the
+self-contained `.sigstore.json` bundle, which verifies offline with cosign ≥ 2.5; the
 per-artifact `.sha256` sidecars stay for the README's download one-liner),
 **per-artifact SLSA provenance** via `actions/attest-build-provenance` (stored in
 GitHub's attestation store — `gh attestation verify <file> -R tobert/kaibo`, zero extra

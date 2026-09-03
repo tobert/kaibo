@@ -21,8 +21,9 @@ What we're verifying, concretely:
 1. **No write reaches the project** — every mutation path is refused, and nothing
    lands on real disk.
 2. **No external command runs** — the host is unreachable from inside the shell.
-3. **No read escapes the root** — paths outside the mount (absolute, `..`, or via a
-   `path` arg) resolve to nothing; adjacent secrets stay unreadable.
+3. **No read escapes the root** — a file read outside the mount (absolute, `..`, or via
+   a `path` arg) resolves to nothing; adjacent secrets stay unreadable. The mount's own
+   prefix directories list, and only ever name the next component toward it — Battery C.
 4. **No secret leaks via the environment** — the sandbox runs with an empty env.
 
 The structural design these probes exercise lives in `src/sandbox.rs` (the four

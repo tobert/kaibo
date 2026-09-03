@@ -103,8 +103,8 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
-- **The README's cosign floor said 3, and 2.5 verifies a release** — the old floor turned
-  away working installs.
+- **The cosign floor said 3, and 2.5 verifies a release** — the old floor turned away
+  working installs, and the release page repeated it.
 - **The explorer's shell no longer drops piped or buffered stdin** across
   `read`/`grep`/`cat`, and a loop that exits early keeps what it already printed.
 
