@@ -2662,7 +2662,11 @@ struct RawContext {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPrompts {
-    /// Replaces the explorer preamble (the nested `explore′` sweep inside `consult`).
+    /// Replaces the explorer preamble — standalone `explore`, the nested `explore′`
+    /// sweep inside `consult`, and `deliberate`'s dossier pass all read it. The
+    /// built-in varies one opening by who receives the report; an override replaces
+    /// that too, so it must read correctly for a report handed to a synth AND for one
+    /// that goes straight back to the caller.
     explorer: Option<String>,
     /// Replaces the `consult` driver preamble.
     consult: Option<String>,

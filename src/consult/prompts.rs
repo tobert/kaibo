@@ -125,6 +125,52 @@ pub enum Phase {
     Batch,
 }
 
+/// Every phrase in the explorer preamble that varies with the reader. Everything else
+/// is shared, and `both_explorer_readers_share_one_body` proves that by normalizing
+/// through this exact list — so a new varying phrase has to be declared here, or the
+/// test fails rather than letting the two readers quietly drift apart.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReaderWords {
+    /// The opening sentences: who this model is and who receives its report.
+    pub opening: &'static str,
+    /// The reader, mid-sentence.
+    pub them: &'static str,
+    /// The reader, opening a sentence.
+    pub they: &'static str,
+    /// What a gap in the report costs — the consequence differs because one reader
+    /// writes an answer from the report and the other acts on the report itself.
+    pub gap: &'static str,
+}
+
+impl ReportReader {
+    pub(crate) fn words(self) -> ReaderWords {
+        match self {
+            ReportReader::SynthesisAgent => ReaderWords {
+                opening: "You are the explorer on a two-model team reading one codebase. \
+                          You build a complete, accurate picture of the code a question \
+                          touches, and you give that picture to the synthesis agent. The \
+                          synthesis agent writes the final answer from what you found. So \
+                          your work is to gather grounded evidence and cite it exactly.",
+                them: "the synthesis agent",
+                they: "The synthesis agent",
+                gap: "is missing from its answer",
+            },
+            ReportReader::CallingAgent => ReaderWords {
+                opening: "You are the explorer, reading one codebase for an agent working \
+                          outside it. You build a complete, accurate picture of the code a \
+                          question touches, and your report goes straight back to that \
+                          agent, which acts on it directly. Your report reaches its reader \
+                          exactly as you write it, so the report is the finished \
+                          deliverable. Your work is to gather grounded evidence and cite \
+                          it exactly.",
+                them: "the agent that asked",
+                they: "The agent that asked",
+                gap: "is missing from what it can act on",
+            },
+        }
+    }
+}
+
 impl Phase {
     /// Every prompt kaibo can send, for callers that enumerate them (the resource).
     /// Both explorer readers appear: they render different text, so a listing that
@@ -241,37 +287,14 @@ pub fn report_preamble(reader: ReportReader) -> String {
     let core = kaish_syntax_core();
     // Who reads the report leads the preamble, because it decides what a good report
     // *is*: evidence handed to a model that will rewrite it, or a finished answer the
-    // caller acts on. The rest of the block is identical for both — same role, same
-    // reading guidance, same report shape — so the two readers cannot drift apart.
-    let opening = match reader {
-        ReportReader::SynthesisAgent => {
-            "You are the explorer on a two-model team reading one codebase. You build a \
-             complete, accurate picture of the code a question touches, and you give that \
-             picture to the synthesis agent. The synthesis agent writes the final answer \
-             from what you found. So your work is to gather grounded evidence and cite it \
-             exactly."
-        }
-        ReportReader::CallingAgent => {
-            "You are the explorer, reading one codebase for an agent working outside it. \
-             You build a complete, accurate picture of the code a question touches, and \
-             your report goes straight back to that agent, which acts on it directly. \
-             Your report reaches its reader exactly as you write it, so the report is the \
-             finished deliverable. Your work is to gather grounded evidence and cite it \
-             exactly."
-        }
-    };
-    // The reader named inline, wherever the body refers back to it. One noun phrase,
-    // four sites, so a rewrite of the body cannot leave a stale reader behind.
-    let them = match reader {
-        ReportReader::SynthesisAgent => "the synthesis agent",
-        ReportReader::CallingAgent => "the agent that asked",
-    };
-    // Sentence-initial form. Separate because one of the four sites opens a sentence,
-    // and a lowercase noun phrase there is the kind of seam a reader notices.
-    let they = match reader {
-        ReportReader::SynthesisAgent => "The synthesis agent",
-        ReportReader::CallingAgent => "The agent that asked",
-    };
+    // caller acts on. Everything the reader changes is declared in [`ReaderWords`]; the
+    // rest of the block is identical for both, so the two readers cannot drift apart.
+    let ReaderWords {
+        opening,
+        them,
+        they,
+        gap,
+    } = reader.words();
     format!(
         "{opening} The tools named in this request are your complete set. Every shell \
          command is one `run_kaish` call: the tool name is always `run_kaish`, and the \
@@ -299,8 +322,8 @@ pub fn report_preamble(reader: ReportReader) -> String {
          HOW TO INVESTIGATE. Read holistically. The question tells you where to start \
          reading, not where to stop. Read the code around each relevant location as \
          well, not only the lines the question names directly. Your report is the only \
-         view of this codebase {them} receives, so anything you leave out is missing \
-         from its answer. Aim for the complete set of relevant locations. \
+         view of this codebase {them} receives, so anything you leave out {gap}. \
+         Aim for the complete set of relevant locations. \
          Follow each key symbol to where it is defined and to every place it is used. \
          When something in the code confuses you, keep reading until it is clear: a \
          confusing section often holds the detail the question depends on. Follow each \
@@ -1139,15 +1162,21 @@ mod tests {
         let synth = report_preamble(ReportReader::SynthesisAgent);
         let caller = report_preamble(ReportReader::CallingAgent);
 
-        let body = |p: &str| {
+        // Normalize through the declared list, not through hand-written literals: a
+        // new reader-varying phrase that someone forgets to add to `ReaderWords` shows
+        // up here as a body mismatch instead of slipping through.
+        let synth_words = ReportReader::SynthesisAgent.words();
+        let caller_words = ReportReader::CallingAgent.words();
+        let body = |p: &str, w: &ReaderWords| {
             let i = p.find(ANCHOR).expect("both readers reach the shared body");
             p[i..]
-                .replace("The agent that asked", "The synthesis agent")
-                .replace("the agent that asked", "the synthesis agent")
+                .replace(w.they, synth_words.they)
+                .replace(w.them, synth_words.them)
+                .replace(w.gap, synth_words.gap)
         };
         assert_eq!(
-            body(&synth),
-            body(&caller),
+            body(&synth, &synth_words),
+            body(&caller, &caller_words),
             "the shared body must be byte-identical once the reader is normalized"
         );
 

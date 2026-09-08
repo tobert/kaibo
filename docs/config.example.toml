@@ -848,7 +848,8 @@ synth    = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # (a calling agent can't inject a prompt). An empty value is a loud load error.
 # Precedence per phase: slot `preamble` (per-model, above) > [prompts].<phase> >
 # built-in. The synth slot feeds both `consult` and `oneshot`, but each keeps
-# its own key, so they can diverge. Phases: `explorer` (the nested explore′ sweep),
+# its own key, so they can diverge. Phases: `explorer` (every sweep — `explore`,
+# `consult`'s nested explore′, `deliberate`'s dossier),
 # `consult` (the driver), `oneshot` (the thin toolless answer), `batch` (the offline
 # max-thinking answer).
 # ---------------------------------------------------------------------------
