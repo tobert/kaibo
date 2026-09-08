@@ -111,7 +111,7 @@ generate       = true      # ...and needs a cast with an `image` slot AND [cas] 
 # overridden per slot (table form, below); request_timeout_secs per backend.
 # ---------------------------------------------------------------------------
 [defaults]
-explorer_max_turns = 100     # bounds each cheap explore′ sweep — cheap, let it rip
+explorer_max_turns = 100     # bounds each cheap explore′ sweep — set here only, no per-call arg
 synth_max_turns    = 200     # bounds the consult driver loop (sweeps AND span reads)
 max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
 thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle

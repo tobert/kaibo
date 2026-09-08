@@ -15,6 +15,12 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Removed
+
+- **`explorer_max_turns` / `synth_max_turns` are no longer tool arguments or CLI flags** —
+  the turn budget is the server's, set in `[defaults]` or `KAIBO_*_MAX_TURNS`, so two
+  calls to one server stay comparable. A call still passing one is refused by name.
+
 ## [0.4.0] — 2026-09-03
 
 ### Added

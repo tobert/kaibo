@@ -138,10 +138,10 @@ pub(crate) fn keep_dossier(
 /// The refusal a `deliberate` call earns when it supplies a dossier AND explorer
 /// arguments, or `None` when there is nothing wrong.
 ///
-/// With a dossier supplied there is no sweep, so `attach`, the explorer overrides, and
-/// `explorer_max_turns` have nothing to act on. Ignoring them would hand back an answer
-/// that looks like it honored them, which is the quiet kind of wrong: the caller attached
-/// a file, saw a deliberation, and has no way to learn the file never reached it.
+/// With a dossier supplied there is no sweep, so `attach` and the explorer overrides have
+/// nothing to act on. Ignoring them would hand back an answer that looks like it honored
+/// them, which is the quiet kind of wrong: the caller attached a file, saw a deliberation,
+/// and has no way to learn the file never reached it.
 ///
 /// A call that builds its own dossier can carry every one of them, so only a reuse call
 /// has anything to answer for here. Checked before either front door resolves anything, so
@@ -155,7 +155,6 @@ pub(crate) fn inert_explorer_args(args: ExplorerArgs<'_>) -> Option<String> {
         (!args.attach.is_empty()).then_some("attach"),
         args.model.is_some().then_some("explorer_model"),
         args.backend.is_some().then_some("explorer_backend"),
-        args.max_turns.is_some().then_some("explorer_max_turns"),
     ]
     .into_iter()
     .flatten()
@@ -187,7 +186,6 @@ pub(crate) struct ExplorerArgs<'a> {
     pub attach: &'a [String],
     pub model: Option<&'a str>,
     pub backend: Option<&'a str>,
-    pub max_turns: Option<usize>,
 }
 
 /// Load a dossier the caller supplied by address, for a second synth to reason over.
@@ -536,7 +534,6 @@ mod tests {
             attach: if attach.is_empty() { &none } else { &one },
             model: None,
             backend: None,
-            max_turns: None,
         };
 
         assert_eq!(
@@ -550,12 +547,12 @@ mod tests {
 
         let refusal = inert_explorer_args(ExplorerArgs {
             model: Some("m"),
-            max_turns: Some(10),
+            backend: Some("b"),
             ..reuse(&[])
         })
         .expect("both are inert");
         assert!(
-            refusal.contains("`explorer_model`") && refusal.contains("`explorer_max_turns`"),
+            refusal.contains("`explorer_model`") && refusal.contains("`explorer_backend`"),
             "every inert argument is named, not just the first: {refusal}"
         );
 
@@ -569,7 +566,6 @@ mod tests {
                 attach: &one,
                 model: Some("m"),
                 backend: Some("b"),
-                max_turns: Some(10),
             }),
             None,
             "a sweeping call is what the explorer arguments are for"

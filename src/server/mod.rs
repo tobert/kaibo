@@ -363,14 +363,6 @@ pub struct ConsultInput {
     #[serde(default)]
     pub session_id: Option<String>,
 
-    /// Max tool-loop turns for each delegated `explore′` sweep (default 100).
-    #[serde(default)]
-    pub explorer_max_turns: Option<usize>,
-
-    /// Max tool-loop turns for the consult driver loop itself (default 200).
-    #[serde(default)]
-    pub synth_max_turns: Option<usize>,
-
     /// Attach the explorer's aggregated report as `structured_content` alongside the
     /// answer, for debugging the hand-off. Off by default (it can be large; an empty
     /// report means the consult delegated no sweep).
@@ -430,18 +422,13 @@ pub struct ExploreInput {
     /// `explorer_model`. See `kaibo://tools`.
     #[serde(default)]
     pub explorer_backend: Option<String>,
-
-    /// Max tool-loop turns for the explorer sweep (default 100).
-    #[serde(default)]
-    pub explorer_max_turns: Option<usize>,
 }
 
 /// Arguments to the `deliberate` tool: `explore → offline synth`. The explorer runs
 /// live to build a cited dossier (you wait for this — minutes), then the offline synth
 /// deliberates over it. No `session_id`/`context`: deliberate reads the repo itself,
-/// and the synth is a single offline turn (so no `synth_max_turns`). `attach` reaches
-/// the dossier-building explorer as read-WHOLE directives — one attach semantic across
-/// the exploring tools.
+/// and the synth is a single offline turn. `attach` reaches the dossier-building
+/// explorer as read-WHOLE directives — one attach semantic across the exploring tools.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeliberateInput {
@@ -489,16 +476,12 @@ pub struct DeliberateInput {
     #[serde(default)]
     pub synth_backend: Option<String>,
 
-    /// Max tool-loop turns for the dossier-building explorer sweep (default 100).
-    #[serde(default)]
-    pub explorer_max_turns: Option<usize>,
-
     /// Reuse a dossier kaibo already built instead of sweeping for a new one: pass the
     /// digest (bare, or as its `kaibo://cas/<digest>` URI) that an earlier `deliberate`
     /// handed back. No explorer runs, so this call costs only the synth — the way to put
     /// the same evidence in front of a second cast. The explorer arguments (`attach`,
-    /// `explorer_model`, `explorer_backend`, `explorer_max_turns`) have nothing to act on
-    /// here, and are refused rather than ignored.
+    /// `explorer_model`, `explorer_backend`) have nothing to act on here, and are refused
+    /// rather than ignored.
     #[serde(default)]
     pub dossier: Option<String>,
 }
@@ -1851,13 +1834,11 @@ impl KaiboHandler {
                     orientation: self.orientation(&root).await?,
                     call_deadline: defaults.call_deadline,
                 },
-                explorer_max_turns: input
-                    .explorer_max_turns
-                    .unwrap_or(defaults.explorer_max_turns),
+                explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
             },
-            synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
+            synth_max_turns: defaults.synth_max_turns,
             attachments,
             artifacts: self.artifact_sink(
                 input.save_artifacts,
@@ -2000,13 +1981,11 @@ impl KaiboHandler {
                     orientation: self.orientation(&root).await?,
                     call_deadline: defaults.call_deadline,
                 },
-                explorer_max_turns: input
-                    .explorer_max_turns
-                    .unwrap_or(defaults.explorer_max_turns),
+                explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
             },
-            synth_max_turns: input.synth_max_turns.unwrap_or(defaults.synth_max_turns),
+            synth_max_turns: defaults.synth_max_turns,
             attachments,
             // Same two-key gate as the sync lane, and refused here for the same reason —
             // synchronously, before a job exists, so a caller asking for something this
@@ -2131,9 +2110,7 @@ impl KaiboHandler {
                 orientation: self.orientation(&root).await?,
                 call_deadline: defaults.call_deadline,
             },
-            explorer_max_turns: input
-                .explorer_max_turns
-                .unwrap_or(defaults.explorer_max_turns),
+            explorer_max_turns: defaults.explorer_max_turns,
             sandbox: self.config.sandbox.clone(),
             max_attachments: defaults.max_attachments,
         };
@@ -2203,7 +2180,6 @@ impl KaiboHandler {
             attach: &input.attach,
             model: input.explorer_model.as_deref(),
             backend: input.explorer_backend.as_deref(),
-            max_turns: input.explorer_max_turns,
         }) {
             return Err(McpError::invalid_params(refusal, None));
         }
@@ -2266,9 +2242,7 @@ impl KaiboHandler {
                     orientation: self.orientation(&root).await?,
                     call_deadline: defaults.call_deadline,
                 },
-                explorer_max_turns: input
-                    .explorer_max_turns
-                    .unwrap_or(defaults.explorer_max_turns),
+                explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
             };
@@ -5384,8 +5358,6 @@ mod tests {
             synth_model: None,
             synth_backend: None,
             session_id: Some("sess-1".into()),
-            explorer_max_turns: None,
-            synth_max_turns: None,
             include_report: false,
             attach: Vec::new(),
             save_artifacts,
@@ -8186,7 +8158,6 @@ enabled = false
                     explorer_backend: None,
                     synth_model: None,
                     synth_backend: None,
-                    explorer_max_turns: None,
                     dossier: Some(kept.digest.clone()),
                 },
                 Arc::new(NullSink),
@@ -8239,7 +8210,6 @@ enabled = false
             explorer_backend: None,
             synth_model: None,
             synth_backend: None,
-            explorer_max_turns: None,
             dossier: Some(digest.to_string()),
         };
 
