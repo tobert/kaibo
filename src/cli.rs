@@ -354,13 +354,6 @@ pub struct ConsultArgs {
     #[arg(long, value_name = "BACKEND")]
     pub synth_backend: Option<String>,
 
-    /// Max tool-loop turns per delegated explorer sweep (default 100).
-    #[arg(long, value_name = "N")]
-    pub explorer_max_turns: Option<usize>,
-    /// Max tool-loop turns for the consult driver loop (default 200).
-    #[arg(long, value_name = "N")]
-    pub synth_max_turns: Option<usize>,
-
     /// Also print the explorer's aggregated report. Under --json it is the `report`
     /// field on stdout; otherwise it goes to stderr under a `--- explorer report ---`
     /// header, so a pipe still captures only the answer. Empty when the consult
@@ -432,9 +425,6 @@ pub struct ExploreArgs {
     /// Run the explorer override on this backend (name or alias). Requires --explorer-model.
     #[arg(long, value_name = "BACKEND")]
     pub explorer_backend: Option<String>,
-    /// Max tool-loop turns for the explorer sweep (default 100).
-    #[arg(long, value_name = "N")]
-    pub explorer_max_turns: Option<usize>,
 
     /// Emit a JSON envelope on stdout (report + provenance + usage) instead of prose.
     #[arg(long)]
@@ -489,9 +479,6 @@ pub struct DeliberateArgs {
     /// Run the synth override on this backend (name or alias). Requires --synth-model.
     #[arg(long, value_name = "BACKEND")]
     pub synth_backend: Option<String>,
-    /// Max tool-loop turns for the dossier-building explorer sweep (default 100).
-    #[arg(long, value_name = "N")]
-    pub explorer_max_turns: Option<usize>,
 
     /// Emit a JSON envelope on stdout instead of prose. A batch cast's envelope carries
     /// the handle to collect later; a direct cast's carries the answer it waited for.
@@ -1028,11 +1015,11 @@ async fn resolve_and_run(
                     .map_err(SetupError::setup)?,
                 call_deadline,
             },
-            explorer_max_turns: args.explorer_max_turns.unwrap_or(default_explorer_turns),
+            explorer_max_turns: default_explorer_turns,
             sandbox: sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
         },
-        synth_max_turns: args.synth_max_turns.unwrap_or(default_synth_turns),
+        synth_max_turns: default_synth_turns,
         attachments,
         // No client key on this front door (see `load_config`), so no sink and no
         // `save_artifact` in the CLI consult's toolset.
@@ -1480,9 +1467,7 @@ async fn explore_inner(
                 .map_err(SetupError::setup)?,
             call_deadline: resolver.config.defaults.call_deadline,
         },
-        explorer_max_turns: args
-            .explorer_max_turns
-            .unwrap_or(resolver.config.defaults.explorer_max_turns),
+        explorer_max_turns: resolver.config.defaults.explorer_max_turns,
         sandbox: resolver.config.sandbox.clone(),
         max_attachments: resolver.config.defaults.max_attachments,
     };
@@ -1587,7 +1572,6 @@ async fn deliberate_inner(
         attach: &args.attach,
         model: args.explorer_model.as_deref(),
         backend: args.explorer_backend.as_deref(),
-        max_turns: args.explorer_max_turns,
     }) {
         return Err(SetupError {
             kind: "usage",
@@ -1676,9 +1660,7 @@ async fn deliberate_inner(
                     .map_err(SetupError::setup)?,
                 call_deadline: resolver.config.defaults.call_deadline,
             },
-            explorer_max_turns: args
-                .explorer_max_turns
-                .unwrap_or(resolver.config.defaults.explorer_max_turns),
+            explorer_max_turns: resolver.config.defaults.explorer_max_turns,
             sandbox: resolver.config.sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
         };
@@ -4080,8 +4062,10 @@ mod tests {
             "src/b.rs",
             "--synth-model",
             "other-synth",
-            "--explorer-max-turns",
-            "7",
+            "--explorer-backend",
+            "alt",
+            "--explorer-model",
+            "other-explorer",
             "--json",
         ]);
         assert_eq!(cli.common.cast.as_deref(), Some("gemini-deliberate"));
@@ -4091,7 +4075,8 @@ mod tests {
                 assert_eq!(d.path.as_deref(), Some("/tmp/proj"));
                 assert_eq!(d.attach, vec!["src/a.rs", "src/b.rs"]);
                 assert_eq!(d.synth_model.as_deref(), Some("other-synth"));
-                assert_eq!(d.explorer_max_turns, Some(7));
+                assert_eq!(d.explorer_backend.as_deref(), Some("alt"));
+                assert_eq!(d.explorer_model.as_deref(), Some("other-explorer"));
                 assert!(d.json);
                 assert_eq!(d.dossier, None);
             }

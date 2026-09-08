@@ -478,8 +478,11 @@ paths sit outside it by nature:
 - **The batch lane** holds no in-process wait at all. The work runs on the provider's
   queue and is collected by polling `job_get`.
 
-**`explorer_max_turns` / `synth_max_turns`.** Available in `[defaults]` and per call
-only. They bound the loop, not the model.
+**`explorer_max_turns` / `synth_max_turns`.** Server-side only — `[defaults]` and the
+env vars, no tool argument and no CLI flag. They bound the loop, not the model, and a
+loop that reaches its cap still answers: kaibo runs one final tools-forbidden turn so the
+caller gets the work, not a stall. Set them for the server so two calls to it stay
+comparable.
 
 **`session_capacity` / `job_capacity`.** Both LRU, capacity-evicted, no TTL.
 `session_capacity` caps multi-turn consult sessions held in memory. `job_capacity` caps
@@ -631,8 +634,8 @@ Highest wins:
 MCP per-call input  >  CLI flag  >  env var  >  config file  >  built-in default
 ```
 
-**Per-call input** is the `cast`, `*_model`, `*_backend`, and `*_max_turns` tool
-arguments. The config supplies the defaults those override.
+**Per-call input** is the `cast`, `*_model`, and `*_backend` tool arguments. The config
+supplies the defaults those override. Turn limits are deliberately not among them.
 
 **A per-call model override** sends the model id verbatim. An id containing `/`
 (HuggingFace style) is still one id: it is never parsed for a backend, so an org prefix
@@ -657,8 +660,8 @@ Everything else follows one naming rule:
 | default cast | `server.cast` | `KAIBO_CAST` | `--cast` |
 | disable a tool | `server.tools.<t> = false` | `KAIBO_NO_<T>` | `--no-<t>` |
 | log filter | `server.log` | `RUST_LOG` *(wins)* / `KAIBO_LOG` | — |
-| explorer max turns | `defaults.explorer_max_turns` | `KAIBO_EXPLORER_MAX_TURNS` | *(per-call only)* |
-| synth max turns | `defaults.synth_max_turns` | `KAIBO_SYNTH_MAX_TURNS` | *(per-call only)* |
+| explorer max turns | `defaults.explorer_max_turns` | `KAIBO_EXPLORER_MAX_TURNS` | — |
+| synth max turns | `defaults.synth_max_turns` | `KAIBO_SYNTH_MAX_TURNS` | — |
 | max output tokens | `defaults.max_tokens` *(per-slot override)* | `KAIBO_MAX_TOKENS` | — |
 | thinking budget | `defaults.thinking_budget` *(per-slot override)* | `KAIBO_THINKING_BUDGET` | — |
 | explorer temperature | `defaults.explorer_temperature` *(per-slot `temperature`)* | `KAIBO_EXPLORER_TEMPERATURE` | — |
