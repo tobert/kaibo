@@ -58,6 +58,17 @@ fn the_mcp_tools_refuse_a_per_call_turn_limit() {
             .err()
             .map(|e| e.to_string()),
         ),
+        // deliberate's synth is one offline completion, not a loop, so this spelling
+        // never belonged here — pinned anyway, so re-adding it anywhere is one failure.
+        (
+            "deliberate",
+            "synth_max_turns",
+            serde_json::from_value::<DeliberateInput>(
+                json!({ "question": "q", "synth_max_turns": 500 }),
+            )
+            .err()
+            .map(|e| e.to_string()),
+        ),
     ];
 
     for (tool, field, err) in cases {
@@ -79,6 +90,13 @@ fn the_cli_has_no_turn_limit_flags() {
         vec!["kaibo", "consult", "why?", "--explorer-max-turns", "5"],
         vec!["kaibo", "consult", "why?", "--synth-max-turns", "500"],
         vec!["kaibo", "explore", "map it", "--explorer-max-turns", "5"],
+        vec![
+            "kaibo",
+            "deliberate",
+            "is this right?",
+            "--synth-max-turns",
+            "500",
+        ],
         vec![
             "kaibo",
             "deliberate",
