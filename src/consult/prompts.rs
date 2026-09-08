@@ -66,7 +66,7 @@ pub struct PromptOverrides {
 /// framing → the file map (immediately useful context) → operator house rules.
 fn phase_preamble(
     override_: Option<&str>,
-    default: fn() -> String,
+    default: impl FnOnce() -> String,
     orientation: Option<&str>,
     house_rules: Option<&str>,
 ) -> String {
@@ -84,11 +84,39 @@ fn phase_preamble(
 /// house rules splice) — live in exactly one place, [`resolve_phase_preamble`]. Every
 /// live tool routes through it, and so does the `kaibo://prompts` resource, so what the
 /// resource shows can never drift from what a call actually sends the model.
+/// Who reads an explorer's report when the sweep finishes.
+///
+/// The explorer preamble names its reader five times — that naming is what makes the
+/// report a hand-off rather than an answer, and it is the one fact that genuinely
+/// differs between the three tools sharing [`Phase::Explorer`]. `consult` and
+/// `deliberate` hand the report to a second model on kaibo's team; standalone
+/// `explore` hands it straight back to the agent that called kaibo, with nothing in
+/// between. Telling a standalone `explore` that a synthesis agent will write the final
+/// answer describes a model that does not exist on that call, and a report curated for
+/// a downstream rewrite is not the same artifact as one written to be acted on.
+///
+/// Carried *inside* `Phase::Explorer` rather than passed beside it so the reader cannot
+/// be forgotten at a call site: there is no way to name the explorer phase without
+/// deciding who reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportReader {
+    /// A second model on kaibo's team writes the final answer from the report — the
+    /// `consult` driver reading an `explore′` sweep, or `deliberate`'s offline synth
+    /// reading the dossier.
+    SynthesisAgent,
+    /// The agent that called kaibo reads the report itself and acts on it. Standalone
+    /// `explore` only: the report IS the deliverable, so nothing downstream will
+    /// restate it.
+    CallingAgent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// The explorer sweep: `explore`, the nested `explore′` inside `consult`, and
-    /// `deliberate`'s dossier phase all share this one.
-    Explorer,
+    /// The explorer sweep — standalone `explore`, the nested `explore′` inside
+    /// `consult`, and `deliberate`'s dossier pass. They share one role and one body of
+    /// reading guidance, and differ only in who receives the report
+    /// ([`ReportReader`]).
+    Explorer(ReportReader),
     /// The `consult` driver.
     Consult,
     /// The thin, toolless `oneshot`.
@@ -98,9 +126,12 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// The four phases, for callers that enumerate every prompt (the resource).
-    pub const ALL: [Phase; 4] = [
-        Phase::Explorer,
+    /// Every prompt kaibo can send, for callers that enumerate them (the resource).
+    /// Both explorer readers appear: they render different text, so a listing that
+    /// showed one would misreport what the other tool sends.
+    pub const ALL: [Phase; 5] = [
+        Phase::Explorer(ReportReader::SynthesisAgent),
+        Phase::Explorer(ReportReader::CallingAgent),
         Phase::Consult,
         Phase::Oneshot,
         Phase::Batch,
@@ -109,20 +140,24 @@ impl Phase {
     /// A short, stable label for a phase — the resource header and the tools it drives.
     pub fn label(self) -> &'static str {
         match self {
-            Phase::Explorer => "explorer (explore · consult sweep · deliberate dossier)",
+            Phase::Explorer(ReportReader::SynthesisAgent) => {
+                "explorer → synthesis agent (consult sweep · deliberate dossier)"
+            }
+            Phase::Explorer(ReportReader::CallingAgent) => "explorer → calling agent (explore)",
             Phase::Consult => "consult driver",
             Phase::Oneshot => "oneshot",
             Phase::Batch => "batch / deliberate synth (offline)",
         }
     }
 
-    /// The built-in default preamble for this phase.
-    fn default_preamble(self) -> fn() -> String {
+    /// Build this phase's built-in default preamble. Called only when no override
+    /// replaces it, so an overridden phase never pays to compose the text it discards.
+    fn default_preamble(self) -> String {
         match self {
-            Phase::Explorer => report_preamble,
-            Phase::Consult => consult_preamble,
-            Phase::Oneshot => oneshot_preamble,
-            Phase::Batch => batch_preamble,
+            Phase::Explorer(reader) => report_preamble(reader),
+            Phase::Consult => consult_preamble(),
+            Phase::Oneshot => oneshot_preamble(),
+            Phase::Batch => batch_preamble(),
         }
     }
 
@@ -131,7 +166,7 @@ impl Phase {
     /// an active override without re-encoding the phase→key mapping.
     pub fn override_in(self, p: &PromptOverrides) -> Option<&str> {
         match self {
-            Phase::Explorer => p.explorer.as_deref(),
+            Phase::Explorer(_) => p.explorer.as_deref(),
             Phase::Consult => p.consult.as_deref(),
             Phase::Oneshot => p.oneshot.as_deref(),
             Phase::Batch => p.batch.as_deref(),
@@ -144,7 +179,7 @@ impl Phase {
     /// it), so neither project layer reaches them — the seam that used to sit as a bare
     /// `None, None` at each of those call sites now lives here, in one place.
     pub fn reads_project(self) -> bool {
-        matches!(self, Phase::Explorer | Phase::Consult)
+        matches!(self, Phase::Explorer(_) | Phase::Consult)
     }
 
     /// Which cast slot's `preamble` frames this phase: the **explorer** slot drives the
@@ -154,7 +189,7 @@ impl Phase {
     /// mapping [`crate::config::Cast::resolved_prompts`] applies.
     pub fn slot_role(self) -> ModelRole {
         match self {
-            Phase::Explorer => ModelRole::Explorer,
+            Phase::Explorer(_) => ModelRole::Explorer,
             Phase::Consult | Phase::Oneshot | Phase::Batch => ModelRole::Synth,
         }
     }
@@ -180,7 +215,7 @@ pub fn resolve_phase_preamble(
     };
     phase_preamble(
         phase.override_in(prompts),
-        phase.default_preamble(),
+        || phase.default_preamble(),
         orientation,
         house_rules,
     )
@@ -190,20 +225,55 @@ pub fn resolve_phase_preamble(
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
 ///
-/// Opens a *role on a team* rather than a capability: this half of the pair is the
-/// **explorer** and its counterpart is the **synthesis agent**, the same two names
-/// the code uses ([`ModelRole::Explorer`]/[`ModelRole::Synth`]) and the same two the
-/// synth-side preambles use — one vocabulary end to end. It closes on the same
-/// completion obligation the synth carries, aimed at this role's deliverable: the
-/// report is what leaves the loop, so the last turn is the report itself.
-pub fn report_preamble() -> String {
+/// Opens a *role* rather than a capability: this model is the **explorer**, the name
+/// the code already uses ([`ModelRole::Explorer`]). It closes on the same completion
+/// obligation the synth carries, aimed at this role's deliverable: the report is what
+/// leaves the loop, so the last turn is the report itself.
+///
+/// `reader` decides who the report is addressed to, and it is the only thing that
+/// varies (see [`ReportReader`]). Under [`ReportReader::SynthesisAgent`] the pairing
+/// carries the same two names as the synth-side preambles — explorer and synthesis
+/// agent, one vocabulary end to end. Under [`ReportReader::CallingAgent`] there is no
+/// second model to name, so the preamble says so rather than inventing one: a sweep
+/// told its work will be rewritten downstream can reasonably leave a thread for the
+/// rewriter to pull, and on standalone `explore` there is no rewriter.
+pub fn report_preamble(reader: ReportReader) -> String {
     let core = kaish_syntax_core();
+    // Who reads the report leads the preamble, because it decides what a good report
+    // *is*: evidence handed to a model that will rewrite it, or a finished answer the
+    // caller acts on. The rest of the block is identical for both — same role, same
+    // reading guidance, same report shape — so the two readers cannot drift apart.
+    let opening = match reader {
+        ReportReader::SynthesisAgent => {
+            "You are the explorer on a two-model team reading one codebase. You build a \
+             complete, accurate picture of the code a question touches, and you give that \
+             picture to the synthesis agent. The synthesis agent writes the final answer \
+             from what you found. So your work is to gather grounded evidence and cite it \
+             exactly."
+        }
+        ReportReader::CallingAgent => {
+            "You are the explorer, reading one codebase for an agent working outside it. \
+             You build a complete, accurate picture of the code a question touches, and \
+             your report goes straight back to that agent, which acts on it directly. \
+             Your report reaches its reader exactly as you write it, so the report is the \
+             finished deliverable. Your work is to gather grounded evidence and cite it \
+             exactly."
+        }
+    };
+    // The reader named inline, wherever the body refers back to it. One noun phrase,
+    // four sites, so a rewrite of the body cannot leave a stale reader behind.
+    let them = match reader {
+        ReportReader::SynthesisAgent => "the synthesis agent",
+        ReportReader::CallingAgent => "the agent that asked",
+    };
+    // Sentence-initial form. Separate because one of the four sites opens a sentence,
+    // and a lowercase noun phrase there is the kind of seam a reader notices.
+    let they = match reader {
+        ReportReader::SynthesisAgent => "The synthesis agent",
+        ReportReader::CallingAgent => "The agent that asked",
+    };
     format!(
-        "You are the explorer on a two-model team reading one codebase. You build a \
-         complete, accurate picture of the code a question touches, and you give that \
-         picture to the synthesis agent. The synthesis agent writes the final answer \
-         from what you found. So your work is to gather grounded evidence and cite it \
-         exactly. The tools named in this request are your complete set. Every shell \
+        "{opening} The tools named in this request are your complete set. Every shell \
          command is one `run_kaish` call: the tool name is always `run_kaish`, and the \
          command you want to run goes inside its `script` argument. \
          {core}\n\n\
@@ -229,23 +299,23 @@ pub fn report_preamble() -> String {
          HOW TO INVESTIGATE. Read holistically. The question tells you where to start \
          reading, not where to stop. Read the code around each relevant location as \
          well, not only the lines the question names directly. Your report is the only \
-         view of this codebase the synthesis agent receives, so anything you leave out \
-         is missing from its answer. Aim for the complete set of relevant locations. \
+         view of this codebase {them} receives, so anything you leave out is missing \
+         from its answer. Aim for the complete set of relevant locations. \
          Follow each key symbol to where it is defined and to every place it is used. \
          When something in the code confuses you, keep reading until it is clear: a \
          confusing section often holds the detail the question depends on. Follow each \
          thread while you are already reading the code, so that one investigation \
          leaves you with the complete picture.\n\n\
-         WHAT TO PRODUCE. A curated report for the synthesis agent, in these \
+         WHAT TO PRODUCE. A curated report for {them}, in these \
          sections:\n\
          - SummaryOfFindings: state what you concluded.\n\
          - RelevantLocations: for each location that matters, give the concrete \
          `file:line`, the key symbols there (functions, types, fields), a short \
          verbatim snippet, and what it means for the question.\n\
-         - ExplorationTrace: the path you took, when it helps the synthesis agent \
-         trust the result.\n\
-         Keep the report focused and evidence-first. The synthesis agent trusts your \
-         citations and builds on them, so ground every claim in an exact `file:line`. \
+         - ExplorationTrace: the path you took, when it helps {them} trust the \
+         result.\n\
+         Keep the report focused and evidence-first. {they} trusts your citations and \
+         builds on them, so ground every claim in an exact `file:line`. \
          That exactness is the whole value of your report. The report is all you hand \
          over, so your last turn is the report itself, written out in full."
     )
@@ -779,7 +849,7 @@ mod tests {
     /// are written against this shape).
     #[test]
     fn report_preamble_keeps_the_reading_directive_and_report_shape() {
-        let p = report_preamble();
+        let p = report_preamble(ReportReader::SynthesisAgent);
         // Reading strategy: whole files by default, wide spans only for a
         // truncated giant, grep to find which files matter.
         assert!(p.contains("cat -n FILE"), "whole-file read idiom: {p}");
@@ -828,7 +898,7 @@ mod tests {
     /// for a span second.
     #[test]
     fn explorer_reads_a_wide_span_around_a_grep_hit_in_a_large_file() {
-        let p = report_preamble();
+        let p = report_preamble(ReportReader::SynthesisAgent);
         assert!(
             p.contains("Once grep names a file, open that file whole."),
             "whole-file stays the default follow-up to a grep hit: {p}"
@@ -894,7 +964,7 @@ mod tests {
     #[test]
     fn every_sed_range_kaibo_writes_is_quoted() {
         for (label, text) in [
-            ("explorer", report_preamble()),
+            ("explorer", report_preamble(ReportReader::SynthesisAgent)),
             ("consult", consult_preamble()),
             (
                 "oversize attachment",
@@ -930,7 +1000,7 @@ mod tests {
     /// roster is complete without enumerating it.
     #[test]
     fn report_preamble_anchors_the_toolset() {
-        let p = report_preamble();
+        let p = report_preamble(ReportReader::SynthesisAgent);
         assert!(
             p.contains("The tools named in this request are your complete set"),
             "roster completeness is stated: {p}"
@@ -985,8 +1055,108 @@ mod tests {
             "the driver names its explorer counterpart: {c}"
         );
         assert!(
-            report_preamble().contains("the synthesis agent"),
+            report_preamble(ReportReader::SynthesisAgent).contains("the synthesis agent"),
             "the explorer names its synth counterpart"
+        );
+    }
+
+    /// Standalone `explore` hands its report straight back to the calling agent, so the
+    /// preamble must not promise a synthesis agent that will not exist on that call.
+    ///
+    /// This is the failing-first half of the bug it fixes: before `ReportReader`, all
+    /// three explorer tools were told "The synthesis agent writes the final answer from
+    /// what you found", which is true for the `consult` sweep and `deliberate`'s dossier
+    /// and false for `explore`. A model that believes a downstream rewrite is coming can
+    /// reasonably leave a thread for the rewriter to pull; on `explore` nobody pulls it.
+    #[test]
+    fn the_calling_agent_is_never_promised_a_synthesis_agent() {
+        let p = report_preamble(ReportReader::CallingAgent);
+        assert!(
+            !p.contains("synthesis agent"),
+            "explore's explorer must not be told a synthesis agent reads it: {p}"
+        );
+        assert!(
+            !p.to_lowercase().contains("two-model team"),
+            "there is no second model on a standalone explore: {p}"
+        );
+        assert!(
+            p.contains("the agent that asked"),
+            "the report must still name its reader, not go unaddressed: {p}"
+        );
+        assert!(
+            p.contains("the report is the finished deliverable"),
+            "the explorer must know nothing downstream restates its work: {p}"
+        );
+        assert!(
+            p.contains("The agent that asked trusts your citations"),
+            "the reader's name is capitalized where it opens a sentence: {p}"
+        );
+
+        // The counterpart still says what it always said — this fix narrows one claim,
+        // it does not delete the two-model framing where that framing is true.
+        let synth = report_preamble(ReportReader::SynthesisAgent);
+        assert!(
+            synth.contains("The synthesis agent writes the final answer from what you found"),
+            "the sweep and dossier keep their hand-off framing: {synth}"
+        );
+    }
+
+    /// Substituting a noun phrase into prose is how a sentence ends up starting with a
+    /// lowercase word. Both readers get checked because the substitution sites are
+    /// shared, so a seam introduced for one shows up in the other.
+    #[test]
+    fn no_sentence_in_an_explorer_preamble_opens_lowercase() {
+        for reader in [ReportReader::SynthesisAgent, ReportReader::CallingAgent] {
+            let p = report_preamble(reader);
+            for (i, _) in p.match_indices(". ") {
+                let rest = &p[i + 2..];
+                let word = rest.split_whitespace().next().unwrap_or("");
+                let first = match word.chars().next() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                // Skip the shell idioms and back-ticked identifiers the prose quotes —
+                // `cat -n FILE`, `grep -rn PATTERN` — which are lowercase on purpose.
+                if !first.is_alphabetic() || word.starts_with('`') {
+                    continue;
+                }
+                assert!(
+                    first.is_uppercase(),
+                    "{reader:?}: a sentence opens on lowercase {word:?} here: \
+                     ...{}...",
+                    &p[i.saturating_sub(60)..(i + 80).min(p.len())]
+                );
+            }
+        }
+    }
+
+    /// One body, two readers. Everything after the opening is identical once the reader
+    /// is named, so a rewrite of the reading guidance cannot land on one tool and miss
+    /// the other — the drift this parameterization exists to prevent.
+    #[test]
+    fn both_explorer_readers_share_one_body() {
+        const ANCHOR: &str = "The tools named in this request are your complete set";
+        let synth = report_preamble(ReportReader::SynthesisAgent);
+        let caller = report_preamble(ReportReader::CallingAgent);
+
+        let body = |p: &str| {
+            let i = p.find(ANCHOR).expect("both readers reach the shared body");
+            p[i..]
+                .replace("The agent that asked", "The synthesis agent")
+                .replace("the agent that asked", "the synthesis agent")
+        };
+        assert_eq!(
+            body(&synth),
+            body(&caller),
+            "the shared body must be byte-identical once the reader is normalized"
+        );
+
+        // And the openings genuinely differ, so the assertion above is not vacuous.
+        let opening = |p: &str| p[..p.find(ANCHOR).expect("anchor")].to_string();
+        assert_ne!(
+            opening(&synth),
+            opening(&caller),
+            "the readers must actually be addressed differently"
         );
     }
 
@@ -1003,7 +1173,7 @@ mod tests {
     fn built_in_preambles_are_written_without_em_dash_clause_chains() {
         let core = kaish_syntax_core();
         for (label, text) in [
-            ("explorer", report_preamble()),
+            ("explorer", report_preamble(ReportReader::SynthesisAgent)),
             ("consult", consult_preamble()),
             ("oneshot", oneshot_preamble()),
             ("batch", batch_preamble()),
@@ -1095,8 +1265,22 @@ mod tests {
     fn resolve_phase_preamble_routes_each_phase_and_gates_project_layers() {
         let base = PromptOverrides::default();
         assert_eq!(
-            resolve_phase_preamble(Phase::Explorer, &base, None, None),
-            report_preamble()
+            resolve_phase_preamble(
+                Phase::Explorer(ReportReader::SynthesisAgent),
+                &base,
+                None,
+                None
+            ),
+            report_preamble(ReportReader::SynthesisAgent)
+        );
+        assert_eq!(
+            resolve_phase_preamble(
+                Phase::Explorer(ReportReader::CallingAgent),
+                &base,
+                None,
+                None
+            ),
+            report_preamble(ReportReader::CallingAgent)
         );
         assert_eq!(
             resolve_phase_preamble(Phase::Consult, &base, None, None),
@@ -1114,7 +1298,11 @@ mod tests {
         let map = "PROJECT FILES.\nsrc/lib.rs";
         let rules = "operator house rule";
         // The reading phases splice both project layers.
-        for phase in [Phase::Explorer, Phase::Consult] {
+        for phase in [
+            Phase::Explorer(ReportReader::SynthesisAgent),
+            Phase::Explorer(ReportReader::CallingAgent),
+            Phase::Consult,
+        ] {
             let p = resolve_phase_preamble(phase, &base, Some(map), Some(rules));
             assert!(
                 p.contains(map) && p.contains(rules),

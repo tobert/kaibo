@@ -39,7 +39,7 @@ use tracing::Instrument;
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
     consult, explore_with, oneshot, sweep_evidence_block, Arm, ConsultConfig, ExploreConfig,
-    ModelCaps, PhaseContext, PromptOverrides,
+    ModelCaps, PhaseContext, PromptOverrides, ReportReader,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
@@ -2139,15 +2139,24 @@ impl KaiboHandler {
         // The top-level `explore` tool doesn't inject `attach` (v1 scope) — its
         // report goes straight back to the calling agent's own context, which is
         // exactly the channel `attach` exists to bypass; no consumer to route to.
-        let (report, usage) =
-            match explore_with(&input.question, root, &explorer, &cfg, &attachments, None)
-                .instrument(span)
-                .await
-            {
-                Ok(out) => out,
-                // A provider/model-loop failure is a clean tool-result error, same as `consult`.
-                Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
-            };
+        let (report, usage) = match explore_with(
+            &input.question,
+            root,
+            &explorer,
+            &cfg,
+            &attachments,
+            None,
+            // The report is the tool result — it lands in the calling agent's own
+            // context, with no synth of ours between the explorer and its reader.
+            ReportReader::CallingAgent,
+        )
+        .instrument(span)
+        .await
+        {
+            Ok(out) => out,
+            // A provider/model-loop failure is a clean tool-result error, same as `consult`.
+            Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
 
         // The report IS the text (no structured_content). Provenance names the one arm
@@ -2301,6 +2310,8 @@ impl KaiboHandler {
                 &cfg,
                 &attachments,
                 sink.as_ref(),
+                // The dossier is written for the offline synth that reasons over it.
+                ReportReader::SynthesisAgent,
             )
             .instrument(span)
             .await
@@ -4679,9 +4690,11 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
              append per call for the project-reading phases (path-dependent).\n\n\
              A phase is a role, not one tool — several tools share a preamble. The \
              **explorer** framing drives standalone `explore`, the delegated sweep inside \
-             `consult`, and `deliberate`'s dossier-building pass; the **offline-synth** \
-             framing serves both `batch_submit` and `deliberate`'s synth. So tuning one \
-             phase moves every tool that wears it.\n",
+             `consult`, and `deliberate`'s dossier-building pass; it is listed twice \
+             because the sweep and the dossier are written for a synthesis agent that \
+             answers from them, while `explore` hands its report straight back to you. \
+             The **offline-synth** framing serves both `batch_submit` and `deliberate`'s \
+             synth. So tuning one phase moves every tool that wears it.\n",
         ),
     }
 
@@ -9227,7 +9240,10 @@ enabled = false
         let text = read_text(PROMPTS_URI, &[]);
         // Each phase's built-in preamble appears verbatim (single-sourced — no drift).
         for body in [
-            report_preamble(),
+            // Both explorer readers: the doc lists them separately because they render
+            // different text, and a doc that showed one would misreport the other tool.
+            report_preamble(ReportReader::SynthesisAgent),
+            report_preamble(ReportReader::CallingAgent),
             consult_preamble(),
             oneshot_preamble(),
             batch_preamble(),

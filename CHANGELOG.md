@@ -33,6 +33,11 @@ record. Each later release appends a new section at the top.
   cast shape it wants, or the absent job producer, plus the tools that are live. A
   misspelled name still reads as `tool not found`.
 
+### Fixed
+
+- **`explore` no longer tells its explorer that a synthesis agent will write the answer** —
+  on a standalone `explore` there is none, and the report is the deliverable.
+
 ### Removed
 
 - **`explorer_max_turns` / `synth_max_turns` are no longer tool arguments or CLI flags** —

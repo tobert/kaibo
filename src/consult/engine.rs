@@ -46,7 +46,7 @@ use super::config::{ConsultConfig, ExploreConfig, PhaseContext};
 use super::prompts::PromptOverrides;
 use super::prompts::{
     consult_user_prompt, deliberation_prompt, explorer_attach_directive, resolve_phase_preamble,
-    sweep_evidence_block, Phase,
+    sweep_evidence_block, Phase, ReportReader,
 };
 use super::shaping::{ModelCaps, ModelShape};
 
@@ -2165,7 +2165,9 @@ fn consult_tools(
     // flagged as central. The directive orders whole `cat -n` reads (the explorer
     // chooses when, not whether), keeping citation-exact line numbers for free.
     let mut explorer_preamble_owned = resolve_phase_preamble(
-        Phase::Explorer,
+        // The nested sweep always reports to the consult driver — this loop IS the
+        // synthesis agent, so the reader is fixed here rather than plumbed in.
+        Phase::Explorer(ReportReader::SynthesisAgent),
         &cfg.explore.phase.prompts,
         cfg.explore.phase.orientation.as_deref(),
         cfg.explore.phase.house_rules.as_deref(),
@@ -2246,9 +2248,10 @@ pub(crate) async fn explore_with(
     cfg: &ExploreConfig,
     attached: &[super::prompts::ConsultAttachment],
     attach: Option<&Arc<SweepAttachSink>>,
+    reader: ReportReader,
 ) -> Result<(String, Usage)> {
     let mut preamble = resolve_phase_preamble(
-        Phase::Explorer,
+        Phase::Explorer(reader),
         &cfg.phase.prompts,
         cfg.phase.orientation.as_deref(),
         cfg.phase.house_rules.as_deref(),
@@ -4035,6 +4038,7 @@ mod tests {
             &cfg,
             &[],
             None,
+            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -4370,6 +4374,55 @@ mod tests {
         }
     }
 
+    /// The reader reaches the wire. `explore_with` is shared by standalone `explore`
+    /// (whose report goes straight to the calling agent) and `deliberate`'s dossier
+    /// pass (whose report goes to an offline synth), so the parameter has to survive
+    /// the trip into rig's preamble — a hardcoded phase inside the function would
+    /// compile fine and quietly send every sweep the wrong framing.
+    #[tokio::test]
+    async fn the_reader_reaches_the_preamble_rig_forwards() {
+        const EXPLORER: &str = "cheap-explorer";
+
+        let run = |reader| async move {
+            let client = ScriptedClient::builder()
+                .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
+                .build();
+            let dir = project_with_marker();
+            explore_with(
+                "what is here?",
+                dir.path().to_path_buf(),
+                &arm(&client, EXPLORER),
+                &ExploreConfig::default(),
+                &[],
+                None,
+                reader,
+            )
+            .await
+            .expect("scripted explore should succeed");
+            client
+                .requests_for(EXPLORER)
+                .first()
+                .and_then(|r| r.preamble.clone())
+                .expect("the explorer request carries a preamble")
+        };
+
+        let caller = run(ReportReader::CallingAgent).await;
+        assert!(
+            !caller.contains("synthesis agent"),
+            "a CallingAgent sweep must not be told a synth reads it: {caller}"
+        );
+        assert!(
+            caller.contains("the agent that asked"),
+            "a CallingAgent sweep still names its reader: {caller}"
+        );
+
+        let synth = run(ReportReader::SynthesisAgent).await;
+        assert!(
+            synth.contains("The synthesis agent writes the final answer"),
+            "a SynthesisAgent sweep keeps the hand-off framing: {synth}"
+        );
+    }
+
     /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
     /// explorer arm over `{run_kaish}` against the real repo and returns the
     /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
@@ -4414,6 +4467,7 @@ mod tests {
             &cfg,
             &[],
             None,
+            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -4462,6 +4516,7 @@ mod tests {
                 size: 900_000,
             }],
             None,
+            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -4519,6 +4574,7 @@ mod tests {
             &cfg,
             &[],
             None,
+            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -4640,6 +4696,7 @@ mod tests {
             &cfg,
             &[],
             Some(&sink),
+            ReportReader::SynthesisAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -4772,6 +4829,7 @@ mod tests {
                 &cfg,
                 &[],
                 None,
+                ReportReader::CallingAgent,
             ),
         )
         .await
@@ -5486,6 +5544,7 @@ mod tests {
             &ExploreConfig::default(),
             &[],
             None,
+            ReportReader::CallingAgent,
         )
         .await
         .expect_err("an explorer that reported nothing must fail, not return an empty report");
