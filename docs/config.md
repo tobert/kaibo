@@ -1577,15 +1577,28 @@ This is narrower than widening to the parent: `--allow-path ~/src` would grant r
 everything under it, while follow admits exactly the worktrees of an already-allowed repo
 and nothing else.
 
+**An allowed tree reaches worktrees only when it is a worktree root itself** — it must
+hold the `.git` entry, a directory for a main worktree or git's `gitdir:` file for a
+linked one. kaibo reads no ancestor of the tree it was given, so a `--root` inside a
+larger repository (a package in a monorepo, or any directory under a home with dotfiles
+in git) follows nothing rather than reaching that repository's other directories. Name
+the repo root as the tree when you want its worktrees.
+
 kaibo resolves this by reading git's own link files — a worktree's `.git` file and the
 repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git`, which is not
 in the build (see [the sandbox probe runbook](sandbox-probes.md)).
 
-Trust flows outward from the allowed repo only. kaibo enumerates the worktrees the
-*allowed* repo's common git dir vouches for and admits a candidate only if it falls inside
-one. It never consults the candidate's own `.git`, so a foreign directory with a forged
-`gitdir:` pointer cannot admit itself. The check runs only on the containment-miss path;
-a normal in-bounds call is untouched.
+**Every link must be named from both ends.** kaibo enumerates the worktrees the allowed
+tree's common git dir vouches for, and uses one only when that common dir names the
+allowed tree back as a worktree root of its own, and when the worktree in question names
+its registration back the way git writes it. So a foreign directory with a forged
+`gitdir:` pointer cannot admit itself; a forged `.git` *file* inside the allowed tree
+cannot aim the reach elsewhere; and a registration file inside the allowed tree cannot
+vouch for a directory that never heard of it. That last one is why the check is per
+entry: for a repository cloned to review, `<tree>/.git` and every registration under it
+are content kaibo did not author. A vouched worktree that contains the allowed tree is
+dropped as well; reach it with `--allow-path`. The check runs only on the
+containment-miss path; a normal in-bounds call is untouched.
 
 Turn it off to keep the boundary strictly static:
 

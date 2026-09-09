@@ -244,13 +244,11 @@ impl Resolver {
         }
         if self.config.follow_worktrees {
             for tree in self.allowed_set.iter() {
-                if let Some(common) = crate::worktree::common_git_dir(tree) {
-                    if let Some(wt) = crate::worktree::vouched_worktrees(&common)
-                        .into_iter()
-                        .find(|wt| canon.starts_with(wt))
-                    {
-                        return Some(wt);
-                    }
+                if let Some(wt) = crate::worktree::worktrees_reachable_from(tree)
+                    .into_iter()
+                    .find(|wt| canon.starts_with(wt))
+                {
+                    return Some(wt);
                 }
             }
         }
@@ -292,10 +290,7 @@ impl Resolver {
         }
         let mut found: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
         for tree in self.allowed_set.iter() {
-            let Some(common) = crate::worktree::common_git_dir(tree) else {
-                continue;
-            };
-            for wt in crate::worktree::vouched_worktrees(&common) {
+            for wt in crate::worktree::worktrees_reachable_from(tree) {
                 if !self.allowed_set.iter().any(|t| wt.starts_with(t)) {
                     found.insert(wt);
                 }
