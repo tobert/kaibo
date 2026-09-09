@@ -802,6 +802,62 @@ async fn spoofed_dotgit_pointing_into_allowed_repo_is_rejected() {
     );
 }
 
+/// The mirror of the spoof above, on the side the reach *starts* from. A `.git` file
+/// inside the allowed tree is content kaibo did not author — a repository cloned to
+/// review carries whatever its author put there — so it can aim `commondir` at any
+/// directory on the host. Following that pointer would vouch for a tree the operator
+/// never named, turning "read this repo" into "read that one". The common dir must
+/// name the allowed tree back, and a fabricated one has never heard of it.
+///
+/// No `require_git!`: the layout is hand-written precisely because git would never
+/// write it.
+#[tokio::test]
+async fn a_forged_dotgit_in_the_allowed_tree_cannot_aim_the_vouch() {
+    let base = tempdir().unwrap();
+    // The allowed tree — a plain directory whose `.git` is a file we control.
+    let project = base.path().join("project");
+    fs::create_dir(&project).unwrap();
+    // A fabricated per-worktree git dir, registered nowhere.
+    let fake = base.path().join("fake-gitdir");
+    fs::create_dir_all(&fake).unwrap();
+    // The tree the operator never named.
+    let victim = base.path().join("victim");
+    fs::create_dir_all(victim.join(".git")).unwrap();
+    fs::write(victim.join("secret.txt"), "sensitive\n").unwrap();
+    fs::write(
+        project.join(".git"),
+        format!("gitdir: {}\n", fake.display()),
+    )
+    .unwrap();
+    fs::write(
+        fake.join("commondir"),
+        format!("{}\n", victim.join(".git").display()),
+    )
+    .unwrap();
+
+    let handler = handler_with_allowed(Some(&project), &[]);
+
+    let err = try_run(&handler, &victim.to_string_lossy(), "cat secret.txt")
+        .await
+        .expect_err("a forged .git in the allowed tree must not aim the vouch");
+    assert!(
+        err.to_lowercase().contains("allowed"),
+        "rejection must name the boundary, got: {err}"
+    );
+
+    // Positive control: the forged pointer costs the operator nothing they had. The
+    // allowed tree itself still reads, so the refusal above is the boundary holding,
+    // not the handler failing to build.
+    fs::write(project.join("own.txt"), "mine\n").unwrap();
+    let inside = try_run(&handler, &project.to_string_lossy(), "cat own.txt")
+        .await
+        .expect("the allowed tree itself must still read");
+    assert!(
+        inside.contains("mine"),
+        "kaibo must still read the project it is pointed at, got: {inside}"
+    );
+}
+
 /// `follow_worktrees = false` keeps the boundary strictly static: a genuine linked
 /// worktree of an allowed repo is rejected like any other outside path.
 #[tokio::test]
@@ -866,6 +922,41 @@ async fn sibling_reachable_when_rooted_at_linked_worktree() {
     assert!(
         out.contains("main worktree"),
         "should read the main worktree's file, got: {out}"
+    );
+}
+
+/// A repo *above* the allowed tree must not widen the boundary. Rooted at a plain
+/// directory that happens to sit inside someone's repository — a project under a
+/// dotfiles `$HOME/.git` is the everyday shape — the ancestor walk finds that repo's
+/// common dir, whose main worktree is the repo root, and the repo root *contains* the
+/// allowed tree. Vouching for it hands the caller every sibling the operator never
+/// named. Follow may reach sideways to a worktree; never upward to the repo enclosing
+/// the tree it was given.
+#[tokio::test]
+async fn a_repo_above_the_allowed_tree_does_not_widen_the_boundary() {
+    require_git!("a_repo_above_the_allowed_tree_does_not_widen_the_boundary");
+    let base = tempdir().unwrap();
+    // `base` is the enclosing repository — stand-in for a home with dotfiles in git.
+    git(base.path(), &["init", "-q"]);
+    fs::write(base.path().join("README.md"), "the enclosing repo\n").unwrap();
+    git(base.path(), &["add", "."]);
+    git(base.path(), &["commit", "-q", "-m", "seed"]);
+    // The allowed tree: a plain subdirectory, not a repo of its own.
+    let project = base.path().join("project");
+    fs::create_dir(&project).unwrap();
+    // A sibling the operator never named, holding what must stay unreadable.
+    let private = base.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::write(private.join("secret.txt"), "sensitive\n").unwrap();
+
+    let handler = handler_with_allowed(Some(&project), &[]);
+
+    let err = try_run(&handler, &private.to_string_lossy(), "cat secret.txt")
+        .await
+        .expect_err("a sibling of the allowed tree must stay outside the boundary");
+    assert!(
+        err.to_lowercase().contains("allowed"),
+        "rejection must name the boundary, got: {err}"
     );
 }
 

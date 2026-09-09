@@ -15,6 +15,15 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Security
+
+- **Following git worktrees could widen the read boundary past the tree you named** —
+  possible exposure of files outside the workspace on every release since `0.2.0`.
+- **An allowed tree now reaches worktrees only when it holds `.git` itself**; kaibo reads
+  no ancestor of it, so a `--root` inside a larger repo no longer reaches that repo.
+- **A forged `.git` in the allowed tree can no longer aim the reach** — the common dir must
+  name that tree back, so a cloned repo cannot point kaibo at a directory you never named.
+
 ### Removed
 
 - **`explorer_max_turns` / `synth_max_turns` are no longer tool arguments or CLI flags** —
