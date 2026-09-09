@@ -417,13 +417,41 @@ async fn a_gated_tool_is_neither_advertised_nor_callable() {
         .try_run_kaish("cat Cargo.toml")
         .await
         .expect_err("a gated tool must refuse the call, not run it");
-    // The wording is rmcp's router, not kaibo's — a gated route simply is not there.
-    // Pin the substance (a protocol-level refusal that says the tool is absent), not
-    // rmcp's exact phrasing.
+    // The refusal is kaibo's own, and it has to survive the trip over the wire — this is
+    // the only place that proves the caller reads these words rather than rmcp's
+    // `tool not found`, which says the same thing about a typo and about a tool the
+    // operator switched off. Pin the three things a blocked model can act on: which tool,
+    // which knob, and what it could reach for instead.
     let refusal = refusal.to_string();
     assert!(
-        refusal.contains("not found"),
-        "a gated tool must be refused as absent; got: {refusal}"
+        refusal.contains("run_kaish") && refusal.contains("--no-run-kaish"),
+        "the refusal must name the tool and the flag that dropped it; got: {refusal}"
+    );
+    assert!(
+        refusal.contains("Live here:") && refusal.contains("`consult`"),
+        "the refusal must name what is live instead; got: {refusal}"
+    );
+    assert!(
+        !refusal.contains("not found"),
+        "a real tool the operator disabled must not read as a missing name; got: {refusal}"
+    );
+
+    // The other half, and the reason the override checks `ALL_TOOL_NAMES` first: a name
+    // kaibo never had is a typo, and `tool not found` is the true answer there. Without
+    // this, an override that explained *every* miss would be indistinguishable from one
+    // that explained the right ones.
+    let params = CallToolRequestParams::new("run_kiash");
+    let typo = bounded("tools/call run_kiash", server.client.call_tool(params))
+        .await
+        .expect_err("a name kaibo never had must still be refused")
+        .to_string();
+    assert!(
+        typo.contains("not found"),
+        "a misspelled tool name keeps the generic answer; got: {typo}"
+    );
+    assert!(
+        !typo.contains("Live here:"),
+        "kaibo must not explain a name it has never had; got: {typo}"
     );
 
     server.shutdown().await;
@@ -628,7 +656,9 @@ async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
             "{what} carries the SEP-2322 discriminator at this version; got: {result}"
         );
     }
-    let served = tools["tools"].as_array().expect("tools/list carries a tools array");
+    let served = tools["tools"]
+        .as_array()
+        .expect("tools/list carries a tools array");
     assert!(
         !served.is_empty(),
         "the session serves the real tool surface alongside the cache fields"
