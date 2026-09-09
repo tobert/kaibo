@@ -1588,13 +1588,16 @@ kaibo resolves this by reading git's own link files — a worktree's `.git` file
 repo's `.git/worktrees/<name>/{gitdir,commondir}` — never by running `git`, which is not
 in the build (see [the sandbox probe runbook](sandbox-probes.md)).
 
-**Both sides of the link must agree.** kaibo enumerates the worktrees the allowed tree's
-common git dir vouches for, and uses them only when that common dir names the allowed
-tree back as one of its own worktree roots. So a foreign directory with a forged `gitdir:`
-pointer cannot admit itself, and a forged `.git` *file* inside the allowed tree — content
-kaibo did not author, in a repository cloned to review — cannot aim the reach at a
-directory the operator never named. A vouched worktree that contains the allowed tree is
-dropped for the same reason; reach it with `--allow-path`. The check runs only on the
+**Every link must be named from both ends.** kaibo enumerates the worktrees the allowed
+tree's common git dir vouches for, and uses one only when that common dir names the
+allowed tree back as a worktree root of its own, and when the worktree in question names
+its registration back the way git writes it. So a foreign directory with a forged
+`gitdir:` pointer cannot admit itself; a forged `.git` *file* inside the allowed tree
+cannot aim the reach elsewhere; and a registration file inside the allowed tree cannot
+vouch for a directory that never heard of it. That last one is why the check is per
+entry: for a repository cloned to review, `<tree>/.git` and every registration under it
+are content kaibo did not author. A vouched worktree that contains the allowed tree is
+dropped as well; reach it with `--allow-path`. The check runs only on the
 containment-miss path; a normal in-bounds call is untouched.
 
 Turn it off to keep the boundary strictly static:

@@ -26,9 +26,13 @@
 //! "candidate points into us" pull would be spoofable (a hostile dir forging `gitdir:`
 //! to smuggle itself in). And we do not take the allowed tree's own `.git` at its word
 //! either: it is content kaibo did not author, so the common dir it names must name the
-//! allowed tree back before any of its worktrees count. An earlier reading trusted that
+//! allowed tree back before any of its worktrees count, and each worktree it registers
+//! must name that registration back before it counts. An earlier reading trusted that
 //! side because "the operator allowed it" — but allowing kaibo to *read* a directory is
-//! not the same grant as letting that directory *name other directories*.
+//! not the same grant as letting that directory *name other directories*. The everyday
+//! case makes that sharp: a main worktree's common dir is `<tree>/.git`, *inside* the
+//! allowed tree, so in any repository cloned to review every registration file under it
+//! is attacker-authored.
 //!
 //! **The tree we were handed is the only tree that vouches.** [`common_git_dir`] reads
 //! `<tree>/.git` and no ancestor of it, so a tree that merely sits inside a repository
@@ -83,18 +87,42 @@ pub fn vouched_worktrees(common_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // Linked worktrees: each `worktrees/<name>/gitdir` holds the absolute path back
-    // to that worktree's `.git` file; its parent is the worktree root. This is the
-    // vouch — the trusted common dir naming where each of its worktrees lives.
+    // Linked worktrees: each `worktrees/<name>/gitdir` holds the absolute path back to
+    // that worktree's `.git` file; its parent is the worktree root. Git writes the pair
+    // — the registration names the worktree, and the worktree's own `.git` file names
+    // the registration — and BOTH halves have to be present for the vouch to count.
+    //
+    // A one-way read of the registration is a read escape. When the allowed tree is a
+    // main worktree its common dir is `<tree>/.git`, a directory *inside* the tree, so
+    // in any repository kaibo did not author — one cloned to review, the everyday case
+    // — the registration files are written by whoever wrote the repo. Naming
+    // `/etc/.git` in a `gitdir` file would otherwise make `/etc` a vouched worktree
+    // root: one file, and any directory on the host that is not an ancestor of the tree
+    // becomes readable. Requiring the back-link kills it, because the named directory
+    // has to point back and an attacker cannot write inside the directory they are
+    // trying to reach.
     if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
         for entry in entries.flatten() {
-            let pointer = entry.path().join("gitdir");
-            let Some(wt_dotgit) = read_gitdir_pointer(&pointer) else {
+            let registration = entry.path();
+            let Some(wt_dotgit) = read_gitdir_pointer(&registration.join("gitdir")) else {
                 continue;
             };
             let Some(wt_root) = wt_dotgit.parent() else {
                 continue;
             };
+            // The other half: `<wt>/.git` must name this exact registration back.
+            let Some(back) = read_gitdir_pointer(&wt_dotgit) else {
+                continue;
+            };
+            let (Ok(back), Ok(registration)) = (
+                std::fs::canonicalize(&back),
+                std::fs::canonicalize(&registration),
+            ) else {
+                continue;
+            };
+            if back != registration {
+                continue;
+            }
             if let Ok(canon) = std::fs::canonicalize(wt_root) {
                 out.push(canon);
             }
@@ -163,6 +191,12 @@ fn resolve_commondir(gitdir: &Path) -> Option<PathBuf> {
 /// itself among its worktree roots: a forged pointer reaches a common dir that has never
 /// heard of `tree`, and the reach collapses to nothing. This is the same two-way check
 /// the candidate side already got, applied to the side the reach starts from.
+///
+/// That handshake alone is not enough, which is why [`vouched_worktrees`] carries its
+/// own: when `tree` is a main worktree the common dir lives *inside* it, so `tree` is a
+/// vouched root by construction and the handshake here passes for free, saying nothing
+/// about the entries beside it. Each registered worktree earns its place separately, by
+/// naming its registration back.
 ///
 /// A vouched tree that strictly *contains* `tree` is dropped as well — a genuine but
 /// unusual layout (`git worktree add` inside the main worktree) would otherwise widen
@@ -246,6 +280,49 @@ mod tests {
             from_main,
             std::fs::canonicalize(repo.join(".git")).unwrap(),
             "the common dir must be the main worktree's own `.git`"
+        );
+    }
+
+    /// `worktrees_reachable_from` hands back only trees whose registration is mutual.
+    /// The allowed tree here is a main worktree, so its common dir sits *inside* it and
+    /// every byte of it belongs to whoever wrote the repo — the shape of any repository
+    /// cloned to review. One `worktrees/<name>/gitdir` naming an outside directory used
+    /// to vouch for it; now the named directory has to point back, which it cannot,
+    /// because writing inside it is the very access being sought.
+    ///
+    /// The `tree`-side handshake cannot catch this on its own: the main worktree entry
+    /// *is* `tree`, so it passes for free and says nothing about its neighbours.
+    #[test]
+    fn a_registration_alone_does_not_vouch_for_the_directory_it_names() {
+        let base = tempdir().unwrap();
+        let project = base.path().join("project");
+        let dotgit = project.join(".git");
+        std::fs::create_dir_all(dotgit.join("worktrees").join("evil")).unwrap();
+        let victim = base.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(
+            dotgit.join("worktrees").join("evil").join("gitdir"),
+            format!("{}\n", victim.join(".git").display()),
+        )
+        .unwrap();
+
+        let canon_project = std::fs::canonicalize(&project).unwrap();
+        let reachable = worktrees_reachable_from(&canon_project);
+        assert_eq!(
+            reachable,
+            vec![canon_project.clone()],
+            "only the allowed tree itself may be reachable, got {reachable:?}"
+        );
+
+        // Positive control: a *mutually* registered worktree does come back, so the
+        // assertion above is the back-link check firing rather than the whole feature
+        // being dead.
+        let (repo, wt) = write_registered_worktree(base.path(), "feature");
+        let canon_repo = std::fs::canonicalize(&repo).unwrap();
+        let canon_wt = std::fs::canonicalize(&wt).unwrap();
+        assert!(
+            worktrees_reachable_from(&canon_repo).contains(&canon_wt),
+            "a mutually registered worktree must still be reachable"
         );
     }
 

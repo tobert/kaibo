@@ -858,6 +858,60 @@ async fn a_forged_dotgit_in_the_allowed_tree_cannot_aim_the_vouch() {
     );
 }
 
+/// The third door, and the one an attacker actually walks through. When the allowed
+/// tree is a *main* worktree its `.git` is a real directory **inside the tree** — the
+/// everyday shape of a repository someone cloned to review — so its whole contents,
+/// registration files included, are authored by whoever wrote the repo. A single
+/// `.git/worktrees/<name>/gitdir` file naming any directory on the host makes that
+/// directory a vouched worktree root.
+///
+/// The `tree`-side handshake cannot see this: the main worktree entry is `tree` itself
+/// by construction, so it is satisfied for free and says nothing about the *other*
+/// entries alongside it. Each vouch has to be mutual on its own — the worktree git
+/// itself registers holds a `.git` pointing back at the registration, and a directory
+/// that was merely named has no such pointer.
+///
+/// No `require_git!`: git would never write this registration.
+#[tokio::test]
+async fn a_registration_naming_a_host_directory_does_not_vouch_for_it() {
+    let base = tempdir().unwrap();
+    // The allowed tree: a main worktree, `.git` a real directory we author.
+    let project = base.path().join("project");
+    let dotgit = project.join(".git");
+    fs::create_dir_all(dotgit.join("worktrees").join("evil")).unwrap();
+    fs::write(project.join("own.txt"), "mine\n").unwrap();
+    // The tree the operator never named — stands in for any directory on the host.
+    let victim = base.path().join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("secret.txt"), "sensitive\n").unwrap();
+    // One registration file, naming the victim. Nothing else is forged.
+    fs::write(
+        dotgit.join("worktrees").join("evil").join("gitdir"),
+        format!("{}\n", victim.join(".git").display()),
+    )
+    .unwrap();
+
+    let handler = handler_with_allowed(Some(&project), &[]);
+
+    let err = try_run(&handler, &victim.to_string_lossy(), "cat secret.txt")
+        .await
+        .expect_err("a directory a registration merely names must not be vouched for");
+    assert!(
+        err.to_lowercase().contains("allowed"),
+        "rejection must name the boundary, got: {err}"
+    );
+
+    // Positive control: the repo the operator did name still reads, so the refusal
+    // above is the boundary holding rather than the handler failing to build.
+    let inside = try_run(&handler, &project.to_string_lossy(), "cat own.txt")
+        .await
+        .expect("the allowed tree itself must still read");
+    assert!(
+        inside.contains("mine"),
+        "kaibo must still read the project it is pointed at, got: {inside}"
+    );
+}
+
 /// `follow_worktrees = false` keeps the boundary strictly static: a genuine linked
 /// worktree of an allowed repo is rejected like any other outside path.
 #[tokio::test]

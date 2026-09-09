@@ -23,6 +23,9 @@ record. Each later release appends a new section at the top.
   no ancestor of it, so a `--root` inside a larger repo no longer reaches that repo.
 - **A forged `.git` in the allowed tree can no longer aim the reach** — the common dir must
   name that tree back, so a cloned repo cannot point kaibo at a directory you never named.
+- **A git worktree registration alone no longer vouches for the directory it names** — the
+  worktree must name its registration back, so one file in a repo you cloned to review
+  cannot make any directory on the host readable.
 
 ### Removed
 
