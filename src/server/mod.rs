@@ -1001,6 +1001,24 @@ pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
         .map(|(_, _, requirement)| *requirement)
 }
 
+/// The `[tools]` key that gates `name`, whose CLI spelling is `--no-<key with dashes>`.
+/// `None` for a tool with no flag of its own: the job verbs follow their producers, and
+/// the two CAS halves follow `[cas] enabled`. Mirrors [`ToolGating::enabled`]'s match —
+/// that one answers *whether*, this one answers *which knob*.
+fn gating_key_for(name: &str) -> Option<&'static str> {
+    match name {
+        "consult" | "consult_submit" => Some("consult"),
+        "explore" => Some("explore"),
+        "deliberate" => Some("deliberate"),
+        "oneshot" => Some("oneshot"),
+        "run_kaish" => Some("run_kaish"),
+        "batch_submit" => Some("batch"),
+        "list_models" => Some("list_models"),
+        "generate" => Some("generate"),
+        _ => None,
+    }
+}
+
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
@@ -3771,8 +3789,122 @@ fn sep_2549_cache_fields(
     }
 }
 
+impl KaiboHandler {
+    /// Why a tool kaibo *has* is not on this server's router, in kaibo's own words.
+    ///
+    /// A gated route is simply absent, so rmcp answers `tool not found` — right for a
+    /// typo, wrong for every tool an operator switched off or no cast can staff. From the
+    /// wire those read identically, and a model that sees "not found" retries the
+    /// spelling of a name that was never misspelled. Naming the knob instead lets it
+    /// either ask the operator for the one thing that would help or reach for a tool that
+    /// works, which is why the live roster rides along.
+    ///
+    /// Every reason that applies is named, not the first one found: `generate` can want
+    /// both a cast and the media store, and fixing one of two still leaves the caller
+    /// blocked. `None` for a name kaibo has never had — there the generic error is true.
+    fn gated_tool_refusal(&self, name: &str) -> Option<McpError> {
+        if !ALL_TOOL_NAMES.contains(&name) {
+            return None;
+        }
+        let mut reasons: Vec<String> = Vec::new();
+
+        if let Some(key) = gating_key_for(name) {
+            if !self.config.tools.enabled(name) {
+                reasons.push(format!(
+                    "The operator turned it off with `--no-{}` (`[tools] {key} = false` \
+                     says the same thing).",
+                    key.replace('_', "-")
+                ));
+            }
+        }
+        if !self.config.cas.enabled && matches!(name, "read_cas" | "write_cas" | "generate") {
+            reasons.push(
+                "The media store is off, so there is nowhere for bytes to live. Set \
+                 `[cas] enabled = true`; `kaibo example-config` shows the shape."
+                    .to_string(),
+            );
+        }
+        if reasons.is_empty() || name == "generate" {
+            if let Some(requirement) = cast_requirement_for(name) {
+                let usable: Vec<String> = self
+                    .config
+                    .usable_casts(|k| std::env::var(k).ok())
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect();
+                if eligible_casts_by_tool(&self.config, &usable)
+                    .get(name)
+                    .is_some_and(|c| c.is_empty())
+                {
+                    reasons.push(format!(
+                        "No configured cast can staff it: it needs {requirement}. \
+                         `kaibo://config` lists every cast and what each one carries."
+                    ));
+                }
+            }
+        }
+        if matches!(name, "job_get" | "job_cancel" | "job_list" | "job_wait") {
+            reasons.push(
+                "Nothing here mints a job handle, so there are no jobs to collect. The \
+                 producers are `consult_submit`, `batch_submit`, `deliberate` and \
+                 `generate`; none of them is live."
+                    .to_string(),
+            );
+        }
+        // A route can only be missing for one of the reasons above, so an empty list
+        // means the gating rules and this explanation have drifted apart. Say that
+        // plainly rather than returning a refusal that explains nothing.
+        if reasons.is_empty() {
+            reasons.push(
+                "This build does not serve it, and kaibo cannot say which setting is \
+                 responsible. `kaibo://config` reports the tool gates in force."
+                    .to_string(),
+            );
+        }
+
+        // Sort the bare names, then wrap: sorting the backticked forms puts
+        // `consult_submit` ahead of `consult`, because `_` sorts before a backtick.
+        let mut live: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        live.sort();
+        let live: Vec<String> = live.into_iter().map(|n| format!("`{n}`")).collect();
+        Some(McpError::invalid_params(
+            format!(
+                "`{name}` is a kaibo tool, but this server does not serve it. {} \
+                 Live here: {}.",
+                reasons.join(" "),
+                live.join(", ")
+            ),
+            None,
+        ))
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for KaiboHandler {
+    /// The `#[tool_handler]` macro's own `call_tool`, with one addition: a call naming a
+    /// tool kaibo has but this server gated off is refused in kaibo's words before the
+    /// router sees it. Writing the method here suppresses the macro's version (it skips
+    /// any method the impl already has), and the dispatch it wraps stays byte-identical —
+    /// a real route reaches `self.tool_router.call` exactly as before.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if !self.tool_router.has_route(&request.name) {
+            if let Some(refusal) = self.gated_tool_refusal(&request.name) {
+                return Err(refusal);
+            }
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     /// The `#[tool_handler]` macro's own `list_tools`, with one difference: the
     /// SEP-2549 fields answer `cacheScope: private`, where the macro answers
     /// `public`. Writing the method here is what suppresses the macro's version (it
@@ -7645,6 +7777,114 @@ enabled = false
                  batch_submit nor deliberate can be staffed. Advertised: {tools:?}"
             );
         }
+    }
+
+    /// The refusal names the *reason* a tool is missing, not just its absence. rmcp
+    /// answers a gated route with `tool not found`, which is the same sentence a typo
+    /// gets — so a model that reads it retries a spelling that was never wrong. Each
+    /// branch here is a different knob, and the refusal has to name the one in force.
+    #[test]
+    fn a_gated_tool_refusal_names_the_reason_and_what_is_live() {
+        // Flag-off: `deliberate` is disabled by the operator, on a config that could
+        // otherwise staff it.
+        let h = hermetic_handler_from_toml(&with_no_builtin_casts(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.pair]
+            explorer = "gem/flash"
+            synth = "gem/flash"
+
+            [server]
+            cast = "pair"
+
+            [server.tools]
+            deliberate = false
+        "#,
+        ));
+        let msg = h
+            .gated_tool_refusal("deliberate")
+            .expect("a gated kaibo tool earns kaibo's own refusal")
+            .to_string();
+        assert!(
+            msg.contains("--no-deliberate") && msg.contains("[tools] deliberate = false"),
+            "a flag-off tool must name the flag AND the config key: {msg}"
+        );
+        assert!(
+            msg.contains("Live here:") && msg.contains("`consult`"),
+            "every refusal names what the caller can reach instead: {msg}"
+        );
+
+        // Unstaffable: `explore` needs an explorer slot, and this cast has none. The
+        // operator changed nothing, so naming a flag here would send them to the wrong
+        // knob entirely.
+        let h = hermetic_handler_from_toml(&with_no_builtin_casts(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.synth_only]
+            synth = "gem/flash"
+
+            [server]
+            cast = "synth_only"
+        "#,
+        ));
+        let msg = h
+            .gated_tool_refusal("explore")
+            .expect("an unstaffable tool earns a refusal too")
+            .to_string();
+        assert!(
+            msg.contains("cast") && msg.contains("explorer"),
+            "an unstaffable tool must name the cast shape it wants: {msg}"
+        );
+        assert!(
+            !msg.contains("--no-explore"),
+            "nobody turned this off — naming a flag would send the reader to the wrong \
+             knob: {msg}"
+        );
+
+        // A name kaibo has never had keeps rmcp's generic answer: it really is not found,
+        // and explaining kaibo's gates to a typo helps nobody.
+        assert!(
+            h.gated_tool_refusal("run_kiash").is_none(),
+            "a misspelled name must fall through to the generic error"
+        );
+    }
+
+    /// The job verbs have no flag of their own, so their refusal has to explain the
+    /// indirection: they went because nothing here can mint a handle. A reader told only
+    /// "not served" would hunt for a `--no-job-get` that does not exist.
+    #[test]
+    fn a_job_verb_refusal_explains_that_no_producer_is_live() {
+        let h = hermetic_handler_from_toml(&with_no_builtin_casts(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.synth_only]
+            synth = "gem/flash"
+
+            [server]
+            cast = "synth_only"
+
+            [server.tools]
+            consult = false
+        "#,
+        ));
+        let msg = h
+            .gated_tool_refusal("job_get")
+            .expect("a dropped job verb earns a refusal")
+            .to_string();
+        assert!(
+            msg.contains("job handle") && msg.contains("consult_submit"),
+            "the refusal must explain that no producer is live, and name the producers: \
+             {msg}"
+        );
     }
 
     /// A tool that takes NO cast is never touched by the staffing gate — `run_kaish` runs

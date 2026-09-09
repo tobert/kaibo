@@ -27,6 +27,12 @@ record. Each later release appends a new section at the top.
   worktree must name its registration back, so one file in a repo you cloned to review
   cannot make any directory on the host readable.
 
+### Changed
+
+- **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the
+  cast shape it wants, or the absent job producer, plus the tools that are live. A
+  misspelled name still reads as `tool not found`.
+
 ### Removed
 
 - **`explorer_max_turns` / `synth_max_turns` are no longer tool arguments or CLI flags** —
