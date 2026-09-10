@@ -14,7 +14,7 @@ floor up. Two symptoms surfaced it:
 
 1. **A profile is one `kind`, so a team is locked to one family.** Roles bind to
    a profile, and a profile is a single connection — so a *chimera* (a deepseek
-   explorer feeding a claude synth: cheap local sweeps, a hosted answer) had no
+   explorer feeding a claude synth: cheap local surveys, a hosted answer) had no
    spelling at all. One composed team, two families, one name — the fused profile
    can't say it.
 2. **The vocabulary confused its only user.** "Profile" meant *connection* in
@@ -69,7 +69,7 @@ api_key_env = "OPENAI_API_KEY"
 # --- casts: role → "backend/model". `cast = "chimera"` selects the whole thing. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — local/cheap family
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast surveys — local/cheap family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
 
 [casts.local-only]                          # privacy posture: nothing leaves the box
@@ -130,16 +130,16 @@ tier looks tempting — two considerations before pinning one:
 
 - **Confabulation risk is why we usually want smarter models.** Under a
   restricted toolset a small or flash-tier model may confabulate — calling a
-  tool that is not in its set, for example — and a sweep re-run without
+  tool that is not in its set, for example — and a survey re-run without
   corrective feedback tends to repeat the confabulation. Thinking depth is not
   the lever here: kaibo already enables thinking at high effort by default on
   every wire that supports it, so the reliable lever is model capability.
-  Prefer a pro-tier explorer for a long sweep that must complete (a
-  `deliberate` dossier build); a flash tier fits interactive sweeps, where the
+  Prefer a pro-tier explorer for a long survey that must complete (a
+  `deliberate` dossier build); a flash tier fits interactive surveys, where the
   consult driver absorbs a failed delegation and answers from its own reads.
 - **Match the explorer to its provider's rate ceiling, not its synth's
-  family.** A sweep with whole-file attachments can request 100k+ tokens per
-  minute; against a tight org TPM ceiling the sweep rate-limits, and a retry
+  family.** A survey with whole-file attachments can request 100k+ tokens per
+  minute; against a tight org TPM ceiling the survey rate-limits, and a retry
   self-starves the next window. The per-call `explorer_backend` /
   `explorer_model` overrides pair any synth with an explorer on a roomier
   provider — family-match buys the synth's answer nothing, and that freedom is
@@ -163,7 +163,7 @@ server.rs: resolve_cast("chimera")
 
 consult(question, root, arms, cfg, session)
 └─ run_phase(synth_arm): loop over {run_kaish, explore′, view_image…}
-     └─ explore′ delegates each sweep to run_phase(explorer_arm)
+     └─ explore′ delegates each survey to run_phase(explorer_arm)
         — different client, different wire protocol, same loop primitive
 ```
 

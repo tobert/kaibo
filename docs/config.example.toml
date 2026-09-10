@@ -111,8 +111,8 @@ generate       = true      # ...and needs a cast with an `image` slot AND [cas] 
 # overridden per slot (table form, below); request_timeout_secs per backend.
 # ---------------------------------------------------------------------------
 [defaults]
-explorer_max_turns = 100     # bounds each cheap explore′ sweep — set here only, no per-call arg
-synth_max_turns    = 200     # bounds the consult driver loop (sweeps AND span reads)
+explorer_max_turns = 100     # bounds each cheap explore′ survey — set here only, no per-call arg
+synth_max_turns    = 200     # bounds the consult driver loop (surveys AND span reads)
 max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
 thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle
 
@@ -190,8 +190,8 @@ job_capacity     = 64        # max async-consult jobs held in memory, running pl
 # never dropped. 0 inlines nothing — the escape hatch for a small-context local cast.
 inline_attach_budget = 262144   # 256 KiB
 
-# Files ONE explorer sweep may route with its attach tool (the bytes ride alongside
-# the sweep's report, never through the explorer's context). 0 disables the tool.
+# Files ONE explorer survey may route with its attach tool (the bytes ride alongside
+# the survey's report, never through the explorer's context). 0 disables the tool.
 max_attachments = 32
 
 # ---------------------------------------------------------------------------
@@ -574,7 +574,7 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 #     `local-only` below) — that single lineage already augments your own agent's. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps — DeepSeek family
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast surveys — DeepSeek family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude family
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
@@ -763,7 +763,7 @@ synth    = "gemini/gemini-pro-latest"        # batch-capable synth; Pro is more 
 # kaibo-facing shape is identical to the others. It needs the HOSTED backend: the Batch API
 # is OpenAI Platform's, so `lane = "batch"` on a local OpenAI-compatible server is a load
 # error naming the fix. Pairing an interactive explorer with the offline synth is what makes
-# a cast `deliberate`-capable — Luna sweeps the repo live and builds the cited dossier, Sol
+# a cast `deliberate`-capable — Luna surveys the repo live and builds the cited dossier, Sol
 # reasons over it offline at max effort.
 [casts.gpt-batch]
 synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }

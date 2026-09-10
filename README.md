@@ -48,7 +48,7 @@ two-model team you picked, from whatever family you like.
 
 From there kaibo runs its own agents. The **synth** is the synthesis agent: it owns
 the investigation, and it decides how to work. It reads spans through the read-only shell
-itself, and it can hand a broad sweep to the **explorer** — a cheaper, faster model that
+itself, and it can hand a broad survey to the **explorer** — a cheaper, faster model that
 searches the repo and reports back what it found. Delegating is a tool call, and it's the
 synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
 writes the answer.
@@ -293,7 +293,7 @@ A **direct** cast has no handle to give — the job would be this process — so
 the long local completion in the foreground and prints the answer, saying on stderr
 that it is waiting. Either way kaibo keeps the dossier and names its digest; pass that
 back as `--dossier` to put the same evidence in front of a second cast with no explorer
-sweep at all, across front doors:
+survey at all, across front doors:
 
 ```sh
 kaibo deliberate "second opinion, same evidence" --cast fable --dossier kaibo://cas/<digest>
@@ -511,7 +511,7 @@ data path the model can't steer. See "Media CAS" in [`docs/config.md`](docs/conf
 
 ## Backends, Roles, and Casts
 
-Short version: a **cast** is just a named team — a cheap explorer that sweeps plus a
+Short version: a **cast** is just a named team — a cheap explorer that surveys plus a
 strong synth that answers — and a call picks its team with the `cast` argument.
 Everything below is how you wire your own.
 
@@ -527,7 +527,7 @@ config has three concepts for configuring models:
   Secrets never live in the TOML — only the *name* of an env var or the path to a key
   file. `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every
   major model family, reasoning on by default via its unified `effort` param.
-- **role** — a *job* a model does: `explorer` (fast sweeps), `synth` (the voice that
+- **role** — a *job* a model does: `explorer` (fast surveys), `synth` (the voice that
   answers), and `image` (the media member behind `generate`). A reasoning slot that
   reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
@@ -549,10 +549,10 @@ base_url = "http://localhost:8080/v1"
 key_optional = true
 
 # A cast that mixes model families — a different lineage per role, named as one team.
-# (kaibo calls this a "chimera": local Qwen does the sweeping, hosted GPT writes
+# (kaibo calls this a "chimera": local Qwen does the surveying, hosted GPT writes
 # the answer. Two families, not two flavors of one.)
 [casts.mixed]
-explorer = "llama/qwen2.5-coder-7b"       # cheap, local sweeps — Qwen family
+explorer = "llama/qwen2.5-coder-7b"       # cheap, local surveys — Qwen family
 synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
 ```
 
@@ -649,7 +649,7 @@ note kaibo asks OpenRouter for no-collection routing by default
 
 **How long does a consult take?** It's a multi-step investigation, not a single API
 call — a deep one can run a few minutes, more with thinking on and a large repo to
-sweep. kaibo emits MCP progress notifications as the explorer and synth work, so a
+survey. kaibo emits MCP progress notifications as the explorer and synth work, so a
 client that surfaces them shows live progress; whether you actually see those beats is
 up to your agent's UI, which kaibo can't control. If you'd rather not block on it,
 `consult_submit` starts the same investigation in the background and `job_get` picks
@@ -703,7 +703,7 @@ without thinking about it; a frontier Anthropic or OpenAI cast adds up a good de
 faster, especially with thinking on. Check your provider's current rates — they move,
 and kaibo won't guess at them for you. What kaibo does do is spend as little as the
 work allows: a family-mixing cast (cheap local explorer + hosted synth) keeps the
-broad, token-heavy sweeping off the expensive model and pays it only for the answer,
+broad, token-heavy surveying off the expensive model and pays it only for the answer,
 and the agent conversations are set up to cache well on most providers. For the
 strongest models, `batch_submit` rides the provider's discounted batch lane.
 

@@ -37,6 +37,8 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **The docs call an explorer's investigation pass a `survey`**, matching what `explore`'s
+  own description has always said; `sweep` was a second word for the same thing.
 - **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the
   cast shape it wants, or the absent job producer, plus the tools that are live. A
   misspelled name still reads as `tool not found`.

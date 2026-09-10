@@ -37,7 +37,7 @@ Battery E). The probes are the *empirical* check on top of the *structural* guar
 
 `run_kaish` drives the read-only kaish kernel **directly** — no model, so **zero
 classifier exposure** — and it is the *exact* `KaishWorker`/VFS that `consult` (its
-driver and nested `explore′` sweep) injects. Hammering it directly therefore covers the
+driver and nested `explore′` survey) injects. Hammering it directly therefore covers the
 model-driven tools too: a model can only emit kaish, which hits the same walls.
 (`oneshot` reads no project — it has no shell at all.)
 

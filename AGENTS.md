@@ -240,11 +240,12 @@ Every prompt, preamble, tool description, help line, and error string is text so
 reads. When we touch one, we **re-read the whole block and judge it whole** — not the diff
 by itself.
 
-**kaibo adopts kaish's `docs/style.md`** — that guide names kaibo as an adopter, and it is
-the source for *how* our prose reads: a small vocabulary, one word per concept, exact
-numbers, the constraint stated before any qualifier, and one clause of reason after a rule.
-Read it before you write help text or operator docs. It sorts files by *weight* — how
-strictly its rules apply to that file — and kaibo's files sort like this.
+The rules for *how* our prose reads are below, absorbed from kaish's writing-style
+guidance so they stand on their own here. kaish keeps a small, predictable subset of `sh`
+so existing shell skill transfers; we keep a small, predictable subset of English for the
+same reason. That subset serves both readers we have: a person configuring kaibo, and the
+model that reads the same words. Files sort by *weight* — how strictly these rules apply
+to that file — and kaibo's files sort like this.
 
 | Weight | kaibo files |
 |---|---|
@@ -285,8 +286,6 @@ settle from the guide alone (2026-08-07, `src/cli.rs`).
   for the shape.** The CLI caller is a person or an agent with file access; both can act on
   a key name, and neither can act on "configure it properly". Name `kaibo configure` only
   when the fix is multi-step setup rather than one key.
-- **`family` is a kaibo term** — a model lineage from one vendor, as in "a model outside
-  your own family". About forty uses, one sense. Use it; do not paraphrase it.
 
 Three audiences are optimized differently:
 
@@ -312,12 +311,10 @@ Three audiences are optimized differently:
   of thousands to millions of tokens. Here verbosity is *licensed where it shapes
   behavior*: say it a few ways, frame positively, be explicit (see **Driving the
   models**). Verbose to install behavior, never verbose by default — plain is not terse:
-  keep the repetition that installs an obligation, drop the decoration around it. Why
-  "Subset, not slang" binds hardest here: most of our synths are not English-first
-  (DeepSeek, GLM, Qwen, Kimi) and the small local models already fixate on odd phrasing,
-  so figurative English is a comprehension tax charged to exactly the models we most need
-  to work well. `built_in_preambles_are_written_without_em_dash_clause_chains` holds the
-  mechanical half.
+  keep the repetition that installs an obligation, drop the decoration around it.
+  **Vocabulary choices** binds hardest on this audience, for the reason stated there.
+  `built_in_preambles_are_written_without_em_dash_clause_chains` holds the mechanical
+  half.
 - **Operator-facing docs** — `docs/config.example.toml`, `docs/config.md`, `README.md`.
   The first two are **embedded in the binary** (`include_str!`) and served as
   `kaibo://config/example` and `kaibo://config/guide`, so a model reads them as often as
@@ -329,6 +326,82 @@ Three audiences are optimized differently:
   a pointer for the rest); the **guide** explains semantics and interactions. Detail that
   isn't a knob belongs in the guide — the template is read start to finish by whoever is
   configuring kaibo, so every line there is a line they pay for.
+
+### Vocabulary choices
+
+Keep the vocabulary small. This limits the number of *distinct words*, not the length of
+the text — a familiar word may need a longer sentence, and that trade is the right one.
+Our synths are mostly not English-first (DeepSeek, GLM, Qwen, Kimi) and the small local
+models fixate on odd phrasing, so a figure of speech is a comprehension tax charged to
+exactly the models we most need to work well.
+
+Use plain words instead of figures of speech. The intended meaning must be available from
+the words themselves, in second-language and partial-context reading.
+
+Use American spelling to match the corpus: `modeled`, not `modelled`.
+
+### One term, one meaning
+
+Pick one word for each concept and keep it. Do not vary a word for style. When a term
+carries a behavioral guarantee, its definition belongs in the Terms table below.
+
+A term may differ between published and internal text, but only deliberately and only one
+way each: `survey` is what published text calls one explorer investigation pass, and
+`sweep` is what the code calls it. Both are in the table so the split is recorded rather
+than rediscovered.
+
+`surface` can hide the thing it names. In published text, name the tool schema, the error
+message, the help topic, or the config key.
+
+Cross-references take one form per target: `kaibo://config` for a resource, `docs/config.md`
+for the guide. Link instead of re-explaining.
+
+### Provide specific values
+
+Give the exit code, the size, the flag, the default, and the condition whenever it is
+practical. This saves a round trip and gives a model a clear observation to update on.
+
+> Before: An oversize attachment is refused.
+>
+> After: An attachment over 5 MB is refused from its metadata, before a byte is read.
+
+State the default and the condition too: "off by default", "applies to the `explorer` slot
+only", "`0` removes the tool entirely".
+
+### The example is the rule
+
+Show the correct example before explaining it, and make the example carry the rule by
+itself — a reader who sees only the example must still get it right.
+
+> Before: **Read whole files.** `cat -n FILE` numbers every line, which is what makes a
+> `file:line` citation exact.
+>
+> After: `cat -n src/auth.rs` — the whole file, numbered. Lead with line numbers so every
+> claim cites `file:line`.
+
+Avoid an incorrect example. When one is necessary, put the correct form first and mark the
+error next to it.
+
+### Terms
+
+The terms that carry a stable definition. **This table is the source.** It grows when a
+collision appears in real prose, not in advance.
+
+| Term | Part of speech | Meaning |
+|---|---|---|
+| backend | noun | A named connection to one provider: a wire protocol, a base URL, and a key source. Two backends may share a protocol. |
+| cast | noun | A model team. Maps each role to a `"backend/model-id"`, freely cross-backend. A call picks one with `cast`. |
+| slot | noun | One role within a cast — `explorer`, `synth`, `vision`, `image` — and the model bound to it. |
+| arm | noun | A resolved slot: a built client plus the request shape for that model. The one live construction point is `Arm::from_slot`. |
+| lane | noun | How a synth is driven: `interactive`, `batch` (a provider's offline queue), or `direct` (a big local model kaibo runs itself). |
+| phase | noun | One model, one preamble, one injected toolset, run as a bounded tool loop. `run_phase` is the primitive. |
+| survey | noun | One explorer investigation pass, ending in a cited report. `explore` runs one; `consult` delegates one; `deliberate` builds a dossier from one. **The published name.** |
+| sweep | noun | The same thing in code — module names, identifiers, comments. Not published. Retiring from published prose, not yet finished; `docs/` is converted, the preambles, tool descriptions, and CLI help are not. As a plain verb ("omit `backend` to sweep every configured backend") it is ordinary English and stays. |
+| dossier | noun | The cited evidence an offline synth reasons over in `deliberate`, gathered by an explorer beforehand. |
+| family | noun | A model lineage from one vendor, as in "a model outside your own family". About forty uses, one sense. Use it; do not paraphrase it. |
+| allowed set | noun | The canonicalized trees a call's path must resolve into — `--root`, each `--allow-path`, and any followed worktree. The read boundary. |
+| published | adjective | Text kaibo sends to a model: a tool `description`, a schema param doc, a clap arg doc, a help topic, an error string. Everything else is internal. |
+
 
 ## Driving the models
 

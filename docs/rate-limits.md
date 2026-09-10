@@ -10,7 +10,7 @@ The branch is `rate-limits`; the worktree is `~/src/wt/kaibo-rate-limits`.
   200000` on three attached files, kaibo neither backed off nor retried, and the
   whole investigation was lost before the synth ran.
 - kaibo sends bursts by construction: rig runs a turn's tool calls with
-  `buffer_unordered`, and a consult can fan out sweeps.
+  `buffer_unordered`, and a consult can fan out surveys.
 - Non-goal, stated so nobody reaches for this plan to fix it: the 2026-08 OpenAI
   batch `validating` failure ("Cannot find file …") is provider-side, reproduced
   with plain curl and reported by many others since 2026-08-19. Retry at kaibo's
