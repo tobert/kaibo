@@ -41,6 +41,16 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 
+- **A composed preamble still ends on the work it asks for** — the project file map and
+  operator house rules splice in after a prompt's closing line, so the obligation is
+  restated last. An operator override keeps its own last word.
+- **A session's earlier turns are trusted evidence** — the history framing asks for what
+  the new question reaches instead of a re-read of every citation an earlier answer made.
+- **`deliberate` closes on the answer after the dossier**, and every prompt that hands
+  work to someone else asks for the same separation of what was read, inferred, and left
+  unknown, in the same words.
+- **The explorer's attach directive names its reader `the synthesis agent`** — `the
+  consult driver` was a second name for the model the preamble already named.
 - **The docs call an explorer's investigation pass a `survey`**, matching what `explore`'s
   own description has always said; `sweep` was a second word for the same thing.
 - **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the

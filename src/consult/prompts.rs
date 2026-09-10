@@ -29,7 +29,7 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
              project conventions and working preferences for this repository. Each \
              section is headed by the path of the file it came from. Treat it as \
              trusted standing context: honor it as you investigate and when you write \
-             your answer. It is background about how this project works, not the \
+             what you hand back. It is background about how this project works, not the \
              question you are answering.\n\n{rules}"
         ),
     }
@@ -70,13 +70,28 @@ fn phase_preamble(
     default: impl FnOnce() -> String,
     orientation: Option<&str>,
     house_rules: Option<&str>,
+    closing: &str,
 ) -> String {
+    let is_default = override_.is_none();
     let mut base = override_.map(str::to_string).unwrap_or_else(default);
     if let Some(map) = orientation {
         base.push_str("\n\n");
         base.push_str(map); // carries its own `PROJECT FILES.` header
     }
-    with_house_rules(base, house_rules)
+    let spliced = orientation.is_some() || house_rules.is_some();
+    let mut composed = with_house_rules(base, house_rules);
+    // A built-in preamble closes on the deliverable, and the model attends most to what
+    // it reads last. Splicing the file map and the operator's house rules after that
+    // close moves the obligation into the middle, so restate it at the end. Repetition
+    // that installs an obligation is the repetition worth keeping.
+    //
+    // Not after an operator override: `[prompts]` replaces the role framing in full, so
+    // appending kaibo's own closing would put back part of what the operator removed.
+    if spliced && is_default {
+        composed.push_str("\n\n");
+        composed.push_str(closing);
+    }
+    composed
 }
 
 /// The model-driven phases whose system prompt kaibo composes. One enum so the three
@@ -207,6 +222,24 @@ impl Phase {
         }
     }
 
+    /// The one sentence that closes this phase's built-in preamble, restated after any
+    /// spliced material so the obligation is still the last thing the model reads. It
+    /// says what leaves the loop, in the same words the built-in close uses, because a
+    /// second phrasing of one obligation reads as a second obligation.
+    fn closing_obligation(self) -> &'static str {
+        match self {
+            Phase::Explorer(_) => "Your last turn is the report itself, written out in full.",
+            Phase::Consult => {
+                "When you have what the question needs, your next turn is that answer, \
+                 written out in full."
+            }
+            Phase::Oneshot | Phase::Batch => {
+                "Write the answer first and write it in full, then give your reasoning \
+                 after it."
+            }
+        }
+    }
+
     /// This phase's `[prompts]` override key (per-slot preamble already folded in
     /// upstream). Public so the `kaibo://prompts` resource can report which phases carry
     /// an active override without re-encoding the phase→key mapping.
@@ -264,6 +297,7 @@ pub fn resolve_phase_preamble(
         || phase.default_preamble(),
         orientation,
         house_rules,
+        phase.closing_obligation(),
     )
 }
 
@@ -400,7 +434,8 @@ pub fn oneshot_preamble() -> String {
      supplied all the context you have.\n\n\
      Reason over exactly the material you were given. Keep your claims grounded in \
      it, and say clearly where the material stops covering the question. Separate \
-     what the material shows from what you infer. If you need something that was not \
+     what you read from what you infer and from what remains unknown. If you need \
+     something that was not \
      given, name it, so the caller can supply it on the next call.\n\n\
      Your reply is the answer itself. Write the answer first and write it in full, \
      then give your reasoning after it."
@@ -453,8 +488,9 @@ pub fn batch_preamble() -> String {
      your answer draw on one shared output budget, so write the part the caller can act \
      on first. Lead with the conclusion (the findings, the verdict, the recommendation) \
      and write it in full, then give your reasoning after it.\n\n\
-     Ground every claim in the material or in your own knowledge. Separate what the \
-     material shows from what you infer, and say clearly where the evidence runs out. \
+     Ground every claim in the material or in your own knowledge. Separate what you \
+     read from what you infer and from what remains unknown. Say clearly where the \
+     evidence stops. \
      If something you need is missing, state the assumption you are making, answer \
      under that assumption, and state what would change if the assumption is wrong."
         .to_string()
@@ -515,9 +551,10 @@ pub fn consult_user_prompt(
             ));
         }
         prompt.push_str(
-            "Use the earlier turns for context and continuity. Investigate fresh, and \
-             re-read any `file:line` an earlier answer cited before you rely on it. The \
-             files are the ground truth, not the prior answer.\n\n",
+            "Use the earlier turns for context and continuity. Trust a `file:line` an \
+             earlier answer cited, and spend your turns on what this question reaches \
+             that the earlier ones did not. If what you read disagrees with a prior \
+             answer, the files are correct.\n\n",
         );
     }
     if let Some(context) = context {
@@ -654,9 +691,10 @@ pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String
          transcribing a span into your report, because an attachment is the real file, \
          numbered like `cat -n`. Attach is for delivering, not reading. You get back a \
          one-line receipt (path, lines, size), never the contents; read with `cat -n` \
-         anything you need to see yourself. Attach the file a load-bearing claim rests \
-         on, and keep writing exact `file:line` cites, because the attachment is what \
-         lets them be checked. Up to {max} files this sweep.",
+         anything you need to see yourself. You may attach up to {max} files this \
+         survey. Attach the file a claim depends on, and keep writing exact `file:line` \
+         cites, because the attachment is what lets them be checked. Your last turn is \
+         still the report itself, written out in full.",
         consumer.label,
     )
 }
@@ -823,8 +861,10 @@ pub fn deliberation_prompt(question: &str, dossier: &str) -> String {
          through to a conclusion, and say clearly where the evidence runs out. If the \
          dossier leaves open a detail the answer depends on, state the assumption you \
          are making, reason under that assumption, and state what would change if the \
-         assumption is wrong.\n\n\
-         ## Question\n{question}\n\n## Dossier\n{dossier}"
+         assumption is wrong. Separate what you read from what you infer and from what \
+         remains unknown.\n\n\
+         ## Question\n{question}\n\n## Dossier\n{dossier}\n\n\
+         Write the answer first and write it in full, then give your reasoning after it."
     )
 }
 
@@ -1724,6 +1764,134 @@ mod tests {
     fn an_empty_delivery_renders_no_block() {
         assert!(
             sweep_evidence_block(&consult_driver_consumer(), &SweepDelivery::default()).is_none()
+        );
+    }
+
+    /// The obligation has to be the last thing the model reads. A built-in preamble
+    /// closes on its deliverable, and then composition splices the project file map and
+    /// the operator's house rules after that close — so without a restatement the
+    /// composed prompt ends on "not the question you are answering" and the report
+    /// obligation sits in the middle. Both project-reading phases are checked, because
+    /// the splice is shared and a fix that reaches one reader and not the other is the
+    /// drift this file keeps testing for.
+    #[test]
+    fn a_composed_preamble_still_ends_on_its_deliverable() {
+        let overrides = PromptOverrides::default();
+        for phase in [
+            Phase::Explorer(ReportReader::SynthesisAgent),
+            Phase::Explorer(ReportReader::CallingAgent),
+            Phase::Consult,
+        ] {
+            let composed = resolve_phase_preamble(
+                phase,
+                &overrides,
+                Some("PROJECT FILES.\nsrc/main.rs 40 lines"),
+                Some("Always run the tests."),
+            );
+            assert!(
+                composed.trim_end().ends_with(phase.closing_obligation()),
+                "{phase:?} composed prompt ends on:\n...{}",
+                &composed[composed.len().saturating_sub(240)..]
+            );
+        }
+    }
+
+    /// `[prompts]` replaces the role framing in full — that is the documented contract.
+    /// Appending kaibo's own closing to an operator's text would put back a piece of
+    /// what the operator removed, so the restatement rides the built-in only.
+    #[test]
+    fn an_operator_override_keeps_its_own_last_word() {
+        let overrides = PromptOverrides {
+            explorer: Some("You are a security auditor. Report what you find.".into()),
+            ..PromptOverrides::default()
+        };
+        let composed = resolve_phase_preamble(
+            Phase::Explorer(ReportReader::SynthesisAgent),
+            &overrides,
+            Some("PROJECT FILES.\nsrc/main.rs 40 lines"),
+            Some("Always run the tests."),
+        );
+        assert!(
+            !composed.contains(Phase::Explorer(ReportReader::SynthesisAgent).closing_obligation()),
+            "an override must not have kaibo's closing appended to it:\n{composed}"
+        );
+    }
+
+    /// The attach directive is appended after everything else, so whatever it ends on is
+    /// what the explorer reads last. Ending it on a file count makes the last word a
+    /// number; ending it on the report keeps the obligation in the closing position.
+    #[test]
+    fn the_attach_directive_ends_on_the_report() {
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::ConsultDriver,
+            label: std::sync::Arc::from("the synthesis agent (`m`)"),
+            vision: false,
+        };
+        let directive = explorer_attach_directive(32, &consumer);
+        assert!(
+            directive
+                .trim_end()
+                .ends_with("Your last turn is still the report itself, written out in full."),
+            "attach directive ends on:\n...{}",
+            &directive[directive.len().saturating_sub(160)..]
+        );
+    }
+
+    /// A session's earlier turns are grounded evidence, so the framing that introduces
+    /// them steers toward acquiring what the new question reaches — not toward
+    /// re-deriving citations an earlier turn already read. The consult preamble tells
+    /// the model to trust a cited `file:line` four paragraphs earlier in the same
+    /// request; ordering a re-read here contradicted it.
+    #[test]
+    fn session_history_asks_for_more_evidence_not_a_re_read() {
+        let history = vec![QaTurn::new("where is auth", "src/auth.rs:12")];
+        let prompt = consult_user_prompt("and where is logout", None, &history, &[]);
+        assert!(
+            !prompt.contains("re-read any `file:line`"),
+            "history framing still orders a re-read:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Trust a `file:line` an earlier answer cited"),
+            "history framing must name the prior citations as trusted:\n{prompt}"
+        );
+    }
+
+    /// One obligation, one phrasing. Every prompt that hands work to someone else asks
+    /// for the same three-way separation, in the same words — a second phrasing of one
+    /// obligation reads to a model as a second obligation.
+    #[test]
+    fn every_handing_over_prompt_asks_for_the_same_separation() {
+        const SEPARATION: &str =
+            "Separate what you read from what you infer and from what remains unknown.";
+        for (name, prompt) in [
+            ("explorer", report_preamble(ReportReader::SynthesisAgent)),
+            ("consult", consult_preamble()),
+            ("oneshot", oneshot_preamble()),
+            ("batch", batch_preamble()),
+            (
+                "deliberation",
+                deliberation_prompt("q", "src/main.rs:1 fn main"),
+            ),
+        ] {
+            assert!(
+                prompt.contains(SEPARATION),
+                "the {name} prompt does not carry the separation sentence:\n{prompt}"
+            );
+        }
+    }
+
+    /// The dossier is the longest thing in a deliberation request, and it goes last so
+    /// the evidence is fresh. That leaves the obligation buried unless the prompt closes
+    /// after it, which is the same rule the composed preambles follow.
+    #[test]
+    fn the_deliberation_prompt_closes_after_the_dossier() {
+        let prompt = deliberation_prompt("why is it slow", "src/run.rs:80 sleep(10)");
+        assert!(
+            prompt.trim_end().ends_with(
+                "Write the answer first and write it in full, then give your reasoning after it."
+            ),
+            "deliberation prompt ends on:\n...{}",
+            &prompt[prompt.len().saturating_sub(200)..]
         );
     }
 }

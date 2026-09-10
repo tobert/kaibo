@@ -46,7 +46,7 @@ const MAX_NOTE_CHARS: usize = 500;
 #[derive(Debug, Clone)]
 pub struct SweepConsumer {
     pub kind: SweepConsumerKind,
-    /// e.g. "the consult driver (`claude-sonnet-4-6`)" — used verbatim in the tool
+    /// e.g. "the synthesis agent (`claude-sonnet-4-6`)" — used verbatim in the tool
     /// description and in receipt lines, so the explorer knows who it's routing to.
     pub label: Arc<str>,
     /// The receiving arm's resolved vision capability. An image attach to a blind
