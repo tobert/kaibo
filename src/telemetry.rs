@@ -21,11 +21,13 @@
 //! and had nowhere to report.
 //!
 //! The read boundary refusing a path is the third, and the one where the asymmetry
-//! bites hardest: a refusal happens *before* a handler has a phase to open a span
-//! around, so for four of the five MCP tools the logs signal is the only road it
-//! travels. `run_kaish` is the exception — its span brackets the whole call, so a
-//! refused shell call closes a `run_kaish` span with `outcome = "refused"` and
-//! reaches traces too. See `server/resolver.rs::containment_error`.
+//! bites hardest: a refusal usually happens *before* the handler has a phase to open
+//! a span around, so the logs signal is the only road it travels. That covers four of
+//! the five tools that resolve a root (`consult`, `consult_submit`, `explore`,
+//! `deliberate`) and every attachment refusal besides. `run_kaish` is the exception —
+//! its span brackets the whole call, so a refused shell call closes a `run_kaish` span
+//! with `outcome = "refused"` and reaches traces too. See
+//! `server/resolver.rs::containment_error`.
 //!
 //! **Metrics carry what neither of those makes cheap to aggregate** — and, more to the
 //! point, what neither of them can do *safely by construction*. Traces are made safe by

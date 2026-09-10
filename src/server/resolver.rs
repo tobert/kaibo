@@ -256,7 +256,7 @@ impl Resolver {
     }
 
     /// The shared "outside the allowed set" rejection, naming the boundary and the
-    /// three widening knobs — and the one place kaibo records that its boundary fired.
+    /// three widening knobs — and the one place kaibo logs that its boundary fired.
     ///
     /// Read-only containment is the product, so the boundary refusing a path is the
     /// most interesting thing kaibo does, and an operator watching a fleet needs to
@@ -265,6 +265,13 @@ impl Resolver {
     /// `read_contained_file` all call it — so one `warn` covers the whole class, from
     /// the MCP tools and the CLI subcommands alike, and a fourth surface added later
     /// is reported the moment it uses the shared check.
+    ///
+    /// *This* boundary, precisely: the allowed set. A consult attachment refused for
+    /// resolving outside the **session root** ([`resolve_consult_attachments`](Self::resolve_consult_attachments)) is a different
+    /// class — the file is inside the allowed set, and the refusal is about which
+    /// project this call mounts — so it stays quiet here. An operator alerting on this
+    /// warn is asking "did the read boundary fire", not "did a caller name the wrong
+    /// project".
     ///
     /// The split between the field and the message is kaibo's existing export policy,
     /// not a new one. `outcome` is on
@@ -289,6 +296,12 @@ impl Resolver {
         } else {
             format!(", which resolves to {}", canon.display())
         };
+        // Refine the enclosing call's span too, for a handler built to receive it —
+        // `run_kaish` declares an `outcome` field and opens its span before this check.
+        // `Span::record` is a no-op for a field the current span never declared, so
+        // this reaches exactly those spans and no others, and it costs nothing when
+        // there is no span at all (the four handlers that resolve before they have one).
+        tracing::Span::current().record("outcome", "refused");
         tracing::warn!(
             outcome = "refused",
             "read boundary refused {}{resolution} — outside the allowed set [{}]",

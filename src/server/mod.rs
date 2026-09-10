@@ -2648,25 +2648,31 @@ impl KaiboHandler {
         // wraps the `.await` from the caller side.
         let span = tracing::info_span!("run_kaish", outcome = tracing::field::Empty);
         async move {
-            let root = self.resolve_root(input.path).inspect_err(|_| {
-                // A refusal is an outcome, not an absence. `resolve_root` already
-                // logged *what* it refused (see `containment_error`); this records
-                // *which call* it was, on the span the caller can join to.
-                tracing::Span::current().record("outcome", "refused");
-            })?;
+            // The outcome starts at the failure value and is refined as the call gets
+            // further. Written this way, rather than on each error arm, because the one
+            // value that is not this handler's to assign is `refused`: only the
+            // containment check knows the boundary fired, and it records that itself
+            // (see `Resolver::containment_error`) from inside the `resolve_root` below —
+            // after this line, and before any arm here could overwrite it. So each
+            // writer sets the field when it knows, in the order it knows.
+            //
+            // `resolve_root` refuses three other ways — no default root, a path that
+            // does not resolve, a path that is not a directory — and those are caller
+            // mistakes, not the boundary firing. They stay `error`, the same reading
+            // `tool_span.rs` gives a malformed-args refusal, so an operator alerting on
+            // `outcome = refused` counts boundary hits and not typos.
+            tracing::Span::current().record("outcome", "error");
+            let root = self.resolve_root(input.path)?;
 
             // A fresh worker (and kernel) per call: stateless, starts at root, and the
             // !Send kernel stays on its own thread so this future stays Send. Applies the
             // configured sandbox limits (timeout, output cap, disabled builtins).
-            let worker =
-                KaishWorker::spawn_with(&root, self.config.sandbox.clone()).map_err(|e| {
-                    tracing::Span::current().record("outcome", "error");
-                    McpError::internal_error(format!("{e:#}"), None)
-                })?;
-            let out = worker.run(input.script).await.map_err(|e| {
-                tracing::Span::current().record("outcome", "error");
-                McpError::internal_error(format!("{e:#}"), None)
-            })?;
+            let worker = KaishWorker::spawn_with(&root, self.config.sandbox.clone())
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            let out = worker
+                .run(input.script)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
             // A non-zero *script* exit is ordinary output, not a tool failure — the
             // same reading `tool_span.rs` takes — so the shell running at all is `ok`.
@@ -5100,6 +5106,55 @@ mod tests {
             span.outcome.as_deref(),
             Some("refused"),
             "the span says how the call ended: {span:?}"
+        );
+    }
+
+    /// A path that simply does not exist is a caller mistake, not the boundary firing,
+    /// and must NOT read as `refused` — an operator alerting on that value is counting
+    /// boundary hits, and a typo landing in the same bucket makes the number useless.
+    ///
+    /// `resolve_root` refuses four ways and only one of them is the boundary. Caught by
+    /// the cross-family review of this change (cast `crusoe`): the first cut recorded
+    /// `refused` on every `resolve_root` error, so the span and the warn could disagree
+    /// — the span said the boundary fired while the logs, which only
+    /// `containment_error` writes, said nothing at all.
+    #[test]
+    fn a_nonexistent_path_is_an_error_not_a_refusal() {
+        use crate::test_support::capture_tracing;
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(allowed.path().to_path_buf());
+        config.infer_cwd = false;
+        let handler = KaiboHandler::new(config).expect("handler builds");
+        let asked = allowed.path().join("no-such-dir").display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = handler
+                .run_kaish(Parameters(RunKaishInput {
+                    script: "pwd".to_string(),
+                    path: Some(asked),
+                }))
+                .await;
+            assert!(refusal.is_err(), "guard: the path does not exist");
+        });
+
+        let spans = captured.spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "run_kaish")
+            .unwrap_or_else(|| panic!("the call still opens a span; saw {spans:?}"));
+        assert_eq!(
+            span.outcome.as_deref(),
+            Some("error"),
+            "a path that does not resolve is an error, not the boundary firing: {span:?}"
+        );
+        assert!(
+            !captured
+                .events()
+                .iter()
+                .any(|e| e.has_field("outcome", "refused")),
+            "and it logs no refusal: {:?}",
+            captured.events()
         );
     }
 

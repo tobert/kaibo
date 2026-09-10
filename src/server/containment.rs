@@ -88,33 +88,6 @@ impl super::Resolver {
         self.containing_tree(canon).is_some()
     }
 
-    /// Resolve caller-named attachment paths into [`Attachment`](crate::attach::Attachment)s,
-    /// read and encoded server-side so the bytes never transit the calling agent's
-    /// context. Each path obeys the *same* boundary as a session root — canonicalize
-    /// (symlinks + `..` resolved), require a regular file, then the shared
-    /// [`containing_tree`](Self::containing_tree) check (allowed set + followed worktrees)
-    /// — so attachments can't read outside the workspace any more than `run_kaish` can.
-    ///
-    /// Failures are loud and per-path: a missing file, a directory, an over-cap or
-    /// non-text/non-image file is a clear `invalid_params`, never a silent skip — an
-    /// attachment the caller named but we dropped would be a corrupt answer. An absolute
-    /// per-file size ceiling is enforced *before* reading (via the file's metadata) so a
-    /// giant file is refused without first slurping it into memory; a batch-level count cap
-    /// and cumulative-byte budget ([`check_attachment_bounds`](crate::attach::check_attachment_bounds))
-    /// bound the *whole call* the same way — a stray thousand-file glob, or many
-    /// individually-legal files summing to an OOM, is refused before the offending read.
-    ///
-    /// **The read goes through the read-only kaish VFS, not `std::fs::read`** — the same
-    /// mechanism `view_image` uses. The canonicalize + containment check above is the
-    /// *friendly early error*; the read itself is mounted on a [`KaishWorker`] rooted at
-    /// the attachment's containing tree, whose VFS re-resolves at read time and refuses to
-    /// follow a symlink out of that tree (proved by `tests/containment.rs`'s
-    /// `mount_layer_symlink_*` battery). That closes the check-then-open TOCTOU window the
-    /// old `std::fs::read` left open — a path swapped for an out-of-tree symlink after the
-    /// check is rejected at the mount layer regardless of timing, structurally rather than
-    /// by racing a re-check. One worker is spawned per *distinct* containing tree and
-    /// reused across attachments under it, so the common case (files under one project
-    /// root) builds a single worker.
     /// Read one caller-named file's bytes, contained.
     ///
     /// The single-file sibling of [`resolve_attachments`](Self::resolve_attachments),
@@ -198,6 +171,33 @@ impl super::Resolver {
         Ok(bytes)
     }
 
+    /// Resolve caller-named attachment paths into [`Attachment`](crate::attach::Attachment)s,
+    /// read and encoded server-side so the bytes never transit the calling agent's
+    /// context. Each path obeys the *same* boundary as a session root — canonicalize
+    /// (symlinks + `..` resolved), require a regular file, then the shared
+    /// [`containing_tree`](Self::containing_tree) check (allowed set + followed worktrees)
+    /// — so attachments can't read outside the workspace any more than `run_kaish` can.
+    ///
+    /// Failures are loud and per-path: a missing file, a directory, an over-cap or
+    /// non-text/non-image file is a clear `invalid_params`, never a silent skip — an
+    /// attachment the caller named but we dropped would be a corrupt answer. An absolute
+    /// per-file size ceiling is enforced *before* reading (via the file's metadata) so a
+    /// giant file is refused without first slurping it into memory; a batch-level count cap
+    /// and cumulative-byte budget ([`check_attachment_bounds`](crate::attach::check_attachment_bounds))
+    /// bound the *whole call* the same way — a stray thousand-file glob, or many
+    /// individually-legal files summing to an OOM, is refused before the offending read.
+    ///
+    /// **The read goes through the read-only kaish VFS, not `std::fs::read`** — the same
+    /// mechanism `view_image` uses. The canonicalize + containment check above is the
+    /// *friendly early error*; the read itself is mounted on a [`KaishWorker`] rooted at
+    /// the attachment's containing tree, whose VFS re-resolves at read time and refuses to
+    /// follow a symlink out of that tree (proved by `tests/containment.rs`'s
+    /// `mount_layer_symlink_*` battery). That closes the check-then-open TOCTOU window the
+    /// old `std::fs::read` left open — a path swapped for an out-of-tree symlink after the
+    /// check is rejected at the mount layer regardless of timing, structurally rather than
+    /// by racing a re-check. One worker is spawned per *distinct* containing tree and
+    /// reused across attachments under it, so the common case (files under one project
+    /// root) builds a single worker.
     pub async fn resolve_attachments(
         &self,
         paths: &[String],

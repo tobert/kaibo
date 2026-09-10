@@ -774,6 +774,12 @@ where
 /// Wraps [`serialized_capture`], so it inherits both the serial guard and the
 /// keepalive dispatcher that keep callsite interest from being poisoned by a
 /// no-subscriber test elsewhere in this binary.
+///
+/// The subscriber is installed as **this thread's** default, so a body that emits
+/// from another thread — a `tokio::spawn`, or kaish's own kernel thread — records
+/// nothing here, silently. Every current caller emits on the calling thread. A future
+/// one that spawns needs a globally-installed subscriber instead, which this binary's
+/// other tests cannot share.
 pub fn capture_tracing<F: std::future::Future>(body: F) -> Captured {
     use tracing_subscriber::layer::SubscriberExt;
     let captured = Captured::default();
