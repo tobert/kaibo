@@ -87,7 +87,7 @@ of your context:
 > record, even Debug noise, briefly wakes the parked loop. An optimization concern,
 > not a correctness one. *[abridged]*
 >
-> ——— kaibo · cast `deepseek` · explorer `deepseek-v4-flash` · synth `deepseek-v4-pro`
+> ——— kaibo · cast `deepseek` · explorer `deepseek-flash` · synth `deepseek-flash`
 
 That's a real consult against this repo, and it ran about four minutes. The
 full answer also surfaced a benign spurious-wakeup path and an optimization
@@ -562,7 +562,7 @@ merges over them by name. The built-ins are:
 | cast | explorer | synth |
 |---|---|---|
 | `anthropic` *(default)* | `claude-haiku-4-5` | `claude-sonnet-4-6` |
-| `deepseek` | `deepseek-v4-flash` | `deepseek-v4-pro` |
+| `deepseek` | `deepseek-flash` | `deepseek-flash` |
 | `gemini` | `gemini-flash-lite-latest` | `gemini-3.5-flash` |
 | `openrouter` | `qwen/qwen3.6-flash` | `qwen/qwen3.7-max` |
 | `openai-local` | local Gemma (small) | local Gemma (large) |

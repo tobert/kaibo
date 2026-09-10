@@ -1502,7 +1502,7 @@ mod tests {
             "anthropic slot carries resolved vision=true:\n{anthropic_synth}"
         );
         let deepseek_synth = body
-            .find("deepseek/deepseek-v4-pro")
+            .find("deepseek/deepseek-flash")
             .map(|i| &body[i..i + 120])
             .unwrap();
         assert!(

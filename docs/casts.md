@@ -69,7 +69,7 @@ api_key_env = "OPENAI_API_KEY"
 # --- casts: role → "backend/model". `cast = "chimera"` selects the whole thing. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast surveys — local/cheap family
+explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
 
 [casts.local-only]                          # privacy posture: nothing leaves the box
@@ -153,7 +153,7 @@ All the chimera-ness happens in one resolution step at the server boundary.
 ```
 server.rs: resolve_cast("chimera")
 │
-├─ explorer = "deepseek/deepseek-v4-flash"
+├─ explorer = "deepseek/deepseek-flash"
 │    └─ Arm { client: rig(deepseek backend, lazy key), model,
 │             params: ModelShape(DeepSeek, model) + explorer effort/temp,
 │             caps: vision=false }

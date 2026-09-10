@@ -282,7 +282,7 @@ A role table. Each slot takes one of two forms:
 
 ```toml
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast surveys
+explorer = "deepseek/deepseek-flash"        # reads the tree and cites
 synth    = "claude/claude-sonnet-4-6"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables
@@ -536,7 +536,7 @@ not OpenAI Platform's own but should still take the Responses shape; see
 | cast | explorer | synth | synth lane |
 |---|---|---|---|
 | `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
-| `deepseek` | `deepseek/deepseek-v4-flash` | `deepseek/deepseek-v4-pro` | |
+| `deepseek` | `deepseek/deepseek-flash` | `deepseek/deepseek-flash` | |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
 | `openrouter` | `openrouter/qwen/qwen3.6-flash` | `openrouter/qwen/qwen3.7-max` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |

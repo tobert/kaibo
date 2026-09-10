@@ -2498,7 +2498,11 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
     };
     match wire {
         credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
-        credentials::WireKind::DeepSeek => ("deepseek-v4-flash", "deepseek-v4-pro"),
+        // DeepSeek serves `deepseek-flash` and `deepseek-v4-pro`; `deepseek-v4-flash`
+        // was retired under us and the built-in dialed it until 2026-09-10. The
+        // undated id is the rot-resistant one — it tracks each new flash generation —
+        // and DeepSeek is folding pro into flash, so both roles name it.
+        credentials::WireKind::DeepSeek => ("deepseek-flash", "deepseek-flash"),
         credentials::WireKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
         // OpenRouter's job here is a family we *can't* reach directly (we key
         // DeepSeek, Gemini, and Anthropic on their own backends), so the gateway

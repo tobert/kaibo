@@ -1,8 +1,14 @@
-//! ProviderKind credentials, from key-files with an env-var override.
+//! ProviderKind credentials: the pure resolution primitives, and the names a
+//! provider's key conventionally goes by.
 //!
-//! Long-term kaibo will take credentials from both files and env. For now the
-//! source of truth is a per-provider dotfile in `$HOME`; if the matching env var
-//! is set it wins (handy for CI / one-off overrides).
+//! **kaibo seeds no key.** A running kaibo resolves a key only from what a backend
+//! declares in `config.toml` — `api_key_env`, `api_key_file`, or `api_key_cmd` — so a
+//! built-in backend with no declared source has no key and every cast built on it is
+//! dropped at startup. The env vars and dotfiles below are *conventional names*, the
+//! values an operator points those fields at, and [`ProviderKind::env_var`] is what
+//! names one in the "declare `api_key_env`" hint a refusal carries. Nothing here reads
+//! them on kaibo's behalf; [`load`] does, and it exists for the `#[ignore]`d live
+//! probes, which need a key before there is a server to ask.
 //!
 //! - Anthropic:  `ANTHROPIC_API_KEY`  / `~/.anthropic-key.txt`
 //! - DeepSeek:   `DEEPSEEK_API_KEY`   / `~/.deepseek-key`
@@ -611,8 +617,10 @@ fn read_capped(mut r: impl Read, cap: usize) -> Vec<u8> {
 }
 
 /// Load a *keyed* `provider`'s key from the real environment and `$HOME` (env var
-/// over dotfile). The opt-in live-probe tests use it to gate on whether a real key
-/// is present. The key-optional (`Openai`) provider is refused: its key may
+/// over dotfile). **Test infrastructure, not a product path**: its one caller is
+/// `live_key` in `tests/consult.rs`, the fallback an `#[ignore]`d live probe uses when
+/// the operator's config declares no backend of that kind. A running kaibo never
+/// reaches it — `Backend::resolve_key` reads declared sources only. The key-optional (`Openai`) provider is refused: its key may
 /// legitimately be absent, so it has no single "the key" to load — resolve it through
 /// the backend (`Backend::resolve_key`), which falls back to a placeholder.
 pub fn load(provider: ProviderKind) -> Result<String> {

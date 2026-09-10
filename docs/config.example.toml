@@ -567,14 +567,14 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 # ---------------------------------------------------------------------------
 
 # --- Advanced — a chimera: mix model FAMILIES across roles, a different lineage per
-#     job, named as one team (`cast = "chimera"`). A cheap DeepSeek explorer + a strong
-#     Claude synth give you mistakes that don't line up. It's the power-user option and
+#     job, named as one team (`cast = "chimera"`). A DeepSeek explorer and a Claude
+#     synth give you mistakes that don't line up. It's the power-user option and
 #     wants a key per family. The common case is simpler: ONE outside family, explorer
 #     and synth both within it (the built-in `deepseek`/`gemini`/`anthropic` casts, or
 #     `local-only` below) — that single lineage already augments your own agent's. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast surveys — DeepSeek family
+explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude family
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
@@ -609,8 +609,8 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 # kind = "stability"              # key: STABILITY_API_KEY / ~/.stability-key.txt
 
 # [casts.artist]
-# explorer = "deepseek/deepseek-v4-flash"
-# synth    = "deepseek/deepseek-v4-pro"
+# explorer = "deepseek/deepseek-flash"
+# synth    = "deepseek/deepseek-flash"
 # image    = "sd/core"            # core | ultra | an sd3.5 variant (e.g. sd3.5-large)
 
 # --- The openai-images kind covers two shapes with one wire. Hosted OpenAI: no
@@ -694,7 +694,7 @@ synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 [casts.deep-dive]
 aliases  = ["deep"]                          # casts (and backends) take aliases
-explorer = { backend = "deepseek", id = "deepseek-v4-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
+explorer = { backend = "deepseek", id = "deepseek-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
 synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
 
 # --- The built-in `openrouter` backend already has a key source, so a custom cast on
