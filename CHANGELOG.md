@@ -27,6 +27,13 @@ record. Each later release appends a new section at the top.
   worktree must name its registration back, so one file in a repo you cloned to review
   cannot make any directory on the host readable.
 
+### Fixed
+
+- **kaish 0.17.2** — ordinary shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
+  `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
+- **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
+  ran the body three times.
+
 ### Changed
 
 - **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the
