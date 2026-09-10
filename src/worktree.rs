@@ -34,6 +34,17 @@
 //! allowed tree, so in any repository cloned to review every registration file under it
 //! is attacker-authored.
 //!
+//! **Agreement is not provenance.** Two files that name each other prove only that
+//! someone wrote both, and in a repository kaibo did not author that someone may be
+//! whoever wrote the repository. So each half must also hold the shape git gives it: the
+//! registration is a direct child of `<common>/worktrees`, the file naming it back is
+//! `<wt_root>/.git` itself, and both are judged at their canonical location, so a
+//! symlink resolves to where the file really lives and vouches only from there. A pair
+//! written anywhere on the host, under any name, reaches nothing. This does not make the
+//! link files trustworthy — text cannot authenticate its author — it makes the only
+//! shape that vouches one an attacker must write *inside the directory being reached*,
+//! which is the access they lack.
+//!
 //! **The tree we were handed is the only tree that vouches.** [`common_git_dir`] reads
 //! `<tree>/.git` and no ancestor of it, so a tree that merely sits inside a repository
 //! reaches nothing: the enclosing repo's main worktree is by definition a *parent* of
@@ -73,7 +84,9 @@ pub fn common_git_dir(worktree_root: &Path) -> Option<PathBuf> {
 /// The canonicalized working-tree roots a common git dir vouches for: the main
 /// worktree (the parent of a `.git` common dir) plus every linked worktree
 /// registered under `<common>/worktrees/<name>/gitdir`. These are the *only* paths
-/// the worktree-follow feature will admit beyond the static allowed set.
+/// the worktree-follow feature will admit beyond the static allowed set. A registration
+/// counts only in git's own shape: a direct child of the common dir's `worktrees`,
+/// naming `<wt_root>/.git`, with that file living in the root it vouches for.
 pub fn vouched_worktrees(common_dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
 
@@ -101,12 +114,34 @@ pub fn vouched_worktrees(common_dir: &Path) -> Vec<PathBuf> {
     // becomes readable. Requiring the back-link kills it, because the named directory
     // has to point back and an attacker cannot write inside the directory they are
     // trying to reach.
-    if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
+    // Both halves have to sit where git puts them. Agreement between two files proves
+    // only that someone wrote both; a pair written anywhere, under any name, is a pair
+    // an attacker can author. So each half must also hold git's own shape: the
+    // registration is a direct child of `<common>/worktrees`, and the file naming it
+    // back is `<wt_root>/.git` itself. A canonical path is what both checks compare, so
+    // a symlinked entry or a symlinked `.git` resolves to where it really lives and is
+    // judged there.
+    let Ok(worktrees_dir) = std::fs::canonicalize(common_dir.join("worktrees")) else {
+        return out;
+    };
+    if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
         for entry in entries.flatten() {
-            let registration = entry.path();
+            let Ok(registration) = std::fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            // A registration reached through a symlink out of the common dir is not a
+            // registration this common dir holds.
+            if registration.parent() != Some(worktrees_dir.as_path()) {
+                continue;
+            }
             let Some(wt_dotgit) = read_gitdir_pointer(&registration.join("gitdir")) else {
                 continue;
             };
+            // Git registers a worktree by naming that worktree's own `.git` file. A
+            // registration naming any other file names a directory git never linked.
+            if wt_dotgit.file_name().and_then(|n| n.to_str()) != Some(".git") {
+                continue;
+            }
             let Some(wt_root) = wt_dotgit.parent() else {
                 continue;
             };
@@ -114,18 +149,23 @@ pub fn vouched_worktrees(common_dir: &Path) -> Vec<PathBuf> {
             let Some(back) = read_gitdir_pointer(&wt_dotgit) else {
                 continue;
             };
-            let (Ok(back), Ok(registration)) = (
-                std::fs::canonicalize(&back),
-                std::fs::canonicalize(&registration),
-            ) else {
+            let Ok(back) = std::fs::canonicalize(&back) else {
                 continue;
             };
             if back != registration {
                 continue;
             }
-            if let Ok(canon) = std::fs::canonicalize(wt_root) {
-                out.push(canon);
+            let (Ok(canon_root), Ok(canon_dotgit)) = (
+                std::fs::canonicalize(wt_root),
+                std::fs::canonicalize(&wt_dotgit),
+            ) else {
+                continue;
+            };
+            // The file that vouches has to live in the directory it vouches for.
+            if canon_dotgit.parent() != Some(canon_root.as_path()) {
+                continue;
             }
+            out.push(canon_root);
         }
     }
 
@@ -445,6 +485,119 @@ mod tests {
             vouched.len(),
             2,
             "spoofing must add nothing to the vouched set: {vouched:?}"
+        );
+    }
+
+    /// A registration names a worktree by naming that worktree's own `.git` file. When
+    /// it names any other file, the pair proves only that someone wrote two files that
+    /// agree — and a pair an attacker authors is exactly what the handshake exists to
+    /// refuse. Git never writes this shape, so nothing legitimate is lost by requiring
+    /// the name.
+    #[test]
+    fn a_registration_naming_a_file_other_than_dotgit_vouches_for_nothing() {
+        let base = tempdir().unwrap();
+        let project = base.path().join("project");
+        let dotgit = project.join(".git");
+        let registration = dotgit.join("worktrees").join("evil");
+        std::fs::create_dir_all(&registration).unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let marker = outside.join("marker");
+        std::fs::write(
+            registration.join("gitdir"),
+            format!("{}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::write(&marker, format!("gitdir: {}\n", registration.display())).unwrap();
+
+        let vouched = vouched_worktrees(&std::fs::canonicalize(&dotgit).unwrap());
+        println!("PROBE A vouched = {vouched:?}");
+        assert!(
+            !vouched.contains(&std::fs::canonicalize(&outside).unwrap()),
+            "PROBE A admitted outside"
+        );
+    }
+
+    /// A `worktrees/<name>` entry that is a symlink resolves to a registration the
+    /// common dir does not hold. The vouch is the common dir's to give, so the
+    /// registration has to be a real direct child of it: reached sideways through a
+    /// symlink, the registration belongs to whoever wrote the link target.
+    #[test]
+    fn a_registration_reached_by_symlink_out_of_the_common_dir_vouches_for_nothing() {
+        let base = tempdir().unwrap();
+        let project = base.path().join("project");
+        let dotgit = project.join(".git");
+        std::fs::create_dir_all(dotgit.join("worktrees")).unwrap();
+        let elsewhere = base.path().join("elsewhere").join("reg");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dotgit.join("worktrees").join("evil")).unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let wt_dotgit = outside.join(".git");
+        std::fs::write(
+            elsewhere.join("gitdir"),
+            format!("{}\n", wt_dotgit.display()),
+        )
+        .unwrap();
+        std::fs::write(&wt_dotgit, format!("gitdir: {}\n", elsewhere.display())).unwrap();
+
+        let vouched = vouched_worktrees(&std::fs::canonicalize(&dotgit).unwrap());
+        println!("PROBE B vouched = {vouched:?}");
+        assert!(
+            !vouched.contains(&std::fs::canonicalize(&outside).unwrap()),
+            "PROBE B admitted outside"
+        );
+    }
+
+    /// A `.git` symlinked at an outside repo resolves that repo's common dir, which has
+    /// never heard of this tree — so the tree-side handshake finds itself absent from
+    /// the vouched set and the reach collapses. This held before the shape checks and
+    /// holds after them; it is here so a later change cannot quietly drop it.
+    #[test]
+    fn a_symlinked_dotgit_reaches_nothing_without_the_handshake() {
+        let base = tempdir().unwrap();
+        let project = base.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside_repo = base.path().join("outside");
+        let outside_git = outside_repo.join(".git");
+        std::fs::create_dir_all(&outside_git).unwrap();
+        std::os::unix::fs::symlink(&outside_git, project.join(".git")).unwrap();
+
+        let reach = worktrees_reachable_from(&std::fs::canonicalize(&project).unwrap());
+        println!("PROBE C reach = {reach:?}");
+        assert!(reach.is_empty(), "PROBE C reached {reach:?}");
+    }
+
+    /// The file that vouches has to live in the directory it vouches for. A `.git` file
+    /// symlinked out of the worktree root names the registration back correctly, but it
+    /// really lives somewhere else, so the directory it would admit is not the directory
+    /// holding git's link.
+    #[test]
+    fn a_dotgit_symlinked_out_of_the_worktree_root_vouches_for_nothing() {
+        let base = tempdir().unwrap();
+        let project = base.path().join("project");
+        let dotgit = project.join(".git");
+        let registration = dotgit.join("worktrees").join("linked");
+        std::fs::create_dir_all(&registration).unwrap();
+
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // The real link file lives elsewhere; `<outside>/.git` is only a symlink to it.
+        let real = base.path().join("elsewhere");
+        std::fs::create_dir_all(&real).unwrap();
+        let real_link = real.join(".git");
+        std::fs::write(&real_link, format!("gitdir: {}\n", registration.display())).unwrap();
+        std::os::unix::fs::symlink(&real_link, outside.join(".git")).unwrap();
+        std::fs::write(
+            registration.join("gitdir"),
+            format!("{}\n", outside.join(".git").display()),
+        )
+        .unwrap();
+
+        let vouched = vouched_worktrees(&std::fs::canonicalize(&dotgit).unwrap());
+        assert!(
+            !vouched.contains(&std::fs::canonicalize(&outside).unwrap()),
+            "a `.git` that lives elsewhere vouched for the directory it points from: {vouched:?}"
         );
     }
 }
