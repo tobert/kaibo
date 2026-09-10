@@ -1050,7 +1050,7 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
         s[0].preamble
             .as_deref()
             .unwrap_or("")
-            .contains("second tool, `explore`"),
+            .contains("You also have `explore`"),
         "synth client got the consult preamble: {:?}",
         s[0].preamble
     );
