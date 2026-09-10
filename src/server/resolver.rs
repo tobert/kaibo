@@ -256,13 +256,58 @@ impl Resolver {
     }
 
     /// The shared "outside the allowed set" rejection, naming the boundary and the
-    /// three widening knobs.
+    /// three widening knobs — and the one place kaibo logs that its boundary fired.
+    ///
+    /// Read-only containment is the product, so the boundary refusing a path is the
+    /// most interesting thing kaibo does, and an operator watching a fleet needs to
+    /// tell a boundary that never fired from one that fired a hundred times. Every
+    /// refusal funnels here — `resolve_root`, `resolve_attachments`, and
+    /// `read_contained_file` all call it — so one `warn` covers the whole class, from
+    /// the MCP tools and the CLI subcommands alike, and a fourth surface added later
+    /// is reported the moment it uses the shared check.
+    ///
+    /// *This* boundary, precisely: the allowed set. A consult attachment refused for
+    /// resolving outside the **session root** ([`resolve_consult_attachments`](Self::resolve_consult_attachments)) is a different
+    /// class — the file is inside the allowed set, and the refusal is about which
+    /// project this call mounts — so it stays quiet here. An operator alerting on this
+    /// warn is asking "did the read boundary fire", not "did a caller name the wrong
+    /// project".
+    ///
+    /// The split between the field and the message is kaibo's existing export policy,
+    /// not a new one. `outcome` is on
+    /// [`SAFE_ATTRIBUTES`](crate::otel_filter::SAFE_ATTRIBUTES), so *that a refusal
+    /// happened* always exports; the paths live in the message body, which
+    /// [`CONTENT_ATTRIBUTES`](crate::otel_filter::CONTENT_ATTRIBUTES) holds back from
+    /// traces unless the operator opts in. A caller-named path is content by the same
+    /// rule that keeps `gen_ai.tool.arguments` off the safe list. The logs signal
+    /// carries the line whole, which is what it is for: what kaibo says about itself.
     pub(super) fn containment_error(&self, raw: &Path, canon: &Path) -> McpError {
         let trees: Vec<String> = self
             .allowed_set
             .iter()
             .map(|p| p.display().to_string())
             .collect();
+        // Name the resolution only when it changed something. A caller usually passes
+        // an already-canonical path, and "refused /etc: it resolves to /etc" reads as
+        // noise in the line an operator sees most often; a `..` or a symlink that
+        // landed somewhere else is exactly what they need spelled out.
+        let resolution = if raw == canon {
+            String::new()
+        } else {
+            format!(", which resolves to {}", canon.display())
+        };
+        // Refine the enclosing call's span too, for a handler built to receive it —
+        // `run_kaish` declares an `outcome` field and opens its span before this check.
+        // `Span::record` is a no-op for a field the current span never declared, so
+        // this reaches exactly those spans and no others, and it costs nothing when
+        // there is no span at all (the four handlers that resolve before they have one).
+        tracing::Span::current().record("outcome", "refused");
+        tracing::warn!(
+            outcome = "refused",
+            "read boundary refused {}{resolution} — outside the allowed set [{}]",
+            raw.display(),
+            trees.join(", "),
+        );
         McpError::invalid_params(
             format!(
                 "path {} resolves to {}, which is outside the allowed set [{}]. \
