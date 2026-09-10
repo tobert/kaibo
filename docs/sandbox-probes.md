@@ -518,35 +518,50 @@ detail is in git, and anything durable a run found has been promoted into the ba
 belongs to rather than left here to be re-read — that promotion is the point of the
 compression, not a side effect of it.
 
-- **2026-09-02** — **Full A–G**, branch `kaish-0.17.1`, run because the `kaish-kernel`
-  0.17.0 → 0.17.1 patch touches the VFS and so trips the trigger. **All clear.** Every
-  battery was run against **both** pins and diffed; A, B, D, E, F and G came back
-  byte-identical, so the two changes below are the whole delta a model can see.
-  - **The release blocker is fixed:** `readlink -f` and `realpath` resolve an in-tree
-    path (exit 0) and refuse an escape by name, where 0.17.0 failed on every operand
-    with `No such file or directory: /tmp`. G3 re-run on the new canonicalize path —
-    existing, missing, and unreadable targets still refuse byte-identically.
-  - **The one new observable, accepted:** the directories *above* the mount list again,
-    each naming only the next component down to the project. Battery C's `/home` note
-    is corrected in place. Synthesis, not host reads — counted it: `ls /tmp` returns one
-    entry where the host holds 3575, and `stat`/`realpath` cannot tell a real host file
-    beside the chain from one that was never created. Adjacent secrets, siblings, and
-    the state db and media CAS all stay invisible (E2/F2 re-run).
-  - **The probe caught itself once:** E1 run without `--root` created a state db, because
-    the fixture was then outside every allowed tree and the guard correctly did not fire.
-    The §0 question — would this read differently if the probe were broken? — is what
-    found it.
-  - **Battery H is new**, written from its own first run against a scratch store: the CAS
-    write path had containment (F) but nothing measured its *shape*. All clear — a stored
-    object's name equals `sha256sum` of its input, a repeat write leaves inode and mtime
-    untouched, a refusal stores nothing, and a fresh object stays invisible to kaish.
-    Writing it found one missing test, now added: `write_cas` had no case for a symlink
-    inside the tree pointing out, the leg `read_contained_file`'s own doc calls the one
-    worth not skipping.
-  - Suites: containment 25 (one new), full `cargo test` 1147 passed. The lone failure is
-    the known `tests/credentials.rs` ETXTBSY exec race under parallelism; green serially,
-    reproduces on unmodified code.
-  - §7 not re-run; deferred to the v0.4.0 pre-release check.
+- **2026-09-10** — **Full A–H**, main `31fdc09`, the 0.5.0 pre-release pass. Run because
+  two triggers fired at once: `kaish-vfs` moved with the 0.17.2 bump (#187), and #191
+  changed containment itself — the worktree vouch now demands git's own shape. **All
+  clear.**
+  - **A** ten writes refused, nine naming `permission denied: filesystem is read-only`
+    and the cross-mount `ln -s` naming the mount rule; host tree clean afterwards.
+    **B** eleven host commands, all 127. **C** every out-of-root read `not found`,
+    including `~/.deepseek-key`, which holds a real key this session — absence would have
+    passed vacuously, so the file existing is what makes the result mean something.
+    `env` carries only kernel-owned `PIPESTATUS`/`PWD`; every provider key, `$HOME` and
+    `$PATH` expand empty. Counted the prefix: `ls /home/atobey` returns 1 entry where the
+    host holds 74, and `/tmp` (631 on the host) is not found at all. **D** all five
+    `path` rows as documented; the `..` row canonicalizes to `/etc` and is refused by
+    *containment*, message naming the allowed set. **E/F** store and CAS both refuse a
+    path inside the project before touching disk, and neither is readable or enumerable
+    from kaish — nor is `~/.local` itself. `no_write_path` green, count exact. **G**
+    target string readable, no bytes cross, and the three refusals stay byte-identical
+    across exists / missing / unreadable. **H** object names equal `sha256sum` of their
+    input, a repeat write leaves inode and mtime untouched to the nanosecond, a refused
+    write stores nothing, and a fresh object stays invisible to kaish.
+  - **The F3 this file asked for is now covered, and it split in two.** `write_cas` —
+    the model-reachable deposit — refuses a source outside the allowed set and stores an
+    in-tree one, with the positive control run so the refusal is not vacuous. The CLI
+    `kaibo cas write` does **not** refuse an outside source, and that is correct rather
+    than a finding: the CLI caller is the operator, who can already read the file. H1's
+    note reads as if one rule covers both surfaces; it covers the tool. Probe the tool.
+  - **The probe caught itself again**, the way §0 says it will. The Battery H fixture put
+    `--state-db` inside the tree it passed as `--root`, so E1 fired, persistence went
+    off, the CAS fell to memory, and `cas write` refused — three batteries' worth of
+    correct behavior reading, at a glance, like a broken store. Both stores have to sit
+    outside the allowed tree for H to measure anything.
+  - **Two message drifts, neither a hole.** `kill 1` now answers `signalling a PID
+    requires the subprocess capability` (exit 1), not the "not supported on this
+    platform" stub this file records. And `grep` following an escaping symlink refuses
+    with exit 1 and *no* stderr line, where every other verb in G2 names the reason —
+    worth knowing before someone reads the silence as success.
+  - Gates beside the batteries: `cargo tree -i` absent for aws-lc-rs / aws-lc-sys /
+    mimalloc / openssl-sys with a printing negative control (`kaish-kernel v0.17.2`);
+    musl binary `statically linked` / `not a dynamic executable` and runs; suite 1363/0.
+
+- **2026-09-02** — Full A–G, branch `kaish-0.17.1`, run against both pins and diffed. All
+  clear. `readlink -f`/`realpath` fixed; the directories above the mount list again, each
+  naming only the next component down. **Battery H is new** — the CAS write path had
+  containment but nothing measured its shape.
 
 - **2026-09-01** — Full A–G, branch `kaish-0.17`, for the 0.14.1 → 0.17.0 bump. All
   clear. Three pass criteria here were false against 0.17 and were corrected in place;
