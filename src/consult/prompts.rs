@@ -24,7 +24,7 @@ fn with_house_rules(base: String, house_rules: Option<&str>) -> String {
         None => base,
         Some(rules) => format!(
             "{base}\n\n\
-             --- Operator house rules for this codebase ---\n\
+             --- Operator house rules for this project ---\n\
              The agent you are helping configured the guidance below. It holds the \
              project conventions and working preferences for this repository. Each \
              section is headed by the path of the file it came from. Treat it as \
@@ -154,7 +154,7 @@ impl ReportReader {
                           Your work is to gather grounded evidence and cite it exactly.",
                 them: "the synthesis agent",
                 they: "The synthesis agent",
-                gap: "is missing from its answer",
+                gap: "is missing from the answer it writes",
             },
             ReportReader::CallingAgent => ReaderWords {
                 opening: "You are the explorer, reading one project tree for an agent \
@@ -165,7 +165,7 @@ impl ReportReader {
                           Your work is to gather grounded evidence and cite it exactly.",
                 them: "the agent that asked",
                 they: "The agent that asked",
-                gap: "is missing from what it can act on",
+                gap: "is missing from what that agent can act on",
             },
         }
     }
@@ -267,7 +267,8 @@ pub fn resolve_phase_preamble(
     )
 }
 
-/// Explorer preamble: gather and organize evidence, don't conclude. Composes the
+/// Explorer preamble: gather and organize evidence for the reader. The report, not
+/// the answer, is the deliverable. Composes the
 /// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
 ///
@@ -301,8 +302,8 @@ pub fn report_preamble(reader: ReportReader) -> String {
          command goes inside its `script` argument. {core}\n\n\
          Read files WHOLE. `cat -n FILE` is your default command for any file the \
          question touches. One read gives you the whole file with its exact line \
-         numbers: every definition, every reference, and the text around them \
-         together. You do not have to guess how big a file is. The project file list \
+         numbers, so each part arrives with the text around it. You do not have to \
+         guess how big a file is. The project file list \
          gives each file's size and marks the few files that will not come back whole. \
          Read whole every file it does not mark. When a file carries no size, read it \
          whole anyway and let the result tell you otherwise. Prefer the bigger read. \
@@ -320,11 +321,11 @@ pub fn report_preamble(reader: ReportReader) -> String {
          Read holistically. The question tells you where to start reading, not where \
          to stop. Read the text around each relevant location, not only the lines the \
          question names. Follow each key name to where it is defined and to every \
-         place it is used. When something confuses you, keep reading until it is \
+         place it appears. When something confuses you, keep reading until it is \
          clear; a confusing section often holds the detail the question depends on. \
-         Your report is the only view of this project {them} receives, so anything \
+         Your report is the only view of this project {them} receives. Anything \
          you leave out {gap}.\n\n\
-         Write a report for {them} in these sections:\n\
+         Write a report in these sections for {them}:\n\
          - SummaryOfFindings: what you concluded. Separate what you read from what \
          you infer and from what remains unknown.\n\
          - RelevantLocations: for each location that matters, the concrete \
@@ -502,7 +503,7 @@ pub fn consult_user_prompt(
     let mut prompt = String::new();
     if !history.is_empty() {
         prompt.push_str(
-            "This is a continuing conversation about the same codebase. Earlier turns, \
+            "This is a continuing conversation about the same project. Earlier turns, \
              oldest first:\n\n",
         );
         for (i, turn) in history.iter().enumerate() {
@@ -516,7 +517,7 @@ pub fn consult_user_prompt(
         prompt.push_str(
             "Use the earlier turns for context and continuity. Investigate fresh, and \
              re-read any `file:line` an earlier answer cited before you rely on it. The \
-             code is the ground truth, not the prior answer.\n\n",
+             files are the ground truth, not the prior answer.\n\n",
         );
     }
     if let Some(context) = context {
@@ -527,8 +528,8 @@ pub fn consult_user_prompt(
              `file:line`, trust that citation instead of re-deriving it. Use your tools \
              when you need more than the context gives you: read a span it refers to \
              but does not quote, read a whole file when you need the full picture, and \
-             read anything the question covers that the context does not. If the code \
-             you read and the context disagree, the code is correct.\n\n",
+             read anything the question covers that the context does not. If the files \
+             you read and the context disagree, the files are correct.\n\n",
         ));
     }
     if !attached.is_empty() {
@@ -760,8 +761,8 @@ pub fn sweep_evidence_block(consumer: &SweepConsumer, delivery: &SweepDelivery) 
 pub fn consult_preamble() -> String {
     let core = kaish_syntax_core();
     format!(
-        "You are the synthesis agent on a two-model team. You investigate a codebase \
-         and write the answer that another agent will act on. Ground every claim in \
+        "You are the synthesis agent on a two-model team. You investigate a project \
+         tree and write the answer that another agent will act on. Ground every claim in \
          evidence and cite the concrete `file:line`. {core}\n\n\
          You also have `explore`. It sends a broad sweep to the fast explorer on your \
          team, which searches the repository on the same read-only shell and returns \
@@ -770,9 +771,9 @@ pub fn consult_preamble() -> String {
          where something lives or gathering the relevant files. One `explore` call \
          searches far more of the repository than you can read in one turn, which \
          leaves you more turns for close reading and reasoning.\n\n\
-         Use `run_kaish` to read the code yourself when you need a specific span. \
-         Read files WHOLE with `cat -n FILE`; nearly every source file comes back \
-         whole in one command. The project file list gives each file's size, so read \
+         Use `run_kaish` to read the files yourself when you need a specific span. \
+         Read files WHOLE with `cat -n FILE`; nearly every file comes back whole in \
+         one command. The project file list gives each file's size, so read \
          whole every file it does not mark, and when you have no size read whole \
          anyway and let the result tell you otherwise. Reading too much costs you one \
          read. Reading too little costs you every read after it. For a file too large \
@@ -784,8 +785,8 @@ pub fn consult_preamble() -> String {
          concrete `file:line`, trust that citation instead of re-deriving it. Spend \
          your turns getting more than the context gave you: read a span it refers to \
          but does not quote, read a whole file when you need the full picture, and \
-         read anything the question covers that the context does not. If the code you \
-         read and the context disagree, the code is correct.\n\n\
+         read anything the question covers that the context does not. If the files \
+         you read and the context disagree, the files are correct.\n\n\
          Your tools exist to support the answer. Writing the answer is your work, and \
          no tool writes it for you. The work is not finished until the answer is \
          written. State each finding first, then put the quoted snippet and its \
@@ -815,9 +816,9 @@ pub fn consult_preamble() -> String {
 /// team" — so the two blocks read as one voice rather than two authors.
 pub fn deliberation_prompt(question: &str, dossier: &str) -> String {
     format!(
-        "The explorer on your team investigated this codebase read-only and assembled \
-         the dossier below. It holds spans read from the real, current source, cited \
-         by `file:line`. Trust those citations as accurate. Use this turn \
+        "The explorer on your team investigated this project tree read-only and \
+         assembled the dossier below. It holds spans read from the real, current \
+         files, cited by `file:line`. Trust those citations as accurate. Use this turn \
          to deliberate on that evidence, not to re-derive it. Reason the question \
          through to a conclusion, and say clearly where the evidence runs out. If the \
          dossier leaves open a detail the answer depends on, state the assumption you \
