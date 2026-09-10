@@ -26,6 +26,10 @@ record. Each later release appends a new section at the top.
 - **A git worktree registration alone no longer vouches for the directory it names** — the
   worktree must name its registration back, so one file in a repo you cloned to review
   cannot make any directory on the host readable.
+- **A worktree link vouches only in the shape git writes it** — the registration must be a
+  direct child of the repo's `worktrees` directory and must name `<worktree>/.git`, which
+  must live in the directory it vouches for. A mutually-naming pair of ordinary files no
+  longer admits a directory.
 
 ### Added
 
