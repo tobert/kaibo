@@ -47,6 +47,8 @@ record. Each later release appends a new section at the top.
   `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
 - **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
   ran the body three times.
+- **`explore` no longer tells its explorer that a synthesis agent will write the answer** —
+  on a standalone `explore` there is none, and the report is the deliverable.
 
 ### Removed
 

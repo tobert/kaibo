@@ -39,7 +39,7 @@ pub use engine::{
 pub(crate) use engine::{run_phase, run_phase_logged};
 pub use prompts::{
     batch_preamble, batch_system_prompt, consult_preamble, consult_user_prompt,
-    deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble,
+    deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble, ReportReader,
     sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides,
 };
 pub use shaping::{
