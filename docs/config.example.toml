@@ -842,16 +842,30 @@ synth    = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # user_files    = ["~/.claude/CLAUDE.md"]
 
 # ---------------------------------------------------------------------------
-# [prompts] — per-PHASE system-prompt overrides. Where [context] ADDS project
-# guidance, [prompts] REPLACES the built-in role framing (full replace — the kaish
-# shell contract rides the run_kaish tool regardless). File-only and operator-only
-# (a calling agent can't inject a prompt). An empty value is a loud load error.
-# Precedence per phase: slot `preamble` (per-model, above) > [prompts].<phase> >
-# built-in. The synth slot feeds both `consult` and `oneshot`, but each keeps
-# its own key, so they can diverge. Phases: `explorer` (every sweep — `explore`,
-# `consult`'s nested explore′, `deliberate`'s dossier),
-# `consult` (the driver), `oneshot` (the thin toolless answer), `batch` (the offline
-# max-thinking answer).
+# [prompts] — replace a phase's role framing.
+#
+# [context] adds project guidance to the built-in prompt. [prompts] replaces the
+# built-in role framing instead, and the replacement is total. The kaish shell
+# contract is not part of it: that text rides the run_kaish tool, so every phase
+# keeps it, whichever prompt it runs.
+#
+# Set these here only. A calling agent cannot set a prompt. An empty value is a
+# load error.
+#
+# Precedence per phase, highest first: a slot's `preamble` (per model, above),
+# then [prompts].<phase>, then the built-in.
+#
+# The synth slot answers both `consult` and `oneshot`. Each keeps its own key
+# here, so the two can differ.
+#
+# One key per phase:
+#   explorer  every survey: standalone `explore`, the survey nested inside
+#             `consult`, and `deliberate`'s dossier. One key, and `explore`'s
+#             report goes to a different reader than the other two — see
+#             `kaibo://config/guide`.
+#   consult   the driver that reads spans and delegates surveys.
+#   oneshot   the toolless answer, with no codebase access.
+#   batch     the offline answer, at maximum thinking depth.
 # ---------------------------------------------------------------------------
 #
 # [prompts]

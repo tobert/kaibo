@@ -1357,16 +1357,18 @@ Prefer architectural answers; name the file:line that carries each claim.
 
 | key | replaces | runs in |
 |---|---|---|
-| `explorer` | `report_preamble` | every explorer sweep: standalone `explore`, `consult`'s nested `explore′`, `deliberate`'s dossier |
+| `explorer` | `report_preamble` | every survey: standalone `explore`, `consult`'s nested `explore′`, `deliberate`'s dossier |
 | `consult` | `consult_preamble` | the `consult` driver |
 | `oneshot` | `oneshot_preamble` | the thin, toolless `oneshot` |
 | `batch` | `batch_preamble` | the offline, max-thinking `batch_submit` |
 
 **One `explorer` key, two readers.** The built-in explorer preamble names who receives the
-report: `consult`'s sweep and `deliberate`'s dossier are told a synthesis agent writes the
-final answer from them, while standalone `explore` is told its report goes straight back to
-the caller and is the finished deliverable. An override is a full replace, so it erases that
-distinction — write one that reads correctly for both, or leave the key unset.
+report. In `consult`'s nested survey and in `deliberate`'s dossier, a synthesis agent writes
+the final answer from it. In standalone `explore`, the report goes straight back to the
+caller and is the finished deliverable.
+
+An override replaces the preamble for both. Write one that reads correctly for either
+reader, or leave the key unset.
 
 **Full replace.** An override *is* the role framing, verbatim; kaibo does not re-wrap it.
 This is safe because the kaish operating contract — how to drive the read-only shell, the
