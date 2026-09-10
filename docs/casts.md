@@ -69,7 +69,7 @@ api_key_env = "OPENAI_API_KEY"
 # --- casts: role → "backend/model". `cast = "chimera"` selects the whole thing. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-flash"        # cheap fast surveys — local/cheap family
+explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
 
 [casts.local-only]                          # privacy posture: nothing leaves the box

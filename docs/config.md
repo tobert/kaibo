@@ -282,7 +282,7 @@ A role table. Each slot takes one of two forms:
 
 ```toml
 [casts.chimera]
-explorer = "deepseek/deepseek-flash"        # cheap fast surveys
+explorer = "deepseek/deepseek-flash"        # reads the tree and cites
 synth    = "claude/claude-sonnet-4-6"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables

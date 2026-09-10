@@ -567,14 +567,14 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 # ---------------------------------------------------------------------------
 
 # --- Advanced — a chimera: mix model FAMILIES across roles, a different lineage per
-#     job, named as one team (`cast = "chimera"`). A cheap DeepSeek explorer + a strong
-#     Claude synth give you mistakes that don't line up. It's the power-user option and
+#     job, named as one team (`cast = "chimera"`). A DeepSeek explorer and a Claude
+#     synth give you mistakes that don't line up. It's the power-user option and
 #     wants a key per family. The common case is simpler: ONE outside family, explorer
 #     and synth both within it (the built-in `deepseek`/`gemini`/`anthropic` casts, or
 #     `local-only` below) — that single lineage already augments your own agent's. ---
 
 [casts.chimera]
-explorer = "deepseek/deepseek-flash"        # cheap fast surveys — DeepSeek family
+explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
 synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude family
 
 # --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
