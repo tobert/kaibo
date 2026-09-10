@@ -27,18 +27,26 @@ record. Each later release appends a new section at the top.
   worktree must name its registration back, so one file in a repo you cloned to review
   cannot make any directory on the host readable.
 
-### Fixed
+### Added
 
-- **kaish 0.17.2** — ordinary shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
-  `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
-- **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
-  ran the body three times.
+- **The read boundary now says when it refuses a path** — a `warn` naming the path and the
+  allowed set, from every surface that checks containment. Rides the `logs` signal.
+- **A refused `run_kaish` call still closes a `run_kaish` span**, tagged
+  `outcome = "refused"` — a boundary that fired no longer looks like a call that never
+  arrived.
 
 ### Changed
 
 - **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the
   cast shape it wants, or the absent job producer, plus the tools that are live. A
   misspelled name still reads as `tool not found`.
+
+### Fixed
+
+- **kaish 0.17.2** — ordinary shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
+  `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
+- **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
+  ran the body three times.
 
 ### Removed
 
