@@ -32,6 +32,9 @@ record. Each later release appends a new section at the top.
 - **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the
   cast shape it wants, or the absent job producer, plus the tools that are live. A
   misspelled name still reads as `tool not found`.
+- **Every built-in preamble now reads in one plain style** — short sentences, one concern
+  per paragraph, no capitalized section labels. The explorer reads a project tree, not
+  only code, and every deliverable separates what was read from what is inferred.
 
 ### Fixed
 
