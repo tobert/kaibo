@@ -3589,7 +3589,7 @@ mod tests {
                 .preamble
                 .as_deref()
                 .unwrap_or("")
-                .contains("second tool, `explore`"),
+                .contains("You also have `explore`"),
             "driver got the consult preamble: {:?}",
             synth_reqs[0].preamble
         );
