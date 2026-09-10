@@ -2181,7 +2181,7 @@ fn consult_tools(
     // synth's own vision cap (the same cap `view_image` below rides).
     let consumer = SweepConsumer {
         kind: SweepConsumerKind::ConsultDriver,
-        label: Arc::from(format!("the consult driver (`{}`)", synth.model)),
+        label: Arc::from(format!("the synthesis agent (`{}`)", synth.model)),
         vision: synth.caps.vision,
     };
     // The caller's own `consult` attachments already reach the driver another way
