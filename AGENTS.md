@@ -395,8 +395,8 @@ collision appears in real prose, not in advance.
 | arm | noun | A resolved slot: a built client plus the request shape for that model. The one live construction point is `Arm::from_slot`. |
 | lane | noun | How a synth is driven: `interactive`, `batch` (a provider's offline queue), or `direct` (a big local model kaibo runs itself). |
 | phase | noun | One model, one preamble, one injected toolset, run as a bounded tool loop. `run_phase` is the primitive. |
-| survey | noun | One explorer investigation pass, ending in a cited report. `explore` runs one; `consult` delegates one. **The published name** — `sweep` is the same thing in code. |
-| sweep | noun | The internal name for a survey. Used in code, comments, and module names; never in published text. |
+| survey | noun | One explorer investigation pass, ending in a cited report. `explore` runs one; `consult` delegates one; `deliberate` builds a dossier from one. **The published name.** |
+| sweep | noun | The same thing in code — module names, identifiers, comments. Not published. Retiring from published prose, not yet finished; `docs/` is converted, the tool descriptions and CLI help are not. As a plain verb ("omit `backend` to sweep every configured backend") it is ordinary English and stays. |
 | dossier | noun | The cited evidence an offline synth reasons over in `deliberate`, gathered by an explorer beforehand. |
 | family | noun | A model lineage from one vendor, as in "a model outside your own family". About forty uses, one sense. Use it; do not paraphrase it. |
 | allowed set | noun | The canonicalized trees a call's path must resolve into — `--root`, each `--allow-path`, and any followed worktree. The read boundary. |

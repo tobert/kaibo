@@ -282,7 +282,7 @@ A role table. Each slot takes one of two forms:
 
 ```toml
 [casts.chimera]
-explorer = "deepseek/deepseek-v4-flash"     # cheap fast sweeps
+explorer = "deepseek/deepseek-v4-flash"     # cheap fast surveys
 synth    = "claude/claude-sonnet-4-6"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables
@@ -503,11 +503,11 @@ Inlined bytes ride every turn of the driver loop, so this bounds resident prompt
 not just one request. The toolless tools (`oneshot`, `batch_submit`) are unaffected;
 with no shell to fall back on, they keep their own per-file and per-call caps.
 
-**`max_attachments`.** Cap on how many files one explorer sweep may route with its
-`attach` tool. The routed bytes ride alongside the sweep's report to whoever reads it —
+**`max_attachments`.** Cap on how many files one explorer survey may route with its
+`attach` tool. The routed bytes ride alongside the survey's report to whoever reads it —
 the `consult` driver, or `deliberate`'s offline synth — without entering the explorer's
 own context. Distinct from `inline_attach_budget`, which bounds inlining the *caller's*
-attachments into the driver prompt: this bounds a sweep's own routing, and it is a
+attachments into the driver prompt: this bounds a survey's own routing, and it is a
 behavioral guard rather than a memory one (the per-file and cumulative byte caps in
 `attach.rs` bound the worst case). `0` disables the tool. Also settable via
 `KAIBO_MAX_ATTACHMENTS` and `--max-attachments`.
@@ -617,7 +617,7 @@ base_url = "http://localhost:8080/v1"
 key_optional = true
 
 [casts.mixed]
-explorer = "llama/qwen2.5-coder-7b"     # sweeps stay local and free
+explorer = "llama/qwen2.5-coder-7b"     # surveys stay local and free
 synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
 ```
 
@@ -960,7 +960,7 @@ kaibo emits six instruments, all histograms, all named by the conventions:
 | `gen_ai.execute_tool.duration` | How long one `run_kaish` / `explore′` / `view_image` took |
 
 The agent metrics carry `gen_ai.agent.name` — `synth` or `explorer` — and that label is
-what makes them worth reading. A delegated sweep is its own invocation, so its twenty
+what makes them worth reading. A delegated survey is its own invocation, so its twenty
 turns are counted against `explorer`, and the driver's `tool_calls` counts only the
 delegation it made. Reading `gen_ai.invoke_agent.tool_calls` for `synth` therefore
 answers the delegation question directly, where before it took trace archaeology.
@@ -1065,7 +1065,7 @@ artifact-producing tool writes into. Three produce today:
 
 `deliberate` needs no key of its own — kaibo writes the dossier, not a model. Each
 deliberation names its dossier's `kaibo://cas/<digest>`; pass that digest back as the
-`dossier` argument to run a second synth over the same evidence with no explorer sweep.
+`dossier` argument to run a second synth over the same evidence with no explorer survey.
 Size the store for dossiers: they are the bulkiest objects most installs hold, and they
 accumulate on every deliberation. A refused write (a full `max_bytes`, an I/O error) is
 logged and the deliberation proceeds — you lose the record, never the answer.
@@ -1264,7 +1264,7 @@ digest and nothing else: it never reports whether the content was already in the
 because that answer would let one project's model team probe another's artifacts. Refusals
 are sanitized for the same reason — the model is told what to do next, never the store's
 path or how full it is. Only the `consult` driver loop gets the tool; delegated explorer
-sweeps never do.
+surveys never do.
 
 **Where the digests are written down.** The answer's footer names every artifact this call
 saved, with its mime, size, label, and (in disk mode) its path. A consult that saved and
@@ -1331,7 +1331,7 @@ This is the distinction from `[server] allow_paths` below. `allow_paths` widens 
 *model* can explore; `[context]` injects fixed operator text the model never navigates to.
 
 **Where it lands.** Every codebase-reading phase: the `consult` driver and its nested
-`explore′` sweep, standalone `explore`, and `deliberate`'s dossier explorer. The cheap
+`explore′` survey, standalone `explore`, and `deliberate`'s dossier explorer. The cheap
 explorer therefore orients on the same guidance while it searches, not only at answer
 time. The toolless `oneshot` and the offline batch synth read no project and get none.
 
@@ -1357,7 +1357,7 @@ Prefer architectural answers; name the file:line that carries each claim.
 
 | key | replaces | runs in |
 |---|---|---|
-| `explorer` | `report_preamble` | the nested `explore′` sweep inside `consult` |
+| `explorer` | `report_preamble` | the nested `explore′` survey inside `consult` |
 | `consult` | `consult_preamble` | the `consult` driver |
 | `oneshot` | `oneshot_preamble` | the thin, toolless `oneshot` |
 | `batch` | `batch_preamble` | the offline, max-thinking `batch_submit` |
@@ -1459,7 +1459,7 @@ directory. Names are traded for structure, and the model recovers them with `glo
 `full_list_max_files = 0` is a load error, since it would refuse every repo; disable the
 block instead. `tree_max_depth = 0` is a load error, since it would render an empty map.
 
-**Scope.** The exploring phases: the `consult` driver and its nested `explore′` sweep,
+**Scope.** The exploring phases: the `consult` driver and its nested `explore′` survey,
 standalone `explore`, and `deliberate`'s dossier explorer. The toolless `oneshot` reads no
 project and gets no map. Like `[context]`, the block re-sends each turn, which the size
 gate keeps bounded. Whether it erases discovery
