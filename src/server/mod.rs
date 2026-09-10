@@ -9685,6 +9685,33 @@ enabled = false
         }
     }
 
+    /// The guide names the models every built-in cast dials, so a default that drifts
+    /// leaves the document promising an operator a model kaibo will not ask for. That is
+    /// how `deepseek-v4-flash` outlived DeepSeek retiring it: the registry and four
+    /// documents each carried the id and nothing tied them together. Now the registry is
+    /// the source and the guide has to keep up.
+    #[test]
+    fn the_guide_names_the_models_every_built_in_cast_dials() {
+        use crate::credentials::ProviderKind;
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::DeepSeek,
+            ProviderKind::Gemini,
+            ProviderKind::OpenRouter,
+            ProviderKind::Openai,
+        ] {
+            let backend = kind.builtin_name();
+            let (explorer, synth) = crate::config::default_models(kind);
+            for id in [explorer, synth] {
+                assert!(
+                    CONFIG_GUIDE_MD.contains(&format!("`{backend}/{id}`")),
+                    "docs/config.md never names `{backend}/{id}`, which the built-in \
+                     `{backend}` cast dials — the guide and the registry have drifted"
+                );
+            }
+        }
+    }
+
     // --- kaibo://config resource tests ---------------------------------------
 
     /// The config resource must appear in the listing with the correct URI and a

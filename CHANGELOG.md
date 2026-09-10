@@ -62,6 +62,9 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 
+- **The built-in `deepseek` cast now names a model DeepSeek serves** — it dialed
+  `deepseek-v4-flash`, which the provider retired, so the shipped default failed at
+  request time. Both roles run `deepseek-flash`, the undated id.
 - **kaish 0.17.2** — ordinary shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
   `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
 - **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
