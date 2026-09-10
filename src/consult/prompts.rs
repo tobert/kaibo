@@ -514,14 +514,16 @@ pub fn batch_system_prompt(override_: Option<&str>) -> String {
 }
 
 /// Build the consult driver's user prompt from the question, any caller-supplied
-/// `context`, and any prior session turns. Pure and offline-testable: this framing
-/// is the whole of the context-seed and multi-turn hand-off, so it's worth pinning.
+/// `context`, any prior session turns, and any attached files. Pure and
+/// offline-testable: this framing is the user-turn half of the context seed — the
+/// preamble installs the same posture for the phase — and the whole of the multi-turn
+/// hand-off, so it's worth pinning.
 ///
-/// With **no** context and **no** history this is exactly the bare question — a
-/// stateless, unseeded consult is byte-for-byte unchanged. Supplied `context`
-/// (a diff summary, a prior report, pasted source) is framed as *trusted starting
-/// evidence*: a grounded `file:line` rarely needs re-deriving, and the steer is to
-/// investigate for *more* when the context isn't enough — the CLAUDE.md acquisition,
+/// With **no** context, **no** history, and **no** attachments this is exactly the bare
+/// question — a stateless, unseeded consult is byte-for-byte unchanged. Supplied
+/// `context` (a diff summary, a prior report, pasted source) is framed as *trusted
+/// starting evidence*: a grounded `file:line` is trusted instead of re-derived, and the
+/// steer is to investigate for *more* when the context isn't enough — the CLAUDE.md acquisition,
 /// not verification, posture. History prepends the prior `(question, answer)` pairs
 /// under that same posture: a `file:line` an earlier answer cited is trusted, and the
 /// turns go to what the new question reaches beyond the old ones. The exploration still
@@ -1404,8 +1406,9 @@ mod tests {
         );
     }
 
-    /// No session history ⇒ the prompt is *exactly* the bare question. This pins the
-    /// promise that a stateless consult is byte-for-byte its pre-session behavior.
+    /// No history, no context, and no attachments ⇒ the prompt is *exactly* the bare
+    /// question. This pins the promise that a stateless consult is byte-for-byte its
+    /// pre-session behavior; the guard it covers tests all three (`consult_user_prompt`).
     #[test]
     fn empty_history_yields_the_bare_question() {
         assert_eq!(
