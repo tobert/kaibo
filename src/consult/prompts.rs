@@ -523,9 +523,10 @@ pub fn batch_system_prompt(override_: Option<&str>) -> String {
 /// evidence*: a grounded `file:line` rarely needs re-deriving, and the steer is to
 /// investigate for *more* when the context isn't enough — the CLAUDE.md acquisition,
 /// not verification, posture. History prepends the prior `(question, answer)` pairs
-/// and steers the model to re-confirm any span a prior answer cited: the exploration
-/// runs fresh every turn (we never replay the stored report — it'd be stale), so the
-/// code is the ground truth, not the old answer.
+/// under that same posture: a `file:line` an earlier answer cited is trusted, and the
+/// turns go to what the new question reaches beyond the old ones. The exploration still
+/// runs fresh every turn (we never replay the stored report — it'd be stale), and the
+/// files win over a prior answer where the two disagree.
 pub fn consult_user_prompt(
     question: &str,
     context: Option<&str>,
