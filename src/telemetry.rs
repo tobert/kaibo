@@ -5,8 +5,8 @@
 //! span per turn (carrying `gen_ai.request.model` and every `gen_ai.usage.*` token
 //! field), and a `tool` span per tool call. Our `run_kaish` and delegated
 //! `explore′` sweeps are rig tools, so they show up as tool spans for free; the
-//! `#[instrument]`s on the four MCP handlers and on `run_phase` (see `server.rs` /
-//! `consult.rs`) just give that tree named kaibo parents. This module's whole job
+//! spans the MCP handlers open around each phase and on `run_phase` (see `server.rs`
+//! / `consult.rs`) just give that tree named kaibo parents. This module's whole job
 //! is to *export* it: stand up the OTLP/HTTP exporters and hand `main`'s subscriber
 //! registry the layers that feed them.
 //!
@@ -19,6 +19,15 @@
 //! phase returns an empty answer and is forced into a write-up turn. Both classes
 //! were tracked as "incidence unmeasured" precisely because the instrument existed
 //! and had nowhere to report.
+//!
+//! The read boundary refusing a path is the third, and the one where the asymmetry
+//! bites hardest: a refusal usually happens *before* the handler has a phase to open
+//! a span around, so the logs signal is the only road it travels. That covers four of
+//! the five tools that resolve a root (`consult`, `consult_submit`, `explore`,
+//! `deliberate`) and every attachment refusal besides. `run_kaish` is the exception —
+//! its span brackets the whole call, so a refused shell call closes a `run_kaish` span
+//! with `outcome = "refused"` and reaches traces too. See
+//! `server/resolver.rs::containment_error`.
 //!
 //! **Metrics carry what neither of those makes cheap to aggregate** — and, more to the
 //! point, what neither of them can do *safely by construction*. Traces are made safe by

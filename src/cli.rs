@@ -40,7 +40,7 @@ use crate::batch::{BatchItem, BatchPoll};
 use crate::config::{Config, Lane, ModelRole, ToolDisables};
 use crate::consult::{
     batch_system_prompt, consult, deliberation_prompt, explore_with, oneshot as run_oneshot_engine,
-    ConsultConfig, ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
+    ConsultConfig, ConsultOutput, ExploreConfig, ModelCaps, PhaseContext, ReportReader,
 };
 use crate::progress::TerminalSink;
 use crate::sandbox::KaishWorker;
@@ -1471,7 +1471,19 @@ async fn explore_inner(
         sandbox: resolver.config.sandbox.clone(),
         max_attachments: resolver.config.defaults.max_attachments,
     };
-    match explore_with(&args.question, root, &explorer, &cfg, &attachments, None).await {
+    // `kaibo explore` prints the report to stdout — the person or script reading it is
+    // the only reader there is.
+    match explore_with(
+        &args.question,
+        root,
+        &explorer,
+        &cfg,
+        &attachments,
+        None,
+        ReportReader::CallingAgent,
+    )
+    .await
+    {
         Ok((report, usage)) => {
             if args.json {
                 println!(
@@ -1704,6 +1716,8 @@ async fn deliberate_inner(
             &cfg,
             &attachments,
             sink.as_ref(),
+            // The dossier is written for the offline synth that reasons over it.
+            ReportReader::SynthesisAgent,
         )
         .await
         {

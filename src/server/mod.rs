@@ -39,7 +39,7 @@ use tracing::Instrument;
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
     consult, explore_with, oneshot, sweep_evidence_block, Arm, ConsultConfig, ExploreConfig,
-    ModelCaps, PhaseContext, PromptOverrides,
+    ModelCaps, PhaseContext, PromptOverrides, ReportReader,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
@@ -2139,15 +2139,24 @@ impl KaiboHandler {
         // The top-level `explore` tool doesn't inject `attach` (v1 scope) — its
         // report goes straight back to the calling agent's own context, which is
         // exactly the channel `attach` exists to bypass; no consumer to route to.
-        let (report, usage) =
-            match explore_with(&input.question, root, &explorer, &cfg, &attachments, None)
-                .instrument(span)
-                .await
-            {
-                Ok(out) => out,
-                // A provider/model-loop failure is a clean tool-result error, same as `consult`.
-                Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
-            };
+        let (report, usage) = match explore_with(
+            &input.question,
+            root,
+            &explorer,
+            &cfg,
+            &attachments,
+            None,
+            // The report is the tool result — it lands in the calling agent's own
+            // context, with no synth of ours between the explorer and its reader.
+            ReportReader::CallingAgent,
+        )
+        .instrument(span)
+        .await
+        {
+            Ok(out) => out,
+            // A provider/model-loop failure is a clean tool-result error, same as `consult`.
+            Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
+        };
         progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
 
         // The report IS the text (no structured_content). Provenance names the one arm
@@ -2301,6 +2310,8 @@ impl KaiboHandler {
                 &cfg,
                 &attachments,
                 sink.as_ref(),
+                // The dossier is written for the offline synth that reasons over it.
+                ReportReader::SynthesisAgent,
             )
             .instrument(span)
             .await
@@ -2639,27 +2650,50 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<RunKaishInput>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(input.path)?;
+        // The direct-shell tool gets its own trace (no model loop under it). The span
+        // brackets the WHOLE call, containment check included, so every way the call
+        // can end closes a span — `tool_span.rs` settled the same question for the
+        // inner tools, and a refused call producing no span at all made the boundary
+        // firing indistinguishable from the call never arriving. The kaish worker is
+        // `!Send` on its own thread; this span never crosses that boundary, it only
+        // wraps the `.await` from the caller side.
+        let span = tracing::info_span!("run_kaish", outcome = tracing::field::Empty);
+        async move {
+            // The outcome starts at the failure value and is refined as the call gets
+            // further. Written this way, rather than on each error arm, because the one
+            // value that is not this handler's to assign is `refused`: only the
+            // containment check knows the boundary fired, and it records that itself
+            // (see `Resolver::containment_error`) from inside the `resolve_root` below —
+            // after this line, and before any arm here could overwrite it. So each
+            // writer sets the field when it knows, in the order it knows.
+            //
+            // `resolve_root` refuses three other ways — no default root, a path that
+            // does not resolve, a path that is not a directory — and those are caller
+            // mistakes, not the boundary firing. They stay `error`, the same reading
+            // `tool_span.rs` gives a malformed-args refusal, so an operator alerting on
+            // `outcome = refused` counts boundary hits and not typos.
+            tracing::Span::current().record("outcome", "error");
+            let root = self.resolve_root(input.path)?;
 
-        // A fresh worker (and kernel) per call: stateless, starts at root, and the
-        // !Send kernel stays on its own thread so this future stays Send. Applies the
-        // configured sandbox limits (timeout, output cap, disabled builtins).
-        let worker = KaishWorker::spawn_with(&root, self.config.sandbox.clone())
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        // The direct-shell tool gets its own trace (no model loop under it). The kaish
-        // worker is `!Send` on its own thread, but this span wraps the async `.await`
-        // here, so the script's wall-clock is captured from the caller side — no span
-        // crosses the thread boundary.
-        let span = tracing::info_span!("run_kaish");
-        let out = worker
-            .run(input.script)
-            .instrument(span)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            // A fresh worker (and kernel) per call: stateless, starts at root, and the
+            // !Send kernel stays on its own thread so this future stays Send. Applies the
+            // configured sandbox limits (timeout, output cap, disabled builtins).
+            let worker = KaishWorker::spawn_with(&root, self.config.sandbox.clone())
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            let out = worker
+                .run(input.script)
+                .await
+                .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            format_output(&out),
-        )]))
+            // A non-zero *script* exit is ordinary output, not a tool failure — the
+            // same reading `tool_span.rs` takes — so the shell running at all is `ok`.
+            tracing::Span::current().record("outcome", "ok");
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                format_output(&out),
+            )]))
+        }
+        .instrument(span)
+        .await
     }
 
     #[tool(
@@ -4679,9 +4713,11 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
              append per call for the project-reading phases (path-dependent).\n\n\
              A phase is a role, not one tool — several tools share a preamble. The \
              **explorer** framing drives standalone `explore`, the delegated sweep inside \
-             `consult`, and `deliberate`'s dossier-building pass; the **offline-synth** \
-             framing serves both `batch_submit` and `deliberate`'s synth. So tuning one \
-             phase moves every tool that wears it.\n",
+             `consult`, and `deliberate`'s dossier-building pass; it is listed twice \
+             because the sweep and the dossier are written for a synthesis agent that \
+             answers from them, while `explore` hands its report straight back to you. \
+             The **offline-synth** framing serves both `batch_submit` and `deliberate`'s \
+             synth. So tuning one phase moves every tool that wears it.\n",
         ),
     }
 
@@ -5038,6 +5074,132 @@ mod tests {
     use rmcp::model::{ContentBlock, NumberOrString};
     use rmcp::ServerHandler;
     use serde_json::json;
+
+    /// A `run_kaish` call refused at the boundary must still close a `run_kaish` span,
+    /// tagged `outcome = "refused"`.
+    ///
+    /// Before this, the span was built *after* `resolve_root`, so a refused call was the
+    /// one outcome of the tool that produced no span at all — the boundary firing looked
+    /// exactly like the call never happening. `tool_span.rs` already settled the same
+    /// question for the inner tools ("a malformed-args refusal is reported as
+    /// `outcome = error` rather than never appearing — the honest reading of *did this
+    /// call work*"); this is the MCP surface catching up to it.
+    #[test]
+    fn a_refused_run_kaish_still_closes_a_span() {
+        use crate::test_support::capture_tracing;
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let outside = tempfile::tempdir().expect("temp outside tree");
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(allowed.path().to_path_buf());
+        config.infer_cwd = false;
+        let handler = KaiboHandler::new(config).expect("handler builds");
+        let asked = outside.path().display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = handler
+                .run_kaish(Parameters(RunKaishInput {
+                    script: "pwd".to_string(),
+                    path: Some(asked),
+                }))
+                .await;
+            assert!(
+                refusal.is_err(),
+                "guard: the path is outside the allowed set"
+            );
+        });
+
+        let spans = captured.spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "run_kaish")
+            .unwrap_or_else(|| {
+                panic!("a refused call still opens a `run_kaish` span; saw {spans:?}")
+            });
+        assert_eq!(
+            span.outcome.as_deref(),
+            Some("refused"),
+            "the span says how the call ended: {span:?}"
+        );
+    }
+
+    /// A path that simply does not exist is a caller mistake, not the boundary firing,
+    /// and must NOT read as `refused` — an operator alerting on that value is counting
+    /// boundary hits, and a typo landing in the same bucket makes the number useless.
+    ///
+    /// `resolve_root` refuses four ways and only one of them is the boundary. Caught by
+    /// the cross-family review of this change (cast `crusoe`): the first cut recorded
+    /// `refused` on every `resolve_root` error, so the span and the warn could disagree
+    /// — the span said the boundary fired while the logs, which only
+    /// `containment_error` writes, said nothing at all.
+    #[test]
+    fn a_nonexistent_path_is_an_error_not_a_refusal() {
+        use crate::test_support::capture_tracing;
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(allowed.path().to_path_buf());
+        config.infer_cwd = false;
+        let handler = KaiboHandler::new(config).expect("handler builds");
+        let asked = allowed.path().join("no-such-dir").display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = handler
+                .run_kaish(Parameters(RunKaishInput {
+                    script: "pwd".to_string(),
+                    path: Some(asked),
+                }))
+                .await;
+            assert!(refusal.is_err(), "guard: the path does not exist");
+        });
+
+        let spans = captured.spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "run_kaish")
+            .unwrap_or_else(|| panic!("the call still opens a span; saw {spans:?}"));
+        assert_eq!(
+            span.outcome.as_deref(),
+            Some("error"),
+            "a path that does not resolve is an error, not the boundary firing: {span:?}"
+        );
+        assert!(
+            !captured
+                .events()
+                .iter()
+                .any(|e| e.has_field("outcome", "refused")),
+            "and it logs no refusal: {:?}",
+            captured.events()
+        );
+    }
+
+    /// The other half of the same field: a call that runs closes `outcome = "ok"`, so
+    /// the refusal above is a distinguishable value rather than the only one ever set.
+    #[test]
+    fn a_served_run_kaish_closes_ok() {
+        use crate::test_support::capture_tracing;
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(allowed.path().to_path_buf());
+        config.infer_cwd = false;
+        let handler = KaiboHandler::new(config).expect("handler builds");
+        let asked = allowed.path().display().to_string();
+
+        let captured = capture_tracing(async {
+            handler
+                .run_kaish(Parameters(RunKaishInput {
+                    script: "pwd".to_string(),
+                    path: Some(asked),
+                }))
+                .await
+                .expect("guard: the path is inside the allowed set");
+        });
+
+        let spans = captured.spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "run_kaish")
+            .unwrap_or_else(|| panic!("a served call opens a `run_kaish` span; saw {spans:?}"));
+        assert_eq!(span.outcome.as_deref(), Some("ok"), "{span:?}");
+    }
 
     /// deliberate-direct's wall-clock backstop tracks its synth backend's own
     /// `request_timeout` (+ margin), NOT the interactive `call_deadline`. This is the
@@ -9227,7 +9389,10 @@ enabled = false
         let text = read_text(PROMPTS_URI, &[]);
         // Each phase's built-in preamble appears verbatim (single-sourced — no drift).
         for body in [
-            report_preamble(),
+            // Both explorer readers: the doc lists them separately because they render
+            // different text, and a doc that showed one would misreport the other tool.
+            report_preamble(ReportReader::SynthesisAgent),
+            report_preamble(ReportReader::CallingAgent),
             consult_preamble(),
             oneshot_preamble(),
             batch_preamble(),
