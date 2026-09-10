@@ -27,6 +27,14 @@ record. Each later release appends a new section at the top.
   worktree must name its registration back, so one file in a repo you cloned to review
   cannot make any directory on the host readable.
 
+### Added
+
+- **The read boundary now says when it refuses a path** — a `warn` naming the path and the
+  allowed set, from every surface that checks containment. Rides the `logs` signal.
+- **A refused `run_kaish` call still closes a `run_kaish` span**, tagged
+  `outcome = "refused"` — a boundary that fired no longer looks like a call that never
+  arrived.
+
 ### Changed
 
 - **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the

@@ -612,3 +612,177 @@ pub fn serialized_capture<F: std::future::Future>(body: F) {
         .unwrap()
         .block_on(body);
 }
+
+// --- Event + outcome capture --------------------------------------------------
+//
+// The span-capture harness above answers "what fields did this span carry". This
+// pair answers the two questions the containment-telemetry tests ask instead: did
+// kaibo *say* something happened (an event), and did the span that wrapped the call
+// record how it ended (`outcome`). Both ride the same [`serialized_capture`] guard —
+// they mutate the same process-global tracing state.
+
+/// One `tracing` event as captured: its level, its rendered message, and the
+/// string-valued fields it carried.
+///
+/// The message and the fields are kept apart on purpose. kaibo's export policy
+/// treats them differently — `message` is a content attribute
+/// ([`crate::otel_filter::CONTENT_ATTRIBUTES`]) and drops unless the operator opts
+/// in, while a field on [`SAFE_ATTRIBUTES`](crate::otel_filter::SAFE_ATTRIBUTES)
+/// always exports — so a test that cares which half a value landed in has to see
+/// them separately.
+#[derive(Clone, Debug)]
+pub struct CapturedEvent {
+    pub level: tracing::Level,
+    pub message: String,
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+impl CapturedEvent {
+    /// Does this event carry `field = value`?
+    pub fn has_field(&self, field: &str, value: &str) -> bool {
+        self.fields.get(field).map(String::as_str) == Some(value)
+    }
+}
+
+/// One closed span as captured: its name and whatever `outcome` it ended with.
+#[derive(Clone, Debug)]
+pub struct CapturedOutcome {
+    pub name: String,
+    pub outcome: Option<String>,
+}
+
+/// Everything one capture run saw, in emission order.
+#[derive(Clone, Default)]
+pub struct Captured {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+    spans: Arc<Mutex<Vec<CapturedOutcome>>>,
+}
+
+impl Captured {
+    /// The events emitted during the run.
+    pub fn events(&self) -> Vec<CapturedEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The spans that closed during the run.
+    pub fn spans(&self) -> Vec<CapturedOutcome> {
+        self.spans.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Collects a `tracing` record's fields, keeping `message` apart from the rest.
+#[derive(Default)]
+struct FieldGrab {
+    message: String,
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+impl FieldGrab {
+    fn put(&mut self, name: &str, value: String) {
+        if name == "message" {
+            self.message = value;
+        } else {
+            self.fields.insert(name.to_string(), value);
+        }
+    }
+}
+
+impl tracing::field::Visit for FieldGrab {
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        self.put(f.name(), v.to_string());
+    }
+    fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+        self.put(f.name(), v.to_string());
+    }
+    fn record_bool(&mut self, f: &tracing::field::Field, v: bool) {
+        self.put(f.name(), v.to_string());
+    }
+    // `%value` and the event body both arrive here; `Debug` on a `&str` quotes it,
+    // so trim the quotes to compare against what the call site wrote.
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        self.put(f.name(), format!("{v:?}").trim_matches('"').to_string());
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for Captured
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut g = FieldGrab::default();
+        event.record(&mut g);
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: g.message,
+                fields: g.fields,
+            });
+    }
+
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut g = FieldGrab::default();
+        attrs.record(&mut g);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(g);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(span) = ctx.span(id) {
+            if let Some(g) = span.extensions_mut().get_mut::<FieldGrab>() {
+                values.record(g);
+            }
+        }
+    }
+
+    fn on_close(&self, id: tracing::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(span) = ctx.span(&id) else { return };
+        let outcome = span
+            .extensions()
+            .get::<FieldGrab>()
+            .and_then(|g| g.fields.get("outcome").cloned());
+        let name = span.name().to_string();
+        self.spans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(CapturedOutcome { name, outcome });
+    }
+}
+
+/// Run `body` with a capturing subscriber installed as this thread's default, and
+/// hand back everything it recorded.
+///
+/// Wraps [`serialized_capture`], so it inherits both the serial guard and the
+/// keepalive dispatcher that keep callsite interest from being poisoned by a
+/// no-subscriber test elsewhere in this binary.
+pub fn capture_tracing<F: std::future::Future>(body: F) -> Captured {
+    use tracing_subscriber::layer::SubscriberExt;
+    let captured = Captured::default();
+    let sink = captured.clone();
+    serialized_capture(async move {
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let guard = tracing::subscriber::set_default(subscriber);
+        body.await;
+        drop(guard);
+    });
+    captured
+}

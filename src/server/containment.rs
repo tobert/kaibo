@@ -311,3 +311,161 @@ impl super::Resolver {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Config;
+    use crate::server::Resolver;
+    use crate::test_support::{capture_tracing, CapturedEvent};
+    use std::sync::Arc;
+
+    /// A resolver whose whole allowed set is one temp directory.
+    fn resolver_rooted_at(root: &std::path::Path) -> Resolver {
+        let mut config = Config::builtin();
+        config.root = Some(root.to_path_buf());
+        config.infer_cwd = false;
+        Resolver::from_config(Arc::new(config)).expect("resolver builds")
+    }
+
+    /// The one event a containment refusal must emit, or a description of what was
+    /// emitted instead — the assertion message is what a reader debugs from.
+    fn refusal_event(events: &[CapturedEvent]) -> CapturedEvent {
+        events
+            .iter()
+            .find(|e| e.has_field("outcome", "refused"))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `outcome = refused` event; captured {} event(s): {:?}",
+                    events.len(),
+                    events
+                        .iter()
+                        .map(|e| (e.level, &e.message, &e.fields))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// The boundary firing is the most interesting thing kaibo does, and until now it
+    /// left no trace at all: `resolve_root` returns the refusal to the caller and the
+    /// server records nothing, so an operator watching a fleet cannot tell a boundary
+    /// that never fired from one that fired a hundred times.
+    ///
+    /// The event carries `outcome = "refused"` as a field — that name is already on
+    /// [`SAFE_ATTRIBUTES`](crate::otel_filter::SAFE_ATTRIBUTES), so the *record that a
+    /// refusal happened* exports with no content policy change — and names the path in
+    /// the message body, which follows kaibo's existing rule for a path: content, and
+    /// so redacted from traces unless the operator opts in.
+    #[test]
+    fn a_refused_root_says_so() {
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let outside = tempfile::tempdir().expect("temp outside tree");
+        let resolver = resolver_rooted_at(allowed.path());
+        let asked = outside.path().display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = resolver.resolve_root(Some(asked.clone()));
+            assert!(
+                refusal.is_err(),
+                "guard: the path is outside the allowed set"
+            );
+        });
+
+        let event = refusal_event(&captured.events());
+        assert_eq!(
+            event.level,
+            tracing::Level::WARN,
+            "a boundary refusal is a warning, not an info line: {event:?}"
+        );
+        assert!(
+            event.message.contains(&asked),
+            "the message names the path that was refused: {}",
+            event.message
+        );
+        assert!(
+            !event.fields.values().any(|v| v.contains(&asked)),
+            "the path stays in the message body, out of the always-exported fields: {:?}",
+            event.fields
+        );
+    }
+
+    /// The same funnel, reached from the attachment surface. `resolve_attachments` and
+    /// `resolve_root` share `containment_error` precisely so the two boundaries cannot
+    /// drift; this pins that the telemetry cannot drift either.
+    #[test]
+    fn a_refused_attachment_says_so() {
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let outside = tempfile::tempdir().expect("temp outside tree");
+        let file = outside.path().join("secret.txt");
+        std::fs::write(&file, b"outside the boundary").expect("fixture file");
+        let resolver = resolver_rooted_at(allowed.path());
+        let asked = file.display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = resolver
+                .resolve_attachments(std::slice::from_ref(&asked))
+                .await;
+            assert!(
+                refusal.is_err(),
+                "guard: the file is outside the allowed set"
+            );
+        });
+
+        let event = refusal_event(&captured.events());
+        assert!(
+            event.message.contains(&asked),
+            "the message names the attachment that was refused: {}",
+            event.message
+        );
+    }
+
+    /// And from the single-file surface `view_image` reads through.
+    #[test]
+    fn a_refused_file_read_says_so() {
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let outside = tempfile::tempdir().expect("temp outside tree");
+        let file = outside.path().join("secret.png");
+        std::fs::write(&file, b"outside the boundary").expect("fixture file");
+        let resolver = resolver_rooted_at(allowed.path());
+        let asked = file.display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = resolver.read_contained_file(&asked, 1 << 20).await;
+            assert!(
+                refusal.is_err(),
+                "guard: the file is outside the allowed set"
+            );
+        });
+
+        let event = refusal_event(&captured.events());
+        assert!(
+            event.message.contains(&asked),
+            "the message names the file that was refused: {}",
+            event.message
+        );
+    }
+
+    /// A path *inside* the boundary must stay quiet. The warn is a signal an operator
+    /// can alert on, which it stops being the moment an ordinary call emits it.
+    #[test]
+    fn an_allowed_root_emits_no_refusal() {
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let resolver = resolver_rooted_at(allowed.path());
+        let asked = allowed.path().display().to_string();
+
+        let captured = capture_tracing(async {
+            resolver
+                .resolve_root(Some(asked))
+                .expect("guard: the path is inside the allowed set");
+        });
+
+        assert!(
+            !captured
+                .events()
+                .iter()
+                .any(|e| e.has_field("outcome", "refused")),
+            "an allowed path emits no refusal: {:?}",
+            captured.events()
+        );
+    }
+}

@@ -2639,27 +2639,44 @@ impl KaiboHandler {
         &self,
         Parameters(input): Parameters<RunKaishInput>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(input.path)?;
+        // The direct-shell tool gets its own trace (no model loop under it). The span
+        // brackets the WHOLE call, containment check included, so every way the call
+        // can end closes a span — `tool_span.rs` settled the same question for the
+        // inner tools, and a refused call producing no span at all made the boundary
+        // firing indistinguishable from the call never arriving. The kaish worker is
+        // `!Send` on its own thread; this span never crosses that boundary, it only
+        // wraps the `.await` from the caller side.
+        let span = tracing::info_span!("run_kaish", outcome = tracing::field::Empty);
+        async move {
+            let root = self.resolve_root(input.path).inspect_err(|_| {
+                // A refusal is an outcome, not an absence. `resolve_root` already
+                // logged *what* it refused (see `containment_error`); this records
+                // *which call* it was, on the span the caller can join to.
+                tracing::Span::current().record("outcome", "refused");
+            })?;
 
-        // A fresh worker (and kernel) per call: stateless, starts at root, and the
-        // !Send kernel stays on its own thread so this future stays Send. Applies the
-        // configured sandbox limits (timeout, output cap, disabled builtins).
-        let worker = KaishWorker::spawn_with(&root, self.config.sandbox.clone())
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        // The direct-shell tool gets its own trace (no model loop under it). The kaish
-        // worker is `!Send` on its own thread, but this span wraps the async `.await`
-        // here, so the script's wall-clock is captured from the caller side — no span
-        // crosses the thread boundary.
-        let span = tracing::info_span!("run_kaish");
-        let out = worker
-            .run(input.script)
-            .instrument(span)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            // A fresh worker (and kernel) per call: stateless, starts at root, and the
+            // !Send kernel stays on its own thread so this future stays Send. Applies the
+            // configured sandbox limits (timeout, output cap, disabled builtins).
+            let worker =
+                KaishWorker::spawn_with(&root, self.config.sandbox.clone()).map_err(|e| {
+                    tracing::Span::current().record("outcome", "error");
+                    McpError::internal_error(format!("{e:#}"), None)
+                })?;
+            let out = worker.run(input.script).await.map_err(|e| {
+                tracing::Span::current().record("outcome", "error");
+                McpError::internal_error(format!("{e:#}"), None)
+            })?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            format_output(&out),
-        )]))
+            // A non-zero *script* exit is ordinary output, not a tool failure — the
+            // same reading `tool_span.rs` takes — so the shell running at all is `ok`.
+            tracing::Span::current().record("outcome", "ok");
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                format_output(&out),
+            )]))
+        }
+        .instrument(span)
+        .await
     }
 
     #[tool(
@@ -5038,6 +5055,83 @@ mod tests {
     use rmcp::model::{ContentBlock, NumberOrString};
     use rmcp::ServerHandler;
     use serde_json::json;
+
+    /// A `run_kaish` call refused at the boundary must still close a `run_kaish` span,
+    /// tagged `outcome = "refused"`.
+    ///
+    /// Before this, the span was built *after* `resolve_root`, so a refused call was the
+    /// one outcome of the tool that produced no span at all — the boundary firing looked
+    /// exactly like the call never happening. `tool_span.rs` already settled the same
+    /// question for the inner tools ("a malformed-args refusal is reported as
+    /// `outcome = error` rather than never appearing — the honest reading of *did this
+    /// call work*"); this is the MCP surface catching up to it.
+    #[test]
+    fn a_refused_run_kaish_still_closes_a_span() {
+        use crate::test_support::capture_tracing;
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let outside = tempfile::tempdir().expect("temp outside tree");
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(allowed.path().to_path_buf());
+        config.infer_cwd = false;
+        let handler = KaiboHandler::new(config).expect("handler builds");
+        let asked = outside.path().display().to_string();
+
+        let captured = capture_tracing(async {
+            let refusal = handler
+                .run_kaish(Parameters(RunKaishInput {
+                    script: "pwd".to_string(),
+                    path: Some(asked),
+                }))
+                .await;
+            assert!(
+                refusal.is_err(),
+                "guard: the path is outside the allowed set"
+            );
+        });
+
+        let spans = captured.spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "run_kaish")
+            .unwrap_or_else(|| {
+                panic!("a refused call still opens a `run_kaish` span; saw {spans:?}")
+            });
+        assert_eq!(
+            span.outcome.as_deref(),
+            Some("refused"),
+            "the span says how the call ended: {span:?}"
+        );
+    }
+
+    /// The other half of the same field: a call that runs closes `outcome = "ok"`, so
+    /// the refusal above is a distinguishable value rather than the only one ever set.
+    #[test]
+    fn a_served_run_kaish_closes_ok() {
+        use crate::test_support::capture_tracing;
+        let allowed = tempfile::tempdir().expect("temp allowed tree");
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(allowed.path().to_path_buf());
+        config.infer_cwd = false;
+        let handler = KaiboHandler::new(config).expect("handler builds");
+        let asked = allowed.path().display().to_string();
+
+        let captured = capture_tracing(async {
+            handler
+                .run_kaish(Parameters(RunKaishInput {
+                    script: "pwd".to_string(),
+                    path: Some(asked),
+                }))
+                .await
+                .expect("guard: the path is inside the allowed set");
+        });
+
+        let spans = captured.spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "run_kaish")
+            .unwrap_or_else(|| panic!("a served call opens a `run_kaish` span; saw {spans:?}"));
+        assert_eq!(span.outcome.as_deref(), Some("ok"), "{span:?}");
+    }
 
     /// deliberate-direct's wall-clock backstop tracks its synth backend's own
     /// `request_timeout` (+ margin), NOT the interactive `call_deadline`. This is the
