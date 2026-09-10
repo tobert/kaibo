@@ -41,6 +41,13 @@ record. Each later release appends a new section at the top.
   cast shape it wants, or the absent job producer, plus the tools that are live. A
   misspelled name still reads as `tool not found`.
 
+### Fixed
+
+- **kaish 0.17.2** — ordinary shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
+  `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
+- **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
+  ran the body three times.
+
 ### Removed
 
 - **`explorer_max_turns` / `synth_max_turns` are no longer tool arguments or CLI flags** —
