@@ -15,68 +15,56 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-10
+
 ### Security
 
 - **Following git worktrees could widen the read boundary past the tree you named** —
   possible exposure of files outside the workspace on every release since `0.2.0`.
-- **An allowed tree now reaches worktrees only when it holds `.git` itself**; kaibo reads
-  no ancestor of it, so a `--root` inside a larger repo no longer reaches that repo.
-- **A forged `.git` in the allowed tree can no longer aim the reach** — the common dir must
-  name that tree back, so a cloned repo cannot point kaibo at a directory you never named.
-- **A git worktree registration alone no longer vouches for the directory it names** — the
-  worktree must name its registration back, so one file in a repo you cloned to review
-  cannot make any directory on the host readable.
+- **An allowed tree reaches worktrees only when it holds `.git` itself** — no ancestor
+  walk, so a `--root` inside a larger repo no longer reaches that repo.
+- **A forged `.git` can no longer aim the reach** — the common dir must name the tree back.
+- **A registration alone no longer vouches for the directory it names** — the worktree
+  must name its registration back.
 - **A worktree link vouches only in the shape git writes it** — the registration must be a
-  direct child of the repo's `worktrees` directory and must name `<worktree>/.git`, which
-  must live in the directory it vouches for. A mutually-naming pair of ordinary files no
-  longer admits a directory.
+  direct child of `worktrees` and must name `<worktree>/.git`, living where it vouches.
 
 ### Added
 
-- **The read boundary now says when it refuses a path** — a `warn` naming the path and the
-  allowed set, from every surface that checks containment. Rides the `logs` signal.
-- **A refused `run_kaish` call still closes a `run_kaish` span**, tagged
-  `outcome = "refused"` — a boundary that fired no longer looks like a call that never
-  arrived.
+- **The read boundary says when it refuses a path** — a `warn` naming the path and the
+  allowed set, from every surface that checks containment.
+- **A refused `run_kaish` call still closes its span**, tagged `outcome = "refused"`.
 
 ### Changed
 
-- **A composed preamble still ends on the work it asks for** — the project file map and
-  operator house rules splice in after a prompt's closing line, so the obligation is
-  restated last. An operator override keeps its own last word.
-- **A session's earlier turns are trusted evidence** — the history framing asks for what
-  the new question reaches instead of a re-read of every citation an earlier answer made.
-- **`deliberate` closes on the answer after the dossier**, and every prompt that hands
-  work to someone else asks for the same separation of what was read, inferred, and left
-  unknown, in the same words.
-- **The explorer's attach directive names its reader `the synthesis agent`** — `the
-  consult driver` was a second name for the model the preamble already named.
-- **The docs call an explorer's investigation pass a `survey`**, matching what `explore`'s
-  own description has always said; `sweep` was a second word for the same thing.
-- **A tool this server does not serve now refuses in kaibo's words** — naming the flag, the
-  cast shape it wants, or the absent job producer, plus the tools that are live. A
-  misspelled name still reads as `tool not found`.
-- **Every built-in preamble now reads in one plain style** — short sentences, one concern
-  per paragraph, no capitalized section labels. The explorer reads a project tree, not
-  only code, and every deliverable separates what was read from what is inferred.
+- **A composed preamble still ends on the work it asks for** — the file map and house
+  rules splice in after the closing line, so the obligation is restated last.
+- **A session's earlier turns are trusted evidence**, not spans to re-read.
+- **`deliberate` closes on the answer after the dossier.**
+- **Every prompt that hands work on asks for the same separation** of what was read,
+  inferred, and left unknown, in the same words.
+- **Every built-in preamble reads in one plain style** — short sentences, one concern per
+  paragraph. The explorer reads a project tree, not only code.
+- **The docs call an explorer's investigation pass a `survey`** — `sweep` was a second
+  word for the same thing, and the attach directive's reader is `the synthesis agent`.
+- **A tool this server does not serve refuses in kaibo's words**, naming the knob and the
+  tools that are live. A misspelled name still reads as `tool not found`.
 
 ### Fixed
 
-- **The built-in `deepseek` cast now names a model DeepSeek serves** — it dialed
-  `deepseek-v4-flash`, which the provider retired, so the shipped default failed at
-  request time. Both roles run `deepseek-flash`, the undated id.
-- **kaish 0.17.2** — ordinary shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
-  `HEAD:src/main.rs`, `p=~/x`, and `ls 1.0*` were all parse errors.
-- **Adjacent for-loop items are refused instead of silently iterating twice** — `for x in a"b" c`
+- **The built-in `deepseek` cast names a model DeepSeek serves** — it dialed
+  `deepseek-v4-flash`, retired by the provider, so the shipped default failed on use.
+- **kaish 0.17.2** — shell a model types now parses: `cat .git/HEAD`, `echo 123.txt`,
+  `HEAD:src/main.rs`, `p=~/x`, `ls 1.0*`.
+- **Adjacent for-loop items are refused, not silently iterated twice** — `for x in a"b" c`
   ran the body three times.
-- **`explore` no longer tells its explorer that a synthesis agent will write the answer** —
-  on a standalone `explore` there is none, and the report is the deliverable.
+- **`explore` no longer promises its explorer a synthesis agent** — standalone, the report
+  is the deliverable.
 
 ### Removed
 
 - **`explorer_max_turns` / `synth_max_turns` are no longer tool arguments or CLI flags** —
-  the turn budget is the server's, set in `[defaults]` or `KAIBO_*_MAX_TURNS`, so two
-  calls to one server stay comparable. A call still passing one is refused by name.
+  the turn budget is the server's, so two calls to one server stay comparable.
 
 ## [0.4.0] — 2026-09-03
 
