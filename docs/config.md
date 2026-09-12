@@ -358,6 +358,7 @@ Global tunables every slot falls back to. Per-slot overrides are documented abov
 | `thinking_style` | `"auto"` | `auto` \| `adaptive` \| `budget` \| `off` |
 | `request_timeout_secs` | 900 | > 0 |
 | `call_deadline_secs` | 3600 | > 0 |
+| `slow_chat_secs` | 60 | `0` turns the warning off |
 | `explorer_max_turns` | 100 | — |
 | `synth_max_turns` | 200 | — |
 | `session_capacity` | 128 | > 0 |
@@ -367,6 +368,12 @@ Global tunables every slot falls back to. Per-slot overrides are documented abov
 
 Out-of-range values are rejected at load, not clamped. This applies at the `[defaults]`
 level and per slot.
+
+`slow_chat_secs` is the mark past which one model call is promoted to the calling model
+as a warning: `job_wait` returns it, and a synchronous call's log stream carries it. A
+running job's `job_get` line shows each role's latency either way, as `synth chat: last
+107 s, p50 98 s over 9 calls`. The single-shot tools (`oneshot`, `deliberate`'s direct
+lane) make one call and report nothing until it returns.
 
 **`max_tokens` / `thinking_budget`.** Output headroom and reasoning budget. Reasoning
 bills against the completion budget, so `max_tokens` must sit well above

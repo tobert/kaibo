@@ -1989,7 +1989,9 @@ impl KaiboHandler {
         // the job *also* remembers the latest beat — `job_get`/`job_list` echo it inline,
         // a second channel for a poller who isn't using `job_wait`. The job below keeps a
         // clone of this exact handle, so what it reads is what the running phase emitted.
-        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
+        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
+            self.config.defaults.slow_chat,
+        ))));
         let cfg = ConsultConfig {
             explore: ExploreConfig {
                 phase: PhaseContext {
@@ -2520,7 +2522,9 @@ impl KaiboHandler {
         // liveness onto `tracing` and let the ProgressLog remember the latest beat for
         // `job_get`/`job_list`. The direct lane is a single completion with no tools, so
         // it emits no beats of its own — the log carries the job's own start/finish.
-        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
+        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
+            self.config.defaults.slow_chat,
+        ))));
         let cast_name = cast.name.clone();
         let swept = explorer_model.is_some();
         let explorer_model = explorer_model.map(str::to_string);
@@ -3284,7 +3288,9 @@ impl KaiboHandler {
             // The lane split follows the operation's DECLARED shape (see
             // stability::Operation::shape), never a sniffed response.
             Ok(crate::media::MediaOutcome::Deferred(provider_job)) => {
-                let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink)));
+                let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
+                    self.config.defaults.slow_chat,
+                ))));
                 let label = format!("generate · cast {} · image {}", cast.name, ran);
                 let prompt = input.prompt.clone();
                 let cast_name = cast.name.clone();

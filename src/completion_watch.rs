@@ -43,6 +43,8 @@ use rig_core::completion::{
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::progress::{PhaseEvent, ProgressSink};
+
 /// The field names a provider spells its finish reason with, in preference order.
 ///
 /// Confirmed against the vendored rig-core 0.41 provider sources rather than
@@ -305,6 +307,19 @@ pub struct Watched<M> {
     /// provider behind it — the offline scripted client — which records nothing; see
     /// [`crate::metrics::PhaseIdentity`].
     ident: Option<MetricIdent>,
+    /// Where each call's duration goes as a progress beat, and which cast role to
+    /// label it — `None` for a wrapper nobody watches. Separate from `ident` on
+    /// purpose: a beat is liveness for the caller, so the offline scripted arm emits
+    /// it too, while a metric is a provider fact that arm has no business recording.
+    beat: Option<ChatBeat>,
+}
+
+/// The progress half of a [`Watched`] wrapper: the sink a call's duration is emitted to
+/// and the role it is labeled with.
+#[derive(Clone, Debug)]
+struct ChatBeat {
+    sink: Arc<dyn ProgressSink>,
+    agent: &'static str,
 }
 
 /// The owned half of [`crate::metrics::CallIdent`]. Owned because this wrapper is
@@ -331,7 +346,16 @@ impl<M> Watched<M> {
                 provider: i.provider,
                 model: model_name.to_string(),
             }),
+            beat: None,
         }
+    }
+
+    /// Emit a [`PhaseEvent::ChatCompleted`] into `sink` after every call, labeled with
+    /// `agent` (the cast role — `"synth"` / `"explorer"`). The tool-loop phases attach
+    /// this; the single-shot lanes leave it off.
+    pub fn with_beat(mut self, sink: Arc<dyn ProgressSink>, agent: &'static str) -> Self {
+        self.beat = Some(ChatBeat { sink, agent });
+        self
     }
 }
 
@@ -377,6 +401,14 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
         // call — which is what the conventions require and what a phase that died at
         // turn 90 has to report to be read honestly.
         self.log.record_attempt();
+        // The beat goes out before the outcome is inspected for the same reason: a call
+        // that failed after three minutes is the latency a caller most wants to see.
+        if let Some(beat) = &self.beat {
+            beat.sink.emit(PhaseEvent::ChatCompleted {
+                agent: beat.agent,
+                elapsed,
+            });
+        }
 
         if let Some(ident) = &self.ident {
             let call = crate::metrics::CallIdent {
@@ -437,6 +469,69 @@ mod tests {
     use rig_core::message::Message;
     use rig_core::OneOrMany;
     use serde_json::json;
+
+    /// The beat is the one place a caller learns how long a call took, so it must carry
+    /// the wall time the call actually spent and the role it was labeled with — and it
+    /// must fire for a failed call too, since a call that died after minutes is the
+    /// latency a caller most wants to see.
+    #[tokio::test]
+    async fn the_beat_carries_the_calls_wall_time_and_role_and_fires_on_failure() {
+        use crate::progress::PhaseEvent;
+        use crate::test_support::RecordingSink;
+        let sink = Arc::new(RecordingSink::default());
+        let model = ScriptedClient::builder()
+            .on_model("m", |req| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                // The second call fails: `max_tokens` is the switch.
+                if req.max_tokens == Some(1) {
+                    Err(provider_error("boom"))
+                } else {
+                    Ok(text_response("hi"))
+                }
+            })
+            .build()
+            .completion_model("m");
+        let watched =
+            Watched::new(model, CompletionLog::new(), None, "m").with_beat(sink.clone(), "synth");
+
+        watched.completion(req()).await.expect("first call answers");
+        let mut failing = req();
+        failing.max_tokens = Some(1);
+        watched
+            .completion(failing)
+            .await
+            .expect_err("second call fails");
+
+        let events = sink.events();
+        assert_eq!(
+            events.len(),
+            2,
+            "one beat per call, failed or not: {events:?}"
+        );
+        for event in &events {
+            match event {
+                PhaseEvent::ChatCompleted { agent, elapsed } => {
+                    assert_eq!(*agent, "synth");
+                    assert!(
+                        *elapsed >= std::time::Duration::from_millis(30),
+                        "the beat carries the call's wall time, got {elapsed:?}"
+                    );
+                }
+                other => panic!("only chat beats expected, got {other:?}"),
+            }
+        }
+    }
+
+    /// The bare wrapper — the single-shot lanes' shape — emits nothing.
+    #[tokio::test]
+    async fn a_wrapper_without_a_beat_emits_nothing() {
+        use crate::test_support::RecordingSink;
+        let sink = Arc::new(RecordingSink::default());
+        let model = model(|_| Ok(text_response("hi")));
+        let watched = Watched::new(model, CompletionLog::new(), None, "m");
+        watched.completion(req()).await.expect("answers");
+        assert!(sink.events().is_empty());
+    }
 
     /// A one-turn request, the shape rig's agent builds for a toolless call.
     fn req() -> CompletionRequest {

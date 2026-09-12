@@ -69,6 +69,11 @@ pub struct JobSnapshot {
     /// echo it so a poller sees forward motion without reaching for `job_wait`. See
     /// [`crate::progress::ProgressLog`].
     pub last_progress: Option<(String, u64)>,
+    /// How fast each role's model is answering on a still-running job — the
+    /// [`ProgressLog::chat_summary`] clause — or `None` before the first call or once
+    /// the job is terminal. Rendered beside `last_progress`, so a poller can tell a slow
+    /// backend from a busy one.
+    pub chat: Option<String>,
 }
 
 /// What `job_cancel` did, so the tool layer can word the reply honestly.
@@ -165,12 +170,7 @@ impl JobStore {
     /// `Arc` the consult's `ConsultConfig.progress` holds). The future's `Ok`/`Err`
     /// becomes the job's terminal `Done`/`Failed` state; an abort (via
     /// [`cancel`](Self::cancel)) leaves it `Canceled` because the task never runs its tail.
-    pub fn submit<F>(
-        &self,
-        label: impl Into<String>,
-        progress: Arc<ProgressLog>,
-        fut: F,
-    ) -> String
+    pub fn submit<F>(&self, label: impl Into<String>, progress: Arc<ProgressLog>, fut: F) -> String
     where
         F: Future<Output = Result<JobResult, String>> + Send + 'static,
     {
@@ -244,14 +244,15 @@ impl JobStore {
     /// it for `Running`.
     fn snapshot(job: &Job) -> JobSnapshot {
         let state = job.state.lock().expect("job state mutex poisoned").clone();
-        let last_progress = matches!(state, JobState::Running)
-            .then(|| job.progress.latest())
-            .flatten();
+        let running = matches!(state, JobState::Running);
+        let last_progress = running.then(|| job.progress.latest()).flatten();
+        let chat = running.then(|| job.progress.chat_summary()).flatten();
         JobSnapshot {
             state,
             label: job.label.clone(),
             age: job.started.elapsed(),
             last_progress,
+            chat,
         }
     }
 
@@ -357,7 +358,9 @@ mod tests {
     #[tokio::test]
     async fn a_failing_future_lands_as_failed() {
         let store = JobStore::new(cap(4));
-        let id = store.submit("cast `x`", pl(), async { Err("provider exploded".to_string()) });
+        let id = store.submit("cast `x`", pl(), async {
+            Err("provider exploded".to_string())
+        });
         assert_eq!(
             await_terminal(&store, &id).await,
             JobState::Failed("provider exploded".to_string())
@@ -470,7 +473,9 @@ mod tests {
         // the FinishGuard the state would sit at Running forever. The guard turns the
         // unwind into a terminal Failed, so `await_terminal` resolves instead of spinning.
         let store = JobStore::new(cap(4));
-        let id = store.submit("cast `x`", pl(), async { panic!("boom in the consult loop") });
+        let id = store.submit("cast `x`", pl(), async {
+            panic!("boom in the consult loop")
+        });
         assert!(
             matches!(await_terminal(&store, &id).await, JobState::Failed(_)),
             "a panicking task must land as Failed, not hang in Running forever"
@@ -510,6 +515,34 @@ mod tests {
             JobState::Done(done("eventually"))
         );
         assert_eq!(store.get(&id).unwrap().last_progress, None);
+    }
+
+    /// The latency clause follows the same rule as the beat: echoed while the job runs,
+    /// dropped once it is terminal (the answer is what a finished job carries).
+    #[tokio::test]
+    async fn a_running_jobs_snapshot_echoes_the_chat_latency_and_a_finished_one_does_not() {
+        use crate::progress::{PhaseEvent, ProgressSink};
+        let store = JobStore::new(cap(4));
+        let progress = Arc::new(ProgressLog::silent());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let id = store.submit("cast `x`", progress.clone(), async move {
+            let _ = rx.await;
+            Ok(done("eventually"))
+        });
+        assert_eq!(store.get(&id).unwrap().chat, None, "no call yet");
+
+        progress.emit(PhaseEvent::ChatCompleted {
+            agent: "synth",
+            elapsed: Duration::from_secs(107),
+        });
+        assert_eq!(
+            store.get(&id).unwrap().chat.as_deref(),
+            Some("synth chat: last 107 s, p50 107 s over 1 call")
+        );
+
+        tx.send(()).unwrap();
+        await_terminal(&store, &id).await;
+        assert_eq!(store.get(&id).unwrap().chat, None);
     }
 
     #[tokio::test]

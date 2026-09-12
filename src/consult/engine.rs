@@ -79,7 +79,8 @@ trait PhaseRunner: Send + Sync {
         initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
-        progress: &'a dyn ProgressSink,
+        progress: Arc<dyn ProgressSink>,
+        role: ModelRole,
         make_tools: ToolFactory<'a>,
         break_on_tool_images: bool,
         identity: Option<crate::metrics::PhaseIdentity>,
@@ -124,7 +125,8 @@ where
         initial_prompt: Message,
         max_turns: usize,
         params: Option<&'a Value>,
-        progress: &'a dyn ProgressSink,
+        progress: Arc<dyn ProgressSink>,
+        role: ModelRole,
         make_tools: ToolFactory<'a>,
         break_on_tool_images: bool,
         identity: Option<crate::metrics::PhaseIdentity>,
@@ -139,6 +141,7 @@ where
             max_turns,
             params,
             progress,
+            role,
             make_tools,
             break_on_tool_images,
             identity,
@@ -566,7 +569,8 @@ impl Arm {
         preamble: &str,
         initial_prompt: Message,
         max_turns: usize,
-        progress: &dyn ProgressSink,
+        progress: Arc<dyn ProgressSink>,
+        role: ModelRole,
         make_tools: ToolFactory<'_>,
     ) -> Result<(String, Usage)> {
         self.runner
@@ -578,6 +582,7 @@ impl Arm {
                 max_turns,
                 self.params.as_ref(),
                 progress,
+                role,
                 make_tools,
                 self.rewrites_tool_images(),
                 self.identity,
@@ -1138,7 +1143,8 @@ pub(crate) async fn run_phase<M, F>(
     initial_prompt: Message,
     max_turns: usize,
     thinking: Option<&Value>,
-    progress: &dyn ProgressSink,
+    progress: Arc<dyn ProgressSink>,
+    role: ModelRole,
     make_tools: F,
     break_on_tool_images: bool,
     identity: Option<crate::metrics::PhaseIdentity>,
@@ -1158,6 +1164,7 @@ where
         max_turns,
         thinking,
         progress,
+        role,
         make_tools,
         break_on_tool_images,
         identity,
@@ -1217,7 +1224,8 @@ pub(crate) async fn run_phase_logged<M, F>(
     initial_prompt: Message,
     max_turns: usize,
     thinking: Option<&Value>,
-    progress: &dyn ProgressSink,
+    progress: Arc<dyn ProgressSink>,
+    role: ModelRole,
     make_tools: F,
     break_on_tool_images: bool,
     identity: Option<crate::metrics::PhaseIdentity>,
@@ -1243,12 +1251,16 @@ where
         // way — the order is about who resolves the failure, and the retry must resolve it
         // below the loop, which loses the transcript on a completion error
         // (`crate::completion_retry`).
+        // The beat rides the same wrapper: the one place a call's duration is known,
+        // labeled with the role the caller named so a poller reads "synth chat" and
+        // "explorer chat" apart.
         &watched(
             retried(model.clone(), model_name),
             log.clone(),
             identity,
             model_name,
-        ),
+        )
+        .with_beat(progress.clone(), role.key()),
         log,
         model_name,
         preamble,
@@ -1257,7 +1269,7 @@ where
         initial_prompt,
         max_turns,
         thinking,
-        progress,
+        progress.as_ref(),
         make_tools,
         break_on_tool_images,
     )
@@ -1794,7 +1806,8 @@ pub(crate) async fn run_explore_phase(
         preamble,
         Message::user(question.to_string()),
         max_turns,
-        progress.as_ref(),
+        progress.clone(),
+        ModelRole::Explorer,
         &|| -> Result<Vec<DynamicTool>> {
             let worker = KaishWorker::spawn_with(&root, sandbox.clone())?;
             let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
@@ -2373,7 +2386,8 @@ pub(crate) async fn consult_with(
             ),
             Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
-            cfg.explore.phase.progress.as_ref(),
+            cfg.explore.phase.progress.clone(),
+            ModelRole::Synth,
             // Rebuilt per call (main loop, and again if run_phase forces a final
             // turn); every build shares the one `reports` + `explore_usage` sink so
             // all explore′ sweeps aggregate.
@@ -3063,7 +3077,8 @@ mod tests {
                 &preamble,
                 Message::user("what changed?"),
                 1,
-                cfg.progress.as_ref(),
+                cfg.progress.clone(),
+                ModelRole::Synth,
                 &|| Ok(Vec::new()),
             )
             .await
@@ -3146,7 +3161,8 @@ mod tests {
             Message::user("q"),
             4,
             None,
-            &crate::progress::NullSink,
+            Arc::new(crate::progress::NullSink),
+            ModelRole::Synth,
             || {
                 Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
                     &root,
@@ -3236,7 +3252,8 @@ mod tests {
             Message::user("q"),
             4,
             None,
-            &crate::progress::NullSink,
+            Arc::new(crate::progress::NullSink),
+            ModelRole::Synth,
             || {
                 Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
                     &root,
@@ -3330,7 +3347,8 @@ mod tests {
             Message::user("q"),
             6,
             None,
-            &crate::progress::NullSink,
+            Arc::new(crate::progress::NullSink),
+            ModelRole::Synth,
             || {
                 Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
                     &root,
@@ -3448,7 +3466,8 @@ mod tests {
             Message::user("q"),
             2,
             None,
-            &crate::progress::NullSink,
+            Arc::new(crate::progress::NullSink),
+            ModelRole::Synth,
             || {
                 Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
                     &root,
@@ -4976,6 +4995,23 @@ mod tests {
         assert!(
             start < nested && nested < finish,
             "sweep must bracket its nested read: {events:?}"
+        );
+        // Every model call beats, labeled with the role that made it: the driver's
+        // calls as `synth`, the delegated sweep's as `explorer`. This is what `job_get`
+        // reads to tell a slow synth from a busy explorer.
+        let beats = |agent: &str| {
+            events
+                .iter()
+                .filter(|e| matches!(e, PhaseEvent::ChatCompleted { agent: a, .. } if *a == agent))
+                .count()
+        };
+        assert!(
+            beats("synth") >= 2,
+            "the driver made at least a tool turn and an answer turn: {events:?}"
+        );
+        assert!(
+            beats("explorer") >= 2,
+            "the delegated sweep made at least a tool turn and a report turn: {events:?}"
         );
     }
 

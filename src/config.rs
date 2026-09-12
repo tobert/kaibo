@@ -105,6 +105,13 @@ pub struct Defaults {
     /// by its synth backend's `request_timeout`, and the batch lane by nothing in-process
     /// (provider queue). See [`crate::consult::PhaseContext::call_deadline`].
     pub call_deadline: Duration,
+    /// One model call at or past this is promoted to the calling model as a warning
+    /// (`job_wait` returns it; a synchronous call's log stream carries it), so a caller
+    /// learns a slow backend at the first slow call instead of at `call_deadline`.
+    /// `None` (`slow_chat_secs = 0`) never promotes one; `job_get` shows the running
+    /// per-role latency either way. Lives on the tracing sink, not the phase — it is an
+    /// audience decision. See [`crate::progress::TracingSink`].
+    pub slow_chat: Option<Duration>,
     /// Max distinct multi-turn `consult` sessions held in memory at once. Eviction
     /// is capacity-driven only (no TTL) — see [`crate::session`]. Server-wide (a
     /// session is a client thread, not a model trait).
@@ -176,6 +183,12 @@ impl Default for Defaults {
             // single completion, yet still turns an "overnight" hang into "you'd notice
             // within the hour". Overridable via `call_deadline_secs` / env.
             call_deadline: Duration::from_secs(3600),
+            // 60 s — a hosted synth call at ~100k input tokens finishes in a few seconds
+            // when the endpoint is healthy; the degraded one that motivated this knob
+            // (2026-09-12, GLM-5.3 at 7 tok/s) took 100 s a call for 29 minutes before
+            // the caller cancelled. One minute separates the two without firing on a
+            // large-context call to a slow local model, whose operator can raise it.
+            slow_chat: Some(Duration::from_secs(60)),
             // 128 lean Q&A threads is a few KB of strings — generous for a personal
             // server, and capacity (not time) is the only eviction pressure.
             session_capacity: NonZeroUsize::new(128).expect("128 is nonzero"),
@@ -2744,6 +2757,7 @@ struct RawDefaults {
     thinking_style: Option<String>,
     request_timeout_secs: Option<u64>,
     call_deadline_secs: Option<u64>,
+    slow_chat_secs: Option<u64>,
     session_capacity: Option<usize>,
     job_capacity: Option<usize>,
     inline_attach_budget: Option<usize>,
@@ -3022,6 +3036,13 @@ fn merge_defaults(raw: RawDefaults) -> Result<Defaults> {
             .call_deadline_secs
             .map(Duration::from_secs)
             .unwrap_or(d.call_deadline),
+        // 0 is legal here: it turns the slow-call warning off (the latency summary in
+        // `job_get` stays).
+        slow_chat: match raw.slow_chat_secs {
+            Some(0) => None,
+            Some(n) => Some(Duration::from_secs(n)),
+            None => d.slow_chat,
+        },
         session_capacity,
         job_capacity,
         // 0 is legal here (unlike the capacities/deadlines): it means "inline
@@ -3348,6 +3369,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if let Some(v) = get("KAIBO_CALL_DEADLINE_SECS") {
         defaults.call_deadline_secs = Some(parse_env_int("KAIBO_CALL_DEADLINE_SECS", &v)?);
+    }
+    if let Some(v) = get("KAIBO_SLOW_CHAT_SECS") {
+        defaults.slow_chat_secs = Some(parse_env_int("KAIBO_SLOW_CHAT_SECS", &v)?);
     }
     if let Some(v) = get("KAIBO_SESSION_CAPACITY") {
         defaults.session_capacity = Some(parse_env_int("KAIBO_SESSION_CAPACITY", &v)?);
