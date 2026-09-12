@@ -1989,9 +1989,7 @@ impl KaiboHandler {
         // the job *also* remembers the latest beat — `job_get`/`job_list` echo it inline,
         // a second channel for a poller who isn't using `job_wait`. The job below keeps a
         // clone of this exact handle, so what it reads is what the running phase emitted.
-        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
-            self.config.defaults.slow_chat,
-        ))));
+        let progress_log = self.job_progress_log();
         let cfg = ConsultConfig {
             explore: ExploreConfig {
                 phase: PhaseContext {
@@ -2522,9 +2520,7 @@ impl KaiboHandler {
         // liveness onto `tracing` and let the ProgressLog remember the latest beat for
         // `job_get`/`job_list`. The direct lane is a single completion with no tools, so
         // it emits no beats of its own — the log carries the job's own start/finish.
-        let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
-            self.config.defaults.slow_chat,
-        ))));
+        let progress_log = self.job_progress_log();
         let cast_name = cast.name.clone();
         let swept = explorer_model.is_some();
         let explorer_model = explorer_model.map(str::to_string);
@@ -3288,9 +3284,7 @@ impl KaiboHandler {
             // The lane split follows the operation's DECLARED shape (see
             // stability::Operation::shape), never a sniffed response.
             Ok(crate::media::MediaOutcome::Deferred(provider_job)) => {
-                let progress_log = Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
-                    self.config.defaults.slow_chat,
-                ))));
+                let progress_log = self.job_progress_log();
                 let label = format!("generate · cast {} · image {}", cast.name, ran);
                 let prompt = input.prompt.clone();
                 let cast_name = cast.name.clone();
@@ -5016,6 +5010,18 @@ fn progress_token(meta: &RequestMetaObject) -> Option<ProgressToken> {
 /// counting and wiring live in [`ProgressReporter`]; this is just the shape.
 fn progress_param(token: ProgressToken, seq: u64, event: &PhaseEvent) -> ProgressNotificationParam {
     ProgressNotificationParam::new(token, seq as f64).with_message(event.message())
+}
+
+impl KaiboHandler {
+    /// The progress recorder every async job holds: a [`TracingSink`] carrying the
+    /// operator's slow-call mark, wrapped so `job_get`/`job_list` can read the latest
+    /// beat and the per-role latency back. One construction site, so the mark cannot
+    /// be dropped at one lane and kept at another.
+    fn job_progress_log(&self) -> Arc<ProgressLog> {
+        Arc::new(ProgressLog::new(Arc::new(TracingSink::new(
+            self.config.defaults.slow_chat,
+        ))))
+    }
 }
 
 /// Pick the sink for one tool call: a live [`ProgressReporter`] when the client

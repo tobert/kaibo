@@ -369,11 +369,13 @@ Global tunables every slot falls back to. Per-slot overrides are documented abov
 Out-of-range values are rejected at load, not clamped. This applies at the `[defaults]`
 level and per slot.
 
-`slow_chat_secs` is the mark past which one model call is promoted to the calling model
-as a warning: `job_wait` returns it, and a synchronous call's log stream carries it. A
-running job's `job_get` line shows each role's latency either way, as `synth chat: last
-107 s, p50 98 s over 9 calls`. The single-shot tools (`oneshot`, `deliberate`'s direct
-lane) make one call and report nothing until it returns.
+`slow_chat_secs` is the mark at which one model call on an async job is promoted to the
+calling model as a warning that `job_wait` returns. A running job's `job_get` line shows
+each role's latency either way, as `synth chat: last 107 s, p50 98 s over 9 calls`. A
+synchronous `consult` or `explore` shows every call's time in its progress notifications
+instead. A retried call is timed per attempt, so the number is the provider's time and
+never kaibo's backoff wait. The single-shot tools (`oneshot`, `deliberate`'s direct lane)
+make one call and report nothing until it returns.
 
 **`max_tokens` / `thinking_budget`.** Output headroom and reasoning budget. Reasoning
 bills against the completion budget, so `max_tokens` must sit well above

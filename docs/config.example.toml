@@ -180,11 +180,12 @@ request_timeout_secs = 900
 # Env: KAIBO_CALL_DEADLINE_SECS.
 call_deadline_secs = 3600
 
-# Slow model call mark (seconds). One chat call at or past it is promoted to the
-# calling model as a warning — `job_wait` returns it, and a synchronous call's log
-# stream carries it — so a caller learns a slow backend at the first slow call
-# instead of at call_deadline_secs. `job_get` shows each role's running latency
-# either way. 0 turns the warning off. Env: KAIBO_SLOW_CHAT_SECS.
+# Slow model call mark (seconds), for async jobs. One chat call at or past it is
+# promoted to the calling model as a warning that `job_wait` returns, so a caller
+# learns a slow backend at the first slow call instead of at call_deadline_secs.
+# `job_get` shows each role's running latency either way; a synchronous call shows
+# every call's time in its progress notifications instead. 0 turns the warning
+# off. Env: KAIBO_SLOW_CHAT_SECS.
 slow_chat_secs = 60
 
 session_capacity = 128       # max multi-turn consult sessions held in memory (LRU,

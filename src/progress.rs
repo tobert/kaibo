@@ -76,13 +76,14 @@ impl PhaseEvent {
 
 /// A duration as seconds for a progress line: one decimal under ten seconds (an
 /// explorer call is often `1.5 s`, and `2 s` would hide the difference), whole seconds
-/// from there (`107 s`).
+/// from there (`107 s`). Whole seconds are floored, not rounded, so a call that reads
+/// `60 s` did reach a 60 s mark and one that reads `59 s` did not.
 fn secs(d: Duration) -> String {
     let s = d.as_secs_f64();
     if s < 10.0 {
         format!("{s:.1} s")
     } else {
-        format!("{s:.0} s")
+        format!("{} s", s.floor())
     }
 }
 
@@ -131,7 +132,9 @@ impl ProgressSink for NullSink {
 ///   guide asks (what happened, why it matters, what to do): a caller learns a slow
 ///   backend at the first slow call instead of at the deadline. The threshold lives on
 ///   this sink because it is an audience decision — who is told — not a phase input;
-///   `[defaults] slow_chat_secs` sets it, `0` turns it off.
+///   `[defaults] slow_chat_secs` sets it, `0` turns it off. Only the async job lanes
+///   build this sink; a synchronous call's caller watches the same beats as progress
+///   notifications (`ProgressReporter`), where every call's time already shows.
 #[derive(Debug, Clone, Copy)]
 pub struct TracingSink {
     slow_chat_after: Option<Duration>,
@@ -162,9 +165,9 @@ impl ProgressSink for TracingSink {
         if promotes_to_caller(&event, self.slow_chat_after) {
             let msg = match (&event, self.slow_chat_after) {
                 (PhaseEvent::ChatCompleted { agent, elapsed }, Some(limit)) => format!(
-                    "{agent} chat call took {}, past the {} `slow_chat_secs` mark. The \
-                     model is answering slowly. `job_get` shows the running latency; \
-                     `job_cancel` and pick another cast if it stays slow.",
+                    "{agent} chat call took {}, reaching the {} `slow_chat_secs` mark. \
+                     The model is answering slowly. `job_get` shows the running latency; \
+                     `job_cancel` it and pick another cast if it stays slow.",
                     secs(*elapsed),
                     secs(limit)
                 ),

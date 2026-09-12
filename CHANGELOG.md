@@ -19,8 +19,10 @@ record. Each later release appends a new section at the top.
 
 - **`job_get` shows each role's model latency on a running job** — `synth chat: last
   107 s, p50 98 s over 9 calls`, so a slow backend is visible at the first poll.
-- **A model call past `slow_chat_secs` warns the caller** through `job_wait` and the log
-  stream. Default 60; `0` turns it off. Env `KAIBO_SLOW_CHAT_SECS`.
+- **A model call on an async job that reaches `slow_chat_secs` warns the caller** through
+  `job_wait`. Default 60; `0` turns it off. Env `KAIBO_SLOW_CHAT_SECS`.
+- **A retried model call is timed and counted per attempt** — the beat, the client
+  metrics, and `inference_calls` see the provider's time, never kaibo's backoff wait.
 
 ## [0.5.0] — 2026-09-10
 

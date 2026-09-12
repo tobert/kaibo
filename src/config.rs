@@ -106,11 +106,12 @@ pub struct Defaults {
     /// (provider queue). See [`crate::consult::PhaseContext::call_deadline`].
     pub call_deadline: Duration,
     /// One model call at or past this is promoted to the calling model as a warning
-    /// (`job_wait` returns it; a synchronous call's log stream carries it), so a caller
-    /// learns a slow backend at the first slow call instead of at `call_deadline`.
-    /// `None` (`slow_chat_secs = 0`) never promotes one; `job_get` shows the running
-    /// per-role latency either way. Lives on the tracing sink, not the phase — it is an
-    /// audience decision. See [`crate::progress::TracingSink`].
+    /// that `job_wait` returns, so a caller learns a slow backend at the first slow call
+    /// instead of at `call_deadline`. Async jobs only: a synchronous call's caller sees
+    /// every call's time in its progress notifications instead. `None`
+    /// (`slow_chat_secs = 0`) never promotes one; `job_get` shows the running per-role
+    /// latency either way. Lives on the tracing sink, not the phase — it is an audience
+    /// decision. See [`crate::progress::TracingSink`].
     pub slow_chat: Option<Duration>,
     /// Max distinct multi-turn `consult` sessions held in memory at once. Eviction
     /// is capacity-driven only (no TTL) — see [`crate::session`]. Server-wide (a

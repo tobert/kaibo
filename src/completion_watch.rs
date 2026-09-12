@@ -243,8 +243,10 @@ impl CompletionLog {
     }
 
     /// How many completions this phase attempted — every turn of the tool loop, the
-    /// forced final turn, each retry of a malformed generation, and every call that
-    /// failed. This is `gen_ai.invoke_agent.inference_calls`.
+    /// forced final turn, each retry (a malformed generation or a transient transport
+    /// failure sent again), and every call that failed. The watcher sits inside the
+    /// retry wrapper, so each attempt the provider sees is one here. This is
+    /// `gen_ai.invoke_agent.inference_calls`.
     pub fn attempts(&self) -> u64 {
         self.attempts.load(Ordering::Relaxed)
     }
@@ -519,6 +521,60 @@ mod tests {
                 }
                 other => panic!("only chat beats expected, got {other:?}"),
             }
+        }
+    }
+
+    /// The watcher sits inside the retry wrapper, so a turn the provider fumbles once
+    /// beats twice — one per attempt, each timed on its own — and the attempt counter
+    /// says two. Neither number ever includes kaibo's wait between attempts.
+    #[tokio::test]
+    async fn a_retried_turn_beats_and_counts_once_per_attempt() {
+        use crate::completion_retry::retried;
+        use crate::progress::PhaseEvent;
+        use crate::test_support::RecordingSink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sink = Arc::new(RecordingSink::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let model = ScriptedClient::builder()
+            .on_model("m", move |_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(provider_error("MALFORMED_FUNCTION_CALL"))
+                } else {
+                    Ok(text_response("hi"))
+                }
+            })
+            .build()
+            .completion_model("m");
+        let log = CompletionLog::new();
+        let stack = retried(
+            Watched::new(model, log.clone(), None, "m").with_beat(sink.clone(), "synth"),
+            "m",
+        );
+
+        stack.completion(req()).await.expect("the retry answers");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one fumble, one answer");
+        assert_eq!(log.attempts(), 2, "the counter sees each attempt");
+        assert_eq!(log.turns().len(), 1, "one response was recorded");
+        let elapsed: Vec<_> = sink
+            .events()
+            .into_iter()
+            .map(|e| match e {
+                PhaseEvent::ChatCompleted {
+                    agent: "synth",
+                    elapsed,
+                } => elapsed,
+                other => panic!("only synth chat beats expected, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(elapsed.len(), 2, "one beat per attempt");
+        for e in elapsed {
+            assert!(
+                e >= std::time::Duration::from_millis(20) && e < std::time::Duration::from_secs(1),
+                "each beat is one attempt's own time, got {e:?}"
+            );
         }
     }
 

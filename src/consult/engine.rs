@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use crate::artifact::SaveArtifact;
 use crate::attach::Attachment;
 use crate::completion_retry::retried;
-use crate::completion_watch::{watched, CompletionLog, Watched};
+use crate::completion_watch::{watched, CompletionLog};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::WireKind;
 use crate::explorer::RunKaish;
@@ -1245,22 +1245,21 @@ where
     // this function is instrumented with.
     let started = std::time::Instant::now();
     let result = run_phase_loop(
-        // Two wrappers, innermost first: [`retried`] sends a turn the provider could not
-        // parse again, then [`watched`] records the response that finally came back. A
-        // failed attempt produces no response, so the log holds one record per turn either
-        // way — the order is about who resolves the failure, and the retry must resolve it
-        // below the loop, which loses the transcript on a completion error
-        // (`crate::completion_retry`).
-        // The beat rides the same wrapper: the one place a call's duration is known,
-        // labeled with the role the caller named so a poller reads "synth chat" and
-        // "explorer chat" apart.
-        &watched(
-            retried(model.clone(), model_name),
-            log.clone(),
-            identity,
+        // Two wrappers, innermost first: [`watched`] times and records each attempt the
+        // provider sees, then [`retried`] sends a turn the provider could not parse (or
+        // a transient transport failure) again. The watcher sits inside the retry so a
+        // call's duration is the provider's alone — never kaibo's own backoff sleep —
+        // and so a failed attempt counts as the inference call it was; a response is
+        // recorded only when one comes back, so the log still holds one record per
+        // turn. The retry sits below the loop because the loop loses the transcript on
+        // a completion error (`crate::completion_retry`). The beat rides the watcher:
+        // the one place a call's duration is known, labeled with the role the caller
+        // named so a poller reads "synth chat" and "explorer chat" apart.
+        &retried(
+            watched(model.clone(), log.clone(), identity, model_name)
+                .with_beat(progress.clone(), role.key()),
             model_name,
-        )
-        .with_beat(progress.clone(), role.key()),
+        ),
         log,
         model_name,
         preamble,
@@ -1304,11 +1303,11 @@ where
 }
 
 /// The bounded tool loop itself, driving whatever model it's handed — in production a
-/// [`Watched`] wrapper, so every turn below (main loop, view_image resume, forced
-/// finalize) records on its way past.
+/// [`crate::completion_watch::Watched`] wrapper inside a retry wrapper, so every turn below (main loop,
+/// view_image resume, forced finalize) records on its way past.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 async fn run_phase_loop<M, F>(
-    model: &Watched<M>,
+    model: &M,
     log: &CompletionLog,
     model_name: &str,
     preamble: &str,
