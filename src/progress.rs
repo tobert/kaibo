@@ -13,9 +13,11 @@
 //! Deliberately rmcp-free: the domain loop (`consult.rs`) emits semantic events
 //! and never names a transport type. The translation to MCP lives at the edge.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// A semantic step in a running phase. The sink decides how (or whether) to surface
 /// it; the loop just announces what it's doing. Ordered roughly by when they fire,
@@ -35,6 +37,15 @@ pub enum PhaseEvent {
     /// with the `attach` tool. The one beat that lets an operator actually observe
     /// the pattern the generous `max_attachments` default exists to watch for.
     Attached { path: String },
+    /// One model call finished — succeeded or failed — after `elapsed`. `agent` is the
+    /// cast role that made it (`"synth"` / `"explorer"`), the axis a slow backend shows
+    /// up on: the synth's calls carry the whole transcript and are the ones that stall.
+    /// Fires from the completion wrapper, so every phase that runs the tool loop emits
+    /// it; the single-shot lanes (`oneshot`, `deliberate`'s direct lane) do not.
+    ChatCompleted {
+        agent: &'static str,
+        elapsed: Duration,
+    },
     /// The phase exhausted its turn cap and is writing a forced final answer.
     TurnCapReached,
     /// The top-level tool finished and is about to return its answer/report.
@@ -54,9 +65,25 @@ impl PhaseEvent {
             }
             PhaseEvent::SweepFinished => "sweep complete".to_string(),
             PhaseEvent::Attached { path } => format!("attached {path} to the report"),
+            PhaseEvent::ChatCompleted { agent, elapsed } => {
+                format!("{agent} chat: {}", secs(*elapsed))
+            }
             PhaseEvent::TurnCapReached => "reached research limit, writing the answer".to_string(),
             PhaseEvent::PhaseFinished { phase } => format!("{phase} complete"),
         }
+    }
+}
+
+/// A duration as seconds for a progress line: one decimal under ten seconds (an
+/// explorer call is often `1.5 s`, and `2 s` would hide the difference), whole seconds
+/// from there (`107 s`). Whole seconds are floored, not rounded, so a call that reads
+/// `60 s` did reach a 60 s mark and one that reads `59 s` did not.
+fn secs(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 10.0 {
+        format!("{s:.1} s")
+    } else {
+        format!("{} s", s.floor())
     }
 }
 
@@ -97,22 +124,58 @@ impl ProgressSink for NullSink {
 ///
 /// Levels follow kaibo's convention — **Warn = "promote to the calling model"**, Info =
 /// the watchable narrative — *not* severity:
-/// - `KaishRun`, the sweep events, and phase start/finish → **Info**: each shell command
-///   and milestone, the user's continuous view.
+/// - `KaishRun`, the sweep events, each `ChatCompleted`, and phase start/finish →
+///   **Info**: each shell command, model call, and milestone, the user's continuous view.
 /// - `TurnCapReached` → **Warn**: the caller should know the research budget ran out and
 ///   the answer was written early, so it surfaces in the model's `job_wait` drain.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TracingSink;
+/// - A `ChatCompleted` at or past `slow_chat_after` → **Warn**, worded as the refusal
+///   guide asks (what happened, why it matters, what to do): a caller learns a slow
+///   backend at the first slow call instead of at the deadline. The threshold lives on
+///   this sink because it is an audience decision — who is told — not a phase input;
+///   `[defaults] slow_chat_secs` sets it, `0` turns it off. Only the async job lanes
+///   build this sink; a synchronous call's caller watches the same beats as progress
+///   notifications (`ProgressReporter`), where every call's time already shows.
+#[derive(Debug, Clone, Copy)]
+pub struct TracingSink {
+    slow_chat_after: Option<Duration>,
+}
+
+impl TracingSink {
+    /// A sink that promotes a chat call at or past `slow_chat_after` to the caller;
+    /// `None` never promotes one.
+    pub fn new(slow_chat_after: Option<Duration>) -> Self {
+        Self { slow_chat_after }
+    }
+}
+
+impl Default for TracingSink {
+    /// The shipped threshold, so a sink built without config behaves like a config-less
+    /// server.
+    fn default() -> Self {
+        Self::new(crate::config::Defaults::default().slow_chat)
+    }
+}
 
 impl ProgressSink for TracingSink {
     fn emit(&self, event: PhaseEvent) {
         // `event.message()` is the same tidy one-liner sync consult streamed; reuse it so
-        // the two channels read identically. The level branch is the only divergence.
-        let msg = event.message();
-        if promotes_to_caller(&event) {
+        // the two channels read identically. The level branch is the only divergence —
+        // and the slow-call promotion, which says more than the one-liner because it is
+        // read at the moment a caller decides whether to keep waiting.
+        if promotes_to_caller(&event, self.slow_chat_after) {
+            let msg = match (&event, self.slow_chat_after) {
+                (PhaseEvent::ChatCompleted { agent, elapsed }, Some(limit)) => format!(
+                    "{agent} chat call took {}, reaching the {} `slow_chat_secs` mark. \
+                     The model is answering slowly. `job_get` shows the running latency; \
+                     `job_cancel` it and pick another cast if it stays slow.",
+                    secs(*elapsed),
+                    secs(limit)
+                ),
+                _ => event.message(),
+            };
             tracing::warn!(target: "kaibo::consult", "{msg}");
         } else {
-            tracing::info!(target: "kaibo::consult", "{msg}");
+            tracing::info!(target: "kaibo::consult", "{}", event.message());
         }
     }
 }
@@ -160,6 +223,11 @@ struct ProgressState {
     /// How many beats have fired — lets `job_get` show forward motion ("step 7") even when
     /// two polls land on the same kind of beat.
     steps: u64,
+    /// Every model call's duration, per cast role, in the order they finished. A chat
+    /// beat records here instead of in `latest`: the "currently" line tracks what the
+    /// phase is doing, and this tracks how fast the models answer — two axes a poller
+    /// reads side by side. Bounded by the turn caps (a few hundred entries at most).
+    chat: BTreeMap<&'static str, Vec<Duration>>,
 }
 
 impl ProgressLog {
@@ -184,28 +252,75 @@ impl ProgressLog {
         let s = self.state.lock().expect("progress log mutex poisoned");
         s.latest.clone().map(|msg| (msg, s.steps))
     }
+
+    /// How fast each role's model is answering, as one clause per role that has made a
+    /// call — `synth chat: last 107 s, p50 98 s over 9 calls` — joined with `; `, or
+    /// `None` before the first call. `job_get` renders this beside the latest beat, so a
+    /// poller can tell a slow backend from a busy one at the first poll.
+    pub fn chat_summary(&self) -> Option<String> {
+        let s = self.state.lock().expect("progress log mutex poisoned");
+        let clauses: Vec<String> = s
+            .chat
+            .iter()
+            .filter(|(_, calls)| !calls.is_empty())
+            .map(|(agent, calls)| {
+                let last = *calls.last().expect("filtered non-empty");
+                let n = calls.len();
+                let calls_word = if n == 1 { "call" } else { "calls" };
+                format!(
+                    "{agent} chat: last {}, p50 {} over {n} {calls_word}",
+                    secs(last),
+                    secs(median(calls))
+                )
+            })
+            .collect();
+        (!clauses.is_empty()).then(|| clauses.join("; "))
+    }
+}
+
+/// The middle value of `calls` (the upper middle for an even count), so the summary
+/// reads as the typical call and one outlier cannot drag it.
+fn median(calls: &[Duration]) -> Duration {
+    let mut sorted = calls.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
 }
 
 impl ProgressSink for ProgressLog {
     fn emit(&self, event: PhaseEvent) {
-        // One-liner first (it borrows `event`), then forward the owned event downstream.
-        let msg = event.message();
         {
             let mut s = self.state.lock().expect("progress log mutex poisoned");
-            s.latest = Some(msg);
-            s.steps += 1;
+            match &event {
+                // A model call's duration is its own axis: it feeds the latency summary
+                // and leaves the "currently" line and its step count to the tool beats.
+                PhaseEvent::ChatCompleted { agent, elapsed } => {
+                    s.chat.entry(agent).or_default().push(*elapsed);
+                }
+                _ => {
+                    s.latest = Some(event.message());
+                    s.steps += 1;
+                }
+            }
         }
         self.inner.emit(event);
     }
 }
 
-/// Does this event clear kaibo's **Warn** bar — "the calling model should see this"? Only
-/// the research-limit beat does today (the answer was written early, which changes how a
-/// caller reads it); the rest are the Info-level narrative. Split out as a pure predicate
+/// Does this event clear kaibo's **Warn** bar — "the calling model should see this"? The
+/// research-limit beat does (the answer was written early, which changes how a caller
+/// reads it), and so does a model call at or past `slow_chat_after` (the caller may want
+/// to stop waiting); the rest are the Info-level narrative. Split out as a pure predicate
 /// so the convention is testable without a `tracing` subscriber (whose capture tests are
-/// flaky — see project memory).
-fn promotes_to_caller(event: &PhaseEvent) -> bool {
-    matches!(event, PhaseEvent::TurnCapReached)
+/// flaky — see project memory). The threshold is an argument rather than state so the
+/// predicate stays pure.
+fn promotes_to_caller(event: &PhaseEvent, slow_chat_after: Option<Duration>) -> bool {
+    match event {
+        PhaseEvent::TurnCapReached => true,
+        PhaseEvent::ChatCompleted { elapsed, .. } => {
+            slow_chat_after.is_some_and(|limit| *elapsed >= limit)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +355,24 @@ mod tests {
             }
             .message(),
             "exploring: where is the sandbox?"
+        );
+        // Under ten seconds keeps a decimal (explorer calls live there); from ten on,
+        // whole seconds.
+        assert_eq!(
+            PhaseEvent::ChatCompleted {
+                agent: "explorer",
+                elapsed: Duration::from_millis(1540)
+            }
+            .message(),
+            "explorer chat: 1.5 s"
+        );
+        assert_eq!(
+            PhaseEvent::ChatCompleted {
+                agent: "synth",
+                elapsed: Duration::from_millis(107_400)
+            }
+            .message(),
+            "synth chat: 107 s"
         );
     }
 
@@ -278,11 +411,14 @@ mod tests {
         NullSink.emit(PhaseEvent::SweepFinished);
     }
 
-    /// The Warn-bar convention: only `TurnCapReached` promotes to the calling model; the
-    /// rest are the Info-level narrative. Pure predicate, so no flaky `tracing` capture.
+    /// The Warn-bar convention: `TurnCapReached` and a slow chat call promote to the
+    /// calling model; the rest are the Info-level narrative. Pure predicate, so no flaky
+    /// `tracing` capture.
     #[test]
-    fn only_the_research_limit_promotes_to_the_caller() {
-        assert!(promotes_to_caller(&PhaseEvent::TurnCapReached));
+    fn the_research_limit_and_a_slow_chat_promote_to_the_caller() {
+        let limit = Some(Duration::from_secs(60));
+        assert!(promotes_to_caller(&PhaseEvent::TurnCapReached, limit));
+        assert!(promotes_to_caller(&PhaseEvent::TurnCapReached, None));
         for event in [
             PhaseEvent::PhaseStarted { phase: "consult" },
             PhaseEvent::PhaseFinished { phase: "consult" },
@@ -293,19 +429,35 @@ mod tests {
             PhaseEvent::KaishRun {
                 script: "cat -n x".into(),
             },
+            PhaseEvent::Attached { path: "x".into() },
         ] {
             assert!(
-                !promotes_to_caller(&event),
+                !promotes_to_caller(&event, limit),
                 "{event:?} is Info-narrative, not a caller promotion"
             );
         }
+    }
+
+    /// A chat call promotes at the mark and past it, never under it, and never when the
+    /// operator turned the mark off (`slow_chat_secs = 0` → `None`).
+    #[test]
+    fn a_chat_call_promotes_only_at_or_past_the_slow_mark() {
+        let chat = |ms: u64| PhaseEvent::ChatCompleted {
+            agent: "synth",
+            elapsed: Duration::from_millis(ms),
+        };
+        let limit = Some(Duration::from_secs(60));
+        assert!(!promotes_to_caller(&chat(59_999), limit));
+        assert!(promotes_to_caller(&chat(60_000), limit));
+        assert!(promotes_to_caller(&chat(107_000), limit));
+        assert!(!promotes_to_caller(&chat(107_000), None), "no mark → never");
     }
 
     #[test]
     fn tracing_sink_handles_every_variant_without_panic() {
         // The thin adapter must take every event (levels are verified live / by the pure
         // predicate above, not by a flaky subscriber-capture test).
-        let sink = TracingSink;
+        let sink = TracingSink::default();
         sink.emit(PhaseEvent::PhaseStarted { phase: "consult" });
         sink.emit(PhaseEvent::KaishRun {
             script: "grep -rn TODO .".into(),
@@ -315,7 +467,27 @@ mod tests {
         });
         sink.emit(PhaseEvent::SweepFinished);
         sink.emit(PhaseEvent::TurnCapReached);
+        // Both branches of the chat beat: under the mark and past it.
+        sink.emit(PhaseEvent::ChatCompleted {
+            agent: "explorer",
+            elapsed: Duration::from_secs(1),
+        });
+        sink.emit(PhaseEvent::ChatCompleted {
+            agent: "synth",
+            elapsed: Duration::from_secs(100_000),
+        });
         sink.emit(PhaseEvent::PhaseFinished { phase: "consult" });
+    }
+
+    /// The shipped sink carries the shipped mark, so a sink built with no config in hand
+    /// promotes the same calls a config-less server would.
+    #[test]
+    fn the_default_tracing_sink_carries_the_shipped_mark() {
+        assert_eq!(
+            TracingSink::default().slow_chat_after,
+            crate::config::Defaults::default().slow_chat
+        );
+        assert_eq!(TracingSink::new(None).slow_chat_after, None);
     }
 
     #[test]
@@ -333,7 +505,60 @@ mod tests {
         });
         sink.emit(PhaseEvent::SweepFinished);
         sink.emit(PhaseEvent::TurnCapReached);
+        sink.emit(PhaseEvent::ChatCompleted {
+            agent: "synth",
+            elapsed: Duration::from_secs(3),
+        });
         sink.emit(PhaseEvent::PhaseFinished { phase: "consult" });
+    }
+
+    /// A chat beat feeds the latency summary and leaves the "currently" line alone: the
+    /// beat count is tool activity, and a poller must not see a finished model call
+    /// replace the command the phase is running.
+    #[test]
+    fn a_chat_beat_feeds_the_summary_and_leaves_the_latest_beat_alone() {
+        let log = ProgressLog::silent();
+        assert_eq!(log.chat_summary(), None, "nothing before the first call");
+        log.emit(PhaseEvent::KaishRun {
+            script: "cat -n x".into(),
+        });
+        log.emit(PhaseEvent::ChatCompleted {
+            agent: "synth",
+            elapsed: Duration::from_secs(3),
+        });
+        assert_eq!(
+            log.latest(),
+            Some(("running kaish: cat -n x".to_string(), 1)),
+            "the chat beat neither replaces the latest line nor counts as a step"
+        );
+        assert_eq!(
+            log.chat_summary().as_deref(),
+            Some("synth chat: last 3.0 s, p50 3.0 s over 1 call")
+        );
+    }
+
+    /// The summary reads `last`, the median, and the count per role — roles sorted, so
+    /// `explorer` precedes `synth` — and the median is the upper middle of an even count.
+    #[test]
+    fn chat_summary_reports_last_median_and_count_per_role() {
+        let log = ProgressLog::silent();
+        for secs in [90, 100, 110, 107] {
+            log.emit(PhaseEvent::ChatCompleted {
+                agent: "synth",
+                elapsed: Duration::from_secs(secs),
+            });
+        }
+        log.emit(PhaseEvent::ChatCompleted {
+            agent: "explorer",
+            elapsed: Duration::from_millis(1500),
+        });
+        assert_eq!(
+            log.chat_summary().as_deref(),
+            Some(
+                "explorer chat: last 1.5 s, p50 1.5 s over 1 call; \
+                 synth chat: last 107 s, p50 107 s over 4 calls"
+            )
+        );
     }
 
     #[test]
@@ -364,7 +589,10 @@ mod tests {
         log.emit(PhaseEvent::KaishRun {
             script: "cat -n a.rs".into(),
         });
-        assert_eq!(log.latest(), Some(("running kaish: cat -n a.rs".to_string(), 1)));
+        assert_eq!(
+            log.latest(),
+            Some(("running kaish: cat -n a.rs".to_string(), 1))
+        );
         log.emit(PhaseEvent::KaishRun {
             script: "grep -rn foo .".into(),
         });
