@@ -42,6 +42,8 @@ pub(super) fn consult_result(
 /// from the error chain by [`classify_failure`].
 #[derive(Debug, PartialEq, Eq)]
 enum FailureKind {
+    /// The HTTP request failed without evidence of a provider rejection.
+    Connection,
     /// A transient provider condition (overload / rate-limit / timeout / reset). Worth a
     /// caller-driven manual retry.
     TransientProvider,
@@ -108,6 +110,11 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     if crate::completion_retry::is_malformed_generation(&s) {
         return FailureKind::MalformedGeneration;
     }
+    // rig can flatten reqwest's error chain to this text, losing the DNS, proxy,
+    // TLS, or OS cause. It establishes a transport failure, not a sandbox diagnosis.
+    if s.contains("httperror") && s.contains("error sending request") {
+        return FailureKind::Connection;
+    }
     // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
     // transport layer (reqwest timeouts/resets from our own `request_timeout`).
     const TRANSIENT: &[&str] = &[
@@ -141,9 +148,8 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 /// augmentation: the calling agent should read a clear message and proceed *without* the
 /// second opinion — not have its own tool call fail at the JSON-RPC layer. The framing is
 /// tailored by [`classify_failure`] so the agent can drive the right next step: a
-/// transient overload/timeout invites a manual retry (kaibo does **not** back off and
-/// retry — one completion is bounded by the backend's `request_timeout`/`connect_timeout`;
-/// see the failure-policy FAQ and `docs/config.md`), a non-transient provider error
+/// transient overload/timeout invites a caller retry after the completion wrapper's
+/// applicable retries have failed (`completion_retry`, `docs/config.md`); a provider error
 /// doesn't, a malformed generation says the retries ([`crate::completion_retry`]) are
 /// already spent, and a kaibo-side failure is named honestly rather than blamed on the
 /// provider. Setup errors *before* the model call — unknown cast, an attachment outside
@@ -226,10 +232,18 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
         crate::completion_retry::MALFORMED_RETRIES
     );
     let guidance = match classify_failure(&err) {
+        FailureKind::Connection => {
+            "The HTTP connection failed; this does not establish a provider rejection. \
+             Check the endpoint, DNS, proxy, TLS, and host network permissions, then \
+             retry within the user's authorized scope. In Codex, MCP and CLI access \
+             can differ: read kaibo://config/codex or run `kaibo config-guide codex`. \
+             If access needs approval, name the provider and data being sent so the \
+             user can grant the needed access."
+        }
         FailureKind::TransientProvider => {
             "This looks like a transient provider condition (overload, rate limit, or \
-             timeout). kaibo does not back off and retry — you may retry this call, or \
-             proceed without the consultation."
+             timeout). Automatic retries, where applicable, did not recover it. \
+             You may retry this call within the user's authorized scope."
         }
         FailureKind::Provider => {
             "The model or its provider rejected the request; retrying is unlikely to help \
@@ -544,6 +558,34 @@ pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_failure_guides_host_access_without_claiming_rejection() {
+        // The actual flattened rig error observed in a network-disabled Codex shell.
+        for marker in [
+            "model call failed",
+            "model loop failed",
+            "model used all 2 turns",
+        ] {
+            let error = anyhow::anyhow!("{marker}: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)");
+            let text = consultation_failure_text("oneshot", "deepseek", error);
+            assert!(text.contains("connection"), "{text}");
+            assert!(text.contains("kaibo config-guide codex"), "{text}");
+            assert!(!text.contains("provider rejected"), "{text}");
+            assert!(!text.contains("proceed without"), "{text}");
+        }
+    }
+
+    #[test]
+    fn provider_rejection_is_not_reported_as_host_network_failure() {
+        let text = consultation_failure_text(
+            "consult",
+            "deepseek",
+            anyhow::anyhow!("model loop failed: ProviderError: invalid_api_key"),
+        );
+        assert!(text.contains("provider rejected"), "{text}");
+        assert!(!text.contains("kaibo config-guide codex"), "{text}");
+    }
 
     /// The MCP path renders a consult's warnings inline (after the answer body), so the
     /// client sees them exactly as #76 shipped even though they now live off the answer

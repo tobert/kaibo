@@ -48,6 +48,10 @@ async fn main() -> Result<()> {
         // buffered span from the run would be lost silently. `init_cli_telemetry`
         // returns `None` (the common case: telemetry unconfigured) without installing
         // anything, so a default CLI run is unchanged.
+        // Recovery guidance must work even when config or telemetry is broken.
+        Some(Command::ConfigGuide(args)) => {
+            std::process::exit(kaibo::cli::run_config_guide(args.topic));
+        }
         Some(command) => {
             let otel_guard = kaibo::cli::init_cli_telemetry(&cli.common).await?;
             let code = run_command(cli.common, command).await;
@@ -77,6 +81,7 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
         Command::Config => kaibo::cli::run_config(common),
         Command::Configure(args) => kaibo::cli::run_configure(args.goal),
         Command::ExampleConfig => kaibo::cli::run_example_config(),
+        Command::ConfigGuide(args) => kaibo::cli::run_config_guide(args.topic),
     }
 }
 

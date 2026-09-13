@@ -271,11 +271,16 @@ human at a terminal can drive kaibo directly:
 | `batch_submit`, `job_get`/`job_list`/`job_cancel` (batch handles) | `kaibo batch submit \| get \| list \| cancel` |
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
+| `kaibo://config/guide` resource | `kaibo config-guide` |
+| `kaibo://config/codex` resource | `kaibo config-guide codex` |
 | `configure` prompt | `kaibo configure [goal]` |
 
 ```sh
 kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 ```
+
+For Codex, see [setup and consent](docs/codex.md). MCP approval controls and CLI
+sandbox permissions are separate; allowing a provider host does not authorize API spend.
 
 **Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
 explicit spelling for the same thing, and may become required in the future.

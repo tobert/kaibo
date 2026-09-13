@@ -113,6 +113,8 @@ const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
 /// this repo's `docs/`, so without it every explanation had to be smuggled into the
 /// example's comments, where it costs bytes on every read and drifts from the code.
 const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
+const CODEX_GUIDE_URI: &str = "kaibo://config/codex";
+pub(crate) const CODEX_GUIDE_MD: &str = include_str!("../../docs/codex.md");
 /// Long-form "how to wield the tools well" guidance — attachments, cast/model
 /// selection, the sync↔async pairs and their handles, and the read-only shell's
 /// idioms. The tool schemas stay terse and point here, so the repetition and positive
@@ -156,7 +158,7 @@ pub(crate) const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.exa
 /// `docs/config.md`, embedded for the same reason as the template above: `cargo install
 /// kaibo` lays down no docs, so a runtime file read would 404 exactly when someone is
 /// trying to configure the thing.
-const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
+pub(crate) const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
 
 /// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
 /// its wall-clock backstop: the per-request reqwest deadline should fire first (a
@@ -4137,6 +4139,12 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
              this when kaibo://config/example's comments leave a question open.",
         ),
         markdown_resource(
+            CODEX_GUIDE_URI,
+            "kaibo: Codex setup",
+            "Configure kaibo with Codex: MCP and CLI access, external-model consent, \
+             network permissions, state directories, and connection errors.",
+        ),
+        markdown_resource(
             SANDBOX_URI,
             "kaibo read-only sandbox",
             "kaibo's read-only boundary: line-number browsing idioms and the exit-code contract.",
@@ -4182,10 +4190,11 @@ models it uses.
 Work through these steps:
 
 1. Read kaibo's config resources first (they're MCP resources — no tool turn spent):
-   • `kaibo://config/example` — the annotated config.toml template, every knob explained.
+   • `kaibo://config/example` — the copyable config.toml template.
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
    • `kaibo://config/guide` — the full reference manual, if a question stays open.
+   • `kaibo://config/codex` — Codex approval and access setup.
 ";
 
 /// Steps 2-6, channel-neutral (which provider, what roster shape, keeping secrets out
@@ -4238,24 +4247,23 @@ diff, a log, a generated file you dropped somewhere — name that directory in \
 `[server] allow_paths` (`$VAR` / `${VAR}` and a leading `~` expand, resolving per machine). \
 It's a deliberate opt-in worth asking me about first, since it widens what a consult can \
 read (and can ship to a model).
-6. Host-agent sandbox. kaibo's own model-facing shell stays read-only, but the host \
-agent or MCP client that launches kaibo may sandbox the kaibo process. A useful kaibo \
-setup needs outbound network access to the model APIs I configure, and long-lived MCP \
-servers need write access to kaibo's own XDG state path \
-(`$XDG_STATE_HOME/kaibo/state.db`, else `~/.local/state/kaibo/state.db`). If a \
-media-producing tool is enabled, its content-addressed media CAS lives under the XDG \
-data dir (`$XDG_DATA_HOME/kaibo/cas`, else `~/.local/share/kaibo/cas`) and may also \
-need host-sandbox access. Ask before opening those paths. I may prefer separate \
-per-client stores — for example a Codex-only state db or CAS dir — when I don't want \
-Claude Code, Codex, and other agents sharing session history or generated artifacts. \
-Codex has a stronger sandbox default than Claude Code in common setups, so its config \
-often needs explicit `network_access` and `writable_roots`; Claude Code usually starts \
-local MCP servers with ordinary access to my home XDG dirs.
+6. Host access and consent. Establish which project/context may go to which providers, \
+and preserve the host's paid-call approval policy. Keep that scope explicit while configuring \
+kaibo and the host. For Codex, run `kaibo config-guide codex`: MCP servers and sandboxed CLI commands have different \
+access. Probe the path you intend to use before changing permissions. A connection \
+failure does not establish a provider rejection. Request missing access through the \
+host's approval mechanism and explain any refusal to the user. Durable state needs \
+writes to `$XDG_STATE_HOME/kaibo/state.db` and disk artifacts to \
+`$XDG_DATA_HOME/kaibo/cas` (the defaults under `~/.local/state` and `~/.local/share` \
+when XDG variables are unset). Use narrow state-directory permissions; keep both \
+stores outside the allowed project trees. Offer per-client stores if I want separate \
+history and artifacts in Codex, Claude Code, or other clients.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_MCP: &str = "\
 7. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
-the config and keys — both load once at startup.";
+the configuration and inherited environment. Key files and key commands resolve when each \
+model client is built.";
 
 /// The CLI-flavored opening/step-1: kaibo's own config surfaces read as plain
 /// subcommands, no MCP client needed — the whole reason `kaibo configure` exists is
@@ -4267,7 +4275,8 @@ your own family. This sets up which models it uses.
 Work through these steps:
 
 1. Read kaibo's own config surfaces first, no MCP client needed:
-   • `kaibo example-config` — the annotated config.toml template, every knob explained.
+   • `kaibo example-config` — the copyable config.toml template.
+   • `kaibo config-guide` — the reference; `kaibo config-guide codex` for Codex access.
    • `kaibo config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
 ";
@@ -4645,6 +4654,9 @@ with the `[prompts]` table, or per cast with a slot's `preamble` (the two axes a
 ";
 
 fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
+    if uri == CODEX_GUIDE_URI {
+        return Some(CODEX_GUIDE_MD.to_string());
+    }
     if uri == SANDBOX_URI {
         return Some(kaibo_sandbox_doc());
     }
@@ -9166,8 +9178,8 @@ enabled = false
         };
         let text = t.text.as_str();
         for needle in [
-            "network_access",
-            "writable_roots",
+            "kaibo config-guide codex",
+            "approval mechanism",
             "$XDG_STATE_HOME/kaibo/state.db",
             "$XDG_DATA_HOME/kaibo/cas",
             "per-client stores",
@@ -9638,6 +9650,24 @@ enabled = false
         );
         crate::config::Config::from_toml_str(&body)
             .expect("the embedded config example must parse as a valid Config");
+    }
+
+    #[test]
+    fn codex_config_guide_is_discoverable_and_embedded() {
+        let uri = "kaibo://config/codex";
+        assert!(kaibo_resources().iter().any(|r| r.uri == uri));
+        let body = render_resource(uri, &[]).expect("Codex guide is readable");
+        for fact in [
+            "MCP",
+            "CLI",
+            "elicitation",
+            "approval",
+            "network",
+            "state",
+            "consent",
+        ] {
+            assert!(body.contains(fact), "missing {fact}");
+        }
     }
 
     // --- kaibo://config/guide resource tests ----------------------------------

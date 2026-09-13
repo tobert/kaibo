@@ -15,6 +15,13 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+- Codex setup guidance through `kaibo://config/codex` and `kaibo config-guide codex`, covering external-model consent, MCP access, and CLI permissions.
+- `kaibo config-guide` prints the embedded configuration reference even when configuration is broken.
+
+### Fixed
+- Connection failures guide callers to endpoint and host-access checks instead of claiming the provider rejected the request.
+
 ## [0.5.0] — 2026-09-10
 
 ### Security
