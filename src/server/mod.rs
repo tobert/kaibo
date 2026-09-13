@@ -4204,49 +4204,26 @@ and where each key is sourced from.
 /// wraps it in its own channel-specific opening (how to *read* kaibo's own config) and
 /// closing (how to make kaibo *pick up* the written file).
 const CONFIGURE_STEPS_CORE: &str = "\
-2. Ask me which providers I can actually reach before writing anything: which of \
-Anthropic / DeepSeek / Gemini / OpenRouter I hold API keys for, and whether I run any \
-OpenAI-compatible local servers (llama.cpp, Ollama, an image server) and at what base \
-URLs. Let me tell you my providers rather than guessing them. OpenRouter is worth \
-naming on its own — one key there reaches every major model family through a single \
-gateway.
-3. Propose a roster built on a provider I actually named in step 2, then write it to \
-`$XDG_CONFIG_HOME/kaibo/config.toml` (default `~/.config/kaibo/config.toml`). The \
-default shape is a single outside family — DeepSeek, Gemini, Anthropic, OpenRouter, or \
-a local pair — with explorer and synth both within it. That one family is already the \
-whole win: it augments my own lineage with a different house's eyes (a cheap, fast \
-explorer and a stronger synth, same family). kaibo's built-in casts are already \
-within-family pairs, so often this is just giving one of them a key rather than writing \
-a new cast. Mixing families across roles (a 'chimera' — say a DeepSeek explorer with a \
-Claude synth) is an advanced move for someone who holds several keys and asks for it; \
-don't reach for it by default. If OpenRouter is the family, ground the model picks in \
-its live catalog instead of guessing ids: `GET https://openrouter.ai/api/v1/models` is \
-public, no auth, and filters to what matters — \
-`?supported_parameters=tools&category=programming&sort=intelligence-high-to-low` finds \
-tool-capable coding models (a consult cast needs `tools` support); `q=` / `context=` / \
-`max_price=` narrow further; each entry carries live pricing, context length, and a \
-`reasoning` capability block. Favor the drift-proof `~author/family-latest` aliases \
-(e.g. `~anthropic/claude-sonnet-latest`) over a pinned slug, and know that `:free` / \
-`:nitro` / `:floor` suffixes pick a free, fastest, or cheapest variant of a concrete \
-slug where offered. When you pick a synth model, read its output ceiling from kaibo's \
-model listing (the `list_models` tool, or `kaibo models` on the CLI) and set that \
-slot's `max_tokens` from the ceiling, because reasoning bills into the same completion \
-budget as the answer. Some providers publish no ceiling; there, look it up in the \
-provider's own model documentation.
-4. Keep secrets out of the config. A backend stanza DECLARES a key source — an env \
-var name (`api_key_env`), a key-file path (`api_key_file`), or a command whose \
-stdout is the key (`api_key_cmd`, e.g. `[\"op\", \"read\", \"op://Vault/Item/Field\"]`) — \
-and kaibo seeds none of them, so nothing works until one is declared. The TOML \
-carries the name, path, or argv; the VALUE stays in the env, file, or vault (the \
-key command runs with stdin closed, a 30-second ceiling, and its output is never \
-logged). Tell me which sources to declare, and let me put the keys in myself.
-5. (Optional) Read scope. By default kaibo reads only the project tree (plus linked git \
-worktrees) and only ever *reads* it — never writes to your project. To let the team see \
-a scratch space — a \
-diff, a log, a generated file you dropped somewhere — name that directory in \
-`[server] allow_paths` (`$VAR` / `${VAR}` and a leading `~` expand, resolving per machine). \
-It's a deliberate opt-in worth asking me about first, since it widens what a consult can \
-read (and can ship to a model).
+2. Use the configured providers and preferences I already gave you. Ask only for \
+missing choices: provider access, local endpoint URLs, model family, and budget. \
+A backend being configured does not by itself authorize paid calls.
+3. Choose a family outside the calling agent's own, with explorer and synth both within it. \
+A built-in cast often needs only a key source. Mixing families across roles is an \
+advanced move; don't reach for it by default. Ground model IDs, tool support, and output \
+limits in `list_models` or `kaibo models`, then provider docs where the catalog leaves \
+a gap. Reasoning uses the completion budget too; choose slot `max_tokens` within the \
+model's output ceiling and my budget. Write only the needed sections to \
+`$XDG_CONFIG_HOME/kaibo/config.toml` (default `~/.config/kaibo/config.toml`).
+4. Declare a key source: an env name (`api_key_env`), a file path (`api_key_file`), or \
+command argv (`api_key_cmd`). \
+The env source wins over file or command; file and command are mutually exclusive. \
+kaibo assumes no source. Let me provide key values in the environment, file, or vault, \
+keeping them out of chat. A key command has stdin closed, a 30-second limit, and output \
+is never logged.
+5. Set read scope from the projects I authorized. kaibo keeps them read-only and follows \
+linked worktrees by default. Add `[server] allow_paths` only for the extra directories \
+I want the team to read; their content may reach a configured model. File paths expand \
+leading `~`, `$VAR`, and `${VAR}`. Confirm additions outside the existing scope.
 6. Host access and consent. Establish which project/context may go to which providers, \
 and preserve the host's paid-call approval policy. Keep that scope explicit while configuring \
 kaibo and the host. For Codex, run `kaibo config-guide codex`: MCP servers and sandboxed CLI commands have different \
