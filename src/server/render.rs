@@ -110,11 +110,6 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     if crate::completion_retry::is_malformed_generation(&s) {
         return FailureKind::MalformedGeneration;
     }
-    // rig can flatten reqwest's error chain to this text, losing the DNS, proxy,
-    // TLS, or OS cause. It establishes a transport failure, not a sandbox diagnosis.
-    if s.contains("httperror") && s.contains("error sending request") {
-        return FailureKind::Connection;
-    }
     // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
     // transport layer (reqwest timeouts/resets from our own `request_timeout`).
     const TRANSIENT: &[&str] = &[
@@ -136,6 +131,11 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     ];
     if TRANSIENT.iter().any(|t| s.contains(t)) {
         FailureKind::TransientProvider
+    } else if s.contains("httperror") && s.contains("error sending request") {
+        // rig can flatten reqwest's error chain to this text, losing the DNS, proxy,
+        // TLS, or OS cause. Preserve any specific timeout/reset diagnosis above;
+        // this establishes only a transport failure, not a sandbox diagnosis.
+        FailureKind::Connection
     } else if empty_answer {
         FailureKind::EmptyAnswer
     } else {
@@ -305,12 +305,6 @@ pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
     }
 }
 
-/// Append a one-line provenance footer naming the cast and the model(s) that
-/// produced `answer`. The point is legibility: a caller — a cross-model study most
-/// of all — should see *which* model answered without cross-referencing
-/// `kaibo://config`, since the answering model is the whole variable. `roles` is the
-/// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
-/// Pure and offline-testable.
 /// Which kind of async work a handle addresses. A batch handle carries a `/`
 /// (`backend/provider-id`); a consult job id (`job-N`) never does, and a backend name
 /// carries no `/` either (enforced at config load), so the presence of a `/` is an
@@ -504,6 +498,8 @@ pub(crate) fn append_warnings(mut answer: String, warnings: &[String]) -> String
     answer
 }
 
+/// Append a provenance footer naming the cast and model(s) that produced `answer`.
+/// `roles` labels each model: one for `oneshot`, explorer+synth for `consult`.
 pub(crate) fn with_provenance(
     answer: String,
     cast: &str,
@@ -571,6 +567,7 @@ mod tests {
             let text = consultation_failure_text("oneshot", "deepseek", error);
             assert!(text.contains("connection"), "{text}");
             assert!(text.contains("kaibo config-guide codex"), "{text}");
+            assert!(text.contains(super::super::CODEX_GUIDE_URI), "{text}");
             assert!(!text.contains("provider rejected"), "{text}");
             assert!(!text.contains("proceed without"), "{text}");
         }
@@ -902,6 +899,11 @@ mod tests {
             "model call failed: ProviderError: {\"type\":\"overloaded_error\"}",
             "model call failed: HttpError: error sending request: operation timed out",
         ] {
+            assert_eq!(
+                classify_failure(&anyhow::anyhow!(body)),
+                FailureKind::TransientProvider,
+                "{body}"
+            );
             let result = consultation_failed("consult", "gemini", anyhow::anyhow!(body));
             let text = answer_text(&result).to_lowercase();
             assert!(

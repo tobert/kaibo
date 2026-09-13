@@ -2,9 +2,9 @@
 
 Use kaibo for reviews and second opinions from another model family. Hosted casts
 send your question, supplied context, and the source they read to their configured
-providers. Read-only protects the project from changes; it does not keep its content
-on your machine. Choose provider access during setup. Keep approval for paid calls separate from
-network access; Codex and the user decide whether an approval applies once or persists.
+providers. Read-only protects the project from changes; source can still reach a
+configured provider. Choose provider access during setup. Keep approval for paid
+calls separate from network access, under Codex's approval policy.
 
 ## Start with MCP
 
@@ -67,10 +67,11 @@ scope and consent explicitly. After a denial, explain it; Codex's `/approve` com
 can authorize one exact retry, which still goes through review. See
 [Codex auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review).
 
-Honor a user's explicit persistent approval through the host's controls. kaibo does
-not store or infer “don't ask again,” and a new session should use Codex's actual
-saved policy. A provider-domain allow rule does not express consent to a model call. Conversely,
-a tool approval does not configure network or filesystem access.
+If the host offers a persistent-approval control, honor the user's choice through
+that control. kaibo does not store or infer “don't ask again.” In a new session,
+check Codex's saved policy before relying on a prior approval. A provider-domain
+allow rule does not express consent to a model call. A tool approval does not
+configure network or filesystem access.
 
 MCP provides server instructions, resources, prompts, tool results, and
 `elicitation/create` for requesting user input. Codex supports form and URL
