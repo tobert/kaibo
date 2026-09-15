@@ -145,8 +145,9 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 
 /// Surface a *runtime* consultation failure as a **tool-result error** (`is_error =
 /// true`) rather than a protocol-level `internal_error`. A consult is an *optional*
-/// augmentation: the calling agent should read a clear message and proceed *without* the
-/// second opinion — not have its own tool call fail at the JSON-RPC layer. The framing is
+/// augmentation: the calling agent should read a clear message and ask its user whether to
+/// retry, use another cast, or continue without the second opinion — not have its own tool
+/// call fail at the JSON-RPC layer, and not decide alone to go on without it. The framing is
 /// tailored by [`classify_failure`] so the agent can drive the right next step: a
 /// transient overload/timeout invites a caller retry after the completion wrapper's
 /// applicable retries have failed (`completion_retry`, `docs/config.md`); a provider error
@@ -227,41 +228,44 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
     let malformed = format!(
         "The provider could not parse a tool call this model generated — the model \
          fumbled one turn, and the request itself is fine. kaibo already sent that \
-         request {} more times and the model repeated the mistake, so retry this call, \
-         or run it on a cast from a different family.",
+         request {} more times and the model repeated the mistake. Ask the user whether \
+         to retry this call, run it on a cast from a different family, or continue \
+         without the consultation.",
         crate::completion_retry::MALFORMED_RETRIES
     );
     let transient = format!(
         "This looks like a transient provider condition (overload, rate limit, or \
          timeout). kaibo retries an overload or rate limit up to {} times before it \
-         returns one; a timeout or reset is not retried. You may retry this call, or \
-         proceed without the consultation.",
+         returns one; a timeout or reset is not retried. Ask the user whether to retry \
+         this call, run it on another cast, or continue without the consultation.",
         crate::completion_retry::TRANSIENT_RETRIES
     );
     let guidance = match classify_failure(&err) {
         FailureKind::Connection => {
             "The HTTP request got no response from the provider, so this is not a \
              provider rejection. Check the endpoint, DNS, proxy, TLS, and the network \
-             access of the process running kaibo, then retry this call, or proceed \
-             without the consultation. A host agent can give its MCP servers and its \
-             shell commands different network access: see Host agents in \
-             kaibo://config/guide (`kaibo config-guide`)."
+             access of the process running kaibo. A host agent can give its MCP servers \
+             and its shell commands different network access: see Host agents in \
+             kaibo://config/guide (`kaibo config-guide`). Ask the user whether to retry \
+             this call after the access is fixed, run it on another cast, or continue \
+             without the consultation."
         }
         FailureKind::TransientProvider => &transient,
         FailureKind::Provider => {
-            "The model or its provider rejected the request; retrying is unlikely to help \
-             — proceed without the consultation, or check the cast and config."
+            "The model or its provider rejected the request; retrying is unlikely to help. \
+             Check the cast and its backend configuration. Ask the user whether to run \
+             this on another cast or continue without the consultation."
         }
         FailureKind::MalformedGeneration => &malformed,
         FailureKind::EmptyAnswer => {
             "The model ran but delivered no answer text — a model-side outcome, not a \
-             kaibo bug. You may retry, and a different cast often helps; if the \
-             diagnostics report finish_reason \"length\", raise that slot's max_tokens \
-             so reasoning cannot starve the answer."
+             kaibo bug. If the diagnostics report finish_reason \"length\", raise that \
+             slot's max_tokens so reasoning cannot starve the answer. Ask the user whether \
+             to retry, use a different cast, or continue without the consultation."
         }
         FailureKind::Internal => {
-            "This is a kaibo-side error (not the provider) — please report it; you can \
-             still proceed without the consultation."
+            "This is a kaibo-side error, not the provider's. Ask the user whether to \
+             retry this call or continue without the consultation."
         }
     };
     format!("{tool} could not complete (cast `{cast}`): {detail}. {guidance}")
@@ -586,8 +590,53 @@ mod tests {
             );
             assert!(text.contains("`kaibo config-guide`"), "{text}");
             assert!(!text.contains("provider rejected"), "{text}");
-            // kaibo is augmentation: every failure leaves the caller free to go on without it.
-            assert!(text.contains("proceed without the consultation"), "{text}");
+        }
+    }
+
+    /// Every failure hands the decision to the user: retry, another cast, or go on without
+    /// the consultation. An agent told to proceed on its own hides a failure the user may
+    /// want to fix. One body per `FailureKind`, and the classification is asserted first,
+    /// so a body that drifted into another arm cannot pass on that arm's wording.
+    #[test]
+    fn every_failure_asks_the_user_what_to_do() {
+        let cases = [
+            (
+                FailureKind::Connection,
+                "model loop failed: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)",
+            ),
+            (
+                FailureKind::TransientProvider,
+                "model loop failed: ProviderError: {\"type\":\"overloaded_error\"}",
+            ),
+            (
+                FailureKind::Provider,
+                "model loop failed: ProviderError: invalid_request_error",
+            ),
+            (
+                FailureKind::MalformedGeneration,
+                "model loop failed: ProviderError: {\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}",
+            ),
+            (
+                FailureKind::EmptyAnswer,
+                "model deepseek-v4-pro returned an EMPTY answer — the single toolless \
+                 completion returned no answer text.",
+            ),
+            (
+                FailureKind::Internal,
+                "failed to build read-only kaish kernel: out of memory",
+            ),
+        ];
+        for (kind, body) in cases {
+            assert_eq!(classify_failure(&anyhow::anyhow!(body)), kind, "{body}");
+            let text = consultation_failure_text("consult", "deepseek", anyhow::anyhow!(body));
+            assert!(
+                text.contains("Ask the user whether"),
+                "{kind:?} must hand the decision to the user: {text}"
+            );
+            assert!(
+                !text.contains("proceed without"),
+                "{kind:?} must not tell the agent to go on alone: {text}"
+            );
         }
     }
 
@@ -948,8 +997,8 @@ mod tests {
                 "a transient failure should invite a manual retry: {body} -> {text}"
             );
             assert!(
-                text.contains("proceed without the consultation"),
-                "a transient failure must leave the caller free to go on: {body} -> {text}"
+                text.contains("ask the user whether"),
+                "a transient failure hands the decision to the user: {body} -> {text}"
             );
         }
     }

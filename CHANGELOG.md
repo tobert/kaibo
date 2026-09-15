@@ -24,6 +24,7 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 - The configuration reference and template are less than half their former length.
+- A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 
 ### Fixed
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
