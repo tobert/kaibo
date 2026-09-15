@@ -254,11 +254,18 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
 /// the first beat lands. Echoes the same one-liner `job_wait` streams (e.g. "exploring: …"),
 /// so a caller polling with `job_get` sees forward motion — `step N` advances every beat even
 /// when two polls catch the same kind of event. See [`crate::progress::ProgressLog`].
-fn running_beat(last_progress: &Option<(String, u64)>) -> String {
-    match last_progress {
+fn running_beat(last_progress: &Option<(String, u64)>, chat: &Option<String>) -> String {
+    let mut s = match last_progress {
         Some((msg, steps)) => format!(", currently: {msg} (step {steps})"),
         None => String::new(),
+    };
+    // The latency clause rides after the beat: what the phase is doing, then how fast
+    // its models are answering — the two questions a poller has.
+    if let Some(chat) = chat {
+        s.push_str("; ");
+        s.push_str(chat);
     }
+    s
 }
 
 /// Render an async background job for the unified `job_get`: a status line while it runs,
@@ -274,7 +281,7 @@ pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
              do other work and `job_get` it again later.",
             snap.label,
             snap.age.as_secs(),
-            running_beat(&snap.last_progress),
+            running_beat(&snap.last_progress, &snap.chat),
         ))]),
         JobState::Done(result) => {
             let include_report = result.report.is_some();
@@ -442,7 +449,7 @@ pub(super) fn render_jobs_section(jobs: &[(String, JobSnapshot)]) -> String {
                 format!(
                     "running, {}s{}",
                     snap.age.as_secs(),
-                    running_beat(&snap.last_progress)
+                    running_beat(&snap.last_progress, &snap.chat)
                 )
             }
             JobState::Done(_) => "done — `job_get` it for the answer".to_string(),
@@ -612,10 +619,26 @@ mod tests {
 
     #[test]
     fn running_beat_renders_a_phrase_only_when_a_beat_exists() {
-        assert_eq!(running_beat(&None), "");
+        assert_eq!(running_beat(&None, &None), "");
         assert_eq!(
-            running_beat(&Some(("exploring: the sandbox".to_string(), 3))),
+            running_beat(&Some(("exploring: the sandbox".to_string(), 3)), &None),
             ", currently: exploring: the sandbox (step 3)"
+        );
+    }
+
+    /// The latency clause follows the beat, so a poller reads what the phase is doing
+    /// and then how fast its models answer — and it renders on its own if the first
+    /// model call finished before any tool beat.
+    #[test]
+    fn running_beat_appends_the_chat_latency_clause() {
+        let chat = Some("synth chat: last 107 s, p50 98 s over 9 calls".to_string());
+        assert_eq!(
+            running_beat(&Some(("running kaish: cat -n x".to_string(), 4)), &chat),
+            ", currently: running kaish: cat -n x (step 4); synth chat: last 107 s, p50 98 s over 9 calls"
+        );
+        assert_eq!(
+            running_beat(&None, &chat),
+            "; synth chat: last 107 s, p50 98 s over 9 calls"
         );
     }
 
@@ -636,13 +659,14 @@ mod tests {
                 label: "cast `x`".into(),
                 age: std::time::Duration::from_secs(12),
                 last_progress: Some(("exploring: where?".to_string(), 2)),
+                chat: Some("synth chat: last 3.0 s, p50 3.0 s over 1 call".to_string()),
             },
         );
         let out = text(with_beat);
         assert!(out.contains("still running"), "status line: {out}");
         assert!(
-            out.contains("currently: exploring: where? (step 2)"),
-            "echoes the latest beat: {out}"
+            out.contains("currently: exploring: where? (step 2); synth chat: last 3.0 s"),
+            "echoes the latest beat and the latency clause: {out}"
         );
 
         let no_beat = render_job(
@@ -652,11 +676,13 @@ mod tests {
                 label: "cast `x`".into(),
                 age: std::time::Duration::from_secs(1),
                 last_progress: None,
+                chat: None,
             },
         );
+        let out = text(no_beat);
         assert!(
-            !text(no_beat).contains("currently:"),
-            "no beat yet → no 'currently' phrase"
+            !out.contains("currently:") && !out.contains("chat:"),
+            "no beat yet → no 'currently' phrase and no latency clause: {out}"
         );
     }
 
