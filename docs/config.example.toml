@@ -3,7 +3,6 @@
 # Override with --config FILE or KAIBO_CONFIG. All settings are optional.
 # Precedence: per-call > CLI > KAIBO_* env > file > built-in.
 # Reference: kaibo://config/guide or `kaibo config-guide`.
-# Codex access and consent: kaibo://config/codex or `kaibo config-guide codex`.
 # Resolved settings: kaibo://config or `kaibo config`.
 
 [server]
@@ -59,8 +58,9 @@ enabled = true                     # false gives in-memory sessions
 [sandbox]
 exec_timeout_secs = 30              # kaish script deadline; exit 124
 output_limit_bytes = 65536          # exit 3 returns a head/tail sample
-scratch_limit_bytes = 67108864      # in-memory root scratch; > 0
-# disable_builtins = ["grep"]       # extra restrictions only; file-only
+scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is refused; > 0
+# disable_builtins = ["grep"]       # extra restrictions only; file-only; a blocked call exits 126
+#                                   # `kaibo serve` refuses an unknown builtin name at startup
 
 # Ignore policy applies inside the read-only shell.
 # [kaish.ignore]

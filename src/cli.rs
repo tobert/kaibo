@@ -151,31 +151,14 @@ pub enum Command {
     Configure(ConfigureArgs),
     /// Print the annotated config.toml template (the `kaibo://config/example` document).
     ExampleConfig,
-    /// Print the configuration reference. Use `codex` for Codex setup and permissions.
-    ConfigGuide(ConfigGuideArgs),
+    /// Print the configuration reference (the `kaibo://config/guide` document). Reads no
+    /// config, so it works when the config is broken.
+    ConfigGuide,
 }
 
-#[derive(Args, Debug)]
-pub struct ConfigGuideArgs {
-    /// Guide to print. Omit for the complete configuration reference.
-    #[arg(value_enum)]
-    pub topic: Option<ConfigGuideTopic>,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum ConfigGuideTopic {
-    Codex,
-}
-
-/// Print embedded configuration guidance without reading config or contacting providers.
-pub fn run_config_guide(topic: Option<ConfigGuideTopic>) -> i32 {
-    print!(
-        "{}",
-        match topic {
-            Some(ConfigGuideTopic::Codex) => crate::server::CODEX_GUIDE_MD,
-            None => crate::server::CONFIG_GUIDE_MD,
-        }
-    );
+/// Print the embedded configuration reference without reading config or contacting providers.
+pub fn run_config_guide() -> i32 {
+    print!("{}", crate::server::CONFIG_GUIDE_MD);
     0
 }
 

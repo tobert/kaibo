@@ -9,12 +9,12 @@ A missing default config file uses built-in defaults.
 | Current settings | `kaibo://config` | `kaibo config` |
 | Copyable TOML | `kaibo://config/example` | `kaibo example-config` |
 | This reference | `kaibo://config/guide` | `kaibo config-guide` |
-| Codex access and consent | `kaibo://config/codex` | `kaibo config-guide codex` |
 | Guided setup | `configure` prompt | `kaibo configure [goal]` |
 
 Hosted models receive your prompt, supplied context, and the source kaibo reads for
 the call. Agree on projects and providers during setup. kaibo keeps the project
-read-only; its own sessions and artifacts live outside the project.
+read-only; its own sessions and artifacts live outside the project. Setup that differs
+by host agent is under [Host agents](#host-agents).
 
 ## The model: backends, roles, casts
 
@@ -163,10 +163,10 @@ completion wrapper also retries selected transient provider failures up to four
 times with bounded backoff: HTTP 429, 500, 502, 503, and 529, or recognized overload
 and rate-limit text when no status survives. Other errors return to the caller.
 
-Connection failures do not establish a provider rejection. Check the endpoint and
-host access, including DNS, proxy, TLS, and network permissions. For Codex, read
-`kaibo://config/codex` or run `kaibo config-guide codex`. Continue within the user's
-authorized scope; an error is not consent to send data elsewhere.
+A connection failure (`error sending request`, with no provider response) is not a
+provider rejection. Check the endpoint, DNS, proxy, TLS, and the network access of the
+process that runs kaibo. A host can give its MCP servers and its shell commands
+different network access; see [Host agents](#host-agents).
 
 `request_timeout_secs` bounds each request; `call_deadline_secs` bounds interactive
 work including retries. Error results preserve the cast and underlying detail.
@@ -301,10 +301,11 @@ whenever thinking is on**, which is every Anthropic slot by default — the Mess
 | gemini | `thinkingLevel` |
 | openrouter | `{"reasoning":{"effort":…}}` |
 | openai (Chat Completions) | `reasoning_effort` |
-| openai (Responses) | `reasoning.effort` |
+| openai (Responses) | `reasoning.effort`, for `gpt-5*` model ids only |
 
 OpenAI-compatible Chat Completions requests carry the bare `reasoning_effort` field.
-Responses requests use `reasoning.effort`. Budget-tier Anthropic uses
+Responses requests use `reasoning.effort` when the model id starts with `gpt-5`; any
+other id on the Responses wire gets no effort field, and `kaibo://config` marks it inert. Budget-tier Anthropic uses
 `thinking_budget` instead. A server that rejects the field needs
 `thinking_style = "off"`; kaibo preserves its error for diagnosis.
 
@@ -666,8 +667,8 @@ those are visible under `[tools]`. Startup warnings report missing cast shapes t
 XDG, with explicit overrides:
 
 ```
-$KAIBO_CONFIG                           # explicit path wins
---config <path>                         # ... or this
+--config <path>                         # explicit path wins
+$KAIBO_CONFIG                           # used when --config is absent
 $XDG_CONFIG_HOME/kaibo/config.toml      # default
 ~/.config/kaibo/config.toml             # when XDG_CONFIG_HOME unset
 ```
@@ -728,7 +729,8 @@ to guess. Transport is OTLP/HTTP protobuf.
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | kaibo exports content when this is set — it is the GenAI conventions' own name for the opt-in, read here unchanged. |
 | `OTEL_SDK_DISABLED` | kaibo exports nothing, whatever any other source says. |
 
-**Precedence: `KAIBO_TELEMETRY_*` / CLI > `config.toml` > `OTEL_*` > off.** This one
+**Precedence: `KAIBO_TELEMETRY_*` > `config.toml` > `OTEL_*` > off.** Telemetry has no
+CLI flags. This one
 family inverts kaibo's usual env-beats-file rule, deliberately. `OTEL_*` is *ambient* —
 a platform sets it for its own collector, not necessarily aiming it at kaibo — so it may
 supply what you left blank and never override what you wrote. An explicit
@@ -821,6 +823,7 @@ multi-agent setups a per-client state db is often cleaner than sharing one histo
 across Claude Code, Codex, and other agents. The same judgment applies to the media CAS
 when an artifact-producing tool is enabled: the default XDG data path is convenient for
 sharing generated artifacts across agents, while a per-client CAS keeps them separated.
+Setup that differs by host is under [Host agents](#host-agents).
 
 **Failure is loud.** If the store cannot open — a bad path, a db inside a project, a
 network mount (turso's multiprocess mode is 64-bit Unix plus local filesystem only) —
@@ -1047,6 +1050,16 @@ on the caller's shell expansion. `KAIBO_ALLOW_PATHS` is colon-separated.
 Name only the projects and scratch directories the user wants models to read.
 `allow_paths = ["~/src"]` grants every project beneath that tree; `--allow-path /`
 removes the useful read boundary. Scratch access is opt-in, including `/tmp`.
+To let a model read files a workflow drops (a diff, a log, generated output), name a
+dedicated per-user directory rather than `/tmp`:
+
+```toml
+[server]
+allow_paths = ["$XDG_RUNTIME_DIR/kaibo"]
+```
+
+An unset variable fails loading, so name one that is set on every machine that reads
+this file. Create the directory first: an allowed entry must exist when kaibo starts.
 `--state-db` and `--cas-dir` select kaibo-owned storage and must stay outside all
 allowed trees.
 
@@ -1117,3 +1130,47 @@ and `api_key_cmd` name the source to diagnose, not its secret.
 Followed worktrees are recomputed on each resource read. Configured `enabled` and
 runtime `active`/`mode` differ when persistence degrades; read both before relying on
 durability.
+
+## Host agents
+
+Each host agent launches and limits kaibo in its own way. This section lists only the
+differences that change setup or troubleshooting.
+
+### Codex
+
+Checked against Codex CLI 0.154.0 on 2026-09-13. Confirm with `codex --version` and
+Codex's [MCP](https://learn.chatgpt.com/docs/extend/mcp) and
+[permissions](https://learn.chatgpt.com/docs/permissions) documentation before copying.
+
+```toml
+# Codex's config.toml
+[mcp_servers.kaibo]
+command = "/absolute/path/to/kaibo"
+args = ["--root", "/absolute/path/to/project"]
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.kaibo.tools.list_models]
+approval_mode = "approve"
+```
+
+- **The MCP server and shell commands have different network access.** Codex's command
+  sandbox rules do not apply to a stdio MCP server. So the kaibo MCP tools can reach a
+  provider while `kaibo consult` run from Codex's shell fails with a connection error.
+  Use the MCP tools, or give the command sandbox network access to the provider hosts.
+  A wrapper or container around Codex can still limit the MCP server.
+- **Forward environment keys.** List each variable an `api_key_env` names in
+  `mcp_servers.kaibo.env_vars`, or declare `api_key_file`, which needs no forwarding.
+- **The MCP tool timeout is 60 seconds by default** (`tool_timeout_sec`). A `consult`
+  often runs longer: use `consult_submit`, then `job_get`, or `job_wait` with a
+  `timeout_secs` below the tool timeout (`job_wait` also defaults to 60 seconds). A
+  client timeout does not stop the call at the provider.
+- **Tool approval.** The snippet asks before every kaibo tool call except
+  `list_models`; a per-tool `approval_mode` wins over the server default. Tool approval
+  does not cover `kaibo` run from Codex's shell.
+- **Shell-run `kaibo` needs write access to its own stores.** Durable sessions write
+  the state directory (`~/.local/state/kaibo` by default, including the database's
+  sidecar files); disk artifacts write the CAS directory (`~/.local/share/kaibo/cas`).
+  `--state-db` and `--cas-dir` give Codex its own stores. `--no-persistence` gives up
+  durable sessions and moves the CAS into memory.
+- **After changing launch settings,** restart the MCP server, then read `kaibo://config`
+  to confirm `allowed_paths`, the default cast, and key sources.

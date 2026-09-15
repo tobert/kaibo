@@ -231,20 +231,23 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
          or run it on a cast from a different family.",
         crate::completion_retry::MALFORMED_RETRIES
     );
+    let transient = format!(
+        "This looks like a transient provider condition (overload, rate limit, or \
+         timeout). kaibo retries an overload or rate limit up to {} times before it \
+         returns one; a timeout or reset is not retried. You may retry this call, or \
+         proceed without the consultation.",
+        crate::completion_retry::TRANSIENT_RETRIES
+    );
     let guidance = match classify_failure(&err) {
         FailureKind::Connection => {
-            "The HTTP connection failed; this does not establish a provider rejection. \
-             Check the endpoint, DNS, proxy, TLS, and host network permissions, then \
-             retry within the user's authorized scope. In Codex, MCP and CLI access \
-             can differ: read kaibo://config/codex or run `kaibo config-guide codex`. \
-             If access needs approval, name the provider and data being sent so the \
-             user can grant the needed access."
+            "The HTTP request got no response from the provider, so this is not a \
+             provider rejection. Check the endpoint, DNS, proxy, TLS, and the network \
+             access of the process running kaibo, then retry this call, or proceed \
+             without the consultation. A host agent can give its MCP servers and its \
+             shell commands different network access: see Host agents in \
+             kaibo://config/guide (`kaibo config-guide`)."
         }
-        FailureKind::TransientProvider => {
-            "This looks like a transient provider condition (overload, rate limit, or \
-             timeout). Automatic retries, where applicable, did not recover it. \
-             You may retry this call within the user's authorized scope."
-        }
+        FailureKind::TransientProvider => &transient,
         FailureKind::Provider => {
             "The model or its provider rejected the request; retrying is unlikely to help \
              — proceed without the consultation, or check the cast and config."
@@ -572,11 +575,19 @@ mod tests {
         ] {
             let error = anyhow::anyhow!("{marker}: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)");
             let text = consultation_failure_text("oneshot", "deepseek", error);
-            assert!(text.contains("connection"), "{text}");
-            assert!(text.contains("kaibo config-guide codex"), "{text}");
-            assert!(text.contains(super::super::CODEX_GUIDE_URI), "{text}");
+            assert_eq!(
+                classify_failure(&anyhow::anyhow!("{marker}: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)")),
+                FailureKind::Connection
+            );
+            assert!(text.contains("network"), "{text}");
+            assert!(
+                text.contains("Host agents in kaibo://config/guide"),
+                "{text}"
+            );
+            assert!(text.contains("`kaibo config-guide`"), "{text}");
             assert!(!text.contains("provider rejected"), "{text}");
-            assert!(!text.contains("proceed without"), "{text}");
+            // kaibo is augmentation: every failure leaves the caller free to go on without it.
+            assert!(text.contains("proceed without the consultation"), "{text}");
         }
     }
 
@@ -588,7 +599,7 @@ mod tests {
             anyhow::anyhow!("model loop failed: ProviderError: invalid_api_key"),
         );
         assert!(text.contains("provider rejected"), "{text}");
-        assert!(!text.contains("kaibo config-guide codex"), "{text}");
+        assert!(!text.contains("Host agents"), "{text}");
     }
 
     /// The MCP path renders a consult's warnings inline (after the answer body), so the
@@ -935,6 +946,10 @@ mod tests {
             assert!(
                 text.contains("retry"),
                 "a transient failure should invite a manual retry: {body} -> {text}"
+            );
+            assert!(
+                text.contains("proceed without the consultation"),
+                "a transient failure must leave the caller free to go on: {body} -> {text}"
             );
         }
     }

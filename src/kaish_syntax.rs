@@ -135,8 +135,8 @@ fn kaibo_lead() -> &'static str {
     "kaibo — codebase review and second opinions from another model family. \
      Hosted casts send questions, context, and source to configured providers; \
      local casts use local endpoints. The project stays READ-ONLY. `consult` is the front door; kaibo \
-     finds and reads the current code, then answers with file:line citations. Codex setup and permissions: \
-     `kaibo://config/codex`. Say what you did or want to know; no pasted files or diffs needed. \
+     finds and reads the current code, then answers with file:line citations. \
+     Say what you did or want to know; no pasted files or diffs needed. \
      `explore` returns a cited survey report. `oneshot` answers from supplied context \
      with no codebase access. `run_kaish` drives the read-only shell directly. \
      `deliberate` reasons offline over a dossier. `consult_submit` and `batch_submit` \
