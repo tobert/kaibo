@@ -40,6 +40,7 @@ synth_effort = "high"
 thinking_style = "auto"            # auto | adaptive | budget | off
 request_timeout_secs = 900          # each request; backend can override; > 0
 call_deadline_secs = 3600           # whole interactive call, including retries; > 0
+slow_chat_secs = 60                 # async jobs: one call this slow warns via job_wait; 0 off
 session_capacity = 128              # memory LRU; > 0
 job_capacity = 64                   # memory LRU; evicting a running job aborts it
 inline_attach_budget = 262144       # consult text bytes inlined; 0 routes all to reads

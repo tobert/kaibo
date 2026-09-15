@@ -16,14 +16,17 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
-- Codex setup guidance through `kaibo://config/codex` and `kaibo config-guide codex`, covering external-model consent, MCP access, and CLI permissions.
-- `kaibo config-guide` prints the embedded configuration reference even when configuration is broken.
+- `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
+- An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.
+- A retried model call is timed per attempt, so latency is the provider's time, never kaibo's backoff.
+- `kaibo config-guide` prints the configuration reference, even when the config is broken.
+- The configuration reference has a host agents section, starting with Codex MCP access, timeouts, and approval.
 
 ### Changed
-- Shorter configuration reference and template separate settings from rationale and correct stale key-resolution, retry, and path guidance.
+- The configuration reference and template are less than half their former length.
 
 ### Fixed
-- Connection failures guide callers to endpoint and host-access checks instead of claiming the provider rejected the request.
+- A connection failure no longer reads as a provider rejection; the message names the checks to run.
 
 ## [0.5.0] — 2026-09-10
 

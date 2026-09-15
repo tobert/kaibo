@@ -1277,6 +1277,29 @@ fn max_attachments_defaults_overrides_and_zero_is_legal() {
     assert_eq!(c.defaults.max_attachments, 4);
 }
 
+/// `slow_chat_secs` is the mark past which one model call is promoted to the calling
+/// model. Same ladder: built-in 60, `[defaults]` override, env over file — and `0` is
+/// legal, meaning "no mark" (`None`), the way a poller turns the warning off while
+/// keeping the latency summary.
+#[test]
+fn slow_chat_secs_defaults_overrides_zero_disables_and_env_wins() {
+    let c = Config::from_toml_str("").unwrap();
+    assert_eq!(c.defaults.slow_chat, Some(Duration::from_secs(60)));
+    let c = Config::from_toml_str("[defaults]\nslow_chat_secs = 120\n").unwrap();
+    assert_eq!(c.defaults.slow_chat, Some(Duration::from_secs(120)));
+    let c = Config::from_toml_str("[defaults]\nslow_chat_secs = 0\n").unwrap();
+    assert_eq!(c.defaults.slow_chat, None, "0 turns the mark off");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[defaults]\nslow_chat_secs = 120\n").unwrap();
+    let env: HashMap<&str, &str> = [("KAIBO_SLOW_CHAT_SECS", "0")].into_iter().collect();
+    let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
+    assert_eq!(
+        c.defaults.slow_chat, None,
+        "env wins over the file, 0 included"
+    );
+}
+
 // --- Key resolution (now a Backend concern) --------------------------------------
 
 fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {
