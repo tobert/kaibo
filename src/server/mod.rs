@@ -156,7 +156,7 @@ pub(crate) const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.exa
 /// `docs/config.md`, embedded for the same reason as the template above: `cargo install
 /// kaibo` lays down no docs, so a runtime file read would 404 exactly when someone is
 /// trying to configure the thing.
-const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
+pub(crate) const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
 
 /// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
 /// its wall-clock backstop: the per-request reqwest deadline should fire first (a
@@ -4133,7 +4133,8 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
             "kaibo: configuration guide",
             "The full configuration reference: precedence across call/CLI/env/file, the \
              backend + cast model, tool gating (why a tool may not be advertised), path \
-             containment, persistence, telemetry, house rules, and prompt overrides. Read \
+             containment, persistence, telemetry, house rules, prompt overrides, and \
+             host-agent setup such as Codex. Read \
              this when kaibo://config/example's comments leave a question open.",
         ),
         markdown_resource(
@@ -4182,7 +4183,7 @@ models it uses.
 Work through these steps:
 
 1. Read kaibo's config resources first (they're MCP resources — no tool turn spent):
-   • `kaibo://config/example` — the annotated config.toml template, every knob explained.
+   • `kaibo://config/example` — the copyable config.toml template.
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
    • `kaibo://config/guide` — the full reference manual, if a question stays open.
@@ -4195,67 +4196,47 @@ and where each key is sourced from.
 /// wraps it in its own channel-specific opening (how to *read* kaibo's own config) and
 /// closing (how to make kaibo *pick up* the written file).
 const CONFIGURE_STEPS_CORE: &str = "\
-2. Ask me which providers I can actually reach before writing anything: which of \
-Anthropic / DeepSeek / Gemini / OpenRouter I hold API keys for, and whether I run any \
-OpenAI-compatible local servers (llama.cpp, Ollama, an image server) and at what base \
-URLs. Let me tell you my providers rather than guessing them. OpenRouter is worth \
-naming on its own — one key there reaches every major model family through a single \
-gateway.
-3. Propose a roster built on a provider I actually named in step 2, then write it to \
-`$XDG_CONFIG_HOME/kaibo/config.toml` (default `~/.config/kaibo/config.toml`). The \
-default shape is a single outside family — DeepSeek, Gemini, Anthropic, OpenRouter, or \
-a local pair — with explorer and synth both within it. That one family is already the \
-whole win: it augments my own lineage with a different house's eyes (a cheap, fast \
-explorer and a stronger synth, same family). kaibo's built-in casts are already \
-within-family pairs, so often this is just giving one of them a key rather than writing \
-a new cast. Mixing families across roles (a 'chimera' — say a DeepSeek explorer with a \
-Claude synth) is an advanced move for someone who holds several keys and asks for it; \
-don't reach for it by default. If OpenRouter is the family, ground the model picks in \
-its live catalog instead of guessing ids: `GET https://openrouter.ai/api/v1/models` is \
-public, no auth, and filters to what matters — \
-`?supported_parameters=tools&category=programming&sort=intelligence-high-to-low` finds \
-tool-capable coding models (a consult cast needs `tools` support); `q=` / `context=` / \
-`max_price=` narrow further; each entry carries live pricing, context length, and a \
-`reasoning` capability block. Favor the drift-proof `~author/family-latest` aliases \
-(e.g. `~anthropic/claude-sonnet-latest`) over a pinned slug, and know that `:free` / \
-`:nitro` / `:floor` suffixes pick a free, fastest, or cheapest variant of a concrete \
-slug where offered. When you pick a synth model, read its output ceiling from kaibo's \
-model listing (the `list_models` tool, or `kaibo models` on the CLI) and set that \
-slot's `max_tokens` from the ceiling, because reasoning bills into the same completion \
-budget as the answer. Some providers publish no ceiling; there, look it up in the \
-provider's own model documentation.
-4. Keep secrets out of the config. A backend stanza DECLARES a key source — an env \
-var name (`api_key_env`), a key-file path (`api_key_file`), or a command whose \
-stdout is the key (`api_key_cmd`, e.g. `[\"op\", \"read\", \"op://Vault/Item/Field\"]`) — \
-and kaibo seeds none of them, so nothing works until one is declared. The TOML \
-carries the name, path, or argv; the VALUE stays in the env, file, or vault (the \
-key command runs with stdin closed, a 30-second ceiling, and its output is never \
-logged). Tell me which sources to declare, and let me put the keys in myself.
-5. (Optional) Read scope. By default kaibo reads only the project tree (plus linked git \
-worktrees) and only ever *reads* it — never writes to your project. To let the team see \
-a scratch space — a \
-diff, a log, a generated file you dropped somewhere — name that directory in \
-`[server] allow_paths` (`$VAR` / `${VAR}` and a leading `~` expand, resolving per machine). \
-It's a deliberate opt-in worth asking me about first, since it widens what a consult can \
-read (and can ship to a model).
-6. Host-agent sandbox. kaibo's own model-facing shell stays read-only, but the host \
-agent or MCP client that launches kaibo may sandbox the kaibo process. A useful kaibo \
-setup needs outbound network access to the model APIs I configure, and long-lived MCP \
-servers need write access to kaibo's own XDG state path \
-(`$XDG_STATE_HOME/kaibo/state.db`, else `~/.local/state/kaibo/state.db`). If a \
-media-producing tool is enabled, its content-addressed media CAS lives under the XDG \
-data dir (`$XDG_DATA_HOME/kaibo/cas`, else `~/.local/share/kaibo/cas`) and may also \
-need host-sandbox access. Ask before opening those paths. I may prefer separate \
-per-client stores — for example a Codex-only state db or CAS dir — when I don't want \
-Claude Code, Codex, and other agents sharing session history or generated artifacts. \
-Codex has a stronger sandbox default than Claude Code in common setups, so its config \
-often needs explicit `network_access` and `writable_roots`; Claude Code usually starts \
-local MCP servers with ordinary access to my home XDG dirs.
+2. Use the configured providers and preferences I already gave you. Ask only for \
+missing choices: provider access, local endpoint URLs, model family, and budget. \
+A backend being configured does not by itself authorize paid calls.
+3. Choose a family outside the calling agent's own, with explorer and synth both within it. \
+A built-in cast often needs only a key source. Mixing families across roles is an \
+advanced move; don't reach for it by default. Ground model IDs, tool support, and output \
+limits in `list_models` or `kaibo models`, then provider docs where the catalog leaves \
+a gap. For OpenRouter, the public catalog \
+`GET https://openrouter.ai/api/v1/models?supported_parameters=tools&category=programming` \
+lists tool-capable coding models with live pricing and context length (a consult cast \
+needs `tools` support); prefer `~author/family-latest` aliases such as \
+`~anthropic/claude-sonnet-latest` over a pinned slug. Reasoning uses the completion \
+budget too; choose slot `max_tokens` within the model's output ceiling and my budget. \
+Write only the needed sections to \
+`$XDG_CONFIG_HOME/kaibo/config.toml` (default `~/.config/kaibo/config.toml`).
+4. Declare a key source: an env name (`api_key_env`), a file path (`api_key_file`), or \
+command argv (`api_key_cmd`). \
+The env source wins over file or command; file and command are mutually exclusive. \
+kaibo assumes no source. Let me provide key values in the environment, file, or vault, \
+keeping them out of chat. A key command has stdin closed, a 30-second limit, and output \
+is never logged.
+5. Set read scope from the projects I authorized. kaibo keeps them read-only and follows \
+linked worktrees by default. Add `[server] allow_paths` only for the extra directories \
+I want the team to read; their content may reach a configured model. File paths expand \
+leading `~`, `$VAR`, and `${VAR}`. Confirm additions outside the existing scope.
+6. Host access. The host agent that launches kaibo may sandbox it. kaibo needs outbound \
+network access to the model APIs I configure, write access to the \
+`$XDG_STATE_HOME/kaibo` directory for durable sessions (`state.db` and its sidecar \
+files), and write access to `$XDG_DATA_HOME/kaibo/cas` for disk artifacts (under \
+`~/.local/state` and \
+`~/.local/share` when the XDG variables are unset). Keep both stores outside the allowed \
+project trees. Offer per-client stores if I want separate history and artifacts in \
+Codex, Claude Code, or other clients. Some hosts give MCP servers and shell commands \
+different access: the reference's Host agents section covers Codex. Ask me before \
+opening access or changing the host's tool approval settings.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_MCP: &str = "\
 7. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
-the config and keys — both load once at startup.";
+the configuration and inherited environment. Key files and key commands resolve when each \
+model client is built.";
 
 /// The CLI-flavored opening/step-1: kaibo's own config surfaces read as plain
 /// subcommands, no MCP client needed — the whole reason `kaibo configure` exists is
@@ -4267,7 +4248,8 @@ your own family. This sets up which models it uses.
 Work through these steps:
 
 1. Read kaibo's own config surfaces first, no MCP client needed:
-   • `kaibo example-config` — the annotated config.toml template, every knob explained.
+   • `kaibo example-config` — the copyable config.toml template.
+   • `kaibo config-guide` — the full reference manual, if a question stays open.
    • `kaibo config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
 ";
@@ -9178,9 +9160,8 @@ enabled = false
         };
         let text = t.text.as_str();
         for needle in [
-            "network_access",
-            "writable_roots",
-            "$XDG_STATE_HOME/kaibo/state.db",
+            "Host agents",
+            "$XDG_STATE_HOME/kaibo` directory",
             "$XDG_DATA_HOME/kaibo/cas",
             "per-client stores",
             "Codex",
@@ -9683,6 +9664,11 @@ enabled = false
         assert!(
             guide.contains("## Tool gating"),
             "docs/config.md must keep the section config.example.toml points at"
+        );
+        assert!(
+            guide.contains("## Host agents"),
+            "docs/config.md must keep the section that failure messages and the configure \
+             prompt point at"
         );
         assert!(
             CONFIG_EXAMPLE_TOML.contains(CONFIG_GUIDE_URI),

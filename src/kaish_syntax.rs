@@ -132,17 +132,15 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 /// `## Scope` — the menu of teams reads before scope, and both sit above the point a
 /// truncating host (Claude Code's 2048-char cap) would cut.
 fn kaibo_lead() -> &'static str {
-    "kaibo — grounded, cited answers about a codebase from a model outside \
-     your own family. DeepSeek, Gemini, Anthropic, OpenRouter, or a local model reads the \
-     project READ-ONLY and answers with file:line citations. Say in prose what you \
-     did or want to know — kaibo finds and reads the current code itself; no \
-     pasted files or diffs needed. `consult` is the front door. `explore` \
-     returns a cited survey report instead of an answer. `oneshot` is a \
-     toolless second opinion when you own the context. `run_kaish` drives the \
-     read-only shell directly. Work you don't wait on: `deliberate` reasons \
-     offline over an investigated dossier (a frontier or big-local model); \
-     `consult_submit` and `batch_submit` return handles; \
-     `job_wait`/`job_get`/`job_list`/`job_cancel` manage them."
+    "kaibo — codebase review and second opinions from another model family. \
+     Hosted casts send questions, context, and source to configured providers; \
+     local casts use local endpoints. The project stays READ-ONLY. `consult` is the front door; kaibo \
+     finds and reads the current code, then answers with file:line citations. \
+     Say what you did or want to know; no pasted files or diffs needed. \
+     `explore` returns a cited survey report. `oneshot` answers from supplied context \
+     with no codebase access. `run_kaish` drives the read-only shell directly. \
+     `deliberate` reasons offline over a dossier. `consult_submit` and `batch_submit` \
+     return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` manage them."
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has

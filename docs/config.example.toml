@@ -1,886 +1,254 @@
-# kaibo — example configuration.
-#
-# Copy to $XDG_CONFIG_HOME/kaibo/config.toml (default ~/.config/kaibo/config.toml),
-# or point at it with --config <path> / KAIBO_CONFIG.
-#
-# EVERYTHING here is optional. With no config file at all, kaibo runs exactly as it
-# does today: five built-in BACKENDS (connections: anthropic/deepseek/gemini/openrouter/
-# openai-local) and seven built-in CASTS (compositions: role → "backend/model-id") —
-# five same-named interactive ones plus two batch casts (anthropic-batch, gemini-batch)
-# — ship in code; this file only OVERRIDES fields or ADDS backends and casts.
-# `[profiles]` is gone — a config that still carries it is a load error pointing at
-# docs/casts.md.
-#
-# Precedence, highest wins:
-#   MCP per-call input  >  CLI flag  >  env var (KAIBO_*)  >  this file  >  built-in
-#
-# Naming rule:  config key `foo_bar`  ⇄  env `KAIBO_FOO_BAR`  ⇄  CLI `--foo-bar`
-# Exceptions (kept native, on purpose): the provider key env vars
-# (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY,
-# OPENAI_API_KEY) and OPENAI_BASE_URL. RUST_LOG is also kept as-is.
+# kaibo configuration. Copy only the sections you need.
+# Default file: $XDG_CONFIG_HOME/kaibo/config.toml, else ~/.config/kaibo/config.toml.
+# Override with --config FILE or KAIBO_CONFIG. All settings are optional.
+# Precedence: per-call > CLI > KAIBO_* env > file > built-in.
+# Reference: kaibo://config/guide or `kaibo config-guide`.
+# Resolved settings: kaibo://config or `kaibo config`.
 
-# ---------------------------------------------------------------------------
-# Getting started — a fresh install has no key yet
-# ---------------------------------------------------------------------------
-# With nothing configured, kaibo starts fine and `run_kaish` works immediately —
-# the read-only shell needs no model. `consult` / `oneshot` need a
-# provider key on the default cast (`anthropic` out of the box). Give it one by
-# DECLARING a key source in this file — kaibo seeds none; the value stays out of
-# the config, so it never enters your chat:
-#   env:     api_key_env = "ANTHROPIC_API_KEY"    then export ANTHROPIC_API_KEY=sk-...
-#   file:    api_key_file = "~/.anthropic-key.txt" then printf %s 'sk-...' > that file
-#   command: api_key_cmd = ["op", "read", "op://Vault/Kaibo/Anthropic-key"]   (no shell)
-# Don't paste the key to the model — declare the source in config.toml and set
-# the actual value in your shell / vault. Then RECONNECT the kaibo MCP server so it
-# re-reads the environment and this file (keys are read once at startup; in Claude
-# Code: run /mcp and reconnect kaibo).
-# Prefer another provider? Pass cast="<backend-or-cast>" per call, or set
-# `cast` below.
-#
-# kaibo serves three config resources you can read from your MCP client, no tool turn
-# spent:
-#   kaibo://config          the *resolved* runtime state (key sources, never values)
-#   kaibo://config/example  this annotated template, embedded in the binary
-#   kaibo://config/guide    the full reference manual — every key, precedence, cast
-#                           design, tool gating, containment, persistence
-
-# ---------------------------------------------------------------------------
-# [server] — process-level defaults (the things --root / --cast / --no-* set)
-# ---------------------------------------------------------------------------
 [server]
-# Default project root when a call omits `path`. Omit to require `path` per call.
-# root = "/home/atobey/src/kaibo"
-
-# Additional allowed path trees beyond root. A per-call `path` must resolve to
-# at-or-under root OR one of these trees. ADDITIVE: setting this never costs you
-# the launch cwd, which stays an allowed tree (and the default root) unless you
-# set `root` above or turn it off with `infer_cwd` below. Also settable via
-# --allow-path (CLI) or KAIBO_ALLOW_PATHS (colon-separated env var); a non-empty
-# CLI list replaces the env/file layer.
-# allow_paths = ["/home/atobey/shared-libs", "/data/shared"]
-
-# Adopt the invocation cwd as an allowed tree and the default root (default true).
-# This is what makes the zero-config case work: an MCP client launches kaibo with
-# cwd = your workspace, so kaibo scopes itself there with no configuration at all.
-# Set false when the allowed set should be exactly what you named above — every
-# call must then pass its own `path` (also: --no-cwd, KAIBO_NO_CWD).
-# infer_cwd = false
-
-# Follow git worktrees of an already-allowed repo (default true). When a call's
-# `path` misses the allowed set, kaibo admits it if it is a linked worktree of a
-# repo already in the set — so a sibling branch checkout (even one created
-# mid-session) is reachable without an --allow-path. Resolved by reading git's
-# link files, never by running git. The kaibo://config [runtime] section lists the
-# worktrees currently followed. Set false to keep the boundary strictly static
-# (also: --no-follow-worktrees, KAIBO_NO_FOLLOW_WORKTREES).
-# follow_worktrees = true
-
-# Default cast (by name or alias) when a call omits `cast`. The old `provider`
-# key is a load error (unknown field) — see docs/casts.md for the rename map.
+# Omit root to use launch cwd. Paths in config expand ~, $VAR, and ${VAR}.
+# root = "~/src/project"
+# allow_paths = ["~/shared/fixtures"] # additional trees; CLI --allow-path repeats
+# infer_cwd = true                  # false disables cwd inference (--no-cwd)
+# follow_worktrees = true           # follows linked worktrees of allowed repos
 cast = "anthropic"
+log = "kaibo=info"                  # RUST_LOG wins
 
-# tracing/EnvFilter directive used when RUST_LOG is unset.
-log = "kaibo=info"
-
-# Tool gating — eight capability flags (the --no-<tool> flags), all default true. They
-# are not one-per-tool: `consult` also gates consult_submit, `batch` gates batch_submit,
-# and the job_* verbs follow whichever handle producers are live. A config that leaves
-# nothing advertised is refused at startup, whether by turning every flag off or by
-# staffing (below) removing what remains.
-#
-# A tool also needs a cast that can STAFF it. One nothing can staff is not advertised at
-# all, so it costs no resident tokens and no call of it can fail. Out of the box that
-# affects `deliberate` (no built-in cast pairs an explorer with an offline synth — see
-# DELIBERATE casts below) and `generate` (no built-in cast carries an `image` slot — see
-# the image-slot example below). kaibo warns at startup naming the cast shape it wants,
-# and kaibo://config's [runtime].unstaffable_tools reports it live. Full table:
-# kaibo://config/guide, "Tool gating".
+# Tools also need a usable cast. Full table: kaibo://config/guide, "Tool gating".
 [server.tools]
-consult        = true
-explore        = true
-deliberate     = true      # ...and needs a deliberate-shaped cast; see below
-oneshot        = true
-run_kaish      = true
-batch          = true
-list_models    = true
-generate       = true      # ...and needs a cast with an `image` slot AND [cas] on
+consult = true                     # includes consult_submit
+explore = true
+deliberate = true                   # requires explorer + offline synth
+oneshot = true
+run_kaish = true
+batch = true                       # batch_submit; requires batch synth
+list_models = true
+generate = true                     # requires image slot + CAS
+# job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
-# ---------------------------------------------------------------------------
-# [defaults] — tunables every cast slot falls back to. The model-tracking knobs
-# (max_tokens, thinking_budget, temperature, effort, thinking_style) can also be
-# overridden per slot (table form, below); request_timeout_secs per backend.
-# ---------------------------------------------------------------------------
 [defaults]
-explorer_max_turns = 100     # bounds each cheap explore′ survey — set here only, no per-call arg
-synth_max_turns    = 200     # bounds the consult driver loop (surveys AND span reads)
-max_tokens         = 16384   # output headroom; MUST sit well above thinking_budget
-thinking_budget    = 8192    # reasoning budget where the provider exposes a toggle
+explorer_max_turns = 100            # per survey; final answer turn follows the cap
+synth_max_turns = 200               # per consult driver
+max_tokens = 16384                  # includes reasoning; check provider output limits
+thinking_budget = 8192              # budget-tier models need max_tokens > this
+explorer_temperature = 0.1          # [0, 2]; omitted where thinking forbids sampling
+synth_temperature = 0.3
+top_p = 0.95                        # (0, 1]
+explorer_effort = "high"            # model-dependent; prefer slot overrides
+synth_effort = "high"
+thinking_style = "auto"            # auto | adaptive | budget | off
+request_timeout_secs = 900          # each request; backend can override; > 0
+call_deadline_secs = 3600           # whole interactive call, including retries; > 0
+slow_chat_secs = 60                 # async jobs: one call this slow warns via job_wait; 0 off
+session_capacity = 128              # memory LRU; > 0
+job_capacity = 64                   # memory LRU; evicting a running job aborts it
+inline_attach_budget = 262144       # consult text bytes inlined; 0 routes all to reads
+max_attachments = 32                # files routed per survey; 0 disables attach
 
-# Sampling, per role: the explorer gathers exact citations (cold); the synth
-# composes the answer (a touch warmer). Temperature in [0.0, 2.0], top_p in
-# (0.0, 1.0] — out of range is a load error, not a clamp. Anthropic drops
-# sampling whenever thinking is on (the API rejects the combination).
-explorer_temperature = 0.1
-synth_temperature    = 0.3
-top_p                = 0.95
-
-# Reasoning depth, per role, for the models that take an effort param (Anthropic
-# adaptive tier, DeepSeek, Gemini's thinkingLevel, OpenRouter, hosted GPT-5.x).
-# A passthrough string — kaibo keeps no allowlist, so a rung a provider ships
-# tomorrow works today.
-#
-# THE LADDER IS PER-PROVIDER, and often per-MODEL. There is no universal rung set,
-# so a value here lands on every cast at once and can be wrong for some of them:
-#   Gemini      minimal | low | medium | high — four, and that is Google's own
-#               schema, not a kaibo limit. "minimal" is the off-switch, itself
-#               model-dependent (gemini-3.5-flash takes it; gemini-pro-latest
-#               refuses it). "none"/"xhigh"/"max" are rejected outright.
-#   DeepSeek    all seven (none…max), strictly validated.
-#   OpenRouter  all seven; the gateway maps each onto the upstream's native knob,
-#               so deep rungs reach models that refuse them on their direct API.
-#   OpenAI      per MODEL, at both ends: gpt-5.6 reaches "max", gpt-5.2 stops at
-#               "xhigh", gpt-5.1 at "high"; gpt-5's bottom rung is "minimal" while
-#               5.1+ use "none". kaibo sends yours and OpenAI names its supported
-#               values if it disagrees.
-#   Anthropic   the adaptive tier takes an effort; the budget tier (Haiku 4.5 and
-#               older) has no effort field at all and drops it.
-#
-# So prefer a deep rung on the SLOT that can use it (see the casts below) over a
-# server-wide default here. kaibo tells you when a value can't land: one this
-# slot's client refuses is a call-time error naming the cast, the slot and the
-# rungs that wire takes; one with nowhere to go is a startup warning and shows up
-# as `inert_tunables` in kaibo://config.
-explorer_effort = "high"
-synth_effort    = "high"
-
-# Force the thinking shape ("auto" | "adaptive" | "budget" | "off") instead of the
-# built-in classifier. adaptive/budget are Anthropic tiers — the escape hatch for a
-# new or misclassified id. "off" sends no reasoning parameter on ANY provider: set it
-# for a server that REJECTS unknown parameters instead of ignoring them (reasoning is
-# on by default everywhere else). See docs/config.md.
-thinking_style = "auto"
-
-# Per-request LLM deadline (seconds): the wall-clock ceiling on ONE completion
-# call. Seeds every backend; override per backend for a slow local model. Keep it
-# above your slowest legitimate single completion — a non-streaming call can't
-# tell wedged from slow. 0 is rejected at load.
-request_timeout_secs = 900
-
-# Whole-call deadline (seconds): the wall-clock ceiling on ONE interactive call
-# (consult / explore / oneshot), across all its completions. This is the backstop
-# for when the per-request timeout above doesn't fire — a wedged local server on a
-# pooled keep-alive, a stalled response body — so a stalled backend aborts loudly
-# instead of hanging your session (a real consult once parked ~17h). Keep it
-# comfortably ABOVE the largest request_timeout a call can reach, so it never cuts a
-# legitimately slow single completion. Bounds the interactive loop tools — consult /
-# explore / oneshot and async consult_submit. `deliberate`'s direct lane (one long
-# completion) is bounded instead by its synth backend's request_timeout, so a slow
-# local model keeps its full patience without forcing this ceiling high; the batch
-# lane holds no in-process wait (provider queue). 0 is rejected at load.
-# Env: KAIBO_CALL_DEADLINE_SECS.
-call_deadline_secs = 3600
-
-# Slow model call mark (seconds), for async jobs. One chat call at or past it is
-# promoted to the calling model as a warning that `job_wait` returns, so a caller
-# learns a slow backend at the first slow call instead of at call_deadline_secs.
-# `job_get` shows each role's running latency either way; a synchronous call shows
-# every call's time in its progress notifications instead. 0 turns the warning
-# off. Env: KAIBO_SLOW_CHAT_SECS.
-slow_chat_secs = 60
-
-session_capacity = 128       # max multi-turn consult sessions held in memory (LRU,
-                             # capacity-evicted, no TTL); must be > 0
-job_capacity     = 64        # max async-consult jobs held in memory, running plus
-                             # uncollected; evicting a running one aborts it; must be > 0
-
-# Byte budget for inlining consult text attachments into the driver prompt (greedy, in
-# caller order). Past it an attachment is DEMOTED to a read-it-whole directive, loudly,
-# never dropped. 0 inlines nothing — the escape hatch for a small-context local cast.
-inline_attach_budget = 262144   # 256 KiB
-
-# Files ONE explorer survey may route with its attach tool (the bytes ride alongside
-# the survey's report, never through the explorer's context). 0 disables the tool.
-max_attachments = 32
-
-# ---------------------------------------------------------------------------
-# [orientation] — a computed-once file map injected into the exploring phases, so a
-# model starts knowing the layout instead of spending turns on glob/ls/find. Built
-# from the kernel's own ignore-aware enumeration, so it can't disagree with what the
-# explorer's shell sees. Omit the stanza to keep the defaults.
-# ---------------------------------------------------------------------------
 [orientation]
-enabled = true               # false turns the map off entirely
-full_list_max_files = 256    # <= this injects the full file list; above, a directory
-                             # map; 0 is a load error (disable instead)
-tree_max_depth = 4           # how deep the fallback directory map descends; 0 is a
-                             # load error (it would render an empty map)
+enabled = true
+full_list_max_files = 256           # larger repos get a directory map; > 0
+tree_max_depth = 4                  # directory map depth; > 0
 
-# ---------------------------------------------------------------------------
-# [persistence] — the state db, ON by default, so consult sessions and batch handles
-# survive a restart and are shared across front doors (start over MCP, continue from
-# the CLI). Fixed XDG path, never one a model controls; refused if it resolves inside
-# an allowed tree. Failure to open is fatal, not a silent drop to memory.
-# ---------------------------------------------------------------------------
 [persistence]
-enabled = true               # false = in-memory only (--no-persistence, KAIBO_NO_PERSISTENCE)
-# Move the db (--state-db FILE, KAIBO_STATE_DB). $VAR/~-expanded like root/allow_paths.
-# path = "$XDG_STATE_HOME/kaibo/state.db"
+enabled = true                     # false gives in-memory sessions
+# path = "~/.local/state/kaibo/state.db" # default uses XDG_STATE_HOME when set
+# --state-db / KAIBO_STATE_DB override path. Keep state outside allowed project trees.
 
-# ---------------------------------------------------------------------------
-# [sandbox] — the read-only execution limits (see src/sandbox.rs)
-# ---------------------------------------------------------------------------
 [sandbox]
-exec_timeout_secs  = 30      # per-kaish-script wall clock; exit 124 on overrun
-output_limit_bytes = 65536   # per-script output cap (64 KiB); exit 3 + head/tail sample
-# Cap on the `/` scratch MemoryFs (redirects, mktemp). A write past it fails loudly
-# (StorageFull), never silently eating host RAM. Default 64 MiB; must be > 0 — there
-# is no "unbounded" setting, an unbounded scratch is the bug this prevents.
-scratch_limit_bytes = 67108864
-# Builtins to shadow-block on top of the structural boundary (exit 126 if invoked).
-# This is the ONLY thing in kaibo that produces 126, and it is empty by default — a
-# refused write is not this, it exits 1 at the read-only mount.
-# Setting it only makes the box STRICTER. It cannot loosen anything: writes are
-# refused by the mount, and git/spawn/exec are not compiled in at all.
-# A name that isn't a real builtin is a loud startup error, not a silent no-op.
-# disable_builtins = ["grep", "find"]
+exec_timeout_secs = 30              # kaish script deadline; exit 124
+output_limit_bytes = 65536          # exit 3 returns a head/tail sample
+scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is refused; > 0
+# disable_builtins = ["grep"]       # extra restrictions only; file-only; a blocked call exits 126
+#                                   # `kaibo serve` refuses an unknown builtin name at startup
 
-# ---------------------------------------------------------------------------
-# [kaish.ignore] — which gitignore-format files the file-walking builtins
-# (glob/grep/ls/find — and the orientation repo-map, which rides the same kernel)
-# honor. This is DISCOVERY/NOISE policy, NOT a safety boundary: it changes what the
-# explorer SEES, never what it's allowed to read. Omit the whole stanza to keep the
-# default below (`.gitignore` + built-in defaults, enforced scope) — that's exactly
-# what kaibo does today. Every key is optional; a partial stanza overrides only the
-# keys it names. File-only (no KAIBO_* env).
-# ---------------------------------------------------------------------------
-
+# Ignore policy applies inside the read-only shell.
 # [kaish.ignore]
-# `files` REPLACES the default [".gitignore"] — to add (say) .claudeignore while
-# keeping .gitignore, list both. Loaded at the root and walked up through ancestors,
-# in precedence order (later wins, ripgrep-style). auto_gitignore (below) still walks
-# root + nested .gitignore files regardless of this list — so dropping ".gitignore"
-# here does NOT disable .gitignore (only stops honoring ANCESTOR .gitignores above
-# the root). To honor .gitignore nowhere, set auto_gitignore = false AND omit it here.
-# files = [".gitignore", ".claudeignore"]
-# defaults         = true       # built-in target/, node_modules/, .git
-# auto_gitignore   = true       # auto-load nested .gitignore files during the walk
-# global_gitignore = false      # also honor the user's global gitignore (excludesFile)
-# scope = "enforced"            # "enforced" = every walker incl. find (guards agent
-                                # context); "advisory" = polite tools only, find stays
-                                # POSIX-unrestricted. A typo here is a load error.
+# files = [".gitignore"]            # replaces the list; [] disables explicit files
+# defaults = true                   # built-in exclusions such as .git and target
+# auto_gitignore = true             # nested .gitignore files
+# global_gitignore = false          # user's git excludesFile
+# scope = "enforced"                # enforced | advisory
 
-# ---------------------------------------------------------------------------
-# [telemetry] — OpenTelemetry export: traces, logs, and metrics.
-#
-# Two knobs, two questions. `enabled` decides whether anything leaves at all.
-# `capture_content` decides whether spans carry prompts, completions, and tool
-# payloads — default FALSE, so a span carries model ids, token counts, durations,
-# finish reasons, and exit codes, and no source.
-#
-# Each signal then has its own on/off key, all defaulting on under `enabled`. Only
-# traces can ever carry content, so `traces = false, metrics = true` exports kaibo's
-# spend, latency, and delegation with no prompt able to leave by that road — no
-# metric in the GenAI conventions has a content-bearing attribute.
-#
-# `enabled` defaults ON when OTEL_EXPORTER_OTLP_ENDPOINT or
-# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set — kaibo exports to the collector the
-# environment already names. Set `enabled = false` here to refuse whatever the
-# environment says; an explicit false always wins. OTEL_SDK_DISABLED turns every
-# signal off and beats every other source.
-#
-# Precedence: KAIBO_TELEMETRY_* / CLI > this file > OTEL_* > off. OTEL_* ranks last
-# because it is ambient — a platform sets it for its own collector, so it fills in
-# what you left blank and never overrides what you wrote.
-#
-# Enabling opens an OUTBOUND OTLP/HTTP connection — allowed under stdio-only, because
-# kaibo never *binds* a socket. Transport is OTLP/HTTP with protobuf, reusing kaibo's
-# reqwest — no gRPC.
-#
-# Env: KAIBO_TELEMETRY_{ENABLED,ENDPOINT,TRACES,LOGS,LOGS_ENDPOINT,METRICS,
-# METRICS_ENDPOINT,TIMEOUT_SECS,SERVICE_NAME,CAPTURE_CONTENT}, plus the standard
-# OTEL_* set. `headers` and `capture` are
-# file-only. Which attributes survive redaction, and why the guard is an allowlist:
-# kaibo://config/guide, "Telemetry".
-# ---------------------------------------------------------------------------
-
+# Optional OTLP/HTTP export. Ambient OTEL_* endpoints can enable it too.
+# Explicit enabled=false or OTEL_SDK_DISABLED disables export.
 # [telemetry]
-# enabled      = true                                # default: on if OTEL_* names an endpoint
-# endpoint     = "http://localhost:4318/v1/traces"   # OTLP/HTTP traces receiver
-# traces       = true                                # default true when enabled
-# logs         = true                                # default true when enabled
-# metrics      = true                                # default true when enabled
-# Where log records go. Omit it and kaibo derives the sibling of `endpoint` when that
-# ends in /v1/traces; any other shape is a load error rather than a guess.
-# logs_endpoint = "http://localhost:4318/v1/logs"
-# Same derivation for metrics. The one difference: with a non-standard `endpoint` and
-# no `metrics_endpoint`, a metrics you never wrote warns and stays off, while a
-# metrics you wrote as true is a load error — an upgrade must not break a config that
-# worked, but an asked-for signal kaibo cannot route must say so.
-# metrics_endpoint = "http://localhost:4318/v1/metrics"
-# timeout_secs = 10                                  # per-export deadline; must be > 0
-# service_name = "kaibo"                             # service.name on both Resources
-# Extra export headers (auth for a remote collector), sent on both signals. The
-# VALUES are secrets — they never appear in the kaibo://config render (only the
-# header names do).
-# headers = { authorization = "Bearer <token>" }
-# Export prompts, completions, and tool payloads on the spans. Default false — the
-# GenAI semantic conventions say an instrumentation must not capture these unless
-# asked. kaibo reads their env spelling too,
-# OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
-# capture_content = false
-# Export named attributes beyond the default set, in semantic-convention spelling —
-# use this when you want one field rather than all of them. A name kaibo does not
-# know is never exported, so a typo costs a field and never leaks one.
-# capture = ["gen_ai.output.messages"]
+# enabled = true
+# endpoint = "http://localhost:4318/v1/traces"
+# traces = true
+# logs = true
+# metrics = true
+# logs_endpoint = "http://localhost:4318/v1/logs"       # default derived from endpoint
+# metrics_endpoint = "http://localhost:4318/v1/metrics" # default derived from endpoint
+# timeout_secs = 10                 # > 0
+# service_name = "kaibo"
+# capture_content = false           # true exports prompts, responses, tool content
+# capture = ["gen_ai.output.messages"] # admit individual content attributes
+# headers = { authorization = "Bearer <token>" } # values are secrets; file-only
 
-# ---------------------------------------------------------------------------
-# [cas] — the media content-addressed store: where an artifact-producing tool writes
-# what it generated. On by default, and it follows persistence: while the state db is
-# open the CAS writes to disk at the dir below; while persistence is off (or degraded)
-# it runs IN MEMORY — artifacts stay fetchable by digest for this run only, and startup
-# warns loudly that they will not survive a restart. `enabled = false` turns it off
-# entirely and un-advertises every tool that needs it (the startup log and
-# kaibo://config's [cas] section say which state you are in, and why).
-#
-# Three tools write here: `generate` (rendered images), `save_artifact` (bulk text a
-# model saved — see [artifacts]), and `deliberate`, which keeps every dossier it builds
-# so you can read it back or hand it to a second synth. Dossiers need no extra key and
-# are usually the bulk of the store; see kaibo://config/guide.
-#
-# It lives under the XDG *data* dir, deliberately NOT beside the state db: the session
-# store is reconstructible bookkeeping, while these are artifacts you spent real provider
-# credits on and may never be able to reproduce (the seed is recorded in a sidecar, but
-# not every operation has one). A backup tool should carry them.
-#
-# NO GC, on purpose. kaibo never prunes this store and never rewrites an object — the
-# address IS the content hash, so an "edit" is a new object and an address you hold never
-# goes stale. Every artifact gets a <hex>.json sidecar (prompt, model, cast, timestamp,
-# mime, seed, producing tool) beside it, so an object reached BY ITS ADDRESS describes
-# itself. That is the access pattern: by digest, one lookup. Sweeping the store to survey
-# it does not scale and is not what this is for.
-#
-# max_bytes is OPT-IN, and unset is not the same as a huge number. Enforcing a ceiling
-# means summing every file in the store, on the write path, for EVERY new object — over
-# a store that never deletes and is sharded two levels deep. That walk is O(objects) and
-# only slows as the store fills, so an operator who never asked for a ceiling pays none
-# of it. Set it and you opt into that cost; leave it and disk-full is the backstop (the
-# OS reports it honestly). A write past a configured cap is REFUSED loudly — kaibo never
-# evicts to make room, because eviction would quietly make "we never delete" a lie.
-# Env: KAIBO_CAS_DIR / KAIBO_CAS_MAX_BYTES. CLI: --cas-dir / --cas-max-bytes.
-# ---------------------------------------------------------------------------
-
+# Artifact store: disk with persistence, otherwise memory; keep outside project trees.
 # [cas]
-# enabled   = true                         # false turns the CAS off and un-advertises
-#                                          # every tool that needs it
-# dir       = "~/.local/share/kaibo/cas"   # default: $XDG_DATA_HOME/kaibo/cas
-# max_bytes = 8589934592                   # 8 GiB. OMIT for no cap (the default);
-#                                          # 0 is a load error, not "refuse everything".
+# enabled = true
+# dir = "~/.local/share/kaibo/cas"   # default uses XDG_DATA_HOME when set
+# max_bytes = 8589934592            # optional 8 GiB soft cap; omit for no cap
+# A cap requires a store walk on each write. Full means refuse, never evict.
 
-# ---------------------------------------------------------------------------
-# [artifacts] — may the model team save what it writes? OFF by default.
-#
-# kaibo's one inverted switch. Every knob in [tools] is on until you turn it off; this
-# one is off until you turn it on, because it is the only surface where a MODEL decides
-# that bytes become durable. Turning it on grants standing permission, not automatic
-# behavior: the call must also pass `save_artifacts`, and [cas] above must be live. All
-# three, or the model never sees the tool.
-#
-# What it buys: a consult producing bulk output (a generated corpus, a long inventory, a
-# fixture) writes it into the CAS and names the digest in its answer, instead of
-# spending your context window on material you may only want to keep. You read it back
-# with the `read_cas` tool (metadata first, bounded ranges), or you do not.
-#
-# Limits are fixed, not configurable: 1 MiB per artifact, 8 artifacts and 8 MiB per call,
-# and a one-line label of at most 200 bytes. A save past a limit is refused and stores
-# nothing. The answer names every artifact it saved; a call with a session_id also
-# persists those digests beside the conversation.
-#
-# Env: KAIBO_ARTIFACTS_ENABLED (accepts only 1/true/yes and 0/false/no — this flag will
-# not guess, so `off` or a typo is a startup error rather than a silent enable).
-# CLI: --allow-save-artifact (serve only).
-# ---------------------------------------------------------------------------
-
+# Permit consult's model to save text. Caller must also set save_artifacts=true.
 # [artifacts]
-# enabled = false                          # true lets a consult that ASKS save artifacts
+# enabled = false                   # default; --allow-save-artifact enables in serve
 
-# ---------------------------------------------------------------------------
-# [backends.<name>] — CONNECTIONS only: `kind` picks the wire and its client. The
-# completion wires (anthropic | deepseek | gemini | openrouter | openai) serve the
-# reasoning slots; the media kinds (stability | openai-images | gemini-images | dashscope | bfl) serve `image` slots
-# only. The rest describes the wire (endpoint, key source, per-request deadline).
-# Models live on cast slots, never here.
-#
-# Keys are referenced, never inlined, and every source is DECLARED — kaibo seeds
-# none, so a backend reads only what you write here. Three sources, env winning over
-# the single file/command source: api_key_env names an env var, api_key_file a path
-# whose contents (trimmed) are the key (~ ok on the path), api_key_cmd a command whose
-# stdout (trimmed) is the key (raw argv — no shell, stdin closed, 30s ceiling).
-# A backend declares at most one of api_key_file and api_key_cmd — both = load error.
-# key_optional=true falls
-# back to a placeholder bearer token (keyless local servers). base_url is legal on
-# the openai kind (required for a new backend), the anthropic and gemini kinds (optional —
-# unset still dials rig's built-in api.anthropic.com / generativelanguage.googleapis.com),
-# and the media kinds (optional — unset dials api.stability.ai for stability,
-# api.openai.com/v1 for openai-images, generativelanguage.googleapis.com for
-# gemini-images, dashscope-intl.aliyuncs.com for dashscope, api.bfl.ai for bfl);
-# set it to point the same wire at a
-# compatible gateway/proxy (or a local server) instead — a ROOT in every case,
-# since the client appends its own path. Every other keyed kind rejects
-# base_url at load (rig fixes those endpoints).
-# ---------------------------------------------------------------------------
-
-# --- The five built-ins, shown COMMENTED OUT with their current models. They ship
-#     in code already — kaibo runs with all five even when this whole file is
-#     absent — but unlike the key wiring, kaibo seeds NO key source: uncomment one
-#     to CHANGE something (a gateway base_url, a different key source), and note the
-#     key lines below are the conventional sources to DECLARE, not defaults that
-#     exist without them. The alias names (claude, google, local,
-#     lemonade, gemma, gemma4) are reserved at both levels regardless of whether
-#     you uncomment them — naming a new backend or cast after one is a loud
-#     collision error. ---
-
-# [backends.anthropic]                         # alias: claude
-# kind = "anthropic"
-# api_key_env  = "ANTHROPIC_API_KEY"
+# Credentials: declare sources explicitly; built-ins assume none.
+# env wins over file OR command. api_key_file and api_key_cmd are mutually exclusive.
+# Key values stay in the environment, file, or vault. Clients resolve fresh per role.
+# MCP config/environment changes need a server restart; rotated files do not.
+# [backends.anthropic]
+# api_key_env = "ANTHROPIC_API_KEY"
 # api_key_file = "~/.anthropic-key.txt"
-# api_key_cmd  = ["op", "read", "op://Vault/Kaibo/Anthropic-key"]   # OR a command; see below
-# Uncomment to dial an Anthropic-Messages-API-compatible gateway/proxy (e.g. a
-# corporate LLM gateway) instead of api.anthropic.com directly. Optional —
-# unlike the openai kind, unset still resolves to rig's built-in endpoint.
-# base_url = "https://llm-gateway.example.internal"
+# Alternative to api_key_file:
+# api_key_cmd = ["op", "read", "op://Vault/Kaibo/Anthropic-key"]
+# Commands use argv, no shell; stdin closed; 30-second limit; output never logged.
 
 # [backends.deepseek]
-# kind = "deepseek"
-# api_key_env  = "DEEPSEEK_API_KEY"
 # api_key_file = "~/.deepseek-key"
-
-# [backends.gemini]                            # alias: google
-# kind = "gemini"
-# api_key_env  = "GEMINI_API_KEY"
-# api_key_file = "~/.gemini-api-key"
-# Uncomment to dial a Gemini-API-compatible gateway/proxy (e.g. a corporate LLM
-# gateway) instead of generativelanguage.googleapis.com directly. Optional —
-# unset still resolves to rig's built-in endpoint. A HOST ROOT, same as the
-# anthropic base_url above: rig appends its own /v1beta path.
-# base_url = "https://llm-gateway.example.internal"
-
-# OpenRouter: one key, every major model family, through a single gateway. Fixed
-# endpoint — rig owns it, so a base_url here is a loud load error, unlike the openai
-# kind below. Reasoning is on by default on every slot (OpenRouter's unified
-# `{"reasoning":{"effort":…}}`, translated per upstream model and silently dropped
-# where a model has no such knob) — see [casts.or-deep] for pushing a slot past
-# [defaults] effort into OpenRouter's deeper `xhigh`/`max` rungs.
-#
-# One slug routes across COMPETING HOSTS whose data policies differ, and kaibo's
-# prompts carry your source — so every request pins no-collection routing
-# (`provider.data_collection = "deny"`) BY DEFAULT. A model whose only hosts
-# retain/train on prompts (most `:free` variants) then fails loudly instead of
-# leaking quietly. `data_collection = "allow"` is the explicit opt-in: kaibo
-# emits no restriction and your OpenRouter account settings govern. This knob
-# exists only on the openrouter kind — anywhere else it's a load error.
+# [backends.gemini]
+# api_key_env = "GEMINI_API_KEY"
 # [backends.openrouter]
-# kind = "openrouter"
-# api_key_env  = "OPENROUTER_API_KEY"
-# api_key_file = "~/.openrouter-key"
-# kaibo always denies unless you uncomment this line:
-# data_collection = "allow"
+# api_key_env = "OPENROUTER_API_KEY"
+# data_collection = "deny"          # default; allow defers to account routing policy
 
-# [backends.openai-local]                            # aliases: local, lemonade, gemma, gemma4
-# kind = "openai"
-# base_url = "http://localhost:13305/api/v1"   # also overridable via OPENAI_BASE_URL
-# api_key_env  = "OPENAI_API_KEY"
-# api_key_file = "~/.openai-key"
-# key_optional = true                          # keyless local default → placeholder
-
-# --- New backends: any number of openai-kind endpoints, each its own connection.
-#     A new backend must declare its `kind`; it carries NO key source — declare one
-#     (api_key_env / api_key_file / api_key_cmd) — and your fields apply on top of
-#     the kind's non-key defaults. A new openai-kind backend must also
-#     set `base_url` (the OPENAI_BASE_URL / local-default fallback belongs to the
-#     built-in `openai-local` backend alone — a forgotten base_url is a load error, not
-#     a silent dial of the wrong server). ---
-
-# Hosted OpenAI, keyed. Backends take their own `aliases`, just like casts — a new
-# alias must not collide with a built-in or another name.
+# A backend is a named connection; kind is required on new backends.
+# Hosted OpenAI uses Responses by default; other openai endpoints use Chat Completions.
 [backends.gpt]
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
-aliases = ["oai"]                            # now `oai/gpt-5.6-sol` resolves to this backend
 key_optional = false
+aliases = ["oai"]
 
-# A second local llama.cpp server on another port, keyless. A slow local model
-# legitimately wants a longer per-request leash than a hosted API.
 [backends.llama]
 kind = "openai"
 base_url = "http://localhost:8080/v1"
-key_optional = true
+key_optional = true                 # missing source uses a placeholder; broken source fails
 request_timeout_secs = 1800
 
-# An OpenAI-compatible gateway/proxy that implements OpenAI's Responses API at
-# /v1/responses (verified against a real gateway) — not OpenAI Platform's own
-# endpoint, so kaibo can't infer this from the URL. `wire = "responses"` opts it
-# into rig's Responses client for interactive calls, the shape current GPT-5.x
-# reasoning models require (they reject Chat Completions' `max_tokens` outright).
-# `wire = "chat"` is the symmetric opt-out, including on OpenAI Platform's own
-# endpoint. Either way, batch stays Platform-only: a gateway proxying /v1/responses
-# doesn't necessarily proxy /v1/batches or the Files API, so `wire` never affects
-# `batch_submit` eligibility — only `[backends.gpt]` above (Platform's exact URL)
-# can staff a batch synth.
+# A gateway that implements Responses must opt into that wire.
 [backends.gateway]
 kind = "openai"
 base_url = "https://llm-gateway.example.internal/v1"
 api_key_env = "GATEWAY_API_KEY"
-wire = "responses"
+wire = "responses"                 # responses | chat; interactive only
 
-# A key from a command — `api_key_cmd`: the command's stdout, trimmed, is the key.
-# Raw argv, NO shell (no pipes/redirection/$VAR — wrap a pipeline in a script and
-# name the script). The child inherits kaibo's env, gets a CLOSED stdin (so an
-# interactive unlock prompt fails fast instead of hanging), a 30s ceiling, and its
-# output is never logged. 1Password (`op read op://Vault/Item/Field`) is the
-# natural fit; `pass show`, `gh auth token`, a vault CLI all work. A backend may
-# declare api_key_file OR api_key_cmd, never both — env (api_key_env) still wins
-# when set, so CI can override the vault with a one-off env var.
 [backends.vault-keyed]
 kind = "deepseek"
 api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 
-# ---------------------------------------------------------------------------
-# [casts.<name>] — COMPOSITIONS: role → model, freely spanning backends. This is
-# what the `cast` call param (and `server.cast` / KAIBO_CAST / --cast) selects.
-#
-# The calling agent sees your cast names — name them for intent (`local-only`,
-# `deep-dive`) so it can route by name without reading this file.
-#
-# Roles: explorer, synth (the reasoning phases), and image (the media member — it
-# points at a media backend, kind stability, openai-images, gemini-images, dashscope,
-# or bfl, and staffs `generate`; see the image-slot examples below). A typo'd role is a loud load
-# error. A cast may omit roles — the tool that needs a missing role fails at call time,
-# naming the gap ("cast `notes` has no synth slot"); absent = capability absent.
-#
-# Slot forms:
-#   role = "backend/model-id"                                  # the common case
-#   role = { backend = "…", id = "…", vision = true, … }       # pins + tunables
-# The first "/" splits a string ref, so HuggingFace-style ids keep their inner
-# slash. A slot ref borrows the backend's CONNECTION only — it never follows
-# another cast, so chains and cycles are structurally impossible. An unknown
-# backend in a slot is a load error naming the known backends.
-#
-# Backends and casts are SEPARATE NAMESPACES, so the same name may legally head
-# both — [backends.gpt] below (a connection) and [casts.gpt] further down (a
-# composition) are two different things that happen to share a name, not a
-# collision. A cast's slot still spells out which backend it wants
-# (`{ backend = "gpt", id = "…" }`), so the shared name never needs
-# disambiguating at the point of use.
-# ---------------------------------------------------------------------------
-
-# --- Advanced — a chimera: mix model FAMILIES across roles, a different lineage per
-#     job, named as one team (`cast = "chimera"`). A DeepSeek explorer and a Claude
-#     synth give you mistakes that don't line up. It's the power-user option and
-#     wants a key per family. The common case is simpler: ONE outside family, explorer
-#     and synth both within it (the built-in `deepseek`/`gemini`/`anthropic` casts, or
-#     `local-only` below) — that single lineage already augments your own agent's. ---
-
+# Cast examples. Usually start with a built-in family; mix backends when useful.
+# String slots split at the first slash. Table slots accept per-model tunables.
 [casts.chimera]
-explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
-synth    = "claude/claude-sonnet-4-6"       # the voice that answers — Claude family
-
-# --- Privacy posture: nothing leaves the box. `gemma` is the built-in alias for
-#     the local-default `openai-local` backend. ---
+explorer = "deepseek/deepseek-flash"
+synth = "claude/claude-sonnet-4-6"
 
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
-synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
+synth = "gemma/Gemma-4-26B-A4B-it-GGUF"
 
-# --- The table form, part 1: capability pins. `vision = true` overrides the
-#     built-in classifier (Anthropic/Gemini multimodal-in, DeepSeek text-only,
-#     generic openai endpoints vision-off until you say otherwise — kaibo can't
-#     know what's behind an arbitrary id, so opt in, don't guess). A vision slot on
-#     an openai-compatible backend really sees: `view_image` reads the file and kaibo
-#     delivers it on the user-turn channel (the openai wire forbids images in a tool
-#     result), so a local Qwen-VL/llava views workspace images the same as a hosted
-#     Claude or Gemini does. ---
-
+# Pin vision on generic endpoints when the actual model accepts image input.
 [casts.vlm]
-explorer = "llama/qwen2.5-coder-7b"                              # bare ref: just the id
-synth    = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
-
-# --- The `image` slot: a MEDIA member on the team. It points at a media backend
-#     (kind = "stability", "openai-images", "gemini-images", "dashscope", or "bfl")
-#     and produces artifacts instead of
-#     text, so the reasoning tunables (effort, thinking_budget, temperature, ...)
-#     do not apply to it — writing one there is inert and kaibo://config flags it.
-#     A cast carries it beside its reasoning slots; a cast without one cannot staff
-#     the media tools. ---
-
-# [backends.sd]
-# kind = "stability"              # key: STABILITY_API_KEY / ~/.stability-key.txt
-
-# [casts.artist]
-# explorer = "deepseek/deepseek-flash"
-# synth    = "deepseek/deepseek-flash"
-# image    = "sd/core"            # core | ultra | an sd3.5 variant (e.g. sd3.5-large)
-
-# --- The openai-images kind covers two shapes with one wire. Hosted OpenAI: no
-#     base_url (unset dials api.openai.com/v1); the key is required — the seeded
-#     default, so a missing OPENAI_API_KEY / ~/.openai-key fails loudly instead of
-#     sending a placeholder bearer to a paid endpoint. Local stable-diffusion.cpp
-#     sd-server: base_url through /v1 plus key_optional = true — keyless is an
-#     explicit opt-in on this kind, stated beside the local endpoint it belongs to.
-#     Provider knobs (size, quality, n, output_format, ...) ride the `generate`
-#     tool's fields, not the config; output_format is checked before the call and
-#     must be png, jpeg, or webp (the set kaibo's media store can name on disk). ---
-
-# [backends.oai-images]
-# kind = "openai-images"          # key: OPENAI_API_KEY / ~/.openai-key (required —
-#                                 # the default; a missing key fails at call setup)
-
-# [backends.sdcpp]
-# kind = "openai-images"
-# base_url = "http://localhost:1234/v1"   # local sd-server...
-# key_optional = true                     # ...which needs no key: explicit opt-in
-
-# [casts.hosted-artist]
-# image = "oai-images/gpt-image-1"        # the request's `model` field
-
-# [casts.local-artist]
-# image = "sdcpp/sd3.5-large"             # whatever the local server loaded
-
-# --- The gemini-images kind is the odd one: Gemini has no images endpoint. Image
-# generation is models/{model}:generateContent — the same call as text — with
-# responseModalities naming what comes back. It is a separate kind from `gemini` so a
-# cast slot knows which use it points at; a reasoning slot aimed here would resolve a
-# completion model that answers in pictures. Same key as `gemini`.
-# [backends.gemini-images]
-# kind = "gemini-images"          # key: GEMINI_API_KEY / ~/.gemini-api-key
-# # base_url defaults to https://generativelanguage.googleapis.com
-#
-# It takes input images (an edit is an instruction plus the picture it refers to) and
-# has no named operations, so `generate`'s `op` parameter is refused on it. It answers
-# with words as well as bytes; kaibo shows what the model said above the digests.
-
-# --- The dashscope kind reaches Alibaba's wan image family. base_url is optional
-#     (unset dials dashscope-intl.aliyuncs.com); a dedicated-endpoint subscription
-#     sets its own host. Either way it is a ROOT — kaibo appends the route.
-#     Media-only on purpose: the same DashScope host serves TEXT on an
-#     OpenAI-compatible endpoint, so a qwen or deepseek model there belongs on a
-#     kind = "openai" backend pointed at <host>/compatible-mode/v1, beside this one.
-#     Provider knobs (n, size, seed, negative_prompt, ...) ride the `generate` tool's
-#     fields; n is 1..4, and size is "W*H" whose total pixels must land between
-#     589824 and 2073600. DashScope delivers artifacts as presigned links rather
-#     than inline bytes, so kaibo fetches each over TLS and stores the bytes; the
-#     mime comes from that response, and a type the media store cannot name is
-#     refused rather than guessed. ---
-
-# [backends.wan]
-# kind = "dashscope"              # key: DASHSCOPE_API_KEY / ~/.dashscope-key
-# base_url = "https://ws-<id>.us-east-1.maas.aliyuncs.com"   # dedicated endpoint
-
-# [casts.wan-artist]
-# image = "wan/wan2.6-t2i"        # the request's `model` field
-
-# --- The bfl kind reaches Black Forest Labs' FLUX family. base_url is optional
-#     (unset dials api.bfl.ai). Every operation is asynchronous — a create call
-#     returns a job id and a polling_url kaibo polls, in-call for a fast generation
-#     and as a `job-N` handle only past that budget. The slot's model id names one of
-#     five operations (flux-dev, flux-2-pro, flux-2-flex, flux-pro-1.1-ultra,
-#     flux-kontext-pro) and doubles as `generate`'s default `op`; a per-call `op`
-#     overrides it. Every operation takes input_image..input_image_8 in `inputs`. ---
-
-# [backends.bfl]
-# kind = "bfl"                    # key: BFL_API_KEY / ~/.bfl-key
-
-# [casts.flux-artist]
-# image = "bfl/flux-2-pro"        # the default operation; override per call with `op`
-
-# --- The table form, part 2: per-slot tunables. Each overrides its [defaults]
-#     per-role value for THIS slot only; knobs you omit fall back. Available:
-#     max_tokens, thinking_budget, temperature, effort, thinking_style, and
-#     `preamble` (the per-model system prompt) — they track the model, not the
-#     server. A typo'd knob is a loud load error. See [prompts] below for how the
-#     per-model `preamble` layers over the per-phase prompt and the built-in. ---
+explorer = "llama/qwen2.5-coder-7b"
+synth = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 
 [casts.deep-dive]
-aliases  = ["deep"]                          # casts (and backends) take aliases
+aliases = ["deep"]
 explorer = { backend = "deepseek", id = "deepseek-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
-synth    = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
-
-# --- The built-in `openrouter` backend already has a key source, so a custom cast on
-#     it needs only slots. `~author/family-latest` aliases (OpenRouter serves them for
-#     anthropic/google/openai/x-ai/moonshotai — not every family) track the newest
-#     release instead of rotting; `effort = "xhigh"` here pushes the synth slot past
-#     [defaults] synth_effort ("high"). OpenRouter takes all seven rungs on every model
-#     and maps each onto the upstream's native knob — it will carry a rung to a model
-#     that refuses it on that vendor's direct API. The same knob is the opt-out:
-#     reasoning is on by default for everything kaibo calls, and `effort = "none"` on a
-#     slot turns it off (structurally, not by asking for zero) when the cost/latency
-#     isn't wanted — reasoning bills as output tokens. ---
+synth = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
 
 [casts.or-deep]
 explorer = "openrouter/~google/gemini-flash-latest"
-synth    = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", effort = "xhigh" }
+synth = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", effort = "xhigh" }
 
-# --- A per-model prompt: a local Gemma explorer wants different framing than a
-#     hosted Claude would. `preamble` lives on the slot, beside the tunables, and
-#     wins over [prompts].explorer and the built-in for THIS model. ---
-
+# Slot preamble > [prompts].phase > built-in; one synth slot can serve several phases.
 [casts.tuned-local]
-explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Quote exact numbered lines; never guess a path." }
-synth    = "claude/claude-sonnet-4-6"        # no per-model prompt → [prompts] or built-in
-
-# --- Hosted GPT end to end, both roles on the keyed backend above.
-#     Sol is the flagship synth; Luna is the fast/tool-capable explorer. Both slots
-#     pin vision because generic openai endpoints default blind until you say otherwise.
-#     Per-slot `effort` trades latency/cost against reasoning depth. The rungs are a
-#     property of the MODEL, not the family: gpt-5.6 goes up to "max", gpt-5.2 stops at
-#     "xhigh", gpt-5.1 at "high", and gpt-5's bottom rung is "minimal" where 5.1+ use
-#     "none". kaibo passes yours through; OpenAI names its supported values if it
-#     disagrees. Note rig's own Responses client caps at "xhigh" — kaibo refuses "max"
-#     up front, naming the cast and slot, rather than letting it die mid-call. ---
+explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Cite exact numbered lines." }
+synth = "claude/claude-sonnet-4-6"
 
 [casts.gpt]
 explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
-synth    = { backend = "gpt", id = "gpt-5.6-sol",  vision = true, effort = "high" }
+synth = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
 
-# A cheaper balanced hosted GPT cast: same fast explorer, Terra as the answerer.
 [casts.gpt-balanced]
-explorer = { backend = "gpt", id = "gpt-5.6-luna",  vision = true, effort = "low" }
-synth    = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "medium" }
+explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
+synth = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "medium" }
 
-# --- A custom batch cast: the offline `batch_submit` lane (max thinking). `lane = "batch"`
-#     on the SYNTH SLOT declares it (lane is a per-slot property, not a cast-level one —
-#     it needs a synth slot on a batch-capable backend: Anthropic, Gemini, or a hosted
-#     OpenAI Platform backend like `gpt` above). The built-in
-#     `batch = true` spelling below is backward-compat sugar for exactly this: it sets the
-#     synth slot's lane, nothing more. The built-in anthropic-batch / gemini-batch casts are
-#     the same shape and, like this one, run the synth alone (no explorer) — but that's a
-#     choice, not a rule: a cast MAY pair an interactive explorer with an offline synth (the
-#     `deliberate` shape), since the lane lives on the slot, not the whole cast. Gemini Pro
-#     especially earns this lane: interactively it's refusal-prone on security framing and
-#     503s under load, but batch sidesteps both — so Pro is more reliable via batch (the
-#     built-in `gemini-batch` cast, or a custom one like this). ---
-
+# Batch-only casts need a synth; deliberate needs an interactive explorer beside it.
 [casts.pro-batch]
-batch    = true
-synth    = "gemini/gemini-pro-latest"        # batch-capable synth; Pro is more reliable via batch
-# Equivalent, spelled directly on the slot (no cast-level sugar):
-#   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+batch = true                       # legacy sugar for synth lane="batch"
+synth = "gemini/gemini-pro-latest"
 
-# Hosted GPT on the same lane. OpenAI's batch is file-based under the hood (kaibo uploads
-# the requests as a JSONL file in YOUR OpenAI account, then downloads the results) — the
-# kaibo-facing shape is identical to the others. It needs the HOSTED backend: the Batch API
-# is OpenAI Platform's, so `lane = "batch"` on a local OpenAI-compatible server is a load
-# error naming the fix. Pairing an interactive explorer with the offline synth is what makes
-# a cast `deliberate`-capable — Luna surveys the repo live and builds the cited dossier, Sol
-# reasons over it offline at max effort.
 [casts.gpt-batch]
-synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
+synth = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 
 [casts.gpt-deliberate]
 explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
-synth    = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
-#
-# OUTPUT BUDGET. Batch FLOORS the knobs, never caps them: "high" effort and a 32768-token
-# output floor (it never skimps on the cheap async lane), and a slot that asks for MORE keeps
-# it — `effort = "xhigh"` on a batch synth reaches the provider as written, which also means
-# the provider's ladder applies (a Gemini batch slot still takes only minimal/low/medium/high,
-# so `xhigh` there is now the provider's error rather than a silent demotion). The floor is on
-# DEPTH, so `effort = "none"` survives it: a cheap bulk-extraction fan-out stays reasoning-off
-# rather than being lifted to "high" and billing thinking on every item. Reasoning bills
-# against that same output budget, so a big attached-file review at max thinking can spend the
-# budget thinking and truncate the answer — kaibo flags such a result INCOMPLETE with its
-# finishReason rather than passing off the cut-off fragment as a clean answer. Give batch more
-# answer headroom by raising `max_tokens` on the synth slot; it's a floor too, so a higher
-# value wins, and mind each model's output ceiling (Gemini Pro is generous; some backends cap
-# lower). A per-slot `thinking_budget` is ignored here (Gemini takes a level; Anthropic floors
-# it), so `max_tokens` is the knob worth setting:
-#   synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch", max_tokens = 65536 }
+synth = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 
-# --- DELIBERATE casts: an interactive explorer PLUS an offline synth. `deliberate` runs
-#     the explorer live to build a cited dossier, then hands dossier+question to the offline
-#     synth to reason over — a frontier model's deepest pass without holding a session open.
-#     The synth's lane picks the offline mechanism: `batch` (a provider batch, half price,
-#     durable handle) below, or `direct` (one long LOCAL completion) further down. Unlike the
-#     synth-only batch casts above, these carry BOTH slots — the explorer is what makes it a
-#     deliberate cast rather than a plain batch one.
-#
-#     THIS SECTION IS WHAT TURNS `deliberate` ON: no built-in cast has this shape, so the
-#     tool is dark on a stock install. Adapt any one cast below and it appears. All three
-#     hosted batch providers work, as does a big LOCAL model on `direct` (no batch API at
-#     all). ---
-
-# Fable on the batch lane, with a Sonnet explorer building the dossier.
 [casts.fable]
 explorer = "anthropic/claude-sonnet-4-6"
-synth    = { backend = "anthropic", id = "claude-fable-5", lane = "batch" }
+synth = { backend = "anthropic", id = "claude-fable-5", lane = "batch" }
 
-# Gemini Pro deliberating on the batch lane, with a cheap Flash-Lite explorer.
 [casts.gemini-deliberate]
 explorer = "gemini/gemini-flash-lite-latest"
-synth    = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
 
-# --- The other offline lane, `lane = "direct"`: one long completion kaibo runs itself
-#     against a big LOCAL model (no async provider API, no `batch = true` sugar for this
-#     one — spell it on the slot). For offline deliberation over a big model that's too slow
-#     to run inside a live tool loop and has no batch endpoint. `deliberate` consumes it: it
-#     builds the dossier with the interactive explorer, then runs the direct synth as one
-#     long local completion under a session-scoped `job-N` handle. ---
-
+# Direct is one long completion, with no provider batch API.
 [casts.local-direct]
-explorer = "gemma/Gemma-4-E4B-it-GGUF"       # an interactive explorer beside an offline synth
-synth    = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
+explorer = "gemma/Gemma-4-E4B-it-GGUF"
+synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 
-# ---------------------------------------------------------------------------
-# [context] — "house rules" files spliced into every consultation tool's preamble
-# as standing guidance, so kaibo's models inherit the calling agent's conventions.
-# Vendor-neutral: the only default is the emerging AGENTS.md convention.
-# ---------------------------------------------------------------------------
-# Two lists, two failure modes:
-#   project_files — root-relative, read IF PRESENT (absent is normal); each must
-#     stay within the project root (a ../ escape or out-of-tree symlink is refused).
-#     Default ["AGENTS.md"]; an explicit [] opts out. Env KAIBO_PROJECT_FILES
-#     (colon-separated) / CLI --project-context-file (repeatable).
-#   user_files — absolute/tilde, read REQUIRED (a missing declared file is a loud
-#     error). Read in trusted server-side Rust; only the CONTENTS reach the model,
-#     never the path, so the read-only shell's scope is not widened. Env
-#     KAIBO_USER_FILES / CLI --user-context-file.
-#
+# Image generation needs a media-kind backend and an image slot. Examples:
+# [backends.sd]
+# kind = "stability"
+# api_key_env = "STABILITY_API_KEY"
+# [casts.artist]
+# image = "sd/core"
+
+# [backends.oai-images]
+# kind = "openai-images"
+# api_key_env = "OPENAI_API_KEY"
+# [casts.hosted-artist]
+# image = "oai-images/gpt-image-1"
+
+# [backends.sdcpp]
+# kind = "openai-images"
+# base_url = "http://localhost:1234/v1"
+# key_optional = true
+# [casts.local-artist]
+# image = "sdcpp/sd3.5-large"
+
+# [backends.gemini-images]
+# kind = "gemini-images"
+# api_key_env = "GEMINI_API_KEY"
+
+# [backends.wan]
+# kind = "dashscope"
+# api_key_env = "DASHSCOPE_API_KEY"
+# base_url = "https://ws-<id>.us-east-1.maas.aliyuncs.com" # optional dedicated endpoint
+# [casts.wan-artist]
+# image = "wan/wan2.6-t2i"
+
+# [backends.bfl]
+# kind = "bfl"
+# api_key_env = "BFL_API_KEY"
+# [casts.flux-artist]
+# image = "bfl/flux-2-pro"
+
+# House rules: project files read if present; user files required when a phase runs.
 # [context]
-# project_files = ["AGENTS.md"]
-# user_files    = ["~/.claude/CLAUDE.md"]
+# project_files = ["AGENTS.md"]      # root-relative; [] opts out
+# user_files = []                   # absolute/tilde; contents sent to reading phases
 
-# ---------------------------------------------------------------------------
-# [prompts] — replace a phase's role framing.
-#
-# [context] adds project guidance to the built-in prompt. [prompts] replaces the
-# built-in role framing instead, and the replacement is total. The kaish shell
-# contract is not part of it: that text rides the run_kaish tool, so every phase
-# keeps it, whichever prompt it runs.
-#
-# Set these here only. A calling agent cannot set a prompt. An empty value is a
-# load error.
-#
-# Precedence per phase, highest first: a slot's `preamble` (per model, above),
-# then [prompts].<phase>, then the built-in.
-#
-# The synth slot answers both `consult` and `oneshot`. Each keeps its own key
-# here, so the two can differ.
-#
-# One key per phase:
-#   explorer  every survey: standalone `explore`, the survey nested inside
-#             `consult`, and `deliberate`'s dossier. One key, and `explore`'s
-#             report goes to a different reader than the other two — see
-#             `kaibo://config/guide`.
-#   consult   the driver that reads spans and delegates surveys.
-#   oneshot   the toolless answer, with no codebase access.
-#   batch     the offline answer, at maximum thinking depth.
-# ---------------------------------------------------------------------------
-#
+# Full role-framing replacements; file-only; empty values fail loading.
 # [prompts]
-# explorer = "You are a security auditor. Hunt injection sinks and unsafe deserialization."
-# oneshot  = "Answer concisely; you have no codebase access, so reason from what you're given."
-# batch    = "Answer concisely; you're offline at max thinking. Reason from what you're given."
-# consult  = """
-# You are a staff engineer reviewing this codebase.
-# Prefer architectural answers; name the file:line that carries each claim.
-# """
+# explorer = "You are a security reviewer. Ground the report in file:line citations."
+# consult = "You are the synthesis agent. Read the evidence and give a cited answer."
+# oneshot = "You are the synthesis agent. Answer from the supplied context."
+# batch = "You are the synthesis agent. Reason from the supplied dossier."

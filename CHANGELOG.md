@@ -16,13 +16,18 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
+- An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.
+- A retried model call is timed per attempt, so latency is the provider's time, never kaibo's backoff.
+- `kaibo config-guide` prints the configuration reference, even when the config is broken.
+- The configuration reference has a host agents section, starting with Codex MCP access, timeouts, and approval.
 
-- **`job_get` shows each role's model latency on a running job** — `synth chat: last
-  107 s, p50 98 s over 9 calls`, so a slow backend is visible at the first poll.
-- **A model call on an async job that reaches `slow_chat_secs` warns the caller** through
-  `job_wait`. Default 60; `0` turns it off. Env `KAIBO_SLOW_CHAT_SECS`.
-- **A retried model call is timed and counted per attempt** — the beat, the client
-  metrics, and `inference_calls` see the provider's time, never kaibo's backoff wait.
+### Changed
+- The configuration reference and template are less than half their former length.
+- A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
+
+### Fixed
+- A connection failure no longer reads as a provider rejection; the message names the checks to run.
 
 ## [0.5.0] — 2026-09-10
 

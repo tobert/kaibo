@@ -151,6 +151,15 @@ pub enum Command {
     Configure(ConfigureArgs),
     /// Print the annotated config.toml template (the `kaibo://config/example` document).
     ExampleConfig,
+    /// Print the configuration reference (the `kaibo://config/guide` document). Reads no
+    /// config, so it works when the config is broken.
+    ConfigGuide,
+}
+
+/// Print the embedded configuration reference without reading config or contacting providers.
+pub fn run_config_guide() -> i32 {
+    print!("{}", crate::server::CONFIG_GUIDE_MD);
+    0
 }
 
 /// `kaibo configure` — the same guided "set up my models" walkthrough as the

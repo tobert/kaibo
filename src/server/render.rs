@@ -42,6 +42,8 @@ pub(super) fn consult_result(
 /// from the error chain by [`classify_failure`].
 #[derive(Debug, PartialEq, Eq)]
 enum FailureKind {
+    /// The HTTP request failed without evidence of a provider rejection.
+    Connection,
     /// A transient provider condition (overload / rate-limit / timeout / reset). Worth a
     /// caller-driven manual retry.
     TransientProvider,
@@ -129,6 +131,11 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     ];
     if TRANSIENT.iter().any(|t| s.contains(t)) {
         FailureKind::TransientProvider
+    } else if s.contains("httperror") && s.contains("error sending request") {
+        // rig can flatten reqwest's error chain to this text, losing the DNS, proxy,
+        // TLS, or OS cause. Preserve any specific timeout/reset diagnosis above;
+        // this establishes only a transport failure, not a sandbox diagnosis.
+        FailureKind::Connection
     } else if empty_answer {
         FailureKind::EmptyAnswer
     } else {
@@ -138,12 +145,12 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
 
 /// Surface a *runtime* consultation failure as a **tool-result error** (`is_error =
 /// true`) rather than a protocol-level `internal_error`. A consult is an *optional*
-/// augmentation: the calling agent should read a clear message and proceed *without* the
-/// second opinion — not have its own tool call fail at the JSON-RPC layer. The framing is
+/// augmentation: the calling agent should read a clear message and ask its user whether to
+/// retry, use another cast, or continue without the second opinion — not have its own tool
+/// call fail at the JSON-RPC layer, and not decide alone to go on without it. The framing is
 /// tailored by [`classify_failure`] so the agent can drive the right next step: a
-/// transient overload/timeout invites a manual retry (kaibo does **not** back off and
-/// retry — one completion is bounded by the backend's `request_timeout`/`connect_timeout`;
-/// see the failure-policy FAQ and `docs/config.md`), a non-transient provider error
+/// transient overload/timeout invites a caller retry after the completion wrapper's
+/// applicable retries have failed (`completion_retry`, `docs/config.md`); a provider error
 /// doesn't, a malformed generation says the retries ([`crate::completion_retry`]) are
 /// already spent, and a kaibo-side failure is named honestly rather than blamed on the
 /// provider. Setup errors *before* the model call — unknown cast, an attachment outside
@@ -221,30 +228,44 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
     let malformed = format!(
         "The provider could not parse a tool call this model generated — the model \
          fumbled one turn, and the request itself is fine. kaibo already sent that \
-         request {} more times and the model repeated the mistake, so retry this call, \
-         or run it on a cast from a different family.",
+         request {} more times and the model repeated the mistake. Ask the user whether \
+         to retry this call, run it on a cast from a different family, or continue \
+         without the consultation.",
         crate::completion_retry::MALFORMED_RETRIES
     );
+    let transient = format!(
+        "This looks like a transient provider condition (overload, rate limit, or \
+         timeout). kaibo retries an overload or rate limit up to {} times before it \
+         returns one; a timeout or reset is not retried. Ask the user whether to retry \
+         this call, run it on another cast, or continue without the consultation.",
+        crate::completion_retry::TRANSIENT_RETRIES
+    );
     let guidance = match classify_failure(&err) {
-        FailureKind::TransientProvider => {
-            "This looks like a transient provider condition (overload, rate limit, or \
-             timeout). kaibo does not back off and retry — you may retry this call, or \
-             proceed without the consultation."
+        FailureKind::Connection => {
+            "The HTTP request got no response from the provider, so this is not a \
+             provider rejection. Check the endpoint, DNS, proxy, TLS, and the network \
+             access of the process running kaibo. A host agent can give its MCP servers \
+             and its shell commands different network access: see Host agents in \
+             kaibo://config/guide (`kaibo config-guide`). Ask the user whether to retry \
+             this call after the access is fixed, run it on another cast, or continue \
+             without the consultation."
         }
+        FailureKind::TransientProvider => &transient,
         FailureKind::Provider => {
-            "The model or its provider rejected the request; retrying is unlikely to help \
-             — proceed without the consultation, or check the cast and config."
+            "The model or its provider rejected the request; retrying is unlikely to help. \
+             Check the cast and its backend configuration. Ask the user whether to run \
+             this on another cast or continue without the consultation."
         }
         FailureKind::MalformedGeneration => &malformed,
         FailureKind::EmptyAnswer => {
             "The model ran but delivered no answer text — a model-side outcome, not a \
-             kaibo bug. You may retry, and a different cast often helps; if the \
-             diagnostics report finish_reason \"length\", raise that slot's max_tokens \
-             so reasoning cannot starve the answer."
+             kaibo bug. If the diagnostics report finish_reason \"length\", raise that \
+             slot's max_tokens so reasoning cannot starve the answer. Ask the user whether \
+             to retry, use a different cast, or continue without the consultation."
         }
         FailureKind::Internal => {
-            "This is a kaibo-side error (not the provider) — please report it; you can \
-             still proceed without the consultation."
+            "This is a kaibo-side error, not the provider's. Ask the user whether to \
+             retry this call or continue without the consultation."
         }
     };
     format!("{tool} could not complete (cast `{cast}`): {detail}. {guidance}")
@@ -298,12 +319,6 @@ pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
     }
 }
 
-/// Append a one-line provenance footer naming the cast and the model(s) that
-/// produced `answer`. The point is legibility: a caller — a cross-model study most
-/// of all — should see *which* model answered without cross-referencing
-/// `kaibo://config`, since the answering model is the whole variable. `roles` is the
-/// labelled models for this tool (one for `oneshot`, explorer+synth for `consult`).
-/// Pure and offline-testable.
 /// Which kind of async work a handle addresses. A batch handle carries a `/`
 /// (`backend/provider-id`); a consult job id (`job-N`) never does, and a backend name
 /// carries no `/` either (enforced at config load), so the presence of a `/` is an
@@ -497,6 +512,8 @@ pub(crate) fn append_warnings(mut answer: String, warnings: &[String]) -> String
     answer
 }
 
+/// Append a provenance footer naming the cast and model(s) that produced `answer`.
+/// `roles` labels each model: one for `oneshot`, explorer+synth for `consult`.
 pub(crate) fn with_provenance(
     answer: String,
     cast: &str,
@@ -551,6 +568,88 @@ pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_failure_guides_host_access_without_claiming_rejection() {
+        // The actual flattened rig error observed in a network-disabled Codex shell.
+        for marker in [
+            "model call failed",
+            "model loop failed",
+            "model used all 2 turns",
+        ] {
+            let error = anyhow::anyhow!("{marker}: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)");
+            let text = consultation_failure_text("oneshot", "deepseek", error);
+            assert_eq!(
+                classify_failure(&anyhow::anyhow!("{marker}: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)")),
+                FailureKind::Connection
+            );
+            assert!(text.contains("network"), "{text}");
+            assert!(
+                text.contains("Host agents in kaibo://config/guide"),
+                "{text}"
+            );
+            assert!(text.contains("`kaibo config-guide`"), "{text}");
+            assert!(!text.contains("provider rejected"), "{text}");
+        }
+    }
+
+    /// Every failure hands the decision to the user: retry, another cast, or go on without
+    /// the consultation. An agent told to proceed on its own hides a failure the user may
+    /// want to fix. One body per `FailureKind`, and the classification is asserted first,
+    /// so a body that drifted into another arm cannot pass on that arm's wording.
+    #[test]
+    fn every_failure_asks_the_user_what_to_do() {
+        let cases = [
+            (
+                FailureKind::Connection,
+                "model loop failed: HttpError: Http client error: error sending request for url (https://api.deepseek.com/chat/completions)",
+            ),
+            (
+                FailureKind::TransientProvider,
+                "model loop failed: ProviderError: {\"type\":\"overloaded_error\"}",
+            ),
+            (
+                FailureKind::Provider,
+                "model loop failed: ProviderError: invalid_request_error",
+            ),
+            (
+                FailureKind::MalformedGeneration,
+                "model loop failed: ProviderError: {\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}",
+            ),
+            (
+                FailureKind::EmptyAnswer,
+                "model deepseek-v4-pro returned an EMPTY answer — the single toolless \
+                 completion returned no answer text.",
+            ),
+            (
+                FailureKind::Internal,
+                "failed to build read-only kaish kernel: out of memory",
+            ),
+        ];
+        for (kind, body) in cases {
+            assert_eq!(classify_failure(&anyhow::anyhow!(body)), kind, "{body}");
+            let text = consultation_failure_text("consult", "deepseek", anyhow::anyhow!(body));
+            assert!(
+                text.contains("Ask the user whether"),
+                "{kind:?} must hand the decision to the user: {text}"
+            );
+            assert!(
+                !text.contains("proceed without"),
+                "{kind:?} must not tell the agent to go on alone: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_rejection_is_not_reported_as_host_network_failure() {
+        let text = consultation_failure_text(
+            "consult",
+            "deepseek",
+            anyhow::anyhow!("model loop failed: ProviderError: invalid_api_key"),
+        );
+        assert!(text.contains("provider rejected"), "{text}");
+        assert!(!text.contains("Host agents"), "{text}");
+    }
 
     /// The MCP path renders a consult's warnings inline (after the answer body), so the
     /// client sees them exactly as #76 shipped even though they now live off the answer
@@ -886,11 +985,20 @@ mod tests {
             "model call failed: ProviderError: {\"type\":\"overloaded_error\"}",
             "model call failed: HttpError: error sending request: operation timed out",
         ] {
+            assert_eq!(
+                classify_failure(&anyhow::anyhow!(body)),
+                FailureKind::TransientProvider,
+                "{body}"
+            );
             let result = consultation_failed("consult", "gemini", anyhow::anyhow!(body));
             let text = answer_text(&result).to_lowercase();
             assert!(
                 text.contains("retry"),
                 "a transient failure should invite a manual retry: {body} -> {text}"
+            );
+            assert!(
+                text.contains("ask the user whether"),
+                "a transient failure hands the decision to the user: {body} -> {text}"
             );
         }
     }

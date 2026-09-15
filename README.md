@@ -271,11 +271,15 @@ human at a terminal can drive kaibo directly:
 | `batch_submit`, `job_get`/`job_list`/`job_cancel` (batch handles) | `kaibo batch submit \| get \| list \| cancel` |
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
+| `kaibo://config/guide` resource | `kaibo config-guide` |
 | `configure` prompt | `kaibo configure [goal]` |
 
 ```sh
 kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 ```
+
+Setup that differs by host agent, such as Codex's separate MCP and shell network access,
+is under [Host agents](docs/config.md#host-agents).
 
 **Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
 explicit spelling for the same thing, and may become required in the future.
@@ -679,23 +683,16 @@ Telemetry is off by default and, when on, only opens an *outbound* OTLP connecti
 you configure.
 
 **What happens if a provider is overloaded or down (a 429/529, a reset, a wedged
-backend)?** kaibo does **not** back off and retry — a single completion is bounded by the backend's
-`request_timeout` (default 15 min, the wall-clock for one model call) and a ≤10s
-`connect_timeout` that fails a dead endpoint fast. When a provider fails, the consult
-returns a **clean tool-result error** (`is_error`) naming the cast and the underlying
-detail, rather than a protocol-level error — because a consult is an *optional* second
-opinion, so your agent should read "the consult failed, here's why" and proceed without
-it (or call again), not have its own turn fail. The message is **tailored to the
-failure**: a transient condition (overload, rate-limit, timeout, reset) says so and
-invites you to retry the call, so the calling agent can drive the retry; a non-transient
-error (auth, bad request) doesn't, since a retry won't help; and a kaibo-side failure is
-named as such rather than blamed on the provider. If a provider is reliably slow, raise
-that backend's `request_timeout_secs`. (Automatic retry/backoff belongs in the HTTP layer
-— an upstream `rig` contribution we haven't made yet.)
-
-One exception: when a provider cannot parse the tool call a model generated, kaibo asks
-that model for the turn twice more — otherwise a single fumbled tool call discards the
-whole investigation.
+backend)?** kaibo retries an overload, a rate limit, or an HTTP 500/502/503 up to four
+times with bounded backoff, and asks a model that fumbled a tool call for that turn twice
+more. A timeout or a reset is not retried: one completion is bounded by the backend's
+`request_timeout` (default 15 min) and a ≤10s `connect_timeout` that fails a dead
+endpoint fast. When a call still fails, the consult returns a **clean tool-result error**
+(`is_error`) naming the cast and the underlying detail, rather than a protocol-level
+error, so your agent's own turn does not fail. The message is **tailored to the
+failure** — transient, rejected, unreachable, malformed, empty, or kaibo-side — and tells
+your agent to ask you whether to retry, use another cast, or continue without the second
+opinion. If a provider is reliably slow, raise that backend's `request_timeout_secs`.
 
 **What's the cost?** `consult` spends tokens on the provider behind the chosen cast,
 so the cast is what decides. A DeepSeek-class team is inexpensive enough to reach for
