@@ -288,7 +288,7 @@ impl CompletionLog {
 ///
 /// Pure passthrough by construction: `completion` awaits the inner model, reads the
 /// response, and returns the very same `Ok`/`Err`. Output, usage, `message_id`,
-/// `raw_response`, and every error are identical to the unwrapped model's — the only
+/// `raw` payload, and every error are identical to the unwrapped model's — the only
 /// difference is that a [`TurnRecord`] landed in the log.
 #[derive(Clone, Debug)]
 pub struct Watched<M> {
@@ -435,8 +435,8 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
 mod tests {
     use super::*;
     use crate::test_support::{
-        provider_error, text_response, tool_call_response, usage, with_raw, with_usage,
-        ScriptedClient, ScriptedModel,
+        provider_error, response_error, text_response, tool_call_response, usage, with_raw,
+        with_usage, ScriptedClient, ScriptedModel,
     };
     use rig_core::client::CompletionClient;
     use rig_core::message::Message;
@@ -573,6 +573,44 @@ mod tests {
             additional_params: None,
             output_schema: None,
             record_telemetry_content: false,
+        }
+    }
+
+    /// Each `CompletionError` variant maps to its own `error.type` label. The match is
+    /// exhaustive since rig 0.42 dropped `#[non_exhaustive]`, so a new variant fails the
+    /// build; this pins that the seven existing names are the right ones, since no
+    /// offline arm carries the identity that would reach the metric through `Watched`.
+    #[test]
+    fn every_completion_error_variant_has_its_own_error_type() {
+        use crate::test_support::status_error;
+        let url = reqwest::Url::parse("not a url").unwrap_err();
+        let json = serde_json::from_str::<Value>("{").unwrap_err();
+        let cases: Vec<(CompletionError, &str)> = vec![
+            (
+                CompletionError::HttpError(rig_core::http_client::Error::StreamEnded),
+                "http_error",
+            ),
+            (CompletionError::JsonError(json), "json_error"),
+            (CompletionError::UrlError(url), "url_error"),
+            (
+                CompletionError::RequestError(Box::new(std::io::Error::other("x"))),
+                "request_error",
+            ),
+            (response_error("x"), "response_error"),
+            (provider_error("x"), "provider_error"),
+            // `status_error` (rig's `from_http_response`) builds an `HttpError`; the
+            // `ProviderResponse` variant is a preserved provider body, built directly.
+            (status_error(503, "overloaded"), "http_error"),
+            (
+                CompletionError::ProviderResponse(rig_core::ProviderResponseError::new(
+                    http::StatusCode::OK,
+                    "{\"error\":\"envelope\"}",
+                )),
+                "provider_response_error",
+            ),
+        ];
+        for (error, want) in cases {
+            assert_eq!(completion_error_type(&error), want, "{error:?}");
         }
     }
 

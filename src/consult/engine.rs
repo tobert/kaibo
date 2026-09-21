@@ -1065,7 +1065,7 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
         // crash, not a quietly dropped message.
         assert!(
             !new_parts.is_empty(),
-            "a non-empty user turn rewrote to an empty one"
+            "a non-empty user turn maps part-for-part to a non-empty result"
         );
         out.push(Message::User { content: new_parts });
         for img in extracted {
@@ -1179,7 +1179,7 @@ where
 /// content and usage — so a phase that stopped early, got truncated, or was refused
 /// by a classifier looks identical to one that finished. The provider *did* say which
 /// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
-/// `CompletionResponse::raw_response`, which the loop discards. Wrapping the model in
+/// `CompletionResponse::raw`, which the loop discards. Wrapping the model in
 /// [`Watched`] puts the record on the one path every completion takes — **including
 /// the turns inside the tool loop and the forced final turn**, which no hook reaches —
 /// and `log` is the caller's slot for it, readable after this returns whether the
@@ -3115,7 +3115,7 @@ mod tests {
     /// The whole reason the wrapper exists: a phase's completion record reaches
     /// [`run_phase_logged`]'s caller **including the turns inside the tool loop** — the
     /// ones rig's agent hook can only see in its medium-neutral form, with no
-    /// `raw_response` and so no finish reason.
+    /// `raw` payload and so no finish reason.
     ///
     /// Two turns here: the driver calls `run_kaish` (a provider reporting
     /// `finish_reason: "tool_calls"`, nested under `choices[]` the OpenAI way), then
@@ -7617,6 +7617,48 @@ mod tests {
     /// reappears as its *own* tool-result-free user message, while the `tool_use`
     /// stays answered (now by text). The separate message is load-bearing — rig's
     /// openai converter drops non-tool parts from a mixed user turn.
+    /// The rewrite rebuilds each image-bearing tool result, so it must carry the whole
+    /// identity across: `provider` is the id the wire echoes back to pair the result
+    /// with its call, and `name` is what name-keyed wires replay. Dropping either
+    /// would still pass the call-id checks in the other rewrite tests.
+    #[test]
+    fn rewrite_keeps_the_tool_results_provider_id_and_name() {
+        use rig_core::completion::message::ProviderCallId;
+        let UserContent::ToolResult(mut tr) = vi_result("call-1") else {
+            unreachable!("vi_result builds a tool result")
+        };
+        tr.provider = ProviderCallId::new("call_wire_1");
+        let history = vec![
+            Message::user("look at shot.png"),
+            vi_call("call-1"),
+            Message::User {
+                content: vec![UserContent::ToolResult(tr)],
+            },
+        ];
+        let out = rewrite_tool_image_history(history);
+        let rewritten = out
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } => content.iter().find_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the tool result survives the rewrite");
+        assert!(
+            !any_tool_result_image(&out),
+            "the rewrite ran on this result: {out:?}"
+        );
+        assert_eq!(rewritten.call.as_str(), "call-1");
+        assert_eq!(
+            rewritten.provider.as_ref().map(|p| p.call_id.as_str()),
+            Some("call_wire_1"),
+            "the provider-issued id survives: {rewritten:?}"
+        );
+        assert_eq!(rewritten.name, ViewImage::NAME, "the tool name survives");
+    }
+
     #[test]
     fn rewrite_moves_view_image_onto_a_separate_user_image_turn() {
         let history = vec![

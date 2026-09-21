@@ -11,6 +11,10 @@
 //! live: a Gemini Flash explorer died on one empty function call twenty turns into a
 //! `deliberate`, and the whole investigation went with it.
 //!
+//! **Audit log.** 0.41 → 0.42 (2026-09-21): both rig facts this module leans on still
+//! hold — the Gemini `ResponseError` text is unchanged, and
+//! `provider_response_status()` still documents that it can return a 2xx.
+//!
 //! **Transient transport failure.** A 429 (every provider's rate limit), a
 //! 500/502/503 (the generic "backend down or overloaded" family), or a 529
 //! (Anthropic's own `overloaded_error`) means the same thing at the transport layer:
@@ -252,7 +256,7 @@ fn transient_wait(attempt: u32, error: &CompletionError) -> std::time::Duration 
 /// every other outcome untouched.
 ///
 /// Transparent on every path that is neither: the response, the usage, the
-/// `raw_response`, and each other error are the inner model's own.
+/// `raw` payload, and each other error are the inner model's own.
 #[derive(Clone, Debug)]
 pub struct Retried<M> {
     inner: M,
