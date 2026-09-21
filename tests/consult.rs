@@ -236,7 +236,7 @@ fn request_params_places_sampling_where_each_wire_format_wants_it() {
     // DeepSeek: thinking toggle and sampling coexist, all top-level.
     let d = request_params(
         ProviderKind::DeepSeek,
-        "deepseek-v4-pro",
+        "deepseek-flash",
         THINKING_BUDGET,
         Some(0.3),
         Some(0.95),
@@ -299,7 +299,7 @@ fn anthropic_thinking_suppresses_sampling_or_the_api_400s() {
     // sampling, so its knobs ride through untouched.
     let d = request_params(
         ProviderKind::DeepSeek,
-        "deepseek-v4-pro",
+        "deepseek-flash",
         THINKING_BUDGET,
         Some(0.3),
         Some(0.95),
@@ -394,7 +394,7 @@ fn effort_is_per_role_and_provider_mapped() {
 
     let deepseek = ModelShape::resolve(
         ProviderKind::DeepSeek,
-        "deepseek-v4-pro",
+        "deepseek-flash",
         ThinkingStyleOverride::Auto,
     )
     .to_params(THINKING_BUDGET, None, None, "max")
@@ -502,7 +502,7 @@ fn deepseek_v4_toggles_thinking_with_reasoning_effort() {
     // DeepSeek V4 is a request-time hybrid: top-level thinking + reasoning_effort
     // (rig flattens additional_params into the body, so top-level is where they go).
     // The budget is irrelevant here — depth is an effort level, not a token count.
-    let d = thinking_params(ProviderKind::DeepSeek, "deepseek-v4-pro", THINKING_BUDGET)
+    let d = thinking_params(ProviderKind::DeepSeek, "deepseek-flash", THINKING_BUDGET)
         .expect("deepseek v4 toggles thinking at request time");
     assert_eq!(d["thinking"]["type"], "enabled");
     assert_eq!(d["reasoning_effort"], "high");
@@ -572,7 +572,7 @@ fn thinking_style_off_sends_no_reasoning_parameter_on_any_wire() {
     // operator is saying "send nothing" — not "pick a different dialect".
     for (kind, model) in [
         (ProviderKind::Openai, "Gemma-4-E4B-it-GGUF"),
-        (ProviderKind::DeepSeek, "deepseek-v4-pro"),
+        (ProviderKind::DeepSeek, "deepseek-flash"),
         (ProviderKind::Anthropic, "claude-sonnet-4-6"),
         (ProviderKind::Gemini, "gemini-3.5-flash"),
         (ProviderKind::OpenRouter, "z-ai/glm-5.2"),
@@ -623,8 +623,14 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-haiku-4-5", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Gemini, "gemini-3.5-flash", None).vision);
-    // DeepSeek chat/reasoner are text-only on the wire.
+    // DeepSeek is per model: `deepseek-flash` (V4.1 Flash, 2026-09-10) reads images on
+    // chat completions (live probe 2026-09-21: a 32x32 red PNG answered "Red", 224
+    // prompt tokens). Any other id stays blind, so an image to it is refused before
+    // the request rather than lost on the wire — `deepseek-v4-pro` accepted the same
+    // request and silently dropped the image (19 prompt tokens).
+    assert!(ModelCaps::resolve(ProviderKind::DeepSeek, "deepseek-flash", None).vision);
     assert!(!ModelCaps::resolve(ProviderKind::DeepSeek, "deepseek-v4-pro", None).vision);
+    assert!(!ModelCaps::resolve(ProviderKind::DeepSeek, "deepseek-flash", Some(false)).vision);
     // A generic OpenAI-compatible endpoint can front anything; vision is opt-in
     // per slot rather than guessed from an arbitrary id.
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", None).vision);
@@ -912,7 +918,7 @@ fn transcript_text(req: &rig_core::completion::CompletionRequest) -> String {
 /// construction — the chimera promise of docs/casts.md, proven with no network.
 #[tokio::test]
 async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
-    const EXPLORER_MODEL: &str = "deepseek-v4-flash";
+    const EXPLORER_MODEL: &str = "deepseek-flash";
     const SYNTH_MODEL: &str = "claude-sonnet-4-6";
     const REPORT: &str = "MIXED_REPORT: src/foo.rs:1 fn target_marker";
 
@@ -1135,7 +1141,7 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
 /// silently flip open for a text-only model.
 #[tokio::test]
 async fn a_blind_synth_is_not_offered_view_image() {
-    const SYNTH_MODEL: &str = "deepseek-v4-pro";
+    const SYNTH_MODEL: &str = "deepseek-flash";
 
     let dir = tempfile::tempdir().unwrap();
     let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
@@ -1793,7 +1799,10 @@ fn deepseek_reasoning_tokens(j: &Value) -> u64 {
 /// DeepSeek validates `reasoning_effort` strictly against a *seven*-rung ladder — it is
 /// the one provider whose accepted set is exactly the universal ladder kaibo's docs once
 /// claimed for everyone. Observed 2026-08-01 on `deepseek-v4-pro`: all seven HTTP 200,
-/// and a garbage value 400s with the ladder spelled out in the error.
+/// and a garbage value 400s with the ladder spelled out in the error. Re-run 2026-09-21
+/// on `deepseek-flash`: the same seven accepted, the refusal now a 422 enumerating the
+/// same seven. DeepSeek's docs say it *runs* only `low`/`high`/`max` and maps the rest
+/// onto them; acceptance and depth are different questions, and this probes acceptance.
 ///
 /// That error text is the real oracle: it means a future DeepSeek ladder change fails
 /// this test loudly instead of drifting past `docs/config.md`'s per-provider table.
@@ -1806,7 +1815,7 @@ async fn deepseek_effort_ladder_live() {
         let (status, json) = deepseek_probe(
             &key,
             json!({
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-flash",
                 "max_tokens": 2048,
                 "thinking": { "type": "enabled" },
                 "reasoning_effort": rung,
@@ -1825,7 +1834,7 @@ async fn deepseek_effort_ladder_live() {
     let (status, json) = deepseek_probe(
         &key,
         json!({
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-flash",
             "max_tokens": 16,
             "thinking": { "type": "enabled" },
             "reasoning_effort": "zzz",
@@ -1833,7 +1842,12 @@ async fn deepseek_effort_ladder_live() {
         }),
     )
     .await;
-    assert_eq!(status, 400, "an off-ladder effort must be refused: {json}");
+    // The status is not the oracle: it was 400 on 2026-08-01 and 422 on 2026-09-21,
+    // with the same enumerated ladder both times. Any client error is a refusal.
+    assert!(
+        (400..500).contains(&status),
+        "an off-ladder effort must be refused with a client error, got {status}: {json}"
+    );
     let msg = json["error"]["message"].as_str().unwrap_or_default();
     for rung in ALL_RUNGS {
         assert!(
@@ -1870,7 +1884,7 @@ async fn deepseek_effort_none_needs_the_structural_disable_live() {
     let key = live_key(ProviderKind::DeepSeek);
     let base = |extra: Value| {
         let mut body = json!({
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-flash",
             "max_tokens": 2048,
             "messages": [{ "role": "user", "content": CHEAP_PROMPT }],
         });
@@ -1915,7 +1929,7 @@ async fn deepseek_effort_none_needs_the_structural_disable_live() {
     // And what kaibo sends TODAY: the shaped params, on the wire, billing nothing.
     let shaped = ModelShape::resolve(
         ProviderKind::DeepSeek,
-        "deepseek-v4-pro",
+        "deepseek-flash",
         ThinkingStyleOverride::Auto,
     )
     .to_params(THINKING_BUDGET, None, None, "none")

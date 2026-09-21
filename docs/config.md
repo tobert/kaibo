@@ -217,7 +217,7 @@ kind:
 | kind | classifier default |
 |---|---|
 | `anthropic`, `gemini` | vision on |
-| `deepseek` | vision off (text-only models) |
+| `deepseek` | vision on for `deepseek-flash`; off for any other id |
 | `openai`, `openrouter` | vision off until pinned |
 
 A generic endpoint is vision-off until its config says otherwise, because kaibo cannot
@@ -319,7 +319,7 @@ that can use it. Measured 2026-08-01:
 | provider | rungs |
 |---|---|
 | Gemini | `minimal` `low` `medium` `high` — Google's own schema rejects `none`/`xhigh`/`max`. `minimal` is the off-switch, itself model-dependent (`gemini-3.5-flash` takes it, `gemini-pro-latest` refuses it). |
-| DeepSeek | all seven (`none` … `max`), strictly validated. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
+| DeepSeek | accepts all seven (`none` … `max`), strictly validated, and runs three: `minimal`/`low` → low, `medium`/`high`/`xhigh` → high, `max` → max. The built-in `deepseek` cast's synth pins `max`. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
 | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
 | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
 | Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured.** |

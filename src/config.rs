@@ -2438,6 +2438,14 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             ProviderKind::Anthropic | ProviderKind::DeepSeek => Some(32_768),
             _ => None,
         };
+        // DeepSeek serves three reasoning rungs (`low`, `high`, `max`) and maps every
+        // other effort onto one of them, so `max` is the only setting above the `high`
+        // default. The synth writes the answer and gets the deepest; the explorer stays
+        // on the inherited default. Pinned by `builtin_deepseek_synth_reasons_at_max`.
+        let synth_effort = match kind {
+            ProviderKind::DeepSeek => Some("max".to_string()),
+            _ => None,
+        };
         // Both agent roles are seeded. A cast may omit one in config — absent means
         // the capability is absent, and nothing downstream errors on that.
         let slots = BTreeMap::from([
@@ -2446,6 +2454,7 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
                 ModelRole::Synth,
                 ModelSlot {
                     max_tokens: synth_max_tokens,
+                    effort: synth_effort,
                     ..slot(synth, None)
                 },
             ),
@@ -2512,10 +2521,11 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
     };
     match wire {
         credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
-        // DeepSeek serves `deepseek-flash` and `deepseek-v4-pro`; `deepseek-v4-flash`
-        // was retired under us and the built-in dialed it until 2026-09-10. The
-        // undated id is the rot-resistant one — it tracks each new flash generation —
-        // and DeepSeek is folding pro into flash, so both roles name it.
+        // kaibo is flash-only on DeepSeek: `deepseek-flash` for both roles, and no
+        // other DeepSeek id is recommended or special-cased. The undated id is the
+        // rot-resistant one — it tracks each new flash generation. The dated
+        // `deepseek-v4-flash` was retired under us, and the built-in dialed it until
+        // 2026-09-10.
         credentials::WireKind::DeepSeek => ("deepseek-flash", "deepseek-flash"),
         credentials::WireKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
         // OpenRouter's job here is a family we *can't* reach directly (we key
@@ -4149,6 +4159,32 @@ mod tests {
         }
     }
 
+    /// The built-in `deepseek` cast reasons at DeepSeek's deepest rung on the synth and
+    /// at the `high` default on the explorer. DeepSeek serves three rungs (`low`,
+    /// `high`, `max`) and maps the others onto them, so `max` is the only setting above
+    /// the default. The explorer inherits, so a `[defaults]` explorer effort still
+    /// reaches it; the synth pin is a slot value, so it outranks `[defaults]` the same
+    /// way the synth `max_tokens` pin does. No other built-in cast pins an effort.
+    #[test]
+    fn builtin_deepseek_synth_reasons_at_max() {
+        let cfg = Config::builtin();
+        let cast = cfg.resolve_cast("deepseek").unwrap();
+        let synth = cast.require_slot(ModelRole::Synth).unwrap();
+        assert_eq!(synth.effort.as_deref(), Some("max"));
+        let explorer = cast.require_slot(ModelRole::Explorer).unwrap();
+        assert_eq!(explorer.effort, None, "the explorer inherits the default");
+        assert_eq!(
+            explorer.tunables(ModelRole::Explorer, &cfg.defaults).effort,
+            "high"
+        );
+        for name in ["anthropic", "gemini", "openrouter", "openai-local"] {
+            let c = cfg.resolve_cast(name).unwrap();
+            for slot in c.slots.values() {
+                assert_eq!(slot.effort, None, "{name:?} pins no effort");
+            }
+        }
+    }
+
     /// Every interactive built-in cast exists, each single-backend with
     /// explorer+synth, and none has a synth on an offline lane.
     #[test]
@@ -4331,7 +4367,7 @@ mod tests {
             r#"
             [casts.bad]
             batch = true
-            synth = "deepseek/deepseek-v4-pro"
+            synth = "deepseek/deepseek-flash"
             "#,
         )
         .expect_err("a batch cast on a non-batch backend must not load");
@@ -4764,7 +4800,7 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [casts.chimera]
-            explorer = "deepseek/deepseek-v4-flash"
+            explorer = "deepseek/deepseek-flash"
             synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
             "#,
         )
@@ -4772,11 +4808,14 @@ mod tests {
         let cast = cfg.resolve_cast("chimera").unwrap();
         let e = cast.require_slot(ModelRole::Explorer).unwrap();
         let s = cast.require_slot(ModelRole::Synth).unwrap();
-        assert_eq!(e.qualified(), "deepseek/deepseek-v4-flash");
+        assert_eq!(e.qualified(), "deepseek/deepseek-flash");
         assert_eq!(s.qualified(), "anthropic/claude-opus-4-8");
         assert_eq!(s.effort.as_deref(), Some("max"));
-        // Caps classify on the slot's backend kind: DeepSeek is blind, Anthropic sees.
-        assert!(!cfg.slot_caps(e).unwrap().vision);
+        // Caps classify on the slot's backend kind and id: `deepseek-flash` sees,
+        // another DeepSeek id does not, and Anthropic sees.
+        assert!(cfg.slot_caps(e).unwrap().vision);
+        let other_deepseek = ModelSlot::bare("deepseek", "deepseek-v4-pro");
+        assert!(!cfg.slot_caps(&other_deepseek).unwrap().vision);
         assert!(cfg.slot_caps(s).unwrap().vision);
         // A vision pin on a generic openai slot overrides the classifier.
         let pinned = ModelSlot {
@@ -4889,7 +4928,7 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [casts.spread]
-            explorer = { backend = "deepseek", id = "deepseek-v4-pro", effort = "low" }
+            explorer = { backend = "deepseek", id = "deepseek-flash", effort = "low" }
             synth = { backend = "anthropic", id = "claude-sonnet-4-6", effort = "xhigh" }
             "#,
         )
@@ -4998,13 +5037,13 @@ mod tests {
             key_optional = true
 
             [casts.plain]
-            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "xhigh" }
+            synth = { backend = "deepseek", id = "deepseek-flash", effort = "xhigh" }
 
             [casts.off]
-            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "none" }
+            synth = { backend = "deepseek", id = "deepseek-flash", effort = "none" }
 
             [casts.newer]
-            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "ludicrous" }
+            synth = { backend = "deepseek", id = "deepseek-flash", effort = "ludicrous" }
 
             [casts.lifted]
             synth = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch", effort = "low" }
@@ -5539,7 +5578,7 @@ mod tests {
             synth = "anthropic/claude-sonnet-4-6"
             [casts.b]
             aliases = ["fast"]
-            synth = "deepseek/deepseek-v4-pro"
+            synth = "deepseek/deepseek-flash"
             "#,
         )
         .unwrap_err()

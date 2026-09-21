@@ -686,7 +686,7 @@ mod tests {
             Arc::new(MediaStore::Memory(MemoryCas::new(None))),
             ArtifactAuthor {
                 prompt: "generate a fuzz corpus".into(),
-                model: "deepseek/deepseek-v4-pro".into(),
+                model: "deepseek/deepseek-flash".into(),
                 cast: "deepseek".into(),
                 slot: "synth",
                 session: Some("s-1".into()),

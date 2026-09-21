@@ -5578,20 +5578,25 @@ mod tests {
         let err = KaiboHandler::gate_consult_image_attachments(
             &img,
             false,
-            "deepseek-v4-pro",
-            "deepseek",
+            "Gemma-4-26B-A4B-it-GGUF",
+            "openai-local",
         )
         .expect_err("an image to a blind synth must be refused");
         assert!(
-            err.message.contains("can't see images") && err.message.contains("deepseek"),
+            err.message.contains("can't see images") && err.message.contains("openai-local"),
             "the refusal names the cause and the cast: {}",
             err.message
         );
         // Vision synth + image → fine; blind synth + text-only → fine.
         KaiboHandler::gate_consult_image_attachments(&img, true, "claude-sonnet-4-6", "anthropic")
             .expect("a vision synth accepts an image");
-        KaiboHandler::gate_consult_image_attachments(&txt, false, "deepseek-v4-pro", "deepseek")
-            .expect("text-only needs no vision");
+        KaiboHandler::gate_consult_image_attachments(
+            &txt,
+            false,
+            "Gemma-4-26B-A4B-it-GGUF",
+            "openai-local",
+        )
+        .expect("text-only needs no vision");
     }
 
     /// A small stand-in builtin set so resource rendering is offline-testable.
@@ -5656,7 +5661,7 @@ mod tests {
                 &input.question,
                 input.session_id.as_deref(),
                 "deepseek",
-                "deepseek/deepseek-v4-pro",
+                "deepseek/deepseek-flash",
             )
         };
 
@@ -9933,13 +9938,13 @@ enabled = false
         h.override_model(
             &mut cast,
             ModelRole::Explorer,
-            "deepseek-v4-flash",
+            "deepseek-flash",
             Some("deepseek"),
         )
         .unwrap();
         let slot = cast.slot(ModelRole::Explorer).unwrap();
         assert_eq!(slot.backend, "deepseek");
-        assert_eq!(slot.id, "deepseek-v4-flash");
+        assert_eq!(slot.id, "deepseek-flash");
         // Aliases resolve to the canonical backend.
         h.override_model(
             &mut cast,
@@ -10023,7 +10028,7 @@ enabled = false
         let config = Config::from_toml_str(
             r#"
             [casts.synthless]
-            explorer = "deepseek/deepseek-v4-flash"
+            explorer = "deepseek/deepseek-flash"
             "#,
         )
         .unwrap();
@@ -10056,7 +10061,7 @@ enabled = false
         let config = Config::from_toml_str(
             r#"
             [casts.synthless]
-            explorer = "deepseek/deepseek-v4-flash"
+            explorer = "deepseek/deepseek-flash"
             "#,
         )
         .unwrap();

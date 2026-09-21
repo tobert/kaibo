@@ -235,7 +235,7 @@ pub struct PhaseIdentity {
 pub struct CallIdent<'a> {
     /// The provider kind behind this arm.
     pub provider: ProviderKind,
-    /// The model id as configured, e.g. `deepseek-v4-pro`. Reported as
+    /// The model id as configured, e.g. `deepseek-flash`. Reported as
     /// `gen_ai.request.model`: kaibo asks for a specific id and gets it, and rig's
     /// normalized response does not carry the served id separately.
     pub model: &'a str,
@@ -411,12 +411,12 @@ mod tests {
         // being free.
         let ident = CallIdent {
             provider: ProviderKind::DeepSeek,
-            model: "deepseek-v4-pro",
+            model: "deepseek-flash",
         };
         record_completion(ident, Duration::from_millis(10), None, None);
         record_agent_invocation(
             "synth",
-            "deepseek-v4-pro",
+            "deepseek-flash",
             Duration::from_secs(1),
             5,
             2,
@@ -532,7 +532,7 @@ mod tests {
             &inst,
             CallIdent {
                 provider: ProviderKind::DeepSeek,
-                model: "deepseek-v4-pro",
+                model: "deepseek-flash",
             },
             Duration::from_millis(900),
             Some(&usage),
@@ -554,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             attr(input, "gen_ai.request.model").as_deref(),
-            Some("deepseek-v4-pro"),
+            Some("deepseek-flash"),
         );
 
         let output = usage_rows
@@ -630,7 +630,7 @@ mod tests {
         record_agent_invocation_on(
             &inst,
             "synth",
-            "deepseek-v4-pro",
+            "deepseek-flash",
             Duration::from_secs(120),
             8,
             2,
@@ -639,7 +639,7 @@ mod tests {
         record_agent_invocation_on(
             &inst,
             "explorer",
-            "deepseek-v4-flash",
+            "deepseek-flash",
             Duration::from_secs(40),
             20,
             19,
