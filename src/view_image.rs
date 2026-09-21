@@ -43,7 +43,6 @@ use rig_agent::tool::{Tool, ToolContext, ToolExecutionError, ToolOutput};
 use rig_core::completion::message::{
     DocumentSourceKind, Image, ImageMediaType, MimeType, ToolResultContent,
 };
-use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -182,18 +181,16 @@ impl ViewImage {
         // and the image is a declared `Image` block — no envelope for rig to
         // re-discover. `run_phase` moves exactly this block onto a user turn on a
         // transport that can't carry an image inside a tool result.
-        Ok(ToolOutput::content(
-            OneOrMany::many([
-                ToolResultContent::text(note),
-                ToolResultContent::Image(Image {
-                    data: DocumentSourceKind::Base64(data),
-                    media_type: ImageMediaType::from_mime_type(mime),
-                    detail: None,
-                    additional_params: None,
-                }),
-            ])
-            .expect("two blocks is never empty"),
-        ))
+        Ok(ToolOutput::content(vec![
+            ToolResultContent::text(note),
+            ToolResultContent::Image(Image {
+                data: DocumentSourceKind::Base64(data),
+                media_type: ImageMediaType::from_mime_type(mime),
+                detail: None,
+                additional_params: None,
+            }),
+        ])
+        .expect("the note and the image are both present"))
     }
 }
 
@@ -337,7 +334,7 @@ mod tests {
         // A declared image block, not a JSON shape rig has to recognize — this is the
         // assertion that fails if the output ever regresses to describing an image
         // instead of declaring one, which a vision model receives as base64 text.
-        let blocks: Vec<_> = out.as_content().iter().cloned().collect();
+        let blocks: Vec<_> = out.as_content().to_vec();
         assert_eq!(blocks.len(), 2, "one text note plus one image: {out:?}");
         let note = blocks
             .iter()

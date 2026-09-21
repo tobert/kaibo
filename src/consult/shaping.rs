@@ -768,32 +768,6 @@ pub fn accepted_efforts(wire: EffortWire) -> Vec<&'static str> {
         .collect()
 }
 
-/// Fold this arm's output-token budget into `params` where the provider needs it
-/// carried out-of-band. **OpenRouter only, and it's a rig-defect workaround**: rig's
-/// OpenRouter request (`openrouter/completion.rs`) never reads
-/// `CompletionRequest.max_tokens`, so
-/// `AgentBuilder::max_tokens()` is silently a no-op for that provider — the answer
-/// would run on OpenRouter's own default budget, starving a thinking-on completion.
-/// `additional_params` *is* `#[serde(flatten)]`-merged into the body, so we inject the
-/// budget there under `max_completion_tokens` (OpenRouter's preferred spelling; the
-/// spec deprecates `max_tokens`). A no-op for every other kind — rig sends their
-/// `max_tokens` natively, so a second copy here would be redundant at best.
-pub fn inject_output_budget(
-    kind: ProviderKind,
-    params: Option<Value>,
-    max_tokens: u64,
-) -> Option<Value> {
-    if kind != ProviderKind::OpenRouter {
-        return params;
-    }
-    let mut obj = match params {
-        Some(Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
-    };
-    obj.insert("max_completion_tokens".into(), json!(max_tokens));
-    Some(Value::Object(obj))
-}
-
 /// Fold the backend's upstream-host data policy into `params`. **OpenRouter only**:
 /// one slug routes across competing hosts whose data policies differ, and kaibo's
 /// prompts carry source code — so under [`DataCollection::Deny`] (the default) every
@@ -1075,78 +1049,5 @@ mod tests {
         // Any other kind: passthrough both ways, including a None params.
         let out = inject_provider_prefs(ProviderKind::Anthropic, None, DataCollection::Deny);
         assert!(out.is_none(), "non-openrouter kinds are untouched");
-    }
-
-    /// OpenRouter drops rig's native `max_tokens`, so the budget must ride
-    /// `additional_params` as `max_completion_tokens` — the rig-defect workaround. The
-    /// value must actually land in the blob the arm sends; and it must be a no-op for
-    /// every other kind (rig sends their `max_tokens` natively).
-    #[test]
-    fn openrouter_output_budget_rides_max_completion_tokens() {
-        // Merges into an existing reasoning blob without clobbering it.
-        let params = ModelShape::resolve(
-            ProviderKind::OpenRouter,
-            "~google/gemini-flash-latest",
-            ThinkingStyleOverride::Auto,
-        )
-        .to_params(8192, None, None, DEFAULT_EFFORT);
-        let out = inject_output_budget(ProviderKind::OpenRouter, params, 16384).unwrap();
-        assert_eq!(
-            out["max_completion_tokens"], 16384,
-            "the output budget must reach the request body OpenRouter reads"
-        );
-        assert_eq!(
-            out["reasoning"]["effort"], "high",
-            "the injection preserves the reasoning param"
-        );
-
-        // Even with no other params (None), the budget still lands.
-        let out = inject_output_budget(ProviderKind::OpenRouter, None, 4096).unwrap();
-        assert_eq!(out["max_completion_tokens"], 4096);
-
-        // A no-op for every other kind — rig sends their max_tokens itself.
-        assert!(inject_output_budget(ProviderKind::Anthropic, None, 4096).is_none());
-        let anthropic = ModelShape::resolve(
-            ProviderKind::Anthropic,
-            "claude-sonnet-4-6",
-            ThinkingStyleOverride::Auto,
-        )
-        .to_params(8192, None, None, DEFAULT_EFFORT);
-        let passthrough = inject_output_budget(ProviderKind::Anthropic, anthropic.clone(), 16384);
-        assert_eq!(
-            passthrough, anthropic,
-            "non-OpenRouter params pass through untouched — no max_completion_tokens added"
-        );
-    }
-
-    /// Canary tying `inject_output_budget` to the rig pin. The workaround exists
-    /// because rig's OpenRouter request has no `max_tokens` field; the day a rig bump
-    /// adds one, `AgentBuilder::max_tokens` starts arriving natively and the injected
-    /// `max_completion_tokens` rides alongside it — redundant at best, a provider 400
-    /// at worst, and silent either way. This failing test is the tripwire: on a rig
-    /// bump, re-read rig's `openrouter/completion.rs`, retire (or deliberately keep)
-    /// the injection, then advance the version prefix here.
-    ///
-    /// **Audit log.** 0.38.2 → 0.41.0 (2026-08-01): defect persists, injection stays.
-    /// Measured, not read — a real `openrouter::CompletionModel` driven through a
-    /// capture transport with `max_tokens = Some(4096)` serialized a body whose only
-    /// keys were `messages`, `model`, `reasoning`. Run that probe again on the next
-    /// bump rather than re-deriving the answer from rig's source.
-    #[test]
-    fn rig_bump_reaudits_the_openrouter_budget_workaround() {
-        let lock = include_str!("../../Cargo.lock");
-        let entry = lock
-            .find("name = \"rig-core\"")
-            .expect("rig-core pinned in Cargo.lock");
-        let version = lock[entry..]
-            .lines()
-            .nth(1)
-            .expect("version line follows the name line");
-        assert!(
-            version.contains("version = \"0.41."),
-            "rig-core moved past 0.41 ({version}): re-audit the OpenRouter max_tokens \
-             defect before shipping — see inject_output_budget, and the audit log on \
-             this test for how it was last measured"
-        );
     }
 }

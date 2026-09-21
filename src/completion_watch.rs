@@ -2,8 +2,8 @@
 //! provider response is *seen* on its way past — most of all the **finish reason**,
 //! which rig's agent layer discards before kaibo can read it.
 //!
-//! The gap this closes: `rig_core::completion::CompletionResponse<T>` carries
-//! `raw_response: T`, the untouched provider payload, but the agent hook event
+//! The gap this closes: `rig_core::completion::CompletionResponse` carries `raw`,
+//! the provider's own payload serialized, but the agent hook event
 //! (`rig-agent`'s `CompletionCall`) is a deliberately medium-neutral shape — prompt,
 //! content, usage, message id, and no raw response. So a consult that came back
 //! empty was reported as a plain success and nothing on the wire could tell an early
@@ -18,10 +18,11 @@
 //! response and errors untouched, so nothing about a call changes except that we now
 //! know how it ended.
 //!
-//! **Provider-agnostic by construction, not by a match arm per backend.** The trait
-//! bounds require `type Response: Serialize + DeserializeOwned`, so the wrapper
-//! serializes the raw response and reads the finish reason out of the JSON under the
-//! spellings providers actually ship ([`finish_reason`]). An unfamiliar shape yields
+//! **Provider-agnostic by construction, not by a match arm per backend.** rig fills
+//! `raw` at every provider seam, so the wrapper reads the finish reason out of that
+//! JSON under the spellings providers actually ship ([`finish_reason`]). rig 0.42 also
+//! carries a normalized `finish_reason()`; kaibo keeps the provider's own word, since
+//! the normalized one flattens exactly the detail a diagnosis needs. An unfamiliar shape yields
 //! `None` — "we don't know", never a broken call — which is the right degrade for a
 //! gateway or a provider rig grows next month.
 //!
@@ -40,14 +41,13 @@ use rig_core::completion::message::AssistantContent;
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
 };
-use serde::Serialize;
 use serde_json::Value;
 
 use crate::progress::{PhaseEvent, ProgressSink};
 
 /// The field names a provider spells its finish reason with, in preference order.
 ///
-/// Confirmed against the vendored rig-core 0.41 provider sources rather than
+/// Confirmed against the vendored rig-core provider sources (first 0.41, re-read at 0.42) rather than
 /// guessed — each entry names where it lives:
 ///
 /// - `finish_reason` — the OpenAI-compatible chat-completions `Choice`
@@ -154,23 +154,13 @@ pub struct TurnRecord {
 }
 
 impl TurnRecord {
-    /// Read one response. The raw payload is serialized here and dropped immediately;
-    /// only the extraction survives (see the module doc on what we keep).
+    /// Read one response. Only the extraction survives; the raw payload stays on the
+    /// response rig hands back (see the module doc on what we keep).
     ///
-    /// A raw response that refuses to serialize degrades to "no finish reason" and a
-    /// debug log — observation must never fail a completion the caller already paid
-    /// for. That is the *only* thing this swallows, and it is loud in the log.
-    fn observe<T: Serialize>(response: &CompletionResponse<T>) -> Self {
-        let raw = match serde_json::to_value(&response.raw_response) {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    "raw provider response would not serialize; finish reason unavailable"
-                );
-                Value::Null
-            }
-        };
+    /// A response built without a provider behind it carries `Value::Null` in `raw`
+    /// (rig's documented "no provider seam"), which reads as "no finish reason".
+    fn observe(response: &CompletionResponse) -> Self {
+        let raw = &response.raw;
         let mut text_chars = 0;
         let mut tool_calls = 0;
         for content in response.choice.iter() {
@@ -181,7 +171,7 @@ impl TurnRecord {
             }
         }
         Self {
-            finish_reason: finish_reason(&raw),
+            finish_reason: finish_reason(raw),
             usage: response.usage,
             text_chars,
             tool_calls,
@@ -206,10 +196,9 @@ fn completion_error_type(error: &CompletionError) -> &'static str {
         CompletionError::ResponseError(_) => "response_error",
         CompletionError::ProviderError(_) => "provider_error",
         CompletionError::ProviderResponse(_) => "provider_response_error",
-        // rig's enum is `#[non_exhaustive]`. A variant added upstream lands here
-        // rather than failing our build, and "other" is the honest label for a class
-        // we have not named yet — the metric keeps working across a rig bump.
-        _ => "other",
+        // Exhaustive on purpose: rig 0.42 dropped `#[non_exhaustive]` from this enum,
+        // so a variant added upstream fails our build and gets a name here, instead
+        // of landing under a catch-all label nobody chose.
     }
 }
 
@@ -299,7 +288,7 @@ impl CompletionLog {
 ///
 /// Pure passthrough by construction: `completion` awaits the inner model, reads the
 /// response, and returns the very same `Ok`/`Err`. Output, usage, `message_id`,
-/// `raw_response`, and every error are identical to the unwrapped model's — the only
+/// `raw` payload, and every error are identical to the unwrapped model's — the only
 /// difference is that a [`TurnRecord`] landed in the log.
 #[derive(Clone, Debug)]
 pub struct Watched<M> {
@@ -373,21 +362,6 @@ pub fn watched<M: CompletionModel>(
 }
 
 impl<M: CompletionModel> CompletionModel for Watched<M> {
-    type Response = M::Response;
-    type StreamingResponse = M::StreamingResponse;
-    type Client = M::Client;
-
-    /// Unreachable, and loudly so. `make` is only ever called through
-    /// `CompletionClient::completion_model`, and no client's `CompletionModel` is a
-    /// `Watched` — kaibo always wraps an already-built model with [`watched`]. Building
-    /// one here would have to invent a log nobody holds, silently discarding every
-    /// observation; a panic names the correct constructor instead.
-    fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-        unreachable!(
-            "Watched is built by `watched(model, log, ..)`, never by CompletionModel::make"
-        )
-    }
-
     /// Still a pure passthrough: the response and every error are returned untouched.
     /// What it now also does is *time* the call, because this is the one place kaibo
     /// sees a single provider request begin and end — rig's agent hook fires per turn
@@ -395,7 +369,7 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
     async fn completion(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+    ) -> Result<CompletionResponse, CompletionError> {
         let started = std::time::Instant::now();
         let result = self.inner.completion(request).await;
         let elapsed = started.elapsed();
@@ -446,17 +420,14 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
     async fn stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<
-        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
-        CompletionError,
-    > {
+    ) -> Result<rig_core::streaming::StreamingCompletionResponse, CompletionError> {
         self.inner.stream(request).await
     }
 
     /// Forwarded: this is a provider capability, and the wrapper must not change what
     /// rig believes the model can do.
-    fn composes_native_output_with_tools(&self) -> bool {
-        self.inner.composes_native_output_with_tools()
+    fn capabilities(&self) -> rig_core::completion::ProviderCapabilities {
+        self.inner.capabilities()
     }
 }
 
@@ -464,12 +435,11 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
 mod tests {
     use super::*;
     use crate::test_support::{
-        provider_error, text_response, tool_call_response, usage, with_raw, with_usage,
-        ScriptedClient, ScriptedModel,
+        provider_error, response_error, text_response, tool_call_response, usage, with_raw,
+        with_usage, ScriptedClient, ScriptedModel,
     };
     use rig_core::client::CompletionClient;
     use rig_core::message::Message;
-    use rig_core::OneOrMany;
     use serde_json::json;
 
     /// The beat is the one place a caller learns how long a call took, so it must carry
@@ -594,7 +564,7 @@ mod tests {
         CompletionRequest {
             model: None,
             preamble: None,
-            chat_history: OneOrMany::one(Message::user("q")),
+            chat_history: vec![Message::user("q")],
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -606,10 +576,48 @@ mod tests {
         }
     }
 
+    /// Each `CompletionError` variant maps to its own `error.type` label. The match is
+    /// exhaustive since rig 0.42 dropped `#[non_exhaustive]`, so a new variant fails the
+    /// build; this pins that the seven existing names are the right ones, since no
+    /// offline arm carries the identity that would reach the metric through `Watched`.
+    #[test]
+    fn every_completion_error_variant_has_its_own_error_type() {
+        use crate::test_support::status_error;
+        let url = reqwest::Url::parse("not a url").unwrap_err();
+        let json = serde_json::from_str::<Value>("{").unwrap_err();
+        let cases: Vec<(CompletionError, &str)> = vec![
+            (
+                CompletionError::HttpError(rig_core::http_client::Error::StreamEnded),
+                "http_error",
+            ),
+            (CompletionError::JsonError(json), "json_error"),
+            (CompletionError::UrlError(url), "url_error"),
+            (
+                CompletionError::RequestError(Box::new(std::io::Error::other("x"))),
+                "request_error",
+            ),
+            (response_error("x"), "response_error"),
+            (provider_error("x"), "provider_error"),
+            // `status_error` (rig's `from_http_response`) builds an `HttpError`; the
+            // `ProviderResponse` variant is a preserved provider body, built directly.
+            (status_error(503, "overloaded"), "http_error"),
+            (
+                CompletionError::ProviderResponse(rig_core::ProviderResponseError::new(
+                    http::StatusCode::OK,
+                    "{\"error\":\"envelope\"}",
+                )),
+                "provider_response_error",
+            ),
+        ];
+        for (error, want) in cases {
+            assert_eq!(completion_error_type(&error), want, "{error:?}");
+        }
+    }
+
     /// A scripted model whose every call answers with `respond`.
     fn model<F>(respond: F) -> ScriptedModel
     where
-        F: Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError>
+        F: Fn(&CompletionRequest) -> Result<CompletionResponse, CompletionError>
             + Send
             + Sync
             + 'static,
@@ -774,7 +782,7 @@ mod tests {
             "message id passes through"
         );
         assert_eq!(
-            wrapped.raw_response, bare.raw_response,
+            wrapped.raw, bare.raw,
             "the raw provider response is handed back untouched"
         );
         assert_eq!(

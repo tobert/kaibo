@@ -23,7 +23,6 @@ use rig_core::completion::message::{
 };
 use rig_core::completion::{CompletionModel, Message, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
-use rig_core::OneOrMany;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -115,7 +114,7 @@ struct ModelArm<M> {
 
 impl<M> PhaseRunner for ModelArm<M>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
 {
     fn run_phase<'a>(
         &'a self,
@@ -232,7 +231,7 @@ impl Arm {
     ) -> Self
     where
         C: CompletionClient + Clone + Send + Sync + 'static,
-        C::CompletionModel: 'static,
+        C::CompletionModel: Clone + 'static,
     {
         let model = model.into();
         Self::from_model(
@@ -254,7 +253,7 @@ impl Arm {
         caps: ModelCaps,
     ) -> Self
     where
-        M: CompletionModel + 'static,
+        M: CompletionModel + Clone + 'static,
     {
         Self::from_model_with_temperature(model_impl, model, max_tokens, None, params, caps)
     }
@@ -269,7 +268,7 @@ impl Arm {
         caps: ModelCaps,
     ) -> Self
     where
-        M: CompletionModel + 'static,
+        M: CompletionModel + Clone + 'static,
     {
         let model = model.into();
         Self {
@@ -367,10 +366,6 @@ impl Arm {
         } else {
             None
         };
-        // OpenRouter drops rig's native `max_tokens` (see `inject_output_budget`), so
-        // the budget must ride `additional_params` as `max_completion_tokens`. A no-op
-        // for every other kind, whose `max_tokens` rig sends itself.
-        let params = super::shaping::inject_output_budget(backend.kind, params, t.max_tokens);
         // OpenRouter routing honors the backend's data policy — deny by default, so
         // source never reaches a data-collecting upstream host without an explicit
         // config opt-in. A no-op for every other kind.
@@ -1032,8 +1027,9 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
                         .any(|rc| matches!(rc, ToolResultContent::Image(_))) =>
                 {
                     let ToolResult {
-                        id,
-                        call_id,
+                        call,
+                        provider,
+                        name,
                         content,
                     } = tr;
                     // Split the result into its text (the load note → ack) and its
@@ -1045,12 +1041,15 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
                             text => texts.push(text),
                         }
                     }
-                    let content = OneOrMany::many(texts).unwrap_or_else(|_| {
-                        OneOrMany::one(ToolResultContent::text(TOOL_IMAGE_ACK))
-                    });
+                    let content = if texts.is_empty() {
+                        vec![ToolResultContent::text(TOOL_IMAGE_ACK)]
+                    } else {
+                        texts
+                    };
                     new_parts.push(UserContent::ToolResult(ToolResult {
-                        id,
-                        call_id,
+                        call,
+                        provider,
+                        name,
                         content,
                     }));
                 }
@@ -1061,15 +1060,17 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
         // Re-emit the (possibly rewritten) tool-results message, then each extracted
         // image as its own tool-result-free user message — the load-bearing separation.
         // Each input part maps to exactly one `new_parts` entry, so an input `User`
-        // turn (always non-empty) yields a non-empty `new_parts` — `many` can't fail.
-        // Assert it rather than silently skipping: if a future refactor breaks that
-        // invariant we want a crash, not a quietly dropped message.
-        let content = OneOrMany::many(new_parts)
-            .expect("a non-empty user turn maps part-for-part to a non-empty result");
-        out.push(Message::User { content });
+        // turn (always non-empty) yields a non-empty `new_parts`. Assert it rather than
+        // silently skipping: if a future refactor breaks that invariant we want a
+        // crash, not a quietly dropped message.
+        assert!(
+            !new_parts.is_empty(),
+            "a non-empty user turn maps part-for-part to a non-empty result"
+        );
+        out.push(Message::User { content: new_parts });
         for img in extracted {
             out.push(Message::User {
-                content: OneOrMany::one(UserContent::Image(img)),
+                content: vec![UserContent::Image(img)],
             });
         }
     }
@@ -1150,7 +1151,7 @@ pub(crate) async fn run_phase<M, F>(
     identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
     run_phase_logged(
@@ -1178,7 +1179,7 @@ where
 /// content and usage — so a phase that stopped early, got truncated, or was refused
 /// by a classifier looks identical to one that finished. The provider *did* say which
 /// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
-/// `CompletionResponse::raw_response`, which the loop discards. Wrapping the model in
+/// `CompletionResponse::raw`, which the loop discards. Wrapping the model in
 /// [`Watched`] puts the record on the one path every completion takes — **including
 /// the turns inside the tool loop and the forced final turn**, which no hook reaches —
 /// and `log` is the caller's slot for it, readable after this returns whether the
@@ -1231,7 +1232,7 @@ pub(crate) async fn run_phase_logged<M, F>(
     identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Surface the exact reasoning/sampling params this phase ships (constant across the
@@ -1321,7 +1322,7 @@ async fn run_phase_loop<M, F>(
     break_on_tool_images: bool,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Loop state across view_image-break resumes. The caller hands us the *assembled*
@@ -1548,7 +1549,7 @@ async fn forced_finish_turn<M>(
     note: &str,
 ) -> std::result::Result<(String, Usage), PromptError>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
 {
     let (history, prompt) = finalize_prompt(chat_history, note);
     let mut builder = AgentBuilder::new(model.clone())
@@ -1594,7 +1595,7 @@ async fn finalize_after_max_turns<M>(
     max_turns: usize,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
 {
     let (answer, usage) = forced_finish_turn(
         model,
@@ -1671,7 +1672,7 @@ pub(crate) async fn run_completion<M>(
     identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
 {
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
@@ -2068,9 +2069,7 @@ impl Tool for RunExplore {
                 })),
                 Attachment::Text { .. } => None,
             }));
-            Ok(ToolOutput::content(
-                OneOrMany::many(parts).expect("the text part is always present"),
-            ))
+            Ok(ToolOutput::content(parts).expect("the text part is always present"))
         }
     }
 }
@@ -2102,9 +2101,7 @@ fn user_turn_with_attachments(attachments: &[Attachment], text: String) -> Messa
             parts.push(UserContent::text(text));
         }
         parts.extend(image_parts);
-        Message::User {
-            content: OneOrMany::many(parts).expect("image_parts is non-empty on this branch"),
-        }
+        Message::User { content: parts }
     }
 }
 
@@ -3119,7 +3116,7 @@ mod tests {
     /// The whole reason the wrapper exists: a phase's completion record reaches
     /// [`run_phase_logged`]'s caller **including the turns inside the tool loop** — the
     /// ones rig's agent hook can only see in its medium-neutral form, with no
-    /// `raw_response` and so no finish reason.
+    /// `raw` payload and so no finish reason.
     ///
     /// Two turns here: the driver calls `run_kaish` (a provider reporting
     /// `finish_reason: "tool_calls"`, nested under `choices[]` the OpenAI way), then
@@ -4246,7 +4243,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                let history: Vec<Message> = req.chat_history.clone();
                 if any_tool_result_image(&history) {
                     Ok(text_response("ANSWER: saw the diagram"))
                 } else {
@@ -4308,7 +4305,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                let history: Vec<Message> = req.chat_history.clone();
                 if user_image_messages(&history) > 0 {
                     Ok(text_response("ANSWER: saw the diagram"))
                 } else {
@@ -4801,7 +4798,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.iter().cloned().collect();
+                let history: Vec<Message> = req.chat_history.clone();
                 assert!(
                     user_image_messages(&history) > 0,
                     "the single turn must carry the routed image"
@@ -5303,10 +5300,11 @@ mod tests {
     /// **The DeepSeek repro.** A reasoning-only terminal turn: `reasoning_content` with
     /// an empty `content`. rig's deepseek converter drops the empty text block and emits
     /// a choice holding only `AssistantContent::Reasoning`
-    /// (`rig-core/src/providers/deepseek.rs:400,:420`); rig sees no tool calls, so it
-    /// takes the clean-finish branch and extracts text with `assistant_text_from_choice`,
-    /// which filters to `Text` and yields `""`
-    /// (`rig-core/src/agent/prompt_request/mod.rs:569`, `:887`, `:918`). `run_phase`
+    /// (rig-core 0.41 `providers/deepseek.rs:400,:420`; 0.42's rewritten converter
+    /// still drops the empty text); rig sees no tool calls, so it takes the
+    /// clean-finish branch and extracts text with `assistant_text_from_choice`, which
+    /// filters to `Text` and yields `""` (as read at 0.41:
+    /// `rig-core/src/agent/prompt_request/mod.rs:569`, `:887`, `:918`). `run_phase`
     /// passes that straight through (`engine.rs:862`), and every layer above — the
     /// provenance footer, the job result — happily renders an empty answer.
     ///
@@ -6444,11 +6442,13 @@ mod tests {
             .expect("a keyless gemini arm with no base_url still builds offline");
     }
 
-    /// The OpenRouter arm's full params assembly — `to_params` chained through
-    /// `inject_output_budget` at the single live construction point. The reasoning
-    /// object (thinking on by default), the rig-defect budget workaround, and the
-    /// slot's sampling must coexist in the one blob the arm sends; any of them
-    /// silently missing starves or blinds the call. Keyed via a key file so the
+    /// The OpenRouter arm's full params assembly at the single live construction
+    /// point. The reasoning object (thinking on by default), the slot's sampling, and
+    /// the privacy pin must coexist in the one blob the arm sends; any of them
+    /// silently missing blinds the call. The output budget is *not* in the blob: rig
+    /// sends it natively as `max_tokens` since 0.42
+    /// (`openrouter_completion_sends_max_tokens_natively`), and a second copy under
+    /// another spelling is the redundant-or-400 case the old workaround warned of. Keyed via a key file so the
     /// test never touches process env.
     #[test]
     fn openrouter_arm_carries_reasoning_budget_and_sampling_together() {
@@ -6481,9 +6481,9 @@ mod tests {
             defaults.synth_effort.as_str(),
             "reasoning rides on by default at the synth-role effort"
         );
-        assert_eq!(
-            params["max_completion_tokens"], defaults.max_tokens,
-            "the output budget must reach the body rig won't carry natively"
+        assert!(
+            params.get("max_completion_tokens").is_none(),
+            "the budget rides rig's native max_tokens, never a second copy: {params}"
         );
         assert_eq!(params["temperature"], 0.3, "slot sampling coexists");
         assert_eq!(
@@ -6533,7 +6533,7 @@ mod tests {
     }
 
     /// `effort = "none"` on a slot threads to the arm as the structural reasoning
-    /// disable, coexisting with the budget workaround and the privacy pin — the
+    /// disable, coexisting with the privacy pin — the
     /// full injection chain, not just the `to_params` step it's pinned at in
     /// shaping.rs (GLM review, 2026-07-03).
     #[test]
@@ -6568,10 +6568,6 @@ mod tests {
         assert!(
             params["reasoning"].get("effort").is_none(),
             "no effort string rides beside the disable, got: {params}"
-        );
-        assert_eq!(
-            params["max_completion_tokens"], defaults.max_tokens,
-            "the budget workaround coexists with the disable"
         );
         assert_eq!(
             params["provider"]["data_collection"], "deny",
@@ -6620,6 +6616,48 @@ mod tests {
         );
     }
 
+    /// rig sends the output budget on the OpenRouter wire itself, as `max_tokens`.
+    /// Until 0.42 it did not, and kaibo injected `max_completion_tokens` through
+    /// `additional_params` to cover it; that workaround is gone, so this is the test
+    /// that fails if rig ever drops the field again. Asserted on the serialized body,
+    /// because a field rig reads but never sends looks identical from every other
+    /// seam.
+    #[tokio::test]
+    async fn openrouter_completion_sends_max_tokens_natively() {
+        let http = CaptureHttp::default();
+        let client = openrouter::Client::builder()
+            .api_key("sk-or-test")
+            .http_client(http.clone())
+            .build()
+            .expect("offline openrouter client construction");
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some("ground every claim".into()),
+            chat_history: vec![Message::user("hi")],
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(4096),
+            tool_choice: None,
+            additional_params: Some(json!({ "reasoning": { "effort": "high" } })),
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        // The capture transport always errors; the body is already built by then.
+        let _ = Arm::openrouter_completion_model(&client, "qwen/qwen3.7-max")
+            .completion(request)
+            .await;
+        let body = http.recorded().expect("rig serialized a request body");
+        assert_eq!(
+            body["max_tokens"], 4096,
+            "the budget reaches the wire: {body}"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "exactly one budget field on the wire: {body}"
+        );
+    }
+
     /// The OpenRouter arm rides with rig's explicit prompt caching ON: Anthropic-
     /// upstream slugs need `cache_control` breakpoints to bill cache-read rates
     /// (2026-07-03: a consult re-billed its full growing prefix every turn without
@@ -6639,7 +6677,7 @@ mod tests {
             let request = CompletionRequest {
                 model: None,
                 preamble: Some("ground every claim".into()),
-                chat_history: OneOrMany::one(Message::user("hi")),
+                chat_history: vec![Message::user("hi")],
                 documents: Vec::new(),
                 tools: Vec::new(),
                 temperature: None,
@@ -7586,11 +7624,11 @@ mod tests {
     fn vi_call(id: &str) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::tool_call(
+            content: vec![AssistantContent::tool_call(
                 id,
                 ViewImage::NAME,
                 json!({ "path": "shot.png" }),
-            )),
+            )],
         }
     }
 
@@ -7598,13 +7636,13 @@ mod tests {
     /// two typed content blocks `ViewImage` returns.
     fn vi_result(id: &str) -> UserContent {
         UserContent::ToolResult(ToolResult {
-            id: id.to_string(),
-            call_id: None,
-            content: OneOrMany::many([
+            call: rig_core::completion::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            name: ViewImage::NAME.to_string(),
+            content: vec![
                 ToolResultContent::text("Loaded image shot.png (image/png, 1.0 KiB)."),
                 ToolResultContent::image_base64("ZmFrZQ==", None, None),
-            ])
-            .unwrap(),
+            ],
         })
     }
 
@@ -7631,13 +7669,55 @@ mod tests {
     /// reappears as its *own* tool-result-free user message, while the `tool_use`
     /// stays answered (now by text). The separate message is load-bearing — rig's
     /// openai converter drops non-tool parts from a mixed user turn.
+    /// The rewrite rebuilds each image-bearing tool result, so it must carry the whole
+    /// identity across: `provider` is the id the wire echoes back to pair the result
+    /// with its call, and `name` is what name-keyed wires replay. Dropping either
+    /// would still pass the call-id checks in the other rewrite tests.
+    #[test]
+    fn rewrite_keeps_the_tool_results_provider_id_and_name() {
+        use rig_core::completion::message::ProviderCallId;
+        let UserContent::ToolResult(mut tr) = vi_result("call-1") else {
+            unreachable!("vi_result builds a tool result")
+        };
+        tr.provider = ProviderCallId::new("call_wire_1");
+        let history = vec![
+            Message::user("look at shot.png"),
+            vi_call("call-1"),
+            Message::User {
+                content: vec![UserContent::ToolResult(tr)],
+            },
+        ];
+        let out = rewrite_tool_image_history(history);
+        let rewritten = out
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } => content.iter().find_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the tool result survives the rewrite");
+        assert!(
+            !any_tool_result_image(&out),
+            "the rewrite ran on this result: {out:?}"
+        );
+        assert_eq!(rewritten.call.as_str(), "call-1");
+        assert_eq!(
+            rewritten.provider.as_ref().map(|p| p.call_id.as_str()),
+            Some("call_wire_1"),
+            "the provider-issued id survives: {rewritten:?}"
+        );
+        assert_eq!(rewritten.name, ViewImage::NAME, "the tool name survives");
+    }
+
     #[test]
     fn rewrite_moves_view_image_onto_a_separate_user_image_turn() {
         let history = vec![
             Message::user("look at shot.png"),
             vi_call("call-1"),
             Message::User {
-                content: OneOrMany::one(vi_result("call-1")),
+                content: vec![vi_result("call-1")],
             },
         ];
         let out = rewrite_tool_image_history(history);
@@ -7656,7 +7736,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.id == "call-1"
+                    if tr.call.as_str() == "call-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
             "the view_image tool_use stays answered by a text result: {out:?}"
         );
@@ -7690,7 +7770,7 @@ mod tests {
             Message::user("q"),
             vi_call("c1"),
             Message::User {
-                content: OneOrMany::one(vi_result("c1")),
+                content: vec![vi_result("c1")],
             },
         ];
         let once = rewrite_tool_image_history(history);
@@ -7708,21 +7788,20 @@ mod tests {
     fn rewrite_leaves_a_co_tool_call_result_intact() {
         let assistant = Message::Assistant {
             id: None,
-            content: OneOrMany::many([
+            content: vec![
                 AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
                 AssistantContent::tool_call("rk", "run_kaish", json!({ "script": "ls" })),
-            ])
-            .unwrap(),
+            ],
         };
         let results = Message::User {
-            content: OneOrMany::many([
+            content: vec![
                 vi_result("vi"),
                 UserContent::tool_result(
                     "rk",
-                    OneOrMany::one(ToolResultContent::text("exit:0\nshot.png")),
+                    "run_kaish",
+                    vec![ToolResultContent::text("exit:0\nshot.png")],
                 ),
-            ])
-            .unwrap(),
+            ],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
 
@@ -7731,7 +7810,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.id == "rk"
+                    if tr.call.as_str() == "rk"
                     && tr.content.iter().any(|rc| matches!(rc,
                         ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
             "the run_kaish tool_result is preserved verbatim: {out:?}"
@@ -7747,22 +7826,24 @@ mod tests {
     fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
         let assistant = Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::tool_call(
+            content: vec![AssistantContent::tool_call(
                 "explore-1",
                 "explore",
                 json!({ "question": "what does the diagram show?" }),
-            )),
+            )],
         };
         let result = Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: "explore-1".to_string(),
-                call_id: None,
-                content: OneOrMany::many([
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig_core::completion::message::ToolCallId::new_or_mint(
+                    "explore-1".to_string(),
+                ),
+                provider: None,
+                name: "explore".to_string(),
+                content: vec![
                     ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
                     ToolResultContent::image_base64("ZmFrZQ==", None, None),
-                ])
-                .unwrap(),
-            })),
+                ],
+            })],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, result]);
 
@@ -7778,7 +7859,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.id == "explore-1"
+                    if tr.call.as_str() == "explore-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
             "the explore tool_use stays answered by a text-only result: {out:?}"
         );
@@ -7792,26 +7873,24 @@ mod tests {
     fn rewrite_moves_both_images_when_two_tools_carry_them() {
         let assistant = Message::Assistant {
             id: None,
-            content: OneOrMany::many([
+            content: vec![
                 AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
                 AssistantContent::tool_call("ex", "explore", json!({ "question": "diagram?" })),
-            ])
-            .unwrap(),
+            ],
         };
         let results = Message::User {
-            content: OneOrMany::many([
+            content: vec![
                 vi_result("vi"),
                 UserContent::ToolResult(ToolResult {
-                    id: "ex".to_string(),
-                    call_id: None,
-                    content: OneOrMany::many([
+                    call: rig_core::completion::message::ToolCallId::new_or_mint("ex".to_string()),
+                    provider: None,
+                    name: "explore".to_string(),
+                    content: vec![
                         ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
                         ToolResultContent::image_base64("ZmFrZTI=", None, None),
-                    ])
-                    .unwrap(),
+                    ],
                 }),
-            ])
-            .unwrap(),
+            ],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
 
@@ -7828,7 +7907,7 @@ mod tests {
             assert!(
                 out.iter().any(|m| matches!(m, Message::User { content }
                     if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                        if tr.id == id
+                        if tr.call.as_str() == id
                         && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
                 "tool_use `{id}` stays answered by a text-only result: {out:?}"
             );
@@ -7855,18 +7934,16 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
 
         // A genuinely declared image part — the block `view_image` and a routed
         // `explore` result emit — does carry.
-        let with_image = ToolOutput::content(
-            OneOrMany::many([
-                ToolResultContent::text("note"),
-                ToolResultContent::Image(Image {
-                    data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
-                    media_type: ImageMediaType::from_mime_type("image/png"),
-                    detail: None,
-                    additional_params: None,
-                }),
-            ])
-            .expect("two blocks is never empty"),
-        );
+        let with_image = ToolOutput::content(vec![
+            ToolResultContent::text("note"),
+            ToolResultContent::Image(Image {
+                data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                media_type: ImageMediaType::from_mime_type("image/png"),
+                detail: None,
+                additional_params: None,
+            }),
+        ])
+        .expect("two parts");
         assert!(tool_output_carries_image(&with_image));
     }
 
@@ -7879,7 +7956,7 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
             Message::user("q"),
             vi_call("a"),
             Message::User {
-                content: OneOrMany::one(vi_result("a")),
+                content: vec![vi_result("a")],
             },
             Message::assistant("thinking"),
         ];
@@ -7895,11 +7972,11 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
             Message::user("q"),
             vi_call("a"),
             Message::User {
-                content: OneOrMany::one(vi_result("a")),
+                content: vec![vi_result("a")],
             },
             // The rewrite's inserted image turn — a user message, not a model turn.
             Message::User {
-                content: OneOrMany::one(UserContent::image_base64("ZmFrZQ==", None, None)),
+                content: vec![UserContent::image_base64("ZmFrZQ==", None, None)],
             },
             Message::assistant("now answering"),
         ];

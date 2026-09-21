@@ -36,7 +36,6 @@ use rig_core::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 use rig_core::message::Message;
-use rig_core::OneOrMany;
 use serde_json::Value;
 
 use kaibo::consult::{
@@ -181,7 +180,7 @@ fn request(params: Option<Value>) -> CompletionRequest {
     CompletionRequest {
         model: None,
         preamble: Some("ground every claim".into()),
-        chat_history: OneOrMany::one(Message::user("hi")),
+        chat_history: vec![Message::user("hi")],
         documents: Vec::new(),
         tools: Vec::new(),
         temperature: None,
