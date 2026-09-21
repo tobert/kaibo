@@ -149,9 +149,12 @@ pub const SAFE_ATTRIBUTES: &[&str] = &[
     // `length`, `MAX_TOKENS`). The singular is kaibo's field on `run_phase`; the
     // plural above is rig's, on each `chat` span.
     "gen_ai.response.finish_reason",
-    // Whether a consult continued a session (a bool), never the session's turns.
+    // On the `consult` span, whether it continued a session (a bool); on the
+    // session-write warning event, the session id. An identifier either way, never
+    // the session's turns.
     "session",
-    // A job or provider batch handle, and a batch's item counts.
+    // A job or provider batch handle (`backend/provider-id`, or the text a caller
+    // passed to `job_get`/`job_cancel`), and a batch's item counts.
     "handle",
     "items",
     "n",

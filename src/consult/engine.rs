@@ -3288,7 +3288,7 @@ mod tests {
     /// The single-shot lane (`oneshot`, `deliberate`'s direct lane) counts each
     /// attempt the provider saw, the same as the tool loop. That holds only when the
     /// watcher sits *inside* the retry, so a resent generation passes through it
-    /// twice; the other order counts one call per turn however many requests went out,
+    /// twice (two attempts, one turn record — only a response is recorded); the other order counts one call per turn however many requests went out,
     /// and times kaibo's own backoff sleep as provider latency.
     #[tokio::test]
     async fn the_single_shot_lane_counts_a_retried_attempt() {

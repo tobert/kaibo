@@ -28,7 +28,7 @@ record. Each later release appends a new section at the top.
 
 ### Fixed
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
-- `oneshot` and `deliberate`'s direct lane count each retried attempt, and their latency excludes kaibo's backoff.
+- `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
 - Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
 - Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
 

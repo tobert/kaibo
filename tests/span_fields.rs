@@ -22,14 +22,17 @@ use std::path::Path;
 
 use kaibo::otel_filter::{CONTENT_ATTRIBUTES, SAFE_ATTRIBUTES};
 
-/// The span-opening forms kaibo uses. Each is followed by a parenthesized argument
-/// list whose `key = value` pairs are the span's fields.
+/// The span-opening forms. Each is followed by a parenthesized argument list whose
+/// `key = value` pairs are the span's fields. `span!(` is the leveled form
+/// (`tracing::span!(Level::INFO, ..)`); it is matched only where it is not the tail of
+/// one of the named macros above it, so `info_span!(` is not counted twice.
 const OPENERS: &[&str] = &[
     "info_span!(",
     "debug_span!(",
     "trace_span!(",
     "warn_span!(",
     "error_span!(",
+    "span!(",
     "instrument(",
 ];
 
@@ -158,8 +161,21 @@ fn collect(dir: &Path, found: &mut BTreeMap<String, Vec<String>>) {
         }
         let text = std::fs::read_to_string(&path).expect("read source file");
         let src = production_part(&text);
+        // A bare `#[instrument]` records every function argument as a field — prompts
+        // and paths included — with no argument list for this scan to read.
+        for bare in ["#[instrument]", "#[tracing::instrument]"] {
+            assert!(
+                !src.lines().any(|l| l.trim_start().starts_with(bare)),
+                "{} uses a bare `{bare}`, which records every argument as a span field; \
+                 write `instrument(skip_all, fields(..))` and name each field",
+                path.display()
+            );
+        }
         for opener in OPENERS {
             for (at, _) in src.match_indices(opener) {
+                if *opener == "span!(" && at > 0 && src.as_bytes()[at - 1] == b'_' {
+                    continue;
+                }
                 let open_paren = at + opener.len() - 1;
                 let line = src[..at].matches('\n').count() + 1;
                 for key in field_keys(&argument_list(src, open_paren)) {
@@ -179,14 +195,22 @@ fn every_span_field_kaibo_declares_is_classified_for_export() {
     let mut found = BTreeMap::new();
     collect(&src, &mut found);
 
-    // The scan looked somewhere real: a bare field, a dotted field, and a quoted field
-    // that kaibo is known to declare, and a floor on the total.
-    for known in ["cast", "gen_ai.request.thinking", "kaish.exit_code"] {
+    // The scan looked somewhere real: in each file that declares spans, one field it
+    // is known to declare (bare, dotted, and quoted forms among them), and a floor on
+    // the total.
+    for (known, file) in [
+        ("cast", "src/server/mod.rs"),
+        ("max_turns", "src/consult/engine.rs"),
+        ("items", "src/batch.rs"),
+        ("kaish.exit_code", "src/tool_span.rs"),
+        ("gen_ai.request.thinking", "src/consult/engine.rs"),
+    ] {
         assert!(
-            found.contains_key(known),
-            "the scanner missed `{known}`, a field kaibo declares — the scan is broken, \
-             not the allowlist. Found: {:?}",
-            found.keys().collect::<Vec<_>>()
+            found
+                .get(known)
+                .is_some_and(|sites| sites.iter().any(|site| site.contains(file))),
+            "the scanner missed `{known}` in {file}, where kaibo declares it — the scan \
+             is broken, not the allowlist. Found: {found:?}"
         );
     }
     assert!(
