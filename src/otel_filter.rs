@@ -129,15 +129,32 @@ pub const SAFE_ATTRIBUTES: &[&str] = &[
     // slot ref is `backend/model-id` — both identifiers.
     "cast",
     "model",
+    "explorer_model",
+    "synth_model",
     "slot",
     "phase",
     "role",
+    // The configured backend a `job_list` sweep is reading, by name.
+    "backend",
     // Loop shape: how many turns, how many delegations. The numbers that answer
     // "did the driver actually delegate", with no payload.
     "turns",
     "turn",
     "max_turns",
-    "finish_reason",
+    // The request shape a phase or batch actually sent: the reasoning and sampling
+    // blob kaibo builds from config (effort, thinking budget, temperature, the
+    // OpenRouter routing pin). Knobs, never prompt text.
+    "gen_ai.request.thinking",
+    // How a phase's last completion ended, in the provider's own word (`stop`,
+    // `length`, `MAX_TOKENS`). The singular is kaibo's field on `run_phase`; the
+    // plural above is rig's, on each `chat` span.
+    "gen_ai.response.finish_reason",
+    // Whether a consult continued a session (a bool), never the session's turns.
+    "session",
+    // A job or provider batch handle, and a batch's item counts.
+    "handle",
+    "items",
+    "n",
 ];
 
 /// Attributes that carry content, exported only when the operator opts in.
@@ -331,6 +348,8 @@ mod tests {
             "kaish.output_bytes",
             "error.type",
             "cast",
+            "gen_ai.request.thinking",
+            "gen_ai.response.finish_reason",
         ] {
             assert!(p.allows(name), "{name} is metadata and should survive");
         }

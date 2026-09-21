@@ -1686,13 +1686,14 @@ where
     // answer, and a real answer — and an agent metric that skipped two of them would
     // undercount exactly the failures the conventions say to include.
     let outcome = async {
-        // Same two wrappers the loop uses: a single-shot lane declares no tools, so it
-        // cannot fumble a tool call, but a provider that could not shape the response
-        // (`MalformedResponse`) reaches here too and is worth the same retry.
-        let mut builder = watched(
-            retried(model.clone(), model_name),
-            log.clone(),
-            identity,
+        // Same two wrappers the loop uses, in the same order: the watcher inside the
+        // retry, so each attempt the provider sees is one record and its duration is
+        // the provider's alone, never kaibo's backoff sleep. A single-shot lane
+        // declares no tools, so it cannot fumble a tool call, but a provider that could
+        // not shape the response (`MalformedResponse`) reaches here too and is worth
+        // the same retry.
+        let mut builder = retried(
+            watched(model.clone(), log.clone(), identity, model_name),
             model_name,
         )
         .completion_request(prompt)
@@ -3281,6 +3282,57 @@ mod tests {
             asked[2].transcript.contains("EVIDENCE"),
             "the retry carries the gathered evidence, not a fresh start: {:?}",
             asked[2].transcript
+        );
+    }
+
+    /// The single-shot lane (`oneshot`, `deliberate`'s direct lane) counts each
+    /// attempt the provider saw, the same as the tool loop. That holds only when the
+    /// watcher sits *inside* the retry, so a resent generation passes through it
+    /// twice; the other order counts one call per turn however many requests went out,
+    /// and times kaibo's own backoff sleep as provider latency.
+    #[tokio::test]
+    async fn the_single_shot_lane_counts_a_retried_attempt() {
+        use std::sync::atomic::AtomicBool;
+        const MODEL: &str = "oneshot-model";
+        // A retry resends a byte-identical request, so the ordering is the behavior
+        // under test: fumble once, then answer.
+        let fumbled = Arc::new(AtomicBool::new(false));
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |_req| {
+                if !fumbled.swap(true, Ordering::SeqCst) {
+                    return Err(crate::test_support::response_error(
+                        "Gemini stopped with finish_reason=MalformedResponse: \
+                         could not shape the response",
+                    ));
+                }
+                Ok(text_response("ANSWER"))
+            })
+            .build();
+        let log = CompletionLog::new();
+        let (answer, _usage) = run_completion(
+            &client.completion_model(MODEL),
+            MODEL,
+            &log,
+            "answer",
+            16384,
+            None,
+            Message::user("q"),
+            None,
+            None,
+        )
+        .await
+        .expect("one malformed generation must not fail the call");
+
+        assert_eq!(answer, "ANSWER");
+        assert_eq!(
+            client.requests_for(MODEL).len(),
+            2,
+            "the provider saw two requests"
+        );
+        assert_eq!(
+            log.attempts(),
+            2,
+            "each request the provider saw is one attempt on the log"
         );
     }
 
