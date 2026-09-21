@@ -358,6 +358,11 @@ pub struct ModelSlot {
     /// (`Config::merge`) requires a lane to sit on a synth slot; an explorer with a
     /// lane is a loud error (the explorer always runs interactively).
     pub lane: Option<Lane>,
+    /// True when `effort` is a built-in cast's pin rather than a value the operator
+    /// wrote. Only `builtin_casts` sets it; a file declaration of the slot replaces the
+    /// slot whole, which clears it. It keeps the pin out of the diagnostics that exist
+    /// to flag an operator's own setting (see [`SlotTunables::effort_explicit`]).
+    pub effort_is_builtin: bool,
 }
 
 impl ModelSlot {
@@ -376,6 +381,7 @@ impl ModelSlot {
             thinking_style: None,
             preamble: None,
             lane: None,
+            effort_is_builtin: false,
         }
     }
 
@@ -412,8 +418,10 @@ impl ModelSlot {
                 .clone()
                 .unwrap_or_else(|| default_effort.to_string()),
             // Explicit either way an operator can write it: on the slot, or in the
-            // `[defaults]`/env layer this slot inherits from.
-            effort_explicit: self.effort.is_some() || default_effort_explicit,
+            // `[defaults]`/env layer this slot inherits from. A built-in cast's pin is
+            // neither.
+            effort_explicit: (self.effort.is_some() && !self.effort_is_builtin)
+                || default_effort_explicit,
             thinking_style: self.thinking_style.unwrap_or(defaults.thinking_style),
         }
     }
@@ -2454,6 +2462,7 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
                 ModelRole::Synth,
                 ModelSlot {
                     max_tokens: synth_max_tokens,
+                    effort_is_builtin: synth_effort.is_some(),
                     effort: synth_effort,
                     ..slot(synth, None)
                 },
@@ -2963,7 +2972,9 @@ impl RawSlot {
             // string form (which trims in `parse_slot_ref`): identical intent must
             // not depend on the spelling. The empty-after-trim case is still caught
             // loudly downstream (`merge`: unknown backend / empty model id).
+            // A file-declared slot is the operator's, so its effort is never built-in.
             Self::Table(t) => Ok(ModelSlot {
+                effort_is_builtin: false,
                 backend: t.backend.trim().to_string(),
                 id: t.id.trim().to_string(),
                 vision: t.vision,
@@ -4183,6 +4194,41 @@ mod tests {
                 assert_eq!(slot.effort, None, "{name:?} pins no effort");
             }
         }
+    }
+
+    /// A built-in effort pin is kaibo's choice, not the operator's, so it stays quiet in
+    /// the diagnostics that exist to flag a value someone wrote. With reasoning switched
+    /// off globally (`thinking_style = "off"`) the pin lands nowhere; reporting it would
+    /// warn about a slot nobody wrote, blaming a wire that does carry the parameter.
+    /// The same pin written in the operator's own file is theirs, and is reported.
+    #[test]
+    fn a_builtin_effort_pin_is_not_reported_as_the_operators() {
+        let cfg = Config::from_toml_str("[defaults]\nthinking_style = \"off\"\n").unwrap();
+        let diags = cfg.effort_diagnostics();
+        assert!(
+            diags.iter().all(|d| d.cast != "deepseek"),
+            "the built-in pin must not be reported: {diags:?}"
+        );
+        let cast = cfg.resolve_cast("deepseek").unwrap();
+        let t = cast
+            .require_slot(ModelRole::Synth)
+            .unwrap()
+            .tunables(ModelRole::Synth, &cfg.defaults);
+        assert_eq!(t.effort, "max", "the pin still applies");
+        assert!(!t.effort_explicit);
+
+        let written = Config::from_toml_str(
+            "[defaults]\nthinking_style = \"off\"\n\n[casts.deepseek]\n\
+             synth = { backend = \"deepseek\", id = \"deepseek-flash\", effort = \"max\" }\n",
+        )
+        .unwrap();
+        assert!(
+            written
+                .effort_diagnostics()
+                .iter()
+                .any(|d| d.cast == "deepseek" && d.role == "synth"),
+            "the same value written by the operator is reported"
+        );
     }
 
     /// Every interactive built-in cast exists, each single-backend with

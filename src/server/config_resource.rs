@@ -461,6 +461,10 @@ pub(crate) fn render_config_resource(
                         thinking_style,
                         preamble,
                         lane,
+                        // Provenance for diagnostics only; the rendered `effort` is the
+                        // value either way, and `inert_tunables` reads provenance through
+                        // `effort_disposition`.
+                        effort_is_builtin: _,
                     } = slot;
                     let caps = config
                         .slot_caps(slot)

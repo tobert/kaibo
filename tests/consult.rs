@@ -918,7 +918,9 @@ fn transcript_text(req: &rig_core::completion::CompletionRequest) -> String {
 /// construction — the chimera promise of docs/casts.md, proven with no network.
 #[tokio::test]
 async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
-    const EXPLORER_MODEL: &str = "deepseek-flash";
+    // Fabricated ids: routing keys, not real models. A real id here would read as a
+    // claim about that model's caps, which these hand-built arms set themselves.
+    const EXPLORER_MODEL: &str = "deepseek-explorer";
     const SYNTH_MODEL: &str = "claude-sonnet-4-6";
     const REPORT: &str = "MIXED_REPORT: src/foo.rs:1 fn target_marker";
 
@@ -1141,7 +1143,9 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
 /// silently flip open for a text-only model.
 #[tokio::test]
 async fn a_blind_synth_is_not_offered_view_image() {
-    const SYNTH_MODEL: &str = "deepseek-flash";
+    // A fabricated id: the arm below sets `vision: false` itself, and a real model id
+    // would read as a claim about that model.
+    const SYNTH_MODEL: &str = "text-only-synth";
 
     let dir = tempfile::tempdir().unwrap();
     let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {

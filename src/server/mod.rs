@@ -5409,6 +5409,36 @@ mod tests {
         );
     }
 
+    /// `explore` refuses an image attachment on every cast, and says why: its survey
+    /// reads through the shell, which has no image tool. The reason must not blame the
+    /// cast's models — the built-in `deepseek` explorer is itself sighted — and the
+    /// refusal names the tools that do take an image.
+    #[tokio::test]
+    async fn explore_refuses_an_image_for_its_toolset_not_its_models() {
+        let root = tempfile::tempdir().unwrap();
+        let root_canon = std::fs::canonicalize(root.path()).unwrap();
+        let png_sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(root_canon.join("shot.png"), png_sig).unwrap();
+        let err = handler()
+            .resolve_sweep_attachments(&root_canon, &["shot.png".to_string()], "explore")
+            .await
+            .expect_err("an image attachment to explore is refused");
+        let msg = err.message.to_string();
+        assert!(msg.contains("shot.png"), "names the file: {msg}");
+        assert!(
+            msg.contains("no image tool"),
+            "gives the toolset reason: {msg}"
+        );
+        assert!(
+            !msg.contains("can't view images"),
+            "does not blame the models: {msg}"
+        );
+        assert!(
+            msg.contains("`consult`") && msg.contains("`oneshot`"),
+            "names what takes an image instead: {msg}"
+        );
+    }
+
     /// consult `attach` sniffs each file's *content* (not its extension) so the driver
     /// prompt routes it right: a text file inlines (or demotes to a shell read), an image
     /// goes to `view_image`. A PNG signature classifies as an image even named `.txt`, and
