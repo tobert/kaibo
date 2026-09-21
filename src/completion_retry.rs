@@ -11,6 +11,10 @@
 //! live: a Gemini Flash explorer died on one empty function call twenty turns into a
 //! `deliberate`, and the whole investigation went with it.
 //!
+//! **Audit log.** 0.41 → 0.42 (2026-09-21): both rig facts this module leans on still
+//! hold — the Gemini `ResponseError` text is unchanged, and
+//! `provider_response_status()` still documents that it can return a 2xx.
+//!
 //! **Transient transport failure.** A 429 (every provider's rate limit), a
 //! 500/502/503 (the generic "backend down or overloaded" family), or a 529
 //! (Anthropic's own `overloaded_error`) means the same thing at the transport layer:
@@ -252,7 +256,7 @@ fn transient_wait(attempt: u32, error: &CompletionError) -> std::time::Duration 
 /// every other outcome untouched.
 ///
 /// Transparent on every path that is neither: the response, the usage, the
-/// `raw_response`, and each other error are the inner model's own.
+/// `raw` payload, and each other error are the inner model's own.
 #[derive(Clone, Debug)]
 pub struct Retried<M> {
     inner: M,
@@ -285,24 +289,10 @@ pub fn retried<M: CompletionModel>(model: M, name: &str) -> Retried<M> {
 }
 
 impl<M: CompletionModel> CompletionModel for Retried<M> {
-    type Response = M::Response;
-    type StreamingResponse = M::StreamingResponse;
-    type Client = M::Client;
-
-    /// Unreachable, and loudly so — the same contract
-    /// [`Watched::make`](crate::completion_watch::Watched) holds. `make` is only ever
-    /// called through `CompletionClient::completion_model`, and no client's
-    /// `CompletionModel` is a `Retried`; kaibo always wraps an already-built model
-    /// with [`retried`]. Building one here would have to invent a model name and a
-    /// bound nobody chose.
-    fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-        unreachable!("Retried is built by `retried(model, name)`, never by CompletionModel::make")
-    }
-
     async fn completion(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+    ) -> Result<CompletionResponse, CompletionError> {
         // Two independent counters, because a turn that fumbles once and then hits a
         // rate limit once must spend both allowances, not share one between classes.
         let mut malformed_attempts = 0usize;
@@ -354,17 +344,14 @@ impl<M: CompletionModel> CompletionModel for Retried<M> {
     async fn stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<
-        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
-        CompletionError,
-    > {
+    ) -> Result<rig_core::streaming::StreamingCompletionResponse, CompletionError> {
         self.inner.stream(request).await
     }
 
     /// Forwarded: this is a provider capability, and the wrapper must not change what
     /// rig believes the model can do.
-    fn composes_native_output_with_tools(&self) -> bool {
-        self.inner.composes_native_output_with_tools()
+    fn capabilities(&self) -> rig_core::completion::ProviderCapabilities {
+        self.inner.capabilities()
     }
 }
 
@@ -376,7 +363,6 @@ mod tests {
     };
     use rig_core::client::CompletionClient;
     use rig_core::completion::message::Message;
-    use rig_core::OneOrMany;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -387,7 +373,7 @@ mod tests {
         CompletionRequest {
             model: None,
             preamble: None,
-            chat_history: OneOrMany::one(Message::user("q")),
+            chat_history: vec![Message::user("q")],
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -448,7 +434,7 @@ mod tests {
         assert!(
             matches!(
                 response.choice.first(),
-                rig_core::completion::message::AssistantContent::Text(_)
+                Some(rig_core::completion::message::AssistantContent::Text(_))
             ),
             "the caller gets the second attempt's answer"
         );
@@ -539,11 +525,10 @@ mod tests {
             .build();
         let model = retried(client.completion_model("m"), "m");
         let mut request = req();
-        request.chat_history = OneOrMany::many([
+        request.chat_history = vec![
             Message::user("the question"),
             Message::assistant("a partial investigation"),
-        ])
-        .expect("two messages");
+        ];
         model.completion(request).await.expect("the retry answers");
 
         let asked = client.requests_for("m");
@@ -576,7 +561,7 @@ mod tests {
         assert!(
             matches!(
                 response.choice.first(),
-                rig_core::completion::message::AssistantContent::Text(_)
+                Some(rig_core::completion::message::AssistantContent::Text(_))
             ),
             "the caller gets the second attempt's answer"
         );

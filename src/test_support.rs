@@ -46,18 +46,15 @@ use rig_core::completion::message::{
     AssistantContent, Message, ToolChoice, ToolResultContent, UserContent,
 };
 use rig_core::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
 };
 use rig_core::http_client::{self, HttpClientExt};
-use rig_core::OneOrMany;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// How the mock answers one request for one model: branch on the request's content
 /// and return a response, or an error to exercise the failure paths.
-pub type Responder = Arc<
-    dyn Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError> + Send + Sync,
->;
+pub type Responder =
+    Arc<dyn Fn(&CompletionRequest) -> Result<CompletionResponse, CompletionError> + Send + Sync>;
 
 /// A snapshot of one inbound completion request, captured for post-hoc assertions.
 /// Decoupled from the responder so a test can assert *what was asked* separately
@@ -109,7 +106,7 @@ impl RecordedRequest {
             additional_params: req.additional_params.clone(),
             max_tokens: req.max_tokens,
             tool_choice: req.tool_choice.clone(),
-            chat_history: req.chat_history.iter().cloned().collect(),
+            chat_history: req.chat_history.clone(),
             raw: serde_json::to_value(req).unwrap_or(Value::Null),
         }
     }
@@ -161,7 +158,7 @@ impl ScriptedBuilder {
     /// and returns a response (or an error, to drive a failure path).
     pub fn on_model<F>(mut self, id: impl Into<String>, responder: F) -> Self
     where
-        F: Fn(&CompletionRequest) -> Result<CompletionResponse<Value>, CompletionError>
+        F: Fn(&CompletionRequest) -> Result<CompletionResponse, CompletionError>
             + Send
             + Sync
             + 'static,
@@ -195,19 +192,6 @@ pub struct ScriptedModel {
     responders: Arc<HashMap<String, Responder>>,
     hangers: Arc<HashSet<String>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
-}
-
-/// Streaming response placeholder: kaibo never streams, so this is never built. It
-/// exists only to satisfy `CompletionModel::StreamingResponse`'s bounds.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NoStream;
-
-impl GetTokenUsage for NoStream {
-    // A zero-valued `Usage` is rig's documented sentinel for "the provider reported
-    // none" — there is no separate absent case.
-    fn token_usage(&self) -> Usage {
-        Usage::new()
-    }
 }
 
 /// An [`HttpClientExt`] that records the request body rig built, then fails.
@@ -278,32 +262,27 @@ impl HttpClientExt for CaptureHttp {
 
 impl CompletionClient for ScriptedClient {
     type CompletionModel = ScriptedModel;
-}
 
-impl CompletionModel for ScriptedModel {
-    /// The **raw provider response**, as free-form JSON. A real provider's raw payload
-    /// is its own struct; here it is a `Value` a responder can shape into whatever
-    /// wire form the test is about — an Anthropic `stop_reason`, a Gemini
-    /// `candidates[].finishReason` — which is what lets the offline harness drive
-    /// [`Watched`](crate::completion_watch::Watched), whose whole job is reading that
-    /// payload. `Value::Null` is the default: a response that reports nothing.
-    type Response = Value;
-    type StreamingResponse = NoStream;
-    type Client = ScriptedClient;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self {
+    fn completion_model(&self, model: impl Into<String>) -> ScriptedModel {
+        ScriptedModel {
             id: model.into(),
-            responders: client.responders.clone(),
-            hangers: client.hangers.clone(),
-            log: client.log.clone(),
+            responders: self.responders.clone(),
+            hangers: self.hangers.clone(),
+            log: self.log.clone(),
         }
     }
+}
 
+/// A scripted response's `raw` is free-form JSON a responder can shape into whatever
+/// wire form the test is about — an Anthropic `stop_reason`, a Gemini
+/// `candidates[].finishReason` — which is what lets the offline harness drive
+/// [`Watched`](crate::completion_watch::Watched), whose whole job is reading that
+/// payload. `Value::Null` is the default: a response that reports nothing.
+impl CompletionModel for ScriptedModel {
     async fn completion(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+    ) -> Result<CompletionResponse, CompletionError> {
         // Record first, so even a request that the responder errors on is observable.
         self.log
             .lock()
@@ -328,10 +307,7 @@ impl CompletionModel for ScriptedModel {
     async fn stream(
         &self,
         _request: CompletionRequest,
-    ) -> Result<
-        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
-        CompletionError,
-    > {
+    ) -> Result<rig_core::streaming::StreamingCompletionResponse, CompletionError> {
         unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
     }
 }
@@ -339,20 +315,22 @@ impl CompletionModel for ScriptedModel {
 // ---- response builders -----------------------------------------------------
 
 /// A final text answer — ends the tool loop.
-pub fn text_response(text: impl Into<String>) -> CompletionResponse<Value> {
-    response(OneOrMany::one(AssistantContent::text(text)))
+pub fn text_response(text: impl Into<String>) -> CompletionResponse {
+    response(vec![AssistantContent::text(text)])
 }
 
 /// A **reasoning-only** terminal turn — the shape a DeepSeek reasoner produces when it
 /// returns `reasoning_content` with an empty/whitespace `content`. rig's deepseek
-/// converter drops the empty text block outright and pushes only
-/// `AssistantContent::Reasoning` (`providers/deepseek.rs:400`/`:420`), so the choice
+/// converter drops the empty text block outright and keeps only
+/// `AssistantContent::Reasoning` (0.42: `providers/deepseek.rs`, the
+/// `NormalizeCompletionResponse` impl passing `text.trim().is_empty()` to
+/// `text_then_tool_calls`), so the choice
 /// carries no `Text` and no `ToolCall`. rig then treats it as a clean terminal turn and
 /// its text extraction (`assistant_text_from_choice`) filters to `Text`, yielding `""` —
 /// an `Ok` response with an empty `output`. The offline stand-in for the
 /// generated-but-undelivered answer.
-pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse<Value> {
-    response(OneOrMany::one(AssistantContent::reasoning(reasoning)))
+pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse {
+    response(vec![AssistantContent::reasoning(reasoning)])
 }
 
 /// A single tool call — drives one more loop turn.
@@ -360,39 +338,35 @@ pub fn tool_call_response(
     id: impl Into<String>,
     name: impl Into<String>,
     args: Value,
-) -> CompletionResponse<Value> {
-    response(OneOrMany::one(AssistantContent::tool_call(id, name, args)))
+) -> CompletionResponse {
+    response(vec![AssistantContent::tool_call(id, name, args)])
 }
 
 /// Several tool calls in *one* assistant turn — the co-tool-call case (e.g. a turn
 /// that calls `view_image` alongside `run_kaish`). rig runs them together and folds
 /// all their results into a single user turn, which is exactly the shape the
 /// view_image turn-boundary break must tolerate without orphaning a `tool_use`.
-pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse<Value> {
+pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse {
     let contents: Vec<AssistantContent> = calls
         .into_iter()
         .map(|(id, name, args)| AssistantContent::tool_call(id, name, args))
         .collect();
-    response(OneOrMany::many(contents).expect("at least one tool call"))
+    response(contents)
 }
 
-fn response(choice: OneOrMany<AssistantContent>) -> CompletionResponse<Value> {
-    CompletionResponse {
-        choice,
-        usage: Usage::new(),
-        // Nothing reported — the default a test that doesn't care about the provider's
-        // own payload gets. Shape one with [`with_raw`] when the payload is the point.
-        raw_response: Value::Null,
-        message_id: None,
-    }
+fn response(choice: Vec<AssistantContent>) -> CompletionResponse {
+    // `raw` starts `Value::Null` — nothing reported, the default a test that doesn't
+    // care about the provider's own payload gets. Shape one with [`with_raw`] when the
+    // payload is the point.
+    CompletionResponse::new(choice, Usage::new(), "scripted")
 }
 
 /// Stamp a **raw provider payload** onto a scripted response — the untouched JSON a
 /// real provider would return alongside the parsed choice. This is what
 /// [`Watched`](crate::completion_watch::Watched) reads, so a test that cares how a
 /// turn *ended* (`finish_reason` / `stop_reason` / `finishReason`) shapes it here.
-pub fn with_raw(mut resp: CompletionResponse<Value>, raw: Value) -> CompletionResponse<Value> {
-    resp.raw_response = raw;
+pub fn with_raw(mut resp: CompletionResponse, raw: Value) -> CompletionResponse {
+    resp.raw = raw;
     resp
 }
 
@@ -413,7 +387,7 @@ pub fn usage(input: u64, output: u64) -> Usage {
 
 /// Stamp a reported [`usage`] onto a scripted response. `text_response`/`tool_call_response`
 /// default to `Usage::new()` (nothing reported); wrap them here to drive the accounting.
-pub fn with_usage(mut resp: CompletionResponse<Value>, usage: Usage) -> CompletionResponse<Value> {
+pub fn with_usage(mut resp: CompletionResponse, usage: Usage) -> CompletionResponse {
     resp.usage = usage;
     resp
 }
