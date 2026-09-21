@@ -7,7 +7,7 @@
 //! {"role":"assistant","content":"391","reasoning":null,"reasoning_content":null}
 //! ```
 //!
-//! rig-core 0.41 declares one field for the two
+//! rig-core (0.41, and still 0.42) declares one field for the two
 //! (`#[serde(rename = "reasoning_content", alias = "reasoning")]`,
 //! `providers/openai/completion/mod.rs`), so both keys land on the same field and
 //! serde raises `duplicate field \`reasoning_content\``. The decode failure does not
@@ -41,6 +41,9 @@
 //! call sites in [`crate::consult::engine`] go away — [`repairs_nothing_when_rig_can_already_decode`]
 //! is the test that will say so, because it decodes the captured payload with rig's own
 //! type and fails the day rig stops needing help.
+//!
+//! **Audit log.** 0.41 → 0.42 (2026-09-21): still needed — 0.42 keeps the
+//! `rename` + `alias` pair, and the canary test above still passes.
 
 use bytes::Bytes;
 use rig_core::http_client::{self, HttpClientExt, LazyBody, Request, Response};

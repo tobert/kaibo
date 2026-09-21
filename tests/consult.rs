@@ -717,7 +717,7 @@ type Responder = Arc<
     dyn Fn(
             &rig_core::completion::CompletionRequest,
         ) -> Result<
-            rig_core::completion::CompletionResponse<()>,
+            rig_core::completion::CompletionResponse,
             rig_core::completion::CompletionError,
         > + Send
         + Sync,
@@ -748,7 +748,7 @@ impl ScriptedClient {
         F: Fn(
                 &rig_core::completion::CompletionRequest,
             ) -> Result<
-                rig_core::completion::CompletionResponse<()>,
+                rig_core::completion::CompletionResponse,
                 rig_core::completion::CompletionError,
             > + Send
             + Sync
@@ -773,36 +773,22 @@ struct ScriptedModel {
     client: ScriptedClient,
 }
 
-/// Streaming placeholder: kaibo never streams; exists only for the trait bounds.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct NoStream;
-
-impl rig_core::completion::GetTokenUsage for NoStream {
-    fn token_usage(&self) -> rig_core::completion::Usage {
-        rig_core::completion::Usage::new()
-    }
-}
-
 impl rig_core::client::CompletionClient for ScriptedClient {
     type CompletionModel = ScriptedModel;
+
+    fn completion_model(&self, model: impl Into<String>) -> ScriptedModel {
+        ScriptedModel {
+            id: model.into(),
+            client: self.clone(),
+        }
+    }
 }
 
 impl rig_core::completion::CompletionModel for ScriptedModel {
-    type Response = ();
-    type StreamingResponse = NoStream;
-    type Client = ScriptedClient;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self {
-            id: model.into(),
-            client: client.clone(),
-        }
-    }
-
     async fn completion(
         &self,
         request: rig_core::completion::CompletionRequest,
-    ) -> Result<rig_core::completion::CompletionResponse<()>, rig_core::completion::CompletionError>
+    ) -> Result<rig_core::completion::CompletionResponse, rig_core::completion::CompletionError>
     {
         assert_eq!(
             self.id, self.client.expect_model,
@@ -832,7 +818,7 @@ impl rig_core::completion::CompletionModel for ScriptedModel {
         &self,
         _request: rig_core::completion::CompletionRequest,
     ) -> Result<
-        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig_core::streaming::StreamingCompletionResponse,
         rig_core::completion::CompletionError,
     > {
         unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
@@ -840,15 +826,12 @@ impl rig_core::completion::CompletionModel for ScriptedModel {
 }
 
 /// A final text answer — ends the tool loop.
-fn text_response(text: impl Into<String>) -> rig_core::completion::CompletionResponse<()> {
-    rig_core::completion::CompletionResponse {
-        choice: rig_core::OneOrMany::one(rig_core::completion::message::AssistantContent::text(
-            text,
-        )),
-        usage: rig_core::completion::Usage::new(),
-        raw_response: (),
-        message_id: None,
-    }
+fn text_response(text: impl Into<String>) -> rig_core::completion::CompletionResponse {
+    rig_core::completion::CompletionResponse::new(
+        vec![rig_core::completion::message::AssistantContent::text(text)],
+        rig_core::completion::Usage::new(),
+        "scripted",
+    )
 }
 
 /// A single tool call — drives one more loop turn.
@@ -856,34 +839,30 @@ fn tool_call_response(
     id: &str,
     name: &str,
     args: Value,
-) -> rig_core::completion::CompletionResponse<()> {
-    rig_core::completion::CompletionResponse {
-        choice: rig_core::OneOrMany::one(
-            rig_core::completion::message::AssistantContent::tool_call(id, name, args),
-        ),
-        usage: rig_core::completion::Usage::new(),
-        raw_response: (),
-        message_id: None,
-    }
+) -> rig_core::completion::CompletionResponse {
+    rig_core::completion::CompletionResponse::new(
+        vec![rig_core::completion::message::AssistantContent::tool_call(
+            id, name, args,
+        )],
+        rig_core::completion::Usage::new(),
+        "scripted",
+    )
 }
 
 /// Several tool calls in ONE assistant turn — the co-tool-call case (`view_image`
 /// alongside `run_kaish`). rig runs them together and folds both results into a single
 /// user turn, exactly the shape the view_image turn-boundary break must tolerate.
-fn tool_calls_response(
-    calls: &[(&str, &str, Value)],
-) -> rig_core::completion::CompletionResponse<()> {
+fn tool_calls_response(calls: &[(&str, &str, Value)]) -> rig_core::completion::CompletionResponse {
     use rig_core::completion::message::AssistantContent;
     let contents: Vec<AssistantContent> = calls
         .iter()
         .map(|(id, name, args)| AssistantContent::tool_call(*id, *name, args.clone()))
         .collect();
-    rig_core::completion::CompletionResponse {
-        choice: rig_core::OneOrMany::many(contents).expect("at least one tool call"),
-        usage: rig_core::completion::Usage::new(),
-        raw_response: (),
-        message_id: None,
-    }
+    rig_core::completion::CompletionResponse::new(
+        contents,
+        rig_core::completion::Usage::new(),
+        "scripted",
+    )
 }
 
 /// True if the request declares a tool named `name`.
@@ -1540,9 +1519,9 @@ async fn two_phase_consult_answers_from_the_real_tree() {
 #[ignore = "hits the OpenRouter API (keyed gateway); run with --ignored and OPENROUTER_API_KEY"]
 async fn openrouter_consult_round_trips() {
     // The live proof of the OpenRouter arm: the unified `{reasoning:{effort}}` param,
-    // the `max_completion_tokens` workaround (rig drops native max_tokens for this
-    // provider — without the injection a thinking-on answer would starve), and the
-    // `with_app_identity` headers all have to be accepted end-to-end. Runs the built-in
+    // rig's native `max_tokens` (sent by rig since 0.42 — without it a thinking-on
+    // answer would starve), and the `with_app_identity` headers all have to be
+    // accepted end-to-end. Runs the built-in
     // openrouter cast (the `~author/family-latest` aliases) so a regression in any of
     // those surfaces as a live failure here, not in production.
     if let Err(e) = load(ProviderKind::OpenRouter) {
@@ -1580,7 +1559,7 @@ async fn openrouter_consult_round_trips() {
         None,
     )
     .await
-    .expect("openrouter consult should succeed (reasoning + max_completion_tokens accepted)");
+    .expect("openrouter consult should succeed (reasoning + max_tokens accepted)");
 
     let lower = out.answer.to_lowercase();
     assert!(

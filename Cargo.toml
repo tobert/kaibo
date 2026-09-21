@@ -39,7 +39,7 @@ anyhow = "1"
 # provider we hand-write: rig already ships openai / xai / azure / huggingface impls of
 # that trait, so an `image` cast slot can reach them for free. Turned off by 986806f
 # when image generation was removed; back on with the media CAS.
-rig-core = { version = "0.41", default-features = false, features = ["reqwest", "derive", "image"] }
+rig-core = { version = "0.42", default-features = false, features = ["reqwest", "derive", "image"] }
 # The agent/tool loop, which rig ships as its own crate beside `rig-core`.
 #
 # DO NOT collapse these two onto the `rig` facade crate. It looks tidier and it is a
@@ -54,7 +54,7 @@ rig-core = { version = "0.41", default-features = false, features = ["reqwest", 
 #
 # `rmcp` is off (kaibo wraps kaish as an in-process rig Tool, not over MCP); `image` is
 # forwarded so a tool can return image content.
-rig-agent = { version = "0.41", default-features = false, features = ["derive", "image"] }
+rig-agent = { version = "0.42", default-features = false, features = ["derive", "image"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
