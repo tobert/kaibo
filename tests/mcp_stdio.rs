@@ -630,27 +630,38 @@ async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
         "io.modelcontextprotocol/clientCapabilities": {},
         "io.modelcontextprotocol/clientInfo": { "name": "raw-probe", "version": "0" }
     });
-    let responses = raw_exchange(vec![
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
-            "params": { "_meta": meta }
-        }),
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
-            "params": { "_meta": meta }
-        }),
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 3, "method": "resources/list",
-            "params": { "_meta": meta }
-        }),
-    ])
-    .await;
-    let [discover, tools, resources] = <[_; 3]>::try_from(responses).expect("three responses");
-    let (discover, tools, resources) = (
-        &discover["result"],
-        &tools["result"],
-        &resources["result"],
-    );
+    // Every list/read result kaibo answers, plus discovery. `prompts/get` is not here:
+    // its result type carries no SEP-2549 fields.
+    let requests: [(&str, serde_json::Value); 6] = [
+        ("server/discover", serde_json::json!({})),
+        ("tools/list", serde_json::json!({})),
+        ("resources/list", serde_json::json!({})),
+        ("resources/templates/list", serde_json::json!({})),
+        ("resources/read", serde_json::json!({ "uri": "kaibo://config" })),
+        ("prompts/list", serde_json::json!({})),
+    ];
+    let script = requests
+        .iter()
+        .zip(1u64..)
+        .map(|((method, params), id)| {
+            let mut params = params.clone();
+            params["_meta"] = meta.clone();
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        })
+        .collect();
+    let responses = raw_exchange(script).await;
+    let results: Vec<(&str, &serde_json::Value)> = requests
+        .iter()
+        .zip(&responses)
+        .map(|((method, _), response)| {
+            assert!(
+                response["result"].is_object(),
+                "{method} answers a result, not an error; got: {response}"
+            );
+            (*method, &response["result"])
+        })
+        .collect();
+    let (discover, tools) = (results[0].1, results[1].1);
 
     assert!(
         discover["supportedVersions"]
@@ -669,11 +680,7 @@ async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
         "discovery carries the instructions `initialize` carried before; got: {discover}"
     );
 
-    for (what, result) in [
-        ("server/discover", discover),
-        ("tools/list", tools),
-        ("resources/list", resources),
-    ] {
+    for &(what, result) in &results {
         assert_eq!(
             result["ttlMs"], 0,
             "{what} must carry the REQUIRED `ttlMs`, as the no-caching floor; got: {result}"
@@ -714,6 +721,10 @@ async fn an_initialize_naming_the_newest_version_gets_the_newest_legacy_one() {
         "`initialize` negotiates the newest version that has it; got: {init}"
     );
     for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+        assert!(
+            result.is_object(),
+            "{what} answers a result, so the absences below are real; got: {result}"
+        );
         for field in ["ttlMs", "cacheScope", "resultType"] {
             assert!(
                 result.get(field).is_none(),
@@ -734,6 +745,10 @@ async fn an_older_protocol_session_keeps_the_legacy_wire_shape() {
         "an in-range client version is echoed, not lifted or lowered; got: {init}"
     );
     for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+        assert!(
+            result.is_object(),
+            "{what} answers a result, so the absences below are real; got: {result}"
+        );
         for field in ["ttlMs", "cacheScope", "resultType"] {
             assert!(
                 result.get(field).is_none(),

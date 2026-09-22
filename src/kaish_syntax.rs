@@ -291,7 +291,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 /// a [`setup_section`] is prepended so the calling model can walk the user through
 /// configuration. `Ready`/`LocalUnverified` get the normal instructions unchanged.
 ///
-/// Used by `get_info` so every `initialize` handshake surfaces the server's
+/// Used by `get_info` so every `initialize` handshake and `server/discover` surfaces the server's
 /// containment posture. Unit-testable: pass your own `Config`, `allowed_set`, and
 /// `usability` rather than fabricating a `RequestContext` or reading the environment.
 ///
