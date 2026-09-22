@@ -461,6 +461,10 @@ pub(crate) fn render_config_resource(
                         thinking_style,
                         preamble,
                         lane,
+                        // Provenance for diagnostics only; the rendered `effort` is the
+                        // value either way, and `inert_tunables` reads provenance through
+                        // `effort_disposition`.
+                        effort_is_builtin: _,
                     } = slot;
                     let caps = config
                         .slot_caps(slot)
@@ -1050,12 +1054,12 @@ mod tests {
 
             # Knobs written on the image slot itself: all inert, all flagged.
             [casts.noisy]
-            synth = "deepseek/deepseek-v4-pro"
+            synth = "deepseek/deepseek-flash"
             image = { backend = "sd", id = "core", thinking_budget = 4096, effort = "high", temperature = 0.5, thinking_style = "adaptive" }
 
             # A bare image slot: nothing written, nothing flagged.
             [casts.clean]
-            synth = "deepseek/deepseek-v4-pro"
+            synth = "deepseek/deepseek-flash"
             image = "sd/ultra"
             "#,
         )
@@ -1209,7 +1213,7 @@ mod tests {
             r#"
             # Forced on a DeepSeek slot: DeepSeek's shape never consults the override.
             [casts.ds_forced]
-            synth = { backend = "deepseek", id = "deepseek-v4-pro", thinking_style = "adaptive" }
+            synth = { backend = "deepseek", id = "deepseek-flash", thinking_style = "adaptive" }
 
             # The identical override on an Anthropic slot moves the wire's shape (it
             # picks the adaptive tier over Haiku's default budget tier), so it must
@@ -1300,7 +1304,7 @@ mod tests {
 
             # Carries it fine.
             [casts.ds]
-            synth = { backend = "deepseek", id = "deepseek-v4-pro", effort = "xhigh" }
+            synth = { backend = "deepseek", id = "deepseek-flash", effort = "xhigh" }
             "#,
         )
         .unwrap();
@@ -1492,7 +1496,8 @@ mod tests {
             );
         }
         // Slots render as "backend/id" with their RESOLVED caps (the classifier on
-        // the slot's backend kind: Anthropic sees, DeepSeek is blind).
+        // the slot's backend kind and id: Anthropic and `deepseek-flash` see, the
+        // generic local kind is blind until pinned).
         assert!(
             body.contains("anthropic/claude-sonnet-4-6"),
             "slots render as backend/id:\n{body}"
@@ -1505,13 +1510,23 @@ mod tests {
             anthropic_synth.contains("vision = true"),
             "anthropic slot carries resolved vision=true:\n{anthropic_synth}"
         );
+        // `deepseek-flash` is classified sighted by id; the generic OpenAI kind is
+        // blind unless a slot opts in, so the built-in local synth shows the `false`.
         let deepseek_synth = body
             .find("deepseek/deepseek-flash")
             .map(|i| &body[i..i + 120])
             .unwrap();
         assert!(
-            deepseek_synth.contains("vision = false"),
-            "deepseek slot carries resolved vision=false:\n{deepseek_synth}"
+            deepseek_synth.contains("vision = true"),
+            "deepseek slot carries resolved vision=true:\n{deepseek_synth}"
+        );
+        let local_synth = body
+            .find("openai-local/Gemma-4-26B-A4B-it-GGUF")
+            .map(|i| &body[i..i + 120])
+            .unwrap();
+        assert!(
+            local_synth.contains("vision = false"),
+            "openai-local slot carries resolved vision=false:\n{local_synth}"
         );
         // Key SOURCES (env var name / file path / command argv) must appear —
         // operators configured them and need to see them for diagnostics. The

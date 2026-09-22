@@ -18,7 +18,7 @@ use tempfile::TempDir;
 fn author() -> ArtifactAuthor {
     ArtifactAuthor {
         prompt: "generate 100 kaish commands that try to break the parser".into(),
-        model: "deepseek/deepseek-v4-pro".into(),
+        model: "deepseek/deepseek-flash".into(),
         cast: "deepseek".into(),
         slot: "synth",
         session: Some("sess-42".into()),
@@ -358,7 +358,7 @@ fn a_saved_artifact_records_its_authorship_in_the_sidecar() {
     assert_eq!(p.label.as_deref(), Some("100 kaish commands"));
     assert_eq!(p.session.as_deref(), Some("sess-42"));
     assert_eq!(p.cast, "deepseek");
-    assert_eq!(p.model, "deepseek/deepseek-v4-pro");
+    assert_eq!(p.model, "deepseek/deepseek-flash");
     assert_eq!(
         p.prompt,
         "generate 100 kaish commands that try to break the parser"

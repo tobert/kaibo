@@ -133,7 +133,7 @@ impl Path {
             Path::AnthropicAdaptive => "claude-sonnet-4-6",
             Path::AnthropicBudget => "claude-haiku-4-5",
             Path::Gemini => "gemini-3.5-flash",
-            Path::DeepSeek => "deepseek-v4-pro",
+            Path::DeepSeek => "deepseek-flash",
             Path::OpenRouter => "z-ai/glm-5.2",
             Path::OpenaiChat => "gemma-local",
             Path::OpenaiResponses => "gpt-5.6-sol",
