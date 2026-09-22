@@ -91,9 +91,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Base64 for `view_image`: the rig tool-result image envelope carries bytes as a
-# base64 string (the only channel that lands image parts in model context). Already
-# in the tree transitively via rig-core; named here so the dep is ours, not implicit.
-base64 = "0.22"
+# base64 string (the only channel that lands image parts in model context). Named
+# here so the dep is ours, not implicit. The tree already carries two base64
+# versions regardless of what we pin: reqwest and rmcp pull `0.23` transitively,
+# while kaish-kernel and turso_sync_engine still pull `0.22`. Pinning kaibo's own
+# use at `0.23` merges it into the reqwest/rmcp group instead of adding a third
+# copy (confirm with `cargo tree -i base64@0.22.1` / `@0.23.1`).
+base64 = "0.23"
 # rig's `HttpClientExt` is typed in `bytes::Bytes`, so `wire_repair`'s transport
 # wrapper needs the type by name. Already in the tree via reqwest/rig-core — zero new
 # crates; named here so the dep is ours, not implicit.
