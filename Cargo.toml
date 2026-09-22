@@ -186,10 +186,15 @@ tracing-opentelemetry = "0.33"
 opentelemetry-appender-tracing = "0.32"
 
 # sha256 for the media CAS (src/cas.rs): the address IS the digest, so hashing is the
-# one operation the whole design leans on. Pure Rust, no C/asm, already in the lock
-# transitively (via kaish-kernel and rig-core's provider stack) — named here explicitly
+# one operation the whole design leans on. Pure Rust, no C/asm — named here explicitly
 # so it's ours, not implicit, matching how the other deps above are documented.
-sha2 = "0.10"
+# Pinned to 0.11, ahead of kaish-kernel's and rig-core's transitive `sha2 = "0.10"`, so
+# the tree now carries TWO sha2 versions (0.10.9 and 0.11.0; confirm with
+# `cargo tree -i sha2@0.10.9` / `@0.11.0`). Accepted: both are pure Rust, no C/asm, and
+# the digest's hex output is verified byte-for-byte identical across the bump
+# (tests/cas.rs::digest_of_bytes_matches_known_sha256_vector pins a known SHA-256
+# vector). Revisit once kaish-kernel/rig-core move to `digest 0.11`.
+sha2 = "0.11"
 
 # Full jitter for the transient-transport backoff (src/completion_retry.rs): kaibo's
 # own bursts (rig's `buffer_unordered` tool-call fan-out) can put several arms into a
