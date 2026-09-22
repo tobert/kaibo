@@ -145,8 +145,9 @@ impl ModelCaps {
 /// documented and first-class. The OpenAI wire forbids images in a `role:tool` message
 /// and rig enforces it before sending (`ToolResultContent::Image(_) => Err(..)` in
 /// `openai/completion/mod.rs`), so a `view_image` result there must instead be
-/// delivered as an `image_url` part on a **user** turn. DeepSeek is moot — vision-blind,
-/// so `view_image` never attaches. Branch the rewrite on *this*, not on `kind == Openai`:
+/// delivered as an `image_url` part on a **user** turn. DeepSeek is the same OpenAI
+/// chat shape, and its sighted model (`deepseek-flash`) takes the same user-turn route.
+/// Branch the rewrite on *this*, not on `kind == Openai`:
 /// the next no-tool-result-image provider is a table entry, not a new `if`.
 fn transport_supports_tool_result_images(wire: WireKind) -> bool {
     match wire {
@@ -160,8 +161,8 @@ fn transport_supports_tool_result_images(wire: WireKind) -> bool {
         // onto the user-turn channel (the break-rewrite-resume path) *before* it can
         // reach that converter, so the bytes actually arrive.
         WireKind::OpenRouter => false,
-        // Vision-blind on the wire; the value is unreached (no view_image attaches),
-        // but "no tool-result image channel" is the honest answer.
+        // DeepSeek takes `content` on a `role:tool` message as a plain string, so an
+        // image for its sighted model rides the user-turn channel like the OpenAI wire.
         WireKind::DeepSeek => false,
     }
 }
@@ -169,16 +170,19 @@ fn transport_supports_tool_result_images(wire: WireKind) -> bool {
 /// The built-in vision classifier. **Empirical — confirm by probe** (the discipline
 /// of [`is_anthropic_adaptive`]): boundaries reflect what the providers actually
 /// serve today, and a wrong guess fails loud at the provider, not silent here.
-fn is_vision_capable(wire: WireKind, _model: &str) -> bool {
+fn is_vision_capable(wire: WireKind, model: &str) -> bool {
     match wire {
         // Every current Claude completion id is multimodal-in (vision shipped with
         // Claude 3; no text-only ids remain in the lineup).
         WireKind::Anthropic => true,
         // The gemini-* completion line is natively multimodal across 2.x/3.x.
         WireKind::Gemini => true,
-        // DeepSeek chat/reasoner are text-only on the wire: images attached to a
-        // blind model must fail loud, not get dropped.
-        WireKind::DeepSeek => false,
+        // Per model. `deepseek-flash` (V4.1 Flash, 2026-09-10) reads images on chat
+        // completions — live probe 2026-09-21, a red PNG answered "Red" at 224 prompt
+        // tokens. Every other id is blind: `deepseek-v4-pro` accepted the same request
+        // and dropped the image without an error (19 prompt tokens), so an image to it
+        // must be refused here, before the request, rather than lost on the wire.
+        WireKind::DeepSeek => model == "deepseek-flash",
         // A generic OpenAI-compatible endpoint can front anything; vision is opt-in
         // per slot (`vision = true` in the role table) rather than guessed from an
         // arbitrary id.
@@ -673,7 +677,8 @@ pub enum EffortWire {
     /// rig flattens the blob into the body verbatim (Anthropic, DeepSeek, OpenRouter, and
     /// the generic OpenAI `/chat/completions` shape). kaibo can express anything here; who
     /// answers for it is the *provider's* business, and they differ — DeepSeek validates
-    /// strictly against its own seven rungs, OpenRouter accepts all seven and normalizes
+    /// strictly against its own seven rungs and runs them on three (`low`/`high`/`max`),
+    /// OpenRouter accepts all seven and normalizes
     /// each onto the upstream's native knob (proven 2026-08-01: `xhigh`/`max` reach
     /// `openai/gpt-5.1` through the gateway with reasoning billed, on ids that 400 those
     /// rungs on OpenAI's direct API — the two halves are
@@ -905,7 +910,7 @@ mod tests {
     fn deepseek_effort_none_disables_reasoning_structurally() {
         let shape = ModelShape::resolve(
             ProviderKind::DeepSeek,
-            "deepseek-v4-pro",
+            "deepseek-flash",
             ThinkingStyleOverride::Auto,
         );
         let params = shape.to_params(8192, None, None, "none").unwrap();

@@ -69,7 +69,14 @@ fn builtin_reproduces_the_historical_defaults() {
         assert_eq!(st.temperature, 0.3, "{kind:?} warmer synth");
         assert_eq!(et.top_p, 0.95);
         assert_eq!(et.effort, "high");
-        assert_eq!(st.effort, "high");
+        // The one built-in effort pin: DeepSeek's synth reasons at its `max` rung
+        // (`builtin_deepseek_synth_reasons_at_max`). Every other synth inherits.
+        let synth_effort = if kind == ProviderKind::DeepSeek {
+            "max"
+        } else {
+            "high"
+        };
+        assert_eq!(st.effort, synth_effort, "{kind:?} synth effort");
         assert_eq!(et.thinking_style, ThinkingStyleOverride::Auto);
     }
 
@@ -191,7 +198,7 @@ fn a_chimera_cast_spans_backends_with_both_slot_forms() {
     let c = Config::from_toml_str(
         r#"
         [casts.chimera]
-        explorer = "deepseek/deepseek-v4-flash"
+        explorer = "deepseek/deepseek-flash"
         synth = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
         "#,
     )
@@ -201,7 +208,7 @@ fn a_chimera_cast_spans_backends_with_both_slot_forms() {
     let s = cast.require_slot(ModelRole::Synth).unwrap();
 
     // String form parses as backend/id; table form carries its tunables.
-    assert_eq!(e.qualified(), "deepseek/deepseek-v4-flash");
+    assert_eq!(e.qualified(), "deepseek/deepseek-flash");
     assert_eq!(s.qualified(), "anthropic/claude-opus-4-8");
     assert_eq!(s.effort.as_deref(), Some("max"));
     assert_eq!(s.max_tokens, Some(32768));
@@ -270,7 +277,7 @@ fn an_omitted_role_is_absent_and_named_loudly() {
     let c = Config::from_toml_str(
         r#"
         [casts.explore-only]
-        explorer = "deepseek/deepseek-v4-flash"
+        explorer = "deepseek/deepseek-flash"
         "#,
     )
     .unwrap();
@@ -287,12 +294,12 @@ fn an_omitted_role_is_absent_and_named_loudly() {
 
 #[test]
 fn caps_classify_on_the_slots_backend_kind() {
-    // A chimera's slots straddle a capability line: the deepseek explorer is
-    // blind, the anthropic synth sees — each classified on ITS backend's kind.
+    // A chimera's slots straddle a capability line: the generic local explorer is
+    // blind until pinned, the anthropic synth sees — each classified on ITS backend.
     let c = Config::from_toml_str(
         r#"
         [casts.chimera]
-        explorer = "deepseek/deepseek-v4-flash"
+        explorer = "openai-local/Gemma-4-E4B-it-GGUF"
         synth = "claude/claude-sonnet-4-6"
         "#,
     )
@@ -300,7 +307,10 @@ fn caps_classify_on_the_slots_backend_kind() {
     let cast = c.resolve_cast("chimera").unwrap();
     let e = cast.require_slot(ModelRole::Explorer).unwrap();
     let s = cast.require_slot(ModelRole::Synth).unwrap();
-    assert!(!c.slot_caps(e).unwrap().vision, "deepseek is text-only");
+    assert!(
+        !c.slot_caps(e).unwrap().vision,
+        "a generic endpoint is blind until pinned"
+    );
     assert!(c.slot_caps(s).unwrap().vision, "anthropic is multimodal-in");
 }
 
@@ -383,7 +393,7 @@ fn per_slot_tunables_override_defaults_others_inherit() {
         synth_temperature = 0.5
 
         [casts.tuned]
-        explorer = { backend = "deepseek", id = "deepseek-v4-flash", temperature = 0.0 }
+        explorer = { backend = "deepseek", id = "deepseek-flash", temperature = 0.0 }
         synth = { backend = "anthropic", id = "claude-opus-4-8", max_tokens = 32768, thinking_budget = 16384 }
         "#,
     )
@@ -618,7 +628,7 @@ fn alias_collisions_are_loud_at_each_level() {
         synth = "anthropic/claude-sonnet-4-6"
         [casts.b]
         aliases = ["fast"]
-        synth = "deepseek/deepseek-v4-pro"
+        synth = "deepseek/deepseek-flash"
         "#,
     )
     .unwrap_err();
@@ -1931,8 +1941,8 @@ fn a_cast_can_carry_an_image_slot() {
         kind = "stability"
 
         [casts.artist]
-        explorer = "deepseek/deepseek-v4-flash"
-        synth    = "deepseek/deepseek-v4-pro"
+        explorer = "deepseek/deepseek-flash"
+        synth    = "deepseek/deepseek-flash"
         image    = "sd/core"
         "#,
     )
@@ -1982,7 +1992,7 @@ fn an_image_slot_cannot_point_at_a_completion_backend() {
     let err = Config::from_toml_str(
         r#"
         [casts.broken]
-        image = "deepseek/deepseek-v4-pro"
+        image = "deepseek/deepseek-flash"
         "#,
     )
     .expect_err("an image slot on a chat backend must be refused at load");
@@ -2134,8 +2144,8 @@ fn written_reasoning_tunables_on_an_image_slot_are_diagnosed() {
         kind = "stability"
 
         [casts.artist]
-        explorer = "deepseek/deepseek-v4-flash"
-        synth    = "deepseek/deepseek-v4-pro"
+        explorer = "deepseek/deepseek-flash"
+        synth    = "deepseek/deepseek-flash"
         image    = { backend = "sd", id = "core", thinking_budget = 4096, effort = "high", temperature = 0.5, thinking_style = "adaptive" }
         "#,
     )
@@ -2170,8 +2180,8 @@ fn inherited_defaults_stay_quiet_on_an_image_slot() {
         kind = "stability"
 
         [casts.artist]
-        explorer = "deepseek/deepseek-v4-flash"
-        synth    = "deepseek/deepseek-v4-pro"
+        explorer = "deepseek/deepseek-flash"
+        synth    = "deepseek/deepseek-flash"
         image    = "sd/core"
         "#,
     )
@@ -2989,7 +2999,7 @@ fn a_key_commands_stdout_never_reaches_kaibos_own_stdout() {
     std::fs::write(
         config_home.join("kaibo/config.toml"),
         format!(
-            "[backends.vault]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:1/v1\"\napi_key_cmd = [\"{}\"]\n\n[casts.vault-cast]\nsynth = \"vault/deepseek-v4-flash\"\n",
+            "[backends.vault]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:1/v1\"\napi_key_cmd = [\"{}\"]\n\n[casts.vault-cast]\nsynth = \"vault/deepseek-flash\"\n",
             stub.display()
         ),
     )

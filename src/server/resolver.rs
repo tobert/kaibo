@@ -706,9 +706,11 @@ impl Resolver {
         if let Some(img) = attachments.iter().find(|a| a.is_image()) {
             return Err(McpError::invalid_params(
                 format!(
-                    "attached file {} is an image, but {tool}'s explorer reads through \
-                     the shell and can't view images — attach it to `consult` with a \
-                     vision-capable cast instead",
+                    "attached file {} is an image, and {tool} refuses image attachments: \
+                     its survey reads files through the shell, which has no image tool, \
+                     whatever the cast's models can see. Attach the image to `consult` or \
+                     `oneshot` with a cast whose synth reads images (`kaibo://config` shows \
+                     `vision = true` on the slot)",
                     img.path()
                 ),
                 None,
