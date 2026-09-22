@@ -203,10 +203,14 @@ sha2 = "0.11"
 # Full jitter for the transient-transport backoff (src/completion_retry.rs): kaibo's
 # own bursts (rig's `buffer_unordered` tool-call fan-out) can put several arms into a
 # rate limit together, so each wait is drawn uniformly at random instead of every
-# caller retrying on the same clock. Pure Rust, no C/asm; already in the tree
-# transitively via opentelemetry_sdk (both kaish-kernel's and kaibo's own pin), so this
-# adds zero new crates — named here so the dep is ours, not implicit.
-rand = "0.9"
+# caller retrying on the same clock. Pure Rust, no C/asm; named here so the dep is
+# ours, not implicit. The tree already carries THREE rand versions regardless of
+# what we pin here — turso_core's antithesis_sdk/shuttle deps want `0.8`,
+# opentelemetry_sdk and turso_core itself want `0.9`, and turso_core's twox-hash
+# wants `0.10` — so pinning kaibo's own use at `0.10` merges it into the twox-hash
+# group instead of adding a fourth copy (confirm with `cargo tree -i rand@0.8.8` /
+# `@0.9.5` / `@0.10.3`).
+rand = "0.10"
 
 # libc is already in the tree transitively (getrandom); named here explicitly, scoped
 # to unix only so no new build cost lands on Windows. Two uses: local-filesystem
