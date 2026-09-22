@@ -129,13 +129,20 @@ lru = "0.18"
 # kaibo's store does not run MVCC); the facade's one change is in `sync.rs`, compiled
 # out with `sync` off. No storage-format or embedded-API change.
 turso = { version = "=0.7.2", default-features = false }
-# The ENGINE, pinned exactly too. The `=` above covers only the facade crate: turso
-# requires `turso_core = "0.7.2"`, a caret, so a plain `cargo update` moved the engine
-# alone past the pin (seen 2026-09-22, when 0.7.1's facade resolved a 0.7.2 core). The
-# turso crates release in lockstep and each requires its siblings at its own version,
-# so holding the core here holds `turso_sdk_kit`, `turso_parser`, and the rest with it.
-# Never named in code; it exists only to make the pin mean what it says.
+# The rest of the family, pinned exactly too. The `=` above covers only the facade
+# crate: turso requires `turso_core = "0.7.2"`, a caret, so a plain `cargo update`
+# moved the engine alone past the pin (seen 2026-09-22, when 0.7.1's facade resolved a
+# 0.7.2 core). Every turso crate requires its siblings as a caret at its own version,
+# so a pin holds the crates that DEPEND on the pinned one (`turso_sdk_kit`,
+# `turso_sync_engine`, `turso_sync_sdk_kit` through the core) but not the ones it
+# depends on. Hence the core plus every leaf below it. A bump moves all five lines with
+# the facade, or resolution fails. None is named in code; `default-features = false`
+# on each so these lines request no feature the facade's edges don't already.
 turso_core = { version = "=0.7.2", default-features = false }
+turso_parser = { version = "=0.7.2", default-features = false }
+turso_ext = { version = "=0.7.2", default-features = false }
+turso_macros = { version = "=0.7.2", default-features = false }
+turso_sdk_kit_macros = { version = "=0.7.2", default-features = false }
 # A typed store error wrapping `turso::Error` variants meaningfully (src/store.rs). The
 # rest of kaibo leans on anyhow, but a persistence library boundary wants a real error
 # enum callers can match on; thiserror is already in the tree (via kaish-kernel), so this
