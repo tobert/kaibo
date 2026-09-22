@@ -156,7 +156,7 @@ server.rs: resolve_cast("chimera")
 ├─ explorer = "deepseek/deepseek-flash"
 │    └─ Arm { client: rig(deepseek backend, lazy key), model,
 │             params: ModelShape(DeepSeek, model) + explorer effort/temp,
-│             caps: vision=false }
+│             caps: vision=true }
 └─ synth = "claude/claude-sonnet-4-6"
      └─ Arm { client: rig(anthropic backend), model, adaptive-thinking params,
               caps: vision=true → toolset gains view_image }

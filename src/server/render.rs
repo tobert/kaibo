@@ -618,7 +618,7 @@ mod tests {
             ),
             (
                 FailureKind::EmptyAnswer,
-                "model deepseek-v4-pro returned an EMPTY answer — the single toolless \
+                "model deepseek-flash returned an EMPTY answer — the single toolless \
                  completion returned no answer text.",
             ),
             (
@@ -912,7 +912,7 @@ mod tests {
             &["a warning".to_string()],
             Some(&sink),
             "deepseek",
-            &[("synth", "deepseek-v4-pro")],
+            &[("synth", "deepseek-flash")],
             &rig_core::completion::Usage::new(),
         );
         let at = |needle: &str| {
@@ -925,7 +925,7 @@ mod tests {
             "warnings before the artifact footer: {text}"
         );
         assert!(
-            at(&format!("kaibo://cas/{digest}")) < at("deepseek-v4-pro"),
+            at(&format!("kaibo://cas/{digest}")) < at("deepseek-flash"),
             "and the provenance line last: {text}"
         );
     }
@@ -1067,17 +1067,17 @@ mod tests {
     fn an_empty_answer_failure_invites_retry_and_is_not_called_a_kaibo_bug() {
         for body in [
             // The tool loop's gate (stopped without answering, no evidence gathered).
-            "model deepseek-v4-pro returned an EMPTY answer — it stopped without \
+            "model deepseek-flash returned an EMPTY answer — it stopped without \
              answering, and its transcript holds no tool results to write up. \
              Diagnostics: 16 of 200 turns used; finish_reason \"stop\" reported by the \
              provider. Retry, or try the same question on a different cast.",
             // The single-shot lanes (oneshot, deliberate direct).
-            "model deepseek-v4-pro returned an EMPTY answer — the single toolless \
+            "model deepseek-flash returned an EMPTY answer — the single toolless \
              completion returned no answer text. Diagnostics: 1 of 1 turns used, 256 \
              reasoning tokens reported; finish_reason \"length\" reported by the \
              provider. Retry, or try the same question on a different cast.",
             // The recovery's own failure wrapper (`run_phase`'s forced write-up turn).
-            "model deepseek-v4-pro returned an empty answer, and the forced \
+            "model deepseek-flash returned an empty answer, and the forced \
              final-answer turn also failed: prompt error",
         ] {
             let text = answer_text(&consultation_failed(
@@ -1107,7 +1107,7 @@ mod tests {
     #[test]
     fn an_empty_answer_whose_forced_turn_hit_a_transient_error_stays_retryable() {
         let err = anyhow::anyhow!(
-            "model deepseek-v4-pro returned an empty answer, and the forced final-answer \
+            "model deepseek-flash returned an empty answer, and the forced final-answer \
              turn also failed: ProviderError: {{\"type\":\"overloaded_error\"}}"
         );
         let text = answer_text(&consultation_failed("consult", "deepseek", err));
@@ -1197,11 +1197,11 @@ mod tests {
         let one = with_provenance(
             "x".into(),
             "deepseek",
-            &[("model", "deepseek-v4-pro")],
+            &[("model", "deepseek-flash")],
             &Usage::new(),
         );
         assert!(
-            one.contains("cast `deepseek` · model `deepseek-v4-pro`"),
+            one.contains("cast `deepseek` · model `deepseek-flash`"),
             "{one}"
         );
     }

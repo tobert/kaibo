@@ -21,15 +21,20 @@ record. Each later release appends a new section at the top.
 - A retried model call is timed per attempt, so latency is the provider's time, never kaibo's backoff.
 - `kaibo config-guide` prints the configuration reference, even when the config is broken.
 - The configuration reference has a host agents section, starting with Codex MCP access, timeouts, and approval.
+- DeepSeek's `deepseek-flash` reads images: attachments and `view_image` work on the `deepseek` cast.
 
 ### Changed
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
-- turso 0.7.2, with its engine crate now pinned exactly too; a plain `cargo update` had moved the engine past the pin.
+- The built-in `deepseek` cast's synth reasons at `max`, DeepSeek's deepest rung; the explorer stays at `high`.
+- turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
 
 ### Fixed
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
+- `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
+- Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
+- Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
 
 ## [0.5.0] — 2026-09-10
 

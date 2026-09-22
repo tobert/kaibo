@@ -2468,7 +2468,7 @@ mod tests {
         // shaping half of the same contract.
         let (_max, params) = batch_shaping(
             ProviderKind::DeepSeek,
-            "deepseek-v4-pro",
+            "deepseek-flash",
             &tunables("none", 100),
         );
         let params = params.expect("deepseek carries a thinking block");

@@ -1687,13 +1687,14 @@ where
     // answer, and a real answer — and an agent metric that skipped two of them would
     // undercount exactly the failures the conventions say to include.
     let outcome = async {
-        // Same two wrappers the loop uses: a single-shot lane declares no tools, so it
-        // cannot fumble a tool call, but a provider that could not shape the response
-        // (`MalformedResponse`) reaches here too and is worth the same retry.
-        let mut builder = watched(
-            retried(model.clone(), model_name),
-            log.clone(),
-            identity,
+        // Same two wrappers the loop uses, in the same order: the watcher inside the
+        // retry, so each attempt the provider sees is one record and its duration is
+        // the provider's alone, never kaibo's backoff sleep. A single-shot lane
+        // declares no tools, so it cannot fumble a tool call, but a provider that could
+        // not shape the response (`MalformedResponse`) reaches here too and is worth
+        // the same retry.
+        let mut builder = retried(
+            watched(model.clone(), log.clone(), identity, model_name),
             model_name,
         )
         .completion_request(prompt)
@@ -3278,6 +3279,57 @@ mod tests {
             asked[2].transcript.contains("EVIDENCE"),
             "the retry carries the gathered evidence, not a fresh start: {:?}",
             asked[2].transcript
+        );
+    }
+
+    /// The single-shot lane (`oneshot`, `deliberate`'s direct lane) counts each
+    /// attempt the provider saw, the same as the tool loop. That holds only when the
+    /// watcher sits *inside* the retry, so a resent generation passes through it
+    /// twice (two attempts, one turn record — only a response is recorded); the other order counts one call per turn however many requests went out,
+    /// and times kaibo's own backoff sleep as provider latency.
+    #[tokio::test]
+    async fn the_single_shot_lane_counts_a_retried_attempt() {
+        use std::sync::atomic::AtomicBool;
+        const MODEL: &str = "oneshot-model";
+        // A retry resends a byte-identical request, so the ordering is the behavior
+        // under test: fumble once, then answer.
+        let fumbled = Arc::new(AtomicBool::new(false));
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, move |_req| {
+                if !fumbled.swap(true, Ordering::SeqCst) {
+                    return Err(crate::test_support::response_error(
+                        "Gemini stopped with finish_reason=MalformedResponse: \
+                         could not shape the response",
+                    ));
+                }
+                Ok(text_response("ANSWER"))
+            })
+            .build();
+        let log = CompletionLog::new();
+        let (answer, _usage) = run_completion(
+            &client.completion_model(MODEL),
+            MODEL,
+            &log,
+            "answer",
+            16384,
+            None,
+            Message::user("q"),
+            None,
+            None,
+        )
+        .await
+        .expect("one malformed generation must not fail the call");
+
+        assert_eq!(answer, "ANSWER");
+        assert_eq!(
+            client.requests_for(MODEL).len(),
+            2,
+            "the provider saw two requests"
+        );
+        assert_eq!(
+            log.attempts(),
+            2,
+            "each request the provider saw is one attempt on the log"
         );
     }
 
@@ -5264,7 +5316,7 @@ mod tests {
     /// **Gate direction 1 of 2: evidence present ⇒ retry, and the retry's answer stands.**
     #[tokio::test]
     async fn an_empty_answer_with_evidence_is_recovered_by_one_forced_write_up_turn() {
-        const SYNTH: &str = "deepseek-v4-pro";
+        const SYNTH: &str = "deepseek-flash";
         const RECOVERED: &str = "REVIEW: src/foo.rs:1 defines the marker.";
         let client = ScriptedClient::builder()
             // Sweep once (so real evidence and real tokens are on the record), "answer"
@@ -5359,7 +5411,7 @@ mod tests {
     /// back would pass an error-only assertion while being exactly wrong.
     #[tokio::test]
     async fn an_empty_answer_with_no_evidence_errors_without_asking_the_model_again() {
-        const SYNTH: &str = "deepseek-v4-pro";
+        const SYNTH: &str = "deepseek-flash";
         let client = ScriptedClient::builder()
             // Straight to a reasoning-only turn: no tool calls, so no tool results, so
             // nothing to write up. The raw payload carries the provider's own
@@ -5415,7 +5467,7 @@ mod tests {
     /// flag-enforced; this is what would fail if a later edit turned it into a loop.
     #[tokio::test]
     async fn an_empty_forced_write_up_turn_errors_and_is_never_retried_twice() {
-        const SYNTH: &str = "deepseek-v4-pro";
+        const SYNTH: &str = "deepseek-flash";
         let client = ScriptedClient::builder()
             // Reasoning-only forever, including when forced to conclude.
             .on_model(SYNTH, |req| {
@@ -5559,7 +5611,7 @@ mod tests {
     /// the sweep failed.)
     #[tokio::test]
     async fn a_reasoning_only_explorer_report_fails_loudly_instead_of_reporting_empty() {
-        const EXPLORER: &str = "deepseek-v4-flash";
+        const EXPLORER: &str = "deepseek-flash";
         let client = ScriptedClient::builder()
             .on_model(EXPLORER, |_req| {
                 Ok(with_usage(
@@ -6218,7 +6270,7 @@ mod tests {
         };
         let slot = ModelSlot {
             effort: Some("ludicrous".into()),
-            ..ModelSlot::bare("deepseek", "deepseek-v4-pro")
+            ..ModelSlot::bare("deepseek", "deepseek-flash")
         };
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
             .expect("a passthrough wire carries an unknown rung to the provider");
@@ -6561,6 +6613,68 @@ mod tests {
         assert_eq!(
             params["reasoning"]["effort"], defaults.synth_effort,
             "thinking-on default survives a command-sourced key"
+        );
+    }
+
+    /// An image kaibo attaches reaches DeepSeek's request body as an `image_url` part
+    /// on the user turn. rig 0.41's DeepSeek converter flattened every content array to
+    /// its text and dropped the image without an error; 0.42 leaves an array holding an
+    /// image intact. `deepseek-flash` is classified sighted on the strength of this, so
+    /// the day the part stops reaching the wire this fails, not a live consult.
+    #[tokio::test]
+    async fn a_deepseek_image_reaches_the_wire_as_an_image_url_part() {
+        let http = CaptureHttp::default();
+        let client = deepseek::Client::builder()
+            .api_key("sk-test")
+            .http_client(http.clone())
+            .build()
+            .expect("offline deepseek client construction");
+        let image = Attachment::Image {
+            path: "shot.png".into(),
+            mime: "image/png",
+            data_b64: "ZmFrZQ==".into(),
+        };
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some("describe it".into()),
+            chat_history: vec![user_turn_with_attachments(
+                std::slice::from_ref(&image),
+                "what color?".into(),
+            )],
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(64),
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        // The capture transport always errors; the body is already built by then.
+        let _ = client
+            .completion_model("deepseek-flash")
+            .completion(request)
+            .await;
+        let body = http.recorded().expect("rig serialized a request body");
+        let user = body["messages"]
+            .as_array()
+            .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+            .unwrap_or_else(|| panic!("a user message: {body}"));
+        let parts = user["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the user content stays an array of parts: {user}"));
+        assert!(
+            parts.iter().any(|p| p["type"] == "image_url"
+                && p["image_url"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("ZmFrZQ=="))),
+            "the image rides the wire as an image_url part: {user}"
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|p| p["type"] == "text" && p["text"] == "what color?"),
+            "the question rides beside it: {user}"
         );
     }
 

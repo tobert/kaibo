@@ -640,7 +640,7 @@ mod tests {
             // question and which nothing exported before.
             tracing::warn!(
                 target: "kaibo::consult::engine",
-                model = "deepseek-v4-pro",
+                model = "deepseek-flash",
                 "model called a tool that does not exist"
             );
             // rig's event chatter: the prompt/completion content traces already carry.
