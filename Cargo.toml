@@ -100,7 +100,10 @@ base64 = "0.22"
 bytes = "1"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
 # raw structs turns a typo'd key into a startup error rather than a silent no-op.
-toml = "0.8"
+# Default features (`std`, `serde`, `parse`, `display`) cover exactly what we use:
+# `toml::from_str` (parse), `toml::to_string_pretty` (display), and `Deserialize`/
+# `Serialize` derives on our raw config structs (serde).
+toml = "1"
 # Neutralizing `<file>`-tag lookalikes in an attachment body (attach.rs) — a literal
 # scan can't catch the whitespace/case variants a model would still read as a
 # delimiter. Pure Rust, no C, so it's clear of the aws-lc/OpenSSL ban; already in the
