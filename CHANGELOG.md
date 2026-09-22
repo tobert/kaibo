@@ -28,6 +28,7 @@ record. Each later release appends a new section at the top.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
 - The built-in `deepseek` cast's synth reasons at `max`, DeepSeek's deepest rung; the explorer stays at `high`.
+- turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
 
 ### Fixed
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.

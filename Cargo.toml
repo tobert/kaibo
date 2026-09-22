@@ -91,16 +91,23 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Base64 for `view_image`: the rig tool-result image envelope carries bytes as a
-# base64 string (the only channel that lands image parts in model context). Already
-# in the tree transitively via rig-core; named here so the dep is ours, not implicit.
-base64 = "0.22"
+# base64 string (the only channel that lands image parts in model context). Named
+# here so the dep is ours, not implicit. The tree already carries two base64
+# versions regardless of what we pin: reqwest and rmcp pull `0.23` transitively,
+# while kaish-kernel and turso_sync_engine still pull `0.22`. Pinning kaibo's own
+# use at `0.23` merges it into the reqwest/rmcp group instead of adding a third
+# copy (confirm with `cargo tree -i base64@0.22.1` / `@0.23.1`).
+base64 = "0.23"
 # rig's `HttpClientExt` is typed in `bytes::Bytes`, so `wire_repair`'s transport
 # wrapper needs the type by name. Already in the tree via reqwest/rig-core — zero new
 # crates; named here so the dep is ours, not implicit.
 bytes = "1"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
 # raw structs turns a typo'd key into a startup error rather than a silent no-op.
-toml = "0.8"
+# Default features (`std`, `serde`, `parse`, `display`) cover exactly what we use:
+# `toml::from_str` (parse), `toml::to_string_pretty` (display), and `Deserialize`/
+# `Serialize` derives on our raw config structs (serde).
+toml = "1"
 # Neutralizing `<file>`-tag lookalikes in an attachment body (attach.rs) — a literal
 # scan can't catch the whitespace/case variants a model would still read as a
 # delimiter. Pure Rust, no C, so it's clear of the aws-lc/OpenSSL ban; already in the
@@ -115,7 +122,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.18"
 # Persistent session + batch-handle store (src/store.rs). turso is the pure-Rust
 # SQLite rewrite (ex-Limbo); the embedded `turso` crate, NOT libSQL or the cloud SDK.
-# EXACT-pinned (`=0.7.1`): the `.db-tshm` on-disk WAL format AND the API are declared
+# EXACT-pinned (`=0.7.2`): the `.db-tshm` on-disk WAL format AND the API are declared
 # unstable between releases (same discipline as the kaish-kernel pin) — a bump must be
 # a deliberate, tested port, never a silent `^` float. `default-features = false` is
 # MANDATORY: the defaults install `mimalloc` as the whole binary's global allocator via
@@ -124,12 +131,25 @@ lru = "0.18"
 # stdio-only + no-aws-lc invariants; the default `turso_sync_engine` weight carries no
 # transport without it. Verified aws-lc-rs/aws-lc-sys/openssl-sys/cmake-free via
 # `cargo tree -i` (see the store module doc-comment for the audit).
-# 0.7.0 -> 0.7.1: checked upstream's compare (9 commits) before pinning forward — the
-# only change touching the embedded engine (core/translate) is two query-planner
-# bugfixes (IN-LIST cost model, a missing-index-after-UPSERT case); everything else is
-# JS/serverless bindings and other-language SDKs kaibo doesn't use. No storage-format
-# or embedded-API change.
-turso = { version = "=0.7.1", default-features = false }
+# 0.7.1 -> 0.7.2: checked upstream's compare (14 commits) before pinning forward — the
+# only engine change is an MVCC-mode fix (sequences leaking into the change count;
+# kaibo's store does not run MVCC); the facade's one change is in `sync.rs`, compiled
+# out with `sync` off. No storage-format or embedded-API change.
+turso = { version = "=0.7.2", default-features = false }
+# The rest of the family, pinned exactly too. The `=` above covers only the facade
+# crate: turso requires `turso_core = "0.7.2"`, a caret, so a plain `cargo update`
+# moved the engine alone past the pin (seen 2026-09-22, when 0.7.1's facade resolved a
+# 0.7.2 core). Every turso crate requires its siblings as a caret at its own version,
+# so a pin holds the crates that DEPEND on the pinned one (`turso_sdk_kit`,
+# `turso_sync_engine`, `turso_sync_sdk_kit` through the core) but not the ones it
+# depends on. Hence the core plus every leaf below it. A bump moves all five lines with
+# the facade, or resolution fails. None is named in code; `default-features = false`
+# on each so these lines request no feature the facade's edges don't already.
+turso_core = { version = "=0.7.2", default-features = false }
+turso_parser = { version = "=0.7.2", default-features = false }
+turso_ext = { version = "=0.7.2", default-features = false }
+turso_macros = { version = "=0.7.2", default-features = false }
+turso_sdk_kit_macros = { version = "=0.7.2", default-features = false }
 # A typed store error wrapping `turso::Error` variants meaningfully (src/store.rs). The
 # rest of kaibo leans on anyhow, but a persistence library boundary wants a real error
 # enum callers can match on; thiserror is already in the tree (via kaish-kernel), so this
@@ -185,10 +205,14 @@ sha2 = "0.10"
 # Full jitter for the transient-transport backoff (src/completion_retry.rs): kaibo's
 # own bursts (rig's `buffer_unordered` tool-call fan-out) can put several arms into a
 # rate limit together, so each wait is drawn uniformly at random instead of every
-# caller retrying on the same clock. Pure Rust, no C/asm; already in the tree
-# transitively via opentelemetry_sdk (both kaish-kernel's and kaibo's own pin), so this
-# adds zero new crates — named here so the dep is ours, not implicit.
-rand = "0.9"
+# caller retrying on the same clock. Pure Rust, no C/asm; named here so the dep is
+# ours, not implicit. The tree already carries THREE rand versions regardless of
+# what we pin here — turso_core's antithesis_sdk/shuttle deps want `0.8`,
+# opentelemetry_sdk and turso_core itself want `0.9`, and turso_core's twox-hash
+# wants `0.10` — so pinning kaibo's own use at `0.10` merges it into the twox-hash
+# group instead of adding a fourth copy (confirm with `cargo tree -i rand@0.8.8` /
+# `@0.9.5` / `@0.10.3`).
+rand = "0.10"
 
 # libc is already in the tree transitively (getrandom); named here explicitly, scoped
 # to unix only so no new build cost lands on Windows. Two uses: local-filesystem
