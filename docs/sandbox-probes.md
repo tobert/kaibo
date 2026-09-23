@@ -51,7 +51,7 @@ the message classifies the block:
 | `126` | a config-`disable_builtins` shadow-block (`… disabled in kaibo's read-only sandbox`) |
 | `127` | command not found — an external/uncompiled command (the host is unreachable) |
 | `124` | killed for exceeding the exec timeout (30s default) |
-| `-1` | the script failed to parse or validate, so nothing ran; stderr says why |
+| `-1` | kaish could not run the script: a parse or validation failure (nothing ran) or a shell error partway through; stderr says why |
 
 ---
 

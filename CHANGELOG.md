@@ -41,7 +41,7 @@ record. Each later release appends a new section at the top.
 - `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
 - A `oneshot` or direct `deliberate` answer lost to reasoning that filled `max_tokens` now says so and names the `effort` and `max_tokens` keys.
 - A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
-- `run_kaish` and the shell guidance document exit `-1` (the script failed to parse or validate; `255` from `kaibo kaish`) and teach `grep -rnF` for literal text.
+- `run_kaish` and the shell guidance document exit `-1` (kaish could not run the script; `255` from `kaibo kaish` on Unix) and teach `grep -rnF` for literal text.
 
 ## [0.5.0] — 2026-09-10
 

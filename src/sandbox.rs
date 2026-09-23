@@ -69,7 +69,8 @@ impl Tool for Blocked {
         // error six published strings carried for two months; keep them apart here.
         // The kernel's other non-zero codes a caller may see: 124 = killed for
         // exceeding [`KAISH_EXEC_TIMEOUT`], 130 = cancelled, 127 = command not
-        // found, -1 = the script failed to parse or validate so nothing ran, and any
+        // found, -1 = kaish could not run the script (parse, validation, or an
+        // execution error partway through — the worker's `Run` arm), and any
         // other non-zero = the script itself failed. 126 also
         // collides with POSIX "not executable", so an automated caller must read
         // the message, not just the code, to classify a block.

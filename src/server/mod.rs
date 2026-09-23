@@ -2654,8 +2654,9 @@ impl KaiboHandler {
             `cat -n FILE` for a whole file, `grep -rn PATTERN` to locate across \
             files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
             refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
-            external commands are unreachable (exit 127); 124 = timed out; -1 = the \
-            script failed to parse or validate, so nothing ran (stderr says why). A \
+            external commands are unreachable (exit 127); 124 = timed out; -1 = kaish \
+            could not run the script (a parse or validation failure, where nothing ran, \
+            or a shell error partway through; stderr says why). A \
             grep PATTERN is a regex: search literal text with \
             `grep -rnF 'fn consult(' src`. Each call starts fresh at the project root. \
             See `kaibo://kaish/*` (or `help` in the script) for idioms and the bash \
@@ -9451,7 +9452,7 @@ enabled = false
             "126",
             "124",
             "127",
-            "`-1`",
+            "`-1` — kaish could not run the script",
             "grep -rnF",
             "permission denied: filesystem is read-only",
         ] {
@@ -9478,8 +9479,11 @@ enabled = false
         }
     }
 
-    /// `run_kaish` lists the exit codes a caller sees, and -1 is one of them: the script
-    /// failed to parse or validate, so nothing ran. It was 4.1% of 11,195 calls and no
+    /// `run_kaish` lists the exit codes a caller sees, and -1 is one of them: kaish could
+    /// not run the script. Most often it failed to parse or validate, so nothing ran;
+    /// a shell error partway through also returns -1 (`sandbox.rs`, the worker's `Run`
+    /// arm), so the text does not claim "nothing ran" for every -1. It was 4.1% of
+    /// 11,195 calls and no
     /// kaibo text named it. The description also carries the example that avoids the
     /// most common cause, a literal `(` in a grep pattern.
     #[test]
@@ -9487,7 +9491,12 @@ enabled = false
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
         let tool = h.tool_router.get("run_kaish").expect("run_kaish advertised");
         let d = tool.description.as_deref().unwrap_or("");
-        for needle in ["-1", "nothing ran", "grep -rnF 'fn consult(' src"] {
+        for needle in [
+            "-1 = kaish could not run the script",
+            "a parse or validation failure, where nothing ran, or a shell error partway \
+             through",
+            "grep -rnF 'fn consult(' src",
+        ] {
             assert!(d.contains(needle), "run_kaish description must name {needle:?}: {d}");
         }
     }

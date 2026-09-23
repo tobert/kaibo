@@ -61,8 +61,9 @@ wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that r
 with its real line numbers. Run `file FILE` on an unfamiliar file first; it names \
 the content as text or binary, so you know what you are about to read. \
 Each call starts at the project root; \
-there is no persistent cwd. Read the exit code: 0 is success; -1 means the script \
-failed to parse or validate, so nothing ran, and stderr says why; 3 means the output \
+there is no persistent cwd. Read the exit code: 0 is success; -1 means kaish could \
+not run the script (a parse or validation failure, where nothing ran, or a shell error \
+partway through), and stderr says why; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 127 is how every external \
 command answers here — its message names the refusal, as in `curl: external \
@@ -453,9 +454,10 @@ pub fn kaibo_sandbox_doc() -> String {
          read the stderr line: a refusal says `permission denied: filesystem is \
          read-only`.\n\
          - `0` — success\n\
-         - `-1` — the script failed to parse or validate, so nothing ran; stderr says \
-         why. The common cause is a grep pattern with a literal `(`: search it with \
-         `grep -rnF`\n\
+         - `-1` — kaish could not run the script. Either it failed to parse or \
+         validate, so nothing ran, or the shell hit an error partway through and the \
+         output is dropped; stderr says why. The common cause is a grep pattern with a \
+         literal `(`: search it with `grep -rnF`\n\
          - `1` — the command failed. A refused write is one of these, and its message \
          reads `permission denied: filesystem is read-only`\n\
          - `3` — output exceeded the cap and was truncated to a head+tail sample \
@@ -594,7 +596,9 @@ mod tests {
             "permission denied: filesystem is read-only",
             // 4.1% of 11,195 `run_kaish` calls returned -1, most often a grep pattern
             // with a literal `(`; nothing in kaibo's text named the code.
-            "-1 means the script failed to parse or validate, so nothing ran",
+            "-1 means kaish could not run the script",
+            "a parse or validation failure, where nothing ran, or a shell error partway \
+             through",
             "`grep -rnF 'fn consult(' src`",
         ] {
             assert!(
