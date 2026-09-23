@@ -356,13 +356,22 @@ impl Resolver {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))
     }
 
-    /// Refuse an interactive tool (`consult`/`consult_submit`/`oneshot`) on a cast
-    /// whose synth runs on an offline lane. A `Batch` synth is a big, slow, expensive
+    /// Refuse an interactive tool (`consult`/`consult_submit`/`oneshot`) on a cast with
+    /// no synth slot, or on a cast whose synth runs on an offline lane. A cast with no
+    /// synth (image-only, explorer-only) has no model to write the answer, so the call
+    /// could only fail later, at the arm resolve, with a bare "has no synth slot"; the
+    /// refusal here names what the cast *is* for instead. A `Batch` synth is a big, slow, expensive
     /// model tuned for free offline batch latency; a `Direct` synth is a big local
     /// model kaibo runs itself — either way, driving it through an interactive tool
     /// loop is the wrong-and-costly mistake this gate stops. Points the caller at the
     /// lane that fits.
-    pub(crate) fn reject_offline_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+    pub(crate) fn require_interactive_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        if cast.slot(ModelRole::Synth).is_none() {
+            return Err(McpError::invalid_params(
+                synthless_cast_refusal(cast, tool),
+                None,
+            ));
+        }
         match cast.synth_lane() {
             Some(Lane::Batch) => Err(McpError::invalid_params(
                 format!(
@@ -771,6 +780,45 @@ impl Resolver {
         }
         Ok(())
     }
+}
+
+/// The refusal for a text tool named on a cast with no synth slot: what was refused
+/// (the tool on this cast), why (no synth, so no model writes the answer; the slots it
+/// does have), and what to do instead (the tools those slots staff, or a cast with a
+/// synth). Kept apart from [`Resolver::require_interactive_cast`] so the slot-to-tool
+/// mapping reads in one place.
+fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
+    let slots: Vec<String> = cast
+        .slots
+        .keys()
+        .map(|role| format!("`{}`", role.key()))
+        .collect();
+    let has = if slots.is_empty() {
+        "it has no slots".to_string()
+    } else {
+        format!("its slots are {}", slots.join(", "))
+    };
+    // The tools a synth-less cast can still staff, by the slot each one runs.
+    let fits: Vec<&str> = [
+        (ModelRole::Explorer, "`explore`"),
+        (ModelRole::Image, "`generate`"),
+    ]
+    .into_iter()
+    .filter(|(role, _)| cast.slot(*role).is_some())
+    .map(|(_, t)| t)
+    .collect();
+    let use_it = if fits.is_empty() {
+        String::new()
+    } else {
+        format!(" Use `{}` with {}.", cast.name, fits.join(" or "))
+    };
+    format!(
+        "cast `{name}` has no `synth` slot, so `{tool}` has no model to write the answer \
+         ({has}).{use_it} For `{tool}`, pick a cast that has a `synth` slot; \
+         `kaibo://config` (on the command line, `kaibo config`) lists every cast with \
+         its slots.",
+        name = cast.name,
+    )
 }
 
 #[cfg(test)]

@@ -909,7 +909,7 @@ type CastEnumRule = (
 /// why removal beats an empty enum.
 ///
 /// Two tests guard it: `cast_enum_never_advertises_a_gated_cast` (no enum offers a cast its
-/// tool's gate — `reject_offline_cast`/`require_batch_cast`/`require_deliberate_cast` —
+/// tool's gate — `require_interactive_cast`/`require_batch_cast`/`require_deliberate_cast` —
 /// would reject) and `every_cast_taking_tool_has_an_enum_rule` (no cast-taking tool ships
 /// without a rule, i.e. a silently-empty enum). `casts_section` (the handshake roster) is a
 /// *consumer* of the same `Config` predicates, not bound to this table: it renders a
@@ -919,7 +919,8 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["consult", "consult_submit", "oneshot"],
         Config::cast_is_interactive,
-        "a cast whose synth answers interactively (any cast without an offline synth lane)",
+        "a cast with a `synth` slot that answers interactively (a synth with no offline \
+         `lane`)",
     ),
     // `explore` runs only the explorer, so it advertises *any* cast with one — including
     // `deliberate`/`direct` casts, whose (often smarter) explorers are useful standalone.
@@ -1604,9 +1605,9 @@ impl KaiboHandler {
         self.resolver.resolve_cast(cast)
     }
 
-    /// Shim over [`Resolver::reject_offline_cast`].
-    fn reject_offline_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        self.resolver.reject_offline_cast(cast, tool)
+    /// Shim over [`Resolver::require_interactive_cast`].
+    fn require_interactive_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        self.resolver.require_interactive_cast(cast, tool)
     }
 
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
@@ -1803,7 +1804,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_offline_cast(&cast, "consult")?;
+        self.require_interactive_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1947,7 +1948,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_offline_cast(&cast, "consult_submit")?;
+        self.require_interactive_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -2101,7 +2102,7 @@ impl KaiboHandler {
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         // Resolve the cast, then layer a per-call explorer override onto the clone.
-        // Deliberately NO `reject_offline_cast`: explore runs the *explorer* arm
+        // Deliberately NO `require_interactive_cast`: explore runs the *explorer* arm
         // interactively, so a deliberate/direct cast's explorer is perfectly valid —
         // explore only needs an explorer slot, resolved next (a synth-only batch cast
         // has none and `arm` errors clearly).
@@ -2595,7 +2596,7 @@ impl KaiboHandler {
         meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_offline_cast(&cast, "oneshot")?;
+        self.require_interactive_cast(&cast, "oneshot")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Synth,
@@ -7749,7 +7750,7 @@ enabled = false
         let gate_accepts = |tool: &str, cast: &Cast| -> bool {
             match tool {
                 "consult" | "consult_submit" | "oneshot" => {
-                    h.reject_offline_cast(cast, tool).is_ok()
+                    h.require_interactive_cast(cast, tool).is_ok()
                 }
                 // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
                 // is accepted (a missing explorer faults later at the arm resolve, not the gate).
@@ -7786,6 +7787,86 @@ enabled = false
             }
         }
         assert!(checked > 0, "the guard checked nothing");
+    }
+
+    /// A cast with no synth slot has no model to answer a text tool: `consult`,
+    /// `consult_submit`, and `oneshot` all end on the synth. An image-only cast
+    /// (`generate`'s kind) and an explorer-only cast used to pass the interactive
+    /// predicate, which checked only for the absence of an offline lane, so both were
+    /// offered on the text tools' `cast` enum and failed later at the arm resolve.
+    /// Here they are left off those enums, stay on the tools they can staff, and a
+    /// caller who names one anyway gets a refusal that says what the cast is for.
+    #[test]
+    fn a_cast_without_a_synth_is_not_offered_to_the_text_tools() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.inter]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+
+            [casts.scout]                                      # explorer only
+            explorer = "gem/lite"
+
+            [backends.sd]
+            kind = "stability"
+            key_optional = true
+
+            [casts.artist]                                     # image only
+            image    = "sd/core"
+            "#,
+        );
+        let enum_of = |tool: &str| -> Vec<String> {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let offered = enum_of(tool);
+            assert!(
+                offered.iter().any(|c| c == "inter"),
+                "`{tool}` must still offer the cast with a synth, got {offered:?}"
+            );
+            for synthless in ["artist", "scout"] {
+                assert!(
+                    !offered.iter().any(|c| c == synthless),
+                    "`{tool}` must not offer `{synthless}`, which has no synth, got {offered:?}"
+                );
+            }
+        }
+        assert!(enum_of("generate").iter().any(|c| c == "artist"));
+        assert!(enum_of("explore").iter().any(|c| c == "scout"));
+
+        let artist = h.config.resolve_cast("artist").unwrap();
+        let err = h
+            .require_interactive_cast(artist, "oneshot")
+            .expect_err("an image-only cast must be refused by `oneshot`");
+        let msg = err.message.to_string();
+        for needle in ["`artist`", "no `synth` slot", "`oneshot`", "`image`", "`generate`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+        let scout = h.config.resolve_cast("scout").unwrap();
+        let err = h
+            .require_interactive_cast(scout, "consult")
+            .expect_err("an explorer-only cast must be refused by `consult`");
+        let msg = err.message.to_string();
+        for needle in ["`scout`", "no `synth` slot", "`consult`", "`explorer`", "`explore`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
     }
 
     /// Renders every BUILT-IN cast unusable, so a staffing fixture's roster is exactly
@@ -8157,7 +8238,7 @@ enabled = false
         let interactive = h.config.resolve_cast("anthropic").unwrap().clone();
 
         let err = h
-            .reject_offline_cast(&batch, "consult")
+            .require_interactive_cast(&batch, "consult")
             .expect_err("an interactive tool must refuse a batch cast");
         let msg = format!("{err:?}");
         assert!(
@@ -8166,14 +8247,14 @@ enabled = false
         );
 
         let err = h
-            .reject_offline_cast(&direct, "consult")
+            .require_interactive_cast(&direct, "consult")
             .expect_err("an interactive tool must refuse a direct cast too");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("mydirect") && msg.contains("direct"),
             "refusal should name the cast and its lane, got: {msg}"
         );
-        assert!(h.reject_offline_cast(&interactive, "consult").is_ok());
+        assert!(h.require_interactive_cast(&interactive, "consult").is_ok());
 
         let err = h
             .require_batch_cast(&interactive)

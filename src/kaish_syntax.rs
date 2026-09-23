@@ -267,22 +267,42 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
             if config.cast_is_batch(name) {
                 tags.push("batch".to_string());
             }
+            // Name the answering (synth) model — the team's voice, the thing an agent
+            // told "ask Gemini Pro" indexes on. The data is already resolved on the
+            // Config (it's what `kaibo://config` prints). Resolution is structural, not
+            // key-gated, so it holds for every usable cast.
+            //
+            // A cast with no synth answers no text tool, so its line says which tool it
+            // does serve (`generate` for an image slot, `explore` for an explorer slot)
+            // and names that slot's model instead. A bare name there read as a team
+            // whose answering model was merely unknown. A name that does not resolve
+            // still renders bare.
+            let cast = config.resolve_cast(name).ok();
+            let model_slot = cast.and_then(|cast| {
+                if let Some(slot) = cast.slot(ModelRole::Synth) {
+                    return Some(slot);
+                }
+                let serves: Vec<&str> = [
+                    (ModelRole::Explorer, "`explore`"),
+                    (ModelRole::Image, "`generate`"),
+                ]
+                .into_iter()
+                .filter(|(role, _)| cast.slot(*role).is_some())
+                .map(|(_, tool)| tool)
+                .collect();
+                if !serves.is_empty() {
+                    tags.push(format!("{} only", serves.join(" or ")));
+                }
+                cast.slot(ModelRole::Image)
+                    .or_else(|| cast.slot(ModelRole::Explorer))
+            });
             let suffix = if tags.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", tags.join(", "))
             };
-            // Name the answering (synth) model — the team's voice, the thing an agent
-            // told "ask Gemini Pro" indexes on. The data is already resolved on the
-            // Config (it's what `kaibo://config` prints); a cast with no synth slot
-            // (explorer-only) just renders its name. Resolution is structural, not
-            // key-gated, so it holds for every usable cast.
-            let synth = config.resolve_cast(name).ok().and_then(|cast| {
-                cast.slot(ModelRole::Synth)
-                    .map(|slot| format!("{}/{}", slot.backend, slot.id))
-            });
-            match synth {
-                Some(model) => format!("- `{name}`{suffix} → {model}"),
+            match model_slot {
+                Some(slot) => format!("- `{name}`{suffix} → {}/{}", slot.backend, slot.id),
                 None => format!("- `{name}`{suffix}"),
             }
         })
@@ -898,6 +918,50 @@ mod tests {
         assert!(
             !line.contains('→'),
             "a cast with no synth slot must not render an arrow/model:\n{line}"
+        );
+    }
+
+    /// A cast with no synth slot cannot answer `consult` or `oneshot`, so its roster
+    /// line says which tool it serves and names that slot's model. An image-only cast
+    /// used to render as a bare name, which read as a cast whose answering model was
+    /// merely unknown.
+    #[test]
+    fn casts_section_tags_a_synthless_cast_with_the_tool_it_serves() {
+        let mut config = Config::builtin();
+        for (name, role, backend, id) in [
+            ("flux", ModelRole::Image, "bfl", "flux-2-pro"),
+            ("scout", ModelRole::Explorer, "deepseek", "deepseek-flash"),
+        ] {
+            config.casts.insert(
+                name.to_string(),
+                Cast {
+                    name: name.to_string(),
+                    slots: std::collections::BTreeMap::from([(
+                        role,
+                        ModelSlot::bare(backend, id),
+                    )]),
+                },
+            );
+        }
+        let usable = vec![
+            ("flux".to_string(), CastUsability::Ready),
+            ("scout".to_string(), CastUsability::Ready),
+        ];
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::Ready,
+            &usable,
+        );
+        assert!(
+            text.contains("- `flux` (`generate` only) → bfl/flux-2-pro"),
+            "an image-only cast names `generate` and its image model:\n{text}"
+        );
+        assert!(
+            text.contains("- `scout` (`explore` only) → deepseek/deepseek-flash"),
+            "an explorer-only cast names `explore` and its explorer model:\n{text}"
         );
     }
 

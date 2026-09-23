@@ -959,7 +959,7 @@ async fn resolve_and_run(
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
     resolver
-        .reject_offline_cast(&cast, "consult")
+        .require_interactive_cast(&cast, "consult")
         .map_err(SetupError::usage)?;
     resolver
         .apply_model_override(
@@ -1343,7 +1343,7 @@ async fn oneshot_inner(
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
     resolver
-        .reject_offline_cast(&cast, "oneshot")
+        .require_interactive_cast(&cast, "oneshot")
         .map_err(SetupError::usage)?;
     resolver
         .apply_model_override(
@@ -1443,7 +1443,7 @@ async fn explore_inner(
     let root = resolver
         .resolve_root(args.path.clone())
         .map_err(SetupError::setup)?;
-    // NO reject_offline_cast: explore runs the *explorer* arm, so a deliberate/direct
+    // NO require_interactive_cast: explore runs the *explorer* arm, so a deliberate/direct
     // cast's explorer is valid; it needs only an explorer slot (resolved next).
     let mut cast = resolver
         .resolve_cast(common.cast.clone())
@@ -3397,7 +3397,7 @@ mod tests {
 
     /// A batch/direct cast on interactive `consult` is a USAGE error (exit 2, kind
     /// "usage") — the offline-cast refusal must classify as usage, not a setup/containment
-    /// rejection. Offline: `reject_offline_cast` fires before any model/key is touched.
+    /// rejection. Offline: `require_interactive_cast` fires before any model/key is touched.
     #[tokio::test]
     async fn an_offline_cast_on_consult_is_a_usage_error_exit_2() {
         let dir = tempfile::tempdir().unwrap();
