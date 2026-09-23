@@ -213,6 +213,13 @@ fn setup_section(config: &Config) -> String {
     )
 }
 
+/// How many allowed trees `## Scope` lists before it summarizes the rest in one
+/// `+N more` line. The allowed set is the root, each `--allow-path`, and the launch cwd,
+/// with no cap, so a line per tree could push Scope itself past Claude Code's 2048-char
+/// cut. `kaibo://config` lists every tree. `lead_and_scope_fit_the_budget_at_any_
+/// allowed_tree_count` holds the bound.
+const ALLOWED_TREE_MAX_LINES: usize = 4;
+
 /// How many casts the resident roster names before it summarizes the rest in one
 /// `+N more` line. The roster is the one handshake section whose size the operator
 /// controls, so it is the one that gets a fixed cap: a 26-cast config rendered 2,596
@@ -349,10 +356,13 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 ///
 /// Dropping the reference did not settle the budget for good. The cast roster grew one
 /// line per usable cast and pushed `## Scope` past the cut again (26 casts, 2,596
-/// characters). Two changes hold it now: Scope renders before the roster, and the
-/// roster is capped at [`ROSTER_MAX_LINES`]. What stays unbounded is operator text
-/// inside fixed-count lines — cast names, model ids, and allowed-tree paths — so a
-/// config with very long ones can still overflow.
+/// characters). What holds it now: Scope renders before the roster, the roster is
+/// capped at [`ROSTER_MAX_LINES`], and Scope's allowed-tree list at
+/// [`ALLOWED_TREE_MAX_LINES`]. Every line count is bounded. What stays unbounded is the
+/// length of operator text inside those lines: the default-root and allowed-tree paths
+/// (which can push Scope itself past the cut), and cast names and model ids (which can
+/// push only the roster's tail, since it renders last). The unconfigured case adds the
+/// setup banner, which names the default cast's backends.
 pub fn kaibo_instructions_with_scope(
     config: &Config,
     allowed_set: &[PathBuf],
@@ -383,11 +393,18 @@ pub fn kaibo_instructions_with_scope(
         Some(r) => format!("- **Default root:** `{}`", r.display()),
         None => "- **Default root:** none — every call must pass a `path` argument.".to_string(),
     };
-    let allowed_lines: String = allowed_set
+    let mut allowed_lines: Vec<String> = allowed_set
         .iter()
+        .take(ALLOWED_TREE_MAX_LINES)
         .map(|p| format!("  - `{}`", p.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    if allowed_set.len() > ALLOWED_TREE_MAX_LINES {
+        allowed_lines.push(format!(
+            "  - +{} more: `kaibo://config`",
+            allowed_set.len() - ALLOWED_TREE_MAX_LINES
+        ));
+    }
+    let allowed_lines = allowed_lines.join("\n");
     // A linked git worktree of an allowed tree is in scope too — kaibo vouches for it
     // by reading git's own link files, never by trusting the candidate's `.git`. Only
     // said when the (default-on) feature is actually live, so a `--no-follow-worktrees`
@@ -1083,6 +1100,69 @@ mod tests {
                 "the default cast must always make the roster:\n{text}"
             );
         }
+    }
+
+    /// The allowed set has one entry per `--allow-path` plus the root and the launch
+    /// cwd, with no cap, and Scope used to print a line for each. Enough of them pushed
+    /// Scope past Claude Code's 2048-character cut the same way the roster once did.
+    /// This grows the allowed set one tree at a time and requires the lead plus Scope,
+    /// the part a caller must always see, to fit on its own at every size.
+    #[test]
+    fn lead_and_scope_fit_the_budget_at_any_allowed_tree_count() {
+        let mut config = Config::builtin();
+        config.default_cast = "deepseek".to_string();
+        let usable = vec![("deepseek".to_string(), CastUsability::Ready)];
+        let mut allowed = vec![PathBuf::from("/home/amy/src/some-project")];
+        for n in 0..40 {
+            allowed.push(PathBuf::from(format!(
+                "/home/amy/src/wt/some-project-feature-branch-{n:02}"
+            )));
+            let text = kaibo_instructions_with_scope(
+                &config,
+                &allowed,
+                Some(Path::new("/home/amy/src/some-project")),
+                true,
+                CastUsability::Ready,
+                &usable,
+            );
+            let head = &text[..text.find("## Casts").expect("has a roster")];
+            let len = head.chars().count();
+            assert!(
+                len <= 2048,
+                "with {} allowed trees the lead and Scope are {len} chars, over the \
+                 2048-char cut:\n{head}",
+                allowed.len()
+            );
+            assert!(
+                head.contains("More without spending a turn"),
+                "Scope must keep its closing pointers:\n{head}"
+            );
+        }
+    }
+
+    /// Past [`ALLOWED_TREE_MAX_LINES`] Scope says how many trees it left out and where
+    /// the full list is, so a capped list never reads as the whole boundary.
+    #[test]
+    fn a_capped_allowed_tree_list_names_the_count_left_out() {
+        let config = Config::builtin();
+        let allowed: Vec<PathBuf> = (0..10)
+            .map(|n| PathBuf::from(format!("/srv/tree-{n:02}")))
+            .collect();
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &allowed,
+            None,
+            false,
+            CastUsability::Ready,
+            &[],
+        );
+        let trees: Vec<&str> = text.lines().filter(|l| l.starts_with("  - ")).collect();
+        assert_eq!(trees.len(), ALLOWED_TREE_MAX_LINES + 1, "{text}");
+        assert_eq!(
+            trees[ALLOWED_TREE_MAX_LINES],
+            format!("  - +{} more: `kaibo://config`", 10 - ALLOWED_TREE_MAX_LINES),
+            "{text}"
+        );
     }
 
     /// Past [`ROSTER_MAX_LINES`] the roster says how many it left out and where they
