@@ -648,7 +648,8 @@ Which cast shape staffs which tool:
 
 | tool | needs |
 |---|---|
-| `consult`, `consult_submit`, `oneshot` | a cast whose synth answers **interactively** (no offline lane) |
+| `consult`, `consult_submit` | a cast with an `explorer` slot **and** a `synth` slot that answers **interactively** (no offline lane) |
+| `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane) |
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |

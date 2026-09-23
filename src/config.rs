@@ -1384,14 +1384,30 @@ impl Config {
     }
 
     /// Whether canonical cast `name` serves the **interactive answer** tools (`consult`,
-    /// `consult_submit`, `oneshot`) — i.e. its synth runs interactively (or it carries no
-    /// synth at all). The mirror of `reject_offline_cast`'s acceptance: an offline synth
-    /// belongs to `batch_submit`/`deliberate`, not these. (`explore` is deliberately *not*
+    /// `consult_submit`, `oneshot`): it has a synth slot, and that synth runs
+    /// interactively. The mirror of `require_interactive_cast`'s acceptance: an offline
+    /// synth belongs to `batch_submit`/`deliberate`, and a cast with no synth (image-only
+    /// or explorer-only) has no model to answer with. (`explore` is deliberately *not*
     /// here — it runs only the explorer, so it takes any cast with one via
     /// [`cast_can_explore`](Self::cast_can_explore), interactive or not.) One of the per-tool
     /// cast predicates the enum roster and the gates share (see `server.rs::CAST_ENUM_RULES`).
     pub fn cast_is_interactive(&self, name: &str) -> bool {
-        self.cast_offline_lane(name).is_none()
+        self.casts
+            .get(name)
+            .is_some_and(|c| c.slot(ModelRole::Synth).is_some() && c.synth_lane().is_none())
+    }
+
+    /// Whether canonical cast `name` can staff `consult`/`consult_submit`: an interactive
+    /// synth ([`cast_is_interactive`](Self::cast_is_interactive)) **and** an explorer
+    /// slot, because `consult` resolves both arms before it runs. `oneshot` runs the
+    /// synth alone, so it keeps the looser predicate. The mirror of
+    /// `require_consult_cast`'s acceptance.
+    pub fn cast_can_consult(&self, name: &str) -> bool {
+        self.cast_is_interactive(name)
+            && self
+                .casts
+                .get(name)
+                .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())
     }
 
     /// Whether `name` is declared for the batch lane specifically. Used to partition

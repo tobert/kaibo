@@ -37,8 +37,18 @@ const OPENERS: &[&str] = &[
 ];
 
 /// Keys inside those argument lists that configure the span rather than name a field.
+/// `otel.status_code` is one: tracing-opentelemetry reads it as the span's status and
+/// never exports it as an attribute, so the allowlist has nothing to decide about it.
 const META_KEYS: &[&str] = &[
-    "name", "level", "target", "parent", "skip", "skip_all", "err", "ret",
+    "name",
+    "level",
+    "target",
+    "parent",
+    "skip",
+    "skip_all",
+    "err",
+    "ret",
+    "otel.status_code",
 ];
 
 /// Production source only: everything from the first `#[cfg(test)]` *module* on is

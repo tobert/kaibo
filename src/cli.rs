@@ -22,7 +22,8 @@
 //!   parsing prose. (An arg-parse error is clap's: usage on stderr, exit 2, nothing on
 //!   stdout — the envelope is guaranteed only once args parse. And `kaibo kaish` passes
 //!   through kaish's own exit code on a normal run — 0 ok/1 failed/124 timed out/127
-//!   not found.)
+//!   not found/255 on Unix for kaish's -1, kaish could not run the script, which
+//!   `--json` reports as -1.)
 //!
 //! `--help` is model-facing text: an agent reads it the way an MCP client reads a
 //! tool description, so the top-level `about` front-loads what kaibo is and every
@@ -81,7 +82,10 @@ EXIT CODES
        worker infra crash
 
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
-this table (0 ok, 1 the command failed, 124 timed out, 127 command not found).
+this table (0 ok, 1 the command failed, 124 timed out, 127 command not found,
+255 on Unix when kaish could not run the script: a parse or validation failure,
+where nothing ran, or a shell error partway through; stderr says why, and
+`--json` reports it as `exit_code` -1).
 A refused write exits 1 and prints `permission denied: filesystem is
 read-only` on stderr.";
 
@@ -498,7 +502,8 @@ pub struct DeliberateArgs {
 /// `kaibo kaish` — one non-interactive kaish command through the same READ-ONLY sandbox
 /// the `run_kaish` MCP tool uses. Scriptable single execution only: no readline, no
 /// REPL. The process exits with kaish's own exit code (0 ok, 1 the command failed,
-/// 124 timed out, 127 command not found).
+/// 124 timed out, 127 command not found, 255 on Unix when kaish could not run the
+/// script; `--json` reports that one as `exit_code` -1).
 #[derive(Args, Debug)]
 pub struct KaishArgs {
     /// The kaish (sh-like) script to run against the read-only project. Required — kaibo
@@ -959,7 +964,7 @@ async fn resolve_and_run(
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
     resolver
-        .reject_offline_cast(&cast, "consult")
+        .require_consult_cast(&cast, "consult")
         .map_err(SetupError::usage)?;
     resolver
         .apply_model_override(
@@ -1343,7 +1348,7 @@ async fn oneshot_inner(
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
     resolver
-        .reject_offline_cast(&cast, "oneshot")
+        .require_interactive_cast(&cast, "oneshot")
         .map_err(SetupError::usage)?;
     resolver
         .apply_model_override(
@@ -1443,7 +1448,7 @@ async fn explore_inner(
     let root = resolver
         .resolve_root(args.path.clone())
         .map_err(SetupError::setup)?;
-    // NO reject_offline_cast: explore runs the *explorer* arm, so a deliberate/direct
+    // NO require_interactive_cast: explore runs the *explorer* arm, so a deliberate/direct
     // cast's explorer is valid; it needs only an explorer slot (resolved next).
     let mut cast = resolver
         .resolve_cast(common.cast.clone())
@@ -2504,7 +2509,8 @@ async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, 
 /// Run `kaibo kaish -c 'SCRIPT'` — one non-interactive execution through the read-only
 /// sandbox. stdout carries the script's stdout, stderr its stderr, and the process exits
 /// with kaish's own exit code (0 ok, 1 the command failed, 124 timed out, 127 command
-/// not found). A missing `-c` is a
+/// not found, 255 on Unix for kaish's -1: kaish could not run the script, which
+/// `--json` reports as -1). A missing `-c` is a
 /// usage error (exit 2); a bad `--path` is a setup rejection (exit 3).
 pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
     init_cli_logging();
@@ -2603,7 +2609,8 @@ pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
                 "kaibo: the kaish shell failed while running your script, so its output is \
                  incomplete: {e:#}. This is a kaibo failure, not a script error — a script's \
                  own exit codes are 0 (ok), 1 (the command failed, which is also how a \
-                 refused write reports), 124 (timed out), and 127 (command not found)."
+                 refused write reports), 124 (timed out), 127 (command not found), and \
+                 255 on Unix (kaish could not run the script; `--json` reports -1)."
             );
             EXIT_CONSULT_FAILURE
         }
@@ -3395,9 +3402,28 @@ mod tests {
         }
     }
 
+    /// `kaibo kaish` passes kaish's exit code through as the process exit, and kaish's
+    /// -1 (kaish could not run the script) arrives as 255 on Unix, because a Unix
+    /// process exit is one unsigned byte. `--json` carries the -1 itself. The help
+    /// table names both numbers so a script sees the one it will get, and says 255 is
+    /// the Unix value, since Windows keeps a 32-bit exit code.
+    #[test]
+    fn exit_codes_help_names_the_run_failure_as_255_on_unix_and_minus_one_in_json() {
+        for needle in [
+            "255 on Unix",
+            "kaish could not run the script",
+            "`--json` reports it as `exit_code` -1",
+        ] {
+            assert!(
+                EXIT_CODES_HELP.contains(needle),
+                "{needle}: {EXIT_CODES_HELP}"
+            );
+        }
+    }
+
     /// A batch/direct cast on interactive `consult` is a USAGE error (exit 2, kind
     /// "usage") — the offline-cast refusal must classify as usage, not a setup/containment
-    /// rejection. Offline: `reject_offline_cast` fires before any model/key is touched.
+    /// rejection. Offline: `require_interactive_cast` fires before any model/key is touched.
     #[tokio::test]
     async fn an_offline_cast_on_consult_is_a_usage_error_exit_2() {
         let dir = tempfile::tempdir().unwrap();

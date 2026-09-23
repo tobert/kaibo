@@ -30,12 +30,21 @@ record. Each later release appends a new section at the top.
 - The built-in `deepseek` cast's synth reasons at `max`, DeepSeek's deepest rung; the explorer stays at `high`.
 - turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
 - rmcp 3.4: `initialize` asking for MCP `2026-07-28` now gets `2025-11-25`; a `2026-07-28` client enters with `server/discover`.
+- The `oneshot` preamble says thinking comes before the reply and shares its output budget.
 
 ### Fixed
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
 - `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
 - Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
 - Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
+- The MCP instructions put `## Scope` first and cap the cast roster at 8 lines and the allowed trees at 4, so Claude Code's 2048-character cut no longer hides Scope.
+- The instructions' cast roster always lists the default cast, tagged `direct` or `no usable key` when that applies, and counts every cast it leaves out.
+- `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
+- `consult` and `consult_submit` no longer offer a synth-only cast, which they could never run; `oneshot` still does.
+- Startup warns when the default cast (`[server] cast`) cannot run `consult`, since every call without `cast` would be refused.
+- An empty answer at the output limit says whether reasoning filled `max_tokens` and names the `effort` and `max_tokens` keys on the slot that ran.
+- A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
+- `run_kaish` and the shell guidance document exit `-1` (kaish could not run the script; `255` from `kaibo kaish` on Unix) and teach `grep -rnF` for literal text.
 
 ## [0.5.0] — 2026-09-10
 

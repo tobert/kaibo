@@ -618,11 +618,14 @@ impl CapturedEvent {
     }
 }
 
-/// One closed span as captured: its name and whatever `outcome` it ended with.
+/// One closed span as captured: its name, whatever `outcome` it ended with, and every
+/// field it carried at close (`outcome` included), so a test can read a field such as
+/// `otel.status_code` without a capture layer of its own.
 #[derive(Clone, Debug)]
 pub struct CapturedOutcome {
     pub name: String,
     pub outcome: Option<String>,
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 /// Everything one capture run saw, in emission order.
@@ -730,15 +733,21 @@ where
 
     fn on_close(&self, id: tracing::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let Some(span) = ctx.span(&id) else { return };
-        let outcome = span
+        let fields = span
             .extensions()
             .get::<FieldGrab>()
-            .and_then(|g| g.fields.get("outcome").cloned());
+            .map(|g| g.fields.clone())
+            .unwrap_or_default();
+        let outcome = fields.get("outcome").cloned();
         let name = span.name().to_string();
         self.spans
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(CapturedOutcome { name, outcome });
+            .push(CapturedOutcome {
+                name,
+                outcome,
+                fields,
+            });
     }
 }
 

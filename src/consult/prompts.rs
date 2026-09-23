@@ -427,6 +427,13 @@ impl ConsultAttachment {
 /// reads the project). It closes on the shared output-ordering line — the reply *is*
 /// the answer, so it leads — which costs one clause and is the same discipline
 /// [`batch_preamble`] spells out at length for the offline lane.
+///
+/// Before that line it states the order the provider actually produces: thinking
+/// first, then the reply, both from one output budget. The ordering line alone read
+/// as though the answer could come before the thinking, and a DeepSeek synth at `max`
+/// effort spent the whole budget thinking and wrote no reply on 10 of 39 calls. The
+/// preamble asks for the move to the reply "once you know the answer", an order and
+/// not a size, per the no-size-cue rule in AGENTS.md.
 pub fn oneshot_preamble() -> String {
     "You are the synthesis agent, giving a direct second opinion to another agent. \
      Answer the question it sends, using the material it provides and your own \
@@ -437,8 +444,10 @@ pub fn oneshot_preamble() -> String {
      what you read from what you infer and from what remains unknown. If you need \
      something that was not \
      given, name it, so the caller can supply it on the next call.\n\n\
-     Your reply is the answer itself. Write the answer first and write it in full, \
-     then give your reasoning after it."
+     Your thinking happens before your reply and draws on the same output budget as \
+     the reply, so move from thinking to writing once you know the answer. Your reply \
+     is the answer itself. Write the answer first and write it in full, then give your \
+     reasoning after it."
         .to_string()
 }
 
@@ -1857,6 +1866,37 @@ mod tests {
         assert!(
             prompt.contains("Trust a `file:line` an earlier answer cited"),
             "history framing must name the prior citations as trusted:\n{prompt}"
+        );
+    }
+
+    /// A provider always emits a reasoning model's thinking before the reply text, and
+    /// both draw on one output budget. "Write the answer first" alone reads as though
+    /// the answer could come before the thinking, and a model at a deep effort filled
+    /// the whole `oneshot` budget with reasoning and wrote nothing (10 of 39 calls). So
+    /// the preamble states the order as it is and asks the model to move to the reply
+    /// once it knows the answer. It gives that as an order, never as a size: a number
+    /// here would be a size cue, and a size cue is a stopping cue.
+    #[test]
+    fn the_oneshot_preamble_states_that_thinking_precedes_the_reply() {
+        let p = oneshot_preamble();
+        assert!(
+            p.contains(
+                "Your thinking happens before your reply and draws on the same output \
+                        budget"
+            ),
+            "the preamble must say where thinking sits and what it spends: {p}"
+        );
+        assert!(
+            p.contains("once you know the answer"),
+            "the preamble must say when to move from thinking to the reply: {p}"
+        );
+        assert!(
+            !p.chars().any(|c| c.is_ascii_digit()),
+            "the preamble must carry no size cue: {p}"
+        );
+        assert!(
+            p.trim_end().ends_with(Phase::Oneshot.closing_obligation()),
+            "the preamble still closes on its obligation: {p}"
         );
     }
 

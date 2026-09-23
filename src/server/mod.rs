@@ -909,17 +909,25 @@ type CastEnumRule = (
 /// why removal beats an empty enum.
 ///
 /// Two tests guard it: `cast_enum_never_advertises_a_gated_cast` (no enum offers a cast its
-/// tool's gate — `reject_offline_cast`/`require_batch_cast`/`require_deliberate_cast` —
+/// tool's gate — `require_interactive_cast`/`require_batch_cast`/`require_deliberate_cast` —
 /// would reject) and `every_cast_taking_tool_has_an_enum_rule` (no cast-taking tool ships
 /// without a rule, i.e. a silently-empty enum). `casts_section` (the handshake roster) is a
 /// *consumer* of the same `Config` predicates, not bound to this table: it renders a
-/// budget-limited display subset (it hides `Direct` casts) — a presentation choice distinct
-/// from tool eligibility.
+/// budget-limited display (it caps the line count and always lists the default, usable or
+/// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
-        &["consult", "consult_submit", "oneshot"],
+        &["consult", "consult_submit"],
+        Config::cast_can_consult,
+        "a cast with an `explorer` slot and a `synth` slot that answers interactively (a \
+         synth with no offline `lane`)",
+    ),
+    // `oneshot` runs the synth alone, so a synth-only cast staffs it.
+    (
+        &["oneshot"],
         Config::cast_is_interactive,
-        "a cast whose synth answers interactively (any cast without an offline synth lane)",
+        "a cast with a `synth` slot that answers interactively (a synth with no offline \
+         `lane`)",
     ),
     // `explore` runs only the explorer, so it advertises *any* cast with one — including
     // `deliberate`/`direct` casts, whose (often smarter) explorers are useful standalone.
@@ -989,6 +997,39 @@ pub(crate) fn eligible_casts_by_tool(
             tools.iter().map(move |&t| (t, casts.clone()))
         })
         .collect()
+}
+
+/// The startup warning for a default cast that cannot staff `consult`, or `None` when
+/// it can. Names the default, why it cannot (the first missing piece, in the order the
+/// gate checks them), what that does to calls, and the config key that fixes it, with
+/// a cast that would work when one exists.
+fn default_cast_consult_warning(
+    config: &Config,
+    eligible: &std::collections::HashMap<&'static str, Vec<String>>,
+) -> Option<String> {
+    let cast = config.resolve_cast(&config.default_cast).ok()?;
+    if config.cast_can_consult(&cast.name) {
+        return None;
+    }
+    let why = if cast.slot(ModelRole::Synth).is_none() {
+        "it has no `synth` slot".to_string()
+    } else if let Some(lane) = cast.synth_lane() {
+        format!("its synth runs on the offline `{}` lane", lane.as_str())
+    } else {
+        "it has no `explorer` slot".to_string()
+    };
+    let example = eligible
+        .get("consult")
+        .and_then(|casts| casts.first())
+        .map(|c| format!(", such as `{c}`"))
+        .unwrap_or_default();
+    Some(format!(
+        "default cast `{name}` cannot staff `consult`: {why}. Every `consult` or \
+         `consult_submit` call that omits `cast` will be refused. Set `[server] cast` in \
+         config.toml to a cast with an `explorer` slot and an interactive `synth` \
+         slot{example} (`kaibo example-config` shows the shape).",
+        name = cast.name,
+    ))
 }
 
 /// The plain-language cast shape tool `name` needs, from its `CAST_ENUM_RULES` entry.
@@ -1262,6 +1303,17 @@ impl KaiboHandler {
         // each. `live_tools` is the single source — `kaibo://config` reports the same
         // decision, so the resource can never describe a surface this router doesn't serve.
         let live = live_tools(&config, &usable);
+
+        // `[server] cast` is validated to resolve, not to staff anything, so a default
+        // that cannot run `consult` (image-only, synth-only, or an offline synth) starts
+        // clean and then refuses every call that omits `cast`. A warning rather than a
+        // load error: a media-only or batch-only setup can legitimately name such a
+        // default, and in that setup `consult` is not live, so this stays quiet.
+        if live.contains(&"consult") {
+            if let Some(warning) = default_cast_consult_warning(&config, &eligible) {
+                tracing::warn!("{warning}");
+            }
+        }
         // `remove_route` silently no-ops on an unknown name, so a renamed #[tool] method
         // would leave its gate quietly inert. Assert the route exists before dropping it —
         // a stale name is a build-time bug we want loud.
@@ -1604,9 +1656,14 @@ impl KaiboHandler {
         self.resolver.resolve_cast(cast)
     }
 
-    /// Shim over [`Resolver::reject_offline_cast`].
-    fn reject_offline_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        self.resolver.reject_offline_cast(cast, tool)
+    /// Shim over [`Resolver::require_interactive_cast`].
+    fn require_interactive_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        self.resolver.require_interactive_cast(cast, tool)
+    }
+
+    /// Shim over [`Resolver::require_consult_cast`].
+    fn require_consult_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        self.resolver.require_consult_cast(cast, tool)
     }
 
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
@@ -1803,7 +1860,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_offline_cast(&cast, "consult")?;
+        self.require_consult_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1947,7 +2004,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_offline_cast(&cast, "consult_submit")?;
+        self.require_consult_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -2101,7 +2158,7 @@ impl KaiboHandler {
     ) -> Result<CallToolResult, McpError> {
         let root = self.resolve_root(input.path)?;
         // Resolve the cast, then layer a per-call explorer override onto the clone.
-        // Deliberately NO `reject_offline_cast`: explore runs the *explorer* arm
+        // Deliberately NO `require_interactive_cast`: explore runs the *explorer* arm
         // interactively, so a deliberate/direct cast's explorer is perfectly valid —
         // explore only needs an explorer slot, resolved next (a synth-only batch cast
         // has none and `arm` errors clearly).
@@ -2595,7 +2652,7 @@ impl KaiboHandler {
         meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let mut cast = self.resolve_cast(input.cast)?;
-        self.reject_offline_cast(&cast, "oneshot")?;
+        self.require_interactive_cast(&cast, "oneshot")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Synth,
@@ -2620,15 +2677,26 @@ impl KaiboHandler {
             call_deadline: self.config.defaults.call_deadline,
         };
 
-        let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
+        let span = tracing::info_span!(
+            "oneshot",
+            cast = %cast.name,
+            model = %arm.model,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
         let (answer, usage) = match oneshot(&input.prompt, &attachments, &arm, &cfg)
-            .instrument(span)
+            .instrument(span.clone())
             .await
         {
             Ok(out) => out,
-            // A provider failure is a clean tool-result error, same as `consult`.
-            Err(e) => return Ok(consultation_failed("oneshot", &cast.name, e)),
+            // A provider failure is a clean tool-result error, same as `consult`. The
+            // tool span closes as an error too, so a trace does not read it as a success.
+            Err(e) => {
+                span.record("otel.status_code", "ERROR");
+                span.record("error.type", crate::consult::failure_class(&e));
+                return Ok(consultation_failed("oneshot", &cast.name, e));
+            }
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 
@@ -2642,9 +2710,13 @@ impl KaiboHandler {
             `cat -n FILE` for a whole file, `grep -rn PATTERN` to locate across \
             files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
             refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
-            external commands are unreachable (exit 127); 124 = timed out. \
-            Each call starts fresh at the project root. See `kaibo://kaish/*` (or \
-            `help` in the script) for idioms and the bash habits that don't carry over."
+            external commands are unreachable (exit 127); 124 = timed out; -1 = kaish \
+            could not run the script (a parse or validation failure, where nothing ran, \
+            or a shell error partway through; stderr says why). A \
+            grep PATTERN is a regex: search literal text with \
+            `grep -rnF 'fn consult(' src`. Each call starts fresh at the project root. \
+            See `kaibo://kaish/*` (or `help` in the script) for idioms and the bash \
+            habits that don't carry over."
     )]
     pub async fn run_kaish(
         &self,
@@ -4617,6 +4689,9 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
   command is unreachable and exits `127`. That's the boundary working, not a bug — read
   freely, and don't try to mutate. Refusals and ordinary failures share exit `1`, so read
   the stderr line when you need to tell them apart.
+- A `grep` PATTERN is a regex, and a script that fails to parse or validate exits `-1`
+  before anything runs; stderr says why. An unbalanced `(` is the common case, so search
+  literal text with `-F`: `grep -rnF 'fn consult(' src`.
 
 Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
 vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
@@ -7748,9 +7823,8 @@ enabled = false
         // Each cast-taking tool's call-time acceptance, in one place beside the enum rules.
         let gate_accepts = |tool: &str, cast: &Cast| -> bool {
             match tool {
-                "consult" | "consult_submit" | "oneshot" => {
-                    h.reject_offline_cast(cast, tool).is_ok()
-                }
+                "consult" | "consult_submit" => h.require_consult_cast(cast, tool).is_ok(),
+                "oneshot" => h.require_interactive_cast(cast, tool).is_ok(),
                 // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
                 // is accepted (a missing explorer faults later at the arm resolve, not the gate).
                 "explore" => true,
@@ -7786,6 +7860,149 @@ enabled = false
             }
         }
         assert!(checked > 0, "the guard checked nothing");
+    }
+
+    /// `consult` and `consult_submit` resolve an explorer arm as well as a synth arm, so a
+    /// synth-only cast cannot staff them; `oneshot` needs only the synth. The enum rule
+    /// for the three tools was shared, so a synth-only cast was offered on `consult` and
+    /// failed at the explorer resolve with a bare "has no explorer slot". Now `consult`
+    /// and `consult_submit` offer only casts with both slots, and naming a synth-only
+    /// cast is refused with the tool it does serve.
+    #[test]
+    fn a_synth_only_cast_is_offered_to_oneshot_but_not_consult() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.inter]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+
+            [casts.solo]                                       # synth only
+            synth    = "gem/flash"
+            "#,
+        );
+        let enum_of = |tool: &str| -> Vec<String> {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for tool in ["consult", "consult_submit"] {
+            let offered = enum_of(tool);
+            assert!(offered.iter().any(|c| c == "inter"), "{tool}: {offered:?}");
+            assert!(
+                !offered.iter().any(|c| c == "solo"),
+                "`{tool}` must not offer the synth-only cast, got {offered:?}"
+            );
+        }
+        let offered = enum_of("oneshot");
+        assert!(
+            offered.iter().any(|c| c == "solo") && offered.iter().any(|c| c == "inter"),
+            "`oneshot` needs only a synth, got {offered:?}"
+        );
+
+        let solo = h.config.resolve_cast("solo").unwrap();
+        assert!(h.require_interactive_cast(solo, "oneshot").is_ok());
+        let err = h
+            .require_consult_cast(solo, "consult")
+            .expect_err("a synth-only cast must be refused by `consult`");
+        let msg = err.message.to_string();
+        for needle in ["`solo`", "no `explorer` slot", "`consult`", "`oneshot`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+    }
+
+    /// A cast with no synth slot has no model to answer a text tool: `consult`,
+    /// `consult_submit`, and `oneshot` all end on the synth. An image-only cast
+    /// (`generate`'s kind) and an explorer-only cast used to pass the interactive
+    /// predicate, which checked only for the absence of an offline lane, so both were
+    /// offered on the text tools' `cast` enum and failed later at the arm resolve.
+    /// Here they are left off those enums, stay on the tools they can staff, and a
+    /// caller who names one anyway gets a refusal that says what the cast is for.
+    #[test]
+    fn a_cast_without_a_synth_is_not_offered_to_the_text_tools() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.inter]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+
+            [casts.scout]                                      # explorer only
+            explorer = "gem/lite"
+
+            [backends.sd]
+            kind = "stability"
+            key_optional = true
+
+            [casts.artist]                                     # image only
+            image    = "sd/core"
+            "#,
+        );
+        let enum_of = |tool: &str| -> Vec<String> {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for tool in ["consult", "consult_submit", "oneshot"] {
+            let offered = enum_of(tool);
+            assert!(
+                offered.iter().any(|c| c == "inter"),
+                "`{tool}` must still offer the cast with a synth, got {offered:?}"
+            );
+            for synthless in ["artist", "scout"] {
+                assert!(
+                    !offered.iter().any(|c| c == synthless),
+                    "`{tool}` must not offer `{synthless}`, which has no synth, got {offered:?}"
+                );
+            }
+        }
+        assert!(enum_of("generate").iter().any(|c| c == "artist"));
+        assert!(enum_of("explore").iter().any(|c| c == "scout"));
+
+        let artist = h.config.resolve_cast("artist").unwrap();
+        let err = h
+            .require_interactive_cast(artist, "oneshot")
+            .expect_err("an image-only cast must be refused by `oneshot`");
+        let msg = err.message.to_string();
+        for needle in ["`artist`", "no `synth` slot", "`oneshot`", "`image`", "`generate`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+        let scout = h.config.resolve_cast("scout").unwrap();
+        let err = h
+            .require_interactive_cast(scout, "consult")
+            .expect_err("an explorer-only cast must be refused by `consult`");
+        let msg = err.message.to_string();
+        for needle in ["`scout`", "no `synth` slot", "`consult`", "`explorer`", "`explore`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
     }
 
     /// Renders every BUILT-IN cast unusable, so a staffing fixture's roster is exactly
@@ -7901,8 +8118,65 @@ enabled = false
         );
     }
 
+    /// The default cast is what every call without `cast` uses, so a default that cannot
+    /// staff `consult` makes the front door refuse every such call. That config started
+    /// clean: `[server] cast` is validated to resolve, never to staff anything. Startup
+    /// now warns, naming the default, the reason, and the key to change. A config whose
+    /// default does staff `consult` gets no such warning.
+    #[test]
+    fn a_default_cast_that_cannot_staff_consult_warns_at_startup() {
+        use crate::test_support::capture_tracing;
+        let toml = |default: &str| {
+            with_no_builtin_casts(&format!(
+                r#"
+                [backends.gem]
+                kind = "gemini"
+                key_optional = true
+
+                [casts.inter]
+                explorer = "gem/lite"
+                synth    = "gem/flash"
+
+                [backends.sd]
+                kind = "stability"
+                key_optional = true
+
+                [casts.artist]
+                image = "sd/core"
+
+                [server]
+                cast = "{default}"
+                "#
+            ))
+        };
+        let warned = |default: &str| {
+            let t = toml(default);
+            let captured = capture_tracing(async move {
+                let h = hermetic_handler_from_toml(&t);
+                assert!(
+                    h.advertised_tools().iter().any(|t| t == "consult"),
+                    "guard: `inter` staffs consult, so the tool is live"
+                );
+            });
+            captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .map(|e| e.message)
+                .find(|m| m.contains("default cast"))
+        };
+        let msg = warned("artist").expect("an image-only default must warn at startup");
+        for needle in ["`artist`", "`consult`", "`[server] cast`", "no `synth` slot"] {
+            assert!(msg.contains(needle), "the warning must name {needle}: {msg}");
+        }
+        assert_eq!(warned("inter"), None, "a default that staffs consult must not warn");
+    }
+
     /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
-    /// tool cannot run.
+    /// tool cannot run. Neither can `consult`, which resolves an explorer arm before its
+    /// synth runs (this test once asserted it survived, on the belief that the driver
+    /// carried its own explorer; `Resolver::arm` has no such fallback, and every such
+    /// call failed at the explorer resolve). `oneshot` runs the synth alone and stays.
     #[test]
     fn explore_is_not_advertised_without_an_explorer_slot() {
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
@@ -7923,10 +8197,17 @@ enabled = false
             !tools.iter().any(|t| t == "explore"),
             "explore must be dropped when no cast carries an explorer slot. Advertised: {tools:?}"
         );
+        for dropped in ["consult", "consult_submit"] {
+            assert!(
+                !tools.iter().any(|t| t == dropped),
+                "{dropped} needs an explorer slot too, so it must be dropped. Advertised: \
+                 {tools:?}"
+            );
+        }
         assert!(
-            tools.iter().any(|t| t == "consult"),
-            "consult must SURVIVE here — its interactive synth can staff it, and the driver \
-             carries its own explorer. Advertised: {tools:?}"
+            tools.iter().any(|t| t == "oneshot"),
+            "oneshot needs only the interactive synth, so it must survive. Advertised: \
+             {tools:?}"
         );
     }
 
@@ -8157,7 +8438,7 @@ enabled = false
         let interactive = h.config.resolve_cast("anthropic").unwrap().clone();
 
         let err = h
-            .reject_offline_cast(&batch, "consult")
+            .require_interactive_cast(&batch, "consult")
             .expect_err("an interactive tool must refuse a batch cast");
         let msg = format!("{err:?}");
         assert!(
@@ -8166,14 +8447,14 @@ enabled = false
         );
 
         let err = h
-            .reject_offline_cast(&direct, "consult")
+            .require_interactive_cast(&direct, "consult")
             .expect_err("an interactive tool must refuse a direct cast too");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("mydirect") && msg.contains("direct"),
             "refusal should name the cast and its lane, got: {msg}"
         );
-        assert!(h.reject_offline_cast(&interactive, "consult").is_ok());
+        assert!(h.require_interactive_cast(&interactive, "consult").is_ok());
 
         let err = h
             .require_batch_cast(&interactive)
@@ -9353,10 +9634,88 @@ enabled = false
             "126",
             "124",
             "127",
+            "`-1` — kaish could not run the script",
+            "grep -rnF",
             "permission denied: filesystem is read-only",
         ] {
             assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
         }
+    }
+
+    /// Claude Code truncates each tool `description` at 2048 characters, the same cap
+    /// as the server instructions, and silently. Every description kaibo advertises must
+    /// fit, so a clause added to one (like the `run_kaish` exit codes) cannot push its
+    /// own tail past the cut.
+    #[test]
+    fn every_tool_description_fits_claude_code_budget() {
+        let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
+        let tools = h.tool_router.list_all();
+        assert!(!tools.is_empty(), "the guard checked nothing");
+        for tool in tools {
+            let len = tool.description.as_deref().unwrap_or("").chars().count();
+            assert!(
+                len <= 2048,
+                "`{}` description is {len} chars, over Claude Code's 2048-char cut",
+                tool.name
+            );
+        }
+    }
+
+    /// `run_kaish` lists the exit codes a caller sees, and -1 is one of them: kaish could
+    /// not run the script. Most often it failed to parse or validate, so nothing ran;
+    /// a shell error partway through also returns -1 (`sandbox.rs`, the worker's `Run`
+    /// arm), so the text does not claim "nothing ran" for every -1. It was 4.1% of
+    /// 11,195 calls and no
+    /// kaibo text named it. The description also carries the example that avoids the
+    /// most common cause, a literal `(` in a grep pattern.
+    #[test]
+    fn run_kaish_description_names_the_parse_failure_code() {
+        let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
+        let tool = h.tool_router.get("run_kaish").expect("run_kaish advertised");
+        let d = tool.description.as_deref().unwrap_or("");
+        for needle in [
+            "-1 = kaish could not run the script",
+            "a parse or validation failure, where nothing ran, or a shell error partway \
+             through",
+            "grep -rnF 'fn consult(' src",
+        ] {
+            assert!(d.contains(needle), "run_kaish description must name {needle:?}: {d}");
+        }
+    }
+
+    /// The code the text documents is the code the shell returns. A grep pattern with an
+    /// unbalanced `(` fails kaish's validation before anything runs, and `run_kaish`
+    /// reports `exit: -1` with the reason on stderr; the fixed-string form of the same
+    /// search runs and finds the line. A kaish bump that changes either answer fails here.
+    #[tokio::test]
+    async fn a_script_that_fails_validation_exits_minus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn consult(q: &str) {}\n").unwrap();
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        config.infer_cwd = false;
+        let h = KaiboHandler::new(config).expect("handler builds");
+        let run = |script: &str| {
+            let script = script.to_string();
+            let h = &h;
+            async move {
+                let out = h
+                    .run_kaish(Parameters(RunKaishInput { script, path: None }))
+                    .await
+                    .expect("the tool call itself succeeds");
+                out.content[0].as_text().expect("text body").text.clone()
+            }
+        };
+        let text = run(r#"grep -rn "fn consult(" ."#).await;
+        assert!(
+            text.starts_with("exit: -1\n") && text.contains("--- stderr ---"),
+            "an unbalanced `(` must fail validation with exit -1 and a reason: {text}"
+        );
+        let text = run("grep -rnF 'fn consult(' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "the fixed-string search must run and find the line: {text}"
+        );
     }
 
     #[test]
