@@ -36,7 +36,7 @@ pub use engine::{
 // when *how* a turn ended is the question (see [`crate::completion_watch`]). No in-crate
 // `use` imports either by that path today, so silence the unused-import lint.
 #[allow(unused_imports)]
-pub(crate) use engine::{run_phase, run_phase_logged};
+pub(crate) use engine::{failure_class, run_phase, run_phase_logged};
 pub use prompts::{
     batch_preamble, batch_system_prompt, consult_preamble, consult_user_prompt,
     deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble, ReportReader,

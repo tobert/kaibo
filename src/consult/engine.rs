@@ -745,8 +745,10 @@ fn transcript_has_tool_results(history: &[Message]) -> bool {
 /// filled 16384 and 32768 budgets with reasoning on 10 of 39 `oneshot` calls), and
 /// the generic "retry" advice does not reach its cause. The two config keys that do
 /// are named, because a caller cannot change either one per call.
+#[allow(clippy::too_many_arguments)] // each is one distinct diagnostic the message names
 fn empty_answer_error(
     model: &str,
+    role: ModelRole,
     turns: usize,
     max_turns: usize,
     usage: &Usage,
@@ -758,36 +760,75 @@ fn empty_answer_error(
         Some(r) => format!("finish_reason \"{r}\" reported by the provider"),
         None => "no finish_reason reported by the provider (normal on some wires)".to_string(),
     };
+    let slot = role.key();
     let (budget, advice) = match finish_reason {
-        Some(r) if is_output_limit(r) => (
+        // Only claim the budget went to reasoning when the provider counted reasoning.
+        Some(r) if is_output_limit(r) && usage.reasoning_tokens > 0 => (
             format!(
                 " The provider stopped the model at its output limit (finish_reason \"{r}\", \
                  max_tokens {max_tokens}) with {} of {} output tokens spent on reasoning, so \
                  the model used its output budget reasoning and never wrote the answer.",
                 usage.reasoning_tokens, usage.output_tokens,
             ),
-            "Retry the call, since how long a model reasons varies from call to call; send \
-             a smaller question; or use another cast. To change the outcome for this cast, \
-             lower `effort` or raise `max_tokens` on its `synth` slot in config.toml \
-             (`kaibo example-config` shows the shape)."
-                .to_string(),
+            format!(
+                "Retry the call, since how long a model reasons varies from call to call; \
+                 send a smaller question; or use another cast. To change the outcome for \
+                 this cast, lower `effort` or raise `max_tokens` on its `{slot}` slot in \
+                 config.toml (`kaibo example-config` shows the shape)."
+            ),
+        ),
+        Some(r) if is_output_limit(r) => (
+            format!(
+                " The provider stopped the model at its output limit (finish_reason \"{r}\", \
+                 max_tokens {max_tokens}) after all {} output tokens, with no answer text. It \
+                 reported no reasoning count, so kaibo cannot say how the budget was spent.",
+                usage.output_tokens,
+            ),
+            format!(
+                "Retry the call; send a smaller question; or use another cast. To change the \
+                 outcome for this cast, raise `max_tokens` or lower `effort` on its `{slot}` \
+                 slot in config.toml (`kaibo example-config` shows the shape)."
+            ),
         ),
         _ => (
             String::new(),
             "Retry, or try the same question on a different cast.".to_string(),
         ),
     };
-    anyhow!(
+    anyhow::Error::new(EmptyAnswer(format!(
         "model {model} returned an EMPTY answer — {detail}.{budget} It is not a result: a \
          completed-but-empty answer is no answer, and returning it would hand you a \
          review that never happened. Diagnostics: {turns} of {max_turns} turns used, \
          {} input tokens ({} cached), {} output tokens, {} reasoning tokens reported; \
          {reason}. {advice}",
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.output_tokens,
-        usage.reasoning_tokens,
-    )
+        usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens,
+    )))
+}
+
+/// The error [`empty_answer_error`] builds, as its own type so the failure class can
+/// travel with it: [`failure_class`] finds it anywhere in an error chain, which is how
+/// the `oneshot` tool span records the same `error.type` as the phase span. Its
+/// `Display` is the message, unchanged.
+#[derive(Debug)]
+struct EmptyAnswer(String);
+
+impl std::fmt::Display for EmptyAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EmptyAnswer {}
+
+/// The `error.type` class of a phase failure, for a span to record: `empty_answer`
+/// when the model returned no answer text (see [`empty_answer_error`]), else
+/// `phase_failed`. Reads the whole chain, so a caller's added context does not hide it.
+pub(crate) fn failure_class(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|e| e.is::<EmptyAnswer>()) {
+        "empty_answer"
+    } else {
+        "phase_failed"
+    }
 }
 
 /// Whether a provider's finish reason means "stopped at the output token limit", in
@@ -1310,6 +1351,7 @@ where
         progress.as_ref(),
         make_tools,
         break_on_tool_images,
+        role,
     )
     .await;
     // Read the ending off the log — after the loop, on every exit path, so a failed
@@ -1358,6 +1400,7 @@ async fn run_phase_loop<M, F>(
     progress: &dyn ProgressSink,
     make_tools: F,
     break_on_tool_images: bool,
+    role: ModelRole,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + Clone + 'static,
@@ -1394,6 +1437,7 @@ where
                 make_tools()?,
                 full,
                 max_turns,
+                role,
             )
             .await;
         }
@@ -1461,6 +1505,7 @@ where
                 if !transcript_has_tool_results(&transcript) {
                     return Err(empty_answer_error(
                         model_name,
+                        role,
                         turns,
                         max_turns,
                         &spent,
@@ -1521,6 +1566,7 @@ where
                 if answer.trim().is_empty() {
                     return Err(empty_answer_error(
                         model_name,
+                        role,
                         turns + 1,
                         max_turns,
                         &usage,
@@ -1547,6 +1593,7 @@ where
                     make_tools()?,
                     *chat_history,
                     max_turns,
+                    role,
                 )
                 .await;
             }
@@ -1633,6 +1680,7 @@ async fn finalize_after_max_turns<M>(
     tools: Vec<DynamicTool>,
     chat_history: Vec<Message>,
     max_turns: usize,
+    role: ModelRole,
 ) -> Result<(String, Usage)>
 where
     M: CompletionModel + Clone + 'static,
@@ -1657,6 +1705,7 @@ where
     if answer.trim().is_empty() {
         return Err(empty_answer_error(
             model_name,
+            role,
             max_turns,
             max_turns,
             &usage,
@@ -1758,7 +1807,7 @@ where
         // "model call failed" keeps this on the provider side of `classify_failure`
         // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
         // overload or rate limit here is still worth a caller retry.
-        let response = response.map_err(|e| (anyhow!("model call failed: {e}"), "phase_failed"))?;
+        let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
         let answer = response
             .choice
             .iter()
@@ -1773,19 +1822,16 @@ where
         // Fail with the same diagnostics vocabulary as the loop, finish reason included
         // (this path reads it off its own log).
         if answer.trim().is_empty() {
-            return Err((
-                empty_answer_error(
-                    model_name,
-                    1,
-                    1,
-                    &response.usage,
-                    log.last_finish_reason().as_deref(),
-                    max_tokens,
-                    "the single toolless completion returned no answer text, and a lane \
-                     with no tools has no gathered evidence to write up, so kaibo does not \
-                     re-ask",
-                ),
-                "empty_answer",
+            return Err(empty_answer_error(
+                model_name,
+                ModelRole::Synth,
+                1,
+                1,
+                &response.usage,
+                log.last_finish_reason().as_deref(),
+                max_tokens,
+                "the single toolless completion returned no answer text, and a lane with no \
+                 tools has no gathered evidence to write up, so kaibo does not re-ask",
             ));
         }
         Ok((answer, response.usage))
@@ -1796,12 +1842,11 @@ where
     // attribute), and `error.type` names the class for a query to group on. Without
     // this every single-shot span closed Unset, so an empty `oneshot` read as a
     // success in traces even though the caller got an error.
-    let outcome = outcome.map_err(|(error, class)| {
+    if let Err(error) = &outcome {
         let span = tracing::Span::current();
         span.record("otel.status_code", "ERROR");
-        span.record("error.type", class);
-        error
-    });
+        span.record("error.type", failure_class(error));
+    }
     // One inference call by definition — or more, when `retried` resent a generation
     // the provider malformed — so the count comes off the log's attempts rather than a
     // literal, and a lane whose single call failed still reports the call it made. No
@@ -5809,6 +5854,110 @@ mod tests {
         ] {
             assert!(msg.contains(needle), "the error must name {needle}: {msg}");
         }
+    }
+
+    /// The output-limit diagnosis must name the slot that ran. An explorer phase shares
+    /// this error (`run_explore_phase`, deliberate's dossier survey), and advice to edit
+    /// the `synth` slot sent the operator to the wrong place.
+    #[tokio::test]
+    async fn an_explorer_that_spends_its_budget_on_reasoning_names_the_explorer_slot() {
+        const EXPLORER: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, |_req| {
+                Ok(with_raw(
+                    with_usage(
+                        reasoning_response("surveying..."),
+                        Usage {
+                            reasoning_tokens: 16384,
+                            ..usage(2_000, 16384)
+                        },
+                    ),
+                    json!({"choices": [{"index": 0, "finish_reason": "length"}]}),
+                ))
+            })
+            .build();
+        let dir = tempdir().unwrap();
+        let err = explore_with(
+            "where does the cast live?",
+            dir.path().to_path_buf(),
+            &arm(&client, EXPLORER),
+            &ExploreConfig::default(),
+            &[],
+            None,
+            ReportReader::CallingAgent,
+        )
+        .await
+        .expect_err("an explorer that reported nothing must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("on its `explorer` slot"), "{msg}");
+        assert!(!msg.contains("`synth` slot"), "{msg}");
+    }
+
+    /// A provider that reports no reasoning count (0) still hits the output limit, but
+    /// kaibo cannot say the budget went to reasoning. The sentence must not read
+    /// "0 of 16384 output tokens spent on reasoning, so the model used its output budget
+    /// reasoning".
+    #[tokio::test]
+    async fn an_output_limit_without_a_reasoning_count_does_not_blame_reasoning() {
+        const MODEL: &str = "quiet-model";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| {
+                Ok(with_raw(
+                    with_usage(reasoning_response("..."), usage(2_000, 16384)),
+                    json!({"choices": [{"index": 0, "finish_reason": "length"}]}),
+                ))
+            })
+            .build();
+        let err = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .expect_err("an answer-less single shot must fail");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("0 of 16384"), "{msg}");
+        assert!(!msg.contains("used its output budget reasoning"), "{msg}");
+        assert!(
+            msg.contains("all 16384 output tokens") && msg.contains("reported no reasoning count"),
+            "the limit is still named, without a claim about reasoning: {msg}"
+        );
+    }
+
+    /// Every spelling of "stopped at the output limit" that `completion_watch` returns,
+    /// and a few that are not a limit.
+    #[test]
+    fn is_output_limit_reads_every_provider_spelling() {
+        for (reason, limit) in [
+            ("length", true),            // OpenAI chat completions, DeepSeek, OpenRouter
+            ("max_tokens", true),        // Anthropic
+            ("MAX_TOKENS", true),        // Gemini
+            ("max_output_tokens", true), // OpenAI Responses
+            ("stop", false),
+            ("end_turn", false),
+            ("STOP", false),
+            ("content_filter", false),
+        ] {
+            assert_eq!(is_output_limit(reason), limit, "{reason}");
+        }
+    }
+
+    /// The failure class travels with the error, so the `oneshot` tool span can record
+    /// the same `error.type` as the phase span instead of a fixed "phase_failed".
+    #[tokio::test]
+    async fn a_single_shot_error_carries_its_failure_class() {
+        const MODEL: &str = "reasoner";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Ok(reasoning_response("thinking...")))
+            .build();
+        let err = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .expect_err("empty");
+        assert_eq!(failure_class(&err), "empty_answer");
+
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Err(provider_error("boom")))
+            .build();
+        let err = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .expect_err("provider error");
+        assert_eq!(failure_class(&err), "phase_failed");
     }
 
     /// The same failure must also read as a failure in traces. Every kaibo span used

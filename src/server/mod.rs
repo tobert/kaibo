@@ -2694,7 +2694,7 @@ impl KaiboHandler {
             // tool span closes as an error too, so a trace does not read it as a success.
             Err(e) => {
                 span.record("otel.status_code", "ERROR");
-                span.record("error.type", "phase_failed");
+                span.record("error.type", crate::consult::failure_class(&e));
                 return Ok(consultation_failed("oneshot", &cast.name, e));
             }
         };
