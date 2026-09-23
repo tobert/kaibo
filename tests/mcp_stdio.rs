@@ -504,14 +504,17 @@ async fn consult_carries_the_always_load_pin_and_no_other_tool_does() {
 }
 
 /// A raw JSON-RPC exchange over the binary's stdio, bypassing rmcp's client so the
-/// test controls the exact `protocolVersion` on the wire. rmcp's client always asks
+/// test controls the exact protocol version on the wire. rmcp's client always asks
 /// for its own latest, so the version-skew cases below are unreachable through it.
+///
+/// `script` is sent line by line, in order. A message with an `id` waits for the
+/// response carrying that id, which is returned in script order; a notification
+/// (no `id`) is sent and not waited on. Other lines the server writes (log
+/// notifications, say) are skipped.
 ///
 /// Same blank-environment rule as [`Server`]: `env_clear()`, then temp `HOME`/XDG
 /// roots, so nothing from the developer's shell shapes the server under test.
-async fn raw_initialize_then_list_tools(
-    client_version: &str,
-) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+async fn raw_exchange(script: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let xdg = TempDir::new().expect("tempdir for the child's HOME/XDG roots");
@@ -545,34 +548,40 @@ async fn raw_initialize_then_list_tools(
     let stdout = child.stdout.take().expect("child stdout is piped");
     let mut lines = BufReader::new(stdout).lines();
 
-    async fn call(
-        stdin: &mut tokio::process::ChildStdin,
-        lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-        what: &str,
-        msg: serde_json::Value,
-        id: u64,
-    ) -> serde_json::Value {
+    let mut responses = Vec::new();
+    for msg in script {
         stdin
             .write_all(format!("{msg}\n").as_bytes())
             .await
             .expect("write a request line");
+        let Some(id) = msg.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let what = format!("raw {}", msg["method"]);
         loop {
-            let line = bounded(what, lines.next_line())
+            let line = bounded(&what, lines.next_line())
                 .await
                 .expect("read a response line")
                 .unwrap_or_else(|| panic!("{what}: the server closed stdout"));
             let value: serde_json::Value =
                 serde_json::from_str(&line).unwrap_or_else(|e| panic!("{what}: bad JSON: {e}"));
             if value.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
-                return value;
+                responses.push(value);
+                break;
             }
         }
     }
 
-    let init = call(
-        &mut stdin,
-        &mut lines,
-        "raw initialize",
+    child.kill().await.ok();
+    responses
+}
+
+/// The legacy entry: `initialize` at `client_version`, `notifications/initialized`,
+/// then `tools/list` and `resources/list`. Returns the three results.
+async fn raw_initialize_then_list_tools(
+    client_version: &str,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let responses = raw_exchange(vec![
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
@@ -581,34 +590,12 @@ async fn raw_initialize_then_list_tools(
                 "clientInfo": { "name": "raw-probe", "version": "0" }
             }
         }),
-        1,
-    )
-    .await;
-
-    stdin
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
-        .await
-        .expect("write the initialized notification");
-
-    let tools = call(
-        &mut stdin,
-        &mut lines,
-        "raw tools/list",
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
         serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
-        2,
-    )
-    .await;
-
-    let resources = call(
-        &mut stdin,
-        &mut lines,
-        "raw resources/list",
         serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {} }),
-        3,
-    )
+    ])
     .await;
-
-    child.kill().await.ok();
+    let [init, tools, resources] = <[_; 3]>::try_from(responses).expect("three responses");
     (
         init["result"].clone(),
         tools["result"].clone(),
@@ -616,32 +603,84 @@ async fn raw_initialize_then_list_tools(
     )
 }
 
-/// A session at the newest negotiable protocol version receives every field that
-/// version's schema REQUIRES on a list result.
+/// A session at `2026-07-28` receives every field that version's schema REQUIRES on
+/// a list result.
 ///
-/// The failure this pins (live, 2026-08-10): rmcp negotiates `2026-07-28` whenever a
-/// client asks for it, but left `ttlMs` and `cacheScope` unset, which SEP-2549 makes
-/// REQUIRED on every list/read result at that version. A strictly-validating client
-/// (Claude Code) rejected the whole `tools/list` over the two missing fields: zero
-/// tools, kaibo unusable until restart. kaibo fills them itself
-/// (`sep_2549_cache_fields`, `server/mod.rs`) with the no-caching floor: `ttlMs: 0`,
-/// `cacheScope: "private"`.
+/// That version has no `initialize`: a client enters with `server/discover` and
+/// states its protocol version and capabilities in each request's `_meta`, so this
+/// test enters the same way.
 ///
-/// A newer rmcp filling the fields is not the signal to delete that helper: 3.1.1
-/// fills only the two results its handler macros generate and answers
-/// `cacheScope: public`, which is the wrong answer for a per-user surface. This test
-/// asserts kaibo's values, so it fails if the SDK's ever start winning.
+/// The failure this pins (live, 2026-08-10): rmcp negotiated `2026-07-28` but left
+/// `ttlMs` and `cacheScope` unset, which SEP-2549 makes REQUIRED on every list/read
+/// result at that version. A strictly-validating client (Claude Code) rejected the
+/// whole `tools/list` over the two missing fields: zero tools, kaibo unusable until
+/// restart. kaibo fills them itself (`sep_2549_cache_fields`, `server/mod.rs`) with
+/// the no-caching floor: `ttlMs: 0`, `cacheScope: "private"`. The helper reads the
+/// version from the request's `_meta` first, which is what makes it reach a session
+/// with no handshake.
+///
+/// A newer rmcp filling the fields is not the signal to delete that helper: rmcp's
+/// handler macros answer `cacheScope: public`, which is the wrong answer for a
+/// per-user surface. This test asserts kaibo's values, so it fails if the SDK's ever
+/// start winning.
 #[tokio::test]
 async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
-    let (init, tools, resources) = raw_initialize_then_list_tools("2026-07-28").await;
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "raw-probe", "version": "0" }
+    });
+    // Every list/read result kaibo answers, plus discovery. `prompts/get` is not here:
+    // its result type carries no SEP-2549 fields.
+    let requests: [(&str, serde_json::Value); 6] = [
+        ("server/discover", serde_json::json!({})),
+        ("tools/list", serde_json::json!({})),
+        ("resources/list", serde_json::json!({})),
+        ("resources/templates/list", serde_json::json!({})),
+        ("resources/read", serde_json::json!({ "uri": "kaibo://config" })),
+        ("prompts/list", serde_json::json!({})),
+    ];
+    let script = requests
+        .iter()
+        .zip(1u64..)
+        .map(|((method, params), id)| {
+            let mut params = params.clone();
+            params["_meta"] = meta.clone();
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        })
+        .collect();
+    let responses = raw_exchange(script).await;
+    let results: Vec<(&str, &serde_json::Value)> = requests
+        .iter()
+        .zip(&responses)
+        .map(|((method, _), response)| {
+            assert!(
+                response["result"].is_object(),
+                "{method} answers a result, not an error; got: {response}"
+            );
+            (*method, &response["result"])
+        })
+        .collect();
+    let (discover, tools) = (results[0].1, results[1].1);
 
+    assert!(
+        discover["supportedVersions"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|v| v == "2026-07-28")),
+        "server/discover offers the version this session speaks; got: {discover}"
+    );
     assert_eq!(
-        init["protocolVersion"], "2026-07-28",
-        "rmcp echoes a known client version; the fix serves that contract rather \
-         than fighting the echo; got: {init}"
+        discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "kaibo",
+        "discovery identifies kaibo, not rmcp; got: {discover}"
+    );
+    assert!(
+        discover["instructions"]
+            .as_str()
+            .is_some_and(|s| s.contains("READ-ONLY")),
+        "discovery carries the instructions `initialize` carried before; got: {discover}"
     );
 
-    for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+    for &(what, result) in &results {
         assert_eq!(
             result["ttlMs"], 0,
             "{what} must carry the REQUIRED `ttlMs`, as the no-caching floor; got: {result}"
@@ -665,6 +704,36 @@ async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
     );
 }
 
+/// An `initialize` naming `2026-07-28` is answered with `2025-11-25`, the newest
+/// version that still has an `initialize` handshake, and the session keeps that
+/// version's legacy wire shape.
+///
+/// rmcp decides this (since 3.2), not kaibo: `2026-07-28` replaced the handshake
+/// with per-request `_meta`, so a client can reach it only through `server/discover`.
+/// This pins the downgrade so an rmcp release that changes it shows up here, beside
+/// the SEP-2549 test above that depends on which door a newest-version client uses.
+#[tokio::test]
+async fn an_initialize_naming_the_newest_version_gets_the_newest_legacy_one() {
+    let (init, tools, resources) = raw_initialize_then_list_tools("2026-07-28").await;
+
+    assert_eq!(
+        init["protocolVersion"], "2025-11-25",
+        "`initialize` negotiates the newest version that has it; got: {init}"
+    );
+    for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+        assert!(
+            result.is_object(),
+            "{what} answers a result, so the absences below are real; got: {result}"
+        );
+        for field in ["ttlMs", "cacheScope", "resultType"] {
+            assert!(
+                result.get(field).is_none(),
+                "{what}: a `2025-11-25` session gets no `2026-07-28` `{field}`; got: {result}"
+            );
+        }
+    }
+}
+
 /// A client on an older protocol version keeps the legacy wire shape — none of the
 /// newer contract's fields leak into a session whose schema does not know them.
 #[tokio::test]
@@ -676,6 +745,10 @@ async fn an_older_protocol_session_keeps_the_legacy_wire_shape() {
         "an in-range client version is echoed, not lifted or lowered; got: {init}"
     );
     for (what, result) in [("tools/list", &tools), ("resources/list", &resources)] {
+        assert!(
+            result.is_object(),
+            "{what} answers a result, so the absences below are real; got: {result}"
+        );
         for field in ["ttlMs", "cacheScope", "resultType"] {
             assert!(
                 result.get(field).is_none(),

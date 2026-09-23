@@ -339,7 +339,8 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     // reads it so a client `setLevel` retunes verbosity live.
     let log_level = handler.mcp_log_level();
     let service = handler.serve(stdio()).await?;
-    // The peer exists now (initialize is done): start forwarding buffered + live logs.
+    // The peer exists now (after `initialize`, or the first request of a `2026-07-28`
+    // session, which has no handshake): start forwarding buffered + live logs.
     tokio::spawn(mcp_log::drain(log_rx, log_level, service.peer().clone()));
     service.waiting().await?;
 

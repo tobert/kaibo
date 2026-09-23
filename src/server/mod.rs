@@ -27,7 +27,7 @@ use rmcp::model::{
     ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
     RequestMetaObject, Resource, ResourceContents, ResourceTemplate, ResultType, Role,
-    ServerCapabilities, ServerInfo, SetLevelRequestParams,
+    ServerCapabilities, ServerConfig, SetLevelRequestParams,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -3781,18 +3781,23 @@ impl KaiboHandler {
 // silently bypassed every `--no-<tool>` flag and every staffing drop. Only a test that
 // speaks MCP can catch that — a handler-side assertion reads the gated router either
 // way; see `tests/mcp_stdio.rs`.
-/// The SEP-2549 response-caching fields, filled when this session's negotiated
-/// protocol version requires them (`2026-07-28` and newer), absent otherwise.
+/// The SEP-2549 response-caching fields, filled when this request's protocol version
+/// requires them (`2026-07-28` and newer), absent otherwise.
 ///
-/// rmcp negotiates `2026-07-28` whenever a client asks for it (the version is in the
-/// SDK's known list), and that spec version makes both fields REQUIRED on every list
-/// and read result. A strictly-validating client (Claude Code, observed 2026-08-10
-/// against rmcp 3.0.0-beta.5) accepts the negotiated version and then rejects the
-/// whole `tools/list` over the missing fields: zero tools, kaibo unusable until
-/// restart.
+/// `2026-07-28` makes both fields REQUIRED on every list and read result. A
+/// strictly-validating client (Claude Code, observed 2026-08-10 against rmcp
+/// 3.0.0-beta.5) accepted that version and then rejected the whole `tools/list` over
+/// the missing fields: zero tools, kaibo unusable until restart.
 ///
-/// rmcp 3.1.1 fills the fields for the two results its handler macros generate
-/// (`tools/list`, `prompts/list`) and answers `cacheScope: public`. That is not
+/// How a session reaches that version changed in rmcp 3.2: `2026-07-28` has no
+/// `initialize` handshake, so an `initialize` naming it is answered with
+/// `2025-11-25`, and a client that speaks `2026-07-28` enters with `server/discover`
+/// and states its version in every request's `_meta`. `context.protocol_version()`
+/// reads that `_meta` first and falls back to the handshake's version, so this one
+/// check serves both kinds of session.
+///
+/// rmcp's handler macros (still in 3.4) fill the fields for the two results they
+/// generate (`tools/list`, `prompts/list`) and answer `cacheScope: public`. That is not
 /// kaibo's answer, and it does not reach kaibo's other results: the resource methods
 /// have no fill at all (the default `ServerHandler` bodies return `::default()`), and
 /// kaibo writes all of these methods by hand regardless. So kaibo answers for itself,
@@ -3960,8 +3965,8 @@ impl rmcp::ServerHandler for KaiboHandler {
         })
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -3981,9 +3986,11 @@ impl rmcp::ServerHandler for KaiboHandler {
         )
         .with_protocol_version(ProtocolVersion::LATEST)
         // Judge provider usability from the live environment so a fresh install
-        // (no key, no config) gets setup guidance in the handshake. Read once here,
-        // at initialize — the same point the rest of config is bound; reconnecting
-        // is what re-reads a newly-set key.
+        // (no key, no config) gets setup guidance in the handshake. Read here, when a
+        // client connects: once at `initialize`, or at each `server/discover` for a
+        // `2026-07-28` client (rmcp's default `discover` calls `get_info`). Config
+        // stays bound at startup either way; reconnecting is what re-reads a
+        // newly-set key.
         .with_instructions(kaibo_instructions_with_scope(
             &self.config,
             self.resolver.allowed_trees(),
