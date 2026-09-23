@@ -2654,9 +2654,12 @@ impl KaiboHandler {
             `cat -n FILE` for a whole file, `grep -rn PATTERN` to locate across \
             files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
             refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
-            external commands are unreachable (exit 127); 124 = timed out. \
-            Each call starts fresh at the project root. See `kaibo://kaish/*` (or \
-            `help` in the script) for idioms and the bash habits that don't carry over."
+            external commands are unreachable (exit 127); 124 = timed out; -1 = the \
+            script failed to parse or validate, so nothing ran (stderr says why). A \
+            grep PATTERN is a regex: search literal text with \
+            `grep -rnF 'fn consult(' src`. Each call starts fresh at the project root. \
+            See `kaibo://kaish/*` (or `help` in the script) for idioms and the bash \
+            habits that don't carry over."
     )]
     pub async fn run_kaish(
         &self,
@@ -4629,6 +4632,9 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
   command is unreachable and exits `127`. That's the boundary working, not a bug — read
   freely, and don't try to mutate. Refusals and ordinary failures share exit `1`, so read
   the stderr line when you need to tell them apart.
+- A `grep` PATTERN is a regex, and a script that fails to parse or validate exits `-1`
+  before anything runs; stderr says why. An unbalanced `(` is the common case, so search
+  literal text with `-F`: `grep -rnF 'fn consult(' src`.
 
 Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
 vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
@@ -9445,10 +9451,80 @@ enabled = false
             "126",
             "124",
             "127",
+            "`-1`",
+            "grep -rnF",
             "permission denied: filesystem is read-only",
         ] {
             assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
         }
+    }
+
+    /// Claude Code truncates each tool `description` at 2048 characters, the same cap
+    /// as the server instructions, and silently. Every description kaibo advertises must
+    /// fit, so a clause added to one (like the `run_kaish` exit codes) cannot push its
+    /// own tail past the cut.
+    #[test]
+    fn every_tool_description_fits_claude_code_budget() {
+        let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
+        let tools = h.tool_router.list_all();
+        assert!(!tools.is_empty(), "the guard checked nothing");
+        for tool in tools {
+            let len = tool.description.as_deref().unwrap_or("").chars().count();
+            assert!(
+                len <= 2048,
+                "`{}` description is {len} chars, over Claude Code's 2048-char cut",
+                tool.name
+            );
+        }
+    }
+
+    /// `run_kaish` lists the exit codes a caller sees, and -1 is one of them: the script
+    /// failed to parse or validate, so nothing ran. It was 4.1% of 11,195 calls and no
+    /// kaibo text named it. The description also carries the example that avoids the
+    /// most common cause, a literal `(` in a grep pattern.
+    #[test]
+    fn run_kaish_description_names_the_parse_failure_code() {
+        let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
+        let tool = h.tool_router.get("run_kaish").expect("run_kaish advertised");
+        let d = tool.description.as_deref().unwrap_or("");
+        for needle in ["-1", "nothing ran", "grep -rnF 'fn consult(' src"] {
+            assert!(d.contains(needle), "run_kaish description must name {needle:?}: {d}");
+        }
+    }
+
+    /// The code the text documents is the code the shell returns. A grep pattern with an
+    /// unbalanced `(` fails kaish's validation before anything runs, and `run_kaish`
+    /// reports `exit: -1` with the reason on stderr; the fixed-string form of the same
+    /// search runs and finds the line. A kaish bump that changes either answer fails here.
+    #[tokio::test]
+    async fn a_script_that_fails_validation_exits_minus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn consult(q: &str) {}\n").unwrap();
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        config.infer_cwd = false;
+        let h = KaiboHandler::new(config).expect("handler builds");
+        let run = |script: &str| {
+            let script = script.to_string();
+            let h = &h;
+            async move {
+                let out = h
+                    .run_kaish(Parameters(RunKaishInput { script, path: None }))
+                    .await
+                    .expect("the tool call itself succeeds");
+                out.content[0].as_text().expect("text body").text.clone()
+            }
+        };
+        let text = run(r#"grep -rn "fn consult(" ."#).await;
+        assert!(
+            text.starts_with("exit: -1\n") && text.contains("--- stderr ---"),
+            "an unbalanced `(` must fail validation with exit -1 and a reason: {text}"
+        );
+        let text = run("grep -rnF 'fn consult(' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "the fixed-string search must run and find the line: {text}"
+        );
     }
 
     #[test]

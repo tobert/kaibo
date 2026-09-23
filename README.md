@@ -331,7 +331,8 @@ wrong-for-the-tool cast), `3` a setup/containment rejection (a path outside
 the allowed set, a missing provider key), `4` the work ran and failed at
 runtime (a provider error, a model-loop failure). `kaibo kaish` is the one
 exception — it passes through kaish's own exit code (`0` ok, `1` the command
-failed, `124` timed out, `127` command not found) instead, since a script
+failed, `124` timed out, `127` command not found, `255` the script failed to
+parse or validate, so nothing ran) instead, since a script
 branches on *that* to know what the sandboxed command did. A refused write is an
 ordinary failure: it exits `1` and prints `permission denied: filesystem is
 read-only`, so branch on the message when you need to tell a refusal from a

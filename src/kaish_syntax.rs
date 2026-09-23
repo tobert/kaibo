@@ -54,13 +54,15 @@ pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so your work here is reading. Read \
 files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN` searches the \
-whole project and prefixes every hit with its path from the root. When a grep hit \
-lands in a large file, read a \
+whole project and prefixes every hit with its path from the root. PATTERN is a \
+regex; search literal text with `-F`, as in `grep -rnF 'fn consult(' src`. When a \
+grep hit lands in a large file, read a \
 wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that range \
 with its real line numbers. Run `file FILE` on an unfamiliar file first; it names \
 the content as text or binary, so you know what you are about to read. \
 Each call starts at the project root; \
-there is no persistent cwd. Read the exit code: 0 is success; 3 means the output \
+there is no persistent cwd. Read the exit code: 0 is success; -1 means the script \
+failed to parse or validate, so nothing ran, and stderr says why; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
 script was killed for running past its time budget; 127 is how every external \
 command answers here — its message names the refusal, as in `curl: external \
@@ -436,6 +438,8 @@ pub fn kaibo_sandbox_doc() -> String {
          - `grep -rn -B3 -A6 PATTERN` — preview matches in context across files\n\
          - `grep -rn PATTERN DIR/` — narrow to a subtree; hits are prefixed with the operand as written, so a named directory still cites a usable path\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
+         - `grep -rnF 'fn consult(' src` — a literal search; PATTERN is otherwise a regex, \
+         and an unbalanced `(` fails validation with exit `-1`\n\
          - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file\n\
          - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
          ## Read-only boundary\n\
@@ -449,6 +453,9 @@ pub fn kaibo_sandbox_doc() -> String {
          read the stderr line: a refusal says `permission denied: filesystem is \
          read-only`.\n\
          - `0` — success\n\
+         - `-1` — the script failed to parse or validate, so nothing ran; stderr says \
+         why. The common cause is a grep pattern with a literal `(`: search it with \
+         `grep -rnF`\n\
          - `1` — the command failed. A refused write is one of these, and its message \
          reads `permission denied: filesystem is read-only`\n\
          - `3` — output exceeded the cap and was truncated to a head+tail sample \
@@ -585,6 +592,10 @@ mod tests {
             "124",
             "127",
             "permission denied: filesystem is read-only",
+            // 4.1% of 11,195 `run_kaish` calls returned -1, most often a grep pattern
+            // with a literal `(`; nothing in kaibo's text named the code.
+            "-1 means the script failed to parse or validate, so nothing ran",
+            "`grep -rnF 'fn consult(' src`",
         ] {
             assert!(
                 KAISH_SANDBOX_ADDENDUM.contains(needle),

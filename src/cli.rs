@@ -22,7 +22,7 @@
 //!   parsing prose. (An arg-parse error is clap's: usage on stderr, exit 2, nothing on
 //!   stdout — the envelope is guaranteed only once args parse. And `kaibo kaish` passes
 //!   through kaish's own exit code on a normal run — 0 ok/1 failed/124 timed out/127
-//!   not found.)
+//!   not found/255, kaish's -1, the script failed to parse or validate.)
 //!
 //! `--help` is model-facing text: an agent reads it the way an MCP client reads a
 //! tool description, so the top-level `about` front-loads what kaibo is and every
@@ -81,7 +81,8 @@ EXIT CODES
        worker infra crash
 
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
-this table (0 ok, 1 the command failed, 124 timed out, 127 command not found).
+this table (0 ok, 1 the command failed, 124 timed out, 127 command not found,
+255 the script failed to parse or validate, so nothing ran; stderr says why).
 A refused write exits 1 and prints `permission denied: filesystem is
 read-only` on stderr.";
 
@@ -498,7 +499,7 @@ pub struct DeliberateArgs {
 /// `kaibo kaish` — one non-interactive kaish command through the same READ-ONLY sandbox
 /// the `run_kaish` MCP tool uses. Scriptable single execution only: no readline, no
 /// REPL. The process exits with kaish's own exit code (0 ok, 1 the command failed,
-/// 124 timed out, 127 command not found).
+/// 124 timed out, 127 command not found, 255 the script failed to parse or validate).
 #[derive(Args, Debug)]
 pub struct KaishArgs {
     /// The kaish (sh-like) script to run against the read-only project. Required — kaibo
@@ -2504,7 +2505,8 @@ async fn cas_read_inner(args: &CasReadArgs, resolver: &Resolver) -> Result<i32, 
 /// Run `kaibo kaish -c 'SCRIPT'` — one non-interactive execution through the read-only
 /// sandbox. stdout carries the script's stdout, stderr its stderr, and the process exits
 /// with kaish's own exit code (0 ok, 1 the command failed, 124 timed out, 127 command
-/// not found). A missing `-c` is a
+/// not found, 255 for kaish's -1: the script failed to parse or validate, so nothing
+/// ran). A missing `-c` is a
 /// usage error (exit 2); a bad `--path` is a setup rejection (exit 3).
 pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
     init_cli_logging();
@@ -2603,7 +2605,8 @@ pub async fn run_kaish(common: CommonArgs, args: KaishArgs) -> i32 {
                 "kaibo: the kaish shell failed while running your script, so its output is \
                  incomplete: {e:#}. This is a kaibo failure, not a script error — a script's \
                  own exit codes are 0 (ok), 1 (the command failed, which is also how a \
-                 refused write reports), 124 (timed out), and 127 (command not found)."
+                 refused write reports), 124 (timed out), 127 (command not found), and \
+                 255 (the script failed to parse or validate, so nothing ran)."
             );
             EXIT_CONSULT_FAILURE
         }
@@ -3393,6 +3396,18 @@ mod tests {
             Some(Command::Consult(c)) => assert_eq!(c.question, "why?"),
             other => panic!("expected consult, got {other:?}"),
         }
+    }
+
+    /// `kaibo kaish` passes kaish's exit code through as the process exit, and kaish's
+    /// -1 (the script failed to parse or validate) arrives as 255, because a process
+    /// exit is one unsigned byte. The help table names both numbers so a script
+    /// branching on `$?` sees the one it will get.
+    #[test]
+    fn exit_codes_help_names_the_parse_failure_as_255() {
+        assert!(
+            EXIT_CODES_HELP.contains("255 the script failed to parse or validate"),
+            "{EXIT_CODES_HELP}"
+        );
     }
 
     /// A batch/direct cast on interactive `consult` is a USAGE error (exit 2, kind
