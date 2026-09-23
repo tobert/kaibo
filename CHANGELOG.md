@@ -36,6 +36,7 @@ record. Each later release appends a new section at the top.
 - `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
 - Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
 - Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
+- The MCP instructions put `## Scope` before the cast roster and cap the roster at 8 lines, so Claude Code's 2048-character cut no longer hides Scope.
 
 ## [0.5.0] — 2026-09-10
 

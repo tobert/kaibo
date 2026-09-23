@@ -128,9 +128,10 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 }
 
 /// The opening paragraph of the handshake: what kaibo is and the tool menu. Split out
-/// so [`kaibo_instructions_with_scope`] can slot the `## Casts` roster *between* it and
-/// `## Scope` — the menu of teams reads before scope, and both sit above the point a
-/// truncating host (Claude Code's 2048-char cap) would cut.
+/// so [`kaibo_instructions_with_scope`] can compose it with `## Scope` and the
+/// `## Casts` roster, in that order. The roster goes last because it is the only
+/// section whose size the operator controls, so a truncating host (Claude Code's
+/// 2048-char cap) cuts it rather than Scope.
 fn kaibo_lead() -> &'static str {
     "kaibo — codebase review and second opinions from another model family. \
      Hosted casts send questions, context, and source to configured providers; \
@@ -209,6 +210,14 @@ fn setup_section(config: &Config) -> String {
     )
 }
 
+/// How many casts the resident roster names before it summarizes the rest in one
+/// `+N more` line. The roster is the one handshake section whose size the operator
+/// controls, so it is the one that gets a fixed cap: a 26-cast config rendered 2,596
+/// characters against Claude Code's 2048. Eight lines of typical length plus the lead
+/// and `## Scope` leave room for a few allowed trees; `instructions_fit_claude_code_
+/// budget_at_any_roster_size` holds the total.
+const ROSTER_MAX_LINES: usize = 8;
+
 /// The `## Casts` block: the casts that can reach a model *right now* (from
 /// [`Config::usable_casts`]), each line naming the cast's answering (synth) model —
 /// the team's voice, so an agent told "ask Gemini Pro" indexes the right cast — with
@@ -221,15 +230,23 @@ fn setup_section(config: &Config) -> String {
 /// once at startup. The synth model lives on the resolved `Config` already (it's what
 /// `kaibo://config` prints) — this surfaces it where the calling agent first reads.
 ///
+/// The roster names at most [`ROSTER_MAX_LINES`] casts, the default first so it always
+/// makes the list, and then says how many it left out. It renders last in the
+/// handshake, after `## Scope`, so a roster longer than the budget expects cuts into
+/// its own tail and never into the containment posture.
+///
 /// Empty `usable` (no cast can reach a model) renders nothing — the `Unconfigured`
-/// setup banner already owns that case and would otherwise say it twice. Returns a
-/// trailing `\n\n` so the caller can splice it in unconditionally.
+/// setup banner already owns that case and would otherwise say it twice.
 fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String {
     if usable.is_empty() {
         return String::new();
     }
-    let lines: String = usable
-        .iter()
+    // The default leads; the rest keep the caller's (alphabetical) order.
+    let (default, rest): (Vec<_>, Vec<_>) =
+        usable.iter().partition(|(name, _)| config.is_default_cast(name));
+    let mut lines: Vec<String> = default
+        .into_iter()
+        .chain(rest)
         // A `direct`-lane cast is kept out of this *resident* roster to hold the 2048-char
         // budget: `deliberate` now routes to it (its `cast` enum lists the deliberate-usable
         // direct casts authoritatively, and `kaibo://config` renders every cast), so it's
@@ -269,15 +286,20 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
                 None => format!("- `{name}`{suffix}"),
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    if lines.len() > ROSTER_MAX_LINES {
+        let left_out = lines.len() - ROSTER_MAX_LINES;
+        lines.truncate(ROSTER_MAX_LINES);
+        lines.push(format!("- +{left_out} more: `kaibo://config`"));
+    }
+    let lines = lines.join("\n");
 
     format!(
         "## Casts\n\
-         A cast is the model team that answers; pass `cast=<name>`. Usable now \
-         (resolved at startup — reconnect after config/key changes; `kaibo://config` \
-         lists all configured, not just these):\n\
-         {lines}\n\n"
+         A cast is the model team that answers; pass `cast=<name>`. Usable now, as \
+         resolved at startup (reconnect after a config or key change). \
+         `kaibo://config` lists every configured cast:\n\
+         {lines}"
     )
 }
 
@@ -301,6 +323,13 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
 /// — before `## Scope`, the containment/trust posture, could render. The shell stays
 /// reachable through `run_kaish`'s own description, the `kaibo://kaish/*` resources,
 /// and `help` inside a script.
+///
+/// Dropping the reference did not settle the budget for good. The cast roster grew one
+/// line per usable cast and pushed `## Scope` past the cut again (26 casts, 2,596
+/// characters). Two changes hold it now: Scope renders before the roster, and the
+/// roster is capped at [`ROSTER_MAX_LINES`]. What stays unbounded is operator text
+/// inside fixed-count lines — cast names, model ids, and allowed-tree paths — so a
+/// config with very long ones can still overflow.
 pub fn kaibo_instructions_with_scope(
     config: &Config,
     allowed_set: &[PathBuf],
@@ -314,10 +343,9 @@ pub fn kaibo_instructions_with_scope(
         CastUsability::Unconfigured => format!("{}\n\n", setup_section(config)),
         CastUsability::Ready | CastUsability::LocalUnverified => String::new(),
     };
-    // Lead, then the live cast roster, then Scope directly — no kaish reference in
-    // between. A caller's first decision is "which team"; Scope is the containment
-    // posture every handshake must carry, so it now sits right after Casts instead
-    // of below the reference wall a truncating host would drop it behind.
+    // Lead, then Scope, then the live cast roster. Scope is the containment posture
+    // every handshake must carry and its size is fixed by kaibo; the roster's size is
+    // the operator's, so it goes last, where a truncating host cuts it and not Scope.
     let lead = kaibo_lead();
     let casts = casts_section(config, usable_casts);
 
@@ -350,9 +378,14 @@ pub fn kaibo_instructions_with_scope(
         ""
     };
 
+    // `casts` is empty in the Unconfigured case; it is the last section otherwise.
+    let casts = if casts.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{casts}")
+    };
     format!(
         "{setup}{lead}\n\n\
-         {casts}\
          ## Scope\n\
          Read-only, always: kaibo never writes your project, and runs only the \
          key-fetch command your config declares (`api_key_cmd`, stdin closed, never \
@@ -363,7 +396,7 @@ pub fn kaibo_instructions_with_scope(
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
          More without spending a turn: `kaibo://config`, `kaibo://tools`, \
-         `kaibo://kaish/*`."
+         `kaibo://kaish/*`.{casts}"
     )
 }
 
@@ -870,10 +903,12 @@ mod tests {
 
     /// The resident handshake dropped the huge kaish onboarding reference entirely —
     /// it blew Claude Code's 2048-char instructions budget and buried `## Scope`
-    /// below the truncation point. Order is now lead → casts → scope, and the old
-    /// reference marker ("The shell is kaish") must not appear at all.
+    /// below the truncation point. The roster then grew into the same failure, so the
+    /// order is now lead → scope → casts: the fixed-size containment posture sits above
+    /// the one section whose size the operator controls. The old reference marker
+    /// ("The shell is kaish") must not appear at all.
     #[test]
-    fn scope_follows_casts_and_the_kaish_reference_is_gone() {
+    fn scope_precedes_casts_and_the_kaish_reference_is_gone() {
         let config = Config::builtin();
         let usable = vec![("anthropic".to_string(), CastUsability::Ready)];
         let text = kaibo_instructions_with_scope(
@@ -895,8 +930,8 @@ mod tests {
              and the tool-search retrieval index:\n{text}"
         );
         assert!(
-            casts_at < scope_at,
-            "order must be lead → casts → scope (got casts={casts_at}, scope={scope_at}):\n{text}"
+            scope_at < casts_at,
+            "order must be lead → scope → casts (got scope={scope_at}, casts={casts_at}):\n{text}"
         );
         assert!(
             !text.contains("The shell is kaish"),
@@ -908,64 +943,118 @@ mod tests {
     /// Claude Code truncates a server's MCP `instructions` at exactly 2048
     /// characters — measured live against a running server; it's a per-server,
     /// hardcoded client-side cap, not an MCP-spec limit and not configurable. Past
-    /// that boundary the calling model never sees the rest, which is exactly how
-    /// `## Scope` — the containment/trust posture — used to go missing behind the
-    /// huge kaish onboarding reference. This drives a *representative* roster (10
-    /// casts: the 6 built-ins plus 4 more spanning default/local-unverified/batch)
-    /// through the full resident handshake and asserts it fits. Fails against
-    /// today's layout (the resident kaish reference blows the budget on its own).
+    /// that boundary the calling model never sees the rest.
+    ///
+    /// The roster is the one section whose size the operator controls: every usable
+    /// cast used to add a line. A 26-cast config (Amy's, 2026-09-23) rendered 2,596
+    /// characters, and `## Scope` sat past the cut. So this grows the roster one cast at
+    /// a time, well past the point it once overflowed, and requires the whole text to
+    /// fit and to carry Scope at every size. The model ids are long OpenRouter-style
+    /// slugs, so each line costs about what a real one does.
     #[test]
-    fn instructions_fit_claude_code_budget() {
-        let mut config = Config::builtin(); // anthropic, deepseek, gemini,
-                                            // openai-local, gemini-batch, anthropic-batch
-        for (name, backend, id) in [
-            ("chimera", "anthropic", "claude-haiku-4-5"),
-            ("glm", "openai-local", "GLM-4.5-Air-UD-Q4K-XL-GGUF"),
-            ("qwen", "openai-local", "Qwen3-Coder-Next-GGUF"),
-            ("zorak", "openai-local", "gemma4-26b"),
-        ] {
+    fn instructions_fit_claude_code_budget_at_any_roster_size() {
+        let mut config = Config::builtin();
+        config.default_cast = "deepseek".to_string();
+        let mut usable = vec![("deepseek".to_string(), CastUsability::Ready)];
+        for n in 0..40 {
+            let name = format!("team-{n:02}-review");
             config.casts.insert(
-                name.to_string(),
+                name.clone(),
                 Cast {
-                    name: name.to_string(),
+                    name: name.clone(),
                     slots: std::collections::BTreeMap::from([(
                         ModelRole::Synth,
-                        ModelSlot::bare(backend, id),
+                        ModelSlot::bare("openrouter", "~google/gemini-flash-latest"),
                     )]),
                 },
             );
+            let state = if n % 3 == 0 {
+                CastUsability::LocalUnverified
+            } else {
+                CastUsability::Ready
+            };
+            usable.push((name, state));
+            usable.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let text = kaibo_instructions_with_scope(
+                &config,
+                &[
+                    PathBuf::from("/home/amy/src/some-project"),
+                    PathBuf::from("/home/amy/src/wt"),
+                ],
+                Some(Path::new("/home/amy/src/some-project")),
+                true,
+                CastUsability::Ready,
+                &usable,
+            );
+            let len = text.chars().count();
+            assert!(
+                len <= 2048,
+                "with {} usable casts the handshake is {len} chars, over Claude Code's \
+                 2048-char instructions budget:\n{text}",
+                usable.len()
+            );
+            assert!(
+                text.contains("## Scope") && text.contains("Read-only, always"),
+                "with {} usable casts the handshake lost `## Scope`:\n{text}",
+                usable.len()
+            );
+            assert!(
+                text.contains("`deepseek` (default)"),
+                "the default cast must always make the roster:\n{text}"
+            );
         }
+    }
 
-        // A realistic usable-casts mix: the interactive built-ins, both batch
-        // lanes (tagged `batch` off the config's own `batch` flag), and a spread
-        // of local/unverified entries — 10 lines total, not the 6-cast minimum.
-        let usable = vec![
-            ("anthropic".to_string(), CastUsability::Ready),
-            ("deepseek".to_string(), CastUsability::Ready),
-            ("gemini".to_string(), CastUsability::Ready),
-            ("gemini-batch".to_string(), CastUsability::Ready),
-            ("anthropic-batch".to_string(), CastUsability::Ready),
-            ("chimera".to_string(), CastUsability::Ready),
-            ("glm".to_string(), CastUsability::LocalUnverified),
-            ("qwen".to_string(), CastUsability::LocalUnverified),
-            ("zorak".to_string(), CastUsability::LocalUnverified),
-            ("openai-local".to_string(), CastUsability::LocalUnverified),
-        ];
-
+    /// Past [`ROSTER_MAX_LINES`] the roster says how many it left out and where they
+    /// are, so a capped list never reads as the whole set. The default leads even when
+    /// its name sorts last.
+    #[test]
+    fn a_capped_roster_names_the_count_left_out_and_leads_with_the_default() {
+        let mut config = Config::builtin();
+        let mut usable = Vec::new();
+        for n in 0..12 {
+            let name = format!("zz-{n:02}");
+            config.casts.insert(
+                name.clone(),
+                Cast {
+                    name: name.clone(),
+                    slots: std::collections::BTreeMap::from([(
+                        ModelRole::Synth,
+                        ModelSlot::bare("deepseek", "deepseek-flash"),
+                    )]),
+                },
+            );
+            usable.push((name, CastUsability::Ready));
+        }
+        config.default_cast = "zz-11".to_string();
         let text = kaibo_instructions_with_scope(
             &config,
-            &[PathBuf::from("/home/amy/src/some-project")],
-            Some(Path::new("/home/amy/src/some-project")),
-            true,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
             CastUsability::Ready,
             &usable,
         );
-
-        let len = text.chars().count();
+        let roster: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("## Casts"))
+            .filter(|l| l.starts_with("- "))
+            .collect();
+        assert_eq!(
+            roster.len(),
+            ROSTER_MAX_LINES + 1,
+            "{ROSTER_MAX_LINES} cast lines plus the remainder line:\n{text}"
+        );
         assert!(
-            len < 2048,
-            "handshake must fit Claude Code's 2048-char instructions budget \
-             (measured live, per-server, hardcoded), got {len} chars:\n{text}"
+            roster[0].starts_with("- `zz-11` (default)"),
+            "the default leads the roster:\n{text}"
+        );
+        let left_out = 12 - ROSTER_MAX_LINES;
+        assert_eq!(
+            roster[ROSTER_MAX_LINES],
+            format!("- +{left_out} more: `kaibo://config`"),
+            "the last line counts the casts left out:\n{text}"
         );
     }
 
