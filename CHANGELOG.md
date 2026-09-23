@@ -38,6 +38,7 @@ record. Each later release appends a new section at the top.
 - Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
 - Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
 - The MCP instructions put `## Scope` first and cap the cast roster at 8 lines and the allowed trees at 4, so Claude Code's 2048-character cut no longer hides Scope.
+- The instructions' cast roster always lists the default cast, tagged `direct` or `no usable key` when that applies, and counts every cast it leaves out.
 - `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
 - A `oneshot` or direct `deliberate` answer lost to reasoning that filled `max_tokens` now says so and names the `effort` and `max_tokens` keys.
 - A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.

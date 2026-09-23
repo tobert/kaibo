@@ -234,14 +234,16 @@ const ROSTER_MAX_LINES: usize = 8;
 /// the default marked, a local/unverified one tagged, and a batch-only cast tagged
 /// `batch` (it's the `batch_submit` lane). This is the handshake answering "what can I
 /// pass as `cast`?" truthfully — it names config.toml casts the static per-tool `cast`
-/// enum can't, and lists only what will actually work (an unconfigured cast is filtered
-/// upstream). It closes by pointing at `kaibo://config` as canonical for the full
-/// configured state, since this list is deliberately partial (usable-only) and read
-/// once at startup. The synth model lives on the resolved `Config` already (it's what
+/// enum can't, and lists what will actually work (an unconfigured cast is filtered
+/// upstream; the default is the one exception, listed and tagged so the agent knows
+/// what an omitted `cast` means). It opens by pointing at `kaibo://config` as canonical
+/// for the full configured state, since this list is partial and read once at startup. The synth model lives on the resolved `Config` already (it's what
 /// `kaibo://config` prints) — this surfaces it where the calling agent first reads.
 ///
 /// The roster names at most [`ROSTER_MAX_LINES`] casts, the default first so it always
-/// makes the list, and then says how many it left out. It renders last in the
+/// makes the list (tagged `no usable key` when it is not in `usable`), and then says
+/// how many it left out. A `direct`-lane cast is tagged `direct`, as a batch one is
+/// tagged `batch`. It renders last in the
 /// handshake, after `## Scope`, so a roster longer than the budget expects cuts into
 /// its own tail and never into the containment posture.
 ///
@@ -251,31 +253,49 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
     if usable.is_empty() {
         return String::new();
     }
-    // The default leads; the rest keep the caller's (alphabetical) order.
-    let (default, rest): (Vec<_>, Vec<_>) =
-        usable.iter().partition(|(name, _)| config.is_default_cast(name));
-    let mut lines: Vec<String> = default
+    // The default leads, always, so the calling agent can see which cast a call without
+    // `cast` uses. A default missing from `usable` (no usable key) still gets its line,
+    // tagged as such: `None` below. The rest keep the caller's (alphabetical) order.
+    //
+    // Every usable cast is a roster entry, `direct`-lane ones included (tagged `direct`).
+    // They were once filtered out to hold the 2048-char budget; the line cap holds it
+    // now, and the filter hid a direct default and left direct casts out of the
+    // "+N more" count.
+    let default_name = config
+        .resolve_cast(&config.default_cast)
+        .ok()
+        .map(|c| c.name.clone());
+    let default_entry: Option<(&str, Option<&CastUsability>)> =
+        default_name.as_deref().map(|name| {
+            let state = usable.iter().find(|(n, _)| n == name).map(|(_, s)| s);
+            (name, state)
+        });
+    let rest = usable
+        .iter()
+        .filter(|(name, _)| Some(name.as_str()) != default_name.as_deref())
+        .map(|(name, state)| (name.as_str(), Some(state)));
+    let mut lines: Vec<String> = default_entry
         .into_iter()
         .chain(rest)
-        // A `direct`-lane cast is kept out of this *resident* roster to hold the 2048-char
-        // budget: `deliberate` now routes to it (its `cast` enum lists the deliberate-usable
-        // direct casts authoritatively, and `kaibo://config` renders every cast), so it's
-        // not unadvertised — just not in the always-billed handshake summary, which stays
-        // synth-voice-focused. The batch deliberate casts still appear here (tagged `batch`).
-        .filter(|(name, _)| config.cast_offline_lane(name) != Some(Lane::Direct))
         .map(|(name, state)| {
             let mut tags = Vec::new();
             if config.is_default_cast(name) {
                 tags.push("default".to_string());
             }
-            if matches!(state, CastUsability::LocalUnverified) {
-                tags.push("local, unverified".to_string());
+            match state {
+                None => tags.push("no usable key".to_string()),
+                Some(CastUsability::LocalUnverified) => {
+                    tags.push("local, unverified".to_string())
+                }
+                Some(_) => {}
             }
             // A batch cast runs synth alone on the `batch_submit` lane (no explorer),
             // so tag it: the agent learns which tool the cast belongs to, not just its
             // name. `cast_is_batch` is the same predicate the per-lane enum split uses.
-            if config.cast_is_batch(name) {
-                tags.push("batch".to_string());
+            match config.cast_offline_lane(name) {
+                Some(Lane::Batch) => tags.push("batch".to_string()),
+                Some(Lane::Direct) => tags.push("direct".to_string()),
+                _ => {}
             }
             // Name the answering (synth) model — the team's voice, the thing an agent
             // told "ask Gemini Pro" indexes on. The data is already resolved on the
@@ -860,13 +880,12 @@ mod tests {
         );
     }
 
-    /// A `direct`-lane cast is forward-declared (validated, rendered on
-    /// `kaibo://config`) but no tool routes to it yet, so the handshake roster must not
-    /// advertise it — an agent reading `## Casts` should never see a cast every tool
-    /// refuses. Mirrors the `direct`-lane exclusion from both `inject_cast_enum`
-    /// partitions in `server.rs`.
+    /// A `direct`-lane cast is listed and tagged `direct`. The roster used to leave it
+    /// out, first because no tool routed to it and later to hold the 2048-char budget;
+    /// `deliberate` routes to it now and the line cap holds the budget, and leaving it
+    /// out hid a direct default and dropped direct casts from the "+N more" count.
     #[test]
-    fn casts_section_excludes_a_direct_lane_cast() {
+    fn casts_section_tags_a_direct_lane_cast() {
         let config = Config::from_toml_str(
             r#"
             [casts.mydirect]
@@ -891,9 +910,8 @@ mod tests {
             "the interactive cast must still render:\n{text}"
         );
         assert!(
-            !text.contains("mydirect"),
-            "a direct-lane cast must not appear in the roster (no tool routes to it \
-             yet):\n{text}"
+            text.contains("- `mydirect` (local, unverified, direct) → openai-local/big-local-model"),
+            "a direct-lane cast is listed with its lane:\n{text}"
         );
     }
 
@@ -926,15 +944,15 @@ mod tests {
         );
     }
 
-    /// An explorer-only cast (no synth slot) renders its name with no `→ model` — the
-    /// handshake doesn't invent an answerer it can't name (the synth gap surfaces at
-    /// call time). Exercises the `None` arm DeepSeek flagged as uncovered.
+    /// A roster name that does not resolve in the config renders bare, with no
+    /// `→ model`: the handshake does not invent a model it cannot name. The live roster
+    /// comes from the config, so this is a defensive path rather than one a real config
+    /// takes; a cast with no synth slot has its own test,
+    /// `casts_section_tags_a_synthless_cast_with_the_tool_it_serves`.
     #[test]
-    fn casts_section_renders_a_synthless_cast_as_name_only() {
+    fn casts_section_renders_an_unresolvable_name_bare() {
         let config = Config::builtin();
-        // A name absent from the registry resolves to no synth slot — the same render
-        // path a real explorer-only cast takes, without fabricating one in the config.
-        let usable = vec![("explorer-only".to_string(), CastUsability::Ready)];
+        let usable = vec![("not-in-config".to_string(), CastUsability::Ready)];
         let text = kaibo_instructions_with_scope(
             &config,
             &[PathBuf::from("/tmp")],
@@ -945,11 +963,108 @@ mod tests {
         );
         let line = text
             .lines()
-            .find(|l| l.contains("explorer-only"))
-            .expect("explorer-only has a roster line");
+            .find(|l| l.contains("not-in-config"))
+            .expect("the name has a roster line");
+        assert_eq!(line, "- `not-in-config`", "an unresolvable name renders bare");
+    }
+
+    /// The default cast always makes the roster, tagged for what it is. A default on
+    /// the `direct` lane was filtered out with every other direct cast, and a default
+    /// with no usable key never reached the usable list, so in both cases the calling
+    /// agent could not see which cast a call without `cast` would use.
+    #[test]
+    fn the_default_cast_is_always_on_the_roster_and_tagged_honestly() {
+        // A direct-lane default.
+        let mut config = Config::builtin();
+        let mut synth = ModelSlot::bare("openai-local", "big-local");
+        synth.lane = Some(Lane::Direct);
+        config.casts.insert(
+            "local-direct".to_string(),
+            Cast {
+                name: "local-direct".to_string(),
+                slots: std::collections::BTreeMap::from([
+                    (ModelRole::Explorer, ModelSlot::bare("openai-local", "small")),
+                    (ModelRole::Synth, synth),
+                ]),
+            },
+        );
+        config.default_cast = "local-direct".to_string();
+        let usable = vec![
+            ("deepseek".to_string(), CastUsability::Ready),
+            ("local-direct".to_string(), CastUsability::LocalUnverified),
+        ];
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::LocalUnverified,
+            &usable,
+        );
         assert!(
-            !line.contains('→'),
-            "a cast with no synth slot must not render an arrow/model:\n{line}"
+            text.contains("- `local-direct` (default, local, unverified, direct) → openai-local/big-local"),
+            "a direct-lane default is listed with its lane:\n{text}"
+        );
+
+        // A default with no usable key, while another cast is usable.
+        let mut config = Config::builtin();
+        config.default_cast = "anthropic".to_string();
+        let usable = vec![("deepseek".to_string(), CastUsability::Ready)];
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::Unconfigured,
+            &usable,
+        );
+        let roster: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("## Casts"))
+            .filter(|l| l.starts_with("- "))
+            .collect();
+        assert_eq!(
+            roster.first().copied(),
+            Some("- `anthropic` (default, no usable key) → anthropic/claude-sonnet-4-6"),
+            "an unusable default leads the roster, tagged unusable:\n{text}"
+        );
+    }
+
+    /// "+N more" counts every cast the roster left out. It used to count only the casts
+    /// that survived the direct-lane filter, so direct casts vanished from the count too.
+    #[test]
+    fn the_roster_remainder_counts_every_cast_left_out() {
+        let mut config = Config::builtin();
+        let mut usable = Vec::new();
+        for n in 0..12 {
+            let name = format!("c-{n:02}");
+            let mut synth = ModelSlot::bare("openai-local", "m");
+            if n % 4 == 0 {
+                synth.lane = Some(Lane::Direct);
+            }
+            config.casts.insert(
+                name.clone(),
+                Cast {
+                    name: name.clone(),
+                    slots: std::collections::BTreeMap::from([(ModelRole::Synth, synth)]),
+                },
+            );
+            usable.push((name, CastUsability::LocalUnverified));
+        }
+        config.default_cast = "c-01".to_string();
+        let text = kaibo_instructions_with_scope(
+            &config,
+            &[PathBuf::from("/tmp")],
+            None,
+            false,
+            CastUsability::LocalUnverified,
+            &usable,
+        );
+        let expected = format!("- +{} more: `kaibo://config`", 12 - ROSTER_MAX_LINES);
+        assert!(
+            text.lines().any(|l| l == expected),
+            "the remainder must count all {} casts left out:\n{text}",
+            12 - ROSTER_MAX_LINES
         );
     }
 

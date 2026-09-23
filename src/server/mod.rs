@@ -913,8 +913,8 @@ type CastEnumRule = (
 /// would reject) and `every_cast_taking_tool_has_an_enum_rule` (no cast-taking tool ships
 /// without a rule, i.e. a silently-empty enum). `casts_section` (the handshake roster) is a
 /// *consumer* of the same `Config` predicates, not bound to this table: it renders a
-/// budget-limited display subset (it hides `Direct` casts and caps the line count) — a
-/// presentation choice distinct from tool eligibility.
+/// budget-limited display (it caps the line count and always lists the default, usable or
+/// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["consult", "consult_submit", "oneshot"],
