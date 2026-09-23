@@ -5856,6 +5856,77 @@ mod tests {
         }
     }
 
+    /// `otel.status_code` only matters if tracing-opentelemetry turns it into the span's
+    /// status. This drives a failed single shot through the real bridge
+    /// (`tracing_opentelemetry::layer()`) into the SDK, through kaibo's export filter
+    /// (content redacted, the default), and reads what the exporter received: the
+    /// `run_phase` span has `Status::Error`, carries `error.type`, and does not carry
+    /// `otel.status_code` as an attribute. A successful call's span stays `Unset`, so a
+    /// bridge that marked every span would fail the second half.
+    #[test]
+    fn a_failed_single_shot_exports_error_status_through_the_otel_bridge() {
+        use crate::otel_filter::{AttributePolicy, Filtered};
+        use crate::test_support::serialized_capture;
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+        const MODEL: &str = "reasoner";
+
+        let export = |answer: bool| {
+            let sink = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(Filtered::new(
+                    sink.clone(),
+                    AttributePolicy::new(false, &[]),
+                ))
+                .build();
+            let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("test"));
+            serialized_capture(async move {
+                let subscriber = tracing_subscriber::registry().with(layer);
+                let _guard = tracing::subscriber::set_default(subscriber);
+                let client = ScriptedClient::builder()
+                    .on_model(MODEL, move |_req| {
+                        Ok(if answer {
+                            text_response("ANSWER")
+                        } else {
+                            reasoning_response("thinking...")
+                        })
+                    })
+                    .build();
+                let _ = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default()).await;
+            });
+            provider.force_flush().expect("flush");
+            sink.get_finished_spans()
+                .expect("finished spans")
+                .into_iter()
+                .find(|s| s.name == "run_phase")
+                .expect("the single shot exported a run_phase span")
+        };
+
+        let failed = export(false);
+        assert!(
+            matches!(failed.status, Status::Error { .. }),
+            "a failed single shot must export Status::Error, got {:?}",
+            failed.status
+        );
+        let attr = |key: &str| {
+            failed
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        assert_eq!(attr("error.type").as_deref(), Some("empty_answer"));
+        assert_eq!(
+            attr("otel.status_code"),
+            None,
+            "consumed as status, not exported"
+        );
+
+        let ok = export(true);
+        assert_eq!(ok.status, Status::Unset, "a successful call stays Unset");
+    }
+
     /// The output-limit diagnosis must name the slot that ran. An explorer phase shares
     /// this error (`run_explore_phase`, deliberate's dossier survey), and advice to edit
     /// the `synth` slot sent the operator to the wrong place.
