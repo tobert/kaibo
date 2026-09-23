@@ -2451,15 +2451,18 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
             ..ModelSlot::bare(&name, id)
         };
         let or = matches!(kind, ProviderKind::OpenRouter);
-        // Synth headroom pins, from measurement (2026-08-02, whole-file attach +
-        // exhaustive-review ask at the 16384 default): reasoning bills into the same
-        // completion budget as the answer, and deepseek-v4-pro spent HALF of a 10.6K
-        // completion on reasoning — so the deepseek and anthropic synths (both
-        // thinking-on by default, ceilings far above this) get 2× the [defaults]
-        // floor. The other built-ins are unmeasured and stay on the floor; the pin
-        // table lives with `builtin_synth_max_tokens_pins_are_deliberate`.
+        // Synth headroom pins. Reasoning bills into the same completion budget as the
+        // answer. Anthropic: measured 2026-08-02 (whole-file attach + exhaustive-review
+        // ask at the 16384 default), half of a 10.6K completion went to reasoning, so
+        // 2× the [defaults] floor. DeepSeek: the synth reasons at `max` (below), and
+        // DeepSeek's API reference makes 128K the default `max_tokens` at that effort
+        // (ceiling 393216, probed 2026-09-23); at 32768, dense reviews ended with
+        // `finish_reason = length` and no answer. The other built-ins are unmeasured
+        // and stay on the floor; the pin table lives with
+        // `builtin_synth_max_tokens_pins_are_deliberate`.
         let synth_max_tokens = match kind {
-            ProviderKind::Anthropic | ProviderKind::DeepSeek => Some(32_768),
+            ProviderKind::Anthropic => Some(32_768),
+            ProviderKind::DeepSeek => Some(131_072),
             _ => None,
         };
         // DeepSeek serves three reasoning rungs (`low`, `high`, `max`) and maps every
@@ -4157,14 +4160,18 @@ mod tests {
     /// test, not just the cast table. Measured 2026-08-02 at the 16384 default
     /// (whole-file attach, exhaustive-review ask): deepseek-v4-pro used 10.6K of
     /// 16.4K with half spent on reasoning, which bills into the same completion
-    /// budget as the answer — so the deepseek and anthropic synths get 2× headroom.
-    /// The unmeasured casts stay on the `[defaults]` floor (16384) rather than
-    /// guessing a ceiling.
+    /// budget as the answer — so the anthropic synth gets 2× headroom. The deepseek
+    /// synth reasons at `max`, and DeepSeek's API reference gives 128K as the default
+    /// `max_tokens` at that effort (64K for other thinking efforts; ceiling 393216,
+    /// confirmed by a live probe 2026-09-23). At the old 32768 pin, dense reviews
+    /// stopped with `finish_reason = length` and no answer, so the pin is DeepSeek's
+    /// own `max` default. The unmeasured casts stay on the `[defaults]` floor (16384)
+    /// rather than guessing a ceiling.
     #[test]
     fn builtin_synth_max_tokens_pins_are_deliberate() {
         let cfg = Config::builtin();
         for (name, expected) in [
-            ("deepseek", Some(32_768)),
+            ("deepseek", Some(131_072)),
             ("anthropic", Some(32_768)),
             ("gemini", None),
             ("openrouter", None),

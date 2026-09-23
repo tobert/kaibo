@@ -458,7 +458,7 @@ Use the live model catalog when changing model IDs or capabilities.
 **Merging.** The TOML merges over this registry by name. Set one field on a built-in to
 retarget it, or add new backends and casts. A cast merges role by role: declaring a slot
 replaces the built-in slot whole, pins included, so retuning the `deepseek` synth means
-restating `effort = "max"` and `max_tokens = 32768` if you want them. A slot's `lane` is
+restating `effort = "max"` and `max_tokens = 131072` if you want them. A slot's `lane` is
 the one exception — it is sticky across a bare re-declaration of its model, so retuning
 `gemini-batch`'s id leaves it on the batch lane.
 
