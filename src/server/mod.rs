@@ -917,7 +917,14 @@ type CastEnumRule = (
 /// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
-        &["consult", "consult_submit", "oneshot"],
+        &["consult", "consult_submit"],
+        Config::cast_can_consult,
+        "a cast with an `explorer` slot and a `synth` slot that answers interactively (a \
+         synth with no offline `lane`)",
+    ),
+    // `oneshot` runs the synth alone, so a synth-only cast staffs it.
+    (
+        &["oneshot"],
         Config::cast_is_interactive,
         "a cast with a `synth` slot that answers interactively (a synth with no offline \
          `lane`)",
@@ -1610,6 +1617,11 @@ impl KaiboHandler {
         self.resolver.require_interactive_cast(cast, tool)
     }
 
+    /// Shim over [`Resolver::require_consult_cast`].
+    fn require_consult_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        self.resolver.require_consult_cast(cast, tool)
+    }
+
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
     /// shared resolver so the CLI `batch submit` front door runs the same gate.
     fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
@@ -1804,7 +1816,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
-        self.require_interactive_cast(&cast, "consult")?;
+        self.require_consult_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1948,7 +1960,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
-        self.require_interactive_cast(&cast, "consult_submit")?;
+        self.require_consult_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -7767,9 +7779,8 @@ enabled = false
         // Each cast-taking tool's call-time acceptance, in one place beside the enum rules.
         let gate_accepts = |tool: &str, cast: &Cast| -> bool {
             match tool {
-                "consult" | "consult_submit" | "oneshot" => {
-                    h.require_interactive_cast(cast, tool).is_ok()
-                }
+                "consult" | "consult_submit" => h.require_consult_cast(cast, tool).is_ok(),
+                "oneshot" => h.require_interactive_cast(cast, tool).is_ok(),
                 // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
                 // is accepted (a missing explorer faults later at the arm resolve, not the gate).
                 "explore" => true,
@@ -7805,6 +7816,69 @@ enabled = false
             }
         }
         assert!(checked > 0, "the guard checked nothing");
+    }
+
+    /// `consult` and `consult_submit` resolve an explorer arm as well as a synth arm, so a
+    /// synth-only cast cannot staff them; `oneshot` needs only the synth. The enum rule
+    /// for the three tools was shared, so a synth-only cast was offered on `consult` and
+    /// failed at the explorer resolve with a bare "has no explorer slot". Now `consult`
+    /// and `consult_submit` offer only casts with both slots, and naming a synth-only
+    /// cast is refused with the tool it does serve.
+    #[test]
+    fn a_synth_only_cast_is_offered_to_oneshot_but_not_consult() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.inter]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+
+            [casts.solo]                                       # synth only
+            synth    = "gem/flash"
+            "#,
+        );
+        let enum_of = |tool: &str| -> Vec<String> {
+            h.tool_router
+                .get(tool)
+                .expect("tool advertised")
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("cast"))
+                .and_then(|c| c.get("enum"))
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for tool in ["consult", "consult_submit"] {
+            let offered = enum_of(tool);
+            assert!(offered.iter().any(|c| c == "inter"), "{tool}: {offered:?}");
+            assert!(
+                !offered.iter().any(|c| c == "solo"),
+                "`{tool}` must not offer the synth-only cast, got {offered:?}"
+            );
+        }
+        let offered = enum_of("oneshot");
+        assert!(
+            offered.iter().any(|c| c == "solo") && offered.iter().any(|c| c == "inter"),
+            "`oneshot` needs only a synth, got {offered:?}"
+        );
+
+        let solo = h.config.resolve_cast("solo").unwrap();
+        assert!(h.require_interactive_cast(solo, "oneshot").is_ok());
+        let err = h
+            .require_consult_cast(solo, "consult")
+            .expect_err("a synth-only cast must be refused by `consult`");
+        let msg = err.message.to_string();
+        for needle in ["`solo`", "no `explorer` slot", "`consult`", "`oneshot`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
     }
 
     /// A cast with no synth slot has no model to answer a text tool: `consult`,
@@ -8001,7 +8075,10 @@ enabled = false
     }
 
     /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
-    /// tool cannot run.
+    /// tool cannot run. Neither can `consult`, which resolves an explorer arm before its
+    /// synth runs (this test once asserted it survived, on the belief that the driver
+    /// carried its own explorer; `Resolver::arm` has no such fallback, and every such
+    /// call failed at the explorer resolve). `oneshot` runs the synth alone and stays.
     #[test]
     fn explore_is_not_advertised_without_an_explorer_slot() {
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
@@ -8022,10 +8099,17 @@ enabled = false
             !tools.iter().any(|t| t == "explore"),
             "explore must be dropped when no cast carries an explorer slot. Advertised: {tools:?}"
         );
+        for dropped in ["consult", "consult_submit"] {
+            assert!(
+                !tools.iter().any(|t| t == dropped),
+                "{dropped} needs an explorer slot too, so it must be dropped. Advertised: \
+                 {tools:?}"
+            );
+        }
         assert!(
-            tools.iter().any(|t| t == "consult"),
-            "consult must SURVIVE here — its interactive synth can staff it, and the driver \
-             carries its own explorer. Advertised: {tools:?}"
+            tools.iter().any(|t| t == "oneshot"),
+            "oneshot needs only the interactive synth, so it must survive. Advertised: \
+             {tools:?}"
         );
     }
 

@@ -964,7 +964,7 @@ async fn resolve_and_run(
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
     resolver
-        .require_interactive_cast(&cast, "consult")
+        .require_consult_cast(&cast, "consult")
         .map_err(SetupError::usage)?;
     resolver
         .apply_model_override(

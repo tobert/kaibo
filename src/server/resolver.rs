@@ -395,6 +395,29 @@ impl Resolver {
         }
     }
 
+    /// Refuse `consult`/`consult_submit` on a cast that cannot staff both of its phases:
+    /// the interactive-synth checks of [`require_interactive_cast`](Self::require_interactive_cast),
+    /// then an explorer slot, which `consult` resolves before it runs. Without this a
+    /// synth-only cast failed at the explorer resolve with a bare "has no explorer slot".
+    pub(crate) fn require_consult_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
+        self.require_interactive_cast(cast, tool)?;
+        if cast.slot(ModelRole::Explorer).is_none() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "cast `{name}` has no `explorer` slot, so `{tool}` has no model to \
+                     survey the code before the synth answers. Use `{name}` with \
+                     `oneshot`, which runs the synth alone on the context you pass. For \
+                     `{tool}`, pick a cast with both an `explorer` and a `synth` slot; \
+                     `kaibo://config` (on the command line, `kaibo config`) lists every \
+                     cast with its slots.",
+                    name = cast.name,
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse `batch_submit` (`kaibo batch submit`) on a cast whose synth isn't on the
     /// `batch` lane specifically — the other half of the lane split. A batch cast must
     /// positively declare `lane = "batch"` on its synth slot, so an ordinary interactive

@@ -1397,6 +1397,19 @@ impl Config {
             .is_some_and(|c| c.slot(ModelRole::Synth).is_some() && c.synth_lane().is_none())
     }
 
+    /// Whether canonical cast `name` can staff `consult`/`consult_submit`: an interactive
+    /// synth ([`cast_is_interactive`](Self::cast_is_interactive)) **and** an explorer
+    /// slot, because `consult` resolves both arms before it runs. `oneshot` runs the
+    /// synth alone, so it keeps the looser predicate. The mirror of
+    /// `require_consult_cast`'s acceptance.
+    pub fn cast_can_consult(&self, name: &str) -> bool {
+        self.cast_is_interactive(name)
+            && self
+                .casts
+                .get(name)
+                .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())
+    }
+
     /// Whether `name` is declared for the batch lane specifically. Used to partition
     /// the live roster onto the right tools' `cast` enums — batch casts to
     /// `batch_submit`, the rest to the interactive tools.
