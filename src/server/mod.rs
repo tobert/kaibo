@@ -999,6 +999,39 @@ pub(crate) fn eligible_casts_by_tool(
         .collect()
 }
 
+/// The startup warning for a default cast that cannot staff `consult`, or `None` when
+/// it can. Names the default, why it cannot (the first missing piece, in the order the
+/// gate checks them), what that does to calls, and the config key that fixes it, with
+/// a cast that would work when one exists.
+fn default_cast_consult_warning(
+    config: &Config,
+    eligible: &std::collections::HashMap<&'static str, Vec<String>>,
+) -> Option<String> {
+    let cast = config.resolve_cast(&config.default_cast).ok()?;
+    if config.cast_can_consult(&cast.name) {
+        return None;
+    }
+    let why = if cast.slot(ModelRole::Synth).is_none() {
+        "it has no `synth` slot".to_string()
+    } else if let Some(lane) = cast.synth_lane() {
+        format!("its synth runs on the offline `{}` lane", lane.as_str())
+    } else {
+        "it has no `explorer` slot".to_string()
+    };
+    let example = eligible
+        .get("consult")
+        .and_then(|casts| casts.first())
+        .map(|c| format!(", such as `{c}`"))
+        .unwrap_or_default();
+    Some(format!(
+        "default cast `{name}` cannot staff `consult`: {why}. Every `consult` or \
+         `consult_submit` call that omits `cast` will be refused. Set `[server] cast` in \
+         config.toml to a cast with an `explorer` slot and an interactive `synth` \
+         slot{example} (`kaibo example-config` shows the shape).",
+        name = cast.name,
+    ))
+}
+
 /// The plain-language cast shape tool `name` needs, from its `CAST_ENUM_RULES` entry.
 /// `None` for a tool that takes no cast. The operator-facing half of the staffing gate:
 /// both the startup warning and `kaibo://config` explain a missing tool with this text.
@@ -1270,6 +1303,17 @@ impl KaiboHandler {
         // each. `live_tools` is the single source — `kaibo://config` reports the same
         // decision, so the resource can never describe a surface this router doesn't serve.
         let live = live_tools(&config, &usable);
+
+        // `[server] cast` is validated to resolve, not to staff anything, so a default
+        // that cannot run `consult` (image-only, synth-only, or an offline synth) starts
+        // clean and then refuses every call that omits `cast`. A warning rather than a
+        // load error: a media-only or batch-only setup can legitimately name such a
+        // default, and in that setup `consult` is not live, so this stays quiet.
+        if live.contains(&"consult") {
+            if let Some(warning) = default_cast_consult_warning(&config, &eligible) {
+                tracing::warn!("{warning}");
+            }
+        }
         // `remove_route` silently no-ops on an unknown name, so a renamed #[tool] method
         // would leave its gate quietly inert. Assert the route exists before dropping it —
         // a stale name is a build-time bug we want loud.
@@ -8072,6 +8116,60 @@ enabled = false
              Advertised: {:?}",
             h.advertised_tools()
         );
+    }
+
+    /// The default cast is what every call without `cast` uses, so a default that cannot
+    /// staff `consult` makes the front door refuse every such call. That config started
+    /// clean: `[server] cast` is validated to resolve, never to staff anything. Startup
+    /// now warns, naming the default, the reason, and the key to change. A config whose
+    /// default does staff `consult` gets no such warning.
+    #[test]
+    fn a_default_cast_that_cannot_staff_consult_warns_at_startup() {
+        use crate::test_support::capture_tracing;
+        let toml = |default: &str| {
+            with_no_builtin_casts(&format!(
+                r#"
+                [backends.gem]
+                kind = "gemini"
+                key_optional = true
+
+                [casts.inter]
+                explorer = "gem/lite"
+                synth    = "gem/flash"
+
+                [backends.sd]
+                kind = "stability"
+                key_optional = true
+
+                [casts.artist]
+                image = "sd/core"
+
+                [server]
+                cast = "{default}"
+                "#
+            ))
+        };
+        let warned = |default: &str| {
+            let t = toml(default);
+            let captured = capture_tracing(async move {
+                let h = hermetic_handler_from_toml(&t);
+                assert!(
+                    h.advertised_tools().iter().any(|t| t == "consult"),
+                    "guard: `inter` staffs consult, so the tool is live"
+                );
+            });
+            captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .map(|e| e.message)
+                .find(|m| m.contains("default cast"))
+        };
+        let msg = warned("artist").expect("an image-only default must warn at startup");
+        for needle in ["`artist`", "`consult`", "`[server] cast`", "no `synth` slot"] {
+            assert!(msg.contains(needle), "the warning must name {needle}: {msg}");
+        }
+        assert_eq!(warned("inter"), None, "a default that staffs consult must not warn");
     }
 
     /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
