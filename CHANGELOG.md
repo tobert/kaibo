@@ -30,6 +30,7 @@ record. Each later release appends a new section at the top.
 - The built-in `deepseek` cast's synth reasons at `max`, DeepSeek's deepest rung; the explorer stays at `high`.
 - turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
 - rmcp 3.4: `initialize` asking for MCP `2026-07-28` now gets `2025-11-25`; a `2026-07-28` client enters with `server/discover`.
+- The `oneshot` preamble says thinking comes before the reply and shares its output budget.
 
 ### Fixed
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
@@ -38,6 +39,8 @@ record. Each later release appends a new section at the top.
 - Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
 - The MCP instructions put `## Scope` before the cast roster and cap the roster at 8 lines, so Claude Code's 2048-character cut no longer hides Scope.
 - `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
+- A `oneshot` or direct `deliberate` answer lost to reasoning that filled `max_tokens` now says so and names the `effort` and `max_tokens` keys.
+- A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
 
 ## [0.5.0] — 2026-09-10
 

@@ -2621,15 +2621,26 @@ impl KaiboHandler {
             call_deadline: self.config.defaults.call_deadline,
         };
 
-        let span = tracing::info_span!("oneshot", cast = %cast.name, model = %arm.model);
+        let span = tracing::info_span!(
+            "oneshot",
+            cast = %cast.name,
+            model = %arm.model,
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
         progress.emit(PhaseEvent::PhaseStarted { phase: "oneshot" });
         let (answer, usage) = match oneshot(&input.prompt, &attachments, &arm, &cfg)
-            .instrument(span)
+            .instrument(span.clone())
             .await
         {
             Ok(out) => out,
-            // A provider failure is a clean tool-result error, same as `consult`.
-            Err(e) => return Ok(consultation_failed("oneshot", &cast.name, e)),
+            // A provider failure is a clean tool-result error, same as `consult`. The
+            // tool span closes as an error too, so a trace does not read it as a success.
+            Err(e) => {
+                span.record("otel.status_code", "ERROR");
+                span.record("error.type", "phase_failed");
+                return Ok(consultation_failed("oneshot", &cast.name, e));
+            }
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "oneshot" });
 

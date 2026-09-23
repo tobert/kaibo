@@ -738,28 +738,66 @@ fn transcript_has_tool_results(history: &[Message]) -> bool {
 /// absence rather than implied to be a clean stop: on some wires (OpenAI's Responses
 /// API) reporting nothing *is* the normal completion signal, so absence carries no
 /// verdict either way.
+///
+/// When that reason is the output limit ([`is_output_limit`]), the message says so in
+/// plain terms: the model spent `max_tokens` on reasoning and wrote nothing. That is
+/// the common shape on a reasoning model at a deep effort (a DeepSeek synth at `max`
+/// filled 16384 and 32768 budgets with reasoning on 10 of 39 `oneshot` calls), and
+/// the generic "retry" advice does not reach its cause. The two config keys that do
+/// are named, because a caller cannot change either one per call.
 fn empty_answer_error(
     model: &str,
     turns: usize,
     max_turns: usize,
     usage: &Usage,
     finish_reason: Option<&str>,
+    max_tokens: u64,
     detail: &str,
 ) -> anyhow::Error {
     let reason = match finish_reason {
         Some(r) => format!("finish_reason \"{r}\" reported by the provider"),
         None => "no finish_reason reported by the provider (normal on some wires)".to_string(),
     };
+    let (budget, advice) = match finish_reason {
+        Some(r) if is_output_limit(r) => (
+            format!(
+                " The provider stopped the model at its output limit (finish_reason \"{r}\", \
+                 max_tokens {max_tokens}) with {} of {} output tokens spent on reasoning, so \
+                 the model used its output budget reasoning and never wrote the answer.",
+                usage.reasoning_tokens, usage.output_tokens,
+            ),
+            "Retry the call, since how long a model reasons varies from call to call; send \
+             a smaller question; or use another cast. To change the outcome for this cast, \
+             lower `effort` or raise `max_tokens` on its `synth` slot in config.toml \
+             (`kaibo example-config` shows the shape)."
+                .to_string(),
+        ),
+        _ => (
+            String::new(),
+            "Retry, or try the same question on a different cast.".to_string(),
+        ),
+    };
     anyhow!(
-        "model {model} returned an EMPTY answer — {detail}. It is not a result: a \
+        "model {model} returned an EMPTY answer — {detail}.{budget} It is not a result: a \
          completed-but-empty answer is no answer, and returning it would hand you a \
          review that never happened. Diagnostics: {turns} of {max_turns} turns used, \
          {} input tokens ({} cached), {} output tokens, {} reasoning tokens reported; \
-         {reason}. Retry, or try the same question on a different cast.",
+         {reason}. {advice}",
         usage.input_tokens,
         usage.cached_input_tokens,
         usage.output_tokens,
         usage.reasoning_tokens,
+    )
+}
+
+/// Whether a provider's finish reason means "stopped at the output token limit", in
+/// each spelling [`crate::completion_watch::finish_reason`] returns: `length` (OpenAI
+/// chat completions, DeepSeek, OpenRouter), `max_tokens` (Anthropic), `MAX_TOKENS`
+/// (Gemini), and `max_output_tokens` (OpenAI Responses).
+fn is_output_limit(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "length" | "max_tokens" | "max_output_tokens"
     )
 }
 
@@ -1427,6 +1465,7 @@ where
                         max_turns,
                         &spent,
                         log.last_finish_reason().as_deref(),
+                        max_tokens,
                         "it stopped without answering, and its transcript holds no tool \
                          results to write up — asking it to answer anyway would invite an \
                          ungrounded review",
@@ -1486,6 +1525,7 @@ where
                         max_turns,
                         &usage,
                         log.last_finish_reason().as_deref(),
+                        max_tokens,
                         "it was asked once to write the answer it owed and came back empty \
                          again",
                     ));
@@ -1621,6 +1661,7 @@ where
             max_turns,
             &usage,
             log.last_finish_reason().as_deref(),
+            max_tokens,
             "it used every turn and then wrote nothing when forced to conclude",
         ));
     }
@@ -1658,6 +1699,9 @@ where
         max_turns = 1,
         gen_ai.request.thinking = tracing::field::Empty,
         gen_ai.response.finish_reason = tracing::field::Empty,
+        // Filled only on failure; see the end of the body.
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
     )
 )]
 pub(crate) async fn run_completion<M>(
@@ -1714,7 +1758,7 @@ where
         // "model call failed" keeps this on the provider side of `classify_failure`
         // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
         // overload or rate limit here is still worth a caller retry.
-        let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
+        let response = response.map_err(|e| (anyhow!("model call failed: {e}"), "phase_failed"))?;
         let answer = response
             .choice
             .iter()
@@ -1729,19 +1773,35 @@ where
         // Fail with the same diagnostics vocabulary as the loop, finish reason included
         // (this path reads it off its own log).
         if answer.trim().is_empty() {
-            return Err(empty_answer_error(
-                model_name,
-                1,
-                1,
-                &response.usage,
-                log.last_finish_reason().as_deref(),
-                "the single toolless completion returned no answer text, and a lane with \
-             no tools has no gathered evidence to write up, so kaibo does not re-ask",
+            return Err((
+                empty_answer_error(
+                    model_name,
+                    1,
+                    1,
+                    &response.usage,
+                    log.last_finish_reason().as_deref(),
+                    max_tokens,
+                    "the single toolless completion returned no answer text, and a lane \
+                     with no tools has no gathered evidence to write up, so kaibo does not \
+                     re-ask",
+                ),
+                "empty_answer",
             ));
         }
         Ok((answer, response.usage))
     }
     .await;
+    // A failed call closes its span as an error. `otel.status_code` is the field
+    // tracing-opentelemetry turns into the span status (it is not exported as an
+    // attribute), and `error.type` names the class for a query to group on. Without
+    // this every single-shot span closed Unset, so an empty `oneshot` read as a
+    // success in traces even though the caller got an error.
+    let outcome = outcome.map_err(|(error, class)| {
+        let span = tracing::Span::current();
+        span.record("otel.status_code", "ERROR");
+        span.record("error.type", class);
+        error
+    });
     // One inference call by definition — or more, when `retried` resent a generation
     // the provider malformed — so the count comes off the log's attempts rather than a
     // literal, and a lane whose single call failed still reports the call it made. No
@@ -5696,6 +5756,111 @@ mod tests {
         assert!(
             !client.requests_for(MODEL).iter().any(is_finalize_request),
             "a toolless lane can never satisfy the evidence gate, so it must never re-ask"
+        );
+    }
+
+    /// A reasoning model that fills its whole output budget with reasoning writes no
+    /// answer: the provider stops it with `finish_reason` `length` and every output
+    /// token counted as reasoning. Telemetry caught this on `oneshot` against the
+    /// built-in `deepseek` cast (10 of 39 calls, at the 16384 and 32768 caps). The
+    /// empty-answer guard already fails such a call, but its message read as a generic
+    /// empty answer and pointed only at "retry". This pins the specific diagnosis and
+    /// the actions that address it: the budget, the reasoning count, and the two
+    /// config keys that change the outcome.
+    #[tokio::test]
+    async fn a_single_shot_that_spends_its_budget_on_reasoning_says_so() {
+        const MODEL: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| {
+                let resp = with_usage(
+                    reasoning_response("Weighing each row..."),
+                    Usage {
+                        reasoning_tokens: 16384,
+                        ..usage(2_000, 16384)
+                    },
+                );
+                Ok(with_raw(
+                    resp,
+                    json!({"choices": [{"index": 0, "finish_reason": "length"}]}),
+                ))
+            })
+            .build();
+
+        let err = oneshot(
+            "label these rows",
+            &[],
+            &arm(&client, MODEL),
+            &PhaseContext::default(),
+        )
+        .await
+        .expect_err("an answer-less single shot must fail");
+        let msg = format!("{err:#}");
+        for needle in [
+            "EMPTY answer",
+            "finish_reason \"length\"",
+            "max_tokens 16384",
+            "16384 of 16384 output tokens",
+            "reasoning",
+            "another cast",
+            "`effort`",
+            "`max_tokens`",
+            "`synth` slot",
+            "kaibo example-config",
+        ] {
+            assert!(msg.contains(needle), "the error must name {needle}: {msg}");
+        }
+    }
+
+    /// The same failure must also read as a failure in traces. Every kaibo span used
+    /// to close with status Unset, so the empty `oneshot` calls above looked like
+    /// successes to anything reading span status. The single-shot `run_phase` span
+    /// records `otel.status_code = "ERROR"` (which tracing-opentelemetry turns into the
+    /// span status) and an `error.type` naming the class. A successful call records
+    /// neither, so a regression that always marks the span fails the second half.
+    #[test]
+    fn a_failed_single_shot_marks_its_span_as_an_error() {
+        use crate::test_support::capture_tracing;
+        const MODEL: &str = "reasoner";
+
+        let captured = capture_tracing(async {
+            let client = ScriptedClient::builder()
+                .on_model(MODEL, |_req| Ok(reasoning_response("thinking...")))
+                .build();
+            let _ = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default()).await;
+        });
+        let span = captured
+            .spans()
+            .into_iter()
+            .find(|s| s.name == "run_phase")
+            .expect("the single shot opened a run_phase span");
+        assert_eq!(
+            span.fields.get("otel.status_code").map(String::as_str),
+            Some("ERROR"),
+            "an empty single shot must mark its span as an error: {span:?}"
+        );
+        assert_eq!(
+            span.fields.get("error.type").map(String::as_str),
+            Some("empty_answer"),
+            "the span names the failure class: {span:?}"
+        );
+
+        let captured = capture_tracing(async {
+            let client = ScriptedClient::builder()
+                .on_model(MODEL, |_req| Ok(text_response("ANSWER")))
+                .build();
+            oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+                .await
+                .expect("a real answer succeeds");
+        });
+        let span = captured
+            .spans()
+            .into_iter()
+            .find(|s| s.name == "run_phase")
+            .expect("the single shot opened a run_phase span");
+        assert!(
+            !span.fields.contains_key("otel.status_code")
+                && !span.fields.contains_key("error.type"),
+            "a successful single shot must leave the status unset: {span:?}"
         );
     }
 
