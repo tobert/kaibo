@@ -27,7 +27,7 @@ record. Each later release appends a new section at the top.
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
-- The built-in `deepseek` cast's synth reasons at `max`, DeepSeek's deepest rung; the explorer stays at `high`.
+- The built-in `deepseek` cast's synth reasons at `max` with `max_tokens = 131072`, DeepSeek's own default at that effort; the explorer stays at `high`.
 - turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
 - rmcp 3.4: `initialize` asking for MCP `2026-07-28` now gets `2025-11-25`; a `2026-07-28` client enters with `server/discover`.
 - The `oneshot` preamble says thinking comes before the reply and shares its output budget.
